@@ -68,12 +68,20 @@ class StreamReader:
             if not line:
                 return
             out_line = prefix + line
-            try:
-                sys.stdout.buffer.write(out_line.encode())
-            except UnicodeEncodeError:
-                out_line = out_line.encode("ascii", "replace").decode("ascii")
-                sys.stdout.write(out_line)
-            sys.stdout.flush()
+            if self.stream_name == "stdout":
+                try:
+                    sys.stdout.buffer.write(out_line.encode())
+                except UnicodeEncodeError:
+                    out_line = out_line.encode("ascii", "replace").decode("ascii")
+                    sys.stdout.write(out_line)
+                sys.stdout.flush()
+            elif self.stream_name == "stderr":
+                try:
+                    sys.stderr.buffer.write(out_line.encode())
+                except UnicodeEncodeError:
+                    out_line = out_line.encode("ascii", "replace").decode("ascii")
+                    sys.stderr.write(out_line)
+                sys.stderr.flush()
             if self.save_limit > 0:
                 if len(self.save_top) < limit_top:
                     self.save_top.append(line)
