@@ -1,0 +1,13 @@
+# Keep the build context small. NOTE: .git MUST be included — setuptools_scm
+# derives the version from git tags during `pip install .`.
+.venv
+.venv314
+.tox
+.mypy_cache
+.ruff_cache
+.pytest_cache
+dist
+build
+*.egg-info
+__pycache__
+*.pyc
