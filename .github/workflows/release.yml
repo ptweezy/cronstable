@@ -36,6 +36,11 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+# Least-privilege default for all jobs; the `release` job opts up to the
+# narrower set of write scopes it actually needs (see its own permissions:).
+permissions:
+  contents: read
+
 jobs:
   # Decide whether to release and at what level. Kept separate (and strict) so
   # the trigger logic lives in a real script, never a fuzzy `contains()` match.
