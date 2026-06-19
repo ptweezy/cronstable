@@ -2,9 +2,9 @@ import asyncio
 import datetime
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
-import pytz
 
 import yacron2.cron
 from yacron2.config import JobConfig
@@ -538,7 +538,7 @@ async def test_auth_middleware():
 
 DT = datetime.datetime
 UTC = datetime.timezone.utc
-LONDON = pytz.timezone("Europe/London")
+LONDON = ZoneInfo("Europe/London")
 
 
 @pytest.mark.parametrize(
