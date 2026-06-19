@@ -228,9 +228,10 @@ class MailReporter(Reporter):
             env_var = mail["password"]["fromEnvVar"]
             password = os.environ.get(env_var)
             if not password:
+                # The env var *name* is config-derived and tied to a secret,
+                # so we don't echo it to the logs.
                 logger.error(
-                    "mail: password env var %r is not set; not sending",
-                    env_var,
+                    "mail: password env var is not set; not sending email"
                 )
                 return
         else:
