@@ -3,8 +3,191 @@ History
 =======
 
 yacron2 is a fork of `yacron <https://github.com/gjcarneiro/yacron>`_,
-continuing from yacron 0.19.  The entries below document the history of the
-original yacron project, on which yacron2 is based.
+continuing from yacron 0.19.  The 1.0.0 entry below documents the fork; the
+entries from 0.19.0 onward document the history of the original yacron
+project, on which yacron2 is based.
+
+
+1.0.0 (2026-06-19)
+------------------
+
+**About this release**
+
+* yacron2 1.0.0 is the first release of the yacron2 fork, based on
+  gjcarneiro/yacron 0.19. It carries forward all of upstream yacron's
+  functionality and adds modernized packaging, a Python 3.13+ runtime, new
+  web-API authentication, and a set of security and correctness fixes.
+* The project, package, command, config directory, and reporter environment
+  variables have all been renamed from ``yacron`` to ``yacron2`` (see Breaking
+  changes for migration steps).
+
+**Breaking changes**
+
+* The installed command and PyPI distribution are renamed ``yacron`` ->
+  ``yacron2`` (install with ``pip install yacron2``; run ``yacron2``). The
+  Python import package is now ``yacron2`` and the entry point is
+  ``yacron2.__main__:main``.
+* The default config directory changed from ``/etc/yacron.d`` to
+  ``/etc/yacron2.d``; operators relying on the default path must move their
+  config directory.
+* Minimum Python is now 3.13 (``requires-python >=3.13``); only Python 3.13 and
+  3.14 are supported. Python 3.7 through 3.12 are no longer supported.
+* Reporter shell environment variables were renamed ``YACRON_*`` ->
+  ``YACRON2_*`` (e.g. ``YACRON2_JOB_NAME``, ``YACRON2_RETCODE``). Existing
+  ``onFailure``/``onSuccess`` shell scripts must be updated.
+* mail ``validate_certs`` now defaults to ``True``, so SMTP TLS certificate
+  validation is enabled unless explicitly disabled. Delivery to servers with
+  self-signed/invalid certificates that previously worked silently will now
+  fail unless ``validate_certs: false`` is set.
+* Privilege drop now drops/sets supplementary groups (``os.initgroups`` /
+  ``os.setgroups``) before ``setuid``, fixing a privilege-escalation bug where
+  root's supplementary group memberships leaked into the child. A numeric
+  ``user`` without an explicit ``group`` now derives its primary gid from the
+  passwd database instead of silently keeping yacron's gid 0.
+* ``defaults.environment`` now merges by key instead of concatenating: a job
+  overriding a default variable yields a single entry. Configs relying on the
+  old duplicate-key concatenation behave differently.
+* Dependency pins changed: ``crontab`` jumped from ``==0.22.8`` to ``>=1,<2``
+  (major version change), ``strictyaml`` to ``>=1.7,<2``, ``aiohttp`` to
+  ``>=3.10,<4``, ``aiosmtplib`` to ``>=3,<6`` (v2+ login API), ``sentry-sdk``
+  to ``>=2,<3``. ``pytz`` and the direct ``ruamel.yaml`` pin were dropped;
+  ``tzdata>=2024.1`` was added.
+
+**Features & behavior**
+
+* New ``web.authToken`` option adds opt-in bearer-token authentication to the
+  HTTP API (literal ``value``, ``fromFile``, or ``fromEnvVar``); when set, an
+  aiohttp middleware requires ``Authorization: Bearer <token>`` on every route,
+  compares it in constant time (``hmac.compare_digest``), and returns 401
+  otherwise.
+* New ``web.socketMode`` option sets octal permissions on ``unix://`` listen
+  sockets, logging a warning rather than failing on invalid values; non-unix
+  schemes are ignored.
+* Job stderr is now written to the process's stderr instead of stdout, so
+  operators separating yacron2's own stdout/stderr streams get correctly routed
+  output.
+* Config now validates numeric ranges at load time and raises a clear
+  ``ConfigError`` for invalid values (``saveLimit>=0``, ``maxLineLength>0``,
+  ``killTimeout>=0``, ``executionTimeout>0``, and ``onFailure.retry``
+  constraints) instead of failing obscurely at runtime.
+* Multi-file config directories now aggregate jobs, defaults, and logging
+  across all files instead of using only the last file's settings. Duplicate
+  ``web`` or ``logging`` blocks across the directory raise a ``ConfigError``,
+  an empty/all-skipped directory yields an empty config (no
+  ``UnboundLocalError``), and a missing/unreadable single config file now
+  raises a clear ``ConfigError``.
+* Logging configuration is now re-applied on reload when it changes and is only
+  marked applied on success, so a logging section fixed after an error or
+  changed at runtime is picked up without a restart.
+* Scheduling a retry for a job that was removed from the configuration
+  mid-retry no longer crashes; the stale retry state is cleared and the retry
+  is skipped.
+* Job stop metrics (statsd ``job_stopped``) are now emitted exactly once per
+  run; a guard makes ``_on_stop`` idempotent, preventing duplicate metrics when
+  ``cancel`` races ``wait`` (e.g. ``concurrencyPolicy=Replace``).
+* Non-UTF-8 job output no longer crashes the stream reader (output is decoded
+  with ``errors='replace'``).
+* A job with an empty environment list now gets its environment assigned
+  correctly (previously left ``None``).
+* Email reports now set an RFC 5322 ``Date`` header
+  (``email.utils.format_datetime``), encode HTML bodies with the correct
+  charset/transfer-encoding (``set_content`` subtype ``html``), and call
+  ``smtp.login`` positionally for aiosmtplib v2+ compatibility.
+* The Sentry client is now initialised once per ``(dsn, environment)`` and
+  cached instead of on every report, and uses ``sentry_sdk.new_scope()``
+  (replacing the deprecated ``push_scope()``).
+* Report templates (sentry/mail body, subject, fingerprint) are now compiled
+  and cached via an ``lru_cache``, and the three report blocks (``onFailure``,
+  ``onPermanentFailure``, ``onSuccess``) deep-copy their defaults so they no
+  longer alias one shared mutable object.
+* The shell reporter now logs a nonzero reporter exit code via ``logger.error``
+  (clean message) instead of ``logger.exception`` (which logged a bogus
+  ``NoneType: None`` traceback).
+* statsd UDP errors are now logged with their detail (``UDP error received:
+  %s``) instead of being dropped due to a missing format placeholder.
+
+**Python & runtime**
+
+* Timezone handling migrated from third-party ``pytz`` to the standard-library
+  ``zoneinfo``; invalid timezones now raise ``ConfigError``.
+* Added ``tzdata>=2024.1`` so ``zoneinfo`` can resolve timezones on
+  slim/minimal container images that don't ship the system tz database.
+* The asyncio event loop is now created with ``asyncio.new_event_loop()``
+  instead of the deprecated ``asyncio.get_event_loop()`` (carried from
+  upstream).
+* Internal logger and argparse program name updated to ``yacron2``; CLI
+  error/version output now reads ``yacron2``.
+
+**Packaging & build**
+
+* Migrated from legacy ``setup.py``/``setup.cfg`` to a PEP 621
+  ``pyproject.toml`` using the setuptools build backend (``setuptools>=77``,
+  ``setuptools_scm>=8``); ``setup.py`` and ``setup.cfg`` were removed.
+* Versioning continues via setuptools_scm, now configured under
+  ``[tool.setuptools_scm]`` writing ``yacron2/version.py``.
+* Adopted a PEP 639 SPDX license expression (``license = "MIT"``) with
+  ``license-files``, and updated the LICENSE with a ``Copyright (c) 2026, the
+  yacron2 developers`` line alongside the original 2019 copyright.
+* Added a ``[project.optional-dependencies]`` ``dev`` extra (mypy,
+  mypy-extensions, pytest, pytest-asyncio, pytest-cov, ruff, tox) and trimmed
+  ``requirements_dev.txt`` to match (dropped flake8, types-pytz, and stale
+  pins; added ruff).
+* Consolidated mypy and pytest configuration into ``pyproject.toml`` and bumped
+  the black/ruff target-version to ``py313``.
+* ``MANIFEST.in`` and packaging metadata updated for the ``README.rst`` ->
+  ``README.md`` switch.
+
+**CI & tooling**
+
+* Removed Travis CI configuration (``.travis.yml``).
+* Switched linting from black + flake8 to ruff (``ruff check`` + ``ruff
+  format``) with bugbear/mccabe/pycodestyle/pyflakes/import-sorting rules and a
+  mccabe complexity limit; added a bandit config and a
+  ``.pre-commit-config.yaml`` running bandit and ruff hooks (carried from
+  upstream).
+* Modernized the GitHub Actions tox workflow: bumped ``actions/checkout`` (v3
+  -> v7) and ``actions/setup-python`` (v3 -> v6.2.0), renamed the lint job, and
+  trimmed the test matrix to Python 3.13 and 3.14.
+* Modernized ``tox.ini`` (envlist ``py313, py314, lint, mypy``), removed the
+  Travis mapping section, added ``skip_install`` to the lint/mypy envs, dropped
+  ``types-pytz`` from the mypy env, and pointed lint/mypy commands at the
+  ``yacron2`` package.
+* Bumped pre-commit hook revisions (ruff-pre-commit and bandit).
+
+**Docs & examples**
+
+* Converted the README from reStructuredText to Markdown (``README.rst`` ->
+  ``README.md``) and rebranded it to yacron2, with a new intro noting it is a
+  fork of gjcarneiro/yacron continuing from 0.19. The content is otherwise the
+  same as upstream 0.19, not a rewrite; install docs now require Python >=
+  3.13, the prebuilt binary targets glibc 2.39 / Ubuntu 24.04, and releases
+  come from github.com/ptweezy/yacron2.
+* ``HISTORY.rst`` gained a fork-attribution preamble; older entries are
+  retained as upstream yacron history.
+* Modernized the Docker example: base image ``python:3.14-slim`` with ``pip
+  install yacron2`` (replacing ubuntu:xenial + virtualenv), config copied into
+  ``/etc/yacron2.d``, and ``ENTRYPOINT ['yacron2']``.
+* Updated the Kubernetes example to the ``apps/v1`` Deployment API with the
+  now-required selector, rebranded ``yacrondemo`` -> ``yacron2demo``.
+* Rebranded the ad-hoc example config directory, example tab file, PyInstaller
+  spec/launcher, and listen socket paths (``/tmp/yacron.sock`` ->
+  ``/tmp/yacron2.sock``) to yacron2.
+
+**Credits (trailing upstream changes)**
+
+* ``web.headers`` option to control HTTP response headers on all web
+  endpoints — Gustavo Carneiro (gjcarneiro), commit bde0f0b; merged upstream
+  but never released in yacron 0.19.0.
+* Python 3.14 compatibility, including ``asyncio.new_event_loop()`` and
+  modern-Python lint/format fixes — Gustavo J. A. M. Carneiro (gjcarneiro),
+  commit 27a32bc (#100).
+* Switch from black/flake8 to ruff, plus bandit and pre-commit configuration —
+  Gustavo Carneiro (gjcarneiro), commits c656fa6 and 4f7936a.
+* Removal of Travis CI and modernization of the Python/PyInstaller version
+  matrices — upstream yacron (gjcarneiro), commits d9b1ca6, 8d28816, 4e6892a,
+  2941dcf.
+* README logging example fix adding ``datefmt: '%Y-%m-%d %H:%M:%S'`` to the
+  custom-logging formatter — andreas-wittig, commit 931b186.
 
 
 0.19.0 (2023-03-11)
