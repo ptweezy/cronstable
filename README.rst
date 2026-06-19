@@ -31,11 +31,6 @@ Features
 
 .. [1] Whereas vixie cron only logs to syslog, requiring a syslog daemon to be running in the background or else you don't get logs!
 
-Status
---------------
-
-The project is in beta stage: essential features are complete, and the focus is
-finding and fixing bugs before the first stable release.
 
 Installation
 ------------
