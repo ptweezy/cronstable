@@ -5,10 +5,13 @@ import os
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email.utils import format_datetime
+from functools import lru_cache
 from socket import gethostname
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import aiosmtplib
 import jinja2
@@ -19,6 +22,13 @@ from yacron.config import JobConfig
 from yacron.statsd import StatsdJobMetricWriter
 
 logger = logging.getLogger("yacron")
+
+
+@lru_cache(maxsize=None)
+def _compiled_template(source: str) -> jinja2.Template:
+    # Template source strings come from config and are constant for the life
+    # of the process; compile each distinct one once and reuse it.
+    return jinja2.Template(source)
 
 
 if "HOSTNAME" not in os.environ:
@@ -43,7 +53,7 @@ class StreamReader:
         save_limit: int,
     ) -> None:
         self.save_top: List[str] = []
-        self.save_bottom: List[str] = []
+        self.save_bottom: Deque[str] = deque()
         self.job_name = job_name
         self.save_limit = save_limit
         self.stream_name = stream_name
@@ -59,7 +69,11 @@ class StreamReader:
         limit_bottom = self.save_limit - limit_top
         while True:
             try:
-                line = (await stream.readline()).decode("utf-8")
+                # errors="replace" so a job emitting non-UTF-8 bytes does not
+                # crash the reader task with UnicodeDecodeError.
+                line = (await stream.readline()).decode(
+                    "utf-8", errors="replace"
+                )
             except ValueError:
                 logger.warning(
                     "job %s: ignored a very long line", self.job_name
@@ -72,22 +86,28 @@ class StreamReader:
                 try:
                     sys.stdout.buffer.write(out_line.encode())
                 except UnicodeEncodeError:
-                    out_line = out_line.encode("ascii", "replace").decode("ascii")
+                    out_line = out_line.encode("ascii", "replace").decode(
+                        "ascii"
+                    )
                     sys.stdout.write(out_line)
                 sys.stdout.flush()
             elif self.stream_name == "stderr":
                 try:
                     sys.stderr.buffer.write(out_line.encode())
                 except UnicodeEncodeError:
-                    out_line = out_line.encode("ascii", "replace").decode("ascii")
+                    out_line = out_line.encode("ascii", "replace").decode(
+                        "ascii"
+                    )
                     sys.stderr.write(out_line)
                 sys.stderr.flush()
             if self.save_limit > 0:
                 if len(self.save_top) < limit_top:
                     self.save_top.append(line)
                 else:
+                    # deque(maxlen) would evict silently; track discards
+                    # explicitly to preserve the "N lines discarded" count.
                     if len(self.save_bottom) == limit_bottom:
-                        del self.save_bottom[0]
+                        self.save_bottom.popleft()
                         self.discarded_lines += 1
                     self.save_bottom.append(line)
             else:
@@ -105,7 +125,7 @@ class StreamReader:
                 if self.discarded_lines
                 else []
             )
-            output = "".join(self.save_top + middle + self.save_bottom)
+            output = "".join(self.save_top + middle + list(self.save_bottom))
         else:
             output = "".join(self.save_top)
         return output, self.discarded_lines
@@ -119,6 +139,12 @@ class Reporter:
 
 
 class SentryReporter(Reporter):
+    def __init__(self) -> None:
+        # Remember the last (dsn, environment) we initialised the global
+        # Sentry client with, so we don't rebuild the client/transport on
+        # every single report.
+        self._inited_key: Optional[Tuple[str, Optional[str]]] = None
+
     async def report(
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
@@ -133,12 +159,14 @@ class SentryReporter(Reporter):
         else:
             return  # sentry disabled: early return
 
-        template = jinja2.Template(config["body"])
+        template = _compiled_template(config["body"])
         body = template.render(job.template_vars)
 
         fingerprint = []
         for line in config["fingerprint"]:
-            fingerprint.append(jinja2.Template(line).render(job.template_vars))
+            fingerprint.append(
+                _compiled_template(line).render(job.template_vars)
+            )
 
         kwargs = {}
         if config.get("maxStringLength"):
@@ -147,7 +175,10 @@ class SentryReporter(Reporter):
             )
         if config.get("environment"):
             kwargs["environment"] = config["environment"]
-        sentry_sdk.init(dsn=dsn, **kwargs)
+        init_key = (dsn, kwargs.get("environment"))
+        if init_key != self._inited_key:
+            sentry_sdk.init(dsn=dsn, **kwargs)
+            self._inited_key = init_key
         extra = {
             "job": job.config.name,
             "exit_code": job.retcode,
@@ -196,12 +227,12 @@ class MailReporter(Reporter):
         username = mail.get("username")
 
         tmpl_vars = job.template_vars
-        body_tmpl = jinja2.Template(mail["body"])
+        body_tmpl = _compiled_template(mail["body"])
         body = body_tmpl.render(tmpl_vars)
         if success and not body.strip():
             logger.debug("body is empty, not sending email")
             return
-        subject_tmpl = jinja2.Template(mail["subject"])
+        subject_tmpl = _compiled_template(mail["subject"])
         subject = subject_tmpl.render(tmpl_vars)
 
         logger.debug("smtp: host=%r, port=%r", smtp_host, smtp_port)
@@ -209,10 +240,12 @@ class MailReporter(Reporter):
         message["From"] = mail["from"]
         message["To"] = mail["to"].strip()
         message["Subject"] = subject.strip()
-        message["Date"] = datetime.now(timezone.utc).isoformat()
+        # RFC 5322 date, e.g. "Wed, 18 Jun 2026 12:34:56 +0000" (not ISO-8601).
+        message["Date"] = format_datetime(datetime.now(timezone.utc))
         if mail["html"]:
-            message.set_payload(body)
-            message.add_header("Content-Type", "text/html")
+            # set_content handles charset + transfer-encoding so non-ASCII
+            # HTML bodies are sent correctly (set_payload would not).
+            message.set_content(body, subtype="html")
         else:
             message.set_content(body)
         smtp = aiosmtplib.SMTP(
@@ -306,7 +339,9 @@ class ShellReporter(Reporter):
 
         retcode = await proc.wait()
         if retcode != 0:
-            logger.exception(
+            # not in an except block: a nonzero exit is not an exception, so
+            # logger.exception would log a bogus "NoneType: None" traceback.
+            logger.error(
                 "Error executing shell reporter of job %s with return code %s",
                 job.config.name,
                 retcode,
@@ -353,6 +388,8 @@ class RunningJob:
         self.execution_deadline = None  # type: Optional[float]
         self.retry_state = retry_state
         self.env = None  # type: Optional[Dict[str, str]]
+        # guards against _on_stop running twice (cancel() racing wait())
+        self._stopped = False
 
         statsd_config = self.config.statsd
         if statsd_config is not None:
@@ -370,6 +407,13 @@ class RunningJob:
             await self.statsd_writer.job_started()
 
     async def _on_stop(self) -> None:
+        # idempotent: cancel() and the wait() task can both reach here for a
+        # single run (e.g. concurrencyPolicy=Replace), but stop metrics must
+        # only be emitted once. Safe without locking because asyncio is
+        # single-threaded and there is no await before the flag is set.
+        if self._stopped:
+            return
+        self._stopped = True
         if self.statsd_writer:
             await self.statsd_writer.job_stopped()
 
@@ -392,7 +436,7 @@ class RunningJob:
             fixup_pyinstaller_env(env)
             for envvar in self.config.environment:
                 env[envvar["key"]] = envvar["value"]
-                self.env = env
+            self.env = env
             kwargs["env"] = env
         if self.config.uid is not None or self.config.gid is not None:
             kwargs["preexec_fn"] = self._demote
@@ -449,16 +493,33 @@ class RunningJob:
             )
 
     def _demote(self):
-        if self.config.gid is not None:
-            logger.debug("Changing to gid %r ...", self.config.gid)
+        # Runs in the child (preexec_fn) while still privileged. Order matters:
+        # set/clear supplementary groups, then the primary gid, then the uid.
+        # Dropping supplementary groups BEFORE setuid is essential — otherwise
+        # the child keeps root's supplementary group memberships (the classic
+        # "forgot setgroups() before setuid()" privilege-escalation bug).
+        gid = self.config.gid
+        uid = self.config.uid
+        username = self.config.username
+        try:
+            if username is not None and gid is not None:
+                # gives the target user exactly their own supplementary groups
+                os.initgroups(username, gid)
+            else:
+                # unknown user/gid: drop all supplementary groups
+                os.setgroups([])
+        except OSError as ex:
+            raise RuntimeError("setgroups/initgroups: {}".format(ex)) from ex
+        if gid is not None:
+            logger.debug("Changing to gid %r ...", gid)
             try:
-                os.setgid(self.config.gid)
+                os.setgid(gid)
             except OSError as ex:
                 raise RuntimeError("setgid: {}".format(ex)) from ex
-        if self.config.uid is not None:
-            logger.debug("Changing to uid %r ...", self.config.uid)
+        if uid is not None:
+            logger.debug("Changing to uid %r ...", uid)
             try:
-                os.setuid(self.config.uid)
+                os.setuid(uid)
             except OSError as ex:
                 raise RuntimeError("setuid: {}".format(ex)) from ex
 

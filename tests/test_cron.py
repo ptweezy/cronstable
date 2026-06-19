@@ -480,6 +480,62 @@ def test_naturaltime(value_in, out):
     assert got_out == out
 
 
+@pytest.mark.asyncio
+async def test_schedule_retry_job_disappeared():
+    # a job removed from config while a retry is pending must not raise
+    # UnboundLocalError; the retry is simply skipped.
+    cron = yacron.cron.Cron(None)
+    await cron.schedule_retry_job("nonexistent", 0.0, 0)
+    assert "nonexistent" not in cron.retry_state
+
+
+def test_resolve_web_token_value():
+    token = yacron.cron.Cron._resolve_web_token(
+        {"authToken": {"value": "secret", "fromFile": None, "fromEnvVar": None}}
+    )
+    assert token == "secret"
+
+
+def test_resolve_web_token_envvar(monkeypatch):
+    monkeypatch.setenv("YACRON_TEST_WEB_TOKEN", "envsecret")
+    token = yacron.cron.Cron._resolve_web_token(
+        {
+            "authToken": {
+                "value": None,
+                "fromFile": None,
+                "fromEnvVar": "YACRON_TEST_WEB_TOKEN",
+            }
+        }
+    )
+    assert token == "envsecret"
+
+
+def test_resolve_web_token_absent():
+    assert yacron.cron.Cron._resolve_web_token({"listen": []}) is None
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware():
+    from aiohttp import web
+
+    middleware = yacron.cron.Cron._make_auth_middleware("secret")
+
+    async def handler(request):
+        return web.Response(text="ok")
+
+    class FakeRequest:
+        def __init__(self, auth):
+            self.headers = {"Authorization": auth} if auth else {}
+
+    resp = await middleware(FakeRequest("Bearer secret"), handler)
+    assert resp.text == "ok"
+
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest("Bearer wrong"), handler)
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest(None), handler)
+
+
 DT = datetime.datetime
 UTC = datetime.timezone.utc
 LONDON = pytz.timezone("Europe/London")

@@ -1,8 +1,10 @@
 import asyncio
 import asyncio.subprocess
 import datetime
+import hmac
 import logging
 import logging.config
+import os
 from collections import OrderedDict, defaultdict
 from typing import Any, Awaitable, Dict, List, Optional, Union  # noqa
 from urllib.parse import urlparse
@@ -15,6 +17,7 @@ from yacron.config import (
     ConfigError,
     JobConfig,
     JobDefaults,
+    LoggingConfig,
     WebConfig,
     YacronConfig,
     parse_config,
@@ -103,7 +106,7 @@ class Cron:
         )
 
         startup = True
-        logging_configured = False
+        applied_logging_config: Optional[LoggingConfig] = None
         while not self._stop_event.is_set():
             try:
                 config = self.update_config()
@@ -116,8 +119,10 @@ class Cron:
                 )
             except Exception:  # pragma: nocover
                 logger.exception("please report this as a bug (1)")
-            if config.logging_config is not None and not logging_configured:
-                logging_configured = True
+            if (
+                config.logging_config is not None
+                and config.logging_config != applied_logging_config
+            ):
                 try:
                     logging.config.dictConfig(config.logging_config)
                 except Exception as ex:
@@ -129,6 +134,11 @@ class Cron:
                         ex,
                         config.logging_config,
                     )
+                else:
+                    # only mark applied on success, and re-apply when the
+                    # config changes, so a fixed-after-error logging section
+                    # is picked up on reload without a restart.
+                    applied_logging_config = config.logging_config
             await self.spawn_jobs(startup)
             startup = False
             sleep_interval = next_sleep_interval()
@@ -259,7 +269,12 @@ class Cron:
             and web_config["listen"]
             and self.web_runner is None
         ):
-            app = web.Application()
+            middlewares = []
+            token = self._resolve_web_token(web_config)
+            if token is not None:
+                logger.info("web: requiring bearer-token authentication")
+                middlewares.append(self._make_auth_middleware(token))
+            app = web.Application(middlewares=middlewares)
             app.add_routes(
                 [
                     web.get("/version", self._web_get_version),
@@ -269,14 +284,60 @@ class Cron:
             )
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
+            socket_mode = web_config.get("socketMode")
             for addr in web_config["listen"]:
                 site = web_site_from_url(self.web_runner, addr)
                 logger.info("web: started listening on %s", addr)
                 try:
                     await site.start()
                 except ValueError:
-                    pass
+                    continue
+                if socket_mode:
+                    self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
+
+    @staticmethod
+    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
+        auth = web_config.get("authToken")
+        if not auth:
+            return None
+        if auth.get("value"):
+            return str(auth["value"])
+        if auth.get("fromFile"):
+            with open(auth["fromFile"], "rt") as token_file:
+                return token_file.read().strip()
+        if auth.get("fromEnvVar"):
+            return os.environ.get(auth["fromEnvVar"])
+        return None
+
+    @staticmethod
+    def _make_auth_middleware(token: str):
+        expected = "Bearer " + token
+
+        @web.middleware
+        async def auth_middleware(request, handler):
+            header = request.headers.get("Authorization", "")
+            # constant-time comparison to avoid leaking the token via timing
+            if not hmac.compare_digest(header, expected):
+                raise web.HTTPUnauthorized()
+            return await handler(request)
+
+        return auth_middleware
+
+    @staticmethod
+    def _apply_socket_mode(addr: str, socket_mode: str) -> None:
+        parsed = urlparse(addr)
+        if parsed.scheme != "unix":
+            return
+        try:
+            os.chmod(parsed.path, int(socket_mode, 8))
+        except (OSError, ValueError) as ex:
+            logger.warning(
+                "web: could not set socketMode %r on %s: %s",
+                socket_mode,
+                parsed.path,
+                ex,
+            )
 
     async def spawn_jobs(self, startup: bool) -> None:
         for job in self.cron_jobs.values():
@@ -479,6 +540,10 @@ class Cron:
                 "disappeared from the configuration",
                 job_name,
             )
+            # clear the now-stale retry state and stop; falling through here
+            # would call maybe_launch_job(job) with an unbound 'job'.
+            self.retry_state.pop(job_name, None)
+            return
         await self.maybe_launch_job(job)
 
     async def handle_job_success(self, job: RunningJob) -> None:

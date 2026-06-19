@@ -19,7 +19,9 @@ class StatsdClientProtocol:
         pass
 
     def error_received(self, exc):
-        logger.error("UDP error received:", exc)
+        # the format string needs a placeholder, otherwise logging raises a
+        # TypeError and the actual exception detail is lost.
+        logger.error("UDP error received: %s", exc)
 
     def connection_lost(self, exc):
         pass

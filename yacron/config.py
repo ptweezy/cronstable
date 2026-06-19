@@ -1,9 +1,10 @@
+import copy
 import datetime
 import logging
 import os.path
 from dataclasses import dataclass
 from grp import getgrnam
-from pwd import getpwnam
+from pwd import getpwnam, getpwuid
 from typing import (
     Any,
     Dict,
@@ -81,7 +82,7 @@ _REPORT_DEFAULTS = {
         "smtpPort": 25,
         "tls": False,
         "starttls": False,
-        "validate_certs": False,
+        "validate_certs": True,
         "html": False,
         "subject": DEFAULT_SUBJECT_TEMPLATE,
         "body": DEFAULT_BODY_TEMPLATE,
@@ -117,10 +118,12 @@ DEFAULT_CONFIG = {
             "maximumDelay": 300,
             "backoffMultiplier": 2,
         },
-        "report": _REPORT_DEFAULTS,
+        # deepcopy so the three report blocks below do not alias the same
+        # mutable object (and its nested lists, e.g. sentry "fingerprint").
+        "report": copy.deepcopy(_REPORT_DEFAULTS),
     },
-    "onPermanentFailure": {"report": _REPORT_DEFAULTS},
-    "onSuccess": {"report": _REPORT_DEFAULTS},
+    "onPermanentFailure": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
+    "onSuccess": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "environment": [],
     "env_file": None,
     "executionTimeout": None,
@@ -251,6 +254,16 @@ CONFIG_SCHEMA = EmptyDict() | Map(
             {
                 "listen": Seq(Str()),
                 Opt("headers"): MapPattern(Str(), Str()),
+                # optional opt-in bearer-token auth for the web API
+                Opt("authToken"): Map(
+                    {
+                        Opt("value"): EmptyNone() | Str(),
+                        Opt("fromFile"): EmptyNone() | Str(),
+                        Opt("fromEnvVar"): EmptyNone() | Str(),
+                    }
+                ),
+                # octal permissions to apply to a unix:// listen socket
+                Opt("socketMode"): Str(),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -281,7 +294,22 @@ def mergedicts(dict1, dict2):
             elif isinstance(v1, dict) and v2 is None:  # modification
                 yield (k, dict(mergedicts(v1, {})))
             elif isinstance(v1, list) and isinstance(v2, list):  # merge lists
-                yield (k, v1 + v2)
+                if k == "environment":
+                    # environment is a list of {key, value}; merge by key so a
+                    # job's variable overrides the default instead of producing
+                    # a duplicate-keyed concatenation.
+                    merged = {e["key"]: e["value"] for e in v1}
+                    for e in v2:
+                        merged[e["key"]] = e["value"]
+                    yield (
+                        k,
+                        [
+                            {"key": kk, "value": vv}
+                            for kk, vv in merged.items()
+                        ],
+                    )
+                else:
+                    yield (k, v1 + v2)
             else:
                 yield (k, v2)
         elif k in dict1:
@@ -310,7 +338,9 @@ class JobConfig:
             logger.debug("Converted schedule to %r", tab)
             self.schedule = CronTab(tab)
         else:
-            raise ConfigError("invalid schedule: %r", self.schedule_unparsed)
+            raise ConfigError(
+                "invalid schedule: {!r}".format(self.schedule_unparsed)
+            )
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
         self.captureStderr = config.pop("captureStderr")
@@ -362,16 +392,32 @@ class JobConfig:
 
         self.uid = None
         self.gid = None
+        # Resolved login name of the target user, used by the child process'
+        # privilege-drop (os.initgroups) so it gets the user's supplementary
+        # groups instead of inheriting root's. None when unknown.
+        self.username: Optional[str] = None
 
         user = config.pop("user", None)
         if user is not None:
             if isinstance(user, int):
                 self.uid = user
+                # Derive the primary gid (and login name) from the passwd
+                # database so a numeric ``user`` without an explicit ``group``
+                # does not silently keep yacron's (root) gid 0.
+                try:
+                    pw = getpwuid(user)
+                except KeyError:
+                    pw = None
+                if pw is not None:
+                    self.username = pw.pw_name
+                    if self.gid is None:
+                        self.gid = pw.pw_gid
             else:
                 try:
                     pw = getpwnam(user)
                     self.uid = pw.pw_uid
                     self.gid = pw.pw_gid
+                    self.username = pw.pw_name
                 except KeyError as e:
                     raise ConfigError(
                         "User not found: {!r}".format(user)
@@ -395,6 +441,44 @@ class JobConfig:
                     "Job {} wants to change user or group, "
                     "but yacron is not running as superuser".format(self.name)
                 )
+
+        self._validate_numeric_ranges()
+
+    def _validate_numeric_ranges(self) -> None:
+        # strictyaml only enforces the type (Int/Float); fail fast on values
+        # that would otherwise produce obscure runtime behaviour instead of a
+        # clear configuration error.
+        def require(condition: bool, message: str) -> None:
+            if not condition:
+                raise ConfigError("Job {}: {}".format(self.name, message))
+
+        require(self.saveLimit >= 0, "saveLimit must be >= 0")
+        require(self.maxLineLength > 0, "maxLineLength must be > 0")
+        require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        if self.executionTimeout is not None:
+            require(
+                self.executionTimeout > 0,
+                "executionTimeout must be > 0 when set",
+            )
+        retry = self.onFailure.get("retry")
+        if retry is not None:
+            # -1 is the documented sentinel for "retry forever".
+            require(
+                retry["maximumRetries"] >= -1,
+                "onFailure.retry.maximumRetries must be >= -1",
+            )
+            require(
+                retry["initialDelay"] >= 0,
+                "onFailure.retry.initialDelay must be >= 0",
+            )
+            require(
+                retry["maximumDelay"] > 0,
+                "onFailure.retry.maximumDelay must be > 0",
+            )
+            require(
+                retry["backoffMultiplier"] > 0,
+                "onFailure.retry.backoffMultiplier must be > 0",
+            )
 
 
 def parse_environment_file(path: str) -> Dict[str, str]:
@@ -486,47 +570,72 @@ def parse_config_file(
 
 
 def parse_config(config_arg: str) -> YacronConfig:
-    jobs = []
-    config_errors = {}
-    web_config = None
-    web_config_source_fname = None
     if os.path.isdir(config_arg):
-        for direntry in os.scandir(config_arg):
-            base, ext = os.path.splitext(direntry.name)
-            if base[0] in {"_", "."}:
-                continue
-            if ext in {".yml", ".yaml"}:
-                try:
-                    config = parse_config_file(direntry.path)
-                except ConfigError as err:
-                    config_errors[direntry.path] = str(err)
-                except OSError as ex:
-                    config_errors[config_arg] = str(ex)
-                else:
-                    jobs.extend(config.jobs)
-                    if config.web_config is not None:
-                        if web_config is None:
-                            web_config = config.web_config
-                            web_config_source_fname = direntry.path
-                        else:
-                            raise ConfigError(
-                                "Multiple 'web' configurations found: "
-                                "first in {}, now in {}".format(
-                                    web_config_source_fname, direntry.path
-                                )
-                            )
-    else:
+        return _parse_config_dir(config_arg)
+    try:
+        return parse_config_file(config_arg)
+    except OSError as ex:
+        # surface a clean ConfigError (e.g. file not found) rather than a bare
+        # OSError, so callers (__main__) handle it uniformly.
+        raise ConfigError(str(ex)) from ex
+
+
+def _parse_config_dir(config_arg: str) -> YacronConfig:
+    jobs: List[JobConfig] = []
+    config_errors: Dict[str, str] = {}
+    web_config: Optional[WebConfig] = None
+    web_config_source_fname: Optional[str] = None
+    logging_config: Optional[LoggingConfig] = None
+    logging_config_source_fname: Optional[str] = None
+    job_defaults: JobDefaults = JobDefaults({})
+    for direntry in os.scandir(config_arg):
+        base, ext = os.path.splitext(direntry.name)
+        if base[0] in {"_", "."}:
+            continue
+        if ext not in {".yml", ".yaml"}:
+            continue
         try:
-            config = parse_config_file(config_arg)
+            config = parse_config_file(direntry.path)
+        except ConfigError as err:
+            config_errors[direntry.path] = str(err)
+            continue
         except OSError as ex:
             config_errors[config_arg] = str(ex)
-        else:
-            jobs.extend(config.jobs)
+            continue
+        jobs.extend(config.jobs)
+        if config.web_config is not None:
+            if web_config is None:
+                web_config = config.web_config
+                web_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'web' configurations found: "
+                    "first in {}, now in {}".format(
+                        web_config_source_fname, direntry.path
+                    )
+                )
+        if config.logging_config is not None:
+            if logging_config is None:
+                logging_config = config.logging_config
+                logging_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'logging' configurations found: "
+                    "first in {}, now in {}".format(
+                        logging_config_source_fname, direntry.path
+                    )
+                )
+        job_defaults = JobDefaults(
+            dict(mergedicts(job_defaults, config.job_defaults))
+        )
     if config_errors:
         raise ConfigError("\n---".join(config_errors.values()))
+    # Build the result from the accumulated values (never the last file's
+    # config), and return an empty config for an empty/all-skipped directory
+    # instead of raising UnboundLocalError.
     return YacronConfig(
         jobs=jobs,
-        web_config=config.web_config,
-        job_defaults=config.job_defaults,
-        logging_config=config.logging_config,
+        web_config=web_config,
+        job_defaults=job_defaults,
+        logging_config=logging_config,
     )
