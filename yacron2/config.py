@@ -13,8 +13,8 @@ from typing import (
     Optional,
     Union,  # noqa
 )
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import pytz
 import strictyaml
 from crontab import CronTab
 from strictyaml import Any as YamlAny
@@ -353,9 +353,11 @@ class JobConfig:
         self.timezone = None  # type: Optional[datetime.tzinfo]
         if config["timezone"] is not None:
             try:
-                self.timezone = pytz.timezone(config["timezone"])
-            except pytz.UnknownTimeZoneError as err:
-                raise ConfigError("unknown timezone: " + str(err)) from err
+                self.timezone = ZoneInfo(config["timezone"])
+            except (ZoneInfoNotFoundError, ValueError) as err:
+                raise ConfigError(
+                    "unknown timezone: {}".format(config["timezone"])
+                ) from err
         elif self.utc:
             self.timezone = datetime.timezone.utc
 
