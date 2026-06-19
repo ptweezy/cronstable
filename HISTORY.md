@@ -6,6 +6,59 @@ entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
 
+## 1.0.4 (2026-06-19)
+
+### Reliability fixes
+
+- Config reload failures no longer risk crashing the scheduler: if
+  re-reading the configuration fails (for example, a YAML error introduced
+  while yacron2 is running), the previously-loaded jobs keep running
+  instead of the main loop failing on an unset `config` reference.
+- A job whose command cannot be launched (for example, the executable does
+  not exist) is now reported as an ordinary failure with exit code `127`,
+  instead of raising `RuntimeError("process is not running")` and being
+  logged as an internal "please report this as a bug" error.
+- statsd reporting is now strictly best-effort: a failure to send the
+  `job_started`/`job_stopped` metrics (for example, an unresolvable statsd
+  host) is logged as a warning instead of propagating out of job
+  start/stop.
+- The mail reporter now always closes its SMTP connection, even when
+  `STARTTLS`, login, or sending fails, so a misbehaving mail server can no
+  longer leak one connection per report.
+- Sentry and e-mail reporting no longer raise `KeyError` when the DSN or
+  password is configured with `fromEnvVar` but the environment variable is
+  unset; yacron2 logs an error and skips that report instead.
+
+### Configuration
+
+- The Sentry `fingerprint` setting now replaces rather than appends when
+  merging `defaults`: a job (or `defaults` block) that defines its own
+  `fingerprint` overrides the default entirely, so custom Sentry issue
+  grouping works as configured (previously the three default entries were
+  silently prepended).
+- `include` cycles are now detected and rejected with a clear `ConfigError`
+  ("include cycle detected") instead of recursing until a `RecursionError`.
+- Jobs loaded from a configuration directory are now processed in sorted
+  filename order, so job ordering and "first config found" messages are
+  deterministic rather than dependent on the filesystem's directory order.
+- Environment files (`env_file`) are now read as UTF-8.
+
+### Security
+
+- The web API's `Authorization` check now treats the `Bearer` auth scheme
+  as case-insensitive (per RFC 7235), while still comparing the token
+  itself in constant time.
+- The mail reporter no longer logs the name of the configured password
+  environment variable.
+
+### Internal
+
+- Refactored `JobConfig` construction into focused helper methods and
+  switched `send_to_statsd` to `asyncio.get_running_loop()`; no behavioural
+  change.
+- Added a `.github/CODEOWNERS` file.
+
+
 ## 1.0.3 (2026-06-19)
 
 This is a tooling and documentation release; there are no changes to the
