@@ -49,7 +49,7 @@ pipx install yacron2
 ### Install using binary
 
 Alternatively, a self-contained binary can be downloaded
-from github: https://github.com/ptweezy/yacron2/releases. This binary should
+from github: <https://github.com/ptweezy/yacron2/releases>. This binary should
 work on any Linux 64-bit system post glibc 2.39 (e.g. Ubuntu:24.04).  Python is not required on the target system (it is embedded in the executable).
 
 ## Production container deployment
@@ -149,7 +149,7 @@ spec:
 Configuration is in YAML format.  To start yacron2, give it a configuration file
 or directory path as the `-c` argument.  For example:
 
-```
+```shell
 yacron2 -c /tmp/my-crontab.yaml
 ```
 
@@ -187,7 +187,7 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in a crontab format specified by https://github.com/josiahcarlson/parse-crontab (this module is used by yacron2).
+The `schedule` option can be a string in a crontab format specified by <https://github.com/josiahcarlson/parse-crontab> (this module is used by yacron2).
 Additionally @reboot can be included , which will only run the job when yacron2 is initially
 executed. Further `schedule` can be an object with properties.  The following configuration
 runs a command every 5 minutes, but only on the specific date 2017-07-19, and
@@ -491,7 +491,7 @@ jobs:
 With this config Yacron2 will write the following metrics over UDP
 to the Statsd listening on `my-statsd.example.com:8125`:
 
-```
+```text
 my.cron.jobs.prefix.test01.start:1|g  # this one is sent when the job starts
 my.cron.jobs.prefix.test01.stop:1|g   # the rest are sent when the job stops
 my.cron.jobs.prefix.test01.success:1|g
@@ -691,7 +691,7 @@ web:
 
 Now you have the following options to control it (using HTTPie as example):
 
-#### Get the version of yacron2:
+#### Get the version of yacron2
 
 ```shell
 $ http get http://127.0.0.1:8080/version
@@ -704,7 +704,7 @@ Server: Python/3.7 aiohttp/3.6.2
 0.10.0b3.dev7+g45bc4ce
 ```
 
-#### Get the status of cron jobs:
+#### Get the status of cron jobs
 
 ```shell
 $ http get http://127.0.0.1:8080/status
@@ -748,7 +748,7 @@ Server: Python/3.7 aiohttp/3.6.2
 ]
 ```
 
-#### Start a job right now:
+#### Start a job right now
 
 Sometimes it's useful to start a cron job right now, even if it's not
 scheduled to run yet, for example for testing:
