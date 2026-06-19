@@ -1,5 +1,10 @@
 name: tox
 on: [push, pull_request]
+
+# Least-privilege default: every job here only reads the repo.
+permissions:
+  contents: read
+
 jobs:
   tox-lint:
     runs-on: ubuntu-latest
