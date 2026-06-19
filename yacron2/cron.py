@@ -29,8 +29,8 @@ logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
 
 
-def naturaltime(seconds: float, future=False) -> str:
-    assert future
+def naturaltime(seconds: float) -> str:
+    # only ever used to describe a future instant ("in N seconds")
     if seconds < 120:
         return "in {} second{}".format(
             int(seconds), "s" if seconds >= 2 else ""
@@ -60,8 +60,13 @@ def next_sleep_interval() -> float:
 def web_site_from_url(runner: web.AppRunner, url: str) -> web.BaseSite:
     parsed = urlparse(url)
     if parsed.scheme == "http":
-        assert parsed.hostname is not None
-        assert parsed.port is not None
+        if parsed.hostname is None or parsed.port is None:
+            # raise ValueError (not AssertionError) so a malformed http url is
+            # treated as a skippable bad-config entry, not an internal bug.
+            logger.warning(
+                "Ignoring web listen url %s: http url needs host and port", url
+            )
+            raise ValueError(url)
         return web.TCPSite(runner, parsed.hostname, parsed.port)
     elif parsed.scheme == "unix":
         return web.UnixSite(runner, parsed.path)
@@ -200,6 +205,10 @@ class Cron:
                         ],
                     }
                 )
+            elif not job.enabled:
+                # disabled jobs never run on schedule; report that honestly
+                # instead of an inapplicable "scheduled (in N seconds)".
+                out.append({"job": name, "status": "disabled"})
             else:
                 crontab = job.schedule  # type: Union[CronTab, str]
                 now = get_now(job.timezone)
@@ -225,14 +234,14 @@ class Cron:
                     status = "running (pid: {pid})".format(
                         pid=", ".join(str(pid) for pid in jobstat["pid"])
                     )
+                elif jobstat["status"] == "disabled":
+                    status = "disabled"
                 else:
                     status = "scheduled ({})".format(
                         (
                             jobstat["scheduled_in"]
                             if isinstance(jobstat["scheduled_in"], str)
-                            else naturaltime(
-                                jobstat["scheduled_in"], future=True
-                            )
+                            else naturaltime(jobstat["scheduled_in"])
                         )
                     )
                 lines.append(
@@ -252,6 +261,13 @@ class Cron:
             job = self.cron_jobs[name]
         except KeyError as ex:
             raise web.HTTPNotFound() from ex
+        if not job.enabled:
+            # a disabled job behaves "as if it isn't there"; refuse to launch
+            # it manually rather than silently overriding the config.
+            raise web.HTTPConflict(
+                text="job {!r} is disabled".format(name),
+                headers=self.web_config.get("headers", None),
+            )
         await self.maybe_launch_job(job)
         return web.Response(headers=self.web_config.get("headers", None))
 
@@ -286,12 +302,16 @@ class Cron:
             await self.web_runner.setup()
             socket_mode = web_config.get("socketMode")
             for addr in web_config["listen"]:
-                site = web_site_from_url(self.web_runner, addr)
-                logger.info("web: started listening on %s", addr)
                 try:
+                    site = web_site_from_url(self.web_runner, addr)
                     await site.start()
-                except ValueError:
+                except (ValueError, OSError) as ex:
+                    # bad scheme/url (ValueError) or bind failure (OSError):
+                    # skip this address rather than aborting the whole config
+                    # update or reporting it as an internal bug.
+                    logger.warning("web: could not listen on %s: %s", addr, ex)
                     continue
+                logger.info("web: started listening on %s", addr)
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
@@ -301,14 +321,30 @@ class Cron:
         auth = web_config.get("authToken")
         if not auth:
             return None
+        # authToken is configured: resolve it from exactly one source and fail
+        # closed (ConfigError) if it cannot be resolved to a non-empty secret.
+        # Otherwise a misconfigured source (unset env var, empty/missing file)
+        # would silently leave the web API listening with no authentication.
         if auth.get("value"):
-            return str(auth["value"])
-        if auth.get("fromFile"):
-            with open(auth["fromFile"], "rt") as token_file:
-                return token_file.read().strip()
-        if auth.get("fromEnvVar"):
-            return os.environ.get(auth["fromEnvVar"])
-        return None
+            token = str(auth["value"])
+        elif auth.get("fromFile"):
+            try:
+                with open(auth["fromFile"], "rt") as token_file:
+                    token = token_file.read().strip()
+            except OSError as ex:
+                raise ConfigError(
+                    "web.authToken.fromFile could not be read: {}".format(ex)
+                ) from ex
+        elif auth.get("fromEnvVar"):
+            token = os.environ.get(auth["fromEnvVar"], "")
+        else:
+            token = ""
+        if not token:
+            raise ConfigError(
+                "web.authToken is configured but resolved to an empty token; "
+                "refusing to start the web API without authentication"
+            )
+        return token
 
     @staticmethod
     def _make_auth_middleware(token: str):
@@ -411,6 +447,9 @@ class Cron:
                 return
             elif job.concurrencyPolicy == "Replace":
                 for running_job in self.running_jobs[job.name]:
+                    # mark before cancelling so the reaper treats the forced
+                    # termination as a replacement, not a job failure.
+                    running_job.replaced = True
                     await running_job.cancel()
             else:
                 raise AssertionError  # pragma: no cover
@@ -454,31 +493,42 @@ class Cron:
                         task.result()
                     except Exception:  # pragma: no cover
                         logger.exception("please report this as a bug (2)")
-
-                    jobs_list = self.running_jobs[job.config.name]
-                    jobs_list.remove(job)
-                    if not jobs_list:
-                        del self.running_jobs[job.config.name]
-
-                    fail_reason = job.fail_reason
-                    logger.info(
-                        "Job %s exit code %s; has stdout: %s, "
-                        "has stderr: %s; fail_reason: %r",
-                        job.config.name,
-                        job.retcode,
-                        str(bool(job.stdout)).lower(),
-                        str(bool(job.stderr)).lower(),
-                        fail_reason,
-                    )
-                    if fail_reason is not None:
-                        await self.handle_job_failure(job)
-                    else:
-                        await self.handle_job_success(job)
+                    await self._handle_finished_job(job)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover
                 logger.exception("please report this as a bug (3)")
                 await asyncio.sleep(1)
+
+    async def _handle_finished_job(self, job: RunningJob) -> None:
+        jobs_list = self.running_jobs[job.config.name]
+        jobs_list.remove(job)
+        if not jobs_list:
+            del self.running_jobs[job.config.name]
+
+        if job.replaced:
+            # deliberately cancelled to make way for a newer instance
+            # (concurrencyPolicy=Replace); not a failure, so don't report it
+            # or trigger retries.
+            logger.info(
+                "Job %s was replaced by a newer instance", job.config.name
+            )
+            return
+
+        fail_reason = job.fail_reason
+        logger.info(
+            "Job %s exit code %s; has stdout: %s, "
+            "has stderr: %s; fail_reason: %r",
+            job.config.name,
+            job.retcode,
+            str(bool(job.stdout)).lower(),
+            str(bool(job.stderr)).lower(),
+            fail_reason,
+        )
+        if fail_reason is not None:
+            await self.handle_job_failure(job)
+        else:
+            await self.handle_job_success(job)
 
     async def handle_job_failure(self, job: RunningJob) -> None:
         if self._stop_event.is_set():

@@ -3,9 +3,43 @@ History
 =======
 
 yacron2 is a fork of `yacron <https://github.com/gjcarneiro/yacron>`_,
-continuing from yacron 0.19.  The 1.0.0 entry below documents the fork; the
+continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
+
+
+1.0.1 (2026-06-19)
+------------------
+
+**Security & behavior fixes**
+
+* The web API now fails closed when ``web.authToken`` is configured but
+  resolves to an empty token (an unset ``fromEnvVar``, or an empty/missing
+  ``fromFile``): yacron2 raises a ``ConfigError`` and refuses to start the
+  HTTP server, instead of silently serving the control API without
+  authentication.
+* The web API now honours ``enabled: false``. ``POST /jobs/<name>/start``
+  returns ``409 Conflict`` for a disabled job rather than launching it, and
+  ``GET /status`` reports such jobs as ``disabled`` instead of an
+  inapplicable ``scheduled (in N seconds)``.
+* Invalid ``web.listen`` URLs (an unsupported scheme, or an ``http`` url
+  missing host/port) are now logged as a warning and skipped, instead of being
+  surfaced as an internal "please report this as a bug" error; a bind failure
+  (``OSError``) on one address likewise no longer aborts the whole config
+  update. The "started listening" message is logged only after the bind
+  actually succeeds.
+* ``concurrencyPolicy: Replace`` no longer reports the replaced (cancelled)
+  job instance as a failure and no longer schedules retries for it; the forced
+  termination is treated as a replacement, not a job failure.
+
+**Cleanups**
+
+* Removed a dead Windows event-loop branch from ``main()`` (yacron2 is
+  POSIX-only because it imports ``grp``/``pwd`` at load time).
+* ``naturaltime`` no longer relies on an ``assert`` for control flow (which
+  would be stripped under ``python -O``).
+* The concurrency-policy test was rewritten to be deterministic (it was
+  previously an ``xfail`` that could never exercise a second job instance).
 
 
 1.0.0 (2026-06-19)
