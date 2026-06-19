@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import asyncio.subprocess
 import logging
 import os
 import signal
@@ -65,11 +64,9 @@ def main_loop(loop):
 
 
 def main():  # pragma: no cover
-    if sys.platform == "win32":
-        _loop = asyncio.ProactorEventLoop()
-        asyncio.set_event_loop(_loop)
-    else:
-        _loop = asyncio.new_event_loop()
+    # yacron2 is POSIX-only (config.py imports grp/pwd at module load), so
+    # there is no Windows event-loop branch to maintain here.
+    _loop = asyncio.new_event_loop()
     try:
         main_loop(_loop)
     finally:

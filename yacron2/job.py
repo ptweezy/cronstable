@@ -391,6 +391,10 @@ class RunningJob:
         self.env = None  # type: Optional[Dict[str, str]]
         # guards against _on_stop running twice (cancel() racing wait())
         self._stopped = False
+        # set by the scheduler when this run is deliberately cancelled to make
+        # way for a newer instance (concurrencyPolicy=Replace). Such a forced
+        # termination is not a job failure and must not be reported or retried.
+        self.replaced = False
 
         statsd_config = self.config.statsd
         if statsd_config is not None:
