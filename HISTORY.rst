@@ -6,21 +6,6 @@ yacron2 is a fork of `yacron <https://github.com/gjcarneiro/yacron>`_,
 continuing from yacron 0.19.  The entries below document the history of the
 original yacron project, on which yacron2 is based.
 
-Unreleased
-----------
-
-* Require Python >= 3.13 (drop 3.10-3.12); test on 3.13 and 3.14.
-* Migrate packaging to PEP 621 ``pyproject.toml`` (remove ``setup.py`` /
-  ``setup.cfg``, ``pytest-runner``, and ``setup_requires``).
-* Upgrade dependencies: sentry-sdk 1.x -> 2.x (use ``new_scope``),
-  aiosmtplib 1.x -> 5.x (positional ``login`` args), crontab 1.x,
-  aiohttp 3.14, strictyaml 1.7.
-* Replace the ``pytz`` dependency with the standard-library ``zoneinfo``
-  (plus ``tzdata`` for minimal images).
-* Modernize Docker images (``python:3.14-slim``; PyInstaller build on
-  Ubuntu 24.04 / Python 3.13 / PyInstaller 6.21) and the Kubernetes example
-  (``apps/v1`` Deployment).
-* Bump pre-commit hooks (ruff 0.15, bandit 1.9).
 
 0.19.0 (2023-03-11)
 -------------------
