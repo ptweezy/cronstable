@@ -5,7 +5,6 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
-
 ## 1.0.4 (2026-06-19)
 
 ### Reliability fixes
@@ -58,7 +57,6 @@ project, on which yacron2 is based.
   change.
 - Added a `.github/CODEOWNERS` file.
 
-
 ## 1.0.3 (2026-06-19)
 
 This is a tooling and documentation release; there are no changes to the
@@ -88,15 +86,11 @@ This is a tooling and documentation release; there are no changes to the
   `HISTORY.md`) and pointed the changelog generator, the `commit-msg` hook, and
   `CONTRIBUTING.md` at the Markdown changelog.
 
-
-## 1.0.2 (2026-06-19)
-
 ### Packaging
 
 - Promote the PyPI `Development Status` classifier from `4 - Beta` to
   `5 - Production/Stable` to reflect the stable 1.0 release series. No code
   changes.
-
 
 ## 1.0.1 (2026-06-19)
 
@@ -129,7 +123,6 @@ This is a tooling and documentation release; there are no changes to the
   would be stripped under `python -O`).
 - The concurrency-policy test was rewritten to be deterministic (it was
   previously an `xfail` that could never exercise a second job instance).
-
 
 ## 1.0.0 (2026-06-19)
 
@@ -311,7 +304,6 @@ This is a tooling and documentation release; there are no changes to the
 - README logging example fix adding `datefmt: '%Y-%m-%d %H:%M:%S'` to the
   custom-logging formatter — andreas-wittig, commit 931b186.
 
-
 ## 0.19.0 (2023-03-11)
 
 - Add ability to configure yacron's own logging (#81 #82 #83, gjcarneiro, bdamian)
@@ -329,31 +321,26 @@ This is a tooling and documentation release; there are no changes to the
 - Shell reporter: handle long lines truncatation (Hannes Hergeth)
 - exe: undo pyinstaller LD_LIBRARY_PATH changes in subprocesses (#68, Gustavo Carneiro)
 
-
 ## 0.16.0 (2021-12-05)
 
 - make the capture max line length configurable and change the default
   from 64K to 16M (#56)
 - Add config option to change prefix of subprocess stream lines (#58, eelkeh)
 
-
 ## 0.15.1 (2021-11-19)
 
 - Fix a bug in the --validate option (#57, Leonid Repin)
-
 
 ## 0.15.0 (2021-11-10)
 
 - Allow emails to be html formatted
 - Fix an error when reading cmd output with huge lines (#56)
 
-
 ## 0.14.0 (2021-10-04)
 
 - Sentry: increase the size of messages before getting truncated #54
 - Sentry: allow specifying the environment option #53
 - Minor fixes
-
 
 ## 0.13.1 (2021-08-10)
 
@@ -364,23 +351,19 @@ This is a tooling and documentation release; there are no changes to the
 - Add ability for one config file to include another one #38
 - Add shell command reporting ability (Hannes Hergeth, #50)
 
-
 ## 0.12.2 (2021-05-31)
 
 - constrain ruamel.yaml to version 0.17.4 or below, later versions are buggy
 
-
 ## 0.12.1 (2021-05-30)
 
 - blacklist ruamel.yaml version 0.17.5 in requirements #47
-
 
 ## 0.12.0 (2021-04-22)
 
 - web: don't crash when receiving a web request without Accept header (#45)
 - add env_file configuration option (Alessandro Romani, #43)
 - email: add missing Date header (#39)
-
 
 ## 0.11.2 (2020-11-29)
 
@@ -390,7 +373,6 @@ This is a tooling and documentation release; there are no changes to the
 
 - Fix email reporting when multiple recipients given
 
-
 ## 0.11.0 (2020-07-20)
 
 - reporting: add a failure reason line at the top of sentry/email (#36)
@@ -398,11 +380,9 @@ This is a tooling and documentation release; there are no changes to the
 - allow jobs to run as a different user (#18)
 - Support timezone schedule (#26)
 
-
 ## 0.10.1 (2020-06-02)
 
 - Minor bugfixes
-
 
 ## 0.10.0 (2019-11-03)
 
@@ -424,7 +404,6 @@ This is a tooling and documentation release; there are no changes to the
 - Added an option to just check if the yaml file is valid without running the scheduler.
 - Fix missing `body` in the schema for sentry config
 
-
 ## 0.8.1 (2018-10-16)
 
 - Fix a bug handling `@reboot` in schedule (#22)
@@ -433,13 +412,11 @@ This is a tooling and documentation release; there are no changes to the
 
 - Sentry: add new `extra` and `level` options.
 
-
 ## 0.7.0 (2018-03-21)
 
 - Added the `utc` option and document that times are utc by default (#17);
 - If an email body is empty, skip sending it;
 - Added docker and k8s example.
-
 
 ## 0.6.0 (2017-11-24)
 
