@@ -43,7 +43,7 @@ Installation
 Install using pip
 +++++++++++++++++
 
-yacron2 requires Python >= 3.10 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
+yacron2 requires Python >= 3.13 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
 virtual environment, for example:
 
 .. code-block:: shell
@@ -69,7 +69,7 @@ Install using binary
 
 Alternatively, a self-contained binary can be downloaded
 from github: https://github.com/ptweezy/yacron2/releases. This binary should
-work on any Linux 64-bit system post glibc 2.23 (e.g. Ubuntu:16.04).  Python is not required on the target system (it is embedded in the executable).
+work on any Linux 64-bit system post glibc 2.39 (e.g. Ubuntu:24.04).  Python is not required on the target system (it is embedded in the executable).
 
 Usage
 -----

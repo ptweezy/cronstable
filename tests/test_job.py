@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import aiosmtplib
 import pytest
+from sentry_sdk.utils import Dsn
 
 import yacron2.config
 import yacron2.job
@@ -377,9 +378,26 @@ async def test_report_sentry(  # noqa: C901
             self.args = args
             self.kwargs = kwargs
             self.messages_sent = []
+            # sentry-sdk 2.x reads transport.parsed_dsn off the client; the
+            # options dict is passed positionally as make_transport(options).
+            options = args[0] if args else kwargs.get("options", {})
+            dsn = options.get("dsn")
+            self.parsed_dsn = Dsn(dsn) if dsn else None
+
+        # sentry-sdk 2.x delivers events as envelopes, not bare events.
+        def capture_envelope(self, envelope):
+            event = envelope.get_event()
+            if event is not None:
+                self.messages_sent.append(event)
 
         def capture_event(self, event_opt):
             self.messages_sent.append(event_opt)
+
+        def record_lost_event(self, *args, **kwargs):
+            pass
+
+        def is_healthy(self):
+            return True
 
         def kill(self):
             pass
