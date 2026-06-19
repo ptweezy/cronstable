@@ -232,7 +232,7 @@ async def test_report_mail(success, stdout, stderr, subject, body):
             "hostname": "smtp1",
             "port": 1025,
             "use_tls": False,
-            "validate_certs": False,
+            "validate_certs": True,
         },
     )
     assert len(connect_calls) == 1

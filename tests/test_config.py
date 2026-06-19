@@ -118,7 +118,7 @@ jobs:
                     },
                     "tls": False,
                     "starttls": False,
-                    "validate_certs": False,
+                    "validate_certs": True,
                     "html": False,
                 },
                 "sentry": (
@@ -192,7 +192,7 @@ jobs:
                     },
                     "tls": False,
                     "starttls": False,
-                    "validate_certs": False,
+                    "validate_certs": True,
                     "html": False,
                 },
                 "sentry": (
@@ -356,3 +356,168 @@ logging:
         "loggers": "four",
         "root": "five",
     }
+
+
+def test_mergedicts_environment_dedup():
+    # when both defaults and a job define `environment`, the job's value must
+    # override the default for the same key instead of producing a duplicate.
+    merged = dict(
+        config.mergedicts(
+            {"environment": [{"key": "FOO", "value": "default"}]},
+            {"environment": [{"key": "FOO", "value": "job"}]},
+        )
+    )
+    assert merged["environment"] == [{"key": "FOO", "value": "job"}]
+
+
+def test_defaults_environment_merge_with_job():
+    conf = config.parse_config_string(
+        """
+defaults:
+  environment:
+    - key: SHARED
+      value: from-default
+    - key: ONLY_DEFAULT
+      value: d
+
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    environment:
+      - key: SHARED
+        value: from-job
+      - key: ONLY_JOB
+        value: j
+""",
+        "",
+    )
+    env = {e["key"]: e["value"] for e in conf.jobs[0].environment}
+    assert env == {
+        "SHARED": "from-job",  # job overrides default, no duplicate
+        "ONLY_DEFAULT": "d",
+        "ONLY_JOB": "j",
+    }
+
+
+def test_report_defaults_not_aliased():
+    # onFailure/onPermanentFailure/onSuccess report blocks must be independent
+    # objects so mutating one cannot corrupt the others (or the global default).
+    conf = config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+""",
+        "",
+    )
+    job = conf.jobs[0]
+    assert (
+        job.onFailure["report"]["sentry"]["fingerprint"]
+        is not job.onSuccess["report"]["sentry"]["fingerprint"]
+    )
+
+
+def test_parse_config_empty_dir(tmp_path):
+    # an existing but empty config directory must yield an empty config,
+    # not crash with UnboundLocalError.
+    conf = config.parse_config(str(tmp_path))
+    assert conf.jobs == []
+    assert conf.web_config is None
+    assert conf.logging_config is None
+
+
+def test_parse_config_dir_aggregates(tmp_path):
+    (tmp_path / "10-jobs.yaml").write_text(
+        """
+jobs:
+  - name: job-a
+    command: foo
+    schedule: "* * * * *"
+"""
+    )
+    (tmp_path / "20-web.yaml").write_text(
+        """
+web:
+  listen:
+    - http://127.0.0.1:8080
+"""
+    )
+    (tmp_path / "30-logging.yaml").write_text(
+        """
+logging:
+  version: 1
+"""
+    )
+    # underscore-prefixed files are ignored
+    (tmp_path / "_ignored.yaml").write_text(
+        """
+jobs:
+  - name: ignored
+    command: foo
+    schedule: "* * * * *"
+"""
+    )
+    conf = config.parse_config(str(tmp_path))
+    assert [j.name for j in conf.jobs] == ["job-a"]
+    # web config from one file is not dropped in favour of the last file
+    assert conf.web_config == {"listen": ["http://127.0.0.1:8080"]}
+    # logging config from a different file is aggregated, not lost
+    assert conf.logging_config == {"version": 1}
+
+
+def test_parse_config_dir_multiple_web(tmp_path):
+    (tmp_path / "a.yaml").write_text(
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+    )
+    (tmp_path / "b.yaml").write_text(
+        "web:\n  listen:\n    - http://127.0.0.1:8081\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config(str(tmp_path))
+    assert "Multiple 'web'" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("saveLimit", -1, "saveLimit"),
+        ("maxLineLength", 0, "maxLineLength"),
+        ("killTimeout", -5, "killTimeout"),
+        ("executionTimeout", -1, "executionTimeout"),
+    ],
+)
+def test_invalid_numeric_ranges(field, value, message):
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            f"""
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    {field}: {value}
+""",
+            "",
+        )
+    assert message in str(exc.value)
+
+
+def test_invalid_retry_backoff():
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            """
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 1
+        maximumDelay: 10
+        backoffMultiplier: 0
+""",
+            "",
+        )
+    assert "backoffMultiplier" in str(exc.value)
