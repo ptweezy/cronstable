@@ -100,14 +100,6 @@ Because no file is committed back to the repo, a release never re-triggers the
 workflow. Because the tag is created *after* publishing, a failed publish leaves
 no orphan tag and a re-run cleanly retries the same version.
 
-### Important: releases are irreversible
-
-- Every release marker that lands on `main` **publishes to PyPI**. There is no
-  staging step — treat a marked commit as "ship it."
-- **PyPI versions are immutable.** A version, once uploaded, can never be
-  re-uploaded, even after it is deleted or yanked. Pick the bump level
-  deliberately.
-
 ## Container image
 
 The official image is built and published by the
@@ -131,19 +123,3 @@ Build it locally the same way CI does (the version is read from git, or pass
 docker build -t yacron2 .
 docker run --rm -v "$PWD/example/docker/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" yacron2
 ```
-
-> The first GHCR push creates the package as **private**. In the repository's
-> *Packages* settings, mark it public and link it to this repo so the image is
-> discoverable and `docker pull` works without authentication.
-
-### Publishing to Docker Hub (optional)
-
-GHCR needs no setup — it authenticates with the built-in `GITHUB_TOKEN`. To
-*also* publish to Docker Hub, add two repository secrets and the workflow picks
-them up automatically (no code change needed):
-
-- `DOCKERHUB_USERNAME` — your Docker Hub account / namespace
-- `DOCKERHUB_TOKEN` — a Docker Hub access token with read/write scope
-
-The image is then pushed to `docker.io/<DOCKERHUB_USERNAME>/yacron2` alongside
-GHCR.
