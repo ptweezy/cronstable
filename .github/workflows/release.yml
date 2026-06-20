@@ -251,11 +251,34 @@ jobs:
           pattern: yacron2-linux-*
           merge-multiple: true
 
+      - name: Build release notes from HISTORY.md
+        env:
+          NEW: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          # Pull this version's section out of HISTORY.md (everything between its
+          # "## X.Y.Z (...)" header and the next "## " header), dropping leading
+          # blank lines. Empty if there is no matching section.
+          awk -v ver="$NEW" '
+            index($0, "## " ver " ") == 1 { cap = 1; next }
+            cap && /^## / { exit }
+            cap { print }
+          ' HISTORY.md | sed '/./,$!d' > release-notes.md
+          if [ -s release-notes.md ]; then
+            echo "::notice::Using HISTORY.md notes for $NEW."
+          else
+            echo "::warning::No HISTORY.md section for $NEW; release notes will be auto-generated only."
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.version.outputs.new }}
           name: ${{ needs.version.outputs.new }}
+          # The curated HISTORY.md section becomes the body; with
+          # generate_release_notes it is prepended above GitHub's auto-generated
+          # "What's Changed" / Full Changelog compare link.
+          body_path: release-notes.md
           generate_release_notes: true
           files: |
             dist/*.whl
