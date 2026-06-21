@@ -30,6 +30,8 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
     [Production container deployment](#production-container-deployment))
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status and start jobs on demand
+* Optional built-in web dashboard to watch each job's latest status, tail its
+  live logs, and run it on demand
 * Arbitrary timezone support
 
 ## Installation
@@ -767,6 +769,41 @@ web:
      - unix:///tmp/yacron2.sock
 ```
 
+#### Web dashboard
+
+With the web interface enabled, yacron2 also serves a small browser dashboard
+at the root path (`/`) of any `http://` listener — open
+<http://127.0.0.1:8080/> in the example above. It is a single self-contained
+page (no build step, no external assets, no internet access required) that lets
+you:
+
+* see each job's **latest status** at a glance — whether it is running,
+  scheduled (with a live countdown to its next run), disabled, or how its last
+  run finished (success / failure, exit code, when, and how long it took);
+* **tail each job's logs live** as it runs (and replay the most recent run's
+  captured output afterwards). Logs are shown for the streams a job captures, so
+  enable `captureStdout` / `captureStderr` on jobs whose output you want to
+  watch here;
+* **run any job on demand** with one click.
+
+The run history and logs are kept **in memory only** — nothing is written to
+disk, so the dashboard does not change yacron2's read-only-filesystem
+deployment story. History resets when yacron2 restarts.
+
+If you have enabled bearer-token authentication for the web API (the
+`web.authToken` option), the dashboard page itself loads without a token, then
+prompts you for one and stores it only in that browser tab; every data request
+it makes is authenticated with that token.
+
+To disable the dashboard and expose only the REST API, set `ui: false`:
+
+```yaml
+web:
+  listen:
+     - http://127.0.0.1:8080
+  ui: false
+```
+
 Now you have the following options to control it (using HTTPie as example):
 
 #### Get the version of yacron2
@@ -838,6 +875,57 @@ Content-Length: 0
 Content-Type: application/octet-stream
 Date: Sun, 03 Nov 2019 19:50:20 GMT
 Server: Python/3.7 aiohttp/3.6.2
+```
+
+#### Get detailed job info (used by the dashboard)
+
+`GET /jobs` returns a JSON array describing every job — its schedule, whether
+it is enabled/running, the time until its next scheduled run, and a summary of
+its most recent finished run (outcome, exit code, start/finish times and
+duration). This is what the web dashboard polls.
+
+```shell
+$ http get http://127.0.0.1:8080/jobs
+[
+    {
+        "name": "test-01",
+        "enabled": true,
+        "schedule": "*/5 * * * *",
+        "command": "echo foobar",
+        "captureStdout": true,
+        "captureStderr": true,
+        "running": false,
+        "pids": [],
+        "scheduled_in": 42.1,
+        "last_run": {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        }
+    }
+]
+```
+
+#### Tail a job's logs
+
+`GET /jobs/{name}/logs` is a
+[Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+stream of a job's captured output: the most recent buffered lines first, then
+new lines live as a running job produces them, and finally an `end` event when
+the run finishes. Each line arrives as an `event: line` whose `data` is a JSON
+object `{"stream": "stdout"|"stderr", "line": "..."}`. Only output from the
+streams a job captures (`captureStdout` / `captureStderr`) is available here.
+
+```shell
+$ curl -N http://127.0.0.1:8080/jobs/test-01/logs
+event: line
+data: {"stream": "stdout", "line": "foobar"}
+
+event: end
+data: {}
 ```
 
 ### Includes

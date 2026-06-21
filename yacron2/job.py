@@ -11,7 +11,7 @@ from email.message import EmailMessage
 from email.utils import format_datetime
 from functools import lru_cache
 from socket import gethostname
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import aiosmtplib
 import jinja2
@@ -43,6 +43,63 @@ def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
             env[env_var] = env.get(f"{env_var}_ORIG", "")
 
 
+# How many of the most recent output lines a JobOutputStream retains for the
+# live web log tail. Independent of saveLimit (which bounds the text kept for
+# failure reports); this only bounds the in-memory buffer the UI streams from.
+LIVE_LOG_LIMIT = 1000
+
+
+class JobOutputStream:
+    """In-memory, broadcastable view of a job run's captured output.
+
+    Lines are appended as the job produces them (see ``StreamReader``) and
+    pushed to any live subscribers — the web UI's log tail. A bounded ring
+    buffer of the most recent lines is retained so a viewer that connects
+    mid-run, or just after the run finished, still sees recent context.
+
+    Nothing is ever written to disk: this lives only for as long as the run's
+    record is kept in memory, preserving yacron2's read-only-filesystem
+    deployment story.
+    """
+
+    def __init__(self, limit: int = LIVE_LOG_LIMIT) -> None:
+        # each item is (stream_name, line) with stream_name "stdout"/"stderr"
+        self.lines: Deque[Tuple[str, str]] = deque(maxlen=limit)
+        self._subscribers: List["asyncio.Queue"] = []
+        self.closed = False
+
+    def publish(self, stream_name: str, line: str) -> None:
+        item = (stream_name, line)
+        self.lines.append(item)
+        for queue in self._subscribers:
+            queue.put_nowait(item)
+
+    def subscribe(self) -> "asyncio.Queue":
+        queue: asyncio.Queue = asyncio.Queue()
+        self._subscribers.append(queue)
+        if self.closed:
+            # the run already finished: deliver the end sentinel immediately so
+            # a late subscriber's read loop terminates after the buffered
+            # snapshot instead of blocking on a stream that will never produce
+            # another line.
+            queue.put_nowait(None)
+        return queue
+
+    def unsubscribe(self, queue: "asyncio.Queue") -> None:
+        try:
+            self._subscribers.remove(queue)
+        except ValueError:
+            pass
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        # None is the end-of-stream sentinel for subscriber read loops.
+        for queue in self._subscribers:
+            queue.put_nowait(None)
+
+
 class StreamReader:
     def __init__(
         self,
@@ -51,6 +108,7 @@ class StreamReader:
         stream: asyncio.StreamReader,
         stream_prefix: str,
         save_limit: int,
+        on_line: Optional[Callable[[str, str], None]] = None,
     ) -> None:
         self.save_top: List[str] = []
         self.save_bottom: Deque[str] = deque()
@@ -58,6 +116,9 @@ class StreamReader:
         self.save_limit = save_limit
         self.stream_name = stream_name
         self.stream_prefix = stream_prefix
+        # called with (stream_name, line) for each line read, so a live viewer
+        # (the web UI) can tail output as the job produces it.
+        self.on_line = on_line
         self._reader = asyncio.create_task(self._read(stream))
         self.discarded_lines = 0
 
@@ -92,6 +153,8 @@ class StreamReader:
                 continue
             if not line:
                 return
+            if self.on_line is not None:
+                self.on_line(self.stream_name, line)
             out_line = prefix + line
             if self.stream_name == "stdout":
                 self._emit(sys.stdout, out_line)
@@ -397,6 +460,11 @@ class RunningJob:
         self.config = config
         self.proc = None  # type: Optional[asyncio.subprocess.Process]
         self.retcode = None  # type: Optional[int]
+        # wall-clock instant this run started, for the web UI's run history;
+        # set in start() so even a failed launch carries a timestamp.
+        self.started_at = None  # type: Optional[datetime]
+        # live, broadcastable view of this run's captured output (web UI tail)
+        self.output = JobOutputStream()
         self._stderr_reader = None  # type: Optional[StreamReader]
         self._stdout_reader = None  # type: Optional[StreamReader]
         self.stderr = None  # type: Optional[str]
@@ -463,6 +531,7 @@ class RunningJob:
     async def start(self) -> None:
         if self.proc is not None:
             raise RuntimeError("process already running")
+        self.started_at = datetime.now(timezone.utc)
         kwargs = {}  # type: Dict[str, Any]
         if isinstance(self.config.command, list):
             create = asyncio.create_subprocess_exec  # type: Any
@@ -525,6 +594,7 @@ class RunningJob:
                 self.proc.stderr,
                 self.config.streamPrefix,
                 self.config.saveLimit,
+                on_line=self.output.publish,
             )
         if self.config.captureStdout:
             assert self.proc.stdout is not None
@@ -534,6 +604,7 @@ class RunningJob:
                 self.proc.stdout,
                 self.config.streamPrefix,
                 self.config.saveLimit,
+                on_line=self.output.publish,
             )
 
     def _demote(self):
@@ -613,6 +684,9 @@ class RunningJob:
                 self.stdout,
                 self.stdout_discarded,
             ) = await self._stdout_reader.join()
+        # signal end-of-output to any live web log subscribers; their read
+        # loops terminate on the sentinel this delivers.
+        self.output.close()
 
     @property
     def failed(self) -> bool:
