@@ -109,6 +109,69 @@ jobs:
     assert out == "one line\nanother line\n"
 
 
+@pytest.mark.asyncio
+async def test_job_output_stream_subscribe_then_publish():
+    out = yacron2.job.JobOutputStream()
+    queue = out.subscribe()
+    out.publish("stdout", "hello\n")
+    out.publish("stderr", "oops\n")
+    assert queue.get_nowait() == ("stdout", "hello\n")
+    assert queue.get_nowait() == ("stderr", "oops\n")
+    # the ring buffer retains lines for late viewers
+    assert list(out.lines) == [("stdout", "hello\n"), ("stderr", "oops\n")]
+
+
+@pytest.mark.asyncio
+async def test_job_output_stream_close_delivers_sentinel():
+    out = yacron2.job.JobOutputStream()
+    queue = out.subscribe()
+    out.publish("stdout", "line\n")
+    out.close()
+    assert queue.get_nowait() == ("stdout", "line\n")
+    assert queue.get_nowait() is None  # end-of-stream sentinel
+
+
+@pytest.mark.asyncio
+async def test_job_output_stream_late_subscriber_gets_sentinel():
+    # subscribing after the run finished must not block forever: the new
+    # subscriber receives the end sentinel immediately, after the buffer.
+    out = yacron2.job.JobOutputStream()
+    out.publish("stdout", "done\n")
+    out.close()
+    queue = out.subscribe()
+    assert queue.get_nowait() is None
+    assert list(out.lines) == [("stdout", "done\n")]
+
+
+@pytest.mark.asyncio
+async def test_job_output_stream_ring_buffer_bounds():
+    out = yacron2.job.JobOutputStream(limit=3)
+    for i in range(5):
+        out.publish("stdout", f"line {i}\n")
+    # only the most recent `limit` lines are retained
+    assert list(out.lines) == [
+        ("stdout", "line 2\n"),
+        ("stdout", "line 3\n"),
+        ("stdout", "line 4\n"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_publishes_to_output():
+    # the on_line hook wires StreamReader output into a JobOutputStream so the
+    # web UI can tail lines live as the job produces them.
+    out = yacron2.job.JobOutputStream()
+    fake_stream = asyncio.StreamReader()
+    reader = yacron2.job.StreamReader(
+        "cronjob-1", "stdout", fake_stream, "", 100, on_line=out.publish
+    )
+    fake_stream.feed_data(b"first\n")
+    fake_stream.feed_data(b"second\n")
+    fake_stream.feed_eof()
+    await reader.join()
+    assert list(out.lines) == [("stdout", "first\n"), ("stdout", "second\n")]
+
+
 A_JOB = """
 jobs:
   - name: test
