@@ -5,7 +5,7 @@ importantly, how releases are cut.
 
 ## Development setup
 
-yacron2 targets **Python 3.13+** (3.13 and 3.14 are tested).
+yacron2 targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested).
 
 ```sh
 git clone https://github.com/ptweezy/yacron2
@@ -23,7 +23,7 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 Everything CI runs is driven by `tox`:
 
 ```sh
-tox            # all envs: py313, py314, lint, mypy
+tox            # all envs: py310, py311, py312, py313, py314, lint, mypy
 tox -e lint    # ruff check + ruff format --check
 tox -e mypy    # mypy
 tox -e py      # pytest on the current interpreter
@@ -84,7 +84,7 @@ On a release the workflow, in order:
 1. **decides** whether to release and at what level (the strict marker check);
 2. **computes** the next version from the latest `X.Y.Z` tag (refusing if that
    tag already exists);
-3. **gates** on `tox` (py313, py314, lint, mypy) — a red build means no release;
+3. **gates** on `tox` (py310, py311, py312, py313, py314, lint, mypy) — a red build means no release;
 4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
    for Linux (`amd64` + `arm64`, glibc and musl) and macOS (`arm64` + `amd64`),
    each on a native runner, smoke-tested with `--version` — all at the computed
