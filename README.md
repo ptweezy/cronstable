@@ -2,8 +2,16 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/yacron2.svg)](https://pypi.org/project/yacron2/)
 [![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg)](https://pypi.org/project/yacron2/)
+[![PyPI status](https://img.shields.io/pypi/status/yacron2.svg)](https://pypi.org/project/yacron2/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/yacron2.svg)](https://pypi.org/project/yacron2/)
+[![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github)](https://github.com/ptweezy/yacron2/releases/latest)
+[![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads)](https://github.com/ptweezy/yacron2/releases)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-informational)](https://github.com/ptweezy/yacron2/releases/latest)
 [![CI](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml/badge.svg)](https://github.com/ptweezy/yacron2/actions/workflows/tox.yml)
 [![Container image](https://img.shields.io/badge/ghcr.io-ptweezy%2Fyacron2-2496ed?logo=docker&logoColor=white)](https://github.com/ptweezy/yacron2/pkgs/container/yacron2)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
+[![pre-commit](https://img.shields.io/badge/pre--commit-enabled-brightgreen?logo=pre-commit&logoColor=white)](https://github.com/pre-commit/pre-commit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A modern, container-friendly cron replacement.
@@ -71,24 +79,32 @@ pipx install yacron2
 
 Alternatively, a self-contained binary can be downloaded
 from github: <https://github.com/ptweezy/yacron2/releases>. Every release
-automatically attaches a binary for both architectures in two libc flavors:
+automatically attaches binaries for Linux and macOS, on both amd64 and arm64:
 
-* `yacron2-linux-amd64` / `yacron2-linux-arm64` — glibc builds for the
-  mainstream distros. They work on any Linux system post glibc 2.39 (e.g.
-  Ubuntu 24.04) on the matching CPU.
-* `yacron2-linux-amd64-musl` / `yacron2-linux-arm64-musl` — musl builds for
-  Alpine and other musl-based systems.
+* **Linux** — `yacron2-linux-amd64` / `yacron2-linux-arm64` are glibc builds
+  for the mainstream distros. They work on any Linux system post glibc 2.39
+  (e.g. Ubuntu 24.04) on the matching CPU. `yacron2-linux-amd64-musl` /
+  `yacron2-linux-arm64-musl` are musl builds for Alpine and other musl-based
+  systems.
+* **macOS** — `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
+  (Intel).
 
 Python is not required on the target system (it is embedded in the executable):
 
 ```shell
-# pick the asset for your architecture and libc (glibc amd64 shown;
-# append -musl on Alpine)
+# pick the asset for your OS and architecture (glibc amd64 Linux shown; append
+# -musl on Alpine, or use yacron2-macos-<arch> on a Mac)
 curl -fsSL -o yacron2 \
   https://github.com/ptweezy/yacron2/releases/latest/download/yacron2-linux-amd64
 chmod +x yacron2
 ./yacron2 --version
 ```
+
+The macOS binaries are Developer ID code-signed and notarized by Apple, so
+Gatekeeper accepts them and they run without any extra steps. (Older releases
+were unsigned; if you hit a "cannot be checked for malicious software" prompt on
+one of those, clear the quarantine attribute once with
+`xattr -d com.apple.quarantine ./yacron2-macos-arm64` and it runs normally.)
 
 The standalone binary is a self-extracting executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared
