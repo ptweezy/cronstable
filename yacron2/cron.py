@@ -44,9 +44,10 @@ JOBS_INLINE_HISTORY = 20
 # browser then authenticates every data request with the token the user enters.
 WEB_PUBLIC_PATHS = frozenset({"/"})
 
-# Defence-in-depth security headers for the dashboard HTML document. The page is
-# fully self-contained (one inline <script>, inline styles, no external assets)
-# and only ever talks to its own origin, so this CSP is deliberately strict:
+# Defence-in-depth security headers for the dashboard HTML document. The
+# page is fully self-contained (one inline <script>, inline styles, no
+# external assets) and only ever talks to its own origin, so this CSP is
+# deliberately strict:
 #   - 'unsafe-inline' for script/style is unavoidable (everything is inlined),
 #     but connect-src 'self' confines any hypothetical injected script to this
 #     origin — it cannot exfiltrate to an attacker's server;
