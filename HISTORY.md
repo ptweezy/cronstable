@@ -5,6 +5,14 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.11 (2026-06-20)
+
+- The macOS binaries are now Developer ID code-signed and notarized by
+  Apple, so Gatekeeper accepts them and they run without first clearing
+  the quarantine attribute (`xattr -d com.apple.quarantine` is no longer
+  needed).
+
+
 ## 1.0.10 (2026-06-20)
 
 - Release binaries now include macOS builds for both Apple Silicon
