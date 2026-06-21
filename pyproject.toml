@@ -90,7 +90,10 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["yacron2"]
+packages = ["yacron2", "yacron2.web"]
+
+[tool.setuptools.package-data]
+"yacron2.web" = ["*.html"]
 
 [tool.setuptools_scm]
 version_file = "yacron2/version.py"

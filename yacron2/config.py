@@ -264,6 +264,8 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 ),
                 # octal permissions to apply to a unix:// listen socket
                 Opt("socketMode"): Str(),
+                # serve the browser dashboard at "/" (default true)
+                Opt("ui"): Bool(),
             }
         ),
         Opt("include"): Seq(Str()),

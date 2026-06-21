@@ -1,13 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files
+
 block_cipher = None
+
+# bundle the single-page web UI (yacron2/web/index.html) so the binary serves
+# it without needing any files on disk
+datas = collect_data_files("yacron2")
 
 
 a = Analysis(
     ["yacron2"],
     pathex=["."],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],
