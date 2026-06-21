@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "yacron2"
 description = "A modern, container-friendly cron replacement."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "P", email = "ptweezy@runforyour.money" }]
@@ -52,6 +52,9 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "Natural Language :: English",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Environment :: Console",
@@ -94,10 +97,10 @@ version_file = "yacron2/version.py"
 
 [tool.black]
 line-length = 79
-target_version = ['py313']
+target_version = ['py310', 'py311', 'py312', 'py313']
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py310"
 line-length = 79
 
 [tool.ruff.lint]
@@ -122,6 +125,10 @@ select = [
 max-complexity = 20
 
 [tool.mypy]
+# Type-check against the lowest supported interpreter so a 3.11+/3.12+-only
+# stdlib API (e.g. datetime.UTC, asyncio.timeout) is flagged here instead of
+# only blowing up at runtime on a 3.10/3.11 host.
+python_version = "3.10"
 no_implicit_optional = true
 warn_no_return = true
 warn_return_any = true
