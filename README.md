@@ -97,7 +97,7 @@ chmod +x yacron2
 ./yacron2 --version
 ```
 
-The macOS binaries are Developer ID code-signed and notarized by Apple.
+The macOS binaries are signed and notarized by Apple.
 
 The standalone binary is a self-extracting executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared
