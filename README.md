@@ -30,7 +30,9 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
     dropped — no writable paths or elevated privileges required (see
     [Production container deployment](#production-container-deployment))
 * Option to automatically retry failing cron jobs, with exponential backoff
-* Optional HTTP REST API, to fetch status and start jobs on demand
+* Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
+  read per-job run history on demand
+* Optional built-in web dashboard to watch each job's latest status, tail its live logs, run or cancel it on demand, and review its recent run history, success rate, and schedule.
 * Arbitrary timezone support
 
 ## Installation
@@ -775,6 +777,51 @@ web:
      - unix:///tmp/yacron2.sock
 ```
 
+#### Web dashboard
+
+With the web interface enabled, yacron2 also serves a browser dashboard at the
+root path (`/`) of any `http://` listener — open <http://127.0.0.1:8080/> in the
+example above. It is a single self-contained page that lets you:
+
+* see each job's **latest status** at a glance — whether it is running,
+  scheduled (with a live countdown to its next run), disabled, cancelled, or how
+  its last run finished (success / failure, exit code, when, and how long it
+  took), with a small **trend sparkline** of its recent runs;
+* **tail each job's logs live** as it runs (and replay the most recent run's
+  captured output afterwards), with in-log **search/grep**, ANSI-colour
+  rendering, optional per-line timestamps, line-wrap toggle, and a download
+  button. Logs are shown for the streams a job captures, so enable
+  `captureStdout` / `captureStderr` on jobs whose output you want to watch here;
+* **run any job on demand**, or **cancel** a running job, with one click;
+* review each job's **run history and statistics** — recent outcomes, success
+  rate, and average / min / max duration;
+* read a plain-English description of each job's **schedule** and a preview of
+  its next few run times.
+
+It is keyboard-first: press `?` for the shortcut list, `Ctrl-K` (or `⌘K`) for a
+command palette, and `/` to filter. Three themes (amber / green CRT, or a flat
+"modern" theme), a compact density mode, optional desktop failure notifications,
+and the polling interval are all configurable from the settings panel and
+remembered in the browser; CRT effects honour `prefers-reduced-motion`.
+
+The run history and logs are kept **in memory only** — nothing is written to
+disk, so the dashboard does not change yacron2's read-only-filesystem
+deployment story. History resets when yacron2 restarts.
+
+If you have enabled bearer-token authentication for the web API (the
+`web.authToken` option), the dashboard page itself loads without a token, then
+prompts you for one and stores it only in that browser tab; every data request
+it makes is authenticated with that token.
+
+To disable the dashboard and expose only the REST API, set `ui: false`:
+
+```yaml
+web:
+  listen:
+     - http://127.0.0.1:8080
+  ui: false
+```
+
 Now you have the following options to control it (using HTTPie as example):
 
 #### Get the version of yacron2
@@ -846,6 +893,115 @@ Content-Length: 0
 Content-Type: application/octet-stream
 Date: Sun, 03 Nov 2019 19:50:20 GMT
 Server: Python/3.7 aiohttp/3.6.2
+```
+
+#### Cancel a running job
+
+`POST /jobs/{name}/cancel` terminates any currently-running instances of a job
+(the same graceful SIGTERM-then-SIGKILL sequence, honouring the job's
+`killTimeout`, that yacron2 uses elsewhere). A job cancelled this way is recorded
+in its history with the outcome `cancelled`; unlike a failure it is **not**
+reported and does **not** trigger retries. It returns `409 Conflict` if the job
+is not currently running, and `404 Not Found` for an unknown job.
+
+```shell
+$ http post http://127.0.0.1:8080/jobs/test-03/cancel
+HTTP/1.1 200 OK
+```
+
+#### Get detailed job info (used by the dashboard)
+
+`GET /jobs` returns a JSON array describing every job — its schedule and
+timezone, whether it is enabled/running, the time until its next scheduled run, a
+summary of its most recent finished run (outcome, exit code, start/finish times
+and duration), and a compact `history` of recent outcomes for the trend
+sparkline. This is what the web dashboard polls.
+
+```shell
+$ http get http://127.0.0.1:8080/jobs
+[
+    {
+        "name": "test-01",
+        "enabled": true,
+        "schedule": "*/5 * * * *",
+        "command": "echo foobar",
+        "captureStdout": true,
+        "captureStderr": true,
+        "utc": true,
+        "timezone": "UTC",
+        "running": false,
+        "pids": [],
+        "scheduled_in": 42.1,
+        "last_run": {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        },
+        "history": [
+            {"outcome": "success", "duration": 0.98},
+            {"outcome": "failure", "duration": 1.21},
+            {"outcome": "success", "duration": 1.02}
+        ]
+    }
+]
+```
+
+#### Get a job's run history
+
+`GET /jobs/{name}/runs` returns the job's retained run history (oldest first,
+bounded and in memory only) together with aggregate statistics. Each run carries
+the same fields as `last_run` above; `stats` summarises them. The `success_rate`
+is computed over runs that ran to completion (cancellations are excluded).
+Returns `404 Not Found` for an unknown job.
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01/runs
+{
+    "name": "test-01",
+    "runs": [
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        }
+    ],
+    "stats": {
+        "total": 1,
+        "success": 1,
+        "failure": 0,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "avg_duration": 1.02,
+        "min_duration": 1.02,
+        "max_duration": 1.02,
+        "last_duration": 1.02
+    }
+}
+```
+
+#### Tail a job's logs
+
+`GET /jobs/{name}/logs` is a
+[Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+stream of a job's captured output: the most recent buffered lines first, then
+new lines live as a running job produces them, and finally an `end` event when
+the run finishes. Each line arrives as an `event: line` whose `data` is a JSON
+object `{"stream": "stdout"|"stderr", "line": "..."}`. Only output from the
+streams a job captures (`captureStdout` / `captureStderr`) is available here.
+
+```shell
+$ curl -N http://127.0.0.1:8080/jobs/test-01/logs
+event: line
+data: {"stream": "stdout", "line": "foobar"}
+
+event: end
+data: {}
 ```
 
 ### Includes
