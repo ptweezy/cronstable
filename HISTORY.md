@@ -5,6 +5,23 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.13 (2026-06-20)
+
+### Improvements
+
+- Update the bundled Python runtime in the standalone binaries to
+  `3.13.14` (from `3.13.5`), picking up the latest upstream bug and
+  security fixes.
+- Expand the PyPI package metadata with additional keywords, trove
+  classifiers, and project links (`Documentation`, `Source`,
+  `Changelog`, `Issues`, and `Container`) for easier discovery.
+
+### Documentation
+
+- Tidy up `README.md`, trimming redundant badges and condensing the
+  macOS code-signing notes.
+
+
 ## 1.0.12 (2026-06-20)
 
 - Update the GitHub Actions used to build and publish Docker images
