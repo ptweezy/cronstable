@@ -3,17 +3,17 @@
 <!--
   Hardened-runtime entitlements for the notarized macOS binary.
 
-  Apple requires the hardened runtime (codesign --options runtime) for
-  notarization, but a PyInstaller one-file binary unpacks its embedded Python
-  runtime to a temp dir and loads/executes those .so/.dylib files at startup.
-  Under the default hardened runtime that is blocked, so the binary would pass
-  notarization yet crash on launch. These three entitlements re-permit it:
+  Apple requires the hardened runtime for notarization, but a PyInstaller
+  one-file binary unpacks its embedded Python runtime to a temp dir and then
+  loads and executes those .so/.dylib files at startup. Under the default
+  hardened runtime that is blocked, so the binary would pass notarization yet
+  crash on launch. These three entitlements re-permit it:
 
-    * allow-unsigned-executable-memory / allow-jit -- CPython's interpreter
-      writes and executes memory the runtime would otherwise refuse.
-    * disable-library-validation -- the freshly unpacked shared libraries are
-      not signed by our Team ID, so library validation must be relaxed to load
-      them.
+    allow-unsigned-executable-memory and allow-jit let CPython write and then
+    execute memory the runtime would otherwise refuse.
+
+    disable-library-validation lets the freshly unpacked shared libraries load
+    even though they are not signed by our Team ID.
 
   Keep this list minimal: each entry widens the runtime, so do not add others
   without a demonstrated need.
