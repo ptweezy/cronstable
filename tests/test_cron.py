@@ -8,7 +8,7 @@ import pytest
 
 import yacron2.cron
 from yacron2.config import ConfigError, JobConfig
-from yacron2.job import RunningJob
+from yacron2.job import JobOutputStream, RunningJob
 
 
 @pytest.fixture(autouse=True)
@@ -338,12 +338,15 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
         retcode=-15,
         stdout=None,
         stderr=None,
+        started_at=None,
+        output=JobOutputStream(),
     )
     cron.running_jobs["test"].append(job)
     await cron._handle_finished_job(job)
 
     assert calls == []  # replaced -> neither reported
     assert "test" not in cron.running_jobs  # still cleaned up
+    assert "test" not in cron.last_run  # replaced runs aren't recorded
 
 
 @pytest.mark.asyncio
@@ -369,11 +372,16 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
         retcode=2,
         stdout=None,
         stderr=None,
+        started_at=None,
+        output=JobOutputStream(),
     )
     cron.running_jobs["test"].append(job)
     await cron._handle_finished_job(job)
 
     assert calls == [("failure", job)]
+    # the finished run is recorded for the web UI
+    assert cron.last_run["test"].outcome == "failure"
+    assert cron.last_run["test"].exit_code == 2
 
 
 def test_simple_config_file(tracing_running_job):
@@ -659,6 +667,178 @@ async def test_web_status_reports_disabled():
     resp = await cron._web_get_status(Req())
     data = json.loads(resp.text)
     assert data[0]["status"] == "disabled"
+
+
+TWO_JOBS = """
+jobs:
+  - name: alpha
+    command: echo alpha
+    schedule: "*/5 * * * *"
+    captureStdout: true
+  - name: beta
+    command:
+      - echo
+      - beta
+    schedule: "@reboot"
+    enabled: false
+"""
+
+
+@pytest.mark.asyncio
+async def test_web_list_jobs():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        pass
+
+    resp = await cron._web_list_jobs(Req())
+    data = json.loads(resp.text)
+    assert [j["name"] for j in data] == ["alpha", "beta"]
+
+    alpha = data[0]
+    assert alpha["enabled"] is True
+    assert alpha["schedule"] == "*/5 * * * *"
+    assert alpha["command"] == "echo alpha"
+    assert alpha["captureStdout"] is True
+    assert alpha["running"] is False
+    assert alpha["scheduled_in"] is not None  # next run computed
+    assert alpha["last_run"] is None  # never run yet
+
+    beta = data[1]
+    assert beta["enabled"] is False
+    assert beta["command"] == "echo beta"  # argv list joined for display
+    assert beta["scheduled_in"] is None  # disabled -> no next run
+
+
+@pytest.mark.asyncio
+async def test_web_list_jobs_includes_last_run():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    cron.last_run["alpha"] = yacron2.cron.JobRunInfo(
+        outcome="failure",
+        exit_code=2,
+        started_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
+        finished_at=DT(1999, 12, 31, 12, 0, 5, tzinfo=UTC),
+        fail_reason="failsWhen=nonzeroReturn and retcode=2",
+        output=JobOutputStream(),
+    )
+
+    class Req:
+        pass
+
+    resp = await cron._web_list_jobs(Req())
+    data = json.loads(resp.text)
+    last = data[0]["last_run"]
+    assert last["outcome"] == "failure"
+    assert last["exit_code"] == 2
+    assert last["duration"] == 5.0
+    assert last["fail_reason"].startswith("failsWhen")
+
+
+@pytest.mark.asyncio
+async def test_web_index_served():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        pass
+
+    resp = await cron._web_index(Req())
+    assert resp.content_type == "text/html"
+    assert "yacron2" in resp.text
+    assert "<html" in resp.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_public_path():
+    from aiohttp import web
+
+    middleware = yacron2.cron.Cron._make_auth_middleware(
+        "secret", yacron2.cron.WEB_PUBLIC_PATHS
+    )
+
+    async def handler(request):
+        return web.Response(text="ok")
+
+    class FakeRequest:
+        def __init__(self, path, auth=None):
+            self.path = path
+            self.headers = {"Authorization": auth} if auth else {}
+
+    # the UI page is reachable without a token...
+    resp = await middleware(FakeRequest("/"), handler)
+    assert resp.text == "ok"
+    # ...but data endpoints still require it
+    with pytest.raises(web.HTTPUnauthorized):
+        await middleware(FakeRequest("/jobs"), handler)
+
+
+@pytest.mark.asyncio
+async def test_web_job_logs_streams_last_run():
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    out = JobOutputStream()
+    out.publish("stdout", "hello world\n")
+    out.publish("stderr", "uh oh\n")
+    out.close()
+    cron.last_run["alpha"] = yacron2.cron.JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=None,
+        finished_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
+        fail_reason=None,
+        output=out,
+    )
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/jobs/alpha/logs")
+        assert resp.status == 200
+        assert resp.content_type == "text/event-stream"
+        body = await resp.text()
+    # buffered lines of the last run are replayed, then the stream ends
+    assert "event: line" in body
+    assert "hello world" in body
+    assert "uh oh" in body
+    assert "event: end" in body
+
+
+@pytest.mark.asyncio
+async def test_web_job_logs_no_output():
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/jobs/alpha/logs")  # never run
+        assert resp.status == 200
+        body = await resp.text()
+    assert "no-output" in body
+
+
+@pytest.mark.asyncio
+async def test_web_job_logs_unknown_job():
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/jobs/nope/logs")
+        assert resp.status == 404
 
 
 DT = datetime.datetime
