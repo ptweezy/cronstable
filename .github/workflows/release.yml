@@ -199,7 +199,7 @@ jobs:
           pyinstaller pyinstaller/yacron2.spec
           dist/yacron2 --version            # smoke test: fails the job if the bundle is broken
           mv dist/yacron2 "dist/yacron2-linux-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yacron2-linux-${{ matrix.arch }}
           path: dist/yacron2-linux-${{ matrix.arch }}
@@ -251,7 +251,7 @@ jobs:
               dist/yacron2 --version            # smoke test: a musl binary on a musl host
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
             '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yacron2-linux-${{ matrix.arch }}-musl
           path: dist/yacron2-linux-${{ matrix.arch }}-musl
@@ -364,7 +364,7 @@ jobs:
             --wait
       - name: Rename binary
         run: mv dist/yacron2 "dist/yacron2-macos-${{ matrix.arch }}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yacron2-macos-${{ matrix.arch }}
           path: dist/yacron2-macos-${{ matrix.arch }}
@@ -415,7 +415,7 @@ jobs:
       # `yacron2-linux-*`) does NOT error on the artifacts it misses, it just
       # silently drops them from the release.
       - name: Download release binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: binaries
           pattern: yacron2-*
@@ -441,7 +441,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.new }}
           name: ${{ needs.version.outputs.new }}
