@@ -5,6 +5,55 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.0 (2026-06-21)
+
+### Features
+
+- Add a built-in web dashboard, served at the root path (`/`) of any
+  `http://` listener. It shows each job's latest status with a live
+  countdown to the next run and a trend sparkline, tails job logs live
+  (with in-log search, ANSI-colour rendering, optional timestamps, a
+  line-wrap toggle, and a download button), runs or cancels jobs on
+  demand, and reports each job's run history, success rate, and a
+  plain-English schedule with a preview of upcoming run times. It is
+  keyboard-first (`?` for shortcuts, `Ctrl-K`/`⌘K` command palette, `/`
+  to filter), with configurable themes, a compact density mode, polling
+  interval, and optional desktop failure notifications, all remembered
+  in the browser.
+- Cancel running jobs over the REST API with `POST /jobs/{name}/cancel`,
+  using the same graceful SIGTERM-then-SIGKILL sequence (honouring
+  `killTimeout`) as elsewhere. A cancelled run is recorded with a
+  `cancelled` outcome and is neither reported nor retried; the endpoint
+  returns `409 Conflict` if the job is not running and `404 Not Found`
+  for an unknown job.
+- `GET /jobs` now returns detailed per-job information — schedule,
+  timezone, enabled/running state, time until the next run, a summary of
+  the most recent finished run, and a compact recent-outcome history.
+- Read a job's retained run history and aggregate statistics (success
+  rate and average/min/max duration) with `GET /jobs/{name}/runs`.
+- Tail a job's captured output live over Server-Sent Events with
+  `GET /jobs/{name}/logs`, replaying the most recent run's buffered
+  output before streaming new lines.
+- Add a `web.ui` option; set `ui: false` to expose only the REST API and
+  disable the dashboard.
+- Keep run history and live logs in memory only, so the dashboard does
+  not change yacron2's read-only-filesystem deployment story; history
+  resets when yacron2 restarts.
+- Ship a `docker-compose.yml` and a demo crontab for trying the
+  dashboard against a set of varied example jobs.
+
+### Security
+
+- Serve the dashboard with a strict `Content-Security-Policy` and
+  additional hardening headers (`X-Content-Type-Options`,
+  `X-Frame-Options`, `Referrer-Policy`); each can be overridden via
+  `web.headers` while unset defaults are still applied.
+- When bearer-token authentication (`web.authToken`) is enabled, the
+  dashboard page loads without a token and then prompts for one, storing
+  it only in that browser tab; every data request it makes is
+  authenticated with that token.
+
+
 ## 1.0.16 (2026-06-21)
 
 - Publish container images to Docker Hub as `docker.io/ptweezy/yacron2`
