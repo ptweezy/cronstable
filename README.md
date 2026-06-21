@@ -1,7 +1,8 @@
-# yacron2 (Yet Another Cron 2)
+# yacron2 (Yet Another Cron... 2...)
 
 [![PyPI version](https://img.shields.io/pypi/v/yacron2.svg)](https://pypi.org/project/yacron2/)
 [![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg)](https://pypi.org/project/yacron2/)
+[![PyPI status](https://img.shields.io/pypi/status/yacron2.svg)](https://pypi.org/project/yacron2/)
 [![GitHub release](https://img.shields.io/github/v/release/ptweezy/yacron2?logo=github)](https://github.com/ptweezy/yacron2/releases/latest)
 [![Release downloads](https://img.shields.io/github/downloads/ptweezy/yacron2/total?logo=github&label=binary%20downloads)](https://github.com/ptweezy/yacron2/releases)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS-informational)](https://github.com/ptweezy/yacron2/releases/latest)
@@ -96,11 +97,7 @@ chmod +x yacron2
 ./yacron2 --version
 ```
 
-The macOS binaries are Developer ID code-signed and notarized by Apple, so
-Gatekeeper accepts them and they run without any extra steps. (Older releases
-were unsigned; if you hit a "cannot be checked for malicious software" prompt on
-one of those, clear the quarantine attribute once with
-`xattr -d com.apple.quarantine ./yacron2-macos-arm64` and it runs normally.)
+The macOS binaries are signed and notarized by Apple.
 
 The standalone binary is a self-extracting executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared
