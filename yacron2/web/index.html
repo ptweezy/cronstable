@@ -1113,6 +1113,7 @@
     });
     const now = new Date();
     $("clock").textContent = pad2(now.getUTCHours()) + ":" + pad2(now.getUTCMinutes()) + ":" + pad2(now.getUTCSeconds()) + " UTC";
+    updateConnTooltip();
   }
 
   // ===================================================================
@@ -1144,9 +1145,31 @@
     }
   }
   function setConnected(ok) {
-    if (state.connected === ok) return;
-    state.connected = ok;
-    $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
+    if (state.connected !== ok) {
+      state.connected = ok;
+      $("conn").innerHTML = '<span class="dot ' + (ok ? "live" : "dead") + '"></span><span>' + (ok ? "live" : "no signal") + "</span>";
+    }
+    updateConnTooltip();
+  }
+  function agoWords(sec) {
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 1) return "just now";
+    if (sec < 60) return sec + " second" + (sec === 1 ? "" : "s") + " ago";
+    const m = Math.floor(sec / 60);
+    if (m < 60) return m + " minute" + (m === 1 ? "" : "s") + " ago";
+    const h = Math.floor(m / 60);
+    return h + " hour" + (h === 1 ? "" : "s") + " ago";
+  }
+  // tooltip on the connection indicator: explains the live state in words and
+  // how recently the server last responded (kept fresh by the per-second tick).
+  function updateConnTooltip() {
+    const conn = $("conn");
+    if (!conn) return;
+    if (!state.fetchedAt) { conn.title = "Waiting for the first response from the yacron2 server…"; return; }
+    const ago = agoWords((performance.now() - state.fetchedAt) / 1000);
+    conn.title = state.connected
+      ? "Connected to the yacron2 server — last response " + ago + "."
+      : "No response from the yacron2 server — last successful response " + ago + ".";
   }
 
   function maybeNotify(jobs) {
