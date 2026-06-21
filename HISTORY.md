@@ -5,6 +5,19 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.0.15 (2026-06-21)
+
+- Lower the minimum required Python version from 3.13 to 3.10;
+  yacron2 now supports Python 3.10, 3.11, 3.12, 3.13, and 3.14.
+- Add PyPI trove classifiers for Python 3.10, 3.11, and 3.12 so the
+  expanded support is reflected on the package page.
+- Expand the test matrix (`tox` and CI) to run across all five
+  supported interpreters (3.10â€“3.14).
+- Type-check with `mypy` against Python 3.10 so stdlib APIs that are
+  unavailable on the lowest supported interpreter are caught at lint
+  time rather than at runtime.
+
+
 ## 1.0.14 (2026-06-21)
 
 Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`, an `arm64` addition to `docker.yml`). Here's the changelog body:
