@@ -54,7 +54,7 @@ Kubernetes/Docker setup.
 
 ### Install using pip
 
-yacron2 requires Python >= 3.13 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
+yacron2 requires Python >= 3.10 (for systems with older Python, use the binary instead).  It is advisable to install it in a Python
 virtual environment, for example:
 
 ```shell
