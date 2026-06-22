@@ -23,17 +23,23 @@ COPY . .
 # leaving the build toolchain behind. The venv lives at the same path in both
 # stages (both are python:3.14-slim), so its interpreter symlinks stay valid.
 #
+# build-essential + libffi/zlib headers let pip source-compile the C-extension
+# deps that ship no wheel on some targets — notably the aiohttp stack on 32-bit
+# x86 (linux/386) and propcache on 32-bit ARM (linux/arm/v7). On 64-bit the
+# whole stack is prebuilt wheels, so the toolchain goes unused; either way it
+# stays in this builder stage and never reaches the slim runtime image.
+#
 # When VERSION is given we hand it to setuptools_scm directly — no git needed.
 # Otherwise (a plain `docker build .`) setuptools_scm reads the version from
-# .git, which requires the git binary the slim image does not ship.
+# .git, which requires the git binary the slim image does not ship; git is
+# installed only in that case.
 RUN set -eux; \
-    if [ -n "$VERSION" ]; then \
-      export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; \
-    else \
-      apt-get update; \
-      apt-get install -y --no-install-recommends git; \
-      rm -rf /var/lib/apt/lists/*; \
-    fi; \
+    apt-get update; \
+    pkgs="build-essential libffi-dev zlib1g-dev"; \
+    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
+    apt-get install -y --no-install-recommends $pkgs; \
+    rm -rf /var/lib/apt/lists/*; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python -m venv /opt/venv; \
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     /opt/venv/bin/pip install --no-cache-dir .
