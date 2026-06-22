@@ -12,7 +12,7 @@ applies to the standalone binary only.
 | --- | --- |
 | Python (pip/pipx) | `>= 3.13`; only 3.13 and 3.14 are supported (`requires-python = ">=3.13"`). Python 3.7–3.12 are not supported. |
 | Operating system | POSIX only (Linux, macOS). yacron2 imports `grp`/`pwd` at module load; there is no Windows support. |
-| CPU architectures | `amd64` (x86_64) and `arm64` for the image and the prebuilt binaries. |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86) and `armv7` (32-bit ARM) — both the container image and the prebuilt binaries; macOS: `amd64` and `arm64` (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -54,7 +54,8 @@ with the interpreter on disk and never self-extract.
 
 ## Run with Docker
 
-Prebuilt, multi-architecture (`linux/amd64` + `linux/arm64`) images are
+Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386` and
+`linux/arm/v7`) images are
 published to the GitHub Container Registry on every release. Mount your crontab
 and run:
 
@@ -122,15 +123,23 @@ following assets, built natively on a matching runner:
 | --- | --- | --- | --- |
 | `yacron2-linux-amd64` | Linux | glibc, x86_64 | Runs on any Linux with glibc 2.39 or newer (e.g. Ubuntu 24.04). |
 | `yacron2-linux-arm64` | Linux | glibc, arm64 | Runs on any Linux with glibc 2.39 or newer on arm64. |
+| `yacron2-linux-i686` | Linux | glibc, 32-bit x86 | 32-bit x86 (i686) for glibc-based systems. |
+| `yacron2-linux-armv7` | Linux | glibc, 32-bit ARM | 32-bit ARM (armv7, e.g. older Raspberry Pi) for glibc-based systems. |
 | `yacron2-linux-amd64-musl` | Linux | musl, x86_64 | For Alpine and other musl-based systems. |
 | `yacron2-linux-arm64-musl` | Linux | musl, arm64 | For Alpine and other musl-based systems. |
+| `yacron2-linux-i686-musl` | Linux | musl, 32-bit x86 | 32-bit x86 (i686) for Alpine and other musl-based systems. |
+| `yacron2-linux-armv7-musl` | Linux | musl, 32-bit ARM | 32-bit ARM (armv7) for Alpine and other musl-based systems. |
 | `yacron2-macos-arm64` | macOS | Apple Silicon (arm64) | Developer ID signed and notarized. |
 | `yacron2-macos-amd64` | macOS | Intel (x86_64) | Developer ID signed and notarized. |
 
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
 (added in 1.0.8) are built inside an Alpine container for musl/Alpine hosts.
-macOS builds (added in 1.0.10) cover both Apple Silicon and Intel.
+The 32-bit `i686` and `armv7` builds (added in 1.1.3, glibc and musl) extend the
+64-bit `amd64`/`arm64` binaries to 32-bit x86 and 32-bit ARM hosts; they are
+built inside a 32-bit container (`i686` natively on the x86-64 runner, `armv7`
+under QEMU emulation). macOS builds (added in 1.0.10) cover both Apple Silicon
+and Intel.
 
 Download and run (glibc amd64 Linux shown — append `-musl` on Alpine, or use
 `yacron2-macos-<arch>` on a Mac):

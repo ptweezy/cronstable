@@ -5,6 +5,21 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which yacron2 is based.
 
+## 1.1.3 (2026-06-22)
+
+- Add self-contained binaries for two more Linux architectures to every
+  release, in both glibc and musl flavors: 32-bit x86 (`yacron2-linux-i686`
+  and `yacron2-linux-i686-musl`) and 32-bit ARM (`yacron2-linux-armv7` and
+  `yacron2-linux-armv7-musl`), alongside the existing 64-bit `amd64` and
+  `arm64` builds. As with the other binaries, Python is not required on the
+  target system. The 32-bit binaries are built inside a 32-bit container
+  (`i686` natively on the x86-64 runner, `armv7` under QEMU emulation).
+- The published container image now covers those architectures too: the
+  multi-arch image is built for `linux/amd64`, `linux/arm64`, `linux/386`
+  and `linux/arm/v7`, and is build-checked at that full arch coverage on
+  every commit.
+
+
 ## 1.1.2 (2026-06-21)
 
 This is a documentation release; there are no changes to the `yacron2`
