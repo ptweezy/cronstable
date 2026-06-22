@@ -33,9 +33,8 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
-* Optional **built-in [web dashboard](#web-dashboard)** — a live, keyboard-driven control panel to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 * Arbitrary timezone support
-* An optional [**built-in web dashboard**](#web-dashboard): a control room to watch every job, tail logs in real time, and run/cancel jobs on demand:
+* Optional **built-in [web dashboard](#web-dashboard)** — a live, keyboard-driven control panel to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 
 [![yacron2 web dashboard — a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](#web-dashboard)
 
