@@ -18,7 +18,7 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 
 ## Web dashboard
 
-yacron2 ships with a **built-in web dashboard** — a single, self-contained page served straight from the daemon: no build step, no external assets, no JavaScript dependencies, no database. Point a browser at the HTTP listener and you have a live, keyboard-driven control room for every job.
+yacron2 ships with a **built-in web dashboard**. Point your browser at the HTTP listener and you have a keyboard-driven control room for every job.
 
 [![yacron2 web dashboard — a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
 
