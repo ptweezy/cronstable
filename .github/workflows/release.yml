@@ -19,9 +19,10 @@ name: release
 # On release it: gates on tox, computes the next version from the latest X.Y.Z
 # tag (or uses the explicit `tag` input verbatim), builds at that version
 # (SETUPTOOLS_SCM_PRETEND_VERSION) -- the wheel
-# + sdist and self-contained PyInstaller binaries for Linux (amd64 + arm64 in
-# both glibc and musl/Alpine flavors) and macOS (arm64 + amd64), each built
-# natively on a matching runner -- publishes the wheel + sdist to PyPI via
+# + sdist and self-contained PyInstaller binaries for Linux (amd64, arm64, i686
+# and armv7 in both glibc and musl/Alpine flavors) and macOS (arm64 + amd64),
+# each built on a matching runner (the 32-bit arches inside a container, armv7
+# under QEMU) -- publishes the wheel + sdist to PyPI via
 # Trusted Publishing (OIDC), then ONLY after a successful publish tags the
 # commit and cuts a GitHub Release with the binaries attached. No file is
 # committed back -> no loop; the binaries build BEFORE the publish (a broken
@@ -253,11 +254,22 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
             platform: linux/arm64
+          - arch: i686
+            runner: ubuntu-24.04
+            platform: linux/386
+          - arch: armv7
+            runner: ubuntu-24.04
+            platform: linux/arm/v7
+            qemu: true            # no native 32-bit ARM on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+      # Register binfmt/QEMU so `docker run --platform` can execute the 32-bit
+      # ARM container. amd64/arm64/i686 run natively and skip this.
+      - if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v4
       - name: Build binary (Alpine/musl)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -269,7 +281,8 @@ jobs:
             python:3.14-alpine sh -euc '
               # build-base brings the C toolchain + strip (the spec sets
               # strip=True); libffi/zlib headers cover any dep that lacks a
-              # musllinux wheel and falls back to compiling from sdist.
+              # musllinux wheel and falls back to compiling from sdist (notably
+              # the i686 aiohttp stack, which ships no musllinux_i686 wheels).
               apk add --no-cache build-base libffi-dev zlib-dev
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
@@ -282,6 +295,65 @@ jobs:
         with:
           name: yacron2-linux-${{ matrix.arch }}-musl
           path: dist/yacron2-linux-${{ matrix.arch }}-musl
+          if-no-files-found: error
+
+  # Build the 32-bit glibc self-contained binaries (i686 + armv7). The native
+  # `binaries` job cannot produce these (64-bit runners; PyInstaller is not a
+  # cross-compiler), so -- like binaries-musl -- they build inside a 32-bit
+  # container via `docker run --platform`, here on python:3.14-slim (Debian
+  # glibc). i686 (linux/386) runs natively on the amd64 runner; armv7 runs under
+  # QEMU. glibc 32-bit wheel coverage is thinner than musl's: the i686 aiohttp
+  # stack and propcache-on-armv7 ship no wheel, so build-essential compiles them
+  # from sdist. Same pyinstaller pin and `--version` smoke test as the other
+  # binary jobs; assets carry no -musl suffix and sit beside the 64-bit glibc
+  # binaries on the release.
+  binaries-glibc32:
+    needs: [decide, version, gate]
+    if: needs.decide.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: i686
+            runner: ubuntu-24.04
+            platform: linux/386
+          - arch: armv7
+            runner: ubuntu-24.04
+            platform: linux/arm/v7
+            qemu: true
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+      - if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v4
+      - name: Build binary (Debian/glibc, 32-bit)
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform ${{ matrix.platform }} \
+            -e SETUPTOOLS_SCM_PRETEND_VERSION \
+            -v "$PWD:/src" -w /src \
+            python:3.14-slim sh -euc '
+              # build-essential brings gcc + strip (the spec sets strip=True);
+              # libffi/zlib headers cover the C-extension deps that ship no
+              # 32-bit glibc wheel and compile from sdist (the i686 aiohttp
+              # stack; propcache on armv7).
+              apt-get update
+              apt-get install -y --no-install-recommends build-essential libffi-dev zlib1g-dev
+              pip install --upgrade pip
+              pip install pyinstaller==6.21.0   # pin matches the other binary jobs
+              pip install .                     # bakes the pinned version into yacron2/version.py
+              pyinstaller pyinstaller/yacron2.spec
+              dist/yacron2 --version            # smoke test: a 32-bit binary, native or emulated
+              mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
+            '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yacron2-linux-${{ matrix.arch }}
+          path: dist/yacron2-linux-${{ matrix.arch }}
           if-no-files-found: error
 
   # Build the self-contained macOS binaries, one per architecture on a native
@@ -398,7 +470,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [decide, version, gate, binaries, binaries-musl, binaries-macos]
+    needs: [decide, version, gate, binaries, binaries-glibc32, binaries-musl, binaries-macos]
     if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -482,8 +554,12 @@ jobs:
             dist/*.tar.gz
             binaries/yacron2-linux-amd64
             binaries/yacron2-linux-arm64
+            binaries/yacron2-linux-i686
+            binaries/yacron2-linux-armv7
             binaries/yacron2-linux-amd64-musl
             binaries/yacron2-linux-arm64-musl
+            binaries/yacron2-linux-i686-musl
+            binaries/yacron2-linux-armv7-musl
             binaries/yacron2-macos-amd64
             binaries/yacron2-macos-arm64
 
