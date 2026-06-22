@@ -39,7 +39,8 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 
 ### Run with Docker
 
-Prebuilt, multi-architecture (`linux/amd64` + `linux/arm64`) images are
+Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386` and
+`linux/arm/v7`) images are
 published on every release to two registries — the GitHub Container Registry
 and Docker Hub. The images are identical; pull from whichever you prefer. Mount
 your crontab and go:
@@ -86,13 +87,17 @@ pipx install yacron2
 
 Alternatively, a self-contained binary can be downloaded
 from github: <https://github.com/ptweezy/yacron2/releases>. Every release
-automatically attaches binaries for Linux and macOS, on both amd64 and arm64:
+automatically attaches binaries for Linux (amd64, arm64, i686 and armv7) and
+macOS (amd64 and arm64):
 
-* **Linux** — `yacron2-linux-amd64` / `yacron2-linux-arm64` are glibc builds
-  for the mainstream distros. They work on any Linux system post glibc 2.39
-  (e.g. Ubuntu 24.04) on the matching CPU. `yacron2-linux-amd64-musl` /
-  `yacron2-linux-arm64-musl` are musl builds for Alpine and other musl-based
-  systems.
+* **Linux** — `yacron2-linux-amd64` / `yacron2-linux-arm64` /
+  `yacron2-linux-i686` / `yacron2-linux-armv7` are glibc builds for the
+  mainstream distros. They work on any Linux system post glibc 2.39
+  (e.g. Ubuntu 24.04) on the matching CPU. The `-musl` variants
+  (`yacron2-linux-amd64-musl`, `yacron2-linux-arm64-musl`,
+  `yacron2-linux-i686-musl`, `yacron2-linux-armv7-musl`) are builds for Alpine
+  and other musl-based systems. `i686` is 32-bit x86 and `armv7` is 32-bit ARM
+  (e.g. older Raspberry Pi).
 * **macOS** — `yacron2-macos-arm64` (Apple Silicon) / `yacron2-macos-amd64`
   (Intel).
 
