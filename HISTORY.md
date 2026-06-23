@@ -143,7 +143,7 @@ package itself.
   interval, and optional desktop failure notifications, all remembered
   in the browser.
 - Cancel running jobs over the REST API with `POST /jobs/{name}/cancel`,
-  using the same graceful SIGTERM-then-SIGKILL sequence (honouring
+  using the same graceful SIGTERM-then-SIGKILL sequence (honoring
   `killTimeout`) as elsewhere. A cancelled run is recorded with a
   `cancelled` outcome and is neither reported nor retried; the endpoint
   returns `409 Conflict` if the job is not running and `404 Not Found`
@@ -422,7 +422,7 @@ This is a tooling and documentation release; there are no changes to the
   `fromFile`): yacron2 raises a `ConfigError` and refuses to start the
   HTTP server, instead of silently serving the control API without
   authentication.
-- The web API now honours `enabled: false`. `POST /jobs/<name>/start`
+- The web API now honors `enabled: false`. `POST /jobs/<name>/start`
   returns `409 Conflict` for a disabled job rather than launching it, and
   `GET /status` reports such jobs as `disabled` instead of an
   inapplicable `scheduled (in N seconds)`.

@@ -303,7 +303,7 @@ The overview shows every job with its **live status**, a **countdown to its next
 | :---: | :---: |
 | [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png) |
 
-Three built-in themes (amber and green phosphor CRT, or a flat **modern** look), plus configurable CRT glow, scanlines, compact density, desktop failure notifications, and polling interval, all remembered in your browser (and the CRT effects honour `prefers-reduced-motion`):
+Three built-in themes (amber and green phosphor CRT, or a flat **modern** look), plus configurable CRT glow, scanlines, compact density, desktop failure notifications, and polling interval, all remembered in your browser (and the CRT effects honor `prefers-reduced-motion`):
 
 | Green phosphor CRT | Flat modern theme |
 | :---: | :---: |
@@ -966,7 +966,7 @@ Server: Python/3.7 aiohttp/3.6.2
 #### Cancel a running job
 
 `POST /jobs/{name}/cancel` terminates any currently-running instances of a job
-(the same graceful SIGTERM-then-SIGKILL sequence, honouring the job's
+(the same graceful SIGTERM-then-SIGKILL sequence, honoring the job's
 `killTimeout`, that yacron2 uses elsewhere). A job cancelled this way is recorded
 in its history with the outcome `cancelled`; unlike a failure it is **not**
 reported and does **not** trigger retries. It returns `409 Conflict` if the job
