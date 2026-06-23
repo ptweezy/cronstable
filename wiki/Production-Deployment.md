@@ -150,8 +150,27 @@ spec:
             name: yacron2tab
 ```
 
-`replicas: 1` is intentional: yacron2 holds the schedule in-process and has no
-distributed leader election, so each replica runs every job independently.
+`replicas: 1` is the safe default: yacron2 holds the schedule in-process, so
+two replicas with no coordination each run every job independently.
+
+To run more than one replica without double-running jobs, enable
+[leader election](https://github.com/ptweezy/yacron2#leader-election): add a
+`cluster` section with `electLeader: true` and a mutual-TLS identity, and only
+the elected leader runs scheduled jobs. It is a quorum-gated, leaderless
+election that keeps no shared state, so:
+
+* **Use an odd replica count.** 3 replicas tolerate one failure, 5 tolerate
+  two; even counts buy no extra fault tolerance, and `replicas: 2` is worse
+  than 1 (a majority of 2 is 2, so both must be up to run anything). Spread them
+  across nodes/zones with `topologySpreadConstraints` — correlated failures
+  defeat quorum regardless of count.
+* **A minority partition stands down** (runs nothing) to guarantee at most one
+  leader, and the view is only as fresh as the poll `interval`, so this is
+  best-effort, not fenced exactly-once. If a job must *never* be skipped or
+  doubled, keep `replicas: 1` (or use a `Lease`-based external coordinator).
+* Provision the per-pod certificates from your own PKI (e.g. cert-manager) and
+  give each pod a stable `nodeName`; a StatefulSet's ordinal hostnames make
+  both the cert SANs and the peer list straightforward.
 
 ## Writable-path exceptions
 

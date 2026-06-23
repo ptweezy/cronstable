@@ -12,6 +12,8 @@ from yacron2.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    elect_leader,
+    quorum_size,
 )
 from yacron2.config import DEFAULT_CLUSTER, ConfigError, parse_config_string
 from yacron2.fingerprint import SCHEME_VERSION
@@ -426,3 +428,120 @@ async def test_web_cluster_endpoint_enabled():
     assert data["enabled"] is True
     assert data["node_name"] == "n"
     assert data["peers"][0]["status"] == "agreed"
+
+
+# --------------------------------------------------------------------------
+# quorum + leader election (pure)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "size,want",
+    [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3), (6, 4), (7, 4)],
+)
+def test_quorum_size(size, want):
+    # even N needs the same quorum as N+1 odd above it -> use odd sizes
+    assert quorum_size(size) == want
+
+
+def test_single_node_always_leads():
+    # degenerate 1-node "cluster": quorum is 1, so it always leads itself
+    assert elect_leader("a", [], 1) == "a"
+
+
+def test_lowest_name_in_full_quorum_leads():
+    # all 3 agree: every node independently elects the same lowest name
+    assert elect_leader("a", ["b", "c"], 3) == "a"
+    assert elect_leader("b", ["a", "c"], 3) == "a"
+    assert elect_leader("c", ["a", "b"], 3) == "a"
+
+
+def test_quorum_with_one_peer_down_still_elects_one_leader():
+    # 3-node cluster, node c down: a and b each see {self, other} == quorum 2,
+    # and both elect "a" -> exactly one leader, no double-run.
+    assert elect_leader("a", ["b"], 3) == "a"
+    assert elect_leader("b", ["a"], 3) == "a"
+
+
+def test_minority_has_no_leader():
+    # only self reachable in a 3-node cluster: below quorum -> stand down
+    assert elect_leader("a", [], 3) is None
+    # 5-node cluster split 3/2: the 2-side is a minority -> no leader there
+    assert elect_leader("d", ["e"], 5) is None
+    # ...while the 3-side elects its lowest name
+    assert elect_leader("a", ["b", "c"], 5) == "a"
+
+
+def test_two_node_cluster_needs_both():
+    assert elect_leader("a", ["b"], 2) == "a"  # both up
+    assert elect_leader("b", ["a"], 2) == "a"
+    assert elect_leader("a", [], 2) is None  # peer down -> nobody leads
+
+
+@pytest.mark.asyncio
+async def test_mtls_round_trip_elects_single_leader(tmp_path):
+    # two agreeing nodes (cluster_size 2, quorum 2): once each has polled the
+    # other, exactly one of them (the lowest name) is leader.
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
+        lambda: "v1:same",
+    )
+    b = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
+        lambda: "v1:same",
+    )
+    await a.start()
+    await b.start()
+    try:
+        await a._poll_all()
+        await b._poll_all()
+        assert a.cluster_size() == 2 and a.quorum() == 2
+        assert a.is_leader() is True  # "node-a" < "node-b"
+        assert b.is_leader() is False
+        assert a.leader_name() == "node-a"
+        assert b.leader_name() == "node-a"
+        # both expose the same election view over /cluster
+        assert a.view_dict()["is_leader"] is True
+        assert b.view_dict()["leader"] == "node-a"
+    finally:
+        await a.stop()
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_is_leader_false_without_quorum(tmp_path):
+    # node-a in a 3-node cluster whose two peers are unreachable: it sees only
+    # itself (1 < quorum 2) and must not lead.
+    tls = _write_tls(tmp_path)
+    pa = _free_port()
+    a = ClusterManager(
+        _cfg(
+            tls,
+            f"127.0.0.1:{pa}",
+            ["localhost:1", "localhost:2"],  # nothing listening
+            "node-a",
+        ),
+        lambda: "v1:same",
+    )
+    await a.start()
+    try:
+        await a._poll_all()
+        assert a.cluster_size() == 3 and a.quorum() == 2
+        assert a.is_leader() is False
+        assert a.leader_name() is None
+    finally:
+        await a.stop()
+
+
+def test_elect_leader_parsed_from_config():
+    cfg = parse_config_string(
+        CLUSTER_YAML + "  electLeader: true\n", ""
+    ).cluster_config
+    assert cfg is not None and cfg["electLeader"] is True
+
+
+def test_elect_leader_defaults_false():
+    cfg = parse_config_string(CLUSTER_YAML, "").cluster_config
+    assert cfg is not None and cfg["electLeader"] is False

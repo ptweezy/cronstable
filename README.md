@@ -38,7 +38,9 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   hold an identical set of jobs (see [Job-set id](#job-set-id))
 * **Cluster peer attestation**: optionally have instances confirm over mutual
   TLS that a configured set of peers is running the same job set (see
-  [Cluster peer attestation](#cluster-peer-attestation))
+  [Cluster peer attestation](#cluster-peer-attestation)), and **elect a leader**
+  so several replicas can run from one config without double-running jobs (see
+  [Leader election](#leader-election))
 * Arbitrary timezone support
 * Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 
@@ -1157,6 +1159,7 @@ cluster:
   nodeName: node-a                # optional; defaults to the system hostname
   interval: 30                    # optional; seconds per round (default 30)
   driftAfter: 3                   # optional; rounds before "drifted" (default 3)
+  electLeader: false              # optional; run jobs on the leader only (see below)
 ```
 
 The trust model is deliberately small and keeps no shared state:
@@ -1179,6 +1182,63 @@ The current view is available at `GET /cluster` on the
 [web interface](#remote-webhttp-interface) and is shown as a panel in the
 dashboard. The `/peer` endpoint is served only on the separate mTLS `listen`
 address, never on the public web API.
+
+### Leader election
+
+(new in version 1.1.8)
+
+By default a `cluster` section is *observe-only*: every instance still runs
+every job, and attestation just tells you whether they agree. Setting
+`electLeader: true` turns the same attestation into a **quorum-gated leader
+election**, so you can run more than one replica from the same config without
+double-running jobs:
+
+```yaml
+cluster:
+  listen: "0.0.0.0:8443"
+  tls: { ca: /etc/yacron2/cluster-ca.pem, cert: /etc/yacron2/this-node.pem, key: /etc/yacron2/this-node.key }
+  peers:
+    - host: yacron-b.internal:8443
+    - host: yacron-c.internal:8443
+  electLeader: true
+```
+
+Each node independently elects, as leader, the lowest `nodeName` among the
+members it currently sees *agreeing* on the job-set id — but only if that set
+is a **quorum** (a strict majority) of the cluster. **Only the leader runs
+*scheduled* jobs.** Manual runs via the API (`POST /jobs/{name}/start`) and
+automatic retries are deliberately *not* gated, so you can still trigger a job
+on any node.
+
+* **List every *other* member in `peers`** (not this node itself). The cluster
+  size is `len(peers) + 1`, and the quorum is `⌊size / 2⌋ + 1` — so the peer
+  lists must be consistent across nodes. The computed size, quorum, elected
+  leader, and whether this node is the leader are all shown at `GET /cluster`
+  and in the dashboard panel.
+* **The quorum gate is what makes this safe with no shared state.** Two strict
+  majorities of `N` can't be disjoint, so under a clean network partition at
+  most one side is quorate and at most one leader exists. The trade-off is
+  liveness: a node that can't see a majority deliberately **stands down** (runs
+  nothing) rather than risk a second leader. A job therefore runs on a given
+  firing only while a majority of the cluster is up and mutually reachable.
+* **Use an odd cluster size.** With per-node availability `p`, the chance a
+  firing runs is the probability a majority is up: ~`3p² − 2p³` for 3 nodes,
+  higher for 5. **3 nodes** tolerate one simultaneous failure (≈4 nines of
+  "runs" at `p = 0.99`); **5 nodes** tolerate two (≈5 nines). Even sizes buy no
+  extra fault tolerance (4 tolerates the same one failure as 3), and **2 nodes
+  is worse than 1** (a majority of 2 is 2, so both must be up). Spread the nodes
+  across independent failure domains — correlated failures (a bad config push, a
+  shared host/AZ) defeat the math regardless of `N`.
+
+**This is best-effort, not fenced exactly-once.** Because each node acts on a
+view only as fresh as its last poll (`interval`), there are narrow windows
+where behaviour degrades: just after a leader dies, a firing may be *skipped*
+until survivors notice; and asymmetric or flapping reachability can briefly
+elect two leaders. If you need a hard exactly-once guarantee you need a
+lease/consensus store (etcd, a Kubernetes `Lease`), which this design
+intentionally avoids in favour of keeping no shared state. If election is
+configured but the cluster listener fails to start, the node **fails closed**
+(stays idle) rather than fall back to running everything.
 
 ### Includes
 

@@ -277,6 +277,12 @@ class Cron:
         self.cluster_manager = None  # type: Optional[ClusterManager]
         # last job-set id we logged, so reloads only log it again on change
         self._logged_job_set_id = None  # type: Optional[str]
+        # whether the loaded config asks us to gate jobs on leader election;
+        # tracked separately from cluster_manager so the gate can fail closed
+        # even when the manager failed to start.
+        self._elect_leader_configured = False
+        # last leadership state we logged, so we only log on transition
+        self._was_leader = False
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -740,6 +746,11 @@ class Cron:
     async def start_stop_cluster(
         self, cluster_config: Optional[ClusterConfig]
     ) -> None:
+        # Track the election intent up front so the leader gate can fail closed
+        # even if the manager (below) is absent or fails to start.
+        self._elect_leader_configured = bool(
+            cluster_config and cluster_config.get("electLeader")
+        )
         # Restart the manager when the cluster section is removed or changed,
         # mirroring start_stop_web_app. The id it reports tracks config reloads
         # on its own (it calls self.job_set_id each round), so only a change to
@@ -829,9 +840,37 @@ class Cron:
             )
 
     async def spawn_jobs(self, startup: bool) -> None:
+        if not self._is_cluster_leader():
+            return
         for job in self.cron_jobs.values():
             if self.job_should_run(startup, job):
                 await self.launch_scheduled_job(job)
+
+    def _is_cluster_leader(self) -> bool:
+        """Whether this node may run *scheduled* jobs this cycle.
+
+        Always true unless leader election is enabled
+        (``cluster.electLeader``), in which case only the elected leader runs
+        scheduled jobs.  Manual (API) triggers and retries go through
+        ``maybe_launch_job`` and are unaffected.
+
+        Fails *closed*: if election is configured but no manager is running
+        (e.g. it failed to start), this node stays quiet rather than risk every
+        replica running every job.
+        """
+        if not self._elect_leader_configured:
+            return True
+        leader = (
+            self.cluster_manager is not None
+            and self.cluster_manager.is_leader()
+        )
+        if leader != self._was_leader:
+            logger.info(
+                "cluster: this node %s scheduled-job leadership",
+                "acquired" if leader else "lost",
+            )
+            self._was_leader = leader
+        return leader
 
     @staticmethod
     def job_should_run(startup: bool, job: JobConfig) -> bool:
