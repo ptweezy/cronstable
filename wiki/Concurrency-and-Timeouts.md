@@ -205,7 +205,7 @@ jobs:
   reported as a failure (the `replaced` flag).
 - **Manual starts.** Launches via the [HTTP Control API](HTTP-API)
   (`POST /jobs/{name}/start`) go through the same `maybe_launch_job` path and
-  thus honour `concurrencyPolicy`.
+  thus honor `concurrencyPolicy`.
 - **start-up failures vs. timeouts.** A `-100` return code specifically denotes
   a timeout-induced cancellation. A command that could not be launched at all
   (e.g. not found) is assigned `127` instead, on the normal failure path; see
