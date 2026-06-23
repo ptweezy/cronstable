@@ -154,8 +154,8 @@ yacron2 runs natively on Windows (x64 and ARM64), in addition to Linux and
 macOS. Install it with `pip install yacron2`, or download the self-contained
 `yacron2-windows-amd64.exe` / `yacron2-windows-arm64.exe` from the
 [releases page](https://github.com/ptweezy/yacron2/releases) (no Python
-required). Everything else — the YAML crontab, scheduling, reporting, retries,
-the HTTP API and the [web dashboard](#web-dashboard) — works the same as on
+required). Everything else, like the YAML crontab, scheduling, reporting, retries,
+the HTTP API and the [web dashboard](#web-dashboard), works the same as on
 POSIX. A few platform details differ:
 
 * **Default config location.** When `-c` is omitted, yacron2 looks in
