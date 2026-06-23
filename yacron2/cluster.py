@@ -18,6 +18,21 @@ The trust model is deliberately simple and keeps no shared state:
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
+
+When ``electLeader`` is set, the same attestation drives a **quorum-gated
+leader election** (see :func:`elect_leader`): each node independently elects,
+as leader, the lowest ``nodeName`` among the *agreeing* members it can see, but
+only if that set is a strict majority (a *quorum*) of the configured cluster.
+Only the leader runs scheduled jobs, so replicas deployed from one config no
+longer double-run.  The quorum gate is what makes this safe with no shared
+state: two strict majorities of N cannot be disjoint, so under a clean
+partition at most one side is quorate and at most one leader exists.  The
+trade-off is liveness — a minority partition deliberately goes idle rather than
+risk a second leader — and, because the view is only as fresh as the last poll,
+the guarantee is best-effort across membership changes (a brief window after a
+leader dies may skip a firing; asymmetric/flapping reachability may briefly
+double-elect).  It is *not* a fenced, exactly-once guarantee; for that you
+would need a lease/consensus store, which this design intentionally avoids.
 """
 
 import asyncio
@@ -25,7 +40,7 @@ import datetime
 import logging
 import ssl
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
 from aiohttp import web
@@ -43,6 +58,36 @@ STATUS_SYNCING = "syncing"  # reachable, id differs but within driftAfter
 STATUS_DRIFTED = "drifted"  # reachable, id has differed >= driftAfter rounds
 STATUS_UNREACHABLE = "unreachable"  # connect/timeout failure
 STATUS_UNTRUSTED = "untrusted"  # TLS/cert verification failed
+
+
+def quorum_size(cluster_size: int) -> int:
+    """The strict majority of ``cluster_size`` nodes.
+
+    A quorum requires *more than half* the cluster, so no two quorums can be
+    disjoint; that is the property the leader gate relies on for safety.  Note
+    this favours odd cluster sizes: N=3 and N=4 both need 3 and both tolerate
+    only one failure, so the even node buys nothing.
+    """
+    return cluster_size // 2 + 1
+
+
+def elect_leader(
+    node_name: str,
+    agreeing_peer_names: Iterable[str],
+    cluster_size: int,
+) -> Optional[str]:
+    """Pure, deterministic leader election from one node's point of view.
+
+    The *live set* is this node plus every peer it currently sees agreeing on
+    the job-set id.  If that set is at least a quorum of ``cluster_size`` the
+    leader is its lowest ``nodeName`` (so every node in one quorum elects the
+    same single leader); otherwise there is no leader and ``None`` is returned,
+    which is how a minority partition is made to stand down.
+    """
+    live = [node_name, *agreeing_peer_names]
+    if len(live) < quorum_size(cluster_size):
+        return None
+    return min(live)
 
 
 @dataclass
@@ -299,9 +344,48 @@ class ClusterManager:
             self.node_name,
         )
 
+    # --- leader election --------------------------------------------------
+
+    def cluster_size(self) -> int:
+        """Total number of cluster members.
+
+        ``peers`` lists every *other* member, so the cluster is those plus this
+        node.  (Listing this node in its own peer list is a misconfiguration;
+        it is reported as ``self`` and never counts toward agreement, so it
+        only makes quorum harder to reach, never easier.)
+        """
+        return len(self.config["peers"]) + 1
+
+    def quorum(self) -> int:
+        return quorum_size(self.cluster_size())
+
+    def _agreeing_peer_names(self) -> List[str]:
+        """Names of peers currently agreeing on our job-set id over mTLS."""
+        return [
+            peer.node_name
+            for peer in self.view.peers.values()
+            if peer.status == STATUS_AGREED and peer.node_name is not None
+        ]
+
+    def leader_name(self) -> Optional[str]:
+        """Elected leader as this node sees it, or ``None`` if not quorate."""
+        return elect_leader(
+            self.node_name, self._agreeing_peer_names(), self.cluster_size()
+        )
+
+    def is_leader(self) -> bool:
+        """Whether this node is the elected leader (quorate, lowest name)."""
+        return self.leader_name() == self.node_name
+
     def view_dict(self) -> Dict[str, Any]:
+        leader = self.leader_name()
         return {
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
+            "cluster_size": self.cluster_size(),
+            "quorum": self.quorum(),
+            "elect_leader": bool(self.config.get("electLeader")),
+            "leader": leader,
+            "is_leader": leader is not None and leader == self.node_name,
             "peers": self.view.to_list(),
         }

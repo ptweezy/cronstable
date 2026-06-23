@@ -29,6 +29,20 @@ project, on which yacron2 is based.
   `GET /cluster` and as a dashboard panel. mTLS (a cluster CA plus a per-node
   cert/key) is the membership boundary, and drift is debounced over
   `driftAfter` rounds so a rolling deploy does not false-alarm.
+- **Leader election.** Setting `cluster.electLeader: true` makes the same
+  attestation drive a quorum-gated leader election, so replicas deployed from
+  one config can finally run with more than one instance without double-running
+  jobs. Each node independently elects the lowest `nodeName` among the agreeing
+  peers it can see, but only when that set is a strict majority (*quorum*) of
+  the cluster; only the leader runs *scheduled* jobs (manual API triggers and
+  retries are unaffected). The quorum gate keeps this safe with no shared
+  state — two majorities can't be disjoint, so a clean partition elects at most
+  one leader — at the cost of liveness: a minority partition stands down rather
+  than risk a second leader. Use an odd cluster size (3 tolerates one failure,
+  5 tolerates two); even sizes buy no extra fault tolerance. Leadership is
+  exposed at `GET /cluster`, shown in the dashboard panel, and logged on each
+  transition. If election is enabled but the cluster manager isn't running, the
+  node fails closed (stays idle) rather than risk every replica firing.
 
 ## 1.1.7 (2026-06-23)
 

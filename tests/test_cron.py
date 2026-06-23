@@ -1291,3 +1291,39 @@ async def test_run_survives_config_error(monkeypatch):
 
     # completes without raising (UnboundLocalError before the fix)
     await asyncio.wait_for(cron.run(), timeout=5)
+
+
+def test_cluster_leader_gate(caplog):
+    import logging
+
+    cron = yacron2.cron.Cron(None)
+
+    # no cluster / election not configured: scheduled jobs always allowed
+    assert cron._is_cluster_leader() is True
+
+    # election configured but no manager running (e.g. it failed to start):
+    # fail closed so we don't risk every replica running every job.
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None
+    assert cron._is_cluster_leader() is False
+
+    class _Mgr:
+        def __init__(self, leader):
+            self._leader = leader
+
+        def is_leader(self):
+            return self._leader
+
+    # election configured with a manager: defer to its election result, and
+    # log only on transition.
+    cron.cluster_manager = _Mgr(True)
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        assert cron._is_cluster_leader() is True
+        assert cron._is_cluster_leader() is True  # unchanged: no second log
+        cron.cluster_manager = _Mgr(False)
+        assert cron._is_cluster_leader() is False
+    msgs = [r.message for r in caplog.records if "leadership" in r.message]
+    assert msgs == [
+        "cluster: this node acquired scheduled-job leadership",
+        "cluster: this node lost scheduled-job leadership",
+    ]

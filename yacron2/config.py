@@ -48,6 +48,10 @@ DEFAULT_CLUSTER = {
     "driftAfter": 3,  # reachable-but-mismatched rounds before "drifted"
     "nodeName": None,  # defaults to the system hostname at load time
     "connectTimeout": 10,  # seconds per peer request
+    # When true, only the elected leader runs *scheduled* jobs (manual API
+    # triggers and retries are unaffected); see yacron2.cluster.elect_leader.
+    # Off by default so a cluster section is observe-only until opted in.
+    "electLeader": False,
 }
 
 
@@ -298,6 +302,8 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("interval"): Int(),
                 Opt("driftAfter"): Int(),
                 Opt("connectTimeout"): Int(),
+                # run scheduled jobs on the elected leader only (default false)
+                Opt("electLeader"): Bool(),
             }
         ),
         Opt("include"): Seq(Str()),
