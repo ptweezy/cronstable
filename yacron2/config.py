@@ -634,6 +634,39 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
         raise ConfigError("cluster.driftAfter must be >= 1")
     if cfg["connectTimeout"] <= 0:
         raise ConfigError("cluster.connectTimeout must be > 0")
+
+    # Validate every address is a well-formed host:port up front, so a typo
+    # (a missing port, a non-numeric port) fails the config load pointing at
+    # the offending value instead of surfacing later as an opaque per-peer
+    # connection error. Mirrors yacron2.cluster._split_host_port, plus a port
+    # range check; anything this accepts also parses at runtime.
+    def _require_host_port(addr: str, what: str) -> None:
+        host, _, port = addr.rpartition(":")
+        if not host or not port.isdigit() or not 0 < int(port) <= 65535:
+            raise ConfigError(
+                "cluster.{} must be host:port, got {!r}".format(what, addr)
+            )
+
+    _require_host_port(cfg["listen"], "listen")
+    for peer in cfg["peers"]:
+        _require_host_port(peer["host"], "peers[].host")
+
+    # De-duplicate peers and drop any entry pointing at our own listen address.
+    # ClusterView keys peers by host (so duplicates collapse) and a self-listed
+    # peer never counts toward agreement -- but cluster_size() (and thus the
+    # quorum threshold) is derived from this list, so a duplicate or self entry
+    # would silently inflate the quorum and cost fault tolerance. Keep the
+    # first occurrence to preserve configured order.
+    seen: "set[str]" = set()
+    deduped: List[Dict[str, Any]] = []
+    for peer in cfg["peers"]:
+        host = peer["host"]
+        if host == cfg["listen"] or host in seen:
+            continue
+        seen.add(host)
+        deduped.append(peer)
+    cfg["peers"] = deduped
+
     if cfg["electLeader"]:
         # `peers` lists every OTHER member, so the cluster is that many plus
         # this node.

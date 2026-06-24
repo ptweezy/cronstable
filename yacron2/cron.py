@@ -794,12 +794,20 @@ class Cron:
             # and would repeat the same warning every minute.
             for warning in cluster_config_warnings(cluster_config):
                 logger.warning("%s", warning)
-            manager = ClusterManager(cluster_config, self.job_set_id)
             try:
+                # Construct INSIDE the try: ClusterManager.__init__ builds the
+                # TLS contexts (loading the CA/cert/key files), which raises
+                # OSError/ssl.SSLError on a missing or malformed file; start()
+                # then parses listen (ValueError) and binds the port (OSError).
+                # All three are operational misconfigurations we log and keep
+                # running through, not bugs -- so they must not escape to the
+                # run loop's generic "please report this as a bug" handler.
+                manager = ClusterManager(cluster_config, self.job_set_id)
                 await manager.start()
             except (OSError, ssl.SSLError, ValueError) as ex:
                 # bad cert files / bad listen address / port already in use:
                 # log and keep running jobs rather than aborting the reload.
+                # (start() cleans up its own half-started runner on failure.)
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
@@ -906,30 +914,50 @@ class Cron:
         )
 
     def _reboot_owner(self, job: JobConfig) -> Optional[str]:
-        """The node that should run a deferred @reboot ``job`` once the cluster
-        converges, or ``None`` if undecided (no quorum yet, or a nodeName
-        conflict).
+        """The node that should run a deferred @reboot ``job``, or ``None`` if
+        undecided.
 
-        Both ``Leader`` and ``PreferLeader`` @reboot one-shots are gated on the
-        quorum owner, so exactly one node runs them after convergence — this
-        avoids the pre-convergence ``PreferLeader`` race where every node,
-        seeing only itself, would run the job.
+        Mirrors the scheduled-job gate in :meth:`_cluster_allows` so a deferred
+        @reboot lands on exactly the node that policy would have run it on:
+
+        * ``PreferLeader`` uses the quorum-*free* availability owner — it never
+          skips while a node is up, so it always resolves to some node (never
+          ``None``) and an isolated/minority node runs it itself rather than
+          starving (PreferLeader accepts a possible double-run as the price);
+        * ``Leader`` uses the quorum-gated owner and additionally stands down
+          on a nodeName conflict, returning ``None`` until the cluster
+          converges safely.
         """
         mgr = self.cluster_manager
         assert mgr is not None
+        spread = mgr.distribution == "spread"
+        if job.clusterPolicy == "PreferLeader":
+            return (
+                mgr.available_job_owner(job.name)
+                if spread
+                else mgr.available_leader_name()
+            )
+        # "Leader": quorum-gated, and unsafe to pick while a nodeName collides
         if mgr.has_conflict():
-            return None  # unsafe to pick an owner while a nodeName collides
-        if mgr.distribution == "spread":
+            return None
+        if spread:
             return mgr.job_owner(job.name)  # quorum-gated; None without quorum
         return mgr.leader_name()  # quorum-gated; None without quorum
 
     async def _process_pending_reboots(self) -> None:
         """Run each deferred @reboot job once the cluster has elected an owner.
 
-        For every pending job: run it here if this node is the elected owner;
-        drop it if another node is the owner (it will run there); otherwise
-        keep waiting (no quorum yet, or a nodeName conflict). If election was
-        turned off on a reload, the gating is gone, so run them here.
+        Each pending job is retired in one of two ways: this node runs it
+        because it is the elected owner, or we learn (via the cluster's
+        ``reboot_ran`` gossip) that it already ran somewhere and stand down
+        without re-running.  We deliberately do *not* drop a job merely because
+        some *other* node currently *looks like* the owner: that node may be
+        unable to run it (reachable from us but not quorate from its own view),
+        and dropping on speculation would lose the one-shot forever.  Dropping
+        only on positive confirmation keeps the never-lose property while
+        avoiding a re-run when leadership later moves to a node that still held
+        the job pending.  If election was turned off on a reload, the gating is
+        gone, so any still-pending jobs run here.
         """
         if not self._pending_reboot_jobs:
             return
@@ -948,9 +976,19 @@ class Cron:
             if name not in self.cron_jobs:
                 del self._pending_reboot_jobs[name]  # removed on a reload
                 continue
+            if mgr.reboot_ran(name):
+                # positive confirmation it already ran in the cluster -> retire
+                # it without re-running (this is what prevents a re-run when
+                # leadership later lands on a node that still held it pending).
+                del self._pending_reboot_jobs[name]
+                logger.info(
+                    "cluster: deferred @reboot job %s already ran in the "
+                    "cluster; standing down here",
+                    name,
+                )
+                continue
             job = self._pending_reboot_jobs[name]
-            owner = self._reboot_owner(job)
-            if owner == mgr.node_name:
+            if self._reboot_owner(job) == mgr.node_name:
                 del self._pending_reboot_jobs[name]
                 logger.info(
                     "cluster: running deferred @reboot job %s (this node is "
@@ -958,16 +996,12 @@ class Cron:
                     name,
                 )
                 await self.launch_scheduled_job(job)
-            elif owner is not None:
-                # another node owns it and will run it -> stop waiting here
-                del self._pending_reboot_jobs[name]
-                logger.info(
-                    "cluster: deferred @reboot job %s will run on %s; "
-                    "standing down here",
-                    name,
-                    owner,
-                )
-            # else owner is None -> not converged / conflict -> keep waiting
+                # record + eagerly tell peers, so no one re-runs it on failover
+                await mgr.mark_reboot_ran(name)
+            # else: another node is (or will be) the owner, or the cluster has
+            # not converged yet (no quorum / a nodeName conflict) -> keep the
+            # job pending and re-evaluate next wakeup. Never drop a one-shot on
+            # another node's behalf: see this method's docstring.
 
     def _cluster_allows(self, job: JobConfig) -> bool:
         """Whether this node may run *scheduled* ``job`` this cycle.

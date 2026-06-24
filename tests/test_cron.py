@@ -1578,7 +1578,11 @@ def _reboot_job(name="boot", policy="Leader"):
     )
 
 
-def _reboot_mgr(*, leader=None, conflict=False, node="node-a"):
+def _reboot_mgr(
+    *, leader=None, conflict=False, node="node-a", available=None, ran=()
+):
+    ran_set = set(ran)
+
     class _Mgr:
         node_name = node
         distribution = "single-leader"
@@ -1588,6 +1592,17 @@ def _reboot_mgr(*, leader=None, conflict=False, node="node-a"):
 
         def leader_name(self):
             return leader
+
+        def available_leader_name(self):
+            # quorum-free owner used by PreferLeader; an isolated node leads
+            # its own reachable set, so default to self.
+            return node if available is None else available
+
+        def reboot_ran(self, name):
+            return name in ran_set
+
+        async def mark_reboot_ran(self, name):
+            ran_set.add(name)
 
     return _Mgr()
 
@@ -1604,14 +1619,44 @@ async def test_deferred_reboot_runs_on_owner(monkeypatch):
     job = _reboot_job()
     cron.cron_jobs["boot"] = job
     cron._pending_reboot_jobs["boot"] = job
-    cron.cluster_manager = _reboot_mgr(leader="node-a")  # we are the owner
+    mgr = _reboot_mgr(leader="node-a")  # we are the owner
+    cron.cluster_manager = mgr
     await cron._process_pending_reboots()
     assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
+    # running it records + advertises the run, so peers won't re-run it
+    assert mgr.reboot_ran("boot") is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_retired_on_ack_without_rerun(monkeypatch):
+    # the gossip-ack: once the cluster reports the job already ran, a node
+    # retires it WITHOUT running -- even if this node is now the elected owner.
+    # This is what stops a re-run when leadership lands on a node that still
+    # held the one-shot pending.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    # we are the owner now, but the cluster already ran it -> do NOT re-run
+    cron.cluster_manager = _reboot_mgr(leader="node-a", ran={"boot"})
+    await cron._process_pending_reboots()
+    assert launched == []
     assert "boot" not in cron._pending_reboot_jobs
 
 
 @pytest.mark.asyncio
-async def test_deferred_reboot_dropped_when_other_owns(monkeypatch):
+async def test_deferred_reboot_kept_when_other_owns(monkeypatch):
+    # #8: a non-owner must NOT drop the one-shot just because some other node
+    # currently looks like the owner -- that node may itself be unable to run
+    # it (reachable from us but not quorate from its own view), and dropping
+    # would lose the boot job forever; we keep waiting instead.
     cron = yacron2.cron.Cron(None)
     cron._elect_leader_configured = True
     launched = []
@@ -1625,7 +1670,74 @@ async def test_deferred_reboot_dropped_when_other_owns(monkeypatch):
     cron.cluster_manager = _reboot_mgr(leader="node-b")  # someone else owns it
     await cron._process_pending_reboots()
     assert launched == []  # did not run here...
-    assert "boot" not in cron._pending_reboot_jobs  # ...but stopped waiting
+    assert "boot" in cron._pending_reboot_jobs  # ...and keeps waiting
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_leader_runs_after_owner_lands_here(monkeypatch):
+    # #8 (continued): because we kept waiting above instead of dropping, the
+    # one-shot still runs when leadership later lands on this node -- so a
+    # deferred boot job is never silently lost.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron.cluster_manager = _reboot_mgr(leader="node-b")  # not us yet
+    await cron._process_pending_reboots()
+    assert launched == [] and "boot" in cron._pending_reboot_jobs
+    cron.cluster_manager = _reboot_mgr(leader="node-a")  # now we are leader
+    await cron._process_pending_reboots()
+    assert launched == ["boot"] and "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_preferleader_runs_without_quorum(monkeypatch):
+    # #9: a PreferLeader @reboot must run even with no quorum (its contract is
+    # to never skip while a node is up). _reboot_owner uses the quorum-free
+    # availability owner, which on an isolated/minority node is this node.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(policy="PreferLeader")
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    # no quorum (leader_name is None) but the availability owner is us
+    cron.cluster_manager = _reboot_mgr(leader=None, available="node-a")
+    await cron._process_pending_reboots()
+    assert launched == ["boot"]
+    assert "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_preferleader_waits_for_available_owner(
+    monkeypatch,
+):
+    # the quorum-free availability owner can still be another node (a lower
+    # name we mutually agree with); that node runs it, so we keep waiting.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(policy="PreferLeader")
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron.cluster_manager = _reboot_mgr(leader=None, available="node-b")
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" in cron._pending_reboot_jobs
 
 
 @pytest.mark.asyncio
@@ -1715,10 +1827,45 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
         def leader_name(self):
             return None  # no quorum at the startup instant
 
+        def reboot_ran(self, name):
+            return False
+
     cron.cluster_manager = _Mgr()
     await cron.spawn_jobs(startup=True)
     assert launched == []  # deferred, not run at boot
     assert "boot" in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_cluster_start_survives_bad_cert_files(caplog):
+    # #6: a missing/unreadable cert file is an operational misconfiguration --
+    # start_stop_cluster must log it and keep running (no manager), NOT let the
+    # exception escape to the run loop's generic "please report this as a bug"
+    # handler. ClusterManager is constructed inside the try for exactly this.
+    import logging
+
+    yaml = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "  electLeader: true\n"
+    )
+    config = parse_config_string(yaml, "")
+    cron = yacron2.cron.Cron(None)
+    with caplog.at_level(logging.ERROR, logger="yacron2"):
+        await cron.start_stop_cluster(config.cluster_config)  # must not raise
+    assert cron.cluster_manager is None
+    # election intent is tracked regardless, so the Leader gate fails closed
+    assert cron._elect_leader_configured is True
+    assert any("failed to start" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
