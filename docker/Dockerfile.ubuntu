@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # yacron2 — Ubuntu variant, built on Ubuntu 24.04 LTS using its native Python
-# 3.12. For users who standardise on an Ubuntu base (familiar userland, apt,
+# 3.12. For users who standardize on an Ubuntu base (familiar userland, apt,
 # matching host images).
 #
 # Build locally:

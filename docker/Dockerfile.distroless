@@ -2,7 +2,7 @@
 #
 # yacron2 — distroless variant. The most locked-down image: Google's
 # "distroless" base ships only the Python runtime and its libraries — no shell,
-# no package manager, no busybox — which minimises the attack surface and pairs
+# no package manager, no busybox — which minimizes the attack surface and pairs
 # naturally with yacron2's hardened, read-only, non-root deployment model.
 #
 # The base provides Python 3.11 (Debian 12 lineage); the venv is built in a
