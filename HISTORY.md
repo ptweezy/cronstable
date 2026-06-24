@@ -100,7 +100,15 @@ project, on which yacron2 is based.
   at-most-once), `PreferLeader` (lowest reachable node runs it, ignoring quorum
   — never skips, but may double-run across a partition), or `EveryNode` (run on
   every replica, for per-node or idempotent work). `clusterPolicy` is part of
-  the job-set id and shown in the dashboard job drawer.
+  the job-set id and shown in the dashboard job drawer. Node identities must be
+  unique: each process reports a random instance id alongside its `nodeName`,
+  so a duplicate `nodeName` (which would otherwise let two nodes each elect
+  themselves and double-run) is detected as a `conflict` — surfaced on
+  `GET /cluster`, in the dashboard panel, and in an error log — and makes
+  `Leader` jobs fail closed until it is resolved. An `@reboot` job with
+  `Leader`/`PreferLeader` policy is deferred until the cluster elects an owner
+  and then run once there, rather than never running (`Leader` saw no quorum at
+  boot) or running on every node (`PreferLeader` saw only itself).
 - **Spread distribution (opt-in).** A `cluster.distribution` option chooses how
   leader-gated jobs spread across the quorate cluster: the default
   `single-leader` keeps one elected leader running every `Leader` job, while

@@ -651,25 +651,41 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
                 "worse than a single replica. Use 3 or more nodes (an odd "
                 "count is best), or run a single replica without electLeader."
             )
-        if size % 2 == 0:
-            # Even sizes tolerate the same number of failures as the odd size
-            # below them (e.g. 4 tolerates 1, same as 3): the extra node only
-            # adds something that can fail. Allowed, but warn.
-            logger.warning(
-                "cluster.electLeader: an even cluster size (%d nodes) "
-                "tolerates no more failures than %d; prefer an odd size.",
-                size,
-                size - 1,
-            )
-    elif cfg["distribution"] != DEFAULT_CLUSTER["distribution"]:
-        # distribution only governs how *leader-gated* jobs spread, so it does
-        # nothing without electLeader. Warn rather than fail (harmless).
-        logger.warning(
-            "cluster.distribution=%r has no effect without electLeader; "
-            "without leader election every node runs every job.",
-            cfg["distribution"],
-        )
     return ClusterConfig(cfg)
+
+
+def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
+    """Non-fatal advisories for a cluster config, returned as messages.
+
+    Returned (not logged) so the caller can emit them *once* — e.g. when the
+    cluster manager (re)starts — instead of on every config reload. The daemon
+    re-parses its config every wakeup, so logging here would spam the same
+    warning every minute for the life of the process.
+    """
+    warnings: List[str] = []
+    if cfg.get("electLeader"):
+        # `peers` lists every OTHER member, so size is that many plus self.
+        size = len(cfg["peers"]) + 1
+        # size == 2 is rejected outright in _build_cluster_config; an even
+        # size > 2 tolerates the same failures as the odd size below it (e.g. 4
+        # tolerates 1, same as 3), so the extra node only adds something that
+        # can fail. Allowed, but worth a warning.
+        if size > 2 and size % 2 == 0:
+            warnings.append(
+                "cluster.electLeader: an even cluster size ({} nodes) "
+                "tolerates no more failures than {}; prefer an odd "
+                "size.".format(size, size - 1)
+            )
+    elif cfg.get("distribution") != DEFAULT_CLUSTER["distribution"]:
+        # distribution only governs how *leader-gated* jobs spread, so it does
+        # nothing without electLeader.
+        warnings.append(
+            "cluster.distribution={!r} has no effect without electLeader; "
+            "without leader election every node runs every job.".format(
+                cfg.get("distribution")
+            )
+        )
+    return warnings
 
 
 @dataclass

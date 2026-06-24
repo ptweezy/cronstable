@@ -155,17 +155,18 @@ Content-Type: application/json; charset=utf-8
 ### `GET /cluster`
 
 Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
-*New in version 1.2.0.* When no `cluster` section is configured, it returns
+*New in version 1.1.8.* When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus the node's view: its `node_name` and `job_set_id`, the
 computed `cluster_size` and `quorum`, whether `elect_leader` is on, the
-`distribution` mode (`single-leader` or `spread`), whether this node is
-`quorate`, the elected `leader` (`null` when this node is not quorate, and
-always `null` in `spread` mode) and `is_leader` (always `false` in `spread`
-mode), and a `peers` array (each with `host`, `status`, `node_name`,
-`job_set_id`, `last_seen`, `last_error`, and `mismatch_streak`). Under
-`distribution: spread`, per-job owners instead appear as a `clusterOwner` field
-on each leader-gated job in `GET /jobs`.
+`distribution` mode (`single-leader` or `spread`), whether a duplicate
+`nodeName` is visible (`conflict`, with the offending names in
+`conflict_names`), whether this node is `quorate`, the elected `leader` (`null`
+when this node is not quorate, and always `null` in `spread` mode) and
+`is_leader` (always `false` in `spread` mode), and a `peers` array (each with
+`host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
+`mismatch_streak`). Under `distribution: spread`, per-job owners instead appear
+as a `clusterOwner` field on each leader-gated job in `GET /jobs`.
 
 ```shell
 $ http get http://127.0.0.1:8080/cluster Accept:application/json
@@ -180,6 +181,8 @@ Content-Type: application/json; charset=utf-8
     "quorum": 2,
     "elect_leader": true,
     "distribution": "single-leader",
+    "conflict": false,
+    "conflict_names": [],
     "quorate": true,
     "leader": "node-a",
     "is_leader": true,
@@ -190,7 +193,7 @@ Content-Type: application/json; charset=utf-8
 ```
 
 The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
-`untrusted`, `self`, `unknown`) are documented in
+`untrusted`, `self`, `conflict`, `unknown`) are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status).
 
 > The separate `GET /peer` attestation endpoint is **not** part of this web API.

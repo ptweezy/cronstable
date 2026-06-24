@@ -14,7 +14,7 @@ elected leader firing scheduled jobs. It builds directly on the
 `yacron2/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
-*New in version 1.2.0.*
+*New in version 1.1.8.*
 
 > **This is best-effort coordination, not fenced exactly-once.** It keeps no
 > shared state, so it is simple to operate and cannot wedge on a missing
@@ -105,7 +105,8 @@ dashboard panel carries one of these statuses (the constants live in
 | `drifted` | Reachable, but its id has differed for `driftAfter` consecutive rounds (an actual disagreement). Also used immediately (no debounce) when the peer reports a different fingerprint **scheme** (`v1:` vs another), since such ids are not comparable. |
 | `unreachable` | Connect/timeout/`OSError`: the peer could not be contacted this round. |
 | `untrusted` | TLS/certificate verification failed: the peer is not (or not provably) a cluster member. |
-| `self` | The peer reported *this* node's own `nodeName` (an operator listed this node's own address in its peer list). It never counts toward agreement. |
+| `self` | The peer reported *this* node's own `nodeName` **and** its own instance id (an operator listed this node's own address in its peer list). It never counts toward agreement. |
+| `conflict` | The peer reported this node's `nodeName` but a *different* instance id — a **duplicate `nodeName`** (two nodes sharing a name). It never counts toward agreement, and while any conflict is visible `Leader` jobs fail closed. See [Unique node names](#unique-node-names). |
 | `unknown` | Not yet contacted (the initial state before the first poll). |
 
 A peer reported as `unreachable` or `untrusted` resets its drift streak, because
@@ -161,6 +162,35 @@ one side is quorate, and therefore **at most one leader exists**. The price is
 liveness: a node that cannot see a majority deliberately **stands down** (runs
 nothing) rather than risk a second leader. A `Leader` job therefore runs on a
 given firing only while a majority of the cluster is up and mutually reachable.
+
+### Unique node names
+
+The safety argument above assumes every node has a **distinct `nodeName`**. If
+two nodes shared one, each would compute itself as the lowest name in its live
+set and *both* would elect themselves — a silent double-run, exactly what
+election is meant to prevent. So `nodeName` uniqueness is a correctness
+requirement, not just a nicety.
+
+yacron2 enforces it at runtime. Each process mints a random **instance id** at
+startup and reports it on `/peer` alongside its `nodeName`. That lets a node
+distinguish two cases that otherwise look identical:
+
+* a **benign self-listing** — an operator put this node's own address in its
+  own peer list — where the peer reports *this* node's name *and* its own
+  instance id (status `self`); from
+* a **duplicate `nodeName`** — a *different* process announcing this node's
+  name — where the instance id differs (status `conflict`). A third node can
+  likewise spot two distinct instances claiming one name.
+
+While any `conflict` is visible, this node's **`Leader` jobs fail closed**
+(stand down) instead of risking a double-run, and the conflict is surfaced as a
+`conflict` flag on [`GET /cluster`](#observing-the-cluster), a banner in the
+dashboard cluster panel, and an `ERROR` log line. It clears automatically once
+the duplicate is renamed — the gate is self-healing. `PreferLeader` is *not*
+gated on conflicts: it already accepts double-runs as the price of never
+skipping. The default `nodeName` (the system hostname) is already unique per
+host; set an explicit, unique `nodeName` when several nodes might share a
+hostname (e.g. identical container images without distinct hostnames).
 
 ### Sizing the cluster
 
@@ -279,14 +309,30 @@ The decision for one node, one firing, is exactly:
 ```text
 election off  -> run (every node runs everything)
 EveryNode     -> run (always, even if the manager failed to start)
+conflict      -> skip (fail closed; a duplicate nodeName is visible)
 no manager    -> skip (fail closed)
 PreferLeader  -> run only if this node is the lowest reachable agreeing node
 Leader        -> run only if this node is the quorum-gated elected leader
 ```
 
-(Under `distribution: spread`, described next, the last two lines become "the
-*per-job owner* among the reachable agreeing nodes" and "the quorum-gated
-*per-job owner*" respectively.)
+(The `conflict` row applies to `Leader` only; `PreferLeader` and `EveryNode`
+are not gated on a duplicate `nodeName`. Under `distribution: spread`, described
+next, the last two lines become "the *per-job owner* among the reachable
+agreeing nodes" and "the quorum-gated *per-job owner*" respectively.)
+
+### `@reboot` jobs under leader election
+
+`@reboot` fires once at startup, which is the one instant the cluster has *not*
+yet converged — no peer has been polled, so there is no quorum and no elected
+owner. Under `electLeader`, an `@reboot` job with `Leader` or `PreferLeader`
+policy is therefore **deferred**: held until the cluster converges, then run
+**once** on the elected (quorum-gated) owner. Without this, a `Leader` `@reboot`
+job would *never* run (it saw no quorum at boot and `@reboot` never re-fires),
+and a `PreferLeader` one would run on *every* node (each saw only itself). If no
+quorum ever forms, a deferred `@reboot` job does not run (consistent with
+`Leader` semantics). For `@reboot` work that must run on **every** node at boot
+(warming a local cache, announcing the node), use `clusterPolicy: EveryNode`,
+which is not deferred.
 
 ## Distribution: one leader, or spread the load
 
@@ -371,6 +417,8 @@ JSON. When no `cluster` section is configured it returns
   "quorum": 2,
   "elect_leader": true,
   "distribution": "single-leader", // or "spread"
+  "conflict": false,               // true if a duplicate nodeName is visible
+  "conflict_names": [],            // the duplicated nodeName(s), if any
   "quorate": true,                 // whether this node sees a quorum
   "leader": "node-a",              // null when not quorate, or always in spread mode
   "is_leader": true,               // always false in spread mode (no single leader)

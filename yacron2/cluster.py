@@ -15,6 +15,16 @@ The trust model is deliberately simple and keeps no shared state:
 * **Each node keeps its own view.**  ``ClusterView`` is just this node's table
   of what it last observed per peer; two healthy nodes converge to the same
   picture, and any disagreement is itself the signal.  Nobody is authoritative.
+* **Identities must be distinct.**  The election's safety rests on every node
+  having a unique ``nodeName``; two nodes sharing one would *both* elect
+  themselves (each is the ``min`` of its own live set) and double-run.  Each
+  process therefore mints a random ``instance_id`` at startup and reports it
+  alongside its name, so a node can tell a benign self-listing (same name *and*
+  instance id) from a genuine duplicate (same name, *different* instance), and
+  a third node can spot two distinct instances claiming one name.  A detected
+  duplicate is reported as ``conflict`` and makes the quorum-gated leader gate
+  fail closed (see :meth:`ClusterManager.has_conflict`), so a misconfiguration
+  pauses ``Leader`` jobs rather than silently double-running them.
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
@@ -50,6 +60,7 @@ import datetime
 import hashlib
 import logging
 import ssl
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -63,12 +74,23 @@ logger = logging.getLogger("yacron2.cluster")
 
 # Per-peer status, as reported in the /cluster view.
 STATUS_UNKNOWN = "unknown"  # not yet contacted
-STATUS_SELF = "self"  # the peer reported our own node name
+STATUS_SELF = "self"  # the peer reported our own node name AND instance id
 STATUS_AGREED = "agreed"  # reachable, same job-set id
 STATUS_SYNCING = "syncing"  # reachable, id differs but within driftAfter
 STATUS_DRIFTED = "drifted"  # reachable, id has differed >= driftAfter rounds
 STATUS_UNREACHABLE = "unreachable"  # connect/timeout failure
 STATUS_UNTRUSTED = "untrusted"  # TLS/cert verification failed
+# A *different* running instance is announcing our own nodeName: a duplicate
+# nodeName, which breaks the election's distinct-identity assumption. Never
+# counts toward agreement, and makes the leader gate fail closed (see
+# ClusterManager.has_conflict / yacron2.cron._cluster_allows).
+STATUS_CONFLICT = "conflict"
+
+# Statuses for which we hold no fresh observation of the peer's identity this
+# round, so the peer is ignored when detecting nodeName collisions.
+_STALE_STATUSES = frozenset(
+    {STATUS_UNKNOWN, STATUS_UNREACHABLE, STATUS_UNTRUSTED}
+)
 
 
 def quorum_size(cluster_size: int) -> int:
@@ -189,6 +211,10 @@ class PeerState:
     status: str = STATUS_UNKNOWN
     job_set_id: Optional[str] = None  # peer's last-reported id
     node_name: Optional[str] = None  # peer's last-reported node name
+    # peer's last-reported per-process instance id, used to distinguish a
+    # benign self-listing from a duplicate nodeName (see record_success).
+    # Deliberately not surfaced in to_dict (it is an internal liveness token).
+    instance_id: Optional[str] = None
     last_seen: Optional[datetime.datetime] = None  # last successful contact
     last_error: Optional[str] = None
     # consecutive reachable-but-mismatched rounds, for the drift hysteresis
@@ -233,16 +259,33 @@ class ClusterView:
         my_id: str,
         now: datetime.datetime,
         my_name: str,
+        peer_instance: Optional[str] = None,
+        my_instance: Optional[str] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
         peer.last_error = None
         peer.job_set_id = peer_id
         peer.node_name = peer_name
+        peer.instance_id = peer_instance
 
         if peer_name is not None and peer_name == my_name:
-            # the peer recognised itself: an operator listed this node's own
-            # address. Not a real peer, so it never counts toward agreement.
+            if peer_instance is not None and peer_instance != my_instance:
+                # A *different* running instance is announcing our own
+                # nodeName. That is a duplicate nodeName, which silently breaks
+                # the election's core assumption (distinct identities -> a
+                # single leader). Surface it as a hard conflict instead of
+                # masking it as 'self'; the leader gate then fails closed.
+                peer.status = STATUS_CONFLICT
+                peer.mismatch_streak = 0
+                peer.last_error = (
+                    "duplicate nodeName {!r}: peer is a different "
+                    "instance".format(peer_name)
+                )
+                return
+            # Same name *and* same instance id (the operator listed this node's
+            # own address), or a peer too old to report an instance id: the
+            # benign self case. Never counts toward agreement.
             peer.status = STATUS_SELF
             peer.mismatch_streak = 0
             return
@@ -322,6 +365,12 @@ class ClusterManager:
         self.config = config
         self.get_job_set_id = get_job_set_id
         self.node_name: str = config["nodeName"]
+        # A random per-process identity, reported alongside node_name so peers
+        # can tell a benign self-listing from a duplicate nodeName (a different
+        # process claiming the same name); see ClusterView.record_success and
+        # has_conflict. Changes every restart, which is fine: it only ever
+        # distinguishes "is this the same running process as me".
+        self.instance_id: str = uuid.uuid4().hex
         # "single-leader" (one leader runs all Leader jobs) or "spread"
         # (per-job ownership via rendezvous hashing); see _cluster_allows.
         self.distribution: str = config.get("distribution", "single-leader")
@@ -343,6 +392,7 @@ class ClusterManager:
                 "node_name": self.node_name,
                 "job_set_id": self.get_job_set_id(),
                 "scheme_version": SCHEME_VERSION,
+                "instance_id": self.instance_id,
             }
         )
 
@@ -436,6 +486,8 @@ class ClusterManager:
             my_id,
             now,
             self.node_name,
+            peer_instance=data.get("instance_id"),
+            my_instance=self.instance_id,
         )
 
     # --- leader election --------------------------------------------------
@@ -460,6 +512,50 @@ class ClusterManager:
             for peer in self.view.peers.values()
             if peer.status == STATUS_AGREED and peer.node_name is not None
         ]
+
+    # --- duplicate-nodeName detection ------------------------------------
+
+    def _live_named_members(self) -> List["tuple[str, str]"]:
+        """``(node_name, identity)`` for this node and every peer we currently
+        have a fresh name for.
+
+        ``identity`` is the peer's per-process ``instance_id`` (falling back to
+        its host when an older peer reports none), so a single ``node_name``
+        backed by two distinct identities is a duplicate nodeName.  Stale peers
+        (unreachable/untrusted/never-contacted) are skipped: we have no current
+        observation of who they are.
+        """
+        members: List["tuple[str, str]"] = [
+            (self.node_name, self.instance_id)
+        ]
+        for peer in self.view.peers.values():
+            if peer.node_name is None or peer.status in _STALE_STATUSES:
+                continue
+            members.append(
+                (peer.node_name, peer.instance_id or "host:" + peer.host)
+            )
+        return members
+
+    def conflict_names(self) -> List[str]:
+        """nodeNames currently claimed by more than one distinct instance.
+
+        Non-empty means a duplicate ``nodeName`` is present, which makes the
+        quorum election unsafe (two nodes would each elect themselves), so the
+        ``Leader`` gate treats it as fail-closed.  A benign self-listing (same
+        name *and* same instance id) is not a conflict.
+        """
+        by_name: Dict[str, str] = {}
+        conflicts = set()
+        for name, ident in self._live_named_members():
+            prev = by_name.get(name)
+            if prev is not None and prev != ident:
+                conflicts.add(name)
+            by_name[name] = ident
+        return sorted(conflicts)
+
+    def has_conflict(self) -> bool:
+        """Whether any duplicate nodeName is currently visible to this node."""
+        return bool(self.conflict_names())
 
     def leader_name(self) -> Optional[str]:
         """Elected leader as this node sees it, or ``None`` if not quorate."""
@@ -513,6 +609,7 @@ class ClusterManager:
     def view_dict(self) -> Dict[str, Any]:
         leader = self.leader_name()
         spread = self.distribution == "spread"
+        conflicts = self.conflict_names()
         return {
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
@@ -520,6 +617,10 @@ class ClusterManager:
             "quorum": self.quorum(),
             "elect_leader": bool(self.config.get("electLeader")),
             "distribution": self.distribution,
+            # a duplicate nodeName was detected: Leader jobs fail closed until
+            # it clears (see has_conflict / cron._cluster_allows).
+            "conflict": bool(conflicts),
+            "conflict_names": conflicts,
             "quorate": leader is not None,
             # In spread mode there is no single leader: ownership is per job,
             # so leader/is_leader are not meaningful (reported null/false).

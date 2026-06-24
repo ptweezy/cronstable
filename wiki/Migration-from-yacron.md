@@ -55,7 +55,7 @@ string). See [Running on Windows](Running-on-Windows).
 `requires-python` is `>=3.10`; Python 3.10 through 3.14 are supported. Python
 3.9 and earlier are no longer supported. If your host runs an older
 interpreter, use the self-contained binary (which embeds Python) or the
-container image instead of a `pip` install. Since 1.2.0, `pip install yacron2`
+container image instead of a `pip` install. Since 1.1.7, `pip install yacron2`
 and the self-contained binaries also work natively on Windows (amd64/arm64);
 see [Running on Windows](Running-on-Windows). See [Installation](Installation).
 

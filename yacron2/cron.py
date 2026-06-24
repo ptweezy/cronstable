@@ -28,6 +28,7 @@ from yacron2.config import (
     LoggingConfig,
     WebConfig,
     Yacron2Config,
+    cluster_config_warnings,
     parse_config,
     parse_config_string,
 )
@@ -283,6 +284,12 @@ class Cron:
         self._elect_leader_configured = False
         # last leadership state we logged, so we only log on transition
         self._was_leader = False
+        # last duplicate-nodeName state we logged, so we only log on transition
+        self._was_conflict = False
+        # @reboot Leader/PreferLeader jobs that could not start at boot because
+        # the cluster had not yet elected an owner; run once on convergence.
+        # name -> JobConfig; see _process_pending_reboots.
+        self._pending_reboot_jobs = {}  # type: Dict[str, JobConfig]
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -782,6 +789,11 @@ class Cron:
             await self.cluster_manager.stop()
             self.cluster_manager = None
         if cluster_config is not None and self.cluster_manager is None:
+            # Emit non-fatal advisories here (only when a manager is actually
+            # (re)started) rather than at parse time, which runs every reload
+            # and would repeat the same warning every minute.
+            for warning in cluster_config_warnings(cluster_config):
+                logger.warning("%s", warning)
             manager = ClusterManager(cluster_config, self.job_set_id)
             try:
                 await manager.start()
@@ -861,8 +873,101 @@ class Cron:
     async def spawn_jobs(self, startup: bool) -> None:
         self._log_cluster_role()
         for job in self.cron_jobs.values():
-            if self.job_should_run(startup, job) and self._cluster_allows(job):
+            if not self.job_should_run(startup, job):
+                continue
+            if startup and self._is_deferrable_reboot(job):
+                # @reboot + Leader/PreferLeader under election: at the startup
+                # instant the cluster has not converged, so we cannot tell who
+                # owns the job yet. Defer it and run once on the elected owner
+                # (see _process_pending_reboots). Running it now would either
+                # skip it forever (Leader sees no quorum) or run it on every
+                # node (PreferLeader sees only itself). EveryNode @reboot is
+                # not deferred: it is meant to run on every node at boot.
+                self._pending_reboot_jobs[job.name] = job
+                logger.info(
+                    "cluster: deferring @reboot job %s until the cluster "
+                    "elects an owner",
+                    job.name,
+                )
+                continue
+            if self._cluster_allows(job):
                 await self.launch_scheduled_job(job)
+        await self._process_pending_reboots()
+
+    def _is_deferrable_reboot(self, job: JobConfig) -> bool:
+        """Whether ``job`` is an @reboot job whose start must wait for the
+        cluster to elect an owner (a ``Leader``/``PreferLeader`` job under
+        ``electLeader``)."""
+        return (
+            self._elect_leader_configured
+            and isinstance(job.schedule, str)
+            and job.schedule == "@reboot"
+            and job.clusterPolicy in ("Leader", "PreferLeader")
+        )
+
+    def _reboot_owner(self, job: JobConfig) -> Optional[str]:
+        """The node that should run a deferred @reboot ``job`` once the cluster
+        converges, or ``None`` if undecided (no quorum yet, or a nodeName
+        conflict).
+
+        Both ``Leader`` and ``PreferLeader`` @reboot one-shots are gated on the
+        quorum owner, so exactly one node runs them after convergence — this
+        avoids the pre-convergence ``PreferLeader`` race where every node,
+        seeing only itself, would run the job.
+        """
+        mgr = self.cluster_manager
+        assert mgr is not None
+        if mgr.has_conflict():
+            return None  # unsafe to pick an owner while a nodeName collides
+        if mgr.distribution == "spread":
+            return mgr.job_owner(job.name)  # quorum-gated; None without quorum
+        return mgr.leader_name()  # quorum-gated; None without quorum
+
+    async def _process_pending_reboots(self) -> None:
+        """Run each deferred @reboot job once the cluster has elected an owner.
+
+        For every pending job: run it here if this node is the elected owner;
+        drop it if another node is the owner (it will run there); otherwise
+        keep waiting (no quorum yet, or a nodeName conflict). If election was
+        turned off on a reload, the gating is gone, so run them here.
+        """
+        if not self._pending_reboot_jobs:
+            return
+        if not self._elect_leader_configured:
+            # election removed on reload: nothing gates these anymore -> run.
+            for name in list(self._pending_reboot_jobs):
+                job = self._pending_reboot_jobs.pop(name)
+                if name in self.cron_jobs:
+                    await self.launch_scheduled_job(job)
+            return
+        mgr = self.cluster_manager
+        if mgr is None:
+            # election wanted but no manager -> fail closed, keep waiting
+            return
+        for name in list(self._pending_reboot_jobs):
+            if name not in self.cron_jobs:
+                del self._pending_reboot_jobs[name]  # removed on a reload
+                continue
+            job = self._pending_reboot_jobs[name]
+            owner = self._reboot_owner(job)
+            if owner == mgr.node_name:
+                del self._pending_reboot_jobs[name]
+                logger.info(
+                    "cluster: running deferred @reboot job %s (this node is "
+                    "the elected owner)",
+                    name,
+                )
+                await self.launch_scheduled_job(job)
+            elif owner is not None:
+                # another node owns it and will run it -> stop waiting here
+                del self._pending_reboot_jobs[name]
+                logger.info(
+                    "cluster: deferred @reboot job %s will run on %s; "
+                    "standing down here",
+                    name,
+                    owner,
+                )
+            # else owner is None -> not converged / conflict -> keep waiting
 
     def _cluster_allows(self, job: JobConfig) -> bool:
         """Whether this node may run *scheduled* ``job`` this cycle.
@@ -889,6 +994,12 @@ class Cron:
         is configured but no manager is running, so a broken cluster does not
         make every replica fire.  Manual (API) triggers and retries go through
         ``maybe_launch_job`` and are unaffected by any of this.
+
+        A detected duplicate ``nodeName`` (``mgr.has_conflict()``) additionally
+        makes ``Leader`` jobs fail closed: the quorum election is unsafe while
+        two nodes share a name (each would elect itself), so skipping is the
+        at-most-once-preserving choice.  ``PreferLeader`` is left running — it
+        already accepts double-runs as the price of never skipping.
         """
         if not self._elect_leader_configured:
             return True
@@ -900,9 +1011,13 @@ class Cron:
         if mgr.distribution == "spread":
             if job.clusterPolicy == "PreferLeader":
                 return mgr.is_available_job_owner(job.name)
+            if mgr.has_conflict():
+                return False  # "Leader": fail closed on a duplicate nodeName
             return mgr.is_job_owner(job.name)  # "Leader"
         if job.clusterPolicy == "PreferLeader":
             return mgr.is_available_leader()
+        if mgr.has_conflict():
+            return False  # "Leader": fail closed on a duplicate nodeName
         return mgr.is_leader()  # "Leader"
 
     def _log_cluster_role(self) -> None:
@@ -915,6 +1030,25 @@ class Cron:
         if not self._elect_leader_configured:
             return
         mgr = self.cluster_manager
+        if mgr is not None:
+            # A duplicate nodeName is a misconfiguration that pauses Leader
+            # jobs cluster-wide; log it loudly (and the recovery), once per
+            # transition, so an operator notices and fixes the names.
+            conflict = mgr.conflict_names()
+            if bool(conflict) != self._was_conflict:
+                if conflict:
+                    logger.error(
+                        "cluster: duplicate nodeName detected (%s) -- Leader "
+                        "jobs will stand down until every node has a unique "
+                        "cluster.nodeName",
+                        ", ".join(conflict),
+                    )
+                else:
+                    logger.info(
+                        "cluster: nodeName conflict resolved; Leader jobs may "
+                        "run again"
+                    )
+                self._was_conflict = bool(conflict)
         if mgr is not None and mgr.distribution == "spread":
             quorate = mgr.is_quorate()
             if quorate != self._was_leader:

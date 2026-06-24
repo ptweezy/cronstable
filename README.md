@@ -1252,6 +1252,12 @@ on any node.
   lists must be consistent across nodes. The computed size, quorum, elected
   leader, and whether this node is the leader are all shown at `GET /cluster`
   and in the dashboard panel.
+* **Give every node a unique `nodeName`.** The election's safety depends on it
+  (two nodes sharing a name would each elect themselves and double-run). Each
+  process reports a random instance id alongside its name, so a duplicate is
+  detected and shown as a `conflict`; while one is visible, `Leader` jobs
+  **fail closed** (stand down) rather than risk a double-run. The default
+  `nodeName` is the system hostname, which is already unique per host.
 * **The quorum gate is what makes this safe with no shared state.** Two strict
   majorities of `N` can't be disjoint, so under a clean network partition at
   most one side is quorate and at most one leader exists. The trade-off is
@@ -1317,6 +1323,11 @@ start; `Leader`/`PreferLeader` jobs fail closed there. The active policy for
 each job (when election is on) is shown in the dashboard's job drawer and in the
 `GET /jobs` payload, and it is part of the [job-set id](#job-set-id), so
 replicas that disagree on a job's policy show up as drift.
+
+An `@reboot` job with `Leader`/`PreferLeader` policy is **deferred** until the
+cluster converges and then runs **once** on the elected owner (rather than never
+running, or running on every node at boot). Use `EveryNode` for `@reboot` work
+that must run on every node at startup.
 
 #### Distribution: one leader, or spread the load
 
