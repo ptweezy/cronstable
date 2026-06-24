@@ -1,6 +1,8 @@
+import asyncio
 import datetime
 import socket
 
+import aiohttp
 import pytest
 
 from yacron2.cluster import (
@@ -12,6 +14,7 @@ from yacron2.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    _split_host_port,
     elect_available_job_owner,
     elect_available_leader,
     elect_job_owner,
@@ -739,3 +742,245 @@ async def test_mtls_spread_assigns_distinct_owners(tmp_path):
     finally:
         await a.stop()
         await b.stop()
+
+
+# --------------------------------------------------------------------------
+# ClusterManager I/O + accessors WITHOUT cryptography
+#
+# The mTLS round-trip tests above mint real certs, so they self-skip where
+# `cryptography` ships no wheel (e.g. win-arm64) -- and they are the *only*
+# tests that touch ClusterManager's network surface, so on that platform
+# cluster.py coverage collapses and the --cov-fail-under gate would fail.
+# These tests stub the TLS context builders and fake the aiohttp session to
+# drive the same paths (init, the /peer handler, start/stop + poll loop,
+# _poll_peer's success/untrusted/unreachable branches, and the election
+# accessors) with no certs and no real handshake, keeping the cluster code
+# covered on every platform. They complement -- not replace -- the
+# real-handshake mTLS tests above.
+# --------------------------------------------------------------------------
+
+_DUMMY_TLS = {"ca": "ca", "cert": "cert", "key": "key"}
+
+
+@pytest.fixture
+def no_tls(monkeypatch):
+    # make ClusterManager constructible without real certs; start() then serves
+    # plaintext (ssl_context=None), which is all these tests need.
+    monkeypatch.setattr(
+        "yacron2.cluster.build_client_ssl_context", lambda tls: None
+    )
+    monkeypatch.setattr(
+        "yacron2.cluster.build_server_ssl_context", lambda tls: None
+    )
+
+
+def test_split_host_port_ok():
+    assert _split_host_port("host:8443") == ("host", 8443)
+    assert _split_host_port("127.0.0.1:1") == ("127.0.0.1", 1)
+
+
+def test_split_host_port_rejects_bad_input():
+    with pytest.raises(ValueError):
+        _split_host_port("noport")
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_payload(no_tls):
+    import json
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    resp = await mgr._handle_peer(_Req())
+    assert json.loads(resp.text) == {
+        "node_name": "node-a",
+        "job_set_id": "v1:mine",
+        "scheme_version": SCHEME_VERSION,
+    }
+
+
+def _seed_agree(mgr, host, name):
+    # mark a configured peer AGREED, as a successful poll round would
+    peer = mgr.view.peers[host]
+    peer.status = STATUS_AGREED
+    peer.node_name = name
+    peer.job_set_id = "v1:mine"
+
+
+def test_manager_accessors_single_leader_quorate(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    assert mgr.cluster_size() == 3
+    assert mgr.quorum() == 2
+    assert mgr._agreeing_peer_names() == ["node-b", "node-c"]
+    assert mgr.leader_name() == "node-a"
+    assert mgr.is_leader() is True
+    assert mgr.is_quorate() is True
+    assert mgr.available_leader_name() == "node-a"
+    assert mgr.is_available_leader() is True
+    view = mgr.view_dict()
+    assert view["is_leader"] is True
+    assert view["leader"] == "node-a"
+    assert view["distribution"] == "single-leader"
+    assert view["quorate"] is True
+    assert len(view["peers"]) == 2
+
+
+def test_manager_accessors_minority_stands_down(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # no peer agreeing -> below quorum -> no leader
+    assert mgr.leader_name() is None
+    assert mgr.is_leader() is False
+    assert mgr.is_quorate() is False
+    # available_* ignores quorum: an isolated node still leads itself
+    assert mgr.is_available_leader() is True
+
+
+def test_manager_accessors_spread(no_tls):
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
+    cfg["distribution"] = "spread"
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    members = {"node-a", "node-b", "node-c"}
+    owner = mgr.job_owner("job-x")
+    assert owner in members
+    assert mgr.is_job_owner("job-x") == (owner == "node-a")
+    assert mgr.available_job_owner("job-x") in members
+    assert isinstance(mgr.is_available_job_owner("job-x"), bool)
+    view = mgr.view_dict()
+    assert view["leader"] is None  # spread mode has no single leader
+    assert view["is_leader"] is False
+    assert view["distribution"] == "spread"
+
+
+def test_manager_spread_job_owner_none_without_quorum(no_tls):
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
+    cfg["distribution"] = "spread"
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    assert mgr.job_owner("job-x") is None
+    assert mgr.is_job_owner("job-x") is False
+
+
+# fake aiohttp session for _poll_peer / _poll_all (no sockets, no certs) -----
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeGet:
+    def __init__(self, resp=None, exc=None):
+        self._resp = resp
+        self._exc = exc
+
+    async def __aenter__(self):
+        if self._exc is not None:
+            raise self._exc
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeSession:
+    def __init__(self, get_result):
+        self._get_result = get_result
+        self.calls = []
+
+    def get(self, url, ssl=None):
+        self.calls.append((url, ssl))
+        return self._get_result
+
+
+class _FakeSSLError(aiohttp.ClientSSLError):
+    # the real __init__ wants a connection key / os error; bypass it and give
+    # str() (which record_failure logs) something printable.
+    def __init__(self):
+        pass
+
+    def __str__(self):
+        return "fake ssl handshake failure"
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_success_records_agreement(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_AGREED
+    assert peer.node_name == "node-b"
+    assert session.calls[0][0] == "https://b:1/peer"
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_ssl_error_is_untrusted(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(_FakeGet(exc=_FakeSSLError()))
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].status == STATUS_UNTRUSTED
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_client_error_is_unreachable(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_poll_all_with_no_peers_is_noop(no_tls):
+    # exercises _poll_all's session setup + empty gather with no network
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    await mgr._poll_all()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_start_stop_lifecycle_plaintext(no_tls):
+    # no peers -> the poll loop's _poll_all is a no-op (no peer sockets), so
+    # this drives start()/_poll_loop/stop() over a plaintext listener with no
+    # certs. stop() is called twice to cover the already-stopped path.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, f"127.0.0.1:{_free_port()}", [], "node-a"),
+        lambda: "v1:mine",
+    )
+    await mgr.start()
+    try:
+        await asyncio.sleep(0)  # let the poll loop reach its first wait
+    finally:
+        await mgr.stop()
+    await mgr.stop()  # idempotent: nothing running
