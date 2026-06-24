@@ -1,0 +1,106 @@
+# A three-node yacron2 cluster with mutual-TLS peer attestation and leader
+# election — a playground for the clustering features.
+#
+#   docker compose -f docker-compose-cluster.yml up --build      # start
+#   docker compose -f docker-compose-cluster.yml logs -f         # watch output
+#   docker compose -f docker-compose-cluster.yml down            # stop
+#   docker compose -f docker-compose-cluster.yml down -v         # stop + wipe certs
+#
+# Three nodes (yacron-a, -b, -c) are deployed from one identical job set
+# (example/cluster/jobs.yaml) plus a per-node cluster section that gives each
+# its TLS identity and peer list. A one-shot `certgen` service mints a throwaway
+# cluster CA and one cert per node (SAN = service name) into a shared volume
+# before the nodes start.
+#
+# Each node serves its own dashboard:
+#   - yacron-a -> http://localhost:8080/
+#   - yacron-b -> http://localhost:8081/
+#   - yacron-c -> http://localhost:8082/
+# Scroll to the "cluster" panel at the bottom of any dashboard to see the peer
+# table, the agreement tally, the quorum, and which node is the leader.
+#
+# THINGS TO TRY
+# -------------
+# 1. Watch it converge. On startup each node reports its peers "unreachable",
+#    then "agreed" within ~10s (the poll interval). The leader is "yacron-a"
+#    (the lowest node name). Confirm with:
+#        curl -s localhost:8080/cluster | jq        # is_leader: true
+#        curl -s localhost:8081/cluster | jq        # leader: "yacron-a"
+#
+# 2. Compare the policies. Open the job drawers / history on all three:
+#        - tick-every-node   (EveryNode)   -> runs on ALL three nodes
+#        - tick-leader-only  (Leader)      -> runs ONLY on the leader (yacron-a)
+#        - tick-prefer-leader(PreferLeader)-> runs on the lowest reachable node
+#
+# 3. Fail the leader.   docker compose -f docker-compose-cluster.yml stop yacron-a
+#    yacron-b and yacron-c still see each other -> quorum holds (2 of 3), and
+#    leadership moves to yacron-b. tick-leader-only now advances on 8081.
+#
+# 4. Lose quorum.       docker compose -f docker-compose-cluster.yml stop yacron-a yacron-b
+#    The lone survivor (yacron-c) can see only itself: 1 of 3 is below quorum, so
+#    it STANDS DOWN — tick-leader-only stops running anywhere (the safety/
+#    liveness trade). tick-every-node keeps running on yacron-c regardless.
+#    Bring them back:   docker compose -f docker-compose-cluster.yml start yacron-a yacron-b
+#
+# 5. Manual triggers ignore the leader. Hit "Run now" on `run-me-anywhere` from
+#    a follower's dashboard (8081/8082) — it runs there. Manual triggers and
+#    retries are never leader-gated.
+#
+# 6. Cause drift. Edit example/cluster/jobs.yaml on ONE node only by pointing its
+#    jobs volume at a different file, restart it, and watch its peers report
+#    "drifted" (after driftAfter=2 rounds) on the others' cluster panels.
+
+x-yacron-node: &yacron-node
+  build:
+    context: .
+  image: yacron2-cluster:local      # built once, reused by all three nodes
+  restart: unless-stopped
+  depends_on:
+    certgen:
+      condition: service_completed_successfully
+
+services:
+  # One-shot: generate the cluster CA + per-node certs into the shared volume,
+  # then exit. The nodes wait for this to finish successfully.
+  certgen:
+    image: alpine:3.20
+    command: ["sh", "/gen-certs.sh"]
+    volumes:
+      - cluster-certs:/certs
+      - ./example/cluster/gen-certs.sh:/gen-certs.sh:ro
+
+  yacron-a:
+    <<: *yacron-node
+    container_name: yacron-a
+    hostname: yacron-a              # also sets $HOSTNAME, used in the job output
+    ports:
+      - "8080:8080"                 # dashboard; 8443 (cluster mTLS) stays internal
+    volumes:
+      - ./example/cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
+      - ./example/cluster/node-a.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - cluster-certs:/certs:ro
+
+  yacron-b:
+    <<: *yacron-node
+    container_name: yacron-b
+    hostname: yacron-b
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./example/cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
+      - ./example/cluster/node-b.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - cluster-certs:/certs:ro
+
+  yacron-c:
+    <<: *yacron-node
+    container_name: yacron-c
+    hostname: yacron-c
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./example/cluster/jobs.yaml:/etc/yacron2.d/jobs.yaml:ro
+      - ./example/cluster/node-c.yaml:/etc/yacron2.d/cluster.yaml:ro
+      - cluster-certs:/certs:ro
+
+volumes:
+  cluster-certs:
