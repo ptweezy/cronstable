@@ -903,7 +903,7 @@ async def test_report_mail_closes_connection_on_error():
 # The child drops supplementary groups BEFORE setuid (the classic "forgot
 # setgroups() before setuid()" privilege-escalation bug). A refactor that
 # reorders these syscalls, drops the setgroups([]) fallback, swaps initgroups
-# for a plain setgid, or stops wrapping OSError would silently re-open that hole
+# for a plain setgid, or stops wrapping OSError, would re-open that hole
 # or run the job as the wrong account. There is no test that catches it today,
 # yet _demote runs on every POSIX deploy that uses user/group. These lock the
 # exact syscall order, both group branches, and the error wrapping.
@@ -928,7 +928,7 @@ def _make_job_with_ids(uid=None, gid=None, username=None):
 
 def _record_priv_syscalls(monkeypatch, calls, failing=None):
     # Replace the four privilege-drop syscalls with recorders. The one named in
-    # `failing` raises OSError instead, to exercise the error-wrapping branches.
+    # `failing` raises OSError instead, exercising the error-wrap branches.
     def make(name):
         def fake(*args):
             if name == failing:
@@ -949,10 +949,10 @@ def test_demote_drops_groups_before_setuid(monkeypatch):
     job = _make_job_with_ids(uid=1000, gid=1000, username="svc")
     job._demote()
 
-    # supplementary groups MUST be set before the primary gid, which MUST be set
+    # supplementary groups MUST be set before the gid, which MUST be set
     # before the uid: once the uid drops to non-root, setgid/setgroups fail.
     assert [name for name, _ in calls] == ["initgroups", "setgid", "setuid"]
-    # a known user+gid uses initgroups (the user's own groups), not setgroups([])
+    # a known user+gid uses initgroups (the user's groups), not setgroups([])
     assert calls[0] == ("initgroups", ("svc", 1000))
     assert calls[1] == ("setgid", (1000,))
     assert calls[2] == ("setuid", (1000,))
@@ -1044,9 +1044,9 @@ jobs:
 # ---------------------------------------------------------------------------
 # Shell-reporter YACRON2_* env contract.
 #
-# Users' alerting scripts read these exact variable names; a rename, drop, typo,
-# or an inverted truncation flag would silently break them with the suite green.
-# The pre-existing shell-reporter test only reads back 4 of the 10 variables and
+# Users' alerting scripts read these exact variable names; a rename or typo,
+# or an inverted truncation flag, breaks them silently with the suite green.
+# The pre-existing shell-reporter test reads back only 4 of 10 variables and
 # never exercises truncation. These lock the full name set, the values, and the
 # 16 KiB truncation behavior.
 # ---------------------------------------------------------------------------
@@ -1196,7 +1196,7 @@ async def test_report_shell_truncates_large_output(
 @pytest.mark.asyncio
 async def test_report_shell_combined_over_limit_is_not_truncated(monkeypatch):
     # DOCUMENTS CURRENT BEHAVIOR (and a latent gap): when stdout and stderr are
-    # each under the 16 KiB per-arg limit but their SUM exceeds it, the reporter
+    # each under the 16 KiB per-arg limit but whose SUM exceeds it, the code
     # flags args_too_long internally, yet the [:16 KiB] slice shortens neither
     # value, so neither *_TRUNCATED flag is set and the combined env block is
     # still ~2x the limit. If this is ever tightened, update this test
