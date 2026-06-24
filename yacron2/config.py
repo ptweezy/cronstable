@@ -655,8 +655,11 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
     # ClusterView keys peers by host (so duplicates collapse) and a self-listed
     # peer never counts toward agreement -- but cluster_size() (and thus the
     # quorum threshold) is derived from this list, so a duplicate or self entry
-    # would silently inflate the quorum and cost fault tolerance. Keep the
-    # first occurrence to preserve configured order.
+    # would otherwise inflate the quorum and cost fault tolerance. Keep the
+    # first occurrence to preserve configured order. (A self entry that escapes
+    # this string match -- e.g. a wildcard `listen` self-listed by hostname --
+    # is recognised at runtime and excluded by ClusterManager.cluster_size, so
+    # it stays harmless rather than diverging this node's N from its peers'.)
     seen: "set[str]" = set()
     deduped: List[Dict[str, Any]] = []
     for peer in cfg["peers"]:

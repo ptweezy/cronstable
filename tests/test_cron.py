@@ -1404,6 +1404,9 @@ def test_cluster_role_logged_on_transition(caplog):
         def conflict_names(self):
             return []
 
+        def conflicting_sizes(self):
+            return []
+
     cron.cluster_manager = _Mgr(True)
     with caplog.at_level(logging.INFO, logger="yacron2"):
         cron._log_cluster_role()
@@ -1433,6 +1436,9 @@ def test_cluster_role_logged_spread_quorum(caplog):
             return self._quorate
 
         def conflict_names(self):
+            return []
+
+        def conflicting_sizes(self):
             return []
 
     cron.cluster_manager = _SpreadMgr(True)
@@ -1534,6 +1540,9 @@ def test_cluster_conflict_logged_on_transition(caplog):
         def conflict_names(self):
             return ["dup"] if self._conflict else []
 
+        def conflicting_sizes(self):
+            return []
+
         def is_leader(self):
             return False
 
@@ -1546,6 +1555,42 @@ def test_cluster_conflict_logged_on_transition(caplog):
     msgs = [r.message for r in caplog.records]
     assert sum("duplicate nodeName detected" in m for m in msgs) == 1
     assert sum("conflict resolved" in m for m in msgs) == 1
+
+
+def test_cluster_size_conflict_logged_on_transition(caplog):
+    import logging
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    class _Mgr:
+        distribution = "single-leader"
+
+        def __init__(self, conflict):
+            self._conflict = conflict
+
+        def conflict_names(self):
+            return []
+
+        def conflicting_sizes(self):
+            return [5] if self._conflict else []
+
+        def cluster_size(self):
+            return 3
+
+        def is_leader(self):
+            return False
+
+    cron.cluster_manager = _Mgr(True)
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        cron._log_cluster_role()
+        cron._log_cluster_role()  # unchanged: no second log
+        cron.cluster_manager = _Mgr(False)
+        cron._log_cluster_role()
+    msgs = [r.message for r in caplog.records]
+    detected = "agreeing peers declare 5 but we declare 3"
+    assert sum(detected in m for m in msgs) == 1
+    assert sum("cluster-size disagreement resolved" in m for m in msgs) == 1
 
 
 def test_is_deferrable_reboot():
@@ -1816,6 +1861,9 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
         distribution = "single-leader"
 
         def conflict_names(self):
+            return []
+
+        def conflicting_sizes(self):
             return []
 
         def is_leader(self):

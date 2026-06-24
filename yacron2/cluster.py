@@ -28,6 +28,16 @@ The trust model is deliberately simple and keeps no shared state:
   the quorum-gated leader gate fail closed (see
   :meth:`ClusterManager.has_conflict`), so a misconfiguration pauses ``Leader``
   jobs rather than silently double-running them.
+* **Membership must be uniform.**  The safety proof below ("two strict
+  majorities of N cannot be disjoint") holds only if every node uses the same
+  cluster size N.  But N is each node's own ``len(peers) + 1`` and the job-set
+  fingerprint deliberately ignores the peer list, so two nodes with divergent
+  peer lists (e.g. mid-resize) still see each other ``AGREED`` yet are each
+  quorate under a *different* N -- a split-brain.  So every node also reports
+  its declared N on /peer, and a peer that agrees on the job set but declares a
+  different N is a ``conflict`` exactly like a duplicate ``nodeName``: the
+  ``Leader`` gate fails closed until the cluster reconverges on one N (see
+  :meth:`ClusterManager.conflicting_sizes`).
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
@@ -42,9 +52,11 @@ only when both directions are confirmed -- we see it agreeing on the job-set id
 *and* its /peer response shows it sees us agreeing too (matched by our unique
 ``instance_id``; see :meth:`ClusterManager._agreeing_peer_names`).  That, plus
 the quorum gate, is what makes this safe with no shared state: two strict
-majorities of N cannot be disjoint, and the mutual requirement means a one-way
-link cannot let two nodes each count the other and both reach a majority, so at
-most one leader exists -- under a clean partition *or* asymmetric reachability.
+majorities of N cannot be disjoint (for a *single* shared N -- divergence is
+caught by the membership-uniformity gate above), and the mutual requirement
+means a one-way link cannot let two nodes each count the other and both reach a
+majority, so at most one leader exists -- under a clean partition *or*
+asymmetric reachability.
 The trade-off is liveness: a minority partition (or a node reachable in only
 one direction) deliberately goes idle rather than risk a second leader, mutual
 agreement costs one extra poll round to converge, and because the view is only
@@ -320,6 +332,13 @@ class PeerState:
     # conflict_names). None when we hold no fresh response. Internal, like
     # instance_id, so deliberately not surfaced in to_dict.
     members: Optional[List["tuple[str, str, bool]"]] = None
+    # the cluster size (len(peers)+1) the peer last declared. The election's
+    # safety rests on every node sharing one N, but N is each node's *local*
+    # count and nothing reconciles it, so a divergence is a first-class
+    # conflict (see ClusterManager.conflicting_sizes). None when no fresh
+    # result, or a peer too old to report it. Internal, like instance_id; not
+    # surfaced in to_dict.
+    declared_size: Optional[int] = None
     # the @reboot job names the peer reports as already run in the cluster
     # (its own runs plus what it learned), used to retire our matching deferred
     # one-shots without re-running them (see ClusterManager.reboot_ran). Only
@@ -369,6 +388,7 @@ class ClusterView:
         my_instance: Optional[str] = None,
         peer_members: Optional[List["tuple[str, str, bool]"]] = None,
         peer_ran_reboot_jobs: Optional["set[str]"] = None,
+        peer_size: Optional[int] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -378,6 +398,7 @@ class ClusterView:
         peer.instance_id = peer_instance
         peer.members = peer_members
         peer.ran_reboot_jobs = peer_ran_reboot_jobs
+        peer.declared_size = peer_size
 
         if peer_name is not None and peer_name == my_name:
             if peer_instance is not None and peer_instance != my_instance:
@@ -544,6 +565,12 @@ class ClusterManager:
                 "job_set_id": self.get_job_set_id(),
                 "scheme_version": SCHEME_VERSION,
                 "instance_id": self.instance_id,
+                # our declared cluster size (len(peers)+1). The election's
+                # safety assumes every node shares one N; a polling peer that
+                # declares a different one treats it as a conflict and fails
+                # Leader closed, mirroring a duplicate nodeName (see
+                # ClusterManager.conflicting_sizes).
+                "cluster_size": self.cluster_size(),
                 # our current observations, so a polling peer can confirm we
                 # see it too (mutual agreement) and spot a duplicate nodeName
                 # transitively; see ClusterView.local_members.
@@ -758,6 +785,21 @@ class ClusterManager:
                 )
                 return
             fields[key] = value
+        # cluster_size is an int, validated separately (bool is an int
+        # subclass, so reject it explicitly). A peer too old to report it sends
+        # None, which simply skips the size check for that peer (fail-open for
+        # the unknown, as with a missing instance_id).
+        size = data.get("cluster_size")
+        if size is not None and (
+            not isinstance(size, int) or isinstance(size, bool) or size < 1
+        ):
+            self.view.record_failure(
+                host,
+                "malformed /peer response: cluster_size is not a positive "
+                "integer",
+                untrusted=False,
+            )
+            return
         self.view.record_success(
             host,
             fields["node_name"],
@@ -770,6 +812,7 @@ class ClusterManager:
             my_instance=self.instance_id,
             peer_members=_parse_members(data.get("members")),
             peer_ran_reboot_jobs=_parse_str_list(data.get("ran_reboot_jobs")),
+            peer_size=size,
         )
 
     # --- deferred @reboot "already ran" gossip ---------------------------
@@ -844,11 +887,22 @@ class ClusterManager:
         """Total number of cluster members.
 
         ``peers`` lists every *other* member, so the cluster is those plus this
-        node.  (Listing this node in its own peer list is a misconfiguration;
-        it is reported as ``self`` and never counts toward agreement, so it
-        only makes quorum harder to reach, never easier.)
+        node -- minus any entry that turns out to be *this* node listed in its
+        own peer list (status ``self``).  The config-load dedup drops a self
+        entry only by string-matching ``listen``, which misses the common case
+        of a wildcard ``listen`` (``0.0.0.0:...``) self-listed by hostname;
+        that entry is instead recognised at runtime as ``self``.  Excluding it
+        keeps N equal to what correctly-configured peers declare, so a benign
+        self-listing stays harmless rather than declaring a larger N and
+        tripping the size-divergence gate cluster-wide (see
+        :meth:`conflicting_sizes`).
         """
-        return len(self.config["peers"]) + 1
+        self_listed = sum(
+            1
+            for peer in self.view.peers.values()
+            if peer.status == STATUS_SELF
+        )
+        return len(self.config["peers"]) + 1 - self_listed
 
     def quorum(self) -> int:
         return quorum_size(self.cluster_size())
@@ -910,9 +964,51 @@ class ClusterManager:
             name for name, idents in by_name.items() if len(idents) > 1
         )
 
+    # --- cluster-size (membership) divergence ----------------------------
+
+    def conflicting_sizes(self) -> List[int]:
+        """Cluster sizes declared by agreeing peers that differ from ours.
+
+        The election's safety rests on every node sharing one cluster size N:
+        "two strict majorities of N cannot be disjoint" holds *only* for a
+        single N.  But N is each node's own ``len(peers) + 1`` and the job-set
+        fingerprint deliberately ignores the peer list, so two nodes with
+        divergent peer lists still see each other ``AGREED`` -- each then
+        reaches a quorum under its *own* N and both elect a leader (a
+        split-brain an ordinary resize, touching only ``peers``, can trigger).
+        A peer that agrees on the job set but declares a different N is
+        therefore a first-class conflict, handled exactly like a duplicate
+        ``nodeName``: the ``Leader`` gate fails closed until the cluster
+        reconverges on one N (see :meth:`has_conflict` /
+        :func:`yacron2.cron.Cron._cluster_allows`).
+
+        Only ``AGREED`` peers are compared: a differing N matters precisely
+        for the members the quorum would otherwise count, and because a resize
+        keeps the job set unchanged the divergent nodes *are* agreed and
+        observe the mismatch symmetrically (each side fails closed).  Stale or
+        job-set-drifted peers, and peers too old to report a size, contribute
+        nothing.
+        """
+        my_size = self.cluster_size()
+        return sorted(
+            {
+                peer.declared_size
+                for peer in self.view.peers.values()
+                if peer.status == STATUS_AGREED
+                and peer.declared_size is not None
+                and peer.declared_size != my_size
+            }
+        )
+
     def has_conflict(self) -> bool:
-        """Whether any duplicate nodeName is currently visible to this node."""
-        return bool(self.conflict_names())
+        """Whether any conflict that makes the election unsafe is visible here.
+
+        Either a duplicate ``nodeName`` (two nodes would each elect themselves;
+        see :meth:`conflict_names`) or a cluster-size disagreement (two nodes
+        quorate under different Ns; see :meth:`conflicting_sizes`).  Both fail
+        the ``Leader`` gate closed.
+        """
+        return bool(self.conflict_names()) or bool(self.conflicting_sizes())
 
     def leader_name(self) -> Optional[str]:
         """Elected leader as this node sees it, or ``None`` if not quorate."""
@@ -967,6 +1063,7 @@ class ClusterManager:
         leader = self.leader_name()
         spread = self.distribution == "spread"
         conflicts = self.conflict_names()
+        size_conflicts = self.conflicting_sizes()
         return {
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
@@ -974,10 +1071,16 @@ class ClusterManager:
             "quorum": self.quorum(),
             "elect_leader": bool(self.config.get("electLeader")),
             "distribution": self.distribution,
-            # a duplicate nodeName was detected: Leader jobs fail closed until
-            # it clears (see has_conflict / cron._cluster_allows).
-            "conflict": bool(conflicts),
+            # a conflict was detected: Leader jobs fail closed until it clears
+            # (see has_conflict / cron._cluster_allows). "conflict" is the
+            # umbrella flag (either kind); the two lists below say which.
+            "conflict": bool(conflicts) or bool(size_conflicts),
+            # a duplicate nodeName (two nodes would each elect themselves)
             "conflict_names": conflicts,
+            # peers that agree on the job set but declare a different cluster
+            # size N (two nodes quorate under different Ns -> split-brain)
+            "size_conflict": bool(size_conflicts),
+            "conflicting_sizes": size_conflicts,
             "quorate": leader is not None,
             # In spread mode there is no single leader: ownership is per job,
             # so leader/is_leader are not meaningful (reported null/false).

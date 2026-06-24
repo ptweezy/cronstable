@@ -2075,10 +2075,19 @@
           " · " + role;
       }
       // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
-      if (data.conflict) {
-        var names = (data.conflict_names || []).join(", ");
+      if (data.conflict_names && data.conflict_names.length) {
         summary +=
-          " · ⚠ duplicate nodeName" + (names ? " (" + names + ")" : "") +
+          " · ⚠ duplicate nodeName (" + data.conflict_names.join(", ") +
+          ") — Leader jobs paused";
+      }
+      // a cluster-size disagreement (divergent peer lists, e.g. mid-resize)
+      // breaks the quorum proof the same way; surface it just as loudly.
+      if (data.size_conflict) {
+        var sizes = (data.conflicting_sizes || []).join(", ");
+        summary +=
+          " · ⚠ cluster size mismatch" +
+          (sizes ? " (peers declare " + sizes + " vs our " +
+            (data.cluster_size || "?") + ")" : "") +
           " — Leader jobs paused";
       }
       $("clusterSummary").textContent = summary;

@@ -147,10 +147,13 @@ on any node.
 * **List every *other* member in `peers`**, not this node itself. The cluster
   size is therefore `len(peers) + 1`, and the quorum is `⌊size / 2⌋ + 1`. The
   peer lists must be consistent across nodes for every node to compute the same
-  size and quorum.
+  size and quorum. This is [enforced at runtime](#consistent-cluster-size),
+  not merely assumed.
 * If you accidentally list a node's own address in its own peer list, that entry
-  is reported as `self` and never counts toward agreement, so it can only make
-  quorum *harder* to reach, never easier.
+  is recognised at runtime as `self`, never counts toward agreement, and is
+  **excluded from the cluster size** — so a self-listing is harmless: it neither
+  changes `N`/quorum nor (since `N` stays equal to what other nodes declare)
+  trips the size-consistency check below.
 * The computed size, quorum, elected leader, and whether this node is the leader
   are all shown at `GET /cluster` and in the dashboard panel.
 
@@ -191,6 +194,40 @@ gated on conflicts: it already accepts double-runs as the price of never
 skipping. The default `nodeName` (the system hostname) is already unique per
 host; set an explicit, unique `nodeName` when several nodes might share a
 hostname (e.g. identical container images without distinct hostnames).
+
+### Consistent cluster size
+
+The safety argument also assumes every node uses the **same cluster size `N`**.
+"Two strict majorities of `N` cannot be disjoint" is only true for a *single*
+`N` — two majorities of *different* sizes **can** be disjoint. But `N` is each
+node's own `len(peers) + 1`, and the [job-set fingerprint](#the-job-set-id-foundation)
+deliberately covers job *definitions* only, **not** the peer list. So two nodes
+with divergent peer lists still see each other `agreed`, each reaches a quorum
+under its *own* `N`, and **both** elect themselves — a silent double-run. An
+ordinary cluster **resize** (say rolling 3 → 5 nodes) triggers exactly this:
+mid-roll, the old nodes still carry `N = 3` (quorum 2) while the new ones carry
+`N = 5` (quorum 3), so the old `{a, b}` and new `{c, d, e}` groups are each
+quorate and each run the `Leader` jobs.
+
+yacron2 closes this the same way it closes a duplicate `nodeName`. Each node
+reports its declared `N` on `/peer`, and a peer that **agrees on the job set but
+declares a different `N`** is treated as a first-class `conflict`: this node's
+`Leader` jobs **fail closed** until the cluster reconverges on one `N`. Because a
+resize leaves the job set unchanged, the divergent nodes *are* mutually `agreed`
+and therefore each observe the mismatch — both sides stand down, so no firing
+double-runs while the roll-out is in flight. The conflict is surfaced as the
+`size_conflict` / `conflicting_sizes` fields on
+[`GET /cluster`](#observing-the-cluster), a banner in the dashboard cluster
+panel, and an `ERROR` log line, and clears automatically once every node's
+`peers` agree on the member set. As with a `nodeName` conflict, `PreferLeader`
+is *not* gated — it already accepts double-runs as the price of never skipping.
+
+> **Note:** the check compares the declared size `N`, which catches every
+> *resize* (the documented failure above). It does not detect a same-`N` but
+> different-*membership* divergence (e.g. swapping one peer for another while
+> keeping the count). To stay safe, change membership **one node at a time** so
+> the old and new majorities always overlap, and let each change converge (the
+> dashboard shows `agreed` on every node) before the next.
 
 ### Sizing the cluster
 
@@ -417,8 +454,10 @@ JSON. When no `cluster` section is configured it returns
   "quorum": 2,
   "elect_leader": true,
   "distribution": "single-leader", // or "spread"
-  "conflict": false,               // true if a duplicate nodeName is visible
+  "conflict": false,               // umbrella: true if any conflict pauses Leader jobs
   "conflict_names": [],            // the duplicated nodeName(s), if any
+  "size_conflict": false,          // true if an agreeing peer declares a different N
+  "conflicting_sizes": [],         // those divergent cluster sizes, if any
   "quorate": true,                 // whether this node sees a quorum
   "leader": "node-a",              // null when not quorate, or always in spread mode
   "is_leader": true,               // always false in spread mode (no single leader)
@@ -455,6 +494,10 @@ there are narrow windows where behaviour degrades:
 * **Just after a leader dies**, a `Leader` firing may be *skipped* until the
   survivors notice (up to one `interval`) and re-elect.
 * **Asymmetric or flapping reachability** can briefly elect two leaders.
+* **While a resize is rolling out**, nodes briefly disagree on the cluster size
+  `N`; `Leader` jobs across the whole cluster stand down (fail closed) until
+  every node's `peers` agree again — the at-most-once-preserving trade-off (see
+  [Consistent cluster size](#consistent-cluster-size)).
 * A `PreferLeader` job **may double-run** across a partition (that is the point
   of the policy: it never skips).
 
