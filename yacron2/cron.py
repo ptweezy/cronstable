@@ -286,6 +286,8 @@ class Cron:
         self._was_leader = False
         # last duplicate-nodeName state we logged, so we only log on transition
         self._was_conflict = False
+        # last cluster-size-disagreement state we logged (same rationale)
+        self._was_size_conflict = False
         # @reboot Leader/PreferLeader jobs that could not start at boot because
         # the cluster had not yet elected an owner; run once on convergence.
         # name -> JobConfig; see _process_pending_reboots.
@@ -1083,6 +1085,27 @@ class Cron:
                         "run again"
                     )
                 self._was_conflict = bool(conflict)
+            # A cluster-size disagreement (divergent peer lists) breaks the
+            # quorum proof exactly as a duplicate nodeName does; log it just as
+            # loudly so an operator reconciles cluster.peers (e.g. an in-flight
+            # resize that has not finished rolling out).
+            size_conflict = mgr.conflicting_sizes()
+            if bool(size_conflict) != self._was_size_conflict:
+                if size_conflict:
+                    logger.error(
+                        "cluster: cluster-size disagreement -- agreeing peers "
+                        "declare %s but we declare %d; Leader jobs will stand "
+                        "down until every node's cluster.peers agree on the "
+                        "member set",
+                        ", ".join(str(s) for s in size_conflict),
+                        mgr.cluster_size(),
+                    )
+                else:
+                    logger.info(
+                        "cluster: cluster-size disagreement resolved; Leader "
+                        "jobs may run again"
+                    )
+                self._was_size_conflict = bool(size_conflict)
         if mgr is not None and mgr.distribution == "spread":
             quorate = mgr.is_quorate()
             if quorate != self._was_leader:

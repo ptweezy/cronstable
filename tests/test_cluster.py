@@ -922,6 +922,8 @@ async def test_handle_peer_payload(no_tls):
     assert payload["scheme_version"] == SCHEME_VERSION
     # the per-process instance id, used to tell a self-listing from a duplicate
     assert payload["instance_id"] == mgr.instance_id and payload["instance_id"]
+    # our declared cluster size N (no peers here -> just this node)
+    assert payload["cluster_size"] == 1
 
 
 def _seed_agree(mgr, host, name, instance=None):
@@ -1077,6 +1079,145 @@ def test_view_dict_reports_conflict(no_tls):
     assert view["conflict_names"] == ["node-a"]
 
 
+# --- cluster-size (membership) divergence ---------------------------------
+
+
+def test_manager_detects_cluster_size_divergence(no_tls):
+    # the headline split-brain: an agreeing peer declares a different cluster
+    # size N. Two nodes quorate under different Ns would each elect themselves
+    # (two majorities of *different* Ns can be disjoint), so a size mismatch is
+    # a first-class conflict, exactly like a duplicate nodeName.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    assert mgr.cluster_size() == 3
+    assert mgr.conflicting_sizes() == []
+    assert mgr.has_conflict() is False
+    # c is mid-resize and now declares N=5
+    mgr.view.peers["c:1"].declared_size = 5
+    assert mgr.conflicting_sizes() == [5]
+    assert mgr.has_conflict() is True
+
+
+def test_manager_no_size_conflict_when_sizes_match(no_tls):
+    # agreeing peers reporting our own N (the healthy case) is no conflict.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    mgr.view.peers["b:1"].declared_size = 3
+    mgr.view.peers["c:1"].declared_size = 3
+    assert mgr.conflicting_sizes() == []
+    assert mgr.has_conflict() is False
+
+
+def test_self_listing_does_not_inflate_size_or_conflict(no_tls):
+    # a benign self-listing (this node's own address in its peers, escaping the
+    # config-load string dedup because `listen` is a wildcard) is recognised at
+    # runtime as STATUS_SELF and excluded from N -- so it neither raises this
+    # node's quorum nor makes agreeing peers see a divergent size (the cluster-
+    # wide false conflict a naive len(peers)+1 size would cause).
+    mgr = ClusterManager(
+        _cfg(
+            _DUMMY_TLS, "0.0.0.0:8443",
+            ["b:1", "c:1", "myhost:8443"], "node-a",
+        ),
+        lambda: "v1:mine",
+    )
+    # before this node has polled itself, the self entry is still counted (N=4)
+    assert mgr.cluster_size() == 4
+    # once it polls its own self-listed address it is marked SELF...
+    selfp = mgr.view.peers["myhost:8443"]
+    selfp.status = STATUS_SELF
+    selfp.node_name = "node-a"
+    selfp.instance_id = mgr.instance_id
+    # ...and N drops back to the real member count, matching its peers
+    assert mgr.cluster_size() == 3
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    mgr.view.peers["b:1"].declared_size = 3
+    mgr.view.peers["c:1"].declared_size = 3
+    assert mgr.conflicting_sizes() == []
+    assert mgr.has_conflict() is False
+
+
+def test_manager_size_divergence_ignores_non_agreed_and_unknown(no_tls):
+    # only AGREED peers are size-checked: a peer on a different job set never
+    # joins our quorum (and a real resize keeps the job set unchanged), and a
+    # peer too old to report a size (None) is simply skipped -- neither is a
+    # false conflict.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    pb = mgr.view.peers["b:1"]
+    pb.status = STATUS_DRIFTED
+    pb.node_name = "node-b"
+    pb.declared_size = 99  # different N, but drifted -> ignored
+    _seed_agree(mgr, "c:1", "node-c")
+    mgr.view.peers["c:1"].declared_size = None  # too old to report -> skipped
+    assert mgr.conflicting_sizes() == []
+    assert mgr.has_conflict() is False
+
+
+def test_view_dict_reports_size_conflict(no_tls):
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    _seed_agree(mgr, "b:1", "node-b")
+    mgr.view.peers["b:1"].declared_size = 5
+    view = mgr.view_dict()
+    assert view["conflict"] is True  # umbrella flag (either kind)
+    assert view["size_conflict"] is True
+    assert view["conflicting_sizes"] == [5]
+    assert view["conflict_names"] == []  # not a nodeName conflict
+
+
+@pytest.mark.asyncio
+async def test_mtls_cluster_size_divergence_detected(tmp_path):
+    # end-to-end repro of the headline trace over real mTLS: mid 3->5 resize,
+    # node a still declares N=3 while node c declares N=5. They share the job
+    # set (a resize touches only `peers`), so each sees the other AGREED -- but
+    # the size mismatch makes BOTH fail Leader closed instead of both leading.
+    # The extra peers are dead 127.0.0.1 ports (fast connection-refused) that
+    # only pad each node's declared N.
+    tls = _write_tls(tmp_path)
+    pa, pc = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(
+            tls, f"127.0.0.1:{pa}",
+            [f"localhost:{pc}", "127.0.0.1:2"], "node-a",  # N = 3
+        ),
+        lambda: "v1:same",
+    )
+    c = ClusterManager(
+        _cfg(
+            tls, f"127.0.0.1:{pc}",
+            [f"localhost:{pa}", "127.0.0.1:2", "127.0.0.1:3", "127.0.0.1:4"],
+            "node-c",  # N = 5
+        ),
+        lambda: "v1:same",
+    )
+    await a.start()
+    await c.start()
+    try:
+        await a._poll_all()
+        await c._poll_all()
+        assert a.cluster_size() == 3 and c.cluster_size() == 5
+        # each saw the other agree on the job set but declare a different N
+        assert a.conflicting_sizes() == [5]
+        assert c.conflicting_sizes() == [3]
+        assert a.has_conflict() and c.has_conflict()
+    finally:
+        await a.stop()
+        await c.stop()
+
+
 @pytest.mark.asyncio
 async def test_mtls_duplicate_nodename_detected(tmp_path):
     # two nodes accidentally share a nodeName: each sees the other announce
@@ -1209,6 +1350,79 @@ async def test_poll_peer_client_error_is_unreachable(no_tls):
     session = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
     await mgr._poll_peer(session, "b:1", "v1:mine")
     assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_records_declared_size(no_tls):
+    # a successful poll stores the peer's declared cluster size for the
+    # size-divergence gate.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "cluster_size": 5,
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].declared_size == 5
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_omitted_size_is_none(no_tls):
+    # a peer too old to report cluster_size leaves declared_size None (the size
+    # check is then skipped for it), not a failed observation.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_AGREED
+    assert peer.declared_size is None
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_rejects_malformed_size(no_tls):
+    # a non-int, non-positive, or bool cluster_size from a CA-trusted but buggy
+    # peer is a malformed observation (bool is an int subclass -> rejected too)
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    for bad in ("five", 0, -1, True, 1.5):
+        session = _FakeSession(
+            _FakeGet(
+                resp=_FakeResp(
+                    {
+                        "node_name": "node-b",
+                        "job_set_id": "v1:mine",
+                        "scheme_version": SCHEME_VERSION,
+                        "cluster_size": bad,
+                    }
+                )
+            )
+        )
+        await mgr._poll_peer(session, "b:1", "v1:mine")
+        peer = mgr.view.peers["b:1"]
+        assert peer.status == STATUS_UNREACHABLE, bad
+        assert "cluster_size" in peer.last_error
 
 
 @pytest.mark.asyncio

@@ -159,9 +159,11 @@ Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus the node's view: its `node_name` and `job_set_id`, the
 computed `cluster_size` and `quorum`, whether `elect_leader` is on, the
-`distribution` mode (`single-leader` or `spread`), whether a duplicate
-`nodeName` is visible (`conflict`, with the offending names in
-`conflict_names`), whether this node is `quorate`, the elected `leader` (`null`
+`distribution` mode (`single-leader` or `spread`), whether any conflict is
+pausing `Leader` jobs (`conflict`) — a duplicate `nodeName` (with the offending
+names in `conflict_names`) and/or an agreeing peer declaring a different cluster
+size (`size_conflict`, with those divergent sizes in `conflicting_sizes`),
+whether this node is `quorate`, the elected `leader` (`null`
 when this node is not quorate, and always `null` in `spread` mode) and
 `is_leader` (always `false` in `spread` mode), and a `peers` array (each with
 `host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
@@ -183,6 +185,8 @@ Content-Type: application/json; charset=utf-8
     "distribution": "single-leader",
     "conflict": false,
     "conflict_names": [],
+    "size_conflict": false,
+    "conflicting_sizes": [],
     "quorate": true,
     "leader": "node-a",
     "is_leader": true,
