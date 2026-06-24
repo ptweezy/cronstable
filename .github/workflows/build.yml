@@ -11,7 +11,7 @@ name: build
 # `--version` smoke test
 # catches) fails the commit early instead of only surfacing at release time.
 #
-# This is the package/binary analogue of docker.yml's per-commit build-only job:
+# This is the package/binary analog of docker.yml's per-commit build-only job:
 #   - no PyPI publish, no git tag, no GitHub Release, no image push;
 #   - the macOS binaries are built and smoke-tested but NOT signed/notarized --
 #     signing needs secrets and is a release-time concern (see release.yml's

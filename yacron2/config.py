@@ -484,7 +484,7 @@ class JobConfig:
 
         # Windows has no setuid/setgid model that maps onto this feature, so
         # reject it with a clear error instead of silently running the job as
-        # the wrong account.  Spelt as ``sys.platform == "win32"`` (rather than
+        # the wrong account.  Spelled as ``sys.platform == "win32"`` (rather than
         # platform.IS_WINDOWS) so the type checker statically prunes the
         # POSIX-only imports/calls below on Windows.
         if sys.platform == "win32":
@@ -543,7 +543,7 @@ class JobConfig:
 
     def _validate_numeric_ranges(self) -> None:
         # strictyaml only enforces the type (Int/Float); fail fast on values
-        # that would otherwise produce obscure runtime behaviour instead of a
+        # that would otherwise produce obscure runtime behavior instead of a
         # clear configuration error.
         def require(condition: bool, message: str) -> None:
             if not condition:

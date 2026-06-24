@@ -126,7 +126,7 @@ jobs:
 
 
 def test_fractional_float_is_preserved():
-    # normalisation must only collapse whole-number floats, not lose precision
+    # normalization must only collapse whole-number floats, not lose precision
     half = """
 jobs:
   - name: a
