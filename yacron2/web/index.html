@@ -450,6 +450,7 @@
   .cdot.syncing { background: #d29922; }
   .cdot.drifted { background: #f85149; }
   .cdot.untrusted { background: #f85149; }
+  .cdot.conflict { background: #f85149; }
   .cdot.unreachable { background: #8b949e; }
   .cdot.self { background: #58a6ff; }
 </style>
@@ -2072,6 +2073,13 @@
         summary +=
           " · quorum " + live + "/" + (data.quorum || "?") +
           " · " + role;
+      }
+      // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
+      if (data.conflict) {
+        var names = (data.conflict_names || []).join(", ");
+        summary +=
+          " · ⚠ duplicate nodeName" + (names ? " (" + names + ")" : "") +
+          " — Leader jobs paused";
       }
       $("clusterSummary").textContent = summary;
       $("clusterRows").innerHTML = peers.map((p) =>

@@ -4,7 +4,7 @@ This page covers every way to install yacron2: the published container image,
 `pip`, `pipx`, and the self-contained PyInstaller binaries. It documents the
 Python and platform requirements, the runtime dependencies, the exact binary
 release assets, and the writable-and-executable temp-directory requirement that
-applies to the standalone binary only. As of 1.2.0 yacron2 runs natively on
+applies to the standalone binary only. As of 1.1.7 yacron2 runs natively on
 Windows in addition to Linux and macOS; see [Running on Windows](Running-on-Windows)
 for the Windows-specific details.
 

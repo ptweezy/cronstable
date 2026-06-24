@@ -7,6 +7,7 @@ import pytest
 
 from yacron2.cluster import (
     STATUS_AGREED,
+    STATUS_CONFLICT,
     STATUS_DRIFTED,
     STATUS_SELF,
     STATUS_SYNCING,
@@ -160,7 +161,47 @@ def test_to_dict_shape():
         "last_error",
         "mismatch_streak",
     }
+    # instance_id is an internal liveness token, deliberately not surfaced
+    assert "instance_id" not in d
     assert d["last_seen"] == NOW.isoformat()
+
+
+# --------------------------------------------------------------------------
+# duplicate-nodeName detection (the instance-id guard)
+# --------------------------------------------------------------------------
+
+
+def test_self_listing_with_matching_instance_is_self():
+    # the operator listed this node's own address: the peer reports our name
+    # AND our own instance id (we polled ourselves) -> the benign self case.
+    view = _view()
+    view.record_success(
+        "peer:8443", "me", "v1:same", SCHEME_VERSION, "v1:same", NOW, "me",
+        peer_instance="inst-1", my_instance="inst-1",
+    )
+    assert view.peers["peer:8443"].status == STATUS_SELF
+
+
+def test_same_name_different_instance_is_conflict():
+    # a DIFFERENT process announcing our nodeName is a duplicate, not self.
+    view = _view()
+    view.record_success(
+        "peer:8443", "me", "v1:same", SCHEME_VERSION, "v1:same", NOW, "me",
+        peer_instance="inst-2", my_instance="inst-1",
+    )
+    p = view.peers["peer:8443"]
+    assert p.status == STATUS_CONFLICT
+    assert "duplicate nodeName" in p.last_error
+
+
+def test_self_name_without_instance_stays_self():
+    # an older peer reporting no instance id cannot be proven a duplicate, so
+    # we keep the historical benign 'self' classification (name match only).
+    view = _view()
+    view.record_success(
+        "peer:8443", "me", "v1:same", SCHEME_VERSION, "v1:same", NOW, "me",
+    )
+    assert view.peers["peer:8443"].status == STATUS_SELF
 
 
 # --------------------------------------------------------------------------
@@ -620,17 +661,18 @@ def test_job_cluster_policy_parsed():
     assert jobs["b"].clusterPolicy == "Leader"  # default
 
 
-def test_elect_leader_warns_on_even_size(caplog):
-    import logging
+def test_elect_leader_warns_on_even_size():
+    # CLUSTER_YAML has 2 peers -> 3 nodes; add one more for an even 4. The
+    # warning is computed (not logged) by cluster_config_warnings so the daemon
+    # can emit it once on (re)start instead of on every config reload.
+    from yacron2.config import cluster_config_warnings
 
-    # CLUSTER_YAML has 2 peers -> 3 nodes; add one more for an even 4
     even_yaml = (
         CLUSTER_YAML + "    - host: yacron-d:8443\n  electLeader: true\n"
     )
-    with caplog.at_level(logging.WARNING, logger="yacron2.config"):
-        cfg = parse_config_string(even_yaml, "").cluster_config
+    cfg = parse_config_string(even_yaml, "").cluster_config
     assert cfg is not None and cfg["electLeader"] is True
-    assert any("even cluster size" in r.message for r in caplog.records)
+    assert any("even cluster size" in w for w in cluster_config_warnings(cfg))
 
 
 # --------------------------------------------------------------------------
@@ -650,16 +692,17 @@ def test_distribution_spread_parsed():
     assert cfg is not None and cfg["distribution"] == "spread"
 
 
-def test_distribution_spread_without_electleader_warns(caplog):
-    import logging
+def test_distribution_spread_without_electleader_warns():
+    from yacron2.config import cluster_config_warnings
 
-    with caplog.at_level(logging.WARNING, logger="yacron2.config"):
-        cfg = parse_config_string(
-            CLUSTER_YAML + "  distribution: spread\n", ""
-        ).cluster_config
+    cfg = parse_config_string(
+        CLUSTER_YAML + "  distribution: spread\n", ""
+    ).cluster_config
     assert cfg is not None and cfg["distribution"] == "spread"
-    assert any("no effect without electLeader" in r.message
-               for r in caplog.records)
+    assert any(
+        "no effect without electLeader" in w
+        for w in cluster_config_warnings(cfg)
+    )
 
 
 def test_job_owner_quorum_gated():
@@ -792,11 +835,12 @@ async def test_handle_peer_payload(no_tls):
         _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
     )
     resp = await mgr._handle_peer(_Req())
-    assert json.loads(resp.text) == {
-        "node_name": "node-a",
-        "job_set_id": "v1:mine",
-        "scheme_version": SCHEME_VERSION,
-    }
+    payload = json.loads(resp.text)
+    assert payload["node_name"] == "node-a"
+    assert payload["job_set_id"] == "v1:mine"
+    assert payload["scheme_version"] == SCHEME_VERSION
+    # the per-process instance id, used to tell a self-listing from a duplicate
+    assert payload["instance_id"] == mgr.instance_id and payload["instance_id"]
 
 
 def _seed_agree(mgr, host, name):
@@ -867,6 +911,107 @@ def test_manager_spread_job_owner_none_without_quorum(no_tls):
     mgr = ClusterManager(cfg, lambda: "v1:mine")
     assert mgr.job_owner("job-x") is None
     assert mgr.is_job_owner("job-x") is False
+
+
+def _seed_conflict(mgr, host, name, instance):
+    # a peer announcing `name` from a specific instance id
+    peer = mgr.view.peers[host]
+    peer.status = STATUS_AGREED
+    peer.node_name = name
+    peer.instance_id = instance
+    peer.job_set_id = "v1:mine"
+
+
+def test_manager_no_conflict_when_names_distinct(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    assert mgr.has_conflict() is False
+    assert mgr.conflict_names() == []
+
+
+def test_manager_detects_duplicate_of_own_name(no_tls):
+    # a peer announces OUR nodeName from a different instance -> conflict
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    p = mgr.view.peers["b:1"]
+    p.status = STATUS_CONFLICT
+    p.node_name = "node-a"
+    p.instance_id = "some-other-instance"
+    assert mgr.has_conflict() is True
+    assert mgr.conflict_names() == ["node-a"]
+
+
+def test_manager_detects_cross_peer_duplicate(no_tls):
+    # two DIFFERENT peers report the same name (neither is ours) -> still a
+    # duplicate: a third node can spot the collision its peers cannot.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_conflict(mgr, "b:1", "dup", "inst-b")
+    _seed_conflict(mgr, "c:1", "dup", "inst-c")
+    assert mgr.conflict_names() == ["dup"]
+    assert mgr.has_conflict() is True
+
+
+def test_manager_self_listing_is_not_conflict(no_tls):
+    # the 'self' peer carries our name AND our own instance id -> benign
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "self:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    selfp = mgr.view.peers["self:1"]
+    selfp.status = STATUS_SELF
+    selfp.node_name = "node-a"
+    selfp.instance_id = mgr.instance_id
+    assert mgr.has_conflict() is False
+
+
+def test_view_dict_reports_conflict(no_tls):
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    p = mgr.view.peers["b:1"]
+    p.status = STATUS_CONFLICT
+    p.node_name = "node-a"
+    p.instance_id = "other"
+    view = mgr.view_dict()
+    assert view["conflict"] is True
+    assert view["conflict_names"] == ["node-a"]
+
+
+@pytest.mark.asyncio
+async def test_mtls_duplicate_nodename_detected(tmp_path):
+    # two nodes accidentally share a nodeName: each sees the other announce
+    # that name from a different instance id -> conflict on both sides.
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "dup"),
+        lambda: "v1:same",
+    )
+    b = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "dup"),
+        lambda: "v1:same",
+    )
+    await a.start()
+    await b.start()
+    try:
+        await a._poll_all()
+        await b._poll_all()
+        assert a.has_conflict() and b.has_conflict()
+        assert a.view.peers[f"localhost:{pb}"].status == STATUS_CONFLICT
+        assert a.conflict_names() == ["dup"]
+    finally:
+        await a.stop()
+        await b.stop()
 
 
 # fake aiohttp session for _poll_peer / _poll_all (no sockets, no certs) -----
