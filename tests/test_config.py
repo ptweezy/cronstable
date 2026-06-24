@@ -462,7 +462,7 @@ jobs:
     )
     conf = config.parse_config(str(tmp_path))
     assert [j.name for j in conf.jobs] == ["job-a"]
-    # web config from one file is not dropped in favour of the last file
+    # web config from one file is not dropped in favor of the last file
     assert conf.web_config == {"listen": ["http://127.0.0.1:8080"]}
     # logging config from a different file is aggregated, not lost
     assert conf.logging_config == {"version": 1}

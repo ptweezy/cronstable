@@ -12,7 +12,7 @@ project, on which yacron2 is based.
   tagged with a `-<distro>` suffix: `-alpine`, `-ubuntu`, `-rhel` (Red Hat
   UBI 9), `-fedora`, `-opensuse` (Leap), `-amazonlinux` (2023) and
   `-distroless`, plus an explicit `-debian` alias for the default. Pick the base
-  that matches your host userland or image-provenance policy; behaviour is
+  that matches your host userland or image-provenance policy; behavior is
   identical, since yacron2 is a pure-Python app (Python >= 3.10) and each image
   uses its distro's native interpreter. The Debian image still owns the bare
   `latest`/`<version>` tags and the widest architecture coverage. See
@@ -25,7 +25,7 @@ project, on which yacron2 is based.
   same configuration produce the same id, so replicas can confirm they hold an
   identical set of jobs. It is taken over the merged, effective config (so
   reordering jobs, or moving
-  a setting into `defaults`, doesn't change it), normalises equivalent schedule
+  a setting into `defaults`, doesn't change it), normalizes equivalent schedule
   spellings, fingerprints `user`/`group` as configured rather than as a
   host-specific resolved uid/gid, and embeds no secret material (inline
   reporting secrets are redacted, and only `environment` variable names are
@@ -133,7 +133,7 @@ package itself.
 ### Documentation
 
 - README changes
-- Add an `Architectures` badge to the README summarising the binary and
+- Add an `Architectures` badge to the README summarizing the binary and
   container targets (`amd64`, `arm64`, `i686`, `armv7`, `ppc64le`,
   `s390x`).
 
@@ -206,7 +206,7 @@ package itself.
 - Add a built-in web dashboard, served at the root path (`/`) of any
   `http://` listener. It shows each job's latest status with a live
   countdown to the next run and a trend sparkline, tails job logs live
-  (with in-log search, ANSI-colour rendering, optional timestamps, a
+  (with in-log search, ANSI-color rendering, optional timestamps, a
   line-wrap toggle, and a download button), runs or cancels jobs on
   demand, and reports each job's run history, success rate, and a
   plain-English schedule with a preview of upcoming run times. It is
@@ -446,7 +446,7 @@ Since 1.0.13, the net changes are entirely build/CI hardening (a new `build.yml`
 ### Internal
 
 - Refactored `JobConfig` construction into focused helper methods and
-  switched `send_to_statsd` to `asyncio.get_running_loop()`; no behavioural
+  switched `send_to_statsd` to `asyncio.get_running_loop()`; no behavioral
   change.
 - Added a `.github/CODEOWNERS` file.
 
@@ -601,7 +601,7 @@ This is a tooling and documentation release; there are no changes to the
   (`email.utils.format_datetime`), encode HTML bodies with the correct
   charset/transfer-encoding (`set_content` subtype `html`), and call
   `smtp.login` positionally for aiosmtplib v2+ compatibility.
-- The Sentry client is now initialised once per `(dsn, environment)` and
+- The Sentry client is now initialized once per `(dsn, environment)` and
   cached instead of on every report, and uses `sentry_sdk.new_scope()`
   (replacing the deprecated `push_scope()`).
 - Report templates (sentry/mail body, subject, fingerprint) are now compiled
