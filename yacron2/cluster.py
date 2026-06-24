@@ -20,11 +20,14 @@ The trust model is deliberately simple and keeps no shared state:
   themselves (each is the ``min`` of its own live set) and double-run.  Each
   process therefore mints a random ``instance_id`` at startup and reports it
   alongside its name, so a node can tell a benign self-listing (same name *and*
-  instance id) from a genuine duplicate (same name, *different* instance), and
-  a third node can spot two distinct instances claiming one name.  A detected
-  duplicate is reported as ``conflict`` and makes the quorum-gated leader gate
-  fail closed (see :meth:`ClusterManager.has_conflict`), so a misconfiguration
-  pauses ``Leader`` jobs rather than silently double-running them.
+  instance id) from a genuine duplicate (same name, *different* instance).
+  Each /peer response also carries the responder's own observations, so a node
+  detects a duplicate *transitively* -- even when it cannot reach both copies
+  directly, two peers that each see one copy let it union the two instance ids
+  for that name.  A detected duplicate is reported as ``conflict`` and makes
+  the quorum-gated leader gate fail closed (see
+  :meth:`ClusterManager.has_conflict`), so a misconfiguration pauses ``Leader``
+  jobs rather than silently double-running them.
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
@@ -34,15 +37,21 @@ leader election** (see :func:`elect_leader`): each node independently elects,
 as leader, the lowest ``nodeName`` among the *agreeing* members it can see, but
 only if that set is a strict majority (a *quorum*) of the configured cluster.
 Only the leader runs scheduled jobs, so replicas deployed from one config no
-longer double-run.  The quorum gate is what makes this safe with no shared
-state: two strict majorities of N cannot be disjoint, so under a clean
-partition at most one side is quorate and at most one leader exists.  The
-trade-off is liveness: a minority partition deliberately goes idle rather than
-risk a second leader, and because the view is only as fresh as the last poll,
-the guarantee is best-effort across membership changes (a brief window after a
-leader dies may skip a firing; asymmetric/flapping reachability may briefly
-double-elect).  It is *not* a fenced, exactly-once guarantee; for that you
-would need a lease/consensus store, which this design intentionally avoids.
+longer double-run.  Agreement is counted *mutually*: a peer joins the live set
+only when both directions are confirmed -- we see it agreeing on the job-set id
+*and* its /peer response shows it sees us agreeing too (matched by our unique
+``instance_id``; see :meth:`ClusterManager._agreeing_peer_names`).  That, plus
+the quorum gate, is what makes this safe with no shared state: two strict
+majorities of N cannot be disjoint, and the mutual requirement means a one-way
+link cannot let two nodes each count the other and both reach a majority, so at
+most one leader exists -- under a clean partition *or* asymmetric reachability.
+The trade-off is liveness: a minority partition (or a node reachable in only
+one direction) deliberately goes idle rather than risk a second leader, mutual
+agreement costs one extra poll round to converge, and because the view is only
+as fresh as the last poll, the guarantee remains best-effort across membership
+changes (a brief window after a leader dies may skip a firing).  It is *not* a
+fenced, exactly-once guarantee; for that you would need a lease/consensus
+store, which this design intentionally avoids.
 
 When ``distribution`` is ``"spread"`` the single elected leader is replaced by
 **per-job ownership** via rendezvous (highest-random-weight) hashing (see
@@ -58,11 +67,13 @@ for each job, so still at most one node runs it).
 import asyncio
 import datetime
 import hashlib
+import json
 import logging
 import ssl
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 import aiohttp
 from aiohttp import web
@@ -91,6 +102,90 @@ STATUS_CONFLICT = "conflict"
 _STALE_STATUSES = frozenset(
     {STATUS_UNKNOWN, STATUS_UNREACHABLE, STATUS_UNTRUSTED}
 )
+
+# Cap on the peer /peer response we will buffer per poll. The legitimate
+# payload is a small JSON object (a fixed header plus one short member entry
+# per node), so this is generous for clusters into the hundreds of nodes while
+# bounding the memory a misbehaving-but-CA-trusted peer can force us to
+# allocate each round (see _read_capped / _poll_peer).
+MAX_PEER_RESPONSE_BYTES = 256 * 1024
+_READ_CHUNK = 8192
+
+
+def _parse_members(raw: Any) -> List["tuple[str, str, bool]"]:
+    """Validate a peer's reported ``members`` list, dropping malformed entries.
+
+    A peer is CA-vouched but otherwise untrusted input, so anything that is not
+    a list of ``{node_name: str, instance_id: str, agreed: bool}`` objects is
+    ignored: a malformed or hostile payload degrades to "no mutual/transitive
+    information" rather than poisoning the election (see the type checks in
+    :meth:`ClusterManager._poll_peer`).
+    """
+    members: List["tuple[str, str, bool]"] = []
+    if not isinstance(raw, list):
+        return members
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("node_name")
+        instance = entry.get("instance_id")
+        agreed = entry.get("agreed")
+        if (
+            isinstance(name, str)
+            and isinstance(instance, str)
+            and isinstance(agreed, bool)
+        ):
+            members.append((name, instance, agreed))
+    return members
+
+
+def _parse_str_list(raw: Any) -> "set[str]":
+    """Validate an untrusted JSON value as a set of strings, dropping the rest.
+
+    Used for the gossiped ``ran_reboot_jobs`` set; like _parse_members, hostile
+    or malformed input degrades to an empty set rather than raising.
+    """
+    if not isinstance(raw, list):
+        return set()
+    return {item for item in raw if isinstance(item, str)}
+
+
+def _peer_sees_me_agreed(
+    peer_members: Optional[List["tuple[str, str, bool]"]],
+    my_instance: str,
+) -> bool:
+    """Whether a peer's reported member list shows *us* — matched by our unique
+    per-process ``instance_id`` — as one of the nodes it currently sees AGREED.
+
+    This is the receiver half of the mutual-attestation gate: we count a peer
+    toward quorum only when it confirms it sees us agreeing too (see
+    :meth:`ClusterManager._agreeing_peer_names`).
+    """
+    if not peer_members:
+        return False
+    for _name, instance, agreed in peer_members:
+        if agreed and instance == my_instance:
+            return True
+    return False
+
+
+async def _read_capped(resp: Any, limit: int) -> "tuple[bytes, bool]":
+    """Read a response body, refusing to buffer more than ``limit`` bytes.
+
+    Returns ``(body, too_large)``.  Iterating (rather than ``resp.read()`` /
+    ``resp.json()``, which buffer the whole body unconditionally) bounds memory
+    even when the peer streams a huge or chunked response, and because aiohttp
+    decompresses as we read, it also caps the *decompressed* size (a gzip-bomb
+    guard).
+    """
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(_READ_CHUNK):
+        total += len(chunk)
+        if total > limit:
+            return b"", True
+        chunks.append(chunk)
+    return b"".join(chunks), False
 
 
 def quorum_size(cluster_size: int) -> int:
@@ -219,6 +314,17 @@ class PeerState:
     last_error: Optional[str] = None
     # consecutive reachable-but-mismatched rounds, for the drift hysteresis
     mismatch_streak: int = 0
+    # the peer's own reported observations (node_name, instance_id, agreed)
+    # from its last /peer response, feeding mutual-agreement and transitive
+    # conflict detection (see ClusterManager._agreeing_peer_names /
+    # conflict_names). None when we hold no fresh response. Internal, like
+    # instance_id, so deliberately not surfaced in to_dict.
+    members: Optional[List["tuple[str, str, bool]"]] = None
+    # the @reboot job names the peer reports as already run in the cluster
+    # (its own runs plus what it learned), used to retire our matching deferred
+    # one-shots without re-running them (see ClusterManager.reboot_ran). Only
+    # trusted from an AGREED peer (same job-set id). None when no fresh result.
+    ran_reboot_jobs: Optional["set[str]"] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -261,6 +367,8 @@ class ClusterView:
         my_name: str,
         peer_instance: Optional[str] = None,
         my_instance: Optional[str] = None,
+        peer_members: Optional[List["tuple[str, str, bool]"]] = None,
+        peer_ran_reboot_jobs: Optional["set[str]"] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -268,6 +376,8 @@ class ClusterView:
         peer.job_set_id = peer_id
         peer.node_name = peer_name
         peer.instance_id = peer_instance
+        peer.members = peer_members
+        peer.ran_reboot_jobs = peer_ran_reboot_jobs
 
         if peer_name is not None and peer_name == my_name:
             if peer_instance is not None and peer_instance != my_instance:
@@ -321,11 +431,45 @@ class ClusterView:
         peer.last_error = error
         peer.status = STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
         # we could not observe the id this round, so the drift streak (which
-        # only counts *reachable* mismatches) is reset.
+        # only counts *reachable* mismatches) is reset and the peer's last
+        # reported view is dropped as stale (no mutual/conflict info this time)
         peer.mismatch_streak = 0
+        peer.members = None
+        peer.ran_reboot_jobs = None
 
     def to_list(self) -> List[Dict[str, Any]]:
         return [peer.to_dict() for peer in self.peers.values()]
+
+    def local_members(
+        self, my_name: str, my_instance: str
+    ) -> List[Dict[str, Any]]:
+        """This node's current observations, for the /peer response body.
+
+        Lists this node (always agreeing with itself) plus every peer we hold a
+        fresh observation of, each tagged with whether we currently see it
+        AGREED.  A polling peer uses this two ways: to confirm *mutual*
+        agreement (does this list carry the poller, agreed?) and to detect a
+        duplicate nodeName transitively (does any name appear with two distinct
+        instance ids once everyone's lists are unioned?).
+        """
+        members: List[Dict[str, Any]] = [
+            {
+                "node_name": my_name,
+                "instance_id": my_instance,
+                "agreed": True,
+            }
+        ]
+        for peer in self.peers.values():
+            if peer.status in _STALE_STATUSES or peer.node_name is None:
+                continue
+            members.append(
+                {
+                    "node_name": peer.node_name,
+                    "instance_id": peer.instance_id,
+                    "agreed": peer.status == STATUS_AGREED,
+                }
+            )
+        return members
 
 
 def build_client_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
@@ -383,6 +527,13 @@ class ClusterManager:
         self._runner: Optional[web.AppRunner] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # @reboot one-shots THIS node has run as the elected owner (plus any it
+        # learned ran via push) -- gossiped so peers retire their matching
+        # deferred jobs without re-running them on failover. Scoped to the
+        # current job-set: cleared when our job_set_id changes (see _poll_all),
+        # so a config change cannot carry a stale "already ran" across it.
+        self._ran_reboot_jobs: Set[str] = set()
+        self._ran_jobs_job_set_id: Optional[str] = None
 
     # --- the mTLS /peer server -------------------------------------------
 
@@ -393,19 +544,71 @@ class ClusterManager:
                 "job_set_id": self.get_job_set_id(),
                 "scheme_version": SCHEME_VERSION,
                 "instance_id": self.instance_id,
+                # our current observations, so a polling peer can confirm we
+                # see it too (mutual agreement) and spot a duplicate nodeName
+                # transitively; see ClusterView.local_members.
+                "members": self.view.local_members(
+                    self.node_name, self.instance_id
+                ),
+                # @reboot one-shots already run in the cluster (ours + learned
+                # from agreed peers), so a poller can retire its matching
+                # deferred job without re-running it; see advertised_ran_jobs.
+                "ran_reboot_jobs": sorted(self.advertised_ran_jobs()),
             }
         )
 
+    async def _handle_reboot_ran(self, request: web.Request) -> web.Response:
+        """Receive an eager push of @reboot jobs a peer just ran.
+
+        The pull-poll already carries this set, but a push shrinks the window
+        in which an owner could run a one-shot and then die before any peer
+        polled it (so a new leader would re-run it).  Best-effort: we accept it
+        only when the sender's job_set_id matches ours (an agreed peer, same
+        config), and any malformed body is ignored.
+
+        Trust scope: the never-re-run guarantee holds against benign failures
+        (crashes, partitions).  A CA-vouched but *hostile* peer could push a
+        fabricated "ran X" to make others retire a job that never ran -- the
+        same Byzantine class as a member lying about its job_set_id to skew the
+        election, which this design already does not defend against.
+        """
+        raw, too_large = await _read_capped(request, MAX_PEER_RESPONSE_BYTES)
+        if too_large:
+            return web.Response(status=413)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return web.Response(status=400)
+        if (
+            isinstance(data, dict)
+            and data.get("job_set_id") == self.get_job_set_id()
+        ):
+            self._ran_reboot_jobs |= _parse_str_list(data.get("names"))
+        return web.Response(status=204)
+
     async def start(self) -> None:
         app = web.Application()
-        app.add_routes([web.get("/peer", self._handle_peer)])
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        host, port = _split_host_port(self.config["listen"])
-        site = web.TCPSite(
-            self._runner, host, port, ssl_context=self._server_ssl
+        app.add_routes(
+            [
+                web.get("/peer", self._handle_peer),
+                web.post("/reboot-ran", self._handle_reboot_ran),
+            ]
         )
-        await site.start()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        try:
+            host, port = _split_host_port(self.config["listen"])
+            site = web.TCPSite(
+                runner, host, port, ssl_context=self._server_ssl
+            )
+            await site.start()
+        except BaseException:
+            # bad listen address (ValueError) or bind failure (OSError, e.g.
+            # the port is already in use) after the runner was set up -- and
+            # cancellation -- must not leak the half-started runner.
+            await runner.cleanup()
+            raise
+        self._runner = runner
         logger.info(
             "cluster: node %r serving mTLS /peer on %s, polling %d peer(s) "
             "every %ds",
@@ -448,14 +651,42 @@ class ClusterManager:
 
     async def _poll_all(self) -> None:
         my_id = self.get_job_set_id()
+        if (
+            self._ran_jobs_job_set_id is not None
+            and my_id != self._ran_jobs_job_set_id
+        ):
+            # our job set CHANGED (config reload): runs recorded under the old
+            # set no longer apply to the new one, so forget them. A still-
+            # deferred @reboot may then run again -- the safe direction; we
+            # never silently skip a job whose definition changed. (The first
+            # observation just establishes the id; it must not clear, or a push
+            # that arrived before the first poll would be wiped.)
+            self._ran_reboot_jobs.clear()
+        self._ran_jobs_job_set_id = my_id
         timeout = aiohttp.ClientTimeout(total=self.config["connectTimeout"])
+        peers = self.config["peers"]
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            await asyncio.gather(
+            # return_exceptions so one peer raising an *unexpected* error (a
+            # bug, not a network failure -- those are handled inside
+            # _poll_peer) cannot abort the whole round and leave the other
+            # peers' coroutines detached. Surface such errors, don't swallow.
+            results = await asyncio.gather(
                 *(
                     self._poll_peer(session, peer["host"], my_id)
-                    for peer in self.config["peers"]
-                )
+                    for peer in peers
+                ),
+                return_exceptions=True,
             )
+        # gather preserves order, so results[i] corresponds to peers[i].
+        for index, result in enumerate(results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.error(
+                    "cluster: unexpected error polling %s: %r",
+                    peers[index]["host"],
+                    result,
+                )
 
     async def _poll_peer(
         self, session: aiohttp.ClientSession, host: str, my_id: str
@@ -465,7 +696,9 @@ class ClusterManager:
         try:
             async with session.get(url, ssl=self._client_ssl) as resp:
                 resp.raise_for_status()
-                data = await resp.json()
+                raw, too_large = await _read_capped(
+                    resp, MAX_PEER_RESPONSE_BYTES
+                )
         except aiohttp.ClientSSLError as ex:
             # cert chain / hostname verification failure: the peer is not (or
             # not provably) a cluster member.
@@ -478,17 +711,132 @@ class ClusterManager:
         ) as ex:
             self.view.record_failure(host, str(ex), untrusted=False)
             return
+        if too_large:
+            self.view.record_failure(
+                host,
+                "oversized /peer response (> {} bytes)".format(
+                    MAX_PEER_RESPONSE_BYTES
+                ),
+                untrusted=False,
+            )
+            return
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            # invalid/truncated JSON (JSONDecodeError and UnicodeDecodeError
+            # both subclass ValueError): a CA-trusted peer can still be buggy
+            # or hostile, so treat an unparseable body as a failed observation.
+            self.view.record_failure(
+                host, "invalid JSON in /peer response", untrusted=False
+            )
+            return
+        if not isinstance(data, dict):
+            self.view.record_failure(
+                host,
+                "malformed /peer response (not a JSON object)",
+                untrusted=False,
+            )
+            return
+        # Type-validate the scalar identity fields: a non-string node_name from
+        # a CA-trusted-but-misbehaving peer would otherwise flow into
+        # min()/sorted()/dict keys during election and crash the scheduler.
+        fields: Dict[str, Optional[str]] = {}
+        for key in (
+            "node_name",
+            "job_set_id",
+            "scheme_version",
+            "instance_id",
+        ):
+            value = data.get(key)
+            if value is not None and not isinstance(value, str):
+                self.view.record_failure(
+                    host,
+                    "malformed /peer response: {!r} is not a string".format(
+                        key
+                    ),
+                    untrusted=False,
+                )
+                return
+            fields[key] = value
         self.view.record_success(
             host,
-            data.get("node_name"),
-            data.get("job_set_id"),
-            data.get("scheme_version"),
+            fields["node_name"],
+            fields["job_set_id"],
+            fields["scheme_version"],
             my_id,
             now,
             self.node_name,
-            peer_instance=data.get("instance_id"),
+            peer_instance=fields["instance_id"],
             my_instance=self.instance_id,
+            peer_members=_parse_members(data.get("members")),
+            peer_ran_reboot_jobs=_parse_str_list(data.get("ran_reboot_jobs")),
         )
+
+    # --- deferred @reboot "already ran" gossip ---------------------------
+
+    def advertised_ran_jobs(self) -> Set[str]:
+        """@reboot one-shots known to have run under our *current* job set.
+
+        Our own runs plus those reported by every peer we currently agree with
+        (same job_set_id).  Re-advertising what we learned makes the fact
+        survive the original owner's death (one-hop gossip), and trusting only
+        AGREED peers scopes it to this config -- a peer on a different job set
+        is not agreed, so its set is ignored.
+        """
+        jobs = set(self._ran_reboot_jobs)
+        for peer in self.view.peers.values():
+            if peer.status == STATUS_AGREED and peer.ran_reboot_jobs:
+                jobs |= peer.ran_reboot_jobs
+        return jobs
+
+    def reboot_ran(self, job_name: str) -> bool:
+        """Whether ``job_name`` already ran in the cluster (this config)."""
+        return job_name in self.advertised_ran_jobs()
+
+    async def mark_reboot_ran(self, job_name: str) -> None:
+        """Record that we ran ``job_name`` as owner, and eagerly tell peers.
+
+        The push is best-effort (the periodic pull carries the same set as a
+        backstop); it just shrinks the window in which we could run the job and
+        then die before any peer observed it.
+        """
+        # the poll loop is the sole authority for _ran_jobs_job_set_id (it
+        # establishes it and clears the set on a change), so we only add here.
+        self._ran_reboot_jobs.add(job_name)
+        await self._push_reboot_ran()
+
+    async def _push_reboot_ran(self) -> None:
+        peers = self.config["peers"]
+        names = sorted(self.advertised_ran_jobs())
+        if not peers or not names:
+            return
+        payload = {"job_set_id": self.get_job_set_id(), "names": names}
+        timeout = aiohttp.ClientTimeout(total=self.config["connectTimeout"])
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            await asyncio.gather(
+                *(
+                    self._push_reboot_ran_one(session, peer["host"], payload)
+                    for peer in peers
+                ),
+                return_exceptions=True,
+            )
+
+    async def _push_reboot_ran_one(
+        self,
+        session: aiohttp.ClientSession,
+        host: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        url = "https://{}/reboot-ran".format(host)
+        try:
+            async with session.post(
+                url, json=payload, ssl=self._client_ssl
+            ) as resp:
+                resp.raise_for_status()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            # best-effort: a delivery failure is fine, the periodic pull-poll
+            # carries the same set; don't let it disturb the run loop.
+            pass
 
     # --- leader election --------------------------------------------------
 
@@ -506,52 +854,61 @@ class ClusterManager:
         return quorum_size(self.cluster_size())
 
     def _agreeing_peer_names(self) -> List[str]:
-        """Names of peers currently agreeing on our job-set id over mTLS."""
+        """Names of peers we *mutually* agree with on our job-set id.
+
+        A peer counts only when both directions are confirmed: we see it AGREED
+        *and* its last /peer response lists us (by our unique ``instance_id``)
+        as a node it sees AGREED too.  The mutual requirement is what keeps the
+        quorum gate sound under asymmetric reachability -- two nodes joined by
+        a one-way link can no longer each count the other and both reach a
+        bogus majority (which would let both self-elect and double-run a Leader
+        job).  The price is one extra poll round to converge after a membership
+        change, and that a purely one-way-reachable peer is treated as
+        unreachable for quorum purposes.
+        """
         return [
             peer.node_name
             for peer in self.view.peers.values()
-            if peer.status == STATUS_AGREED and peer.node_name is not None
+            if peer.status == STATUS_AGREED
+            and peer.node_name is not None
+            and _peer_sees_me_agreed(peer.members, self.instance_id)
         ]
 
     # --- duplicate-nodeName detection ------------------------------------
-
-    def _live_named_members(self) -> List["tuple[str, str]"]:
-        """``(node_name, identity)`` for this node and every peer we currently
-        have a fresh name for.
-
-        ``identity`` is the peer's per-process ``instance_id`` (falling back to
-        its host when an older peer reports none), so a single ``node_name``
-        backed by two distinct identities is a duplicate nodeName.  Stale peers
-        (unreachable/untrusted/never-contacted) are skipped: we have no current
-        observation of who they are.
-        """
-        members: List["tuple[str, str]"] = [
-            (self.node_name, self.instance_id)
-        ]
-        for peer in self.view.peers.values():
-            if peer.node_name is None or peer.status in _STALE_STATUSES:
-                continue
-            members.append(
-                (peer.node_name, peer.instance_id or "host:" + peer.host)
-            )
-        return members
 
     def conflict_names(self) -> List[str]:
         """nodeNames currently claimed by more than one distinct instance.
 
         Non-empty means a duplicate ``nodeName`` is present, which makes the
         quorum election unsafe (two nodes would each elect themselves), so the
-        ``Leader`` gate treats it as fail-closed.  A benign self-listing (same
-        name *and* same instance id) is not a conflict.
+        ``Leader`` gate treats it as fail-closed.
+
+        The view is built by unioning *our own* fresh observations with every
+        reachable peer's reported observations (the ``members`` list from its
+        /peer response -- one-hop gossip).  That transitivity closes the gap
+        where the duplicates are not both visible to us directly: two peers
+        that each see only one copy of the duplicated name still let us spot
+        the collision.  ``identity`` is the per-process ``instance_id``
+        (falling back to a peer's host if it somehow reported none), and benign
+        self-listing (same name *and* same instance id) is not a conflict.
+        Stale peers (unreachable/untrusted/never-contacted) contribute nothing.
         """
-        by_name: Dict[str, str] = {}
-        conflicts = set()
-        for name, ident in self._live_named_members():
-            prev = by_name.get(name)
-            if prev is not None and prev != ident:
-                conflicts.add(name)
-            by_name[name] = ident
-        return sorted(conflicts)
+        by_name: Dict[str, Set[str]] = defaultdict(set)
+        by_name[self.node_name].add(self.instance_id)
+        for peer in self.view.peers.values():
+            if peer.status in _STALE_STATUSES:
+                continue
+            if peer.node_name is not None:
+                # our own direct observation of this peer's identity
+                by_name[peer.node_name].add(
+                    peer.instance_id or "host:" + peer.host
+                )
+            # the peer's one-hop view of the cluster
+            for name, instance, _agreed in peer.members or ():
+                by_name[name].add(instance)
+        return sorted(
+            name for name, idents in by_name.items() if len(idents) > 1
+        )
 
     def has_conflict(self) -> bool:
         """Whether any duplicate nodeName is currently visible to this node."""
