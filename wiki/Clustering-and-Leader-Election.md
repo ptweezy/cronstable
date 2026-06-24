@@ -164,26 +164,61 @@ given firing only while a majority of the cluster is up and mutually reachable.
 
 ### Sizing the cluster
 
-**Use an odd cluster size.** With per-node availability `p`, the chance a firing
-runs is the probability a majority is up: roughly `3p² − 2p³` for 3 nodes,
-higher for 5.
+A `Leader` job fires successfully only while a quorum is up and mutually
+reachable. If each node is independently up with probability `p`, and the quorum
+is `q = ⌊N/2⌋ + 1`, then the chance a given firing runs is the probability that
+**at least `q` of `N` nodes are up**, which is a binomial tail:
 
-| Size | Tolerates | Notes |
+```text
+P(runs) = Σ (from k=q to N)  C(N, k) · p^k · (1 − p)^(N − k)
+```
+
+The table below evaluates that for a few realistic per-node availabilities, as a
+fraction and as "nines" (`−log₁₀(1 − P)`). "Tol." is how many simultaneous node
+failures the size survives (`N − q`).
+
+| N | Quorum | Tol. | P(runs), p=0.9 | p=0.99 | p=0.999 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 0 | 0.9000 (1.0 nines) | 0.9900 (2.0) | 0.99900 (3.0) |
+| 2 | 2 | 0 | 0.8100 (0.7) | 0.9801 (1.7) | 0.99800 (2.7) |
+| **3** | 2 | **1** | 0.9720 (1.6) | 0.99970 (3.5) | 0.9999970 (5.5) |
+| 4 | 3 | 1 | 0.9477 (1.3) | 0.99941 (3.2) | 0.9999940 (5.2) |
+| **5** | 3 | **2** | 0.9914 (2.1) | 0.999990 (5.0) | ≈1 (8.0) |
+| 7 | 4 | 3 | 0.9973 (2.6) | ≈1 (6.5) | ≈1 (10.5) |
+
+How to read it:
+
+* **Odd sizes are the sweet spot.** Each odd size adds one failure of headroom
+  over the previous odd size: 3 tolerates 1, 5 tolerates 2, 7 tolerates 3.
+* **Even sizes are equal-or-worse, never better.** N=4 still needs a quorum of
+  3, so it tolerates the same single failure as N=3, but it has an extra node
+  that can fail, so its P(runs) is actually slightly *lower* (0.99941 vs 0.99970
+  at p=0.99). yacron2 warns on even sizes for exactly this reason.
+* **2 is worse than 1.** A 2-node quorum is 2, so both must be up: P = p²
+  (0.9801 at p=0.99), below a single node's `p` (0.99), with no failover upside.
+  yacron2 **refuses to start** with `electLeader` and a 2-node cluster, raising a
+  `ConfigError` ("...strictly worse than a single replica..."). The same 2-node
+  cluster is fine for attestation-only (without `electLeader`).
+
+The same numbers as expected **skipped firings** for an hourly `Leader` job
+(8760 firings/year), which is often the more intuitive framing:
+
+| N | p=0.99 | p=0.999 |
 | --- | --- | --- |
-| 1 | 0 failures | Degenerate "cluster"; always leads itself. Equivalent to a plain single instance. |
-| **3** | **1 failure** | Recommended minimum for HA (~4 nines of "runs" at `p = 0.99`). |
-| **5** | **2 failures** | More headroom (~5 nines). |
-| 2 | n/a | **Rejected** with `electLeader` (see below). |
-| 4, 6, … (even) | same as size−1 | Allowed but **warned**: an even size tolerates no more failures than the odd size below it; the extra node only adds something that can fail. |
+| 1 | ≈88 skips/yr | ≈8.8 skips/yr |
+| 3 | ≈2.6 skips/yr | ≈0.03 skips/yr |
+| 5 | ≈0.09 skips/yr | negligible |
 
-* **2 nodes is worse than 1.** A quorum of 2 is 2, so *both* must be up for
-  *either* to run: lower availability than a single replica, with no failover
-  upside. yacron2 **refuses to start** with `electLeader` and a 2-node cluster,
-  raising a `ConfigError` ("...strictly worse than a single replica..."). The
-  same 2-node cluster is fine for attestation-only (without `electLeader`).
-* Spread the nodes across **independent failure domains**. Correlated failures
-  (a bad config push, a shared host/zone) defeat the quorum math regardless of
-  `N`.
+Caveats on the math:
+
+* It assumes **independent** failures. Correlated failures (a bad config push, a
+  shared host, zone, or power domain) break that assumption, and then more nodes
+  can even hurt. Spread the nodes across independent failure domains; `p` should
+  be realistic uptime *including* deploys and restarts, not raw hardware MTBF.
+* It only models "is a quorum up". It does *not* capture the narrow
+  membership-change windows in [Guarantees and trade-offs](#guarantees-and-trade-offs)
+  (a firing may still slip through them), nor `PreferLeader` duplication, which
+  is about partitions rather than node-up probability.
 
 ### Failure handling
 
