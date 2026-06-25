@@ -153,6 +153,16 @@ Peers the node has listed as its own address (`self`) are excluded from the
 agreement tally. This makes it easy to watch a rolling deploy (`syncing` →
 `agreed`), spot drift, or watch leadership move when a node goes down.
 
+The bullets above describe the **gossip** backend. The
+[lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
+(`kubernetes` / `etcd`) have no peer set, so the panel renders a different shape:
+a **role summary** (`node-name · backend · role`, where the role is **leader**,
+**follower (leader: …)**, **follower**, or **no quorum (store unreachable)**)
+followed by a **key/value lease-detail table** (the lease/election name, the
+holder, the identity, and the expiry) — no status dots, no agreement tally, no
+quorum count. There `no quorum` means *the lease store is unreachable from this
+node*, not "no majority".
+
 ## Command palette
 
 [![The command palette open, fuzzy-matching the query "run" to per-job run and log actions](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)

@@ -95,6 +95,10 @@ def holder_from_txn_response(
     A succeeded transaction means *we* created the key, so the holder is us; a
     failed one carries the existing key's value in its range response.  Returns
     ``None`` if neither is present (an empty/odd response).
+
+    This is the *display* name (the human ``nodeName`` stored at the key); the
+    leadership decision uses :func:`campaign_won`, which fences on the bound
+    lease id, not on this string.
     """
     if resp.get("succeeded"):
         return identity
@@ -105,6 +109,31 @@ def holder_from_txn_response(
             if kvs and kvs[0].get("value") is not None:
                 return _b64decode(kvs[0]["value"])
     return None
+
+
+def campaign_won(resp: Dict[str, Any], my_lease_id: str) -> bool:
+    """Whether *we* hold the election key after this campaign transaction.
+
+    ``True`` iff we created the key (the transaction succeeded) **or** the
+    existing key is bound to *our* lease id.  Fencing leadership on the lease
+    id -- not merely on the stored identity string -- is what makes the
+    election safe even when two nodes share an identity (a duplicate
+    ``nodeName``): each node grants its *own* lease, so only the node whose
+    lease actually backs the key is the leader.  A lost campaign against a key
+    bound to someone else's lease (even one storing our own identity string)
+    returns ``False``, so the loser stands down instead of both believing they
+    hold the fence.
+    """
+    if resp.get("succeeded"):
+        return True
+    for entry in resp.get("responses", []) or []:
+        rng = entry.get("response_range") or entry.get("responseRange")
+        if rng:
+            kvs = rng.get("kvs") or []
+            if kvs:
+                bound = kvs[0].get("lease")
+                return bound is not None and str(bound) == str(my_lease_id)
+    return False
 
 
 def lease_id_from_grant(resp: Dict[str, Any]) -> Optional[str]:
@@ -128,12 +157,6 @@ def lease_ttl_from_keepalive(resp: Dict[str, Any]) -> Optional[int]:
     except (TypeError, ValueError):
         return None
 
-
-def is_leader_from_lock_state(
-    holder: Optional[str], identity: str, lease_alive: bool
-) -> bool:
-    """Leader iff we hold the election key *and* our lease is still alive."""
-    return holder == identity and lease_alive
 
 
 class EtcdBackend(LeaseBackend):
@@ -212,15 +235,18 @@ class EtcdBackend(LeaseBackend):
     def _apply_round(
         self,
         holder: Optional[str],
-        lease_alive: bool,
+        is_leader: bool,
         now: datetime.datetime,
     ) -> None:
-        """Update live leader state from a round's outcome (pure, tested)."""
+        """Update live leader state from a round's outcome (pure, tested).
+
+        ``is_leader`` is whether *we* hold the election key via *our* lease
+        (see :func:`campaign_won`); ``holder`` is the display name stored at
+        the key (whoever currently holds it).
+        """
         self._last_contact = now
         self._holder = holder
-        self._is_leader = is_leader_from_lock_state(
-            holder, self.identity, lease_alive
-        )
+        self._is_leader = is_leader
         if self._is_leader:
             self._lease_deadline = self._leader_deadline(now)
 
@@ -260,13 +286,23 @@ class EtcdBackend(LeaseBackend):
         resp = await self._post(
             "/v3/auth/authenticate",
             {"name": self.username, "password": self.password},
+            allow_reauth=False,
         )
         return resp.get("token")
 
     async def _post(
-        self, path: str, body: Dict[str, Any]
+        self, path: str, body: Dict[str, Any], *, allow_reauth: bool = True
     ) -> Dict[str, Any]:  # pragma: no cover - network
-        """POST ``body`` to ``path`` on the first responsive endpoint."""
+        """POST ``body`` to ``path`` on the first responsive endpoint.
+
+        etcd auth tokens have a TTL, so on a ``401`` from an auth-enabled
+        cluster the token has expired: re-authenticate once and retry, so the
+        backend recovers on its own instead of failing every round against a
+        healthy etcd until the process is restarted.  The retry passes
+        ``allow_reauth=False`` (and ``_authenticate`` itself does too) to bound
+        recursion to a single refresh -- a persistent ``401`` (e.g. bad
+        credentials) then surfaces as a normal failed round.
+        """
         assert self._session is not None
         headers = {}
         if self._auth_token:
@@ -278,6 +314,15 @@ class EtcdBackend(LeaseBackend):
                 async with self._session.post(
                     url, json=body, ssl=self._ssl, headers=headers
                 ) as resp:
+                    if (
+                        resp.status == 401
+                        and self.username
+                        and allow_reauth
+                    ):
+                        self._auth_token = await self._authenticate()
+                        return await self._post(
+                            path, body, allow_reauth=False
+                        )
                     resp.raise_for_status()
                     data: Dict[str, Any] = await resp.json()
                     return data
@@ -300,12 +345,20 @@ class EtcdBackend(LeaseBackend):
 
     async def _campaign(
         self, lease_id: str
-    ) -> Optional[str]:  # pragma: no cover - network
+    ) -> "tuple[Optional[str], bool]":  # pragma: no cover - network
+        """Campaign for the election key; return ``(holder, won)``.
+
+        ``holder`` is the display name stored at the key; ``won`` is whether
+        the key is bound to *our* lease (the fence; see :func:`campaign_won`).
+        """
         resp = await self._post(
             "/v3/kv/txn",
             build_campaign_txn(self.election_name, self.identity, lease_id),
         )
-        return holder_from_txn_response(resp, self.identity)
+        return (
+            holder_from_txn_response(resp, self.identity),
+            campaign_won(resp, lease_id),
+        )
 
     async def _renew_loop(self) -> None:  # pragma: no cover - network loop
         while not self._stop.is_set():
@@ -335,8 +388,8 @@ class EtcdBackend(LeaseBackend):
             self._lease_id = await self._grant_lease()
         if self._lease_id is None:
             raise aiohttp.ClientError("etcd lease grant returned no id")
-        holder = await self._campaign(self._lease_id)
-        self._apply_round(holder, True, now)
+        holder, won = await self._campaign(self._lease_id)
+        self._apply_round(holder, won, now)
 
     async def stop(self) -> None:  # pragma: no cover - network
         self._stop.set()

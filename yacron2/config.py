@@ -726,17 +726,24 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
       its own at runtime: a `listen` bound to all interfaces (`0.0.0.0` / `::`)
       self-listed by hostname. We recognise it structurally when the entry's
       host equals our `nodeName` (which defaults to the system hostname -- the
-      name the cert SAN and the peer address use by convention) on the same
-      port. Dropping it here keeps config-time `N` equal to runtime `N`, so the
-      2-node guard and the size-divergence gate can't be silently defeated by a
-      self-listing, and a self that never manages to poll itself (a cert SAN or
-      loopback-routing quirk) can no longer permanently inflate `N` and pin
-      `Leader` jobs closed cluster-wide.
+      name the cert SAN and the peer address use by convention), or -- when
+      `nodeName` is a bare label -- when the entry is an FQDN whose first label
+      is our `nodeName` (e.g. the peers list `node-a` by its FQDN
+      `node-a.internal` while `nodeName` is the short `node-a`), on the same
+      port. `nodeName` is required unique across the cluster, so a peer host
+      carrying our `nodeName` can only be us, never another member -- safe to
+      drop as self. Dropping it here keeps config-time `N` equal to runtime
+      `N`, so the 2-node guard and the size-divergence gate can't be silently
+      defeated by a self-listing, and a self that never manages to poll itself
+      (a cert SAN or loopback-routing quirk) can no longer permanently inflate
+      `N` and pin `Leader` jobs closed cluster-wide.
 
-    A self-listing whose host is neither the literal `listen` nor `nodeName`
-    (e.g. an FQDN when `nodeName` is the short name) still escapes to the
-    runtime `STATUS_SELF` recognition; structural detection without resolving
-    addresses can only cover the documented common case.
+    Only name-based self-listings are recognised here (no DNS resolution at
+    config time, which would block the per-reload parse). A self-listing by an
+    unrelated alias whose host bears no relation to `nodeName`, or any
+    self-listing behind a *concrete* (non-wildcard) `listen` other than the
+    literal listen string, still falls back to the runtime `STATUS_SELF`
+    recognition once its self-poll succeeds.
     """
     if peer_host == listen:
         return True
@@ -744,7 +751,11 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     if listen_host not in _WILDCARD_LISTEN_HOSTS:
         return False
     peer_h, _, peer_port = peer_host.rpartition(":")
-    return peer_port == listen_port and peer_h == node_name
+    if peer_port != listen_port:
+        return False
+    return peer_h == node_name or (
+        "." not in node_name and peer_h.split(".", 1)[0] == node_name
+    )
 
 
 def _cluster_base(raw: dict) -> "Dict[str, Any]":
