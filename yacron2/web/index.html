@@ -275,6 +275,26 @@
   .muted { color: var(--fg-dim); }
   .faint { color: var(--fg-faint); }
   .nowrap { white-space: nowrap; }
+
+  /* per-job cluster owner (distribution: spread) — the Owner column and its
+     header only appear once a job carries ownership data (table.show-owner). */
+  .col-owner { display: none; }
+  table.show-owner .col-owner { display: table-cell; }
+  .owner {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+    padding: 1px 7px; border-radius: var(--radius); white-space: nowrap;
+    background: var(--bg2); border: 1px solid var(--border); color: var(--fg-dim);
+  }
+  .owner .nd { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-faint); flex: none; }
+  /* this node owns the job — highlight in the accent colour so an operator can
+     see at a glance which jobs land on the node they're looking at. */
+  .owner.self { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .owner.self .nd { background: var(--accent); }
+  .owner.none { color: var(--fg-faint); border-style: dashed; }      /* no quorum: nobody owns it */
+  .owner.every .nd { background: var(--ok); }                        /* EveryNode: runs on all */
+  /* per-node ownership tally in the cluster panel (spread only) */
+  .col-owns { display: none; text-align: right; }
+  #clusterTable.show-owns .col-owns { display: table-cell; }
   .exit { font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-left: 6px; }
   .exit.zero { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
   .exit.nonzero { color: var(--fail); background: color-mix(in srgb, var(--fail) 16%, transparent); }
@@ -440,7 +460,7 @@
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
   @media (max-width: 820px) {
-    .col-cmd, .col-sched, .col-dur, .col-next, .col-trend { display: none; }
+    .col-cmd, .col-sched, .col-dur, .col-next, .col-trend, table.show-owner .col-owner { display: none; }
     .summary .pill.opt { display: none; }
     .clock, .brand .ver { display: none; }
   }
@@ -509,11 +529,12 @@
 
   <div class="card">
     <div class="card-label"><span>┌─ jobs</span><span class="grow"></span><span id="countLabel"></span></div>
-    <table>
+    <table id="jobsTable">
       <thead>
         <tr>
           <th class="sortable" data-sort="status">Status</th>
           <th class="sortable" data-sort="name">Job</th>
+          <th class="col-owner sortable" data-sort="owner">Owner</th>
           <th class="col-sched">Schedule</th>
           <th class="sortable col-last" data-sort="last">Last run</th>
           <th class="col-dur sortable" data-sort="duration">Took</th>
@@ -533,7 +554,7 @@
   <div class="card" id="clusterCard" style="display:none">
     <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><span id="clusterSummary"></span></div>
     <table id="clusterTable">
-      <thead><tr><th>Peer</th><th>Node</th><th>Status</th><th>Job set</th></tr></thead>
+      <thead><tr><th>Peer</th><th>Node</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
       <tbody id="clusterRows"></tbody>
     </table>
     <table id="clusterLease" style="display:none">
@@ -711,6 +732,8 @@
     prevFail: {},              // name -> finished_at of last seen failure (notifications)
     seenFirst: false,
     connected: true,
+    clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
+    clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     palette: { open: false, items: [], cur: 0 },
     lastRowSig: null,          // signature of the last rendered table (skip redundant rebuilds)
     focusStack: [],            // saved focus per open overlay/drawer (restore on close)
@@ -1029,6 +1052,32 @@
     return html + "</span>";
   }
 
+  // The per-job owning node under distribution: spread. `clusterOwner` is only
+  // present in the payload for leader-gated jobs in spread mode (null = the
+  // node has no quorum, so nobody owns it); EveryNode jobs carry a policy but
+  // no owner (they run everywhere). Outside spread mode neither is present and
+  // the whole column stays hidden.
+  function ownerCell(job) {
+    if (!("clusterOwner" in job)) {
+      if (job.clusterPolicy === "EveryNode")
+        return '<span class="owner every" title="runs on every node"><span class="nd"></span>all nodes</span>';
+      return '<span class="faint">—</span>';
+    }
+    const o = job.clusterOwner;
+    if (o == null) return '<span class="owner none" title="no quorum — owner undecided">no quorum</span>';
+    const self = !!state.clusterNode && o === state.clusterNode;
+    return '<span class="owner' + (self ? " self" : "") +
+      '" title="owned by ' + escAttr(o) + (self ? " (this node)" : "") + '">' +
+      '<span class="nd"></span>' + esc(o) + "</span>";
+  }
+  // Sort key for the Owner column. A leading digit groups the categories so
+  // real owners (0) sort first — alphabetically among themselves — then
+  // no-quorum (1), then EveryNode (2) and not-owned (3) park at the end.
+  function ownerSortKey(j) {
+    if (!("clusterOwner" in j)) return j.clusterPolicy === "EveryNode" ? "2" : "3";
+    return j.clusterOwner == null ? "1" : "0" + j.clusterOwner.toLowerCase();
+  }
+
   function computeView() {
     const f = state.filter.toLowerCase();
     let v = state.jobs.filter((j) => {
@@ -1045,6 +1094,7 @@
       else if (key === "last") r = (lastTs(a) - lastTs(b));
       else if (key === "next") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
       else if (key === "duration") r = ((a.last_run && a.last_run.duration) || 0) - ((b.last_run && b.last_run.duration) || 0);
+      else if (key === "owner") r = ownerSortKey(a).localeCompare(ownerSortKey(b));
       if (r === 0) r = a.name.localeCompare(b.name);
       return r * dir;
     });
@@ -1056,6 +1106,14 @@
   function renderRows() {
     const tbody = $("rows");
     const jobs = computeView();
+    // Reveal the Owner column only under distribution: spread. The reliable
+    // signals are a `clusterOwner` key on any job (the daemon adds it only in
+    // spread mode) or the /cluster view reporting spread (covers the degenerate
+    // all-EveryNode cluster, whose jobs carry no owner). NOT clusterPolicy
+    // alone — that is present under single-leader too. Toggled before the
+    // signature early-return so the column tracks the data on any poll.
+    const showOwner = !!state.clusterSpread || jobs.some((j) => "clusterOwner" in j);
+    $("jobsTable").classList.toggle("show-owner", showOwner);
     $("emptyState").style.display = jobs.length ? "none" : "block";
     $("emptyMsg").textContent = state.jobs.length ? "No jobs match your filter." : "No jobs configured.";
     $("countLabel").textContent = jobs.length + (jobs.length === 1 ? " job" : " jobs") +
@@ -1070,11 +1128,16 @@
     const sig = JSON.stringify({
       f: state.filter, s: state.statusFilter, so: state.sort, sd: state.sortDir,
       sel: state.selected, dr: state.drawerJob,
+      // owner column visibility + this node's name (for the self highlight)
+      ow: showOwner, cn: state.clusterNode,
       j: jobs.map((j) => [
         j.name, j.enabled, j.running, j.scheduled_in == null,
         j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
         j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
         (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
+        // ownership can change between polls (a node joins/leaves); track it so
+        // the row re-renders. "in" check distinguishes absent from a null owner.
+        "clusterOwner" in j ? "o:" + (j.clusterOwner || "") : j.clusterPolicy || "",
       ]),
     });
     if (sig === state.lastRowSig) return;
@@ -1103,6 +1166,7 @@
           '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span></td>" +
           '<td><div class="jobname">' + esc(job.name) + "</div>" +
               '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
+          '<td class="col-owner">' + ownerCell(job) + "</td>" +
           '<td class="col-sched"><span class="chip" title="' + escAttr(describeCron(job.schedule)) + '">' + esc(job.schedule) + "</span></td>" +
           '<td class="col-last">' + last + "</td>" +
           '<td class="col-dur muted nowrap">' + (lr ? fmtDuration(lr.duration) : "—") + "</td>" +
@@ -2042,6 +2106,29 @@
     return id ? id.replace(/^v\d+:/, "").slice(0, 12) : "—";
   }
 
+  // Record this node's name and whether spread is active (from /cluster). Both
+  // feed the job table's Owner column — the node name for the self-highlight,
+  // the flag to reveal the column even for an all-EveryNode cluster — so a
+  // change re-renders the rows. No-op when unchanged (steady-state poll).
+  function setClusterMeta(node, spread) {
+    if (state.clusterNode === node && state.clusterSpread === spread) return;
+    state.clusterNode = node;
+    state.clusterSpread = spread;
+    renderRows();
+  }
+
+  // How many jobs each node currently owns under spread, keyed by node name.
+  // Only resolved string owners count: an EveryNode job has no owner and a
+  // no-quorum job's owner is null, so neither is attributed to any node.
+  function ownerCounts() {
+    const m = {};
+    for (const j of state.jobs) {
+      const o = j.clusterOwner;
+      if (o) m[o] = (m[o] || 0) + 1;
+    }
+    return m;
+  }
+
   // Render the lease-backend (kubernetes/etcd) cluster view: a role summary
   // plus the backend's lease detail block, in place of the gossip peer table.
   function loadClusterLease(data) {
@@ -2069,11 +2156,19 @@
       if (!r.ok) return;
       const data = await r.json();
       const card = $("clusterCard");
-      if (!data.enabled) { card.style.display = "none"; return; }
+      if (!data.enabled) {
+        card.style.display = "none";
+        setClusterMeta(null, false);
+        return;
+      }
       card.style.display = "";
+      // spread is per-job ownership and only meaningful with election on; this
+      // mirrors the daemon's own gate for emitting clusterOwner in /jobs.
+      const spread = !!data.elect_leader && data.distribution === "spread";
+      setClusterMeta(data.node_name || null, spread);
       // Lease backends (kubernetes/etcd) have no static peer set: the lease
       // store is authoritative. Render the lease/role detail instead of a peer
-      // tally.
+      // tally. (They are always single-leader, so spread is false above.)
       if (data.backend && data.backend !== "gossip") {
         loadClusterLease(data);
         return;
@@ -2106,6 +2201,8 @@
         summary +=
           " · quorum " + live + "/" + (data.quorum || "?") +
           " · " + role;
+        // under spread, how many jobs this node itself currently owns
+        if (spread) summary += " · owns " + (ownerCounts()[data.node_name] || 0);
       }
       // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
       if (data.conflict_names && data.conflict_names.length) {
@@ -2124,9 +2221,13 @@
           " — Leader jobs paused";
       }
       $("clusterSummary").textContent = summary;
+      // the Owns column lists each peer's job count; reveal it only under spread
+      $("clusterTable").classList.toggle("show-owns", spread);
+      const counts = spread ? ownerCounts() : {};
       $("clusterRows").innerHTML = peers.map((p) =>
         '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
         "<td>" + esc(p.node_name || "—") + "</td>" +
+        '<td class="col-owns">' + (p.node_name ? esc(counts[p.node_name] || 0) : "—") + "</td>" +
         "<td>" + esc(p.status) + "</td>" +
         '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
       ).join("");
