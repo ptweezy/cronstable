@@ -2184,13 +2184,21 @@ async def test_poll_peer_rejects_non_dict_and_invalid_json(no_tls):
 
 
 @pytest.mark.asyncio
-async def test_poll_peer_rejects_deeply_nested_json(no_tls):
-    # a deeply-nested body (under the size cap) makes json.loads raise
-    # RecursionError, NOT ValueError. It must still be classified as a failed
-    # observation: were it to escape, _observe_peer would skip record_failure
-    # and freeze the peer's last (stale) AGREED state in the view forever while
-    # _poll_all logged a traceback every round.
-    from yacron2.cluster import MAX_PEER_RESPONSE_BYTES
+async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
+    # a deeply-nested body makes json.loads raise RecursionError, NOT
+    # ValueError. It must still be classified as a failed observation: were it
+    # to escape, _observe_peer would skip record_failure and freeze the peer's
+    # last (stale) AGREED state in the view forever while _poll_all logged a
+    # traceback every round.
+    #
+    # The depth at which json.loads actually overflows is interpreter- and
+    # platform-specific (CPython 3.14 on Linux parses far deeper before it
+    # raises than 3.13 or any Windows build did), so inject the RecursionError
+    # to pin the handling rather than the parser's moving threshold.
+    import yacron2.cluster as cluster_mod
+
+    def _raise_recursion(_raw):
+        raise RecursionError("maximum recursion depth exceeded")
 
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
@@ -2199,9 +2207,8 @@ async def test_poll_peer_rejects_deeply_nested_json(no_tls):
     # frozen, by the malformed round.
     _seed_agree(mgr, "b:1", "node-b")
     assert mgr.view.peers["b:1"].status == STATUS_AGREED
-    body = b"[" * 20000 + b"]" * 20000  # ~40 KB, well under the 256 KB cap
-    assert len(body) < MAX_PEER_RESPONSE_BYTES
-    session = _FakeSession(_FakeGet(resp=_FakeResp(body=body)))
+    monkeypatch.setattr(cluster_mod.json, "loads", _raise_recursion)
+    session = _FakeSession(_FakeGet(resp=_FakeResp(body=b"[[[]]]")))
     await mgr._poll_peer(session, "b:1", "v1:mine")
     peer = mgr.view.peers["b:1"]
     assert peer.status == STATUS_UNREACHABLE  # demoted, not frozen at AGREED
@@ -2462,16 +2469,28 @@ async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
 
 
 @pytest.mark.asyncio
-async def test_handle_reboot_ran_rejects_deeply_nested_json(no_tls):
+async def test_handle_reboot_ran_rejects_deeply_nested_json(
+    no_tls, monkeypatch
+):
     # a deeply-nested push body raises RecursionError in json.loads (not a
     # ValueError); it must be rejected as a clean 400, not escape the handler
     # as a 500 with a traceback.
+    #
+    # The overflow depth is interpreter/platform dependent (see
+    # test_poll_peer_rejects_deeply_nested_json), so inject the RecursionError
+    # directly instead of relying on a fixed nesting depth.
+    import yacron2.cluster as cluster_mod
+
+    def _raise_recursion(_raw):
+        raise RecursionError("maximum recursion depth exceeded")
+
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
     )
+    monkeypatch.setattr(cluster_mod.json, "loads", _raise_recursion)
 
     class _NestedReq:
-        content = _FakeContent(b"[" * 20000 + b"]" * 20000)
+        content = _FakeContent(b"[[[]]]")
 
     resp = await mgr._handle_reboot_ran(_NestedReq())
     assert resp.status == 400
