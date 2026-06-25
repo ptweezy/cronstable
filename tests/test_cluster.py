@@ -1461,6 +1461,62 @@ def test_view_dict_reports_size_conflict(no_tls):
     assert view["conflict_names"] == []  # not a nodeName conflict
 
 
+def test_size_divergent_peer_dropped_from_mutual_set(no_tls):
+    # a peer that agrees on the job set but declares a different N is BOTH a
+    # size conflict AND dropped from the mutual-agreement set: we neither count
+    # it toward quorum nor gossip it as a node we vouch for. Detection in
+    # conflicting_sizes is independent (scans every peer), so the Leader gate
+    # still fails closed. Dropping it from what we gossip is what stops a third
+    # node -- one that cannot see the divergent N -- from bridge-confirming the
+    # stale-N node as quorate and deferring to a node that is itself failing
+    # closed (the resize-while-bridging stand-down).
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
+    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=4, quorum 3
+    _seed_agree(mgr, "b:1", "node-b")  # the stale-N node (mid-resize)
+    _seed_agree(mgr, "c:1", "node-c")
+    _seed_agree(mgr, "d:1", "node-d")
+    mgr.view.peers["b:1"].declared_size = 5  # b on a different N
+    mgr.view.peers["c:1"].declared_size = 4
+    mgr.view.peers["d:1"].declared_size = 4
+    # node-b is excluded from the mutual set we count and gossip...
+    assert mgr._agreeing_peer_names() == ["node-c", "node-d"]
+    # ...but still detected as a size conflict, so Leader fails closed.
+    assert mgr.conflicting_sizes() == [5]
+    assert mgr.has_conflict() is True
+    # a peer too old to declare a size is NOT excluded (no divergence signal).
+    mgr.view.peers["b:1"].declared_size = None
+    assert mgr._agreeing_peer_names() == ["node-b", "node-c", "node-d"]
+    assert mgr.conflicting_sizes() == []
+
+
+def test_size_divergent_node_not_bridge_confirmed(no_tls):
+    # the resize-while-bridging scenario, deferrer side. node-z (N=5) reaches
+    # witnesses c, d, e (rolled, N=5) but NOT the stale-N node-a directly.
+    # Since the witnesses drop the size-divergent node-a from the
+    # mutual_agreeing they gossip (see test above), node-z never witnesses a
+    # two-way edge into node-a, cannot confirm it quorate, and won't defer.
+    cfg = _cfg(
+        _DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1", "e:1"], "node-z"
+    )
+    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=5, quorum 3
+    # witnesses gossip the post-fix set: node-a (stale) is absent from it.
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-z", "node-d", "node-e"})
+    _seed_agree(mgr, "d:1", "node-d", mutual={"node-z", "node-c", "node-e"})
+    _seed_agree(mgr, "e:1", "node-e", mutual={"node-z", "node-c", "node-d"})
+    # node-a (the stale-N node) is unreachable from z and vouched for by nobody
+    assert "node-a" not in mgr._bridge_candidates()
+    assert mgr.leader_name() != "node-a"  # never defers to the stale-N node
+
+    # control: were a stale-N witness to still vouch for node-a (the pre-fix
+    # behaviour), the bridge WOULD confirm it and node-z -- which cannot see
+    # the divergent N -- would defer to the lower-named node-a, a node that is
+    # itself failing closed. This is the stand-down the fix removes at source.
+    for h in ("c:1", "d:1", "e:1"):
+        mgr.view.peers[h].mutual_agreeing |= {"node-a"}
+    assert "node-a" in mgr._bridge_candidates()
+    assert mgr.leader_name() == "node-a"
+
+
 @pytest.mark.asyncio
 async def test_mtls_cluster_size_divergence_detected(tmp_path):
     # end-to-end repro of the headline trace over real mTLS: mid 3->5 resize,
@@ -2080,6 +2136,31 @@ async def test_poll_peer_rejects_non_dict_and_invalid_json(no_tls):
 
 
 @pytest.mark.asyncio
+async def test_poll_peer_rejects_deeply_nested_json(no_tls):
+    # a deeply-nested body (under the size cap) makes json.loads raise
+    # RecursionError, NOT ValueError. It must still be classified as a failed
+    # observation: were it to escape, _observe_peer would skip record_failure
+    # and freeze the peer's last (stale) AGREED state in the view forever while
+    # _poll_all logged a traceback every round.
+    from yacron2.cluster import MAX_PEER_RESPONSE_BYTES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # seed a prior healthy observation so we can prove it is overwritten, not
+    # frozen, by the malformed round.
+    _seed_agree(mgr, "b:1", "node-b")
+    assert mgr.view.peers["b:1"].status == STATUS_AGREED
+    body = b"[" * 20000 + b"]" * 20000  # ~40 KB, well under the 256 KB cap
+    assert len(body) < MAX_PEER_RESPONSE_BYTES
+    session = _FakeSession(_FakeGet(resp=_FakeResp(body=body)))
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.status == STATUS_UNREACHABLE  # demoted, not frozen at AGREED
+    assert "invalid JSON" in (peer.last_error or "")
+
+
+@pytest.mark.asyncio
 async def test_start_cleans_up_runner_on_bind_failure(no_tls):
     # #7: a bind failure (port already in use) after AppRunner.setup() must not
     # leak the runner; start() cleans up after itself and leaves the manager
@@ -2330,6 +2411,22 @@ async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
 
     resp = await mgr._handle_reboot_ran(_RawReq())
     assert resp.status == 413
+
+
+@pytest.mark.asyncio
+async def test_handle_reboot_ran_rejects_deeply_nested_json(no_tls):
+    # a deeply-nested push body raises RecursionError in json.loads (not a
+    # ValueError); it must be rejected as a clean 400, not escape the handler
+    # as a 500 with a traceback.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+
+    class _NestedReq:
+        content = _FakeContent(b"[" * 20000 + b"]" * 20000)
+
+    resp = await mgr._handle_reboot_ran(_NestedReq())
+    assert resp.status == 400
 
 
 @pytest.mark.asyncio

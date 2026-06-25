@@ -37,11 +37,16 @@ The trust model is deliberately simple and keeps no shared state:
   its declared N on /peer, and a peer that agrees on the job set but declares a
   different N is a ``conflict`` exactly like a duplicate ``nodeName``: the
   ``Leader`` gate fails closed until the cluster reconverges on one N (see
-  :meth:`ClusterManager.conflicting_sizes`).  This catches every *resize* (a
-  changed N); it does **not** catch a same-N change of *membership* (swapping
-  one peer for another keeps N, so two disjoint quorate groups could each
-  lead).  Change membership one node at a time so the old and new majorities
-  always overlap.
+  :meth:`ClusterManager.conflicting_sizes`).  A size-divergent peer is *also*
+  dropped from the mutual-agreement set (see
+  :meth:`ClusterManager._agreeing_peers`), so it is neither counted toward
+  quorum nor gossiped as a node we vouch for -- otherwise a third node that
+  cannot itself see the divergence could bridge-confirm the stale-N node as
+  quorate and defer to it (a node that is itself failing closed), stranding the
+  whole cluster mid-resize.  This catches every *resize* (a changed N); it does
+  **not** catch a same-N change of *membership* (swapping one peer for another
+  keeps N, so two disjoint quorate groups could each lead).  Change membership
+  one node at a time so the old and new majorities always overlap.
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
@@ -758,7 +763,11 @@ class ClusterManager(LeadershipBackend):
             return web.Response(status=413)
         try:
             data = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # unparseable (ValueError) or too deeply nested for the JSON
+            # scanner (RecursionError, not a ValueError); either is a malformed
+            # push from a CA-trusted-but-buggy/hostile peer -> reject cleanly
+            # rather than 500 on an escaped exception.
             return web.Response(status=400)
         if (
             isinstance(data, dict)
@@ -1009,10 +1018,15 @@ class ClusterManager(LeadershipBackend):
             return
         try:
             data = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             # invalid/truncated JSON (JSONDecodeError and UnicodeDecodeError
-            # both subclass ValueError): a CA-trusted peer can still be buggy
-            # or hostile, so treat an unparseable body as a failed observation.
+            # both subclass ValueError), or a deeply-nested document the JSON
+            # scanner refuses (RecursionError, a RuntimeError -- NOT a
+            # ValueError -- reachable under the size cap): a CA-trusted peer
+            # can still be buggy or hostile, so treat any unparseable body as a
+            # failed observation. Letting RecursionError escape here would skip
+            # record_failure and freeze the peer's last (stale) observation in
+            # the view, since _poll_all only logs the stray exception.
             self.view.record_failure(
                 host, "invalid JSON in /peer response", untrusted=False
             )
@@ -1047,8 +1061,13 @@ class ClusterManager(LeadershipBackend):
             fields[key] = value
         # cluster_size is an int, validated separately (bool is an int
         # subclass, so reject it explicitly). A peer too old to report it sends
-        # None, which simply skips the size check for that peer (fail-open for
-        # the unknown, as with a missing instance_id).
+        # None, which skips the size check for that peer. Unlike the
+        # instance_id fail-open (a missing one only forgoes *extra* conflict
+        # evidence), a missing declared_size forgoes a fail-*closed* guard:
+        # such a peer is neither flagged in conflicting_sizes nor dropped from
+        # the mutual set, so a genuinely divergent-but-silent peer (only
+        # possible pre-size-gate builds) is trusted. That is the version-skew
+        # residual, not a normal resize -- every current build reports its N.
         size = data.get("cluster_size")
         if size is not None and (
             not isinstance(size, int) or isinstance(size, bool) or size < 1
@@ -1181,7 +1200,7 @@ class ClusterManager(LeadershipBackend):
         return quorum_size(self.cluster_size())
 
     def _agreeing_peers(self) -> List[PeerState]:
-        """Peers we *mutually* agree with on our job-set id.
+        """Peers we *mutually* agree with on our job-set id *and* cluster size.
 
         A peer counts only when both directions are confirmed: we see it AGREED
         *and* its last /peer response lists us (by our unique ``instance_id``)
@@ -1192,13 +1211,33 @@ class ClusterManager(LeadershipBackend):
         job).  The price is one extra poll round to converge after a membership
         change, and that a purely one-way-reachable peer is treated as
         unreachable for quorum purposes.
+
+        A peer that agrees on the job set but declares a *different* cluster
+        size N is also excluded here -- it is a size conflict
+        (:meth:`conflicting_sizes`), and that disagreement already fails our
+        own ``Leader`` gate closed.  Dropping it from the mutual set is the
+        load-bearing half of that gate's safety under asymmetric reachability:
+        the names we gossip as ``mutual_agreeing`` are exactly these peers, so
+        a node stuck on the old N is never *vouched for* to a third node that
+        cannot see its divergent N -- which would otherwise let that third node
+        bridge-confirm it as quorate and defer to a node that is itself failing
+        closed (a cluster-wide stand-down for the whole resize).  Detection in
+        :meth:`conflicting_sizes` is independent of this (it scans every peer),
+        so the conflict is still surfaced and the gate still fails closed; a
+        peer too old to declare a size (``declared_size is None``) is *not*
+        excluded -- it contributes no divergence evidence, the safe direction.
         """
+        my_size = self.cluster_size()
         return [
             peer
             for peer in self.view.peers.values()
             if peer.status == STATUS_AGREED
             and peer.node_name is not None
             and _peer_sees_me_agreed(peer.members, self.instance_id)
+            and not (
+                peer.declared_size is not None
+                and peer.declared_size != my_size
+            )
         ]
 
     def _agreeing_peer_names(self) -> List[str]:
