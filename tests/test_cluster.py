@@ -165,10 +165,28 @@ def test_is_self_listed_edge_cases():
     assert _is_self_listed("node-a:9443", "0.0.0.0:8443", "node-a") is False
     # non-wildcard listen only matches the literal string, never by nodeName
     assert _is_self_listed("node-a:8443", "10.0.0.5:8443", "node-a") is False
-    # FQDN vs short nodeName escapes structural detection (documented residual,
-    # falls back to runtime STATUS_SELF) -- not a false positive here
+    # FQDN whose first label is our (bare) nodeName -> recognised as self, so a
+    # self-listing that never self-polls can no longer inflate N (the fix for
+    # the gossip cluster-size-pin defect).
     assert (
         _is_self_listed("node-a.internal:8443", "0.0.0.0:8443", "node-a")
+        is True
+    )
+    # a DIFFERENT node's FQDN (first label != our nodeName) stays a real peer
+    assert (
+        _is_self_listed("node-b.internal:8443", "0.0.0.0:8443", "node-a")
+        is False
+    )
+    # when nodeName is itself an FQDN, only an exact host match is self -- a
+    # sibling FQDN sharing the first label is a distinct member, not dropped
+    assert (
+        _is_self_listed(
+            "node-a.internal:8443", "0.0.0.0:8443", "node-a.internal"
+        )
+        is True
+    )
+    assert (
+        _is_self_listed("node-a.other:8443", "0.0.0.0:8443", "node-a.internal")
         is False
     )
 

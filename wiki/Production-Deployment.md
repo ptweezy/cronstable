@@ -154,29 +154,36 @@ spec:
 two replicas with no coordination each run every job independently.
 
 To run more than one replica without double-running jobs, enable
-[leader election](Clustering-and-Leader-Election): add a
-`cluster` section with `electLeader: true` and a mutual-TLS identity, and only
-the elected leader runs scheduled jobs. It is a quorum-gated, leaderless
-election that keeps no shared state, so:
+[leader election](Clustering-and-Leader-Election) with a `cluster` section.
+Pick a backend by whether you already run a coordination store:
 
-* **Use an odd replica count.** 3 replicas tolerate one failure, 5 tolerate
-  two; even counts buy no extra fault tolerance, and `replicas: 2` is worse
-  than 1 (a majority of 2 is 2, so both must be up to run anything); yacron2
-  refuses to start with `electLeader` and a 2-node cluster, and warns on even
-  sizes. Spread the replicas across nodes/zones with
-  `topologySpreadConstraints`; correlated failures defeat quorum regardless of
-  count.
-* **A minority partition stands down** (runs nothing) to guarantee at most one
-  leader, and the view is only as fresh as the poll `interval`, so this is
-  best-effort, not fenced exactly-once. If a job must *never* be skipped or
-  doubled, keep `replicas: 1` (or use a `Lease`-based external coordinator).
-* Provision the per-pod certificates from your own PKI (e.g. cert-manager) and
-  give each pod a stable `nodeName`; a StatefulSet's ordinal hostnames make
-  both the cert SANs and the peer list straightforward.
+* **`backend: kubernetes` (recommended on Kubernetes).** A
+  `coordination.k8s.io/v1` `Lease` gives a **fenced, exactly-once** election
+  while the apiserver is reachable. No mTLS, no peer list, no odd-replica
+  rule — a plain `Deployment` with any replica count works; you only grant the
+  `Lease` RBAC (`get`/`create`/`update`). Likewise `backend: etcd` if you run
+  etcd. See
+  [Operating the lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
+  and [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes).
+* **`backend: gossip` (the default, no coordination store).** A quorum-gated,
+  mutual-TLS election that keeps no shared state, so:
+  * **Use an odd replica count.** 3 replicas tolerate one failure, 5 tolerate
+    two; even counts buy no extra fault tolerance, and `replicas: 2` is worse
+    than 1 (a majority of 2 is 2, so both must be up to run anything); yacron2
+    refuses to start with `electLeader` and a 2-node cluster, and warns on even
+    sizes. Spread replicas across nodes/zones with `topologySpreadConstraints`;
+    correlated failures defeat quorum regardless of count.
+  * **A minority partition stands down** (runs nothing) to guarantee at most one
+    leader, and the view is only as fresh as the poll `interval`, so this is
+    best-effort, not fenced exactly-once. If a job must *never* be skipped or
+    doubled, use a lease backend above or keep `replicas: 1`.
+  * Provision the per-pod certificates from your own PKI (e.g. cert-manager) and
+    give each pod a stable `nodeName`; a StatefulSet's ordinal hostnames make
+    both the cert SANs and the peer list straightforward.
 
 See [Clustering and Leader Election](Clustering-and-Leader-Election) for the full
-trust model, quorum math, per-job `clusterPolicy`, and a runnable local
-three-node example.
+trust model, quorum math, per-job `clusterPolicy`, the lease backends, and a
+runnable local example.
 
 ## Writable-path exceptions
 

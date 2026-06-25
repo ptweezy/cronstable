@@ -89,7 +89,7 @@ required **only for this backend**:
 | `driftAfter` | `Int` | `3` | Consecutive reachable-but-mismatched rounds before a peer is reported `drifted` (debounce). Must be `>= 1`. |
 | `connectTimeout` | `Int` | `10` | Seconds per request (also the HTTP timeout for the lease backends). Must be `> 0`. |
 | `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a gossip `cluster` section is observe-only until opted in. The lease backends imply `electLeader: true` (configuring one is opting into leadership). |
-| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). **Rejected for the lease backends** (a single lease holder cannot also be a per-job owner). See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
+| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With `backend: kubernetes`/`etcd` a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner) — not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
 Gossip load-time validation (in addition to the numeric ranges above): with
 `electLeader: true`, a **2-node** cluster (one peer) is rejected with a
@@ -106,7 +106,7 @@ and an **even** cluster size is allowed but logs a warning.
 | `leaseDurationSeconds` | `Int` | `15` | How long a renewal keeps the lease valid. Must be `> renewDeadlineSeconds`. |
 | `renewDeadlineSeconds` | `Int` | `10` | Per-round renew/observe deadline: a round that exceeds it is abandoned and retried next round, so a stuck apiserver call cannot run out the full lease. Must be `> 0` and `< leaseDurationSeconds`. |
 | `retryPeriodSeconds` | `Int` | `2` | Seconds between renew/observe rounds. Must be `> 0`. |
-| `identity` | `Str` or null | null → `nodeName` | The lease `holderIdentity` written for this node. |
+| `identity` | `Str` or null | null → `nodeName` | The human-readable holder for this node (shown in the dashboard / `GET /cluster`). yacron2 appends a **per-process token** to the `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes sharing an `identity`/`nodeName` still write distinct holders and cannot both believe they hold the `Lease`. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
 | `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. |
 | `apiServer` | `Str` or null | null | Override the apiserver URL (else the in-cluster `KUBERNETES_SERVICE_*` env or the kubeconfig). |
 | `clientLibrary` | `Enum(["auto", "http", "library"])` | `auto` | Transport selection. `auto` uses the official `kubernetes` client when it is importable (install `yacron2[kubernetes]`) and otherwise falls back to a hand-rolled apiserver REST transport over `aiohttp`; `library` requires the native client (a `ConfigError` if absent); `http` forces the hand-rolled transport. |
@@ -118,9 +118,9 @@ native client). Defaults from `DEFAULT_ETCD`:
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `endpoints` | `Seq(Str)` | `["http://127.0.0.1:2379"]` | etcd client URLs (`http(s)://host:port`), tried in order for failover. Each must be a well-formed URL with a host and port. |
-| `electionName` | `Str` | `yacron2/leader` | The etcd key contended for; its value is the holder's `nodeName`. |
+| `electionName` | `Str` | `yacron2/leader` | The etcd key contended for; its value is the holder's `nodeName`. There is **no separate `identity` key** for etcd — the holder identity is always `cluster.nodeName` — but leadership is fenced on the **bound lease id**, not this string, so a duplicate `nodeName` cannot make two nodes both lead. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
 | `ttl` | `Int` | `15` | Lease time-to-live, seconds. Must be `> 0`. The keepalive cadence is ~`ttl/3`. |
-| `username` | `Str` or null | null | etcd auth username (omit for an auth-less cluster). |
+| `username` | `Str` or null | null | etcd auth username (omit for an auth-less cluster). Pair it with a resolvable `password`. The auth token is re-fetched automatically when it expires (re-auth on a `401`). |
 | `password` | `Map` | unset | etcd auth password, resolved like `web.authToken` from exactly one of `value` / `fromFile` / `fromEnvVar`; a configured-but-empty source fails closed. |
 | `tls.ca` / `tls.cert` / `tls.key` | `Str` or null | null | Optional client TLS for `https://` endpoints. |
 

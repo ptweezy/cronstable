@@ -12,8 +12,8 @@ from yacron2.backends.etcd import (
     _b64,
     _b64decode,
     build_campaign_txn,
+    campaign_won,
     holder_from_txn_response,
-    is_leader_from_lock_state,
     lease_id_from_grant,
     lease_ttl_from_keepalive,
 )
@@ -141,14 +141,66 @@ def test_lease_ttl_from_keepalive():
     assert lease_ttl_from_keepalive({"result": {"TTL": "nope"}}) is None
 
 
-# --- is_leader_from_lock_state --------------------------------------------
+# --- campaign_won (lease-id fence) ----------------------------------------
 
 
-def test_is_leader_from_lock_state():
-    assert is_leader_from_lock_state("node-a", "node-a", True) is True
-    assert is_leader_from_lock_state("node-a", "node-a", False) is False
-    assert is_leader_from_lock_state("node-b", "node-a", True) is False
-    assert is_leader_from_lock_state(None, "node-a", True) is False
+def test_campaign_won_on_succeeded():
+    # we created the key -> bound to our lease -> we hold it.
+    assert campaign_won({"succeeded": True}, "777") is True
+
+
+def test_campaign_won_when_key_bound_to_our_lease():
+    # a lost create race against a key that is nonetheless bound to OUR lease
+    # (we already hold it; create-if-absent fails as it exists) -> we lead.
+    resp = {
+        "succeeded": False,
+        "responses": [
+            {
+                "response_range": {
+                    "kvs": [{"value": _b64("node-a"), "lease": "777"}]
+                }
+            }
+        ],
+    }
+    assert campaign_won(resp, "777") is True
+
+
+def test_campaign_lost_when_key_bound_to_other_lease():
+    # the duplicate-identity fence: the key stores OUR identity string but is
+    # bound to a DIFFERENT lease (another process sharing our nodeName) -> we
+    # are NOT the leader, so we do not both believe we hold the fence.
+    resp = {
+        "succeeded": False,
+        "responses": [
+            {
+                "response_range": {
+                    "kvs": [{"value": _b64("node-a"), "lease": "999"}]
+                }
+            }
+        ],
+    }
+    assert campaign_won(resp, "777") is False
+
+
+def test_campaign_won_camelcase_and_missing_lease():
+    won = {
+        "succeeded": False,
+        "responses": [
+            {
+                "responseRange": {
+                    "kvs": [{"value": _b64("node-a"), "lease": "5"}]
+                }
+            }
+        ],
+    }
+    assert campaign_won(won, "5") is True
+    # a key with no lease bound is never ours
+    no_lease = {
+        "succeeded": False,
+        "responses": [{"response_range": {"kvs": [{"value": _b64("x")}]}}],
+    }
+    assert campaign_won(no_lease, "5") is False
+    assert campaign_won({"succeeded": False}, "5") is False
 
 
 # --- backend local state --------------------------------------------------
@@ -208,13 +260,16 @@ def test_apply_round_win():
 
 def test_apply_round_follower():
     b = _backend()
-    b._apply_round("node-b", True, NOW)
+    # another node holds the key (won=False), even though it displays as us
+    b._apply_round("node-b", False, NOW)
     assert b._is_leader is False
     assert b._holder == "node-b"
     assert b._last_contact == NOW
 
 
-def test_apply_round_dead_lease_not_leader():
+def test_apply_round_lost_key_not_leader():
+    # won=False (the key is bound to another lease) -> not the leader, even
+    # though the stored holder string matches our own identity.
     b = _backend()
     b._apply_round("node-a", False, NOW)
     assert b._is_leader is False

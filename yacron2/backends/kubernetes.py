@@ -40,6 +40,7 @@ import logging
 import os
 import ssl
 import tempfile
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -68,6 +69,22 @@ ACTION_WAIT = "wait"  # someone else holds a still-valid lease -> not us
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def display_holder(raw: Optional[str]) -> Optional[str]:
+    """The human-readable holder name from a (possibly suffixed) identity.
+
+    yacron2 writes ``spec.holderIdentity`` as ``<name>#<instance token>`` (see
+    :class:`KubernetesBackend`) so that two nodes sharing a configured
+    ``identity`` / ``nodeName`` still write *distinct* holder identities and
+    cannot both believe they hold the ``Lease`` -- the fence is the
+    ``holderIdentity`` string, so it must be per-process unique.  For display
+    we strip the ``#<token>`` suffix back to ``<name>``; a holder identity
+    written by some other tool (no ``#``) is shown unchanged.
+    """
+    if raw is None:
+        return None
+    return raw.rpartition("#")[0] or raw
 
 
 @dataclass
@@ -274,7 +291,21 @@ class KubernetesBackend(LeaseBackend):
         super().__init__(config, get_job_set_id)
         k8s = config["kubernetes"]
         self.lease_name: str = k8s["leaseName"]
-        self.identity: str = k8s["identity"]
+        # The configured/defaulted human name (defaults to nodeName), shown in
+        # the dashboard and GET /cluster.
+        self.display_identity: str = k8s["identity"]
+        # A random per-process token appended to the holderIdentity actually
+        # written to the Lease, so two nodes that share a configured identity
+        # (a duplicate nodeName: a Deployment, a shared HOSTNAME) still write
+        # DISTINCT holder identities and cannot both believe they hold the
+        # fence.  decide_lease_action compares this full string, so only the
+        # exact process that wrote it renews; a same-name peer sees a different
+        # holder and waits.  Stripped back to display_identity for display (see
+        # display_holder / lease_detail).
+        self.instance_id: str = uuid.uuid4().hex[:12]
+        self.identity: str = "{}#{}".format(
+            self.display_identity, self.instance_id
+        )
         self.lease_duration: int = k8s["leaseDurationSeconds"]
         self.renew_deadline: int = k8s["renewDeadlineSeconds"]
         self.retry_period: int = k8s["retryPeriodSeconds"]
@@ -341,7 +372,7 @@ class KubernetesBackend(LeaseBackend):
         return {
             "name": self.lease_name,
             "namespace": self.namespace,
-            "identity": self.identity,
+            "identity": self.display_identity,
             "holder": self._holder,
             "expiry": (
                 _format_microtime(self._leader_until)
@@ -389,16 +420,20 @@ class KubernetesBackend(LeaseBackend):
         self._last_contact = now
         if action == ACTION_WAIT:
             self._is_leader = False
-            self._holder = state.holder if state is not None else None
+            self._holder = (
+                display_holder(state.holder) if state is not None else None
+            )
             return
         if write_ok:
             self._is_leader = True
-            self._holder = self.identity
+            self._holder = self.display_identity
             self._leader_until = self._leader_deadline(now)
         else:
             # lost the optimistic-concurrency race (409): not leader now.
             self._is_leader = False
-            self._holder = state.holder if state is not None else None
+            self._holder = (
+                display_holder(state.holder) if state is not None else None
+            )
 
     # --- transport selection + renew loop (integration-only) -------------
 

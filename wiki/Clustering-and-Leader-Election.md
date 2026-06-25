@@ -29,9 +29,15 @@ elected leader firing scheduled jobs. It builds directly on the
 ## Choosing a backend
 
 `cluster.backend` selects how leadership is decided. All three present the same
-seam to the scheduler — `clusterPolicy` (`Leader` / `PreferLeader` /
-`EveryNode`), the dashboard cluster panel, and `GET /cluster` work the same — so
-you pick a point on the CAP trade-off without changing how jobs are written.
+**per-job** seam to the scheduler — `clusterPolicy` (`Leader` / `PreferLeader` /
+`EveryNode`) means the same thing on every backend — so you pick a point on the
+CAP trade-off without changing how jobs are written. What differs is the
+*coordination* underneath, and therefore how the cluster is **observed**: the
+gossip backend exposes a peer table, quorum count, and conflict gates, while the
+lease backends expose a single holder and lease expiry. The dashboard cluster
+panel and `GET /cluster` render each shape accordingly (see
+[Observing the cluster](#observing-the-cluster) and
+[Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd)).
 
 | | `gossip` *(default)* | `kubernetes` | `etcd` |
 | --- | --- | --- | --- |
@@ -61,6 +67,14 @@ uses its own v3 JSON gateway, so it has no optional client.
   logically a single holder (`cluster_size` / `quorum` report `1`), and
   `GET /cluster` returns a lease-shaped view (a `lease` block with the holder
   and expiry; an empty `peers` array).
+* **The lease is the fence — not a name.** Leadership is decided by the
+  *lease*, so a duplicate node identity cannot make two nodes both lead the way
+  it can on a naive lease holder: etcd fences on the **bound lease id** (only
+  the node whose own lease backs the election key leads), and Kubernetes writes
+  a **per-process `holderIdentity` token** so two nodes sharing a `nodeName`
+  still write distinct holders. You should still give each node a stable, unique
+  name for clear observability — see
+  [Node identity](#node-identity-for-the-lease-backends).
 * **Local-expiry safety.** A holder only calls itself leader until a
   *locally-computed* lease deadline (renew time + duration, minus a small
   clock-skew margin), so a node whose renew loop stalls self-demotes **without a
@@ -71,12 +85,16 @@ uses its own v3 JSON gateway, so it has no optional client.
   stays fail-closed: it skips while the store is unreachable. This is the
   deliberate, documented trade — a `PreferLeader` job never skips, at the cost of
   a possible double-run during a store outage.
-* **`distribution: spread` is rejected.** A single lease holder cannot also be a
-  per-job owner; use the gossip backend if you need per-job spread.
+* **`distribution: spread` is rejected** at config load (a hard `ConfigError`,
+  not a silent fallback). A single lease holder cannot also be a per-job owner;
+  use the gossip backend if you need per-job spread.
 
 The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`) are in the
-[Configuration Reference](Configuration-Reference#cluster); runnable samples are
-in [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes)
+[Configuration Reference](Configuration-Reference#cluster); deployment, RBAC,
+auth/TLS, failure modes, and monitoring are in
+[Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd).
+Runnable samples are in
+[`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes)
 and [`example/etcd/`](https://github.com/ptweezy/yacron2/tree/develop/example/etcd).
 
 The rest of this page documents the **`gossip`** backend (the default) in
@@ -203,6 +221,15 @@ agreement graph, and `@reboot` run state** off `/peer` — and could fabricate
 those fields. So the cluster CA must be a dedicated, closed boundary issued only
 to yacron2 nodes, **not** a shared service-mesh or organisation-wide CA.
 
+Individual `/peer` requests are bounded (a per-request size cap and the
+`connectTimeout`), but the listener places **no cap on concurrent
+connections**, so a CA-admitted peer that has been compromised or misconfigured
+could exhaust file descriptors / coroutines. This is a residual of trusting
+CA-vouched peers (the same boundary as the fabrication risk above); if that
+concerns you, front the `listen` port with an upstream connection limit. A
+non-CA-admitted client is rejected at the TLS handshake and never reaches the
+handler.
+
 ## Leader election
 
 Setting `electLeader: true` turns the same attestation into a **quorum-gated
@@ -277,6 +304,16 @@ distinguish two cases that otherwise look identical:
 * a **duplicate `nodeName`** — a *different* process announcing this node's
   name — where the instance id differs (status `conflict`). A third node can
   likewise spot two distinct instances claiming one name.
+
+> **This detection is best-effort.** It relies on some node being able to see
+> both copies — directly, or transitively by unioning peers' reported member
+> lists (one hop). Two copies of a duplicated `nodeName` that sit in **disjoint
+> partitions** (no single node can observe both, even transitively) cannot be
+> reconciled, so each side stays quorate and **both lead** — the same residual
+> class as a same-`N` membership swap (see
+> [Consistent cluster size](#consistent-cluster-size)). So treat unique
+> `nodeName`s as something to **enforce** (distinct cert SANs, the orchestrator's
+> stable hostnames), not merely to detect at runtime.
 
 While any `conflict` is visible, this node's **`Leader` jobs fail closed**
 (stand down) instead of risking a double-run, and the conflict is surfaced as a
@@ -604,6 +641,16 @@ In `spread` mode there is no single leader, so `leader` is `null` and
 owned jobs. The per-job owners appear as a `clusterOwner` field on each
 leader-gated job in [`GET /jobs`](HTTP-API).
 
+The JSON above is the **gossip** shape. A lease backend returns a lease-shaped
+view instead: `backend` names the backend, `peers` is `[]`,
+`cluster_size`/`quorum` are `1`, `conflict`/`size_conflict` are always `false`,
+and an extra `lease` block carries the holder and expiry — for `kubernetes`
+`{name, namespace, identity, holder, expiry}`, for `etcd`
+`{electionName, identity, holder, leaseId, expiry}`. There `quorate` means the
+node has a *fresh read of the lease store* (see
+[Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd)
+and the [`GET /cluster`](HTTP-API#get-cluster) reference).
+
 The same view is rendered as a **cluster panel** in the
 [Web Dashboard](Web-Dashboard): a status dot per peer, the agreement tally, and
 (when election is on) the quorum count and this node's role (leader, follower,
@@ -785,16 +832,225 @@ node whose refresh lagged. Recovery does **not** require restarts:
 **skips** firings rather than double-running them — there is no split-brain risk
 during the recovery, only the missed-firing cost until trust reconverges.
 
-## Kubernetes
+## Operating the lease backends (Kubernetes and etcd)
 
-A StatefulSet pairs naturally with this feature: its stable ordinal hostnames
-(`yacron2-0`, `yacron2-1`, …) make both the certificate SANs and the peer list
-straightforward, and give each pod a stable `nodeName`. Use an **odd**
-`replicas` count, spread pods across nodes/zones with
-`topologySpreadConstraints`, and provision the per-pod certificates from your own
-PKI (e.g. cert-manager). See
-[Production and Container Deployment](Production-Deployment) for the deployment
-walkthrough.
+The `kubernetes` and `etcd` backends replace the gossip protocol with a real
+coordination store, giving a **fenced, exactly-once** election while the store
+is reachable. They share one code path (`yacron2.leadership.LeaseBackend`) and
+differ only in which store they talk to. This section covers how they elect, how
+to deploy each, their failure modes, and how to monitor them; the config keys
+are in the [Configuration Reference](Configuration-Reference#cluster).
+
+### How a lease backend elects
+
+Both reduce leadership to "hold a short-lived lease on a shared object and keep
+renewing it":
+
+* **Kubernetes** drives a single `coordination.k8s.io/v1` `Lease`. The holder
+  writes its identity into `spec.holderIdentity` and refreshes `spec.renewTime`
+  every `retryPeriodSeconds`; if it stops, another node observes the lease go
+  stale and takes it over — the standard client-go leader-election algorithm.
+  The takeover deadline is anchored to *the challenger's own clock from the
+  moment it first saw the record* (client-go's `observedTime`), so it is
+  **immune to clock skew** between holder and challenger: a fast clock cannot
+  steal a freshly-renewed lease.
+* **etcd** creates a single key (`electionName`) with a *create-if-absent*
+  transaction (compare `CREATE` revision `== 0`), bound to a short-TTL lease it
+  keeps alive. At most one node's transaction wins; if the holder dies the lease
+  expires, etcd deletes the key, and another node's transaction wins. etcd's
+  server enforces the TTL.
+
+Both gate `is_leader()` on a **locally-computed** lease deadline (renew/keepalive
+time + duration − a 1 s clock-skew margin), so a node whose renew loop stalls
+**self-demotes with no network call** — that local expiry, not the store, is what
+guarantees two holders never act at once. Separately, `is_quorate()` reflects
+whether the node has a *fresh successful read* of the store (within one lease
+duration / TTL); when it goes stale, `Leader` jobs fail closed and the never-skip
+`PreferLeader` default runs the job anyway.
+
+> **Precision note.** The clock-skew margin applies to `is_leader`'s **lease
+> deadline**, not to the `is_quorate` **freshness window** (the full duration /
+> TTL, no margin). So a follower's *view of who leads* can briefly lag a dead
+> holder by up to one freshness window, while the would-be leader has already
+> self-demoted — bounded and self-healing, and `PreferLeader` never skips during
+> it.
+
+### Node identity for the lease backends
+
+Leadership is fenced on the **lease**, but each node still carries an identity:
+
+* **etcd** — the value written at the election key is `cluster.nodeName` (there
+  is no separate `etcd.identity` key). Leadership is decided on the **bound
+  lease id**, not this string, so even two nodes sharing a `nodeName` cannot both
+  lead (only the node whose lease backs the key is leader); a shared name only
+  makes the *displayed* holder ambiguous.
+* **Kubernetes** — `cluster.kubernetes.identity` (defaulting to `nodeName`) is
+  the human-readable holder; yacron2 appends a **per-process token** to the
+  `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes
+  sharing an identity still write distinct holders and cannot both renew. The
+  dashboard and `GET /cluster` strip the token back to the readable name (so
+  `kubectl get lease … -o jsonpath='{.spec.holderIdentity}'` shows the suffixed
+  form, while the dashboard shows the clean name).
+
+A duplicate identity therefore no longer silently breaks the fence — but give
+each node a **stable, unique name** anyway so the holder shown in the dashboard,
+`kubectl get lease`, or `etcdctl get` unambiguously names one node. In Kubernetes
+both a Deployment and a StatefulSet give each pod a unique hostname; a
+StatefulSet's ordinals just make the holder name predictable across restarts.
+
+### Kubernetes (`backend: kubernetes`)
+
+No mTLS, no peer list, no odd-replica rule — the apiserver is the authority, not
+a quorum, so a plain `Deployment` with any replica count works:
+
+```yaml
+cluster:
+  backend: kubernetes
+  kubernetes:
+    leaseName: yacron2-leader      # the Lease object the replicas contend for
+    # leaseNamespace: null         # default: the pod's own namespace
+    leaseDurationSeconds: 15        # failover happens within ~this long
+    renewDeadlineSeconds: 10        # must be < leaseDurationSeconds
+    retryPeriodSeconds: 2           # renew/observe cadence
+    # clientLibrary: auto          # auto | http | library (see below)
+```
+
+* **RBAC (required).** The backend needs `get` (observe), `create` (first
+  acquire), and `update` (renew / take over / release) on the one `Lease`:
+
+  ```yaml
+  apiVersion: rbac.authorization.k8s.io/v1
+  kind: Role
+  rules:
+    - apiGroups: ["coordination.k8s.io"]
+      resources: ["leases"]
+      verbs: ["get", "create", "update"]
+  ```
+
+  A ready-to-apply `ServiceAccount` + `Role` + `RoleBinding` + 3-replica
+  `Deployment` is in
+  [`example/kubernetes/deployment.yaml`](https://github.com/ptweezy/yacron2/blob/develop/example/kubernetes/deployment.yaml).
+* **Credentials.** In-cluster, the pod's service-account token, CA, and
+  namespace file are used automatically (`leaseNamespace` defaults to the pod's
+  own namespace). For out-of-cluster / local testing set
+  `cluster.kubernetes.kubeconfig` (and optionally `apiServer` to override the
+  server URL).
+* **Transport (`clientLibrary`).** `auto` (default) uses the official
+  `kubernetes` client when it is importable (`pip install yacron2[kubernetes]`)
+  and otherwise falls back to a hand-rolled apiserver REST transport over the
+  core `aiohttp` dependency — so on an architecture without the client it still
+  works. `http` forces the REST transport; `library` **requires** the native
+  client and fails the backend start (the node then fails closed) if it is not
+  importable. Both transports drive the same Lease, so the choice is purely
+  about which client code runs.
+* **Failover timing.** A holder that dies is replaced within
+  ~`leaseDurationSeconds`. On a *graceful* shutdown the holder clears
+  `holderIdentity` so a survivor takes over immediately. Shorter durations fail
+  over faster at the cost of more apiserver traffic; keep
+  `leaseDurationSeconds > renewDeadlineSeconds` (enforced at config load).
+
+### etcd (`backend: etcd`)
+
+Point the backend at one or more etcd endpoints (tried in order for failover):
+
+```yaml
+cluster:
+  backend: etcd
+  etcd:
+    endpoints: [http://etcd-0:2379, http://etcd-1:2379]
+    electionName: yacron2/leader   # the key; its value is the holder's nodeName
+    ttl: 15                         # lease TTL, seconds (keepalive every ~ttl/3)
+    # username: root               # for an auth-enabled cluster …
+    # password: { fromEnvVar: ETCD_PASSWORD }
+    # tls: { ca: /etc/etcd/ca.pem, cert: /etc/etcd/client.pem, key: /etc/etcd/client.key }
+```
+
+* **Transport.** Speaks etcd's v3 gRPC-gateway JSON/HTTP API directly over
+  `aiohttp` — no `etcd3`/grpc client, so no extra dependency and full
+  architecture coverage. There is no optional native-client extra for etcd.
+* **Authentication.** For an auth-enabled cluster set `username` and resolve the
+  `password` from exactly one of `value` / `fromFile` / `fromEnvVar` (like
+  `web.authToken`); a configured-but-empty source fails closed at load. The auth
+  token is obtained at startup and **re-fetched automatically when it expires**
+  (yacron2 re-authenticates on an etcd `401`), so a token TTL does not wedge the
+  backend. Always pair a `username` with a resolvable `password`.
+* **TLS.** For `https://` endpoints set `tls.ca` (and `tls.cert` / `tls.key` for
+  client-cert auth). `http://` and `https://` endpoints are detected per-URL.
+* **Failover timing.** A dead holder is replaced within ~`ttl`. On a *graceful*
+  shutdown the holder **revokes** its lease, deleting the key at once for
+  immediate failover. The value at `electionName` is the holder's `nodeName`, so
+  `etcdctl get yacron2/leader` shows who leads.
+
+### Failure modes
+
+* **Store unreachable** (apiserver / etcd down, or partitioned from this node).
+  Within one duration / TTL the node's `is_quorate()` goes stale, so its
+  `Leader` jobs **fail closed** (skip) and its `PreferLeader` jobs **run anyway**
+  (the never-skip rule — they may double-run across the outage). When the store
+  returns, leadership re-establishes within ~one duration. This is the lease
+  backends' one double-run exposure, and it is the documented `PreferLeader`
+  trade, not a fence break.
+* **A fenced backend never shows two simultaneous leaders.** Unlike gossip there
+  is no thin-bridge / convergence double-run window for `Leader` jobs, so
+  scraping every replica for `is_leader: true` (the gossip double-run check)
+  will never find two while the store is healthy.
+* **Kubernetes optimistic concurrency.** Writes carry the observed
+  `resourceVersion`; a node that loses the race gets an HTTP `409`, stands down
+  for that round, and retries. The graceful release is best-effort — if it races
+  a concurrent write the handover may instead wait out `leaseDurationSeconds`.
+* **etcd lease loss.** If a keepalive reports the lease gone (TTL ≤ 0) the holder
+  re-grants a fresh lease and re-campaigns, becoming leader again only if it
+  re-wins the key.
+
+### Monitoring the lease backends
+
+The gossip alerts on the [Monitoring](#monitoring-and-alerting) table — per-peer
+status, agreed-peers-vs-quorum, `untrusted` certs, the multi-leader scrape — **do
+not apply**: a lease view has `peers: []`, `quorum: 1`, and `conflict` is always
+`false`, and a fenced backend never reports two leaders. The signal that matters
+is **`quorate`**:
+
+| Alert when | Field(s) | Means |
+| --- | --- | --- |
+| `quorate` is `false` on a replica for more than a few rounds | `quorate` | that replica **cannot reach the lease store** (not "no majority"): its `Leader` jobs are standing down and its `PreferLeader` jobs may double-run |
+| the holder is unexpected or flapping | `lease.holder`, `lease.expiry` | leadership is moving more than it should (renew loop starved, duration too short) |
+
+Probe `GET /cluster` on each replica, or watch the store directly
+(`kubectl get lease <name> -o jsonpath='{.spec.holderIdentity}'`,
+`etcdctl get <electionName>`). The same leadership transitions are logged.
+
+### `@reboot` jobs on a lease backend
+
+The [`@reboot` deferral](#reboot-jobs-under-leader-election) works the same way,
+translated to lease vocabulary: a `Leader` `@reboot` one-shot runs **once on the
+lease holder** (and skips while the store is unreachable, since the holder is
+unknown until a fresh read); a `PreferLeader` `@reboot` runs on **this** node
+when the store is unreachable (a possible boot-time double-run); `EveryNode` is
+not deferred. There is **no cross-node "already ran" gossip** on a lease backend
+(it is a single-holder store), so a non-owner replica simply does not run the
+deferred one-shot — the holder does.
+
+## Running multiple replicas on Kubernetes
+
+On Kubernetes you have two ways to run more than one replica without
+double-running jobs:
+
+* **`backend: kubernetes` (recommended on Kubernetes).** A `coordination.k8s.io`
+  `Lease` gives a **fenced, exactly-once** election with no mTLS, no peer list,
+  and no odd-replica requirement — a plain `Deployment` works. See
+  [Kubernetes (`backend: kubernetes`)](#kubernetes-backend-kubernetes) above and
+  [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes).
+* **`backend: gossip` on a StatefulSet.** If you do not want to grant `Lease`
+  RBAC (or want to keep the no-coordination-store model), the gossip backend
+  pairs naturally with a StatefulSet: its stable ordinal hostnames (`yacron2-0`,
+  `yacron2-1`, …) make both the certificate SANs and the peer list
+  straightforward and give each pod a stable `nodeName`. Use an **odd**
+  `replicas` count, spread pods across nodes/zones with
+  `topologySpreadConstraints`, and provision the per-pod certificates from your
+  own PKI (e.g. cert-manager). This keeps the best-effort guarantee.
+
+See [Production and Container Deployment](Production-Deployment) for the
+deployment walkthrough.
 
 ## Trying it locally
 
@@ -835,6 +1091,24 @@ DISTRIBUTION=single-leader docker compose -f docker-compose-cluster-large.yml up
 (Ten is an *even* size, so the nodes log the even-size warning; that is expected
 and called out in the file. Quorum is 6, so it tolerates four failures.) Its
 header comments list how to inspect per-job owners and fail nodes.
+
+### A fenced backend locally
+
+To try a **lease backend** instead of gossip,
+[`example/etcd/`](https://github.com/ptweezy/yacron2/tree/develop/example/etcd)
+ships a `docker-compose.yml` with a single etcd plus two yacron2 instances
+(`backend: etcd`) and one job of each `clusterPolicy`:
+
+```shell
+docker compose -f example/etcd/docker-compose.yml up --build
+# exactly one instance leads; fail it over and watch the other take over within ~ttl:
+docker compose -f example/etcd/docker-compose.yml stop yacron2-a
+docker compose -f example/etcd/docker-compose.yml exec etcd etcdctl get yacron2/leader
+```
+
+For the Kubernetes `Lease` backend,
+[`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes)
+has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 
 ## See also
 

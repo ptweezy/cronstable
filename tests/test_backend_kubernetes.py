@@ -25,6 +25,7 @@ from yacron2.backends.kubernetes import (
     _parse_microtime,
     build_lease_body,
     decide_lease_action,
+    display_holder,
     lease_is_expired,
     parse_lease,
     plan_lease_write,
@@ -280,7 +281,9 @@ def test_plan_create_when_absent():
 def test_construction_defaults_and_identity():
     b = _backend()
     assert b.backend_name == "kubernetes"
-    assert b.identity == "node-a"  # defaulted from nodeName
+    assert b.display_identity == "node-a"  # defaulted from nodeName
+    # the written holderIdentity carries a per-process token for uniqueness
+    assert b.identity.startswith("node-a#")
     assert b.namespace == "ns"
     assert b.lease_duration == 15
     assert b.distribution == "single-leader"
@@ -288,7 +291,31 @@ def test_construction_defaults_and_identity():
 
 def test_identity_can_be_overridden():
     b = _backend(extra="    identity: custom-id\n")
-    assert b.identity == "custom-id"
+    assert b.display_identity == "custom-id"
+    assert b.identity.startswith("custom-id#")
+
+
+def test_identity_is_unique_per_process():
+    # two nodes sharing a nodeName (a duplicate identity) still write DISTINCT
+    # holderIdentity strings, so neither sees the other's holder as "us" and
+    # both cannot believe they hold the Lease -- the fenced-guarantee fix.
+    b1, b2 = _backend(), _backend()
+    assert b1.display_identity == b2.display_identity == "node-a"
+    assert b1.identity != b2.identity
+    # the loser observes the winner's full identity holding a valid lease and
+    # decides to WAIT, not RENEW (a bare-nodeName match would wrongly renew).
+    held = LeaseState(b1.identity, NOW, NOW, 15, 0, "1")
+    assert decide_lease_action(held, b2.identity, NOW, NOW) == ACTION_WAIT
+    # and the true holder still renews its own lease.
+    assert decide_lease_action(held, b1.identity, NOW, NOW) == ACTION_RENEW
+
+
+def test_display_holder_strips_instance_token():
+    assert display_holder("node-a#deadbeef0000") == "node-a"
+    assert display_holder("yacron2-0#abc123") == "yacron2-0"
+    # no suffix (a foreign / older holder) -> shown unchanged
+    assert display_holder("legacy-holder") == "legacy-holder"
+    assert display_holder(None) is None
 
 
 def test_client_library_default_and_override():
