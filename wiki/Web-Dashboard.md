@@ -55,6 +55,7 @@ Each row shows:
 | --- | --- |
 | **Status** | The job's current health — one of **Running**, **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`) — each with a color and glyph. |
 | **Job** | The job `name` and its command. |
+| **Owner** | *(cluster only, under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load))* the node that currently **owns** the job. The jobs owned by the node you're viewing are highlighted in the accent color, so you can see at a glance which work lands here; `EveryNode` jobs read **all nodes**, and a `Leader` job with no quorum reads **no quorum**. The column is hidden entirely outside spread mode. Sortable, so you can group jobs by node. |
 | **Schedule** | The raw schedule string; hover it for a plain-English reading. |
 | **Last run** | How long ago the last run finished (kept fresh every second) and an exit-code badge. |
 | **Took** | The last run's duration. |
@@ -143,11 +144,16 @@ job list and renders:
   **follower** (with the current leader's name), or **no quorum** when the node
   has stood down. Under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
   there is no single leader, so the role reads **spread (per-job owner)** while
-  quorate, or **spread (no quorum)** otherwise;
+  quorate, or **spread (no quorum)** otherwise. Under spread the summary also
+  reports how many jobs **this** node owns (e.g. `… · owns 3`);
 - a **per-peer table** listing each peer's host, reported node name, status, and
   the short form of its job-set id, with a coloured **status dot**: green for
   `agreed`, amber for `syncing`, red for `drifted`/`untrusted`, grey for
-  `unreachable`, and blue for `self`.
+  `unreachable`, and blue for `self`. Under
+  [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+  the table gains an **Owns** column counting how many jobs each node owns, so
+  the whole job-to-node distribution is visible at a glance (it pairs with the
+  per-job **Owner** column in the job table above).
 
 Peers the node has listed as its own address (`self`) are excluded from the
 agreement tally. This makes it easy to watch a rolling deploy (`syncing` →

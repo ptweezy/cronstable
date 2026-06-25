@@ -1375,8 +1375,12 @@ cannot comfortably carry all the scheduled work; for light workloads the default
 single leader is simpler and equally correct. Set `distribution` consistently on
 every node (like `electLeader`); it is inert without election. In spread mode
 `GET /cluster` reports `distribution`/`quorate` (no single `leader`), and each
-leader-gated job's owner appears as `clusterOwner` in `GET /jobs` and the
-dashboard drawer.
+leader-gated job's owner appears as `clusterOwner` in `GET /jobs`. The
+dashboard surfaces it directly: an **Owner** column in the job table (shown
+only under spread) tags every job with its owning node — highlighting the ones
+owned by the node you're viewing — and the cluster panel adds a per-node
+**Owns** tally, so you can see which jobs belong to which node at a glance. It
+also appears in each job's drawer.
 
 ### Includes
 
