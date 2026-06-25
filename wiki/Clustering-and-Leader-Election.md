@@ -145,7 +145,9 @@ The trust model is deliberately small and keeps no shared state:
   must carry `yacron-b.internal` as a Subject Alternative Name. Provision the
   certificates with your own PKI (cert-manager, a service mesh, an internal CA);
   yacron2 only consumes them. The same per-node cert/key is used both to serve
-  `/peer` and to authenticate as a client when polling peers.
+  `/peer` and to authenticate as a client when polling peers. An **in-place
+  renewal** of these files (same paths, new bytes) is detected and applied
+  automatically, with no restart — see [Certificate rotation](#certificate-rotation).
 * **Each node keeps its own view.** No node is authoritative: two healthy nodes
   converge to the same picture, and any disagreement is itself the signal.
 * **Drift is debounced.** A reachable peer whose id differs is only reported as
@@ -598,7 +600,7 @@ probes that endpoint on each replica. Useful alerts:
 | `quorate` is `false` for more than a few `interval`s | `quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
 | `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes` | a duplicate `nodeName` or a cluster-size disagreement is pausing `Leader` jobs — page on this |
 | `agreed` peers fall below `quorum − 1` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum |
-| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation) |
+| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation — see [Certificate rotation](#certificate-rotation)) |
 
 A blackbox / JSON-exporter probe (Prometheus `json_exporter`, a Nagios check,
 etc.) scraping `GET /cluster` on every replica covers all of these. The same
@@ -672,6 +674,78 @@ If you need a hard exactly-once guarantee, you need a lease/consensus store
 must *never* be skipped or doubled, run a single replica (`replicas: 1`) or use
 an external coordinator. Tuning the `interval` shorter narrows the degraded
 windows at the cost of more polling traffic.
+
+## Certificate rotation
+
+The `gossip` backend builds its mTLS contexts **once**, when the cluster manager
+starts, and loads the CA/cert/key into memory. A long-running process would
+therefore keep serving its *old* certificate after an in-place renewal — the
+exact pattern cert-manager, Vault, and Kubernetes mounted-secret refreshes use
+(same file paths, new bytes) — until the old cert expires and peers begin
+rejecting each other, losing quorum **fleet-wide** and all at once.
+
+yacron2 closes this automatically. On each config-reload pass (every minute, at
+the top of the minute), it compares the on-disk CA, cert, and key against what
+it loaded at startup; if any changed, it **restarts the cluster manager** to
+rebuild the TLS contexts with the new material. So an in-place rotation needs
+**no manual restart** — yacron2 picks it up within ~1 minute and reloads
+seamlessly. (`os.stat` follows symlinks, so the atomic symlink swap Kubernetes
+uses for mounted secrets is detected too.) This is `gossip`-only; the lease
+backends do not use per-node mTLS certs.
+
+> **Detection caveat.** Change is detected by comparing each file's
+> `(modification time, size)`. Essentially every renewal tool rewrites the bytes
+> and bumps the mtime, so this is reliable in practice — but a tool that
+> produces a **byte-length-identical** file *and* preserves/resets the mtime
+> (some restore-from-backup or `touch`-style flows) would be missed. If you use
+> such a flow, restart the process after rotation instead.
+
+### Rotating a node's certificate
+
+Per-node leaf certs (renewed by your PKI on their own schedule) are the common
+case and need no coordination as long as every cert chains to the **same** CA:
+when a node's cert is rewritten in place, that node reloads within ~1 minute and
+its peers keep trusting it (same CA). Provision certs with a comfortable overlap
+(issue the new one well before the old expires) so a slow refresh never leaves a
+node serving an expired cert.
+
+### Rolling the cluster CA
+
+Changing the CA itself is the case that needs care, because a node only trusts
+peers whose certs chain to the CA bundle **it currently holds**. Roll it so trust
+always overlaps:
+
+1. Build a **bundle CA** file containing *both* the old and new CA certificates,
+   and distribute it as the `tls.ca` on **every** node first. Each node reloads
+   within ~1 minute and now trusts certs signed by either CA.
+2. Confirm every node still shows its peers `agreed` on `GET /cluster` (no
+   `untrusted`).
+3. Re-issue each node's leaf cert from the **new** CA, **one node at a time**,
+   watching `GET /cluster` after each: the rotated node and its peers must
+   return to `agreed` before you proceed to the next.
+4. Once every node presents a new-CA cert, narrow the bundle back to the **new**
+   CA alone and distribute it everywhere.
+
+Never cut over the CA in a single step: if some nodes trust only the new CA
+while others still present old-CA certs, they reject each other as `untrusted`
+and the cluster loses quorum until trust overlaps again.
+
+### Recovering from an `untrusted` cascade
+
+If peers start showing `untrusted` on `GET /cluster` (or the
+`peer … is untrusted` `WARNING` appears in the logs) after a rotation, certs and
+CA trust have diverged — typically a CA roll that skipped the overlap step, or a
+node whose refresh lagged. Recovery does **not** require restarts:
+
+* Restore the trust overlap — push a CA bundle that includes whichever CA the
+  still-`untrusted` peers were issued from — or finish rolling the lagging nodes
+  onto the new CA.
+* Each node reloads within ~1 minute; once certs chain to a trusted CA again,
+  peers return to `agreed` and quorum is restored automatically.
+
+`Leader` jobs stand down (fail closed) while quorum is lost, so the cascade
+**skips** firings rather than double-running them — there is no split-brain risk
+during the recovery, only the missed-firing cost until trust reconverges.
 
 ## Kubernetes
 
