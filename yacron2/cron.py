@@ -284,6 +284,9 @@ class Cron:
         self._elect_leader_configured = False
         # last leadership state we logged, so we only log on transition
         self._was_leader = False
+        # last quorum-membership state we logged; tracked on every node so a
+        # follower losing quorum logs it too (not just the ex-leader)
+        self._was_quorate = False
         # last duplicate-nodeName state we logged, so we only log on transition
         self._was_conflict = False
         # last cluster-size-disagreement state we logged (same rationale)
@@ -1072,9 +1075,11 @@ class Cron:
     def _log_cluster_role(self) -> None:
         """Log this node's run-eligibility transitions (once per change).
 
-        In single-leader mode this is leadership; in spread mode there is no
-        single leader, so we log quorum membership (the gate that decides
-        whether this node runs its owned jobs at all).
+        Quorum membership is logged in both modes, so any node -- leader or
+        follower -- records losing (and regaining) quorum, the gate that
+        decides whether the cluster can run leader-gated work at all.
+        Single-leader mode additionally logs this node acquiring or losing the
+        one scheduled-job leadership.
         """
         if not self._elect_leader_configured:
             return
@@ -1119,16 +1124,34 @@ class Cron:
                         "jobs may run again"
                     )
                 self._was_size_conflict = bool(size_conflict)
-        if mgr is not None and mgr.distribution == "spread":
-            quorate = mgr.is_quorate()
-            if quorate != self._was_leader:
+        # Quorum membership is logged on *every* node, in both modes, so a
+        # follower that drops below quorum -- i.e. the whole cluster losing the
+        # ability to elect a leader -- leaves a breadcrumb in its own log, not
+        # only the ex-leader's (in single-leader mode only the ex-leader's
+        # is_leader() flips, so followers used to log nothing on quorum loss).
+        spread = mgr is not None and mgr.distribution == "spread"
+        quorate = mgr is not None and mgr.is_quorate()
+        if quorate != self._was_quorate:
+            if spread and quorate:
                 logger.info(
-                    "cluster: this node %s quorum; per-job ownership %s",
-                    "joined" if quorate else "left",
-                    "active" if quorate else "suspended",
+                    "cluster: this node joined quorum; "
+                    "per-job ownership active"
                 )
-                self._was_leader = quorate
-            return
+            elif spread:
+                logger.info(
+                    "cluster: this node left quorum; per-job ownership "
+                    "suspended"
+                )
+            elif quorate:
+                logger.info("cluster: this node joined quorum")
+            else:
+                logger.info(
+                    "cluster: this node left quorum; no majority reachable, "
+                    "so Leader jobs cannot run until one is"
+                )
+            self._was_quorate = quorate
+        if spread:
+            return  # no single leader in spread mode
         leader = mgr is not None and mgr.is_leader()
         if leader != self._was_leader:
             logger.info(

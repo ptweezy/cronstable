@@ -37,7 +37,11 @@ The trust model is deliberately simple and keeps no shared state:
   its declared N on /peer, and a peer that agrees on the job set but declares a
   different N is a ``conflict`` exactly like a duplicate ``nodeName``: the
   ``Leader`` gate fails closed until the cluster reconverges on one N (see
-  :meth:`ClusterManager.conflicting_sizes`).
+  :meth:`ClusterManager.conflicting_sizes`).  This catches every *resize* (a
+  changed N); it does **not** catch a same-N change of *membership* (swapping
+  one peer for another keeps N, so two disjoint quorate groups could each
+  lead).  Change membership one node at a time so the old and new majorities
+  always overlap.
 * **Drift is debounced.**  A reachable peer whose id differs is only reported
   as ``drifted`` after ``driftAfter`` consecutive rounds, so a rolling deploy
   (a transient, legitimate mismatch) does not raise a false alarm.
@@ -72,10 +76,18 @@ mutually-agreeing members.
 A node only ever elects a candidate it can *confirm is itself quorate* (a
 direct peer whose gossiped ``mutual_agreeing`` is at or above quorum, or a
 witnessed bridge node) -- never a node that would itself stand down.  This is
-deliberate and is the design's liveness choice: in a **uniform-version**
-cluster a healthy majority is never stood down (electing the lowest of a
-confirmed-quorate set always lands on a node that actually runs).  The accepted
-cost is the converse -- two quorate nodes whose bridge is too thin to confirm
+deliberate and is the design's liveness choice: in a **uniform-version**,
+*converged* cluster a healthy majority is not stood down (electing the lowest
+of a confirmed-quorate set lands on a node that actually runs).  That
+confirmation is only as fresh as the witnesses' last gossip, though: a
+bridge-confirmed candidate proves it *had* a quorum of mutual agreers when the
+witnesses last saw it, not that it is still reachable now.  So if such a
+candidate becomes isolated, the witnesses keep advertising it as quorate for up
+to ~1--2 poll ``interval``s, and during that window the majority can briefly
+*all* defer to that now-sub-quorum candidate and skip a firing -- the
+liveness-side mirror of the double-run window below, and like it transient and
+self-healing once the stale gossip ages out.  The accepted steady-state cost is
+the converse -- two quorate nodes whose bridge is too thin to confirm
 each other (fewer than ``quorum - 1`` shared members), are more than one gossip
 hop apart, or are still converging may *each* elect itself and **double-run** a
 ``Leader`` job.  We trade the (fail-closed) risk of a missed firing for never
@@ -243,8 +255,9 @@ def quorum_size(cluster_size: int) -> int:
 
     A quorum requires *more than half* the cluster, so no two quorums can be
     disjoint; that is the property the leader gate relies on for safety.  Note
-    this favours odd cluster sizes: N=3 and N=4 both need 3 and both tolerate
-    only one failure, so the even node buys nothing.
+    this favours odd cluster sizes: N=3 needs 2 (tolerates one failure) and N=4
+    needs 3 (still tolerates only one), so the even node buys nothing, while
+    N=5 needs 3 and tolerates two.
     """
     return cluster_size // 2 + 1
 
@@ -271,10 +284,14 @@ def elect_leader(
     * electing the lowest among a set that spans a bridge makes two would-be
       leaders joined only by shared members defer to the same node, so only one
       leads (closing the asymmetric double-run); and
-    * because every candidate is confirmed quorate, this node never defers to a
-      peer that would *itself* stand down -- so a healthy majority is never
-      stood down (the liveness choice; the residual is that two quorate nodes
-      with too thin a bridge to confirm each other may both run).
+    * because every candidate is confirmed quorate *as of the witnesses' last
+      gossip*, this node defers only to a node that was runnable then -- so in
+      a converged view a healthy majority is not stood down (the liveness
+      choice).  The residuals: two quorate nodes whose bridge is too thin to
+      confirm each
+      other may both run, and a candidate confirmed from now-stale gossip that
+      has since become isolated can briefly draw the majority into deferring to
+      it (a transient skip until the gossip ages out).
 
     ``candidate_names`` defaults to ``live_peer_names`` (the simple, no-
     confirmation behaviour) and never affects the quorum gate, which is always
@@ -664,6 +681,10 @@ class ClusterManager(LeadershipBackend):
         self._tls_signature = _tls_file_signature(config["tls"])
         self._runner: Optional[web.AppRunner] = None
         self._poll_task: Optional[asyncio.Task] = None
+        # one client session for the lifetime of the manager, so peer polls and
+        # reboot-ran pushes reuse connections instead of re-handshaking mTLS
+        # every round; created in start(), closed in stop().
+        self._session: Optional[aiohttp.ClientSession] = None
         self._stop = asyncio.Event()
         # @reboot one-shots THIS node has run as the elected owner (plus any it
         # learned ran via push) -- gossiped so peers retire their matching
@@ -722,7 +743,17 @@ class ClusterManager(LeadershipBackend):
         same Byzantine class as a member lying about its job_set_id to skew the
         election, which this design already does not defend against.
         """
-        raw, too_large = await _read_capped(request, MAX_PEER_RESPONSE_BYTES)
+        try:
+            raw, too_large = await asyncio.wait_for(
+                _read_capped(request, MAX_PEER_RESPONSE_BYTES),
+                self.config["connectTimeout"],
+            )
+        except asyncio.TimeoutError:
+            # a slow/stalled body read (a hung but CA-vouched peer): bound it
+            # by the same per-request timeout the client side uses, rather than
+            # letting it pin a handler coroutine indefinitely (the size cap in
+            # _read_capped bounds bytes, not time).
+            return web.Response(status=408)
         if too_large:
             return web.Response(status=413)
         try:
@@ -733,6 +764,13 @@ class ClusterManager(LeadershipBackend):
             isinstance(data, dict)
             and data.get("job_set_id") == self.get_job_set_id()
         ):
+            # Reconcile our recorded runs to the current job set *before*
+            # absorbing, mirroring _poll_all.  A reload may have changed the
+            # job set while _ran_jobs_job_set_id still lags; without this the
+            # names would be seeded under the stale id and wiped by the next
+            # poll.  Reconciling first records them under the live id so they
+            # survive (and clears a stale set rather than carry it across).
+            self._reconcile_job_set_id(self.get_job_set_id())
             self._ran_reboot_jobs |= _parse_str_list(data.get("names"))
         return web.Response(status=204)
 
@@ -759,6 +797,12 @@ class ClusterManager(LeadershipBackend):
             await runner.cleanup()
             raise
         self._runner = runner
+        # one session for the manager's lifetime: peer polls and reboot-ran
+        # pushes reuse it (and its kept-alive mTLS connections) instead of
+        # opening a fresh session -- and re-handshaking -- every round.
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.config["connectTimeout"])
+        )
         logger.info(
             "cluster: node %r serving mTLS /peer on %s, polling %d peer(s) "
             "every %ds",
@@ -778,6 +822,11 @@ class ClusterManager(LeadershipBackend):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        if self._session is not None:
+            # close after the poll task is cancelled, so no in-flight request
+            # is using it; before the runner, mirroring teardown order.
+            await self._session.close()
+            self._session = None
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -809,34 +858,48 @@ class ClusterManager(LeadershipBackend):
             except asyncio.TimeoutError:
                 pass
 
-    async def _poll_all(self) -> None:
-        my_id = self.get_job_set_id()
+    def _reconcile_job_set_id(self, my_id: str) -> None:
+        """Align the recorded-@reboot-runs set with the current job set.
+
+        Clears ``_ran_reboot_jobs`` when our job set CHANGED (a config reload):
+        runs recorded under the old set no longer apply to the new one, so a
+        still-deferred @reboot may run again -- the safe direction; we never
+        silently skip a job whose definition changed.  The first observation
+        only *establishes* the id (no clear), so a push that arrived before the
+        first poll is not wiped.
+
+        The poll loop calls this each round, but :meth:`mark_reboot_ran` and
+        :meth:`_handle_reboot_ran` call it too, immediately before they add to
+        the set: that records their entries under the live id so the loop's
+        next reconcile (same id -> no clear) cannot discard them, closing the
+        window where an add raced a reload-driven clear.  It is idempotent and
+        await-free, so calling it from those paths interleaves safely.
+        """
         if (
             self._ran_jobs_job_set_id is not None
             and my_id != self._ran_jobs_job_set_id
         ):
-            # our job set CHANGED (config reload): runs recorded under the old
-            # set no longer apply to the new one, so forget them. A still-
-            # deferred @reboot may then run again -- the safe direction; we
-            # never silently skip a job whose definition changed. (The first
-            # observation just establishes the id; it must not clear, or a push
-            # that arrived before the first poll would be wiped.)
             self._ran_reboot_jobs.clear()
         self._ran_jobs_job_set_id = my_id
-        timeout = aiohttp.ClientTimeout(total=self.config["connectTimeout"])
+
+    async def _poll_all(self) -> None:
+        my_id = self.get_job_set_id()
+        self._reconcile_job_set_id(my_id)
         peers = self.config["peers"]
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # return_exceptions so one peer raising an *unexpected* error (a
-            # bug, not a network failure -- those are handled inside
-            # _poll_peer) cannot abort the whole round and leave the other
-            # peers' coroutines detached. Surface such errors, don't swallow.
-            results = await asyncio.gather(
-                *(
-                    self._poll_peer(session, peer["host"], my_id)
-                    for peer in peers
-                ),
-                return_exceptions=True,
-            )
+        session = self._session
+        if not peers or session is None:
+            # no peers to poll, or the manager is not running (e.g. _poll_all
+            # invoked directly in a test): the reconcile above is the only work
+            # this round.
+            return
+        # return_exceptions so one peer raising an *unexpected* error (a
+        # bug, not a network failure -- those are handled inside _poll_peer)
+        # cannot abort the whole round and leave the other peers' coroutines
+        # detached. Surface such errors, don't swallow.
+        results = await asyncio.gather(
+            *(self._poll_peer(session, peer["host"], my_id) for peer in peers),
+            return_exceptions=True,
+        )
         # gather preserves order, so results[i] corresponds to peers[i].
         for index, result in enumerate(results):
             if isinstance(result, asyncio.CancelledError):
@@ -849,6 +912,70 @@ class ClusterManager(LeadershipBackend):
                 )
 
     async def _poll_peer(
+        self, session: aiohttp.ClientSession, host: str, my_id: str
+    ) -> None:
+        """Observe one peer, then log any status transition (once per change).
+
+        The observation lives in :meth:`_observe_peer`; this thin wrapper diffs
+        the peer's status across it so a reachability, cert, or drift change
+        gets a log line at the manager seam -- ``ClusterView`` itself stays
+        pure (no I/O, no logging) so its state machine remains trivially
+        testable.
+        """
+        prev_status = self.view.peers[host].status
+        await self._observe_peer(session, host, my_id)
+        self._log_peer_status_change(host, prev_status)
+
+    def _log_peer_status_change(self, host: str, prev: str) -> None:
+        """Log a peer's status transition once, where the manager has a seam.
+
+        Cert failures are the highest-value signal: a botched in-place rotation
+        otherwise turns peers ``untrusted`` one by one in silence until enough
+        fall off to break quorum.  A first contact going *unreachable* out of
+        ``unknown`` (and any no-op transition) is not logged, so a cluster
+        coming up does not emit a startup burst while peers are still binding;
+        a first *successful* contact does log a single ``now agreed``.
+        """
+        peer = self.view.peers[host]
+        new = peer.status
+        if new == prev:
+            return
+        if new == STATUS_UNTRUSTED:
+            logger.warning(
+                "cluster: peer %s is untrusted -- TLS/cert verification "
+                "failed: %s",
+                host,
+                peer.last_error,
+            )
+        elif new == STATUS_UNREACHABLE and prev not in _STALE_STATUSES:
+            # only warn when a peer we had previously reached drops; a peer
+            # that was never contacted (unknown / already stale) is startup
+            # noise.
+            logger.warning(
+                "cluster: peer %s became unreachable: %s",
+                host,
+                peer.last_error,
+            )
+        elif new == STATUS_DRIFTED:
+            logger.warning(
+                "cluster: peer %s drifted -- its job-set id has differed for "
+                ">= driftAfter rounds (or reports a different fingerprint "
+                "scheme)",
+                host,
+            )
+        elif new == STATUS_CONFLICT:
+            # the cluster-wide conflict is logged loudly by
+            # Cron._log_cluster_role; a per-peer line at INFO just pinpoints
+            # which peer collided.
+            logger.info(
+                "cluster: peer %s reports a duplicate nodeName: %s",
+                host,
+                peer.last_error,
+            )
+        elif new == STATUS_AGREED and prev != STATUS_SELF:
+            logger.info("cluster: peer %s now agreed", host)
+
+    async def _observe_peer(
         self, session: aiohttp.ClientSession, host: str, my_id: str
     ) -> None:
         url = "https://{}/peer".format(host)
@@ -981,26 +1108,30 @@ class ClusterManager(LeadershipBackend):
         backstop); it just shrinks the window in which we could run the job and
         then die before any peer observed it.
         """
-        # the poll loop is the sole authority for _ran_jobs_job_set_id (it
-        # establishes it and clears the set on a change), so we only add here.
+        # Reconcile to the live job set *before* adding, so the entry lands
+        # under the current id.  Otherwise the poll loop, waking during the
+        # push below, could observe a reloaded id and clear() this just-added
+        # entry.  _reconcile_job_set_id is await-free, so the reconcile+add
+        # cannot itself be interleaved, and the loop's next same-id reconcile
+        # is then a no-op.
+        self._reconcile_job_set_id(self.get_job_set_id())
         self._ran_reboot_jobs.add(job_name)
         await self._push_reboot_ran()
 
     async def _push_reboot_ran(self) -> None:
         peers = self.config["peers"]
         names = sorted(self.advertised_ran_jobs())
-        if not peers or not names:
+        session = self._session
+        if not peers or not names or session is None:
             return
         payload = {"job_set_id": self.get_job_set_id(), "names": names}
-        timeout = aiohttp.ClientTimeout(total=self.config["connectTimeout"])
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            await asyncio.gather(
-                *(
-                    self._push_reboot_ran_one(session, peer["host"], payload)
-                    for peer in peers
-                ),
-                return_exceptions=True,
-            )
+        await asyncio.gather(
+            *(
+                self._push_reboot_ran_one(session, peer["host"], payload)
+                for peer in peers
+            ),
+            return_exceptions=True,
+        )
 
     async def _push_reboot_ran_one(
         self,
@@ -1106,11 +1237,18 @@ class ClusterManager(LeadershipBackend):
         ``members`` -- is what keeps it *live*: a node merely *reached* one-way
         by a quorum is not quorate, and deferring to it would stand every node
         down (it cannot run).  By requiring a witnessed two-way edge we never
-        confirm such a node.  Combined with the monotonicity argued on
-        :func:`elect_leader` (this only ever *adds* candidates, so it can only
-        make this node defer to a confirmed-quorate node, never lead more), the
-        change neither double-runs nor introduces a stand-down.  Residual gaps
-        stay best-effort: a pair sharing fewer than ``quorum - 1`` mutual
+        confirm such a node.  The monotonicity argued on :func:`elect_leader`
+        (this only ever *adds* candidates) soundly gives the **no-double-run**
+        half: adding candidates can only make this node defer to a
+        confirmed-quorate node, never lead more.  The **no-stand-down** half is
+        weaker -- it holds only in a *converged* view, because confirmation
+        proves a candidate *had* a quorum of mutual agreers as of the
+        witnesses' last gossip, not that it is still reachable now.  A
+        candidate that has
+        since become isolated can therefore briefly pull the majority into
+        deferring to it (a transient skip until the stale gossip ages out; see
+        the module docstring).  Residual gaps stay best-effort: a pair sharing
+        fewer than ``quorum - 1`` mutual
         bridges cannot be confirmed (so may still double-run), a node more than
         one gossip hop away is invisible until it propagates, and a stale view
         converges only as fast as the poll ``interval``.  A hard exactly-once
@@ -1157,11 +1295,15 @@ class ClusterManager(LeadershipBackend):
 
         A peer we cannot confirm quorate -- one reporting a sub-quorum set, or
         an older build that does not report the set at all -- is *not* elected.
-        For a uniform-version cluster this means a quorate node always elects a
-        runnable leader, so a healthy majority is never stood down (the
-        liveness choice); the accepted residual is the converse -- two quorate
-        nodes whose bridge is too thin to confirm each other may each elect
-        itself and double-run a ``Leader`` job.  During a *rolling upgrade*
+        For a uniform-version cluster this means that, *in a converged view*, a
+        quorate node elects a runnable leader, so a healthy majority is not
+        stood down (the liveness choice).  The accepted residuals are the
+        converse: two quorate nodes whose bridge is too thin to confirm each
+        other may each elect itself and double-run a ``Leader`` job, and --
+        symmetrically -- a candidate confirmed from now-stale bridge gossip
+        that has since become isolated can briefly draw the majority into
+        deferring to it (a transient skip until the gossip ages out; see the
+        module docstring).  During a *rolling upgrade*
         (old and new builds) the two builds run different election logic and
         cannot agree, so excluding the unconfirmable old peers leans the new
         nodes toward running (a possible double-run) rather than standing down;
@@ -1236,6 +1378,14 @@ class ClusterManager(LeadershipBackend):
         observe the mismatch symmetrically (each side fails closed).  Stale or
         job-set-drifted peers, and peers too old to report a size, contribute
         nothing.
+
+        This compares the declared *size* N, so it catches every resize.  It
+        does **not** catch a same-N change of *membership* (e.g. swapping one
+        peer for another while keeping the count): two disjoint groups that
+        each declare the same N would each reach a quorum with no conflict
+        flagged.  The mitigation is operational -- change membership one node
+        at a time so the old and new majorities always overlap (see the module
+        docstring).
         """
         my_size = self.cluster_size()
         return sorted(

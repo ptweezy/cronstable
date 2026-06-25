@@ -1210,7 +1210,10 @@ The trust model is deliberately small and keeps no shared state:
 * **Each node keeps its own view.** No node is authoritative: two healthy nodes
   converge to the same picture, and any disagreement is itself the signal. Each
   peer is reported as `agreed`, `syncing`, `drifted`, `unreachable`,
-  `untrusted`, or `self` (the node found its own address in the peer list).
+  `untrusted`, `self` (the node found its own address in the peer list),
+  `conflict` (a duplicate `nodeName`), or `unknown` (not yet contacted) — the
+  full table is in the
+  [clustering guide](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election#per-peer-status).
 * **Drift is debounced.** A reachable peer whose id differs is only reported as
   `drifted` after `driftAfter` consecutive rounds, so a rolling deploy (a brief,
   legitimate mismatch) does not raise a false alarm.
@@ -1282,10 +1285,12 @@ until survivors notice; and asymmetric or partial reachability can briefly
 double-run a `Leader` job. Two nodes that never agree with each other but are
 bridged by shared members collapse back to one leader once each confirms the
 other through the bridge (a bridge of `quorum - 1` shared members suffices). A
-node only elects a leader it can confirm is itself quorate, so a healthy
-majority is **never silently stood down**; the deliberate trade is that a
-*thinner* bridge or the convergence window can double-run instead of skipping
-(`spread` behaves the same per job). The default `gossip` backend keeps **no
+node only elects a leader it can confirm is itself quorate, so in a *converged*
+view a healthy majority is **not silently stood down**; the trades are that a
+*thinner* bridge or the convergence window can double-run instead of skipping,
+and — symmetrically — a candidate confirmed from now-stale bridge gossip that
+has since become isolated can briefly draw the majority into deferring to it (a
+transient skip until the gossip ages out). `spread` behaves the same per job. The default `gossip` backend keeps **no
 shared state**, which is what makes it best-effort. If you need a hard
 exactly-once guarantee **and** already run a coordination store, set
 `cluster.backend: kubernetes` or `cluster.backend: etcd` to elect through a
