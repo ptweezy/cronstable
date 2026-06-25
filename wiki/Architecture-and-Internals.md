@@ -234,9 +234,13 @@ The `ClusterManager` (in `yacron2/cluster.py`) owns two things:
 
 - **The mTLS `/peer` listener** — its own `aiohttp` `AppRunner` on the `cluster`
   `listen` address, with a server SSL context that *requires* a CA-signed client
-  cert (`ssl.CERT_REQUIRED`). It serves a single route returning
-  `{"node_name", "job_set_id", "scheme_version"}`. This listener is entirely
-  separate from the public web app.
+  cert (`ssl.CERT_REQUIRED`). Its `GET /peer` returns the node's `node_name`,
+  `job_set_id`, and `scheme_version` plus the attestation fields the gates run
+  on — `instance_id`, declared `cluster_size`, its `members` observations,
+  `mutual_agreeing`, and `ran_reboot_jobs` (full schema in
+  [Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status)).
+  It also accepts `POST /reboot-ran` (the eager `@reboot` push). This listener
+  is entirely separate from the public web app.
 - **The poll loop** — every `interval` seconds it polls each peer's `/peer` over
   mTLS (a client SSL context with `check_hostname=True`, so the peer cert's SAN
   must match the configured host), and feeds each observation into the pure

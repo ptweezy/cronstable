@@ -173,8 +173,33 @@ A peer reported as `unreachable` or `untrusted` resets its drift streak, because
 the streak only counts *reachable-but-mismatched* rounds.
 
 The `/peer` endpoint is served **only** on the separate mTLS `listen` address,
-never on the public [web API](HTTP-API). It returns a small JSON document:
-`{"node_name": ..., "job_set_id": ..., "scheme_version": "v1"}`.
+never on the public [web API](HTTP-API). It returns a JSON document carrying
+everything a polling peer needs to drive attestation, the quorum gate, and the
+conflict checks:
+
+```jsonc
+{
+  "node_name": "node-b",          // this node's nodeName
+  "job_set_id": "v1:…",           // its job-set fingerprint (the agreement key)
+  "scheme_version": "v1",         // fingerprint scheme; ids compare only within one
+  "instance_id": "a1b2…",         // random per-process id → duplicate-nodeName detection
+  "cluster_size": 3,              // its declared N → the size-divergence gate
+  "members": [                    // its own per-peer observations → mutual agreement
+    {"node_name": "node-a", "instance_id": "…", "agreed": true}
+    // …one entry per node it holds a fresh view of → transitive conflict detection
+  ],
+  "mutual_agreeing": ["node-a"],  // peers it *two-way* agrees with → bridge discovery
+  "ran_reboot_jobs": ["boot"]     // @reboot one-shots known run → deferred-@reboot retirement
+}
+```
+
+Every field after the first three is load-bearing for a safety check described
+on this page (mutual agreement, the bridge mitigation, the duplicate-`nodeName`
+and cluster-size conflict gates, `@reboot` de-duplication). A consequence worth
+calling out: **any peer the cluster CA admits can read the full member graph,
+agreement graph, and `@reboot` run state** off `/peer` — and could fabricate
+those fields. So the cluster CA must be a dedicated, closed boundary issued only
+to yacron2 nodes, **not** a shared service-mesh or organisation-wide CA.
 
 ## Leader election
 
@@ -421,15 +446,29 @@ agreeing nodes" and "the quorum-gated *per-job owner*" respectively.)
 
 `@reboot` fires once at startup, which is the one instant the cluster has *not*
 yet converged — no peer has been polled, so there is no quorum and no elected
-owner. Under `electLeader`, an `@reboot` job with `Leader` or `PreferLeader`
-policy is therefore **deferred**: held until the cluster converges, then run
-**once** on the elected (quorum-gated) owner. Without this, a `Leader` `@reboot`
-job would *never* run (it saw no quorum at boot and `@reboot` never re-fires),
-and a `PreferLeader` one would run on *every* node (each saw only itself). If no
-quorum ever forms, a deferred `@reboot` job does not run (consistent with
-`Leader` semantics). For `@reboot` work that must run on **every** node at boot
-(warming a local cache, announcing the node), use `clusterPolicy: EveryNode`,
-which is not deferred.
+owner. Running a leader-gated `@reboot` job immediately would misfire: a
+`Leader` job would see no quorum and skip *forever* (`@reboot` never re-fires),
+and a `PreferLeader` job would see only itself on every node and run *everywhere*.
+So under `electLeader` an `@reboot` job with `Leader` or `PreferLeader` policy is
+**deferred** — held until the cluster converges, then run **once** on the owner
+that policy resolves to. The deferral exists only to get past that boot-time
+"every node sees only itself" window; **which owner runs it, and whether it runs
+at all without a quorum, follows the job's policy exactly as for a scheduled
+firing**:
+
+* **`Leader`** runs on the **quorum-gated** elected owner. If no quorum ever
+  forms, the deferred job **does not run** (the at-most-once trade — a skip is
+  preferred to a double-run), and it also stands down while a `nodeName`/size
+  conflict is visible.
+* **`PreferLeader`** runs on the **quorum-free** availability owner — the lowest
+  reachable agreeing node — so it **always resolves to some node and runs even
+  with no quorum** (an isolated or minority node runs it itself), exactly
+  mirroring `PreferLeader`'s never-skip contract for scheduled jobs. The price,
+  as ever for `PreferLeader`, is a possible double-run across a partition.
+
+For `@reboot` work that must run on **every** node at boot (warming a local
+cache, announcing the node), use `clusterPolicy: EveryNode`, which is not
+deferred.
 
 ## Distribution: one leader, or spread the load
 
@@ -495,8 +534,10 @@ name and the live member set, so it stays put until membership changes (then
 only the affected jobs move). You can confirm it live:
 
 ```shell
-curl -s http://localhost:8080/jobs | python -m json.tool | grep -A1 clusterPolicy
-# each leader-gated job shows a "clusterOwner" naming the node that runs it
+curl -s http://localhost:8080/jobs | python -m json.tool | grep -A1 clusterOwner
+# under distribution: spread, each leader-gated job carries a "clusterOwner"
+# naming the node that runs it; single-leader mode emits no clusterOwner (the
+# leader from GET /cluster owns every Leader job)
 ```
 
 ## Observing the cluster
@@ -508,6 +549,7 @@ JSON. When no `cluster` section is configured it returns
 ```jsonc
 {
   "enabled": true,
+  "backend": "gossip",             // the active cluster.backend
   "node_name": "node-a",
   "job_set_id": "v1:…",
   "cluster_size": 3,
@@ -544,6 +586,53 @@ The same view is rendered as a **cluster panel** in the
 (when election is on) the quorum count and this node's role (leader, follower,
 "no quorum", or, in spread mode, "spread (per-job owner)").
 
+### Monitoring and alerting
+
+yacron2 does not export cluster state to statsd (the
+[statsd integration](Metrics-with-Statsd) is per-job); instead every signal you
+would alert on is a pre-derived field on `GET /cluster`, so the simplest monitor
+probes that endpoint on each replica. Useful alerts:
+
+| Alert when | Field(s) | Means |
+| --- | --- | --- |
+| `quorate` is `false` for more than a few `interval`s | `quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
+| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes` | a duplicate `nodeName` or a cluster-size disagreement is pausing `Leader` jobs — page on this |
+| `agreed` peers fall below `quorum − 1` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum |
+| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation) |
+
+A blackbox / JSON-exporter probe (Prometheus `json_exporter`, a Nagios check,
+etc.) scraping `GET /cluster` on every replica covers all of these. The same
+transitions are also **logged** — leadership and quorum changes, conflict
+onset at `ERROR` (clear at `INFO`), and per-peer `untrusted`/`unreachable`/drift
+at `WARNING` — so a log-based alert is a viable second source.
+
+### Detecting a double-run
+
+The [best-effort guarantee](#guarantees-and-trade-offs) admits narrow windows
+where two nodes each run the same `Leader` firing (a thin bridge, a >1-hop
+gossip gap, or mid-convergence). This is **not** caught by the `conflict` flag —
+that flag is only for a duplicate `nodeName` or a size disagreement, and by
+construction the two transient leaders cannot see each other, so neither one's
+`GET /cluster` shows anything wrong (each reports `is_leader: true`). There is
+no single-node signal for it.
+
+To detect it, scrape **every** replica's `GET /cluster` and alert when more than
+one calls itself the leader:
+
+```shell
+# across all replicas, count how many believe they are the leader
+for url in node-a:8080 node-b:8080 node-c:8080; do
+  curl -s "http://$url/cluster" \
+    | python -c 'import sys,json; print(str(json.load(sys.stdin).get("is_leader")).lower())'
+done | grep -c '^true$'     # > 1 means a transient double-leader
+```
+
+Under `distribution: spread` there is no single leader, so instead compare the
+`clusterOwner` each replica reports per job (`GET /jobs`) and alert if any job
+has more than one distinct owner across the fleet. A non-idempotent job that
+must *never* double-run belongs on a fenced backend (`kubernetes` / `etcd`) or a
+single replica, not the gossip backend.
+
 ## Guarantees and trade-offs
 
 This design intentionally keeps **no shared state**, which is what makes it easy
@@ -559,13 +648,17 @@ there are narrow windows where behaviour degrades:
   through the shared members' gossip and, once it can confirm the other is
   itself quorate, the lower `nodeName` wins on both sides — so a bridge of at
   least `quorum - 1` shared members collapses two would-be leaders back to one.
-  A node only ever elects a leader it can confirm is itself quorate, so a
-  **healthy majority is never silently stood down** (it always elects a node
-  that actually runs). The deliberate trade for that liveness is the converse:
+  A node only ever elects a leader it can confirm is itself quorate, so in a
+  *converged* view a **healthy majority is not silently stood down** (it elects
+  a node that actually runs). Two deliberate trades come with that liveness:
   two quorate nodes whose bridge is *thinner* than `quorum - 1` shared members,
   are more than one gossip hop apart, or are still converging may each elect
-  themselves and **double-run** a `Leader` job. `spread` behaves the same per
-  job. (Choosing instead to *fail closed* here — skip rather than double-run —
+  themselves and **double-run** a `Leader` job; and symmetrically — because
+  bridge confirmation is only as fresh as the witnesses' last gossip — a
+  confirmed candidate that has since become isolated can briefly draw the
+  majority into deferring to it, a transient **skip** until the stale gossip
+  ages out (~1–2 `interval`s). `spread` behaves the same per job. (Choosing
+  instead to *fail closed* on the double-run — skip rather than double-run —
   would require a lease/consensus store; see below.)
 * **While a resize is rolling out**, nodes briefly disagree on the cluster size
   `N`; `Leader` jobs across the whole cluster stand down (fail closed) until

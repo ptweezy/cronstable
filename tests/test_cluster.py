@@ -2190,6 +2190,10 @@ async def test_push_reboot_ran_fans_out_to_peers(no_tls, monkeypatch):
         lambda: "v1:mine",
     )
     mgr._ran_reboot_jobs.add("boot")
+    # the push reuses the manager's lifetime session (created in start()); this
+    # test drives _push_reboot_ran directly without start(), so stand in a
+    # sentinel -- the monkeypatched _push_reboot_ran_one ignores it.
+    mgr._session = object()  # type: ignore[assignment]
     sent = []
 
     async def fake_one(session, host, payload):
@@ -2218,3 +2222,148 @@ async def test_ran_jobs_cleared_on_job_set_change(no_tls):
     job_set["id"] = "v2:b"  # config reload changes the job-set id
     await mgr._poll_all()  # id changed -> cleared
     assert mgr.reboot_ran("boot") is False
+
+
+# --------------------------------------------------------------------------
+# adversarial-review follow-ups: per-peer transition logging (C2), the
+# /reboot-ran read timeout (A5), and the reconcile-before-add race (A2/A3)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_peer_status_change_logs_untrusted_with_error(no_tls, caplog):
+    # C2: a TLS/cert failure is the highest-value transition -> WARNING with
+    # the host and the underlying error (botched rotations must stay visible).
+    import logging
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(_FakeGet(exc=_FakeSSLError()))
+    with caplog.at_level(logging.WARNING, logger="yacron2.cluster"):
+        await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].status == STATUS_UNTRUSTED
+    assert any(
+        "untrusted" in m and "b:1" in m and "fake ssl handshake failure" in m
+        for m in (r.message for r in caplog.records)
+    )
+
+
+@pytest.mark.asyncio
+async def test_peer_status_change_unreachable_quiet_at_startup(no_tls, caplog):
+    # C2: a first contact (unknown -> unreachable) is NOT warned, so a cluster
+    # coming up does not emit a burst while peers are still binding.
+    import logging
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    down = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
+    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+        await mgr._poll_peer(down, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
+    assert not [r for r in caplog.records if "unreachable" in r.message]
+
+
+@pytest.mark.asyncio
+async def test_peer_status_change_warns_only_on_real_drop(no_tls, caplog):
+    # C2: one "now agreed" on first contact, nothing on a repeat poll, and a
+    # WARNING (with the error) only when a *previously reached* peer drops.
+    import logging
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    agreed = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                }
+            )
+        )
+    )
+    down = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
+    with caplog.at_level(logging.INFO, logger="yacron2.cluster"):
+        await mgr._poll_peer(agreed, "b:1", "v1:mine")  # unknown -> agreed
+        await mgr._poll_peer(agreed, "b:1", "v1:mine")  # agreed again: quiet
+        await mgr._poll_peer(down, "b:1", "v1:mine")  # agreed -> unreachable
+    msgs = [r.message for r in caplog.records]
+    assert sum("now agreed" in m for m in msgs) == 1
+    assert any("became unreachable" in m and "boom" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_handle_reboot_ran_times_out_on_slow_body(no_tls):
+    # A5: a hung body read is bounded by connectTimeout -> 408, rather than
+    # pinning a handler coroutine indefinitely.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    mgr.config["connectTimeout"] = 0.01
+
+    class _HangingContent:
+        async def iter_chunked(self, n):
+            await asyncio.Event().wait()  # never completes
+            yield b""  # pragma: no cover
+
+    class _HangingReq:
+        content = _HangingContent()
+
+    resp = await mgr._handle_reboot_ran(_HangingReq())
+    assert resp.status == 408
+
+
+@pytest.mark.asyncio
+async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
+    # A5/DoS: an over-cap body is refused (413) before any JSON parse.
+    from yacron2.cluster import MAX_PEER_RESPONSE_BYTES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+
+    class _RawReq:
+        content = _FakeContent(b"x" * (MAX_PEER_RESPONSE_BYTES + 1))
+
+    resp = await mgr._handle_reboot_ran(_RawReq())
+    assert resp.status == 413
+
+
+@pytest.mark.asyncio
+async def test_mark_reboot_ran_survives_concurrent_reload_clear(no_tls):
+    # A2: mark_reboot_ran reconciles to the live id BEFORE adding, so a poll
+    # under the (now-current) id does not discard the just-recorded run.
+    job_set = {"id": "v1:old"}
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: job_set["id"]
+    )
+    await mgr._poll_all()  # establishes v1:old
+    job_set["id"] = "v1:new"  # config reload changes the job set
+    await mgr.mark_reboot_ran("boot")  # reconciles to v1:new, then adds boot
+    assert mgr._ran_jobs_job_set_id == "v1:new"
+    assert mgr.reboot_ran("boot") is True
+    await mgr._poll_all()  # same new id -> no clear
+    assert mgr.reboot_ran("boot") is True
+
+
+@pytest.mark.asyncio
+async def test_handle_reboot_ran_survives_lagged_job_set_id(no_tls):
+    # A3: a push arriving after a reload changed the live id (but before the
+    # poll loop advanced _ran_jobs_job_set_id) is recorded under the live id
+    # and survives the next poll, instead of being seeded stale and wiped.
+    job_set = {"id": "v1:old"}
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: job_set["id"]
+    )
+    await mgr._poll_all()  # establishes v1:old
+    job_set["id"] = "v1:new"  # reload; _ran_jobs_job_set_id still lags behind
+    await mgr._handle_reboot_ran(
+        _PushReq({"job_set_id": "v1:new", "names": ["boot"]})
+    )
+    assert mgr._ran_jobs_job_set_id == "v1:new"
+    assert mgr.reboot_ran("boot") is True
+    await mgr._poll_all()  # same new id -> no clear
+    assert mgr.reboot_ran("boot") is True

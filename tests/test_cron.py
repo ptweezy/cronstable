@@ -1395,11 +1395,17 @@ def test_cluster_role_logged_on_transition(caplog):
     class _Mgr:
         distribution = "single-leader"
 
-        def __init__(self, leader):
+        def __init__(self, leader, quorate=None):
             self._leader = leader
+            # in single-leader mode the leader is by definition quorate; a
+            # follower may be quorate without leading (default to leader state)
+            self._quorate = leader if quorate is None else quorate
 
         def is_leader(self):
             return self._leader
+
+        def is_quorate(self):
+            return self._quorate
 
         def conflict_names(self):
             return []
@@ -1418,6 +1424,48 @@ def test_cluster_role_logged_on_transition(caplog):
         "cluster: this node acquired scheduled-job leadership",
         "cluster: this node lost scheduled-job leadership",
     ]
+
+
+def test_cluster_quorum_logged_on_follower_single_leader(caplog):
+    # C1 regression: a follower (never leader) that loses quorum must still log
+    # it -- previously only the ex-leader's is_leader() flip was logged, so a
+    # whole cluster dropping below quorum left followers silent.
+    import logging
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    class _Follower:
+        distribution = "single-leader"
+
+        def __init__(self, quorate):
+            self._quorate = quorate
+
+        def is_leader(self):
+            return False  # this node never leads (a higher-priority node does)
+
+        def is_quorate(self):
+            return self._quorate
+
+        def conflict_names(self):
+            return []
+
+        def conflicting_sizes(self):
+            return []
+
+    cron.cluster_manager = _Follower(True)
+    with caplog.at_level(logging.INFO, logger="yacron2"):
+        cron._log_cluster_role()  # joins quorum as a follower
+        cron.cluster_manager = _Follower(False)
+        cron._log_cluster_role()  # loses quorum -> must log here
+    msgs = [r.message for r in caplog.records if "quorum" in r.message]
+    assert msgs == [
+        "cluster: this node joined quorum",
+        "cluster: this node left quorum; no majority reachable, so Leader "
+        "jobs cannot run until one is",
+    ]
+    # and a follower never logs a leadership line (it never led)
+    assert not [r for r in caplog.records if "leadership" in r.message]
 
 
 def test_cluster_role_logged_spread_quorum(caplog):
@@ -1546,6 +1594,9 @@ def test_cluster_conflict_logged_on_transition(caplog):
         def is_leader(self):
             return False
 
+        def is_quorate(self):
+            return True
+
     cron.cluster_manager = _Mgr(True)
     with caplog.at_level(logging.INFO, logger="yacron2"):
         cron._log_cluster_role()
@@ -1580,6 +1631,9 @@ def test_cluster_size_conflict_logged_on_transition(caplog):
 
         def is_leader(self):
             return False
+
+        def is_quorate(self):
+            return True
 
     cron.cluster_manager = _Mgr(True)
     with caplog.at_level(logging.INFO, logger="yacron2"):
@@ -1868,6 +1922,9 @@ async def test_spawn_jobs_defers_reboot_leader_at_startup(monkeypatch):
 
         def is_leader(self):
             return False
+
+        def is_quorate(self):
+            return False  # no quorum at the startup instant
 
         def has_conflict(self):
             return False
