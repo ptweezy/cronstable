@@ -2176,6 +2176,13 @@
       $("clusterTable").style.display = "";
       $("clusterLease").style.display = "none";
       const peers = data.peers || [];
+      // Per-node ownership counts need the /jobs payload. At boot loadCluster()
+      // can resolve before the first loadJobs() (they run concurrently), so
+      // until state.jobs is actually populated (state.fetchedAt > 0) we have no
+      // ownership data — render neutral placeholders rather than a bogus 0, and
+      // let the post-loadJobs re-poll fill in the real counts. Computed once and
+      // reused by the summary and the per-peer Owns column.
+      const ownsCounts = (spread && state.fetchedAt > 0) ? ownerCounts() : null;
       // "self" entries are this node listed in its own peers; exclude from the
       // agreement tally.
       const counted = peers.filter((p) => p.status !== "self");
@@ -2201,8 +2208,9 @@
         summary +=
           " · quorum " + live + "/" + (data.quorum || "?") +
           " · " + role;
-        // under spread, how many jobs this node itself currently owns
-        if (spread) summary += " · owns " + (ownerCounts()[data.node_name] || 0);
+        // under spread, how many jobs this node itself currently owns (omitted
+        // until the jobs payload is known — see ownsCounts above)
+        if (ownsCounts) summary += " · owns " + (ownsCounts[data.node_name] || 0);
       }
       // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
       if (data.conflict_names && data.conflict_names.length) {
@@ -2223,11 +2231,10 @@
       $("clusterSummary").textContent = summary;
       // the Owns column lists each peer's job count; reveal it only under spread
       $("clusterTable").classList.toggle("show-owns", spread);
-      const counts = spread ? ownerCounts() : {};
       $("clusterRows").innerHTML = peers.map((p) =>
         '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
         "<td>" + esc(p.node_name || "—") + "</td>" +
-        '<td class="col-owns">' + (p.node_name ? esc(counts[p.node_name] || 0) : "—") + "</td>" +
+        '<td class="col-owns">' + (ownsCounts && p.node_name ? esc(ownsCounts[p.node_name] || 0) : "—") + "</td>" +
         "<td>" + esc(p.status) + "</td>" +
         '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
       ).join("");
