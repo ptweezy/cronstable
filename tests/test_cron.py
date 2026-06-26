@@ -520,6 +520,59 @@ async def test_schedule_retry_job_disappeared():
     assert "nonexistent" not in cron.retry_state
 
 
+@pytest.mark.asyncio
+async def test_schedule_retry_job_abandoned_when_no_longer_owner():
+    # H1 regression: a retry can outlive the leadership it started under (a
+    # partition / quorum loss moved ownership while it slept). It must re-check
+    # the gate and abandon rather than relaunch -- relaunching here while the
+    # new owner also runs it on its next tick is the split-brain double-run
+    # the abstraction exists to prevent.
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="single-leader",
+        is_leader=lambda: False,  # leadership moved away
+        is_available_leader=lambda: False,
+        has_conflict=lambda: False,
+    )
+    job = types.SimpleNamespace(name="j", clusterPolicy="Leader")
+    cron.cron_jobs["j"] = job
+    cron.retry_state["j"] = object()  # a pending retry
+    await cron.schedule_retry_job("j", 0.0, 0)
+    # abandoned (not relaunched) and the stale retry state cleared
+    assert "j" not in cron.retry_state
+    assert "j" not in cron.running_jobs
+
+
+def test_cluster_allows_fails_closed_on_backend_error():
+    # crash-safety: a backend read that raises must not escape _cluster_allows
+    # (spawn_jobs runs outside the run loop's try/except, so it would kill the
+    # scheduler); the gate fails closed instead.
+    import types
+
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+
+    def boom():
+        raise RuntimeError("backend bug")
+
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="single-leader",
+        is_leader=boom,
+        is_available_leader=boom,
+        has_conflict=lambda: False,
+    )
+    leader = types.SimpleNamespace(clusterPolicy="Leader", name="j")
+    prefer = types.SimpleNamespace(clusterPolicy="PreferLeader", name="j")
+    assert cron._cluster_allows(leader) is False
+    assert cron._cluster_allows(prefer) is False
+    # EveryNode never touches the backend, so it still runs
+    every = types.SimpleNamespace(clusterPolicy="EveryNode", name="j")
+    assert cron._cluster_allows(every) is True
+
+
 def test_resolve_web_token_value():
     auth = {"value": "secret", "fromFile": None, "fromEnvVar": None}
     token = yacron2.cron.Cron._resolve_web_token({"authToken": auth})

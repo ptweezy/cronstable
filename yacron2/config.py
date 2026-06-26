@@ -82,7 +82,9 @@ DEFAULT_K8S: Dict[str, Any] = {
     "retryPeriodSeconds": 2,
     "identity": None,  # None -> nodeName
     "kubeconfig": None,  # for out-of-cluster / local (Docker) testing
-    # override the apiserver URL (else in-cluster env / kubeconfig)
+    # override the IN-CLUSTER apiserver URL (e.g. point at a kube-rbac-proxy
+    # sidecar); still uses the ServiceAccount token/CA, must be https. For
+    # out-of-cluster use set kubeconfig instead.
     "apiServer": None,
     # auto (native `kubernetes` client if importable, else hand-rolled HTTP) |
     # library (require the native client) | http (force hand-rolled).
@@ -759,6 +761,27 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     return peer_h == node_name
 
 
+def _likely_self_fqdn(peer_host: str, listen: str, node_name: str) -> bool:
+    """Whether a peer entry *looks like* this node listed by its FQDN.
+
+    A heuristic for diagnostics only (never used to drop a peer -- that fuzzy
+    match is exactly the dangerous over-match :func:`_is_self_listed` refuses).
+    True when, under a wildcard ``listen``, a peer on our port has a host
+    whose first DNS label equals our ``nodeName`` but is not an exact match
+    (which :func:`_is_self_listed` would already have dropped). Used to warn
+    that a cluster declared as 3 nodes may really be a degenerate 2-node one.
+    """
+    if _is_self_listed(peer_host, listen, node_name):
+        return False
+    listen_host, _, listen_port = listen.rpartition(":")
+    if listen_host not in _WILDCARD_LISTEN_HOSTS:
+        return False
+    peer_h, _, peer_port = peer_host.rpartition(":")
+    if peer_port != listen_port:
+        return False
+    return peer_h.split(".", 1)[0] == node_name and peer_h != node_name
+
+
 def _cluster_base(raw: dict) -> "Dict[str, Any]":
     """Fill the shared cluster defaults over a raw (schema-validated) block.
 
@@ -917,6 +940,19 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         # the lease holderIdentity that distinguishes this node; default it to
         # the (already-defaulted) nodeName.
         k8s["identity"] = cfg["nodeName"]
+    # The apiserver override carries the in-cluster ServiceAccount bearer token
+    # on every request; a plaintext http:// target would send that high-value
+    # credential in cleartext (aiohttp ignores the SSL context for an http URL)
+    # and expose the lease store to MITM. Require https, mirroring the etcd
+    # backend's auth-over-https guard. (A local kube-rbac-proxy that genuinely
+    # needs http should front it with https or use a kubeconfig.)
+    api_server = k8s.get("apiServer")
+    if api_server and not str(api_server).lower().startswith("https://"):
+        raise ConfigError(
+            "cluster.kubernetes.apiServer must be an https:// URL so the "
+            "ServiceAccount bearer token is not sent in cleartext; got "
+            "{!r}".format(api_server)
+        )
     duration = k8s["leaseDurationSeconds"]
     renew = k8s["renewDeadlineSeconds"]
     retry = k8s["retryPeriodSeconds"]
@@ -955,6 +991,16 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
     # configuring a lease backend is opting into leadership.
     cfg["electLeader"] = True
     return ClusterConfig(cfg)
+
+
+def _redact_userinfo(url: str) -> str:
+    """Replace ``user:pass@`` userinfo in ``url`` with ``***@`` for logs."""
+    parsed = urlparse(url)
+    if parsed.username is None and parsed.password is None:
+        return url
+    after = url.split("://", 1)[1] if "://" in url else url
+    hostpart = after.split("@", 1)[1] if "@" in after else after
+    return "{}://***@{}".format(parsed.scheme, hostpart)
 
 
 def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
@@ -997,22 +1043,70 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         try:
             port = parsed.port
         except ValueError:
-            port = None
+            bad_port = True
+        else:
+            # a missing port is fine -- it defaults to the scheme's port at
+            # connection time (e.g. https://etcd.svc behind 443 ingress); only
+            # an explicitly-present out-of-range port is rejected.
+            bad_port = port is not None and not 0 < port <= 65535
         if (
             parsed.scheme not in ("http", "https")
             or not parsed.hostname
-            or port is None
-            or not 0 < port <= 65535
+            or bad_port
         ):
             raise ConfigError(
-                "cluster.etcd.endpoints entries must be http(s)://host:port, "
+                "cluster.etcd.endpoints must be http(s)://host[:port], "
                 "got {!r}".format(endpoint)
             )
+        # Reject credentials embedded in the URL (https://user:pass@host): they
+        # would be logged in cleartext at start() and sent as HTTP Basic auth,
+        # bypassing the username/password block's https-only guard below. Use
+        # the structured cluster.etcd.username/password fields instead.
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError(
+                "cluster.etcd.endpoints must not embed credentials in the URL "
+                "(userinfo@host); use cluster.etcd.username/password instead, "
+                "got {!r}".format(_redact_userinfo(endpoint))
+            )
+    # mTLS to etcd needs BOTH the client cert and key; one without the other
+    # silently degrades to one-way TLS (the cert is never loaded -- see
+    # EtcdBackend._build_ssl), which either fails auth opaquely or drops the
+    # intended posture. Require them together.
+    tls = etcd["tls"]
+    if bool(tls.get("cert")) != bool(tls.get("key")):
+        raise ConfigError(
+            "cluster.etcd.tls.cert and cluster.etcd.tls.key must be set "
+            "together (a client certificate needs its private key); got "
+            "cert={!r}, key={!r}".format(
+                bool(tls.get("cert")), bool(tls.get("key"))
+            )
+        )
+    # TLS material supplied but every endpoint is plaintext -> the material is
+    # silently ignored (_build_ssl only builds a context for an https endpoint)
+    # and traffic goes in cleartext. That is always a misconfiguration (a
+    # forgotten 's' in https://), so refuse it rather than quietly downgrade.
+    if any(tls.get(key) for key in ("ca", "cert", "key")) and not any(
+        urlparse(endpoint).scheme == "https" for endpoint in etcd["endpoints"]
+    ):
+        raise ConfigError(
+            "cluster.etcd.tls is configured but no endpoint is https:// , so "
+            "the TLS material would be ignored and traffic sent in cleartext; "
+            "use https:// endpoints or remove cluster.etcd.tls"
+        )
     # resolve the password once at load time (fail closed on an empty source),
     # like the web auth token; None when etcd needs no auth.
     etcd["resolved_password"] = _resolve_secret(
         etcd["password"], "cluster.etcd.password"
     )
+    if etcd["username"] and not etcd["resolved_password"]:
+        # etcd's /v3/auth/authenticate needs a password for the username; a
+        # username with no resolvable password would fail auth opaquely every
+        # round (a recurring 401, no token, Leader jobs never run) instead of a
+        # clean config error.
+        raise ConfigError(
+            "cluster.etcd.username is set but no password is configured; set "
+            "cluster.etcd.password (value/fromFile/fromEnvVar)"
+        )
     if etcd["username"] or etcd["resolved_password"]:
         # Authentication credentials (the cleartext username/password POSTed
         # to /v3/auth/authenticate, and the bearer token attached to every
@@ -1068,6 +1162,33 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
                 "size); shrink to {} for the same tolerance with one fewer "
                 "node, or grow to {} to tolerate one more failure; prefer an "
                 "odd size.".format(size, size - 1, size - 1, size + 1)
+            )
+        # A self-listing by FQDN (vs the short nodeName) is not dropped at
+        # config time, so the declared size can be one larger than the real
+        # cluster -- which, at the boundary, hides the degenerate 2-node case
+        # the size==2 refusal exists to catch (the runtime STATUS_SELF
+        # exclusion later drops it, leaving a real quorum of 2). Warn so the
+        # operator can fix the listing rather than discover it as flapping
+        # leadership.
+        listen = cfg.get("listen") or ""
+        node_name = cfg["nodeName"]
+        self_hosts = [
+            peer["host"]
+            for peer in cfg["peers"]
+            if _likely_self_fqdn(peer["host"], listen, node_name)
+        ]
+        if self_hosts and size - len(self_hosts) <= 2:
+            warnings.append(
+                "cluster.electLeader: {} peer(s) look like this node listed "
+                "by FQDN ({}) while nodeName is {!r}; if so the real cluster "
+                "is only {} node(s) and leader election will be degenerate or "
+                "refused at runtime. List the peer by its exact nodeName, or "
+                "fix the addresses.".format(
+                    len(self_hosts),
+                    ", ".join(self_hosts),
+                    node_name,
+                    size - len(self_hosts),
+                )
             )
     elif cfg.get("distribution") != DEFAULT_CLUSTER["distribution"]:
         # distribution only governs how *leader-gated* jobs spread, so it does

@@ -6,6 +6,7 @@ exercised only by the Docker integration tests.
 
 import base64
 import datetime
+import time
 
 import aiohttp
 import pytest
@@ -18,6 +19,7 @@ from yacron2.backends.etcd import (
     campaign_won,
     holder_from_txn_response,
     lease_id_from_grant,
+    lease_ttl_from_grant,
     lease_ttl_from_keepalive,
 )
 from yacron2.config import parse_config_string
@@ -226,21 +228,23 @@ def test_endpoint_is_https():
 
 
 def test_is_leader_gated_on_lease_deadline():
+    # the fence is a MONOTONIC deadline (immune to wall-clock steps), not the
+    # wall-clock _lease_deadline (which is display only).
     b = _backend()
     assert b.is_leader() is False
     b._is_leader = True
-    b._lease_deadline = NOW  # in the past
+    b._lease_deadline_mono = time.monotonic() - 1  # in the past
     assert b.is_leader() is False  # self-demote without a keepalive
-    b._lease_deadline = _utc_now_plus(100)
+    b._lease_deadline_mono = time.monotonic() + 100
     assert b.is_leader() is True
 
 
 def test_is_quorate_tracks_fresh_contact():
     b = _backend()
     assert b.is_quorate() is False
-    b._last_contact = _utc_now_plus(0)
+    b._last_contact_mono = time.monotonic()
     assert b.is_quorate() is True
-    b._last_contact = _utc_now_plus(-(b.ttl + 5))
+    b._last_contact_mono = time.monotonic() - (b.ttl + 5)
     assert b.is_quorate() is False
 
 
@@ -248,7 +252,7 @@ def test_leader_name_none_when_stale():
     b = _backend()
     b._holder = "node-b"
     assert b.leader_name() is None
-    b._last_contact = _utc_now_plus(0)
+    b._last_contact_mono = time.monotonic()
     assert b.leader_name() == "node-b"
 
 
@@ -257,8 +261,9 @@ def test_apply_round_win():
     b._apply_round("node-a", True, NOW)
     assert b._is_leader is True
     assert b._holder == "node-a"
-    assert b._lease_deadline == b._leader_deadline(NOW)
-    assert b._last_contact == NOW
+    assert b._lease_deadline == b._leader_deadline(NOW)  # wall, for display
+    assert b._last_contact_mono is not None  # monotonic freshness advanced
+    assert b.is_quorate() is True
 
 
 def test_apply_round_follower():
@@ -267,7 +272,29 @@ def test_apply_round_follower():
     b._apply_round("node-b", False, NOW)
     assert b._is_leader is False
     assert b._holder == "node-b"
-    assert b._last_contact == NOW
+    assert b._last_contact_mono is not None
+
+
+def test_lease_ttl_from_grant():
+    assert lease_ttl_from_grant({"ID": "1", "TTL": "15"}) == 15
+    assert lease_ttl_from_grant({"ID": "1", "TTL": 9}) == 9
+    assert lease_ttl_from_grant({"ID": "1"}) is None
+    assert lease_ttl_from_grant({"TTL": "bad"}) is None
+
+
+def test_effective_ttl_narrows_to_server_grant():
+    # M1: the deadline must follow the TTL etcd actually grants/keepalives, not
+    # the configured value, or is_leader stays true past the server expiry.
+    b = _backend()  # configured ttl 15
+    assert b._effective_ttl == 15
+    # simulate a keepalive/grant that returned a shorter TTL
+    b._effective_ttl = max(1, min(b.ttl, 5))
+    assert b._effective_ttl == 5
+    mono = time.monotonic()
+    b._apply_round("node-a", True, NOW, mono)
+    # the monotonic deadline reflects the 5s effective ttl (minus skew), well
+    # short of the configured 15s.
+    assert b._lease_deadline_mono <= mono + 5
 
 
 def test_apply_round_lost_key_not_leader():

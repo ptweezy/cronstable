@@ -6,6 +6,7 @@ logic plus the locally-computed leader/quorum state.
 """
 
 import datetime
+import time
 
 import pytest
 
@@ -123,6 +124,31 @@ def test_parse_lease_empty_object():
     assert state.duration is None
     assert state.transitions == 0
     assert state.resource_version is None
+    assert state.annotations == {}
+
+
+def test_parse_and_build_lease_annotations_roundtrip():
+    # H2: the @reboot-ran set is persisted in metadata.annotations; parse_lease
+    # must surface them and build_lease_body must write them back.
+    obj = {
+        "metadata": {
+            "resourceVersion": "9",
+            "annotations": {"yacron2.io/reboot-ran": "blob"},
+        },
+        "spec": {"holderIdentity": "node-a", "leaseDurationSeconds": 15},
+    }
+    state = parse_lease(obj)
+    assert state.annotations == {"yacron2.io/reboot-ran": "blob"}
+    body = build_lease_body(
+        "yl", "ns", "node-a", NOW, 15, state, ACTION_RENEW,
+        {"yacron2.io/reboot-ran": "blob2"},
+    )
+    assert body["metadata"]["annotations"] == {
+        "yacron2.io/reboot-ran": "blob2"
+    }
+    # no annotations passed -> the block is omitted
+    bare = build_lease_body("yl", "ns", "node-a", NOW, 15, None, ACTION_CREATE)
+    assert "annotations" not in bare["metadata"]
 
 
 def test_parse_lease_non_int_fields_ignored():
@@ -399,21 +425,23 @@ def test_namespace_ignores_incluster_file_when_kubeconfig_set(monkeypatch):
 
 
 def test_is_leader_gated_on_local_expiry():
+    # the fence is a MONOTONIC deadline (immune to wall-clock steps); the
+    # wall-clock _leader_until is display only.
     b = _backend()
     assert b.is_leader() is False  # fresh: never renewed
     b._is_leader = True
-    b._leader_until = NOW  # in the past relative to real now
+    b._leader_until_mono = time.monotonic() - 1  # in the past
     assert b.is_leader() is False  # self-demote without a network call
-    b._leader_until = _utc_now_plus(100)
+    b._leader_until_mono = time.monotonic() + 100
     assert b.is_leader() is True
 
 
 def test_is_quorate_tracks_fresh_contact():
     b = _backend()
     assert b.is_quorate() is False  # never contacted
-    b._last_contact = _utc_now_plus(0)
+    b._last_contact_mono = time.monotonic()
     assert b.is_quorate() is True
-    b._last_contact = _utc_now_plus(-(b.lease_duration + 5))
+    b._last_contact_mono = time.monotonic() - (b.lease_duration + 5)
     assert b.is_quorate() is False  # stale -> Leader fails closed
 
 
@@ -421,8 +449,21 @@ def test_leader_name_none_when_not_quorate():
     b = _backend()
     b._holder = "node-b"
     assert b.leader_name() is None  # stale read -> unknown
-    b._last_contact = _utc_now_plus(0)
+    b._last_contact_mono = time.monotonic()
     assert b.leader_name() == "node-b"
+
+
+def test_lease_detail_expiry_only_while_leader():
+    # L4: a former holder must not keep advertising a stale expiry. Expiry is
+    # populated only while is_leader() is true.
+    b = _backend()
+    # leader, fresh deadline -> expiry shown
+    b._apply_round(ACTION_CREATE, True, None, _utc_now_plus(0))
+    assert b.lease_detail()["expiry"] is not None
+    # a later WAIT round (a peer took over) -> not leader -> no expiry
+    state = LeaseState("node-b#x", NOW, NOW, 15, 0, "1")
+    b._apply_round(ACTION_WAIT, False, state, _utc_now_plus(0))
+    assert b.lease_detail()["expiry"] is None
 
 
 def test_track_observation_resets_clock_on_record_change():
@@ -493,19 +534,19 @@ def _utc_now_plus(seconds):
 
 
 async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
-    # The skew-immune steal anchor (_observed_at) must be the instant we
-    # actually read the Lease, not a timestamp captured before the observe()
-    # GET returns. Anchoring it before the await would back-date the record by
-    # the observe latency (bounded by renewDeadline, not the 1s skew budget),
-    # shrinking the steal window and risking two simultaneous leaders on a slow
-    # apiserver. Mirrors client-go's observedTime = now() after the Get.
+    # The steal anchor (_observed_at) must be the MONOTONIC instant we actually
+    # read the Lease, not a timestamp captured before observe() returns.
+    # Anchoring it before the await would back-date the record by the observe
+    # latency (bounded by renewDeadline, not the 1s skew budget), shrinking the
+    # steal window and risking two simultaneous leaders on a slow apiserver.
+    # Mirrors client-go's observedTime = now() after the Get.
     b = _backend()
-    clock = [0.0]
+    mono = [100.0]
 
-    def fake_now():
-        return NOW + datetime.timedelta(seconds=clock[0])
+    def fake_mono():
+        return mono[0]
 
-    monkeypatch.setattr("yacron2.backends.kubernetes._utcnow", fake_now)
+    monkeypatch.setattr("yacron2.backends.kubernetes._monotonic", fake_mono)
 
     lease_obj = {
         "metadata": {"name": "yl", "namespace": "ns", "resourceVersion": "7"},
@@ -520,7 +561,7 @@ async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
 
     class _FakeTransport:
         async def observe(self):
-            clock[0] += observe_latency  # the GET takes time
+            mono[0] += observe_latency  # the GET takes monotonic time
             return lease_obj
 
         async def write(self, body, *, create):  # pragma: no cover - not hit
@@ -535,7 +576,8 @@ async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
     b._transport = _FakeTransport()
     await b._renew_once()
 
-    assert b._observed_at == NOW + datetime.timedelta(seconds=observe_latency)
+    # the anchor is sampled AFTER observe() returns (100 + 5), not before.
+    assert b._observed_at == 105.0
 
 
 # --- HTTP transport: rotating service-account token -----------------------

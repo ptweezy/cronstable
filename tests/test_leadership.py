@@ -8,8 +8,11 @@ import pytest
 
 from yacron2.config import parse_config_string
 from yacron2.leadership import (
+    REBOOT_RAN_KEY,
     LeadershipBackend,
     LeaseBackend,
+    decode_reboot_ran,
+    encode_reboot_ran,
     make_backend,
 )
 
@@ -171,6 +174,89 @@ def test_never_skip_holder_runs_when_identity_differs_from_node_name():
     )
     assert isolated.is_available_leader() is True
     assert isolated.available_leader_name() == "node-a"
+
+
+class _FakeLease(LeaseBackend):
+    """A minimal concrete lease backend for the @reboot-ran cache tests."""
+
+    def __init__(self, job_set_id="v1:js"):
+        super().__init__({"nodeName": "node-a"}, lambda: job_set_id)  # type: ignore[arg-type]
+
+    async def start(self):  # pragma: no cover - not exercised
+        ...
+
+    async def stop(self):  # pragma: no cover - not exercised
+        ...
+
+    def is_leader(self):
+        return False
+
+    def leader_name(self):
+        return None
+
+    def is_quorate(self):
+        return False
+
+
+def test_encode_decode_reboot_ran_roundtrip():
+    jsid, jobs = decode_reboot_ran(encode_reboot_ran("v1:js", {"b", "a"}))
+    assert jsid == "v1:js"
+    assert jobs == {"a", "b"}
+
+
+def test_decode_reboot_ran_tolerates_garbage():
+    assert decode_reboot_ran(None) == (None, set())
+    assert decode_reboot_ran("") == (None, set())
+    assert decode_reboot_ran("not json") == (None, set())
+    assert decode_reboot_ran("[1,2]") == (None, set())  # not a dict
+    jsid, jobs = decode_reboot_ran('{"jobSetId": 5, "jobs": "x"}')
+    assert jsid is None and jobs == set()  # wrong types ignored
+
+
+async def test_lease_backend_reboot_ran_cache():
+    # H2: mark_reboot_ran records locally (so this node won't re-run), and the
+    # _persist_reboot_ran is a harmless no-op for the base test backend.
+    b = _FakeLease()
+    assert b.reboot_ran("j") is False
+    await b.mark_reboot_ran("j")
+    assert b.reboot_ran("j") is True
+
+
+def test_observe_reboot_ran_is_job_set_scoped():
+    b = _FakeLease(job_set_id="v1:js")
+    b._observe_reboot_ran("v1:js", {"a"})
+    assert b.reboot_ran("a") is True
+    # a stored set tagged with a DIFFERENT job set belongs to an older config
+    # and is ignored, so the one-shot runs again under the new job set.
+    b._observe_reboot_ran("v0:old", {"b"})
+    assert b.reboot_ran("b") is False
+
+
+def test_reboot_ran_annotation_carries_forward_and_encodes():
+    b = _FakeLease(job_set_id="v1:js")
+    b._reboot_ran_local.add("a")
+    ann = b.reboot_ran_annotation({"other/key": "keep"})
+    assert ann["other/key"] == "keep"  # someone else's annotation preserved
+    jsid, jobs = decode_reboot_ran(ann[REBOOT_RAN_KEY])
+    assert jsid == "v1:js" and jobs == {"a"}
+    # nothing to write and no existing annotations -> None (skip the block)
+    assert _FakeLease().reboot_ran_annotation(None) is None
+
+
+def test_never_skip_duplicate_nodename_follower_does_not_self_elect():
+    # H3 regression: two replicas share the same nodeName (a Kubernetes
+    # Deployment / shared HOSTNAME). The follower observes the holder's DISPLAY
+    # identity, which -- because the names collide -- equals its OWN node_name.
+    # A name-comparison gate (available_leader_name() == node_name) would make
+    # the follower think it is the available leader and run all PreferLeader
+    # job on every replica, silently. The self-state gate must keep it
+    # deferring: it is quorate, it is not the lease holder, and the holder is
+    # known, so it stands down.
+    follower = _IdentityLease(
+        quorate=True, is_leader=False, holder="node-a", node_name="node-a"
+    )
+    assert follower.is_available_leader() is False
+    assert follower.is_available_job_owner("j") is False
 
 
 class _BareLease(LeaseBackend):

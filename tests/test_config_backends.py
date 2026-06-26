@@ -198,12 +198,12 @@ def test_etcd_ttl_floor_rejects_unleadable_small_ttl():
 
 
 def test_etcd_rejects_malformed_endpoint():
-    # missing port, missing host, bad scheme, non-numeric port, out-of-range
-    # port, and port 0 must all raise a clean ConfigError (never a raw
-    # ValueError from urlparse().port).
+    # missing host, bad scheme, non-numeric port, out-of-range port, and port 0
+    # must all raise a clean ConfigError (never a raw ValueError from
+    # urlparse().port). A MISSING port is allowed (defaults to scheme port);
+    # see test_etcd_accepts_portless_endpoint.
     bad_endpoints = (
-        "127.0.0.1:2379",
-        "http://nohost",
+        "127.0.0.1:2379",  # no scheme
         "ftp://h:2379",
         "http://h:notaport",
         "http://h:99999",
@@ -219,6 +219,35 @@ def test_etcd_rejects_malformed_endpoint():
         )
         with pytest.raises(ConfigError, match="endpoints"):
             _cluster(yaml)
+
+
+def test_etcd_accepts_portless_endpoint():
+    # a host without an explicit port is valid (it defaults to the scheme's
+    # port, e.g. https behind a 443 ingress); the old validation wrongly
+    # required a port.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://etcd.svc.cluster.local\n"
+    )
+    cfg = _cluster(yaml)
+    assert cfg["etcd"]["endpoints"] == ["https://etcd.svc.cluster.local"]
+
+
+def test_etcd_rejects_url_embedded_credentials():
+    # credentials in the URL would be logged in cleartext and sent as Basic
+    # auth, bypassing the username/password https-only guard.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://user:s3cret@etcd:2379\n"
+    )
+    with pytest.raises(ConfigError, match="credentials"):
+        _cluster(yaml)
 
 
 def test_etcd_password_from_value():
@@ -285,6 +314,60 @@ def test_etcd_password_from_missing_file_fails(tmp_path):
     yaml = _ETCD + "    password:\n      fromFile: {}\n".format(missing)
     with pytest.raises(ConfigError, match="could not be read"):
         _cluster(yaml)
+
+
+def test_etcd_tls_cert_requires_key():
+    # a client cert without its key silently degrades mTLS to one-way TLS.
+    yaml = _ETCD_TLS + "    tls:\n      cert: /c\n"
+    with pytest.raises(ConfigError, match="cert and .*key must be set"):
+        _cluster(yaml)
+    yaml2 = _ETCD_TLS + "    tls:\n      key: /k\n"
+    with pytest.raises(ConfigError, match="cert and .*key must be set"):
+        _cluster(yaml2)
+    # both together is fine
+    both = _ETCD_TLS + "    tls:\n      cert: /c\n      key: /k\n"
+    assert _cluster(both)["etcd"]["tls"]["cert"] == "/c"
+
+
+def test_etcd_tls_without_https_endpoint_rejected():
+    # TLS material set but every endpoint is plaintext -> silently ignored;
+    # refuse rather than send cleartext.
+    yaml = _ETCD + "    tls:\n      ca: /ca\n"
+    with pytest.raises(ConfigError, match="no endpoint is https"):
+        _cluster(yaml)
+
+
+def test_etcd_username_requires_password():
+    yaml = _ETCD_TLS + "    username: root\n"
+    with pytest.raises(ConfigError, match="no password is configured"):
+        _cluster(yaml)
+
+
+def test_kubernetes_apiserver_must_be_https():
+    # an http:// apiserver would leak the ServiceAccount bearer token.
+    yaml = _K8S + "  kubernetes:\n    apiServer: http://kube-proxy:8080\n"
+    with pytest.raises(ConfigError, match="apiServer must be an https"):
+        _cluster(yaml)
+    # https is accepted
+    ok = _K8S + "  kubernetes:\n    apiServer: https://api:6443\n"
+    assert _cluster(ok)["kubernetes"]["apiServer"] == "https://api:6443"
+
+
+def test_gossip_fqdn_self_listing_warns_degenerate_size():
+    # a 3-node config where one peer is this node by FQDN (short nodeName) is
+    # really 2 nodes at runtime; warn so it is not discovered as flapping.
+    cfg = _cluster(
+        "cluster:\n"
+        "  listen: '0.0.0.0:8443'\n"
+        "  nodeName: node-a\n"
+        "  electLeader: true\n"
+        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
+        "  peers:\n"
+        "    - host: node-a.internal:8443\n"
+        "    - host: node-b:8443\n"
+    )
+    warnings = cluster_config_warnings(cfg)
+    assert any("FQDN" in w for w in warnings)
 
 
 # --- warnings -------------------------------------------------------------
