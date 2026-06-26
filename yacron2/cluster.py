@@ -1130,13 +1130,28 @@ class ClusterManager(LeadershipBackend):
 
         Our own runs plus those reported by every peer we currently agree with
         (same job_set_id).  Re-advertising what we learned makes the fact
-        survive the original owner's death (one-hop gossip), and trusting only
-        AGREED peers scopes it to this config -- a peer on a different job set
-        is not agreed, so its set is ignored.
+        survive the original owner's death (one-hop gossip).
+
+        A peer's contribution is gated on its last-reported ``job_set_id``
+        matching our *live* id, not merely on the cached ``STATUS_AGREED``.
+        ``STATUS_AGREED`` only proves the ids matched at the *last poll*; a
+        local config reload changes our live id immediately, yet a peer keeps
+        its stale AGREED status (and its old-config ran-set) until its next
+        poll round (up to one ``interval``).  Without the live-id check a stale
+        set could mask a *redefined* @reboot one-shot and make
+        :meth:`yacron2.cron.Cron._process_pending_reboots` retire it without
+        running the new definition -- a silent skip the local-set reconcile in
+        :meth:`_reconcile_job_set_id` already prevents for our own runs.  The
+        live check mirrors the gate :meth:`_handle_reboot_ran` puts on pushes.
         """
+        my_id = self.get_job_set_id()
         jobs = set(self._ran_reboot_jobs)
         for peer in self.view.peers.values():
-            if peer.status == STATUS_AGREED and peer.ran_reboot_jobs:
+            if (
+                peer.status == STATUS_AGREED
+                and peer.job_set_id == my_id
+                and peer.ran_reboot_jobs
+            ):
                 jobs |= peer.ran_reboot_jobs
         return jobs
 
