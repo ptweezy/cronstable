@@ -43,9 +43,48 @@ The surface is split three ways so a new lease backend stays tiny:
 """
 
 import abc
-from typing import Any, Callable, Dict, List, Optional
+import json
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from yacron2.config import ClusterConfig, ConfigError
+
+#: the key (kubernetes Lease annotation / etcd sibling key) under which a
+#: lease backend persists the set of @reboot one-shots already run in the
+#: cluster, so a failover holder does not re-run them.
+REBOOT_RAN_KEY = "yacron2.io/reboot-ran"
+
+
+def encode_reboot_ran(job_set_id: str, jobs: Set[str]) -> str:
+    """Encode the @reboot-ran set + its job-set fingerprint for the store."""
+    return json.dumps(
+        {"jobSetId": job_set_id, "jobs": sorted(jobs)},
+        separators=(",", ":"),
+    )
+
+
+def decode_reboot_ran(raw: Optional[str]) -> Tuple[Optional[str], Set[str]]:
+    """Decode a stored @reboot-ran blob to ``(job_set_id, jobs)``.
+
+    Tolerant of any malformed/absent value (returns ``(None, set())``), since a
+    backend must never crash its renew loop on a junk annotation/key written by
+    something else.
+    """
+    if not raw:
+        return None, set()
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None, set()
+    if not isinstance(data, dict):
+        return None, set()
+    job_set_id = data.get("jobSetId")
+    jobs = data.get("jobs")
+    if not isinstance(jobs, list):
+        jobs = []
+    return (
+        job_set_id if isinstance(job_set_id, str) else None,
+        {j for j in jobs if isinstance(j, str)},
+    )
 
 
 class LeadershipBackend(abc.ABC):
@@ -156,19 +195,18 @@ class LeadershipBackend(abc.ABC):
     # --- never-skip PreferLeader defaults (the locked lease semantics) ----
 
     def available_leader_name(self) -> str:
-        """Leader for the ``PreferLeader`` policy, never returning ``None``.
+        """The ``PreferLeader`` owner's *display* name, never ``None``.
 
-        When the store is unreachable (not quorate) this node names *itself* --
-        the never-skip choice (it runs, and may double-run).  When this node is
-        itself the holder it also names *itself*: a lease backend's
-        :meth:`leader_name` reports the holder's display *identity*
-        (``cluster.<backend>.identity``), which may legitimately differ from
-        ``node_name`` (e.g. a Kubernetes pod identity).  Comparing that
-        identity against ``node_name`` in :meth:`is_available_leader` would
-        otherwise make the holder fail to recognise itself -- so *every* node
-        defers and the ``PreferLeader`` job is silently skipped clusterwide.
-        Otherwise it defers to the observed leader (falling back to itself if
-        unknown).
+        Used only to *show* the owner (``GET /cluster`` / the dashboard); the
+        run/skip decision is :meth:`is_available_leader`, computed from
+        authoritative self-state, not from this string.  When the store is
+        unreachable (not quorate) or this node is itself the holder, it names
+        *itself*; otherwise it reports the observed holder's display identity
+        (falling back to itself when the holder is unknown).  Because this can
+        return a display identity that coincides with another node's
+        ``node_name`` (a duplicate ``nodeName``), it must **not** be string-
+        compared against ``node_name`` to gate a run -- see
+        :meth:`is_available_leader`.
         """
         if not self.is_quorate():
             return self.node_name
@@ -179,14 +217,33 @@ class LeadershipBackend(abc.ABC):
     def is_available_leader(self) -> bool:
         """Whether this node should run a ``PreferLeader`` job this cycle.
 
-        Derived from :meth:`available_leader_name` so the boolean gate and the
-        name it would resolve to can never disagree -- in particular in the
-        quorate-but-unknown-holder window (a lost ``create`` race), where the
-        never-skip rule names *this* node and so must also run it.  ``True``
-        when the store is unreachable (run anyway, never skip) or this node is
-        the available leader.
+        Decided from this node's own *authoritative* state, never from a
+        comparison of two display names.  ``True`` exactly when:
+
+        * the store is unreachable (not quorate) -- the never-skip choice: run
+          anyway, may double-run; or
+        * this node holds the lease (:meth:`is_leader`); or
+        * the store is reachable but the holder is genuinely unknown
+          (:meth:`leader_name` is ``None`` -- a lost ``create`` race), where
+          never-skip names *this* node so the job still runs somewhere.
+
+        Otherwise a different node holds the lease and this node defers.  This
+        deliberately does **not** string-compare :meth:`available_leader_name`
+        (the holder's *display* identity) against ``node_name``: a lease
+        backend's display identity can legitimately equal another node's
+        ``node_name`` (a duplicate ``nodeName`` -- the default for a Kubernetes
+        Deployment -- or an ``identity`` set to a peer's name), which would
+        otherwise make a quorate *follower* believe it is the available leader
+        and run every ``PreferLeader`` job, silently, on every replica.  The
+        fence itself is per-process unique (a lease id / ``#<token>`` suffix),
+        so :meth:`is_leader` self-recognises correctly regardless of any
+        display-name collision.
         """
-        return self.available_leader_name() == self.node_name
+        if not self.is_quorate():
+            return True
+        if self.is_leader():
+            return True
+        return self.leader_name() is None
 
     def available_job_owner(self, job_name: str) -> str:
         """``available_leader_name`` for the per-job (spread) shape.
@@ -205,7 +262,18 @@ class LeadershipBackend(abc.ABC):
         return self.job_owner(job_name) or self.node_name
 
     def is_available_job_owner(self, job_name: str) -> bool:
-        return self.available_job_owner(job_name) == self.node_name
+        """Per-job (spread) analogue of :meth:`is_available_leader`.
+
+        Decided from authoritative self-state, not a display-name comparison,
+        for the same duplicate-identity reason.  Lease backends reject
+        ``distribution: spread`` at config time, so for them per-job ownership
+        collapses to leadership and this mirrors :meth:`is_available_leader`.
+        """
+        if not self.is_quorate():
+            return True
+        if self.is_job_owner(job_name):
+            return True
+        return self.job_owner(job_name) is None
 
 
 class LeaseBackend(LeadershipBackend):
@@ -234,6 +302,67 @@ class LeaseBackend(LeadershipBackend):
         # lease backends are always a single holder; spread is rejected at
         # config time, so per-job ownership never diverges from leadership.
         self.distribution = "single-leader"
+        # @reboot "already ran" tracking, persisted in the store scoped to
+        # the current job-set so a FAILOVER holder does not re-run a
+        # deferred @reboot Leader one-shot (the gossip backend gossips this; a
+        # lease backend has no peer set, so it persists it instead).
+        # ``_reboot_ran`` is what we have read back from the store;
+        # ``_reboot_ran_local`` is what this node has run but not yet confirmed
+        # persisted. reboot_ran checks the union (see cron's deferred-reboot
+        # handling). Note the semantics differ slightly from gossip: keyed by
+        # job-set id, an @reboot Leader job runs once per job CONFIG on a lease
+        # cluster (persisted across restarts), not once per process boot.
+        self._reboot_ran: Set[str] = set()
+        self._reboot_ran_local: Set[str] = set()
+
+    def reboot_ran(self, job_name: str) -> bool:
+        return (
+            job_name in self._reboot_ran
+            or job_name in self._reboot_ran_local
+        )
+
+    async def mark_reboot_ran(self, job_name: str) -> None:
+        self._reboot_ran_local.add(job_name)
+        await self._persist_reboot_ran()
+
+    async def _persist_reboot_ran(self) -> None:  # pragma: no cover
+        """Eagerly persist the local @reboot-ran set to the store.
+
+        Default no-op (the kubernetes backend folds the set into its periodic
+        Lease write instead); the etcd backend overrides this to write its
+        sibling key at once.
+        """
+
+    def _observe_reboot_ran(
+        self, stored_job_set_id: Optional[str], stored: Set[str]
+    ) -> None:
+        """Fold a store-read @reboot-ran set into the cache, job-set-scoped.
+
+        A stored set tagged with a DIFFERENT job-set id belongs to an older
+        configuration, so it is ignored (the @reboot job runs again under the
+        new job set), matching gossip's job-set scoping of ``advertised_ran``.
+        """
+        if stored_job_set_id == self.get_job_set_id():
+            self._reboot_ran = set(stored)
+        else:
+            self._reboot_ran = set()
+
+    def reboot_ran_annotation(
+        self, existing: Optional[Dict[str, str]] = None
+    ) -> Optional[Dict[str, str]]:
+        """The annotations to write back: carry ``existing`` forward, set ours.
+
+        Returns ``None`` when there is nothing to write and no existing
+        annotations to preserve, so a backend can skip an empty annotations
+        block. Used by the kubernetes backend's Lease write.
+        """
+        combined = self._reboot_ran | self._reboot_ran_local
+        annotations = dict(existing or {})
+        if combined:
+            annotations[REBOOT_RAN_KEY] = encode_reboot_ran(
+                self.get_job_set_id(), combined
+            )
+        return annotations or None
 
     def lease_detail(self) -> Dict[str, Any]:
         """Backend-specific ``"lease"`` block for :meth:`view_dict`.

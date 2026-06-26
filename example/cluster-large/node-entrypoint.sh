@@ -14,6 +14,22 @@
 #   DRIFT_AFTER    rounds before "drifted"  (default 2)
 set -eu
 
+# Validate every value that is spliced into a file path or the generated YAML,
+# so a stray/hostile env value cannot traverse paths (NODE_NAME -> the loaded
+# cert/key path) or inject extra config keys (host tokens -> the cluster.yaml).
+# Allowed: letters, digits, '.', '_', '-', and ':' (for host:port); reject '..'.
+_valid() {
+  case "$1" in
+    "" | *..* | *[!A-Za-z0-9._:-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if ! _valid "$NODE_NAME" || [ "${NODE_NAME#*:}" != "$NODE_NAME" ]; then
+  echo "[entrypoint] invalid NODE_NAME: ${NODE_NAME}" >&2
+  exit 1
+fi
+
 DIR="${YACRON2_DIR:-/tmp/yacron2.d}"
 mkdir -p "$DIR"
 # the job set is mounted read-only at /config/jobs.yaml; yacron2 needs every
@@ -25,9 +41,9 @@ cp /config/jobs.yaml "$DIR/jobs.yaml"
   echo "  listen: \"0.0.0.0:8443\""
   echo "  tls:"
   echo "    ca: /certs/ca.pem"
-  echo "    cert: /certs/${NODE_NAME}.pem"
-  echo "    key: /certs/${NODE_NAME}.key"
-  echo "  nodeName: ${NODE_NAME}"
+  echo "    cert: \"/certs/${NODE_NAME}.pem\""
+  echo "    key: \"/certs/${NODE_NAME}.key\""
+  echo "  nodeName: \"${NODE_NAME}\""
   echo "  electLeader: ${ELECT_LEADER:-true}"
   echo "  distribution: ${DISTRIBUTION:-spread}"
   echo "  interval: ${INTERVAL:-10}"
@@ -37,7 +53,11 @@ cp /config/jobs.yaml "$DIR/jobs.yaml"
   for hp in $(echo "$CLUSTER_HOSTS" | tr ',' ' '); do
     [ -z "$hp" ] && continue
     [ "${hp%%:*}" = "$NODE_NAME" ] && continue
-    echo "    - host: ${hp}"
+    if ! _valid "$hp"; then
+      echo "[entrypoint] skipping invalid CLUSTER_HOSTS entry: ${hp}" >&2
+      continue
+    fi
+    echo "    - host: \"${hp}\""
   done
 } > "$DIR/cluster.yaml"
 

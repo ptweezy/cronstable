@@ -1062,9 +1062,14 @@ class Cron:
                     "the elected owner)",
                     name,
                 )
-                await self.launch_scheduled_job(job)
-                # record + eagerly tell peers, so no one re-runs it on failover
+                # Record (and eagerly gossip / persist) intent-to-run BEFORE
+                # spawning, not after: a crash in the launch->record window
+                # would otherwise leave no peer/store aware it ran, so the
+                # failover owner re-runs it. Recording first means the worst
+                # case is a recorded-but-not-actually-run one-shot (at-most-
+                # once preserved), not a double-run.
                 await mgr.mark_reboot_ran(name)
+                await self.launch_scheduled_job(job)
             # else: another node is (or will be) the owner, or the cluster has
             # not converged yet (no quorum / a nodeName conflict) -> keep the
             # job pending and re-evaluate next wakeup. Never drop a one-shot on
@@ -1093,8 +1098,12 @@ class Cron:
 
         ``Leader``/``PreferLeader`` fail *closed* (return False) when election
         is configured but no manager is running, so a broken cluster does not
-        make every replica fire.  Manual (API) triggers and retries go through
-        ``maybe_launch_job`` and are unaffected by any of this.
+        make every replica fire.  Manual (API) triggers go through
+        ``maybe_launch_job`` directly and are deliberately *not* gated (an
+        explicit operator action runs where it is invoked).  Scheduled-job
+        *retries* re-check this gate in ``schedule_retry_job`` before
+        relaunching, so a retry that outlives the leadership it began under is
+        abandoned rather than double-running across a failover.
 
         A detected conflict (``mgr.has_conflict()`` — a duplicate ``nodeName``,
         an agreeing peer declaring a different cluster size ``N``, or an
@@ -1114,17 +1123,31 @@ class Cron:
         mgr = self.cluster_manager
         if mgr is None:
             return False  # election wanted but undeterminable -> fail closed
-        if mgr.distribution == "spread":
+        try:
+            if mgr.distribution == "spread":
+                if job.clusterPolicy == "PreferLeader":
+                    return mgr.is_available_job_owner(job.name)
+                if mgr.has_conflict():
+                    return False  # "Leader": fail closed on duplicate nodeName
+                return mgr.is_job_owner(job.name)  # "Leader"
             if job.clusterPolicy == "PreferLeader":
-                return mgr.is_available_job_owner(job.name)
+                return mgr.is_available_leader()
             if mgr.has_conflict():
                 return False  # "Leader": fail closed on a duplicate nodeName
-            return mgr.is_job_owner(job.name)  # "Leader"
-        if job.clusterPolicy == "PreferLeader":
-            return mgr.is_available_leader()
-        if mgr.has_conflict():
-            return False  # "Leader": fail closed on a duplicate nodeName
-        return mgr.is_leader()  # "Leader"
+            return mgr.is_leader()  # "Leader"
+        except Exception:
+            # A backend read should never raise, but a bug in one (a bad gossip
+            # payload reaching election, a KeyError in rendezvous hashing) must
+            # not escape: spawn_jobs runs OUTSIDE the run loop's try/except, so
+            # an exception here would kill the whole scheduler -- including the
+            # EveryNode jobs meant to survive a broken manager. Fail closed
+            # (skip this leader-gated job) and keep scheduling.
+            logger.exception(
+                "cluster: error evaluating the leader gate for job %s; "
+                "failing closed (skipping it this cycle)",
+                job.name,
+            )
+            return False
 
     def _log_cluster_role(self) -> None:
         """Log this node's run-eligibility transitions (once per change).
@@ -1468,6 +1491,21 @@ class Cron:
             )
             # clear the now-stale retry state and stop; falling through here
             # would call maybe_launch_job(job) with an unbound 'job'.
+            self.retry_state.pop(job_name, None)
+            return
+        # Re-check the leadership gate before relaunching: a retry can outlive
+        # the leadership it started under (a partition / quorum loss / reload
+        # moved ownership while we slept), and maybe_launch_job does NOT gate.
+        # Relaunching unconditionally would run a Leader-policy job here while
+        # the new owner also runs it on its next tick -- the exact double-run
+        # the abstraction promises to prevent. If we are no longer the owner,
+        # abandon the retry (the new owner runs it on its own schedule).
+        if not self._cluster_allows(job):
+            logger.info(
+                "Cron job %s retry abandoned: this node is no longer the "
+                "cluster owner for it",
+                job_name,
+            )
             self.retry_state.pop(job_name, None)
             return
         await self.maybe_launch_job(job)

@@ -28,21 +28,40 @@ import base64
 import datetime
 import logging
 import ssl
+import time
 from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 
-from yacron2.config import ClusterConfig
-from yacron2.leadership import LeaseBackend
+from yacron2.config import ClusterConfig, _redact_userinfo
+from yacron2.leadership import (
+    LeaseBackend,
+    decode_reboot_ran,
+    encode_reboot_ran,
+)
 
 logger = logging.getLogger("yacron2.backends.etcd")
 
 # See yacron2.backends.kubernetes._CLOCK_SKEW.
 _CLOCK_SKEW = datetime.timedelta(seconds=1)
+_SKEW_SECONDS = _CLOCK_SKEW.total_seconds()
 
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _monotonic() -> float:
+    """A monotonic clock for lease/quorum *deadlines*.
+
+    Lease fences must never be judged on the wall clock: a backward NTP/VM step
+    would keep ``is_leader`` true past the server's lease expiry (a second node
+    has by then won the campaign); a forward step would expire quorum early.
+    ``time.monotonic`` cannot jump, so deadlines anchored to it stay correct
+    across any wall-clock correction. The wall clock is used only for the
+    human-readable expiry shown in the dashboard.
+    """
+    return time.monotonic()
 
 
 def _b64(text: str) -> str:
@@ -142,6 +161,24 @@ def lease_id_from_grant(resp: Dict[str, Any]) -> Optional[str]:
     return str(lease_id) if lease_id is not None else None
 
 
+def lease_ttl_from_grant(resp: Dict[str, Any]) -> Optional[int]:
+    """The *server-chosen* TTL from a ``/v3/lease/grant`` response, if any.
+
+    etcd may grant a TTL lower than requested; the local lease deadline must be
+    derived from what etcd granted, not the configured value, or a node
+    would call itself leader past the point etcd has already expired the key.
+    ``None`` if the field is absent or unparseable (the caller keeps the
+    configured ttl).
+    """
+    ttl = resp.get("TTL")
+    if ttl is None:
+        return None
+    try:
+        return int(ttl)
+    except (TypeError, ValueError):
+        return None
+
+
 def lease_ttl_from_keepalive(resp: Dict[str, Any]) -> Optional[int]:
     """Remaining TTL from a ``/v3/lease/keepalive`` response.
 
@@ -172,9 +209,18 @@ class EtcdBackend(LeaseBackend):
         etcd = config["etcd"]
         self.endpoints: List[str] = list(etcd["endpoints"])
         self.election_name: str = etcd["electionName"]
+        # a sibling, non-lease-bound key holding the @reboot-ran set (persisted
+        # so a failover holder does not re-run a deferred one-shot; see
+        # LeaseBackend). Separate from the election key, so it survives the
+        # election lease expiring on a leader change.
+        self.reboot_ran_key: str = self.election_name + "/reboot-ran"
         # the value written at the election key; nodeName is the identity.
         self.identity: str = config["nodeName"]
         self.ttl: int = etcd["ttl"]
+        # the TTL the lease deadline is actually computed from -- etcd may
+        # grant/refresh a shorter one (see lease_ttl_from_grant); starts at the
+        # configured value and is narrowed by each grant/keepalive.
+        self._effective_ttl: int = self.ttl
         self.username: Optional[str] = etcd["username"]
         self.password: Optional[str] = etcd.get("resolved_password")
         self._tls: Dict[str, Optional[str]] = etcd["tls"]
@@ -186,8 +232,12 @@ class EtcdBackend(LeaseBackend):
         self._is_leader = False
         self._holder: Optional[str] = None
         self._lease_id: Optional[str] = None
+        # wall-clock expiry, for the dashboard/lease_detail display ONLY
         self._lease_deadline: Optional[datetime.datetime] = None
-        self._last_contact: Optional[datetime.datetime] = None
+        # monotonic deadlines: the load-bearing fence/freshness gates (immune
+        # wall-clock steps; see _monotonic)
+        self._lease_deadline_mono: Optional[float] = None
+        self._last_contact_mono: Optional[float] = None
 
         self._auth_token: Optional[str] = None
         self._ssl: Optional[ssl.SSLContext] = None
@@ -198,12 +248,17 @@ class EtcdBackend(LeaseBackend):
     # --- pure local-state reads (no I/O) ---------------------------------
 
     def _leader_deadline(self, now: datetime.datetime) -> datetime.datetime:
-        return now + datetime.timedelta(seconds=self.ttl) - _CLOCK_SKEW
+        """Wall-clock lease expiry, for display only (see ``_apply_round``)."""
+        return (
+            now + datetime.timedelta(seconds=self._effective_ttl) - _CLOCK_SKEW
+        )
 
     def is_leader(self) -> bool:
-        if not self._is_leader or self._lease_deadline is None:
+        if not self._is_leader or self._lease_deadline_mono is None:
             return False
-        return _utcnow() < self._lease_deadline
+        # gated on a MONOTONIC deadline so a backward wall-clock step cannot
+        # keep us "leader" past the point etcd has expired the key.
+        return _monotonic() < self._lease_deadline_mono
 
     def leader_name(self) -> Optional[str]:
         if not self.is_quorate():
@@ -211,10 +266,9 @@ class EtcdBackend(LeaseBackend):
         return self._holder
 
     def is_quorate(self) -> bool:
-        if self._last_contact is None:
+        if self._last_contact_mono is None:
             return False
-        freshness = datetime.timedelta(seconds=self.ttl)
-        return _utcnow() < self._last_contact + freshness
+        return _monotonic() < self._last_contact_mono + self._effective_ttl
 
     def lease_detail(self) -> Dict[str, Any]:
         from yacron2.backends.kubernetes import _format_microtime
@@ -236,18 +290,27 @@ class EtcdBackend(LeaseBackend):
         holder: Optional[str],
         is_leader: bool,
         now: datetime.datetime,
+        mono: Optional[float] = None,
     ) -> None:
         """Update live leader state from a round's outcome (pure, tested).
 
         ``is_leader`` is whether *we* hold the election key via *our* lease
         (see :func:`campaign_won`); ``holder`` is the display name stored at
-        the key (whoever currently holds it).
+        the key (whoever currently holds it).  ``now`` is wall-clock (for the
+        displayed expiry); ``mono`` is the matching monotonic instant the
+        fence/freshness gates use (captured for the same round) -- defaulted to
+        the current monotonic clock for the pure unit tests.
         """
-        self._last_contact = now
+        if mono is None:
+            mono = _monotonic()
+        self._last_contact_mono = mono
         self._holder = holder
         self._is_leader = is_leader
         if self._is_leader:
             self._lease_deadline = self._leader_deadline(now)
+            self._lease_deadline_mono = (
+                mono + self._effective_ttl - _SKEW_SECONDS
+            )
 
     # --- network glue (integration-only) ---------------------------------
 
@@ -258,6 +321,17 @@ class EtcdBackend(LeaseBackend):
         try:
             if self.username:
                 self._auth_token = await self._authenticate()
+            # Run one round up front so is_quorate/is_leader reflect a read
+            # of the store BEFORE the first spawn_jobs. Without it a
+            # lease backend is "never contacted" for one cycle, which makes
+            # every PreferLeader job run on every node at boot (and on every
+            # reload that rebuilds the manager). Best-effort: a failed/slow
+            # round is swallowed (the loop retries), leaving the not-quorate
+            # state -- the genuine "store unreachable" case.
+            try:
+                await asyncio.wait_for(self._renew_once(), self.ttl)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+                logger.warning("cluster: etcd initial round failed: %s", ex)
         except BaseException:
             # Honour the "a backend cleans up its own half-started state on
             # failure" contract (as KubernetesBackend.start already does): an
@@ -275,7 +349,8 @@ class EtcdBackend(LeaseBackend):
             self.identity,
             self.election_name,
             self.ttl,
-            ", ".join(self.endpoints),
+            # redact any userinfo (config rejects it, but never log a secret).
+            ", ".join(_redact_userinfo(e) for e in self.endpoints),
         )
         self._stop.clear()
         self._task = asyncio.create_task(self._renew_loop())
@@ -349,9 +424,16 @@ class EtcdBackend(LeaseBackend):
             "all etcd endpoints failed: {}".format(last_error)
         )
 
-    async def _grant_lease(self) -> Optional[str]:  # pragma: no cover
+    async def _grant_lease(
+        self,
+    ) -> "tuple[Optional[str], Optional[int]]":  # pragma: no cover
+        """Grant a lease; return ``(lease_id, server_granted_ttl)``.
+
+        The granted TTL may be lower than requested, so the caller narrows the
+        local deadline to it (see :func:`lease_ttl_from_grant`).
+        """
         resp = await self._post("/v3/lease/grant", {"TTL": str(self.ttl)})
-        return lease_id_from_grant(resp)
+        return lease_id_from_grant(resp), lease_ttl_from_grant(resp)
 
     async def _keepalive(
         self, lease_id: str
@@ -379,12 +461,20 @@ class EtcdBackend(LeaseBackend):
     async def _renew_loop(self) -> None:  # pragma: no cover - network loop
         while not self._stop.is_set():
             try:
-                await self._renew_once()
+                # Bound the whole round by the ttl: _renew_once makes several
+                # sequential POSTs, each iterating every endpoint, so on
+                # slow/half-open endpoints an unbounded round could block for
+                # far longer than the lease lifetime (N_endpoints x
+                # connectTimeout per call). After ttl the lease has lapsed
+                # anyway (is_leader self-demotes on its monotonic deadline), so
+                # abandon and retry rather than wedge the loop.
+                await asyncio.wait_for(self._renew_once(), self.ttl)
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
-                # could not reach etcd this round: leave _last_contact alone so
-                # is_quorate goes stale (Leader closed, PreferLeader runs).
+                # could not reach etcd this round: leave the monotonic contact
+                # deadline alone so is_quorate goes stale (Leader closed,
+                # PreferLeader runs).
                 logger.warning("cluster: etcd round failed: %s", ex)
             except Exception:
                 logger.exception("cluster: unexpected etcd error")
@@ -395,17 +485,71 @@ class EtcdBackend(LeaseBackend):
 
     async def _renew_once(self) -> None:  # pragma: no cover - network
         now = _utcnow()
+        mono = _monotonic()
         if self._lease_id is not None:
             ttl = await self._keepalive(self._lease_id)
             if ttl is None or ttl <= 0:
                 self._lease_id = None  # lease expired; re-grant below
                 self._is_leader = False
+            else:
+                # honour the TTL etcd refreshed to (may be < requested)
+                self._effective_ttl = max(1, min(self.ttl, ttl))
         if self._lease_id is None:
-            self._lease_id = await self._grant_lease()
+            self._lease_id, granted = await self._grant_lease()
+            if granted is not None:
+                self._effective_ttl = max(1, min(self.ttl, granted))
         if self._lease_id is None:
             raise aiohttp.ClientError("etcd lease grant returned no id")
         holder, won = await self._campaign(self._lease_id)
-        self._apply_round(holder, won, now)
+        self._apply_round(holder, won, now, mono)
+        await self._sync_reboot_ran()
+
+    # --- @reboot-ran persistence (H2: no peer set, so persist to the store) --
+
+    async def _sync_reboot_ran(self) -> None:  # pragma: no cover - network
+        """Best-effort: read the @reboot-ran key, fold it in, re-persist marks.
+
+        Wrapped so an auxiliary read/write failure never fails the leadership
+        round (the local set still prevents this node re-running its own one-
+        shot); the next round retries.
+        """
+        try:
+            resp = await self._post(
+                "/v3/kv/range", {"key": _b64(self.reboot_ran_key)}
+            )
+            kvs = resp.get("kvs") or []
+            raw = (
+                _b64decode(kvs[0]["value"])
+                if kvs and kvs[0].get("value") is not None
+                else None
+            )
+            stored_jsid, stored_jobs = decode_reboot_ran(raw)
+            self._observe_reboot_ran(stored_jsid, stored_jobs)
+            # re-persist any local marks the store has not yet recorded (a
+            # failed eager _persist_reboot_ran is retried here).
+            if self._reboot_ran_local - self._reboot_ran:
+                await self._write_reboot_ran()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
+
+    async def _write_reboot_ran(self) -> None:  # pragma: no cover - network
+        combined = self._reboot_ran | self._reboot_ran_local
+        value = encode_reboot_ran(self.get_job_set_id(), combined)
+        await asyncio.wait_for(
+            self._post(
+                "/v3/kv/put",
+                {"key": _b64(self.reboot_ran_key), "value": _b64(value)},
+            ),
+            self.connect_timeout,
+        )
+
+    async def _persist_reboot_ran(self) -> None:  # pragma: no cover - network
+        # eager write on mark_reboot_ran (before the deferred job launches);
+        # best-effort -- _sync_reboot_ran retries it each round if it fails.
+        try:
+            await self._write_reboot_ran()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            logger.debug("cluster: etcd reboot-ran persist failed: %s", ex)
 
     async def stop(self) -> None:  # pragma: no cover - network
         self._stop.set()
@@ -418,10 +562,15 @@ class EtcdBackend(LeaseBackend):
             self._task = None
         if self._lease_id is not None:
             # revoking the lease deletes the election key at once -> immediate
-            # failover (no waiting out the TTL).
+            # failover (no waiting out the TTL). Bound the whole attempt by
+            # connectTimeout: _post iterates every endpoint, so an unreachable
+            # etcd at shutdown/reload time would otherwise stall the inline
+            # start_stop_cluster reload for N_endpoints x connectTimeout. A
+            # failed revoke is harmless -- the lease still expires by its TTL.
             try:
-                await self._post(
-                    "/v3/lease/revoke", {"ID": str(self._lease_id)}
+                await asyncio.wait_for(
+                    self._post("/v3/lease/revoke", {"ID": self._lease_id}),
+                    self.connect_timeout,
                 )
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
                 logger.debug("cluster: etcd lease revoke failed: %s", ex)

@@ -409,6 +409,14 @@ class PeerState:
     # benign self-listing from a duplicate nodeName (see record_success).
     # Deliberately not surfaced in to_dict (it is an internal liveness token).
     instance_id: Optional[str] = None
+    # whether a successful poll of this host has positively identified it as
+    # THIS node (it returned our own instance id, or our name with no instance
+    # id). A node's identity at an address it once answered does not change
+    # because a later poll fails, so once set this keeps the entry STATUS_SELF
+    # across transient self-poll failures (a hairpin/NAT quirk) -- otherwise
+    # cluster_size would flap N<->N+1 on the poll interval. Re-evaluated on
+    # every successful poll. Internal, like instance_id; not in to_dict.
+    self_confirmed: bool = False
     last_seen: Optional[datetime.datetime] = None  # last successful contact
     last_error: Optional[str] = None
     # consecutive reachable-but-mismatched rounds, for the drift hysteresis
@@ -512,6 +520,9 @@ class ClusterView:
         peer.mutual_agreeing = peer_mutual_agreeing
         peer.declared_distribution = peer_distribution
         peer.declared_elect_leader = peer_elect_leader
+        # re-determine self-ness on every successful poll: an address that no
+        # longer answers as us (reassigned) must be able to lose the flag.
+        peer.self_confirmed = False
 
         if peer_name is not None and peer_name == my_name:
             if peer_instance is not None and peer_instance != my_instance:
@@ -531,6 +542,7 @@ class ClusterView:
             # own address), or a peer too old to report an instance id: the
             # benign self case. Never counts toward agreement.
             peer.status = STATUS_SELF
+            peer.self_confirmed = True  # latch: keep SELF across poll failures
             peer.mismatch_streak = 0
             return
 
@@ -563,11 +575,26 @@ class ClusterView:
     ) -> None:
         peer = self.peers[host]
         peer.last_error = error
-        peer.status = STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
-        # we could not observe the id this round, so the drift streak (which
-        # only counts *reachable* mismatches) is reset and the peer's last
-        # reported view is dropped as stale (no mutual/conflict info this time)
-        peer.mismatch_streak = 0
+        if peer.self_confirmed:
+            # this host has been positively identified as THIS node; a failed
+            # poll (a hairpin/NAT quirk where we cannot dial our own advertised
+            # address) does not change that. Keep it SELF rather than flapping
+            # to UNREACHABLE, which would oscillate cluster_size (and so the
+            # quorum threshold and the size-divergence gate) on the poll
+            # interval, in turn flapping Leader-gated jobs.
+            peer.status = STATUS_SELF
+        else:
+            peer.status = (
+                STATUS_UNTRUSTED if untrusted else STATUS_UNREACHABLE
+            )
+        # we could not observe the id this round, so drop the peer's last
+        # reported view as stale (no mutual/conflict info this time). The drift
+        # streak is deliberately NOT reset here: it counts *reachable*
+        # mismatches, and zeroing it on every unreachable round means an
+        # intermittently-reachable but genuinely drifted peer never accumulates
+        # driftAfter consecutive mismatches, so the drift alarm never fires for
+        # exactly the flaky case it exists to catch. It is reset only by a
+        # confirmed AGREED (or SELF) observation in record_success.
         peer.members = None
         peer.ran_reboot_jobs = None
         peer.mutual_agreeing = None

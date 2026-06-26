@@ -40,15 +40,20 @@ import logging
 import os
 import ssl
 import tempfile
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
 from yacron2.backends import TRANSPORT_LIBRARY, select_transport
 from yacron2.config import ClusterConfig, ConfigError
-from yacron2.leadership import LeaseBackend
+from yacron2.leadership import (
+    REBOOT_RAN_KEY,
+    LeaseBackend,
+    decode_reboot_ran,
+)
 
 logger = logging.getLogger("yacron2.backends.kubernetes")
 
@@ -56,6 +61,21 @@ logger = logging.getLogger("yacron2.backends.kubernetes")
 # leader, so a node whose clock runs slightly fast self-demotes *before* a peer
 # would be entitled to steal the lease -- erring is_leader toward False.
 _CLOCK_SKEW = datetime.timedelta(seconds=1)
+_SKEW_SECONDS = _CLOCK_SKEW.total_seconds()
+
+
+def _monotonic() -> float:
+    """A monotonic clock for the lease fence, steal anchor, and quorum window.
+
+    These must never ride the wall clock: a same-node forward step would make a
+    follower's ``observed_at + duration`` steal deadline fire early (stealing a
+    still-valid lease -> two leaders), and a backward step would keep a former
+    holder ``is_leader`` past expiry. ``time.monotonic`` cannot jump, so the
+    timing stays correct across any wall-clock correction (NTP, VM resume). The
+    wall clock is used only for the RFC3339 ``renewTime``/``acquireTime`` we
+    write and the human-readable expiry shown in the dashboard.
+    """
+    return time.monotonic()
 
 _API_GROUP = "coordination.k8s.io/v1"
 _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -97,6 +117,10 @@ class LeaseState:
     duration: Optional[int]
     transitions: int
     resource_version: Optional[str]
+    # the Lease's metadata.annotations, where the @reboot-ran set is persisted
+    # (see yacron2.leadership.REBOOT_RAN_KEY); default {} so positional
+    # LeaseState(...) constructions in the tests are unaffected.
+    annotations: Dict[str, str] = field(default_factory=dict)
 
 
 def _parse_microtime(value: Any) -> Optional[datetime.datetime]:
@@ -143,6 +167,7 @@ def parse_lease(obj: Optional[Dict[str, Any]]) -> LeaseState:
     meta = (obj or {}).get("metadata") or {}
     duration = spec.get("leaseDurationSeconds")
     transitions = spec.get("leaseTransitions")
+    annotations = meta.get("annotations")
     return LeaseState(
         holder=spec.get("holderIdentity"),
         renew_time=_parse_microtime(spec.get("renewTime")),
@@ -150,40 +175,56 @@ def parse_lease(obj: Optional[Dict[str, Any]]) -> LeaseState:
         duration=duration if isinstance(duration, int) else None,
         transitions=transitions if isinstance(transitions, int) else 0,
         resource_version=meta.get("resourceVersion"),
+        annotations=annotations if isinstance(annotations, dict) else {},
     )
 
 
 def lease_is_expired(
     state: LeaseState,
-    now: datetime.datetime,
-    observed_at: Optional[datetime.datetime],
+    now: Any,
+    observed_at: Optional[Any],
 ) -> bool:
     """Whether another holder's lease has lapsed, from *our* clock's view.
 
     The deadline is anchored to ``observed_at`` -- the local instant we first
     saw this lease record -- not to the holder's own ``renewTime``.  This is
-    client-go's ``observedTime + leaseDurationSeconds`` rule: both the anchor
-    and ``now`` are this node's wall clock, so the steal decision is **immune
-    to clock skew** between us and the holder (judging the holder's own
+    client-go's ``observedTime + leaseDurationSeconds`` rule.  Both the anchor
+    and ``now`` are *this node's* clock, so the steal decision is immune to
+    clock skew **between** us and the holder (judging the holder's own
     ``renewTime`` against our clock could otherwise make a fast clock steal a
-    freshly-renewed lease and elect a second leader).  ``observed_at`` is
-    ``None`` only before
-    the first observation is recorded, where we fall back to ``renewTime``; a
-    lease with no usable anchor or no duration is treated as expired.
+    freshly-renewed lease and elect a second leader).  The live caller passes a
+    **monotonic** ``now``/``observed_at`` (see
+    :meth:`KubernetesBackend._renew_once`), so the decision is also immune to a
+    discontinuous jump in *our own* wall clock -- a forward NTP/VM step cannot
+    make ``now`` leap past ``observed_at + duration`` and steal a still-valid
+    lease.  This function itself only does the arithmetic, so it is agnostic to
+    which clock the caller uses (the unit tests pass wall datetimes).
+    ``observed_at`` is ``None`` only before the first observation is recorded,
+    where we fall back to ``renewTime``; a lease with no usable anchor or no
+    duration is treated as expired.
     """
     if not state.duration:
         return True
+    if isinstance(now, (int, float)):
+        # live path: a monotonic clock (seconds). The anchor is the monotonic
+        # observed_at, in the same units; there is no renewTime fallback here
+        # (renewTime is wall-clock and would not be comparable). No monotonic
+        # anchor yet -> treat as expired.
+        if observed_at is None:
+            return True
+        return bool(now >= observed_at + state.duration)
+    # test path: wall-clock datetimes, with the renewTime fallback.
     anchor = observed_at if observed_at is not None else state.renew_time
     if anchor is None:
         return True
-    return now >= anchor + datetime.timedelta(seconds=state.duration)
+    return bool(now >= anchor + datetime.timedelta(seconds=state.duration))
 
 
 def decide_lease_action(
     state: Optional[LeaseState],
     identity: str,
-    now: datetime.datetime,
-    observed_at: Optional[datetime.datetime],
+    now: Any,
+    observed_at: Optional[Any],
 ) -> str:
     """Choose the action for this round given the observed lease.
 
@@ -210,6 +251,7 @@ def build_lease_body(
     duration: int,
     state: Optional[LeaseState],
     action: str,
+    annotations: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Build the ``Lease`` object to POST (create) or PUT (acquire/renew).
 
@@ -218,6 +260,8 @@ def build_lease_body(
     ``acquireTime`` and bumps ``leaseTransitions``; a renew preserves both.  A
     replace (acquire/renew) carries the observed ``resourceVersion`` so the
     apiserver rejects the write (HTTP 409) if another node raced us.
+    ``annotations`` (when non-empty) is written to ``metadata.annotations`` --
+    this is where the @reboot-ran set is persisted so it survives failover.
     """
     if action == ACTION_RENEW and state is not None:
         acquire_time = state.acquire_time or now
@@ -231,6 +275,8 @@ def build_lease_body(
     metadata: Dict[str, Any] = {"name": name}
     if namespace:
         metadata["namespace"] = namespace
+    if annotations:
+        metadata["annotations"] = annotations
     if (
         action != ACTION_CREATE
         and state is not None
@@ -258,22 +304,29 @@ def plan_lease_write(
     identity: str,
     now: datetime.datetime,
     duration: int,
-    observed_at: Optional[datetime.datetime],
+    observed_at: Optional[Any],
+    mono_now: Optional[float] = None,
+    annotations: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Optional[Dict[str, Any]], Optional[LeaseState]]:
     """Pure planning step: observed Lease -> (action, body, state).
 
     ``observed_at`` is the local instant we first saw the current lease record
-    (the skew-immune steal anchor; see :func:`lease_is_expired`).  ``body`` is
-    ``None`` for ``wait`` (nothing to write).  This is the whole per-round
-    decision with no I/O, so the renew loop reduces to "observe, track, plan,
-    maybe write, update local state".
+    (the steal anchor; see :func:`lease_is_expired`).  Timing and body-stamping
+    use *different* clocks: the steal/expiry **decision** runs on a monotonic
+    clock (``mono_now`` and the monotonic ``observed_at``) so a wall-clock jump
+    cannot mis-time a takeover, while the ``renewTime``/``acquireTime`` written
+    into the object must be wall-clock RFC3339 (``now``).  When ``mono_now`` is
+    omitted the decision falls back to ``now`` (the unit tests pass one wall
+    clock for both, which is internally consistent).  ``body`` is ``None`` for
+    ``wait`` (nothing to write).
     """
     state = parse_lease(lease_obj) if lease_obj is not None else None
-    action = decide_lease_action(state, identity, now, observed_at)
+    decide_now = now if mono_now is None else mono_now
+    action = decide_lease_action(state, identity, decide_now, observed_at)
     if action == ACTION_WAIT:
         return action, None, state
     body = build_lease_body(
-        name, namespace, identity, now, duration, state, action
+        name, namespace, identity, now, duration, state, action, annotations
     )
     return action, body, state
 
@@ -318,19 +371,25 @@ class KubernetesBackend(LeaseBackend):
         # resolved at start() from the in-cluster files or a kubeconfig
         self.namespace: Optional[str] = self._configured_namespace
 
-        # live state, written by the renew loop and read by the sync methods
+        # live state, written by the renew loop and read by the sync methods.
+        # _leader_until / _last_contact are WALL-CLOCK, for display only; the
+        # load-bearing fence and freshness gates use the monotonic deadlines
+        # below (immune to wall-clock steps; see _monotonic).
         self._is_leader = False
         self._holder: Optional[str] = None
         self._leader_until: Optional[datetime.datetime] = None
         self._last_contact: Optional[datetime.datetime] = None
+        self._leader_until_mono: Optional[float] = None
+        self._last_contact_mono: Optional[float] = None
 
         # client-go's observedTime: the (holder, renewTime) record we last saw
-        # and the local clock when we first saw it. The steal decision is
-        # anchored to _observed_at (our clock), not the holder's renewTime, so
-        # it is immune to clock skew between us and the holder.
+        # and the MONOTONIC clock when we first saw it. The steal decision is
+        # anchored to _observed_at (our monotonic clock), not the holder's
+        # renewTime, so it is immune both to skew between us and the holder and
+        # to a discontinuous jump in our own wall clock.
         self._observed_holder: Optional[str] = None
         self._observed_renew: Optional[datetime.datetime] = None
-        self._observed_at: Optional[datetime.datetime] = None
+        self._observed_at: Optional[float] = None
 
         # the chosen transport (native client or hand-rolled HTTP), bound in
         # start(); see select_transport.
@@ -341,16 +400,18 @@ class KubernetesBackend(LeaseBackend):
     # --- pure local-state reads (no I/O) ---------------------------------
 
     def _leader_deadline(self, now: datetime.datetime) -> datetime.datetime:
-        """The instant a successful renew at ``now`` keeps us leader until."""
+        """Wall-clock lease expiry, for display only (see ``_apply_round``)."""
         return (
             now + datetime.timedelta(seconds=self.lease_duration) - _CLOCK_SKEW
         )
 
     def is_leader(self) -> bool:
-        if not self._is_leader or self._leader_until is None:
+        if not self._is_leader or self._leader_until_mono is None:
             return False
-        # local-expiry safety: a stalled renew loop self-demotes with no call.
-        return _utcnow() < self._leader_until
+        # local-expiry safety on a MONOTONIC deadline: a stalled renew loop
+        # self-demotes with no network call, and no wall-clock step can keep us
+        # leader past the point the apiserver has expired the lease.
+        return _monotonic() < self._leader_until_mono
 
     def leader_name(self) -> Optional[str]:
         if not self.is_quorate():
@@ -363,10 +424,9 @@ class KubernetesBackend(LeaseBackend):
         Stale (or never-contacted) -> not quorate, so ``Leader`` fails closed
         and the never-skip ``PreferLeader`` default runs the job anyway.
         """
-        if self._last_contact is None:
+        if self._last_contact_mono is None:
             return False
-        freshness = datetime.timedelta(seconds=self.lease_duration)
-        return _utcnow() < self._last_contact + freshness
+        return _monotonic() < self._last_contact_mono + self.lease_duration
 
     def lease_detail(self) -> Dict[str, Any]:
         return {
@@ -374,9 +434,11 @@ class KubernetesBackend(LeaseBackend):
             "namespace": self.namespace,
             "identity": self.display_identity,
             "holder": self._holder,
+            # only advertise an expiry while we actually hold the lease, so a
+            # former holder's view does not keep showing a stale deadline.
             "expiry": (
                 _format_microtime(self._leader_until)
-                if self._leader_until is not None
+                if self.is_leader() and self._leader_until is not None
                 else None
             ),
         }
@@ -402,23 +464,24 @@ class KubernetesBackend(LeaseBackend):
     # --- the renew loop's per-round local-state update (pure) ------------
 
     def _track_observation(
-        self, state: Optional[LeaseState], now: datetime.datetime
-    ) -> Optional[datetime.datetime]:
+        self, state: Optional[LeaseState], mono_now: float
+    ) -> Optional[float]:
         """Record client-go's observedTime and return the steal anchor.
 
         Whenever the observed ``(holder, renewTime)`` record changes, reset the
-        local observation clock to ``now``; an unchanged record keeps the
-        original ``_observed_at``.  The returned anchor is what
-        :func:`lease_is_expired` measures the lease duration from, so a peer's
-        lease is only ever stolen after *we* have watched the same record for a
-        full duration on our own clock.
+        local observation clock to ``mono_now`` (a *monotonic* timestamp); an
+        unchanged record keeps the original ``_observed_at``.  The returned
+        anchor is what :func:`lease_is_expired` measures the lease duration
+        from, so a peer's lease is only ever stolen after *we* have watched the
+        same record for a full monotonic duration -- which no wall-clock
+        jump can fast-forward.
         """
         holder = state.holder if state is not None else None
         renew = state.renew_time if state is not None else None
         if holder != self._observed_holder or renew != self._observed_renew:
             self._observed_holder = holder
             self._observed_renew = renew
-            self._observed_at = now
+            self._observed_at = mono_now
         return self._observed_at
 
     def _apply_round(
@@ -427,15 +490,21 @@ class KubernetesBackend(LeaseBackend):
         write_ok: bool,
         state: Optional[LeaseState],
         now: datetime.datetime,
+        mono: Optional[float] = None,
     ) -> None:
         """Update the live leader state from this round's outcome.
 
         Separated from the I/O so it is unit-tested: ``write_ok`` is whether
         the create/replace succeeded (a 409 conflict is ``False`` -- another
-        node won).  Always advances ``_last_contact`` (we *did* reach apiserver
-        this round, which is what ``is_quorate`` tracks).
+        node won). Always advances the contact clocks (we *did* reach apiserver
+        this round, which is what ``is_quorate`` tracks). ``now`` is wall-clock
+        (display); ``mono`` is the monotonic instant the fence/freshness
+        gates use (defaulted to the current monotonic clock for unit tests).
         """
+        if mono is None:
+            mono = _monotonic()
         self._last_contact = now
+        self._last_contact_mono = mono
         if action == ACTION_WAIT:
             self._is_leader = False
             self._holder = (
@@ -446,6 +515,9 @@ class KubernetesBackend(LeaseBackend):
             self._is_leader = True
             self._holder = self.display_identity
             self._leader_until = self._leader_deadline(now)
+            self._leader_until_mono = (
+                mono + self.lease_duration - _SKEW_SECONDS
+            )
         else:
             # lost the optimistic-concurrency race (409): not leader now.
             self._is_leader = False
@@ -474,6 +546,19 @@ class KubernetesBackend(LeaseBackend):
         )
         try:
             await self._transport.setup()
+            # Run one round up front so is_quorate/is_leader reflect a read
+            # of the Lease BEFORE the first spawn_jobs. Without it a
+            # lease backend is "never contacted" for one cycle, which makes
+            # every PreferLeader job run on every node at boot (and on every
+            # reload that rebuilds the manager). Best-effort: a failed/slow
+            # round is swallowed (the loop retries), leaving the not-quorate
+            # state -- the genuine "apiserver unreachable" case.
+            try:
+                await asyncio.wait_for(self._renew_once(), self.renew_deadline)
+            except Exception as ex:
+                logger.warning(
+                    "cluster: kubernetes initial round failed: %s", ex
+                )
         except BaseException:
             # clean up half-started state (an open session, temp cert files)
             # so a failed start leaks nothing, honouring the caller's contract.
@@ -520,17 +605,29 @@ class KubernetesBackend(LeaseBackend):
     async def _renew_once(self) -> None:  # pragma: no cover - network
         assert self._transport is not None
         lease_obj = await self._transport.observe()
-        # Capture the clock AFTER observe() returns, so the steal anchor (and
+        # Capture the clocks AFTER observe() returns, so the steal anchor (and
         # the renewTime we write) reflect the instant we actually read the
         # record -- client-go's observedTime = now() *after* the Get. Sampling
-        # `now` before the await would anchor whatever (possibly newer) record
-        # the GET returns to a time up to one observe-latency earlier (bounded
-        # by renewDeadline, not the 1s skew budget), shrinking the skew-immune
-        # steal window and risking two leaders at once on a slow apiserver.
+        # before the await would anchor whatever (possibly newer) record GET
+        # returns to a time up to one observe-latency earlier (bounded by
+        # renewDeadline, not the skew budget), shrinking the steal window and
+        # risking two leaders at once on a slow apiserver. `mono` drives the
+        # steal/expiry timing (jump-proof); `now` (wall) only stamps written
+        # renewTime/acquireTime and the displayed expiry.
         now = _utcnow()
-        observed_at = self._track_observation(
-            parse_lease(lease_obj) if lease_obj is not None else None, now
+        mono = _monotonic()
+        observed = parse_lease(lease_obj) if lease_obj is not None else None
+        observed_at = self._track_observation(observed, mono)
+        # Fold the @reboot-ran set persisted in the Lease annotations into our
+        # cache (so a node that just acquired the lease learns what already ran
+        # and does not re-run it), then carry those annotations forward and add
+        # our own pending marks for the write below.
+        observed_annotations = observed.annotations if observed else {}
+        stored_jsid, stored_jobs = decode_reboot_ran(
+            observed_annotations.get(REBOOT_RAN_KEY)
         )
+        self._observe_reboot_ran(stored_jsid, stored_jobs)
+        write_annotations = self.reboot_ran_annotation(observed_annotations)
         action, body, state = plan_lease_write(
             lease_obj,
             self.lease_name,
@@ -539,13 +636,15 @@ class KubernetesBackend(LeaseBackend):
             now,
             self.lease_duration,
             observed_at,
+            mono,
+            write_annotations,
         )
         write_ok = False
         if body is not None:
             write_ok = await self._transport.write(
                 body, create=(action == ACTION_CREATE)
             )
-        self._apply_round(action, write_ok, state, now)
+        self._apply_round(action, write_ok, state, now, mono)
 
     async def stop(self) -> None:  # pragma: no cover - network
         self._stop.set()
@@ -557,9 +656,29 @@ class KubernetesBackend(LeaseBackend):
                 pass
             self._task = None
         if self._transport is not None:
+            # Bound the release + close so a hung apiserver cannot wedge the
+            # inline start_stop_cluster reload (the native client calls run in
+            # an uncancellable worker thread; a deadline-less _release/close
+            # would block the whole reload, and the lease would not be handed
+            # back -- a peer then waits out the full leaseDuration). A failed
+            # release safely falls back to TTL expiry.
             if self._is_leader:
-                await self._release()
-            await self._transport.close()
+                try:
+                    await asyncio.wait_for(
+                        self._release(), self.renew_deadline
+                    )
+                except Exception as ex:
+                    logger.debug(
+                        "cluster: kubernetes lease release timed out: %s", ex
+                    )
+            try:
+                await asyncio.wait_for(
+                    self._transport.close(), self.connect_timeout
+                )
+            except Exception as ex:
+                logger.debug(
+                    "cluster: kubernetes transport close timed out: %s", ex
+                )
             self._transport = None
         self._is_leader = False
 
@@ -715,6 +834,11 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         host = os.environ.get("KUBERNETES_SERVICE_HOST")
         port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
         if self.b.api_server_override:
+            # apiServer is an IN-CLUSTER url override (e.g. a kube-rbac-proxy
+            # sidecar), still authenticated with the ServiceAccount token/CA
+            # below; not an out-of-cluster mode (use kubeconfig for that).
+            # Config validation already requires https, so the token below is
+            # never sent in cleartext.
             self._base_url = self.b.api_server_override.rstrip("/")
         elif host:
             self._base_url = "https://{}:{}".format(host, port)
@@ -722,6 +846,16 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             raise ConfigError(
                 "kubernetes backend: not running in a cluster and no "
                 "cluster.kubernetes.kubeconfig or apiServer configured"
+            )
+        # Defence in depth: never attach the SA bearer token to a non-https
+        # target (config already rejects an http apiServer; this catches any
+        # path that slips through before the token is read).
+        if not self._base_url.lower().startswith("https://"):
+            raise ConfigError(
+                "kubernetes backend: refusing to send the ServiceAccount "
+                "bearer token to a non-https apiserver ({})".format(
+                    self._base_url
+                )
             )
         try:
             # remember the path so _auth_headers can re-read the rotating
@@ -734,8 +868,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         except OSError as ex:
             raise ConfigError(
                 "kubernetes backend: could not read in-cluster service "
-                "account credentials ({}); set cluster.kubernetes.kubeconfig "
-                "for out-of-cluster use".format(ex)
+                "account credentials ({}); these are required for the "
+                "in-cluster and apiServer-override paths. For out-of-cluster "
+                "use set cluster.kubernetes.kubeconfig instead".format(ex)
             ) from ex
 
     def _load_kubeconfig(self, path: str) -> None:
@@ -763,6 +898,17 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             self._ssl = ssl.create_default_context()
             self._ssl.check_hostname = False
             self._ssl.verify_mode = ssl.CERT_NONE
+            # Loud, every-start warning: with verification off the apiserver
+            # cert is not checked, so the lease store can be MITM'd and any
+            # bearer token sent to it captured (-> token theft + a forged
+            # holderIdentity -> two leaders). Intended for local testing only;
+            # the silent default is a real footgun in production.
+            logger.warning(
+                "cluster: kubernetes kubeconfig sets insecure-skip-tls-verify "
+                "-- the apiserver certificate is NOT verified, exposing the "
+                "lease store (and any bearer token) to MITM. Use only for "
+                "local testing; prefer a real CA."
+            )
         else:
             self._ssl = ssl.create_default_context()
             ca_data = cluster.get("certificate-authority-data")
@@ -777,6 +923,12 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
 
         if user.get("token"):
             self._auth_token = user["token"]
+            if self._base_url.lower().startswith("http://"):
+                logger.warning(
+                    "cluster: kubernetes kubeconfig server is http:// -- the "
+                    "bearer token will be sent in cleartext. Use an https:// "
+                    "server."
+                )
         cert = self._material(
             user.get("client-certificate"),
             user.get("client-certificate-data"),
@@ -864,22 +1016,35 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
     async def setup(self) -> None:
         from kubernetes import client
         from kubernetes import config as kube_config
+        from kubernetes.config.config_exception import ConfigException
 
         context_namespace: Optional[str] = None
-        if self.b.kubeconfig:
-            kube_config.load_kube_config(config_file=self.b.kubeconfig)
-            # honour the active context's namespace, matching the HTTP
-            # transport's kubeconfig handling so the two transports cannot
-            # contend for the Lease in different namespaces (a split-brain).
-            _contexts, active = kube_config.list_kube_config_contexts(
-                config_file=self.b.kubeconfig
-            )
-            if active:
-                context_namespace = (active.get("context") or {}).get(
-                    "namespace"
+        try:
+            if self.b.kubeconfig:
+                kube_config.load_kube_config(config_file=self.b.kubeconfig)
+                # honour the active context's namespace, matching the HTTP
+                # transport's kubeconfig handling so the two transports cannot
+                # contend for the Lease in two namespaces (a split-brain).
+                _contexts, active = kube_config.list_kube_config_contexts(
+                    config_file=self.b.kubeconfig
                 )
-        else:
-            kube_config.load_incluster_config()
+                if active:
+                    context_namespace = (active.get("context") or {}).get(
+                        "namespace"
+                    )
+            else:
+                kube_config.load_incluster_config()
+        except ConfigException as ex:
+            # a malformed/absent kubeconfig or missing in-cluster files is an
+            # operational misconfiguration, not a yacron2 bug. ConfigException
+            # is NOT in start_stop_cluster's caught tuple, so without this it
+            # escapes to the run loop's "please report this as a bug" handler;
+            # re-raise as ConfigError so it is logged as "cluster: failed to
+            # start" and the daemon keeps running.
+            raise ConfigError(
+                "kubernetes backend: could not load client configuration "
+                "({})".format(ex)
+            ) from ex
         # honour cluster.kubernetes.apiServer here too, so the override is not
         # silently dropped when the native client is selected.
         config_obj = client.Configuration.get_default_copy()

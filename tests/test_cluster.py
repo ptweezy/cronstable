@@ -273,11 +273,46 @@ def test_record_failure_classifies():
     assert view.peers["peer:8443"].status == STATUS_UNTRUSTED
 
 
-def test_failure_resets_mismatch_streak():
+def test_failure_preserves_mismatch_streak():
+    # L2: an unreachable round must NOT reset the drift streak, or an
+    # intermittently-reachable-but-drifted peer never latches STATUS_DRIFTED
+    # (the drift alarm never fires for the flaky case it targets). The streak
+    # is reset only by a confirmed AGREED observation.
     view = _view(drift_after=5)
     _ok(view, pid="v1:other")  # streak 1
     view.record_failure("peer:8443", "down", untrusted=False)
-    assert view.peers["peer:8443"].mismatch_streak == 0
+    assert view.peers["peer:8443"].mismatch_streak == 1
+    # a flaky drifted peer eventually latches after enough reachable mismatches
+    for _ in range(4):
+        view.record_failure("peer:8443", "down", untrusted=False)
+        _ok(view, pid="v1:other")
+    assert view.peers["peer:8443"].status == STATUS_DRIFTED
+    # and a confirmed agreement finally resets it
+    p = _ok(view, pid="v1:same")
+    assert p.status == STATUS_AGREED and p.mismatch_streak == 0
+
+
+def test_confirmed_self_sticks_across_failed_self_poll():
+    # L1/H6: a host positively identified as THIS node (returned our own
+    # instance id) stays SELF across a later failed self-poll (a NAT/hairpin
+    # quirk), so cluster_size does not flap N<->N+1 on the poll interval.
+    view = _view()
+    view.record_success(
+        "peer:8443",
+        "me",
+        "v1:same",
+        SCHEME_VERSION,
+        "v1:same",
+        NOW,
+        "me",
+        peer_instance="inst-1",
+        my_instance="inst-1",
+    )
+    peer = view.peers["peer:8443"]
+    assert peer.status == STATUS_SELF and peer.self_confirmed is True
+    # the self-poll now fails (cannot dial our own advertised address)
+    view.record_failure("peer:8443", "connection refused", untrusted=False)
+    assert peer.status == STATUS_SELF  # sticky, not UNREACHABLE
 
 
 def test_to_dict_shape():
