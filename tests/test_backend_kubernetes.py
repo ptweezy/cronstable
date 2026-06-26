@@ -22,6 +22,7 @@ from yacron2.backends.kubernetes import (
     KubernetesBackend,
     LeaseState,
     _format_microtime,
+    _K8sHttpTransport,
     _parse_microtime,
     build_lease_body,
     decide_lease_action,
@@ -535,3 +536,36 @@ async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
     await b._renew_once()
 
     assert b._observed_at == NOW + datetime.timedelta(seconds=observe_latency)
+
+
+# --- HTTP transport: rotating service-account token -----------------------
+
+
+def test_http_transport_rereads_rotating_token(tmp_path):
+    # Kubernetes rotates the projected SA token on disk (~hourly); the lease
+    # backend is never rebuilt on rotation, so _auth_headers must re-read the
+    # token each request or a stale frozen token 401s the node into a
+    # permanent, cluster-wide loss of leadership.
+    token = tmp_path / "token"
+    token.write_text("tok-1")
+    t = _K8sHttpTransport(_backend())
+    t._token_path = str(token)
+    assert t._auth_headers() == {"Authorization": "Bearer tok-1"}
+    # the kubelet replaces the file with a fresh token before the old expires.
+    token.write_text("tok-2")
+    assert t._auth_headers() == {"Authorization": "Bearer tok-2"}
+    # a transient read failure keeps the last good token (the round may fail,
+    # which fails Leader closed -- it does not drop the credential).
+    token.unlink()
+    assert t._auth_headers() == {"Authorization": "Bearer tok-2"}
+
+
+def test_http_transport_static_token_and_no_token(tmp_path):
+    # a kubeconfig bearer token has no _token_path and is used as-is; with no
+    # token at all (client-cert auth) there is no Authorization header.
+    t = _K8sHttpTransport(_backend())
+    t._token_path = None
+    t._auth_token = "static-tok"
+    assert t._auth_headers() == {"Authorization": "Bearer static-tok"}
+    t._auth_token = None
+    assert t._auth_headers() == {}

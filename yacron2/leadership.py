@@ -253,11 +253,14 @@ class LeaseBackend(LeadershipBackend):
             "elect_leader": True,
             "distribution": self.distribution,
             # a lease store is authoritative: there is no gossip-style
-            # duplicate-name or size-divergence conflict to report.
+            # duplicate-name, size-divergence, or coordination-policy conflict
+            # to report (a single holder, distribution pinned single-leader).
             "conflict": False,
             "conflict_names": [],
             "size_conflict": False,
             "conflicting_sizes": [],
+            "policy_conflict": False,
+            "conflicting_policies": [],
             "quorate": self.is_quorate(),
             "leader": leader,
             "is_leader": self.is_leader(),

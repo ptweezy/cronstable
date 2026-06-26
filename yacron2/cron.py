@@ -1096,13 +1096,16 @@ class Cron:
         make every replica fire.  Manual (API) triggers and retries go through
         ``maybe_launch_job`` and are unaffected by any of this.
 
-        A detected conflict (``mgr.has_conflict()`` — a duplicate ``nodeName``
-        *or* an agreeing peer declaring a different cluster size ``N``)
-        additionally makes ``Leader`` jobs fail closed: the quorum election is
-        unsafe while two nodes share a name or disagree on ``N`` (either lets
-        two nodes each elect themselves), so skipping is the
-        at-most-once-preserving choice.  ``PreferLeader`` is left running — it
-        already accepts double-runs as the price of never skipping.
+        A detected conflict (``mgr.has_conflict()`` — a duplicate ``nodeName``,
+        an agreeing peer declaring a different cluster size ``N``, or an
+        agreeing peer running a different coordination policy
+        (``distribution`` / ``electLeader``)) additionally makes ``Leader``
+        jobs fail closed: the quorum election is unsafe while two nodes share a
+        name, disagree on ``N`` (either lets two nodes each elect themselves),
+        or pick owners by different rules (which would double-run or drop a
+        ``Leader`` job), so skipping is the at-most-once-preserving choice.
+        ``PreferLeader`` is left running — it already accepts double-runs as
+        the price of never skipping.
         """
         if not self._elect_leader_configured:
             return True

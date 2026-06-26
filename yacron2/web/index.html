@@ -2228,6 +2228,16 @@
             (data.cluster_size || "?") + ")" : "") +
           " — Leader jobs paused";
       }
+      // a coordination-policy mismatch (a peer running a different
+      // distribution / electLeader) picks different owners and would
+      // double-run or drop Leader jobs; surface it just as loudly.
+      if (data.policy_conflict) {
+        var policies = (data.conflicting_policies || []).join("; ");
+        summary +=
+          " · ⚠ coordination policy mismatch" +
+          (policies ? " (" + policies + ")" : "") +
+          " — Leader jobs paused";
+      }
       $("clusterSummary").textContent = summary;
       // the Owns column lists each peer's job count; reveal it only under spread
       $("clusterTable").classList.toggle("show-owns", spread);

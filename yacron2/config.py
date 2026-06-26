@@ -933,6 +933,25 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         )
     if retry <= 0:
         raise ConfigError("cluster.kubernetes.retryPeriodSeconds must be > 0")
+    if retry >= renew:
+        # client-go's third leaderelection invariant (RenewDeadline must
+        # exceed the RetryPeriod). The renew loop sleeps retryPeriodSeconds
+        # *between* rounds, unbounded by the lease window: with
+        # retry >= renew (and so, with duration > renew already enforced
+        # above, retry can also exceed the whole lease duration) a holder
+        # cannot complete a renewal before the next attempt is due, so it
+        # lapses out of the lease for most of every cycle -- is_leader and
+        # is_quorate flap False, no Leader job ever runs stably (a single
+        # holder, so no peer leads either) and never-skip PreferLeader jobs
+        # double-run on every replica. Reject it rather than silently defeat
+        # the at-most-once guarantee a lease backend exists to provide.
+        raise ConfigError(
+            "cluster.kubernetes.retryPeriodSeconds ({}) must be less than "
+            "renewDeadlineSeconds ({}): a holder must be able to renew "
+            "within the renew window before the next retry, or it lapses "
+            "out of the lease every cycle and no Leader job runs "
+            "stably".format(retry, renew)
+        )
     # configuring a lease backend is opting into leadership.
     cfg["electLeader"] = True
     return ClusterConfig(cfg)
@@ -994,6 +1013,29 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     etcd["resolved_password"] = _resolve_secret(
         etcd["password"], "cluster.etcd.password"
     )
+    if etcd["username"] or etcd["resolved_password"]:
+        # Authentication credentials (the cleartext username/password POSTed
+        # to /v3/auth/authenticate, and the bearer token attached to every
+        # request thereafter) must never travel unencrypted. _build_ssl only
+        # builds a TLS context when an endpoint is https, and the _post
+        # failover loop would otherwise POST those credentials over any
+        # plaintext member -- including a single http:// endpoint, or the
+        # plaintext one in a mixed http/https list. Refuse the combination at
+        # load time so credentials cannot be sniffed; the default loopback
+        # endpoint is plaintext but needs no auth, so it is unaffected.
+        insecure = [
+            endpoint
+            for endpoint in etcd["endpoints"]
+            if urlparse(endpoint).scheme != "https"
+        ]
+        if insecure:
+            raise ConfigError(
+                "cluster.etcd: authentication (username/password) requires "
+                "https:// endpoints so credentials are not sent in "
+                "cleartext, but these endpoints are plaintext: {}".format(
+                    ", ".join(insecure)
+                )
+            )
     cfg["electLeader"] = True
     return ClusterConfig(cfg)
 

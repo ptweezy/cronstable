@@ -426,6 +426,15 @@ class PeerState:
     # result, or a peer too old to report it. Internal, like instance_id; not
     # surfaced in to_dict.
     declared_size: Optional[int] = None
+    # the coordination policy the peer last declared: its cluster.distribution
+    # ("single-leader"/"spread") and whether it has electLeader on. Like
+    # declared_size these are behaviour-affecting and NOT part of the job-set
+    # fingerprint, so two nodes that differ only here still see each other
+    # AGREED; a divergence is a first-class conflict (see
+    # ClusterManager.conflicting_policies). None when no fresh result, or a
+    # peer too old to report it. Internal, like instance_id; not in to_dict.
+    declared_distribution: Optional[str] = None
+    declared_elect_leader: Optional[bool] = None
     # the @reboot job names the peer reports as already run in the cluster
     # (its own runs plus what it learned), used to retire our matching deferred
     # one-shots without re-running them (see ClusterManager.reboot_ran). Only
@@ -488,6 +497,8 @@ class ClusterView:
         peer_ran_reboot_jobs: Optional["set[str]"] = None,
         peer_size: Optional[int] = None,
         peer_mutual_agreeing: Optional["set[str]"] = None,
+        peer_distribution: Optional[str] = None,
+        peer_elect_leader: Optional[bool] = None,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -499,6 +510,8 @@ class ClusterView:
         peer.ran_reboot_jobs = peer_ran_reboot_jobs
         peer.declared_size = peer_size
         peer.mutual_agreeing = peer_mutual_agreeing
+        peer.declared_distribution = peer_distribution
+        peer.declared_elect_leader = peer_elect_leader
 
         if peer_name is not None and peer_name == my_name:
             if peer_instance is not None and peer_instance != my_instance:
@@ -714,6 +727,15 @@ class ClusterManager(LeadershipBackend):
                 # Leader closed, mirroring a duplicate nodeName (see
                 # ClusterManager.conflicting_sizes).
                 "cluster_size": self.cluster_size(),
+                # our coordination policy: distribution and electLeader pick
+                # *which* node runs a Leader job (single-leader elects the
+                # min live name; spread picks a per-job rendezvous owner;
+                # electLeader off runs every job ungated). Neither is in the
+                # job-set fingerprint, so a peer that declares a different one
+                # is treated as a conflict and fails Leader closed (see
+                # ClusterManager.conflicting_policies).
+                "distribution": self.distribution,
+                "elect_leader": bool(self.config.get("electLeader")),
                 # our current observations, so a polling peer can confirm we
                 # see it too (mutual agreement) and spot a duplicate nodeName
                 # transitively; see ClusterView.local_members.
@@ -1071,6 +1093,7 @@ class ClusterManager(LeadershipBackend):
             "job_set_id",
             "scheme_version",
             "instance_id",
+            "distribution",
         ):
             value = data.get(key)
             if value is not None and not isinstance(value, str):
@@ -1103,6 +1126,18 @@ class ClusterManager(LeadershipBackend):
                 untrusted=False,
             )
             return
+        # elect_leader is a bool; a peer too old to report it sends None, which
+        # forgoes the policy-conflict guard for that peer (the safe direction:
+        # it is simply not compared). Reject a non-bool from a misbehaving peer
+        # before it reaches conflicting_policies.
+        elect = data.get("elect_leader")
+        if elect is not None and not isinstance(elect, bool):
+            self.view.record_failure(
+                host,
+                "malformed /peer response: elect_leader is not a boolean",
+                untrusted=False,
+            )
+            return
         self.view.record_success(
             host,
             fields["node_name"],
@@ -1116,6 +1151,8 @@ class ClusterManager(LeadershipBackend):
             peer_members=_parse_members(data.get("members")),
             peer_ran_reboot_jobs=_parse_str_list(data.get("ran_reboot_jobs")),
             peer_size=size,
+            peer_distribution=fields["distribution"],
+            peer_elect_leader=elect,
             # An older build that omits the field, or a peer reporting an empty
             # set, both parse to an empty set here: either way it is not
             # confirmed quorate, so _eligible_candidates won't elect it. (The
@@ -1490,15 +1527,71 @@ class ClusterManager(LeadershipBackend):
             }
         )
 
+    def conflicting_policies(self) -> List[str]:
+        """Coordination-policy divergences declared by agreeing peers.
+
+        The leader gate's safety assumes every node coordinates the same way:
+        the same ``distribution`` and the same ``electLeader``.  These pick
+        *which* node runs a ``Leader`` job -- ``single-leader`` elects
+        ``min(live)`` while ``spread`` picks a per-job rendezvous owner (two
+        independent selectors that name different nodes for most jobs), and a
+        node with ``electLeader`` off runs *every* job ungated.  Neither field
+        is part of the job-set fingerprint (it is deliberately per-*job*) nor
+        of the ``cluster_size`` gate, so two nodes identical but for these
+        still see each other ``AGREED`` -- and would then either double-run a
+        ``Leader`` job (two different owners each fire it) or drop it entirely
+        (each defers to the other).  A divergence is therefore a first-class
+        conflict, handled exactly like a duplicate ``nodeName`` or a size
+        disagreement: the ``Leader`` gate fails *closed* on every divergent
+        node until the cluster reconverges (see :meth:`has_conflict` /
+        :func:`yacron2.cron.Cron._cluster_allows`).
+
+        Only ``AGREED`` peers that actually reported a value are compared; a
+        peer too old to declare these contributes nothing (the safe
+        direction).  Returns human-readable ``"field theirs != ours"``
+        descriptors, sorted and de-duplicated, for the dashboard / view.
+        """
+        my_elect = bool(self.config.get("electLeader"))
+        conflicts: Set[str] = set()
+        for peer in self.view.peers.values():
+            if peer.status != STATUS_AGREED:
+                continue
+            if (
+                peer.declared_distribution is not None
+                and peer.declared_distribution != self.distribution
+            ):
+                conflicts.add(
+                    "distribution {!r} != {!r}".format(
+                        peer.declared_distribution, self.distribution
+                    )
+                )
+            if (
+                peer.declared_elect_leader is not None
+                and peer.declared_elect_leader != my_elect
+            ):
+                conflicts.add(
+                    "electLeader {!r} != {!r}".format(
+                        peer.declared_elect_leader, my_elect
+                    )
+                )
+        return sorted(conflicts)
+
     def has_conflict(self) -> bool:
         """Whether any conflict that makes the election unsafe is visible here.
 
-        Either a duplicate ``nodeName`` (two nodes would each elect themselves;
-        see :meth:`conflict_names`) or a cluster-size disagreement (two nodes
-        quorate under different Ns; see :meth:`conflicting_sizes`).  Both fail
-        the ``Leader`` gate closed.
+        A duplicate ``nodeName`` (two nodes would each elect themselves; see
+        :meth:`conflict_names`), a cluster-size disagreement (two nodes quorate
+        under different Ns; see :meth:`conflicting_sizes`), or a
+        coordination-policy divergence (agreeing peers running a different
+        ``distribution`` / ``electLeader`` and so picking different owners; see
+        :meth:`conflicting_policies`).  All three fail the ``Leader`` gate
+        closed.
         """
-        return bool(self.conflict_names()) or bool(self.conflicting_sizes())
+        return (
+            bool(self.conflict_names())
+            or bool(self.conflicting_sizes())
+            or bool(self.conflicting_policies())
+        )
 
     def leader_name(self) -> Optional[str]:
         """Elected leader as this node sees it, or ``None`` if not quorate.
@@ -1572,6 +1665,7 @@ class ClusterManager(LeadershipBackend):
         spread = self.distribution == "spread"
         conflicts = self.conflict_names()
         size_conflicts = self.conflicting_sizes()
+        policy_conflicts = self.conflicting_policies()
         return {
             "backend": "gossip",
             "node_name": self.node_name,
@@ -1582,14 +1676,22 @@ class ClusterManager(LeadershipBackend):
             "distribution": self.distribution,
             # a conflict was detected: Leader jobs fail closed until it clears
             # (see has_conflict / cron._cluster_allows). "conflict" is the
-            # umbrella flag (either kind); the two lists below say which.
-            "conflict": bool(conflicts) or bool(size_conflicts),
+            # umbrella flag (any kind); the lists below say which.
+            "conflict": (
+                bool(conflicts)
+                or bool(size_conflicts)
+                or bool(policy_conflicts)
+            ),
             # a duplicate nodeName (two nodes would each elect themselves)
             "conflict_names": conflicts,
             # peers that agree on the job set but declare a different cluster
             # size N (two nodes quorate under different Ns -> split-brain)
             "size_conflict": bool(size_conflicts),
             "conflicting_sizes": size_conflicts,
+            # agreeing peers running a different distribution / electLeader
+            # (independent owner selectors -> double-run or lost-run)
+            "policy_conflict": bool(policy_conflicts),
+            "conflicting_policies": policy_conflicts,
             "quorate": leader is not None,
             # In spread mode there is no single leader: ownership is per job,
             # so leader/is_leader are not meaningful (reported null/false).
