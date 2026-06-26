@@ -25,7 +25,7 @@ from yacron2.config import parse_config_string
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 
-def _backend(extra=""):
+def _backend(extra="", endpoint="http://127.0.0.1:2379"):
     yaml = (
         "cluster:\n"
         "  backend: etcd\n"
@@ -33,7 +33,7 @@ def _backend(extra=""):
         "  connectTimeout: 4\n"
         "  etcd:\n"
         "    endpoints:\n"
-        "      - http://127.0.0.1:2379\n"
+        "      - " + endpoint + "\n"
         "    electionName: yacron2/leader\n"
         "    ttl: 15\n" + extra
     )
@@ -301,7 +301,11 @@ async def test_start_closes_session_when_authenticate_fails(monkeypatch):
     # so the caller never stop()s it). A ClientResponseError (a 401) is also
     # not an OSError, so it must still surface and be cleaned up.
     b = _backend(
-        "    username: admin\n    password:\n      value: secret\n"
+        "    username: admin\n    password:\n      value: secret\n",
+        # auth credentials require an https endpoint (config rejects auth over
+        # plaintext); use one so the authenticate-failure cleanup path is what
+        # this test exercises, not the config-time scheme guard.
+        endpoint="https://127.0.0.1:2379",
     )
 
     async def boom():

@@ -1559,6 +1559,100 @@ def test_view_dict_reports_size_conflict(no_tls):
     assert view["conflict_names"] == []  # not a nodeName conflict
 
 
+# --- coordination-policy (distribution / electLeader) divergence ----------
+
+
+def test_manager_detects_distribution_divergence(no_tls):
+    # distribution and the job-set fingerprint are orthogonal: two nodes with
+    # the same jobs but different distribution agree on the job-set id yet pick
+    # DIFFERENT owners for a Leader job (single-leader elects min(live);
+    # spread rendezvous-hashes per job), so one would double-run and the other
+    # drop it. A divergence among agreeing peers is a first-class conflict.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    _seed_agree(mgr, "c:1", "node-c")
+    assert mgr.distribution == "single-leader"
+    # both peers report our policy: no conflict.
+    for host in ("b:1", "c:1"):
+        mgr.view.peers[host].declared_distribution = "single-leader"
+        mgr.view.peers[host].declared_elect_leader = False
+    assert mgr.conflicting_policies() == []
+    assert mgr.has_conflict() is False
+    # c is misconfigured with distribution: spread.
+    mgr.view.peers["c:1"].declared_distribution = "spread"
+    assert mgr.conflicting_policies() == [
+        "distribution 'spread' != 'single-leader'"
+    ]
+    assert mgr.has_conflict() is True
+
+
+def test_manager_detects_elect_leader_divergence(no_tls):
+    # a peer with electLeader off runs EVERY job ungated; mixing it with an
+    # electing node double-runs Leader jobs. Surface it as a conflict too.
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    _seed_agree(mgr, "b:1", "node-b")
+    mgr.view.peers["b:1"].declared_distribution = "single-leader"
+    mgr.view.peers["b:1"].declared_elect_leader = False
+    assert mgr.conflicting_policies() == ["electLeader False != True"]
+    assert mgr.has_conflict() is True
+
+
+def test_policy_divergence_ignores_non_agreed_and_unknown(no_tls):
+    # only AGREED peers that actually reported a value are compared: a drifted
+    # peer, or one too old to declare the fields, contributes no conflict.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    pb = mgr.view.peers["b:1"]
+    pb.status = STATUS_DRIFTED  # different policy, but drifted -> ignored
+    pb.declared_distribution = "spread"
+    mgr.view.peers["c:1"].declared_distribution = None  # too old -> skipped
+    assert mgr.conflicting_policies() == []
+    assert mgr.has_conflict() is False
+
+
+def test_view_dict_reports_policy_conflict(no_tls):
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    _seed_agree(mgr, "b:1", "node-b")
+    mgr.view.peers["b:1"].declared_distribution = "spread"
+    view = mgr.view_dict()
+    assert view["conflict"] is True  # umbrella flag (any kind)
+    assert view["policy_conflict"] is True
+    assert view["conflicting_policies"] == [
+        "distribution 'spread' != 'single-leader'"
+    ]
+    assert view["size_conflict"] is False  # not a size conflict
+
+
+def test_observe_peer_records_declared_policy(no_tls):
+    # the /peer payload now carries distribution + elect_leader, and a
+    # successful observation stores them on the peer for conflict detection.
+    view = ClusterView(["peer:8443"], drift_after=3)
+    view.record_success(
+        "peer:8443",
+        "node-b",
+        "v1:mine",
+        SCHEME_VERSION,
+        "v1:mine",
+        NOW,
+        "node-a",
+        peer_distribution="spread",
+        peer_elect_leader=True,
+    )
+    peer = view.peers["peer:8443"]
+    assert peer.declared_distribution == "spread"
+    assert peer.declared_elect_leader is True
+
+
 def test_size_divergent_peer_dropped_from_mutual_set(no_tls):
     # a peer that agrees on the job set but declares a different N is BOTH a
     # size conflict AND dropped from the mutual-agreement set: we neither count

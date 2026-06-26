@@ -101,6 +101,28 @@ def test_kubernetes_retry_must_be_positive():
         _cluster(yaml)
 
 
+def test_kubernetes_retry_must_be_less_than_renew():
+    # client-go's third leaderelection invariant: with retry >= renew a holder
+    # cannot renew before the next attempt is due, so it lapses out of the
+    # lease every cycle and no Leader job runs stably. retry == renew is the
+    # boundary case and must also be rejected.
+    yaml = _K8S + (
+        "  kubernetes:\n"
+        "    leaseDurationSeconds: 15\n"
+        "    renewDeadlineSeconds: 10\n"
+        "    retryPeriodSeconds: 10\n"
+    )
+    with pytest.raises(ConfigError, match="retryPeriodSeconds"):
+        _cluster(yaml)
+
+
+def test_kubernetes_default_retry_renew_valid():
+    # the shipped defaults (retry 2 < renew 10 < duration 15) must pass.
+    cfg = _cluster(_K8S)
+    k8s = cfg["kubernetes"]
+    assert k8s["retryPeriodSeconds"] < k8s["renewDeadlineSeconds"]
+
+
 # --- etcd -----------------------------------------------------------------
 
 _ETCD = (
@@ -110,6 +132,18 @@ _ETCD = (
     "  etcd:\n"
     "    endpoints:\n"
     "      - http://127.0.0.1:2379\n"
+)
+
+# auth credentials must never cross a plaintext wire, so a config that sets a
+# username/password is only valid with https endpoints (see
+# _build_etcd_cluster_config); the password-resolution tests use this base.
+_ETCD_TLS = (
+    "cluster:\n"
+    "  backend: etcd\n"
+    "  nodeName: node-a\n"
+    "  etcd:\n"
+    "    endpoints:\n"
+    "      - https://127.0.0.1:2379\n"
 )
 
 
@@ -188,7 +222,7 @@ def test_etcd_rejects_malformed_endpoint():
 
 
 def test_etcd_password_from_value():
-    yaml = _ETCD + (
+    yaml = _ETCD_TLS + (
         "    username: root\n"
         "    password:\n"
         "      value: s3cret\n"
@@ -200,8 +234,36 @@ def test_etcd_password_from_value():
 
 def test_etcd_password_from_env(monkeypatch):
     monkeypatch.setenv("ETCD_PW", "from-env")
-    yaml = _ETCD + "    password:\n      fromEnvVar: ETCD_PW\n"
+    yaml = _ETCD_TLS + "    password:\n      fromEnvVar: ETCD_PW\n"
     assert _cluster(yaml)["etcd"]["resolved_password"] == "from-env"
+
+
+def test_etcd_auth_requires_https():
+    # credentials over a plaintext endpoint would be sniffable: reject the
+    # combination at load time (the default endpoint is http:// but needs no
+    # auth, so it stays valid without credentials).
+    yaml = _ETCD + "    username: root\n    password:\n      value: s3cret\n"
+    with pytest.raises(ConfigError, match="cleartext"):
+        _cluster(yaml)
+
+
+def test_etcd_auth_rejects_mixed_scheme_endpoints():
+    # a mixed http/https list still lets the _post failover loop POST
+    # credentials over the plaintext member, so it is rejected too.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  nodeName: node-a\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://etcd-1:2379\n"
+        "      - http://etcd-2:2379\n"
+        "    username: root\n"
+        "    password:\n"
+        "      value: s3cret\n"
+    )
+    with pytest.raises(ConfigError, match="http://etcd-2:2379"):
+        _cluster(yaml)
 
 
 def test_etcd_password_empty_source_fails_closed(monkeypatch):
@@ -214,7 +276,7 @@ def test_etcd_password_empty_source_fails_closed(monkeypatch):
 def test_etcd_password_from_file(tmp_path):
     secret = tmp_path / "pw"
     secret.write_text("file-secret\n")
-    yaml = _ETCD + "    password:\n      fromFile: {}\n".format(secret)
+    yaml = _ETCD_TLS + "    password:\n      fromFile: {}\n".format(secret)
     assert _cluster(yaml)["etcd"]["resolved_password"] == "file-secret"
 
 

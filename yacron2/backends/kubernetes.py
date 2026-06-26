@@ -652,6 +652,11 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         self.b = backend
         self._base_url: Optional[str] = None
         self._auth_token: Optional[str] = None
+        # the on-disk path of a *rotating* in-cluster service-account token,
+        # re-read before every request (see _auth_headers). None when the
+        # token is static (a kubeconfig bearer token) or absent (client-cert
+        # auth), in which case _auth_token alone is used.
+        self._token_path: Optional[str] = None
         self._ssl: Optional[ssl.SSLContext] = None
         self._tempfiles: List[str] = []
         self._session: Optional[aiohttp.ClientSession] = None
@@ -659,13 +664,43 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
     async def setup(self) -> None:
         self._load_connection()
         timeout = aiohttp.ClientTimeout(total=self.b.connect_timeout)
+        # The Authorization header is set *per request* (see _auth_headers),
+        # not frozen on the session: a projected service-account token is
+        # rotated on disk by the kubelet and a token baked in here would 401
+        # after the first rotation with no way to recover.
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        if self._auth_token:
-            headers["Authorization"] = "Bearer " + self._auth_token
         self._session = aiohttp.ClientSession(timeout=timeout, headers=headers)
+
+    @staticmethod
+    def _read_token(path: str) -> str:
+        with open(path) as token_file:
+            return token_file.read().strip()
+
+    def _auth_headers(self) -> Dict[str, str]:
+        """Per-request ``Authorization`` header, refreshing a rotating token.
+
+        Kubernetes >= 1.22 projects *bound* service-account tokens that the
+        kubelet rotates on disk roughly hourly. A lease backend is never
+        rebuilt on a token rotation (``cron.start_stop_cluster`` only rebuilds
+        on a config-byte or gossip-TLS change), so a token frozen at
+        :meth:`setup` would 401 once the first rotation lands and the node
+        would silently lose leadership cluster-wide for good. For the
+        in-cluster path we therefore re-read the (kubelet-kept-fresh) token
+        before each request; a static kubeconfig token has no ``_token_path``
+        and is used as-is. A transient read failure keeps the last good token
+        (a stale token simply fails the round, which fails ``Leader`` closed).
+        """
+        if self._token_path is not None:
+            try:
+                self._auth_token = self._read_token(self._token_path)
+            except OSError:
+                pass
+        if self._auth_token:
+            return {"Authorization": "Bearer " + self._auth_token}
+        return {}
 
     def _load_connection(self) -> None:
         """Resolve the apiserver URL, auth token, CA and namespace.
@@ -689,8 +724,10 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                 "cluster.kubernetes.kubeconfig or apiServer configured"
             )
         try:
-            with open(os.path.join(_SA_DIR, "token")) as token_file:
-                self._auth_token = token_file.read().strip()
+            # remember the path so _auth_headers can re-read the rotating
+            # token on every request rather than freezing it here.
+            self._token_path = os.path.join(_SA_DIR, "token")
+            self._auth_token = self._read_token(self._token_path)
             ca_path = os.path.join(_SA_DIR, "ca.crt")
             self._ssl = ssl.create_default_context(cafile=ca_path)
             self.b.namespace = self.b._resolve_namespace(None)
@@ -774,7 +811,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
 
     async def observe(self) -> Optional[Dict[str, Any]]:
         assert self._session is not None
-        async with self._session.get(self._lease_url(), ssl=self._ssl) as resp:
+        async with self._session.get(
+            self._lease_url(), ssl=self._ssl, headers=self._auth_headers()
+        ) as resp:
             if resp.status == 404:
                 return None
             resp.raise_for_status()
@@ -788,7 +827,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             url, method = self._lease_url(collection=True), self._session.post
         else:
             url, method = self._lease_url(), self._session.put
-        async with method(url, json=body, ssl=self._ssl) as resp:
+        async with method(
+            url, json=body, ssl=self._ssl, headers=self._auth_headers()
+        ) as resp:
             if resp.status == 409:
                 return False
             resp.raise_for_status()

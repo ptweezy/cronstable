@@ -318,8 +318,19 @@ class EtcdBackend(LeaseBackend):
         headers = {}
         if self._auth_token:
             headers["Authorization"] = self._auth_token
+        endpoints = self.endpoints
+        if self.username or self.password:
+            # Defence in depth: never transmit credentials (the cleartext
+            # password to /v3/auth/authenticate, or the bearer token on every
+            # other call) over a plaintext endpoint. Config validation already
+            # rejects auth combined with any http:// endpoint, so in practice
+            # this filters nothing -- but it guarantees that even a mixed list
+            # that somehow reached here cannot leak the secret over its http
+            # member. With no auth configured there is nothing to protect, so
+            # all endpoints stay eligible.
+            endpoints = [e for e in endpoints if self.endpoint_is_https(e)]
         last_error: Optional[Exception] = None
-        for endpoint in self.endpoints:
+        for endpoint in endpoints:
             url = endpoint.rstrip("/") + path
             try:
                 async with self._session.post(
