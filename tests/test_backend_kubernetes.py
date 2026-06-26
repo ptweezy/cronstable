@@ -489,3 +489,49 @@ def _utc_now_plus(seconds):
     return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
         seconds=seconds
     )
+
+
+async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
+    # The skew-immune steal anchor (_observed_at) must be the instant we
+    # actually read the Lease, not a timestamp captured before the observe()
+    # GET returns. Anchoring it before the await would back-date the record by
+    # the observe latency (bounded by renewDeadline, not the 1s skew budget),
+    # shrinking the steal window and risking two simultaneous leaders on a slow
+    # apiserver. Mirrors client-go's observedTime = now() after the Get.
+    b = _backend()
+    clock = [0.0]
+
+    def fake_now():
+        return NOW + datetime.timedelta(seconds=clock[0])
+
+    monkeypatch.setattr("yacron2.backends.kubernetes._utcnow", fake_now)
+
+    lease_obj = {
+        "metadata": {"name": "yl", "namespace": "ns", "resourceVersion": "7"},
+        "spec": {
+            "holderIdentity": "other#tok",
+            "renewTime": _format_microtime(NOW),
+            "leaseDurationSeconds": 15,
+            "leaseTransitions": 0,
+        },
+    }
+    observe_latency = 5.0
+
+    class _FakeTransport:
+        async def observe(self):
+            clock[0] += observe_latency  # the GET takes time
+            return lease_obj
+
+        async def write(self, body, *, create):  # pragma: no cover - not hit
+            return True
+
+        async def setup(self):
+            pass
+
+        async def close(self):
+            pass
+
+    b._transport = _FakeTransport()
+    await b._renew_once()
+
+    assert b._observed_at == NOW + datetime.timedelta(seconds=observe_latency)

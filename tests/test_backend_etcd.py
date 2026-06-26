@@ -7,6 +7,9 @@ exercised only by the Docker integration tests.
 import base64
 import datetime
 
+import aiohttp
+import pytest
+
 from yacron2.backends.etcd import (
     EtcdBackend,
     _b64,
@@ -289,3 +292,24 @@ def test_view_dict_and_lease_detail():
     assert view["lease"]["holder"] == "node-a"
     assert view["lease"]["leaseId"] == "777"
     assert view["lease"]["expiry"] is not None
+
+
+async def test_start_closes_session_when_authenticate_fails(monkeypatch):
+    # start() creates the aiohttp session before authenticating; a rejected
+    # credential / unreachable etcd must close it before re-raising, or one
+    # session+connector leaks per config reload (the manager is never stored,
+    # so the caller never stop()s it). A ClientResponseError (a 401) is also
+    # not an OSError, so it must still surface and be cleaned up.
+    b = _backend(
+        "    username: admin\n    password:\n      value: secret\n"
+    )
+
+    async def boom():
+        raise aiohttp.ClientResponseError(
+            request_info=None, history=(), status=401
+        )
+
+    monkeypatch.setattr(b, "_authenticate", boom)
+    with pytest.raises(aiohttp.ClientError):
+        await b.start()
+    assert b._session is None

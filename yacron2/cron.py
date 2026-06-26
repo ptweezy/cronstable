@@ -14,6 +14,7 @@ from functools import lru_cache
 from typing import Any, Awaitable, Deque, Dict, List, Optional, Union  # noqa
 from urllib.parse import urlparse
 
+import aiohttp
 from aiohttp import web
 from crontab import CronTab  # noqa
 
@@ -848,11 +849,22 @@ class Cron:
                 # "please report this as a bug" handler.
                 manager = make_backend(cluster_config, self.job_set_id)
                 await manager.start()
-            except (OSError, ssl.SSLError, ValueError, ConfigError) as ex:
+            except (
+                OSError,
+                ssl.SSLError,
+                ValueError,
+                ConfigError,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as ex:
                 # bad cert/credential files / bad listen address / port already
                 # in use / unreachable setup: log and keep running jobs rather
                 # than aborting the reload. (A backend cleans up its own
-                # half-started state on failure.)
+                # half-started state on failure.) aiohttp.ClientError /
+                # asyncio.TimeoutError cover a lease backend that cannot reach
+                # or authenticate to its store at start() -- an operational
+                # misconfiguration to log, not the generic "report a bug" path
+                # (a ClientResponseError on a rejected token is not OSError).
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
