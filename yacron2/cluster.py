@@ -1145,7 +1145,21 @@ class ClusterManager(LeadershipBackend):
         live check mirrors the gate :meth:`_handle_reboot_ran` puts on pushes.
         """
         my_id = self.get_job_set_id()
-        jobs = set(self._ran_reboot_jobs)
+        # Gate our OWN recorded runs on the live id too, not just peers'. They
+        # were recorded under _ran_jobs_job_set_id, which the periodic poll
+        # reconciles (and clears on change) only lazily. Between an in-place
+        # reload and the next poll the live id is already the new one while
+        # _ran_reboot_jobs still holds the old set, and /peer (_handle_peer
+        # never reconciles, unlike the push paths) would otherwise advertise
+        # that stale set under the *new* id -- a toxic pairing an agreed peer
+        # trusts, retiring its redefined @reboot one-shot without running it.
+        # (None means "no runs recorded yet": the set is empty, so it is the
+        # safe direction -- it only establishes the id, never clears.)
+        jobs = (
+            set(self._ran_reboot_jobs)
+            if self._ran_jobs_job_set_id in (None, my_id)
+            else set()
+        )
         for peer in self.view.peers.values():
             if (
                 peer.status == STATUS_AGREED

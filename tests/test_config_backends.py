@@ -141,6 +141,28 @@ def test_etcd_ttl_must_be_positive():
         _cluster(yaml)
 
 
+def test_etcd_ttl_floor_rejects_unleadable_small_ttl():
+    # A ttl below the floor passes the > 0 check but makes the leader deadline
+    # (ttl - 1s skew) collapse to <= the keepalive period, so a node that wins
+    # the campaign immediately treats its own lease as expired and is_leader()
+    # is permanently False -- at-most-once silently degrades to at-most-zero.
+    # ttl 1 and 2 must be rejected; 3 (the floor) must be accepted.
+    def _yaml(ttl):
+        return (
+            "cluster:\n"
+            "  backend: etcd\n"
+            "  etcd:\n"
+            "    endpoints:\n"
+            "      - http://127.0.0.1:2379\n"
+            "    ttl: {}\n".format(ttl)
+        )
+
+    for bad in (1, 2):
+        with pytest.raises(ConfigError, match="ttl must be >= 3"):
+            _cluster(_yaml(bad))
+    assert _cluster(_yaml(3))["etcd"]["ttl"] == 3
+
+
 def test_etcd_rejects_malformed_endpoint():
     # missing port, missing host, bad scheme, non-numeric port, out-of-range
     # port, and port 0 must all raise a clean ConfigError (never a raw

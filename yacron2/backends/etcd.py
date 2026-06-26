@@ -255,8 +255,20 @@ class EtcdBackend(LeaseBackend):
         self._ssl = self._build_ssl()
         timeout = aiohttp.ClientTimeout(total=self.connect_timeout)
         self._session = aiohttp.ClientSession(timeout=timeout)
-        if self.username:
-            self._auth_token = await self._authenticate()
+        try:
+            if self.username:
+                self._auth_token = await self._authenticate()
+        except BaseException:
+            # Honour the "a backend cleans up its own half-started state on
+            # failure" contract (as KubernetesBackend.start already does): an
+            # unreachable etcd or a rejected credential raises here; without
+            # this the open ClientSession/connector leaks -- one per reload --
+            # and is never closed (start() never returns, so the caller never
+            # stores the manager to stop() it). BaseException also covers a
+            # cancellation mid-handshake.
+            await self._session.close()
+            self._session = None
+            raise
         logger.info(
             "cluster: etcd backend, identity %r, election key %r, ttl %ds, "
             "endpoints %s",

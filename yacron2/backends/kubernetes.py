@@ -519,8 +519,15 @@ class KubernetesBackend(LeaseBackend):
 
     async def _renew_once(self) -> None:  # pragma: no cover - network
         assert self._transport is not None
-        now = _utcnow()
         lease_obj = await self._transport.observe()
+        # Capture the clock AFTER observe() returns, so the steal anchor (and
+        # the renewTime we write) reflect the instant we actually read the
+        # record -- client-go's observedTime = now() *after* the Get. Sampling
+        # `now` before the await would anchor whatever (possibly newer) record
+        # the GET returns to a time up to one observe-latency earlier (bounded
+        # by renewDeadline, not the 1s skew budget), shrinking the skew-immune
+        # steal window and risking two leaders at once on a slow apiserver.
+        now = _utcnow()
         observed_at = self._track_observation(
             parse_lease(lease_obj) if lease_obj is not None else None, now
         )

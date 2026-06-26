@@ -1155,6 +1155,29 @@ def test_advertised_ran_jobs_drops_stale_agreed_peer_on_reload(no_tls):
     assert "boot" not in mgr.advertised_ran_jobs()
 
 
+def test_advertised_ran_jobs_drops_own_stale_set_on_reload(no_tls):
+    # H3 (own-set half): the node's OWN recorded @reboot runs must also be
+    # gated on the live id, not only peers'. _handle_peer (the /peer responder)
+    # never reconciles, so between an in-place reload and the next poll the
+    # live id is already v2 while _ran_reboot_jobs/_ran_jobs_job_set_id lag at
+    # v1. Without gating the own set, /peer advertises {job_set_id: v2,
+    # ran_reboot_jobs: [boot]} -- a toxic pairing an agreed peer trusts,
+    # retiring its redefined @reboot one-shot without running it.
+    live = {"id": "v1:mine"}
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
+        lambda: live["id"],
+    )
+    # this node ran "boot" as owner, recorded under v1 (like mark_reboot_ran)
+    mgr._reconcile_job_set_id("v1:mine")
+    mgr._ran_reboot_jobs.add("boot")
+    assert "boot" in mgr.advertised_ran_jobs()  # fine while the id matches
+    # an in-place reload redefines the job set; the poll has not reconciled yet
+    live["id"] = "v2:new"
+    assert mgr.reboot_ran("boot") is False
+    assert "boot" not in mgr.advertised_ran_jobs()
+
+
 def test_manager_accessors_single_leader_quorate(no_tls):
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),

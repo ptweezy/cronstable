@@ -952,8 +952,21 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     }
     etcd["tls"] = {**DEFAULT_ETCD["tls"], **(raw_etcd.get("tls") or {})}
     cfg["etcd"] = etcd
-    if etcd["ttl"] <= 0:
-        raise ConfigError("cluster.etcd.ttl must be > 0")
+    # A winning node holds the election key only until (ttl - 1s clock-skew
+    # margin) and re-keepalives every max(1s, ttl/3); below 3s that leader
+    # window collapses to <= the keepalive period, so a node that wins the
+    # campaign immediately considers its own lease expired and NO Leader job
+    # ever runs cluster-wide -- a silent at-most-once -> at-most-zero.
+    # (kubernetes is protected by its duration>renew invariant; etcd is not,
+    # so floor ttl here.)
+    if etcd["ttl"] < 3:
+        raise ConfigError(
+            "cluster.etcd.ttl must be >= 3 seconds (the leader holds the "
+            "key only until ttl minus a 1s clock-skew margin and renews "
+            "every max(1s, ttl/3); a smaller ttl makes a node that wins "
+            "the election immediately treat its own lease as expired, so "
+            "no Leader job ever runs); got {}".format(etcd["ttl"])
+        )
     if not etcd["endpoints"]:
         raise ConfigError("cluster.etcd.endpoints must list at least one URL")
     for endpoint in etcd["endpoints"]:
