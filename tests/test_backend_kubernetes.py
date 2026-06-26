@@ -29,6 +29,7 @@ from yacron2.backends.kubernetes import (
     lease_is_expired,
     parse_lease,
     plan_lease_write,
+    resolve_namespace,
 )
 from yacron2.config import ConfigError, parse_config_string
 
@@ -336,6 +337,21 @@ def test_select_transport_library_requires_native():
     assert select_transport("library", True, "kubernetes") == TRANSPORT_LIBRARY
     with pytest.raises(ConfigError, match="not importable"):
         select_transport("library", False, "kubernetes")
+
+
+def test_resolve_namespace_precedence():
+    # H2 regression: both transports must converge on the SAME namespace, and
+    # it must never be None -- the in-cluster HTTP path used to leave it None
+    # while the native path fell back to "default", a cross-namespace
+    # split-brain. Explicit cluster.kubernetes.leaseNamespace wins over all.
+    assert resolve_namespace("explicit", "ctx", "incluster") == "explicit"
+    # then the kubeconfig context's namespace (kubeconfig path only)
+    assert resolve_namespace(None, "ctx", "incluster") == "ctx"
+    # then the in-cluster service-account namespace
+    assert resolve_namespace(None, None, "incluster") == "incluster"
+    # finally "default" -- crucially never None, even when the SA namespace
+    # file is absent/unreadable (the trigger for the HTTP/library divergence)
+    assert resolve_namespace(None, None, None) == "default"
 
 
 def test_is_leader_gated_on_local_expiry():

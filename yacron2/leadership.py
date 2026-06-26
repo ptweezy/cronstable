@@ -159,10 +159,20 @@ class LeadershipBackend(abc.ABC):
         """Leader for the ``PreferLeader`` policy, never returning ``None``.
 
         When the store is unreachable (not quorate) this node names *itself* --
-        the never-skip choice (it runs, and may double-run).  Otherwise it
-        defers to the observed leader (falling back to itself if unknown).
+        the never-skip choice (it runs, and may double-run).  When this node is
+        itself the holder it also names *itself*: a lease backend's
+        :meth:`leader_name` reports the holder's display *identity*
+        (``cluster.<backend>.identity``), which may legitimately differ from
+        ``node_name`` (e.g. a Kubernetes pod identity).  Comparing that
+        identity against ``node_name`` in :meth:`is_available_leader` would
+        otherwise make the holder fail to recognise itself -- so *every* node
+        defers and the ``PreferLeader`` job is silently skipped clusterwide.
+        Otherwise it defers to the observed leader (falling back to itself if
+        unknown).
         """
         if not self.is_quorate():
+            return self.node_name
+        if self.is_leader():
             return self.node_name
         return self.leader_name() or self.node_name
 
@@ -182,9 +192,15 @@ class LeadershipBackend(abc.ABC):
         """``available_leader_name`` for the per-job (spread) shape.
 
         Lease backends reject ``distribution: spread`` at config time, so this
-        simply mirrors the single-leader path.
+        simply mirrors the single-leader path -- including recognising this
+        node as the owner via :meth:`is_job_owner` (which for a single holder
+        collapses to :meth:`is_leader`), so an identity that differs from
+        ``node_name`` cannot make the owner skip its own job (see
+        :meth:`available_leader_name`).
         """
         if not self.is_quorate():
+            return self.node_name
+        if self.is_job_owner(job_name):
             return self.node_name
         return self.job_owner(job_name) or self.node_name
 

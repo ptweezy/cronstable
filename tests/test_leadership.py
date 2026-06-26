@@ -113,6 +113,66 @@ def test_available_job_owner_mirrors_leader_paths():
     assert unknown.available_job_owner("j") == "node-a"
 
 
+class _IdentityLease(LeadershipBackend):
+    """A lease-style backend whose ``leader_name`` is the holder's display
+    *identity* (which may differ from ``node_name``, as KubernetesBackend's
+    does), with an independent ``is_leader`` flag -- the H1 shape.
+    """
+
+    def __init__(self, *, quorate, is_leader, holder, node_name="node-a"):
+        self.config = {}  # type: ignore[assignment]
+        self.node_name = node_name
+        self.distribution = "single-leader"
+        self._quorate = quorate
+        self._is_leader = is_leader
+        self._holder = holder
+
+    async def start(self):  # pragma: no cover - not exercised
+        ...
+
+    async def stop(self):  # pragma: no cover - not exercised
+        ...
+
+    def is_leader(self):
+        return self._is_leader
+
+    def leader_name(self):
+        return self._holder if self._quorate else None
+
+    def is_quorate(self):
+        return self._quorate
+
+    def view_dict(self):  # pragma: no cover - not exercised
+        return {"backend": "idlease"}
+
+
+def test_never_skip_holder_runs_when_identity_differs_from_node_name():
+    # H1 regression: a lease backend reports the holder's display *identity*
+    # (cluster.kubernetes.identity), which may differ from node_name. The
+    # holder must still recognise itself and run PreferLeader, else every node
+    # defers and the job is silently skipped cluster-wide while quorate.
+    holder = _IdentityLease(
+        quorate=True, is_leader=True, holder="pod-xyz", node_name="node-a"
+    )
+    assert holder.is_available_leader() is True
+    assert holder.available_leader_name() == "node-a"
+    assert holder.is_available_job_owner("j") is True
+    assert holder.available_job_owner("j") == "node-a"
+    # a healthy follower (sees the holder identity, is not the holder) defers
+    follower = _IdentityLease(
+        quorate=True, is_leader=False, holder="pod-xyz", node_name="node-b"
+    )
+    assert follower.is_available_leader() is False
+    assert follower.available_leader_name() == "pod-xyz"
+    assert follower.is_available_job_owner("j") is False
+    # store unreachable -> run anyway, regardless of identity
+    isolated = _IdentityLease(
+        quorate=False, is_leader=False, holder=None, node_name="node-a"
+    )
+    assert isolated.is_available_leader() is True
+    assert isolated.available_leader_name() == "node-a"
+
+
 class _BareLease(LeaseBackend):
     """A LeaseBackend that does not override lease_detail (covers the base)."""
 

@@ -575,6 +575,26 @@ def _incluster_namespace() -> Optional[str]:  # pragma: no cover - file I/O
         return None
 
 
+def resolve_namespace(
+    configured: Optional[str],
+    context_namespace: Optional[str],
+    incluster_namespace: Optional[str],
+) -> str:
+    """Resolve the Lease namespace identically for both transports.
+
+    Precedence: an explicit ``cluster.kubernetes.leaseNamespace``, then the
+    kubeconfig context's namespace (the kubeconfig path only), then the
+    in-cluster service-account namespace, then ``"default"``.  Centralised, and
+    never ``None``, so the HTTP and native transports can never elect the Lease
+    in *different* namespaces -- a cross-namespace split-brain (two leaders).
+    The in-cluster HTTP path previously left the namespace ``None`` when the
+    service-account ``namespace`` file was unreadable (a custom projected-token
+    mount) while the native path fell back to ``"default"``: a mixed-transport
+    fleet then ran two leaders, one per namespace.
+    """
+    return configured or context_namespace or incluster_namespace or "default"
+
+
 class _K8sTransport:
     """The observe/write/close surface the renew loop drives a Lease over."""
 
@@ -648,8 +668,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
                 self._auth_token = token_file.read().strip()
             ca_path = os.path.join(_SA_DIR, "ca.crt")
             self._ssl = ssl.create_default_context(cafile=ca_path)
-            if self.b.namespace is None:
-                self.b.namespace = _incluster_namespace()
+            self.b.namespace = resolve_namespace(
+                self.b.namespace, None, _incluster_namespace()
+            )
         except OSError as ex:
             raise ConfigError(
                 "kubernetes backend: could not read in-cluster service "
@@ -676,8 +697,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         cluster = clusters[ctx["cluster"]]
         user = users.get(ctx["user"], {})
         self._base_url = cluster["server"].rstrip("/")
-        if self.b.namespace is None:
-            self.b.namespace = ctx.get("namespace") or "default"
+        self.b.namespace = resolve_namespace(
+            self.b.namespace, ctx.get("namespace"), None
+        )
 
         if cluster.get("insecure-skip-tls-verify"):
             self._ssl = ssl.create_default_context()
@@ -803,10 +825,9 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
             config_obj.host = self.b.api_server_override.rstrip("/")
         self._api_client = client.ApiClient(config_obj)
         self._api = client.CoordinationV1Api(self._api_client)
-        if self.b.namespace is None:
-            self.b.namespace = (
-                context_namespace or _incluster_namespace() or "default"
-            )
+        self.b.namespace = resolve_namespace(
+            self.b.namespace, context_namespace, _incluster_namespace()
+        )
 
     async def observe(self) -> Optional[Dict[str, Any]]:
         from kubernetes.client.exceptions import ApiException

@@ -1128,6 +1128,30 @@ def _seed_agree(mgr, host, name, instance=None, mutual=None):
     peer.mutual_agreeing = mutual
 
 
+def test_advertised_ran_jobs_drops_stale_agreed_peer_on_reload(no_tls):
+    # H3 regression: a peer's @reboot ran-set is trusted only while the peer's
+    # last-reported job_set_id still matches our LIVE id -- not merely on the
+    # cached STATUS_AGREED. After a local reload changes our id, a peer still
+    # cached AGREED under the OLD id (until its next poll) must no longer mask
+    # a redefined @reboot one-shot, else the deferred one-shot is silently
+    # skipped.
+    live = {"id": "v1:mine"}
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
+        lambda: live["id"],
+    )
+    _seed_agree(mgr, "b:1", "node-b")  # records peer.job_set_id = "v1:mine"
+    mgr.view.peers["b:1"].ran_reboot_jobs = {"boot"}
+    # same live id: the agreed peer's ran-set is trusted
+    assert mgr.reboot_ran("boot") is True
+    assert "boot" in mgr.advertised_ran_jobs()
+    # a local reload redefines the job set; the peer is still cached AGREED
+    # under the OLD id until its next poll re-derives status
+    live["id"] = "v2:new"
+    assert mgr.reboot_ran("boot") is False
+    assert "boot" not in mgr.advertised_ran_jobs()
+
+
 def test_manager_accessors_single_leader_quorate(no_tls):
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
