@@ -67,3 +67,16 @@ jobs:
       - run: pip install --upgrade pip
       - run: pip install tox
       - run: tox -e py
+      # Publish coverage to Codecov. Every matrix cell uploads its own
+      # coverage.xml; Codecov merges them by flag into one combined number, so
+      # POSIX-only paths (privilege drop, user/group) that Windows skips still
+      # count. fail_ci_if_error stays false so a Codecov outage never reds the
+      # build, and the experimental rows (continue-on-error) don't gate uploads.
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          flags: ${{ matrix.os }}-py${{ matrix.python }}
+          fail_ci_if_error: false
