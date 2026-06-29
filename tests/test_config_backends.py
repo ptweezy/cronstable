@@ -261,6 +261,68 @@ def test_etcd_rejects_url_embedded_credentials():
         _cluster(yaml)
 
 
+def test_etcd_credentialed_bad_port_does_not_leak_password():
+    # M6: an endpoint with BOTH embedded credentials AND a bad port must be
+    # rejected with the password REDACTED. It previously short-circuited into
+    # the scheme/port branch, which printed the raw endpoint (cleartext
+    # password) into the ConfigError that reaches stderr/logs/CI.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://user:s3cretpw@etcd:70000\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        _cluster(yaml)
+    assert "s3cretpw" not in str(exc.value)
+    assert "***" in str(exc.value)
+
+
+def test_kubernetes_rejects_stray_etcd_store_block():
+    # M5: an etcd: store block under backend: kubernetes is silently ignored by
+    # the k8s builder, discarding the operator's intended endpoints/TLS/creds
+    # and arbitrating leadership against the default store. Reject it loudly.
+    yaml = (
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://etcd:2379\n"
+    )
+    with pytest.raises(ConfigError, match="cluster.etcd is configured"):
+        _cluster(yaml)
+
+
+def test_etcd_rejects_stray_kubernetes_store_block():
+    # M5: the symmetric case -- a kubernetes: block under backend: etcd.
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - https://etcd:2379\n"
+        "  kubernetes:\n"
+        "    leaseName: yacron2-leader\n"
+    )
+    with pytest.raises(ConfigError, match="cluster.kubernetes is configured"):
+        _cluster(yaml)
+
+
+def test_kubernetes_rejects_lease_name_with_path_chars():
+    # L2: leaseName is spliced into the apiserver URL path; a '/' (or other
+    # path metacharacter) would retarget the request to a different resource.
+    # Reject non-RFC1123 names at config load, not silently at runtime.
+    yaml = (
+        "cluster:\n"
+        "  backend: kubernetes\n"
+        "  kubernetes:\n"
+        "    leaseName: team/leader\n"
+    )
+    with pytest.raises(ConfigError, match="leaseName"):
+        _cluster(yaml)
+
+
 def test_etcd_password_from_value():
     yaml = _ETCD_TLS + (
         "    username: root\n"

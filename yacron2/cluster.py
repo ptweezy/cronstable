@@ -174,15 +174,37 @@ _STALE_STATUSES = frozenset(
 MAX_PEER_RESPONSE_BYTES = 256 * 1024
 _READ_CHUNK = 8192
 
+# Per-field bounds on a CA-vouched-but-untrusted peer's /peer payload. The byte
+# cap above bounds a single response, but the @reboot-ran set is PERSISTENT and
+# re-advertised (advertised_ran_jobs), so without a per-set bound a peer could
+# push names that accumulate and re-broadcast until OUR /peer response exceeds
+# the byte cap -- which honest peers then reject as oversized, dropping us from
+# their quorum (a cluster-wide availability DoS). These cap the cardinality and
+# per-string length of the absorbed/re-emitted sets so a node never emits a
+# response that overflows the cap, and reject over-long / control-character
+# scalar identity fields (which would otherwise be reflected verbatim into the
+# /cluster JSON and logs).
+MAX_PEER_FIELD_LEN = 256  # node_name, job_set_id, instance_id, ...
+MAX_MEMBER_ENTRIES = 4096  # members[] / mutual_agreeing[] cardinality
+MAX_REBOOT_JOB_NAME_LEN = 128  # a single @reboot job name
+MAX_ADVERTISED_REBOOT_JOBS = 512  # ran-set cardinality stored + re-advertised
 
-def _parse_members(raw: Any) -> List["tuple[str, str, bool]"]:
+
+def _parse_members(
+    raw: Any,
+    *,
+    max_len: Optional[int] = None,
+    max_items: Optional[int] = None,
+) -> List["tuple[str, str, bool]"]:
     """Validate a peer's reported ``members`` list, dropping malformed entries.
 
     A peer is CA-vouched but otherwise untrusted input, so anything that is not
     a list of ``{node_name: str, instance_id: str, agreed: bool}`` objects is
     ignored: a malformed or hostile payload degrades to "no mutual/transitive
     information" rather than poisoning the election (see the type checks in
-    :meth:`ClusterManager._poll_peer`).
+    :meth:`ClusterManager._poll_peer`). ``max_len`` drops entries whose
+    name/instance exceeds it, and ``max_items`` caps the list length, so a
+    hostile peer cannot force unbounded conflict-detection work.
     """
     members: List["tuple[str, str, bool]"] = []
     if not isinstance(raw, list):
@@ -198,11 +220,22 @@ def _parse_members(raw: Any) -> List["tuple[str, str, bool]"]:
             and isinstance(instance, str)
             and isinstance(agreed, bool)
         ):
+            if max_len is not None and (
+                len(name) > max_len or len(instance) > max_len
+            ):
+                continue
             members.append((name, instance, agreed))
+            if max_items is not None and len(members) >= max_items:
+                break
     return members
 
 
-def _parse_str_list(raw: Any) -> "set[str]":
+def _parse_str_list(
+    raw: Any,
+    *,
+    max_len: Optional[int] = None,
+    max_items: Optional[int] = None,
+) -> "set[str]":
     """Validate an untrusted JSON value as a set of strings, dropping the rest.
 
     Used for the gossiped ``ran_reboot_jobs`` set and the ``mutual_agreeing``
@@ -210,11 +243,22 @@ def _parse_str_list(raw: Any) -> "set[str]":
     :meth:`ClusterManager._bridge_candidates`); like _parse_members, hostile or
     malformed input degrades to an empty set rather than raising, and a peer
     that omits the field (an older build) parses to an empty set -- the safe
-    direction (it simply contributes no evidence).
+    direction (it simply contributes no evidence). ``max_len`` drops over-long
+    strings and ``max_items`` caps the set size, bounding what a CA-vouched
+    peer can make us store and re-broadcast.
     """
     if not isinstance(raw, list):
         return set()
-    return {item for item in raw if isinstance(item, str)}
+    out: "set[str]" = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        if max_len is not None and len(item) > max_len:
+            continue
+        out.add(item)
+        if max_items is not None and len(out) >= max_items:
+            break
+    return out
 
 
 def _peer_sees_me_agreed(
@@ -794,7 +838,12 @@ class ClusterManager(LeadershipBackend):
                 # @reboot one-shots already run in the cluster (ours + learned
                 # from agreed peers), so a poller can retire its matching
                 # deferred job without re-running it; see advertised_ran_jobs.
-                "ran_reboot_jobs": sorted(self.advertised_ran_jobs()),
+                # Capped so this response can never exceed MAX_PEER_RESPONSE_
+                # BYTES even if an upstream peer's set was inflated (the
+                # membership test reboot_ran() still uses the full union).
+                "ran_reboot_jobs": sorted(self.advertised_ran_jobs())[
+                    :MAX_ADVERTISED_REBOOT_JOBS
+                ],
                 # the peers we *mutually* agree with: a poller uses this as the
                 # sound evidence that a node it reaches only transitively is
                 # itself quorate (a witnessed two-way edge), driving the
@@ -851,7 +900,19 @@ class ClusterManager(LeadershipBackend):
             # poll.  Reconciling first records them under the live id so they
             # survive (and clears a stale set rather than carry it across).
             self._reconcile_job_set_id(self.get_job_set_id())
-            self._ran_reboot_jobs |= _parse_str_list(data.get("names"))
+            self._ran_reboot_jobs |= _parse_str_list(
+                data.get("names"),
+                max_len=MAX_REBOOT_JOB_NAME_LEN,
+                max_items=MAX_ADVERTISED_REBOOT_JOBS,
+            )
+            # Bound the PERSISTENT set so a peer cannot grow it (and the /peer
+            # response that re-advertises it) past the byte cap and collapse
+            # quorum cluster-wide. Dropping excess marks only risks rerunning a
+            # one-shot (the documented PreferLeader envelope), never an outage.
+            if len(self._ran_reboot_jobs) > MAX_ADVERTISED_REBOOT_JOBS:
+                self._ran_reboot_jobs = set(
+                    sorted(self._ran_reboot_jobs)[:MAX_ADVERTISED_REBOOT_JOBS]
+                )
         return web.Response(status=204)
 
     async def start(self) -> None:
@@ -1171,6 +1232,25 @@ class ClusterManager(LeadershipBackend):
                     untrusted=False,
                 )
                 return
+            # Bound the length and reject control characters: these strings are
+            # stored in PeerState and reflected verbatim into the authenticated
+            # GET /cluster JSON and into log lines, so an over-long or
+            # newline-bearing value from a CA-vouched-but-hostile peer is a
+            # payload-bloat / log-injection vector. Legitimate identities
+            # (hostnames, hashes, uuids, "single-leader"/"spread", "v1") are
+            # short and printable, so this rejects nothing real.
+            if value is not None and (
+                len(value) > MAX_PEER_FIELD_LEN or not value.isprintable()
+            ):
+                self.view.record_failure(
+                    host,
+                    "malformed /peer response: {!r} is over {} chars or "
+                    "contains control characters".format(
+                        key, MAX_PEER_FIELD_LEN
+                    ),
+                    untrusted=False,
+                )
+                return
             fields[key] = value
         # cluster_size is an int, validated separately (bool is an int
         # subclass, so reject it explicitly). A peer too old to report it sends
@@ -1214,8 +1294,16 @@ class ClusterManager(LeadershipBackend):
             self.node_name,
             peer_instance=fields["instance_id"],
             my_instance=self.instance_id,
-            peer_members=_parse_members(data.get("members")),
-            peer_ran_reboot_jobs=_parse_str_list(data.get("ran_reboot_jobs")),
+            peer_members=_parse_members(
+                data.get("members"),
+                max_len=MAX_PEER_FIELD_LEN,
+                max_items=MAX_MEMBER_ENTRIES,
+            ),
+            peer_ran_reboot_jobs=_parse_str_list(
+                data.get("ran_reboot_jobs"),
+                max_len=MAX_REBOOT_JOB_NAME_LEN,
+                max_items=MAX_ADVERTISED_REBOOT_JOBS,
+            ),
             peer_size=size,
             peer_distribution=fields["distribution"],
             peer_elect_leader=elect,
@@ -1223,7 +1311,11 @@ class ClusterManager(LeadershipBackend):
             # set, both parse to an empty set here: either way it is not
             # confirmed quorate, so _eligible_candidates won't elect it. (The
             # PeerState default None -- never polled -- is treated the same.)
-            peer_mutual_agreeing=_parse_str_list(data.get("mutual_agreeing")),
+            peer_mutual_agreeing=_parse_str_list(
+                data.get("mutual_agreeing"),
+                max_len=MAX_PEER_FIELD_LEN,
+                max_items=MAX_MEMBER_ENTRIES,
+            ),
         )
 
     # --- deferred @reboot "already ran" gossip ---------------------------
@@ -1295,7 +1387,9 @@ class ClusterManager(LeadershipBackend):
 
     async def _push_reboot_ran(self) -> None:
         peers = self.config["peers"]
-        names = sorted(self.advertised_ran_jobs())
+        # capped like the /peer serialization so a push body cannot exceed the
+        # receiver's MAX_PEER_RESPONSE_BYTES (else rejected as oversized).
+        names = sorted(self.advertised_ran_jobs())[:MAX_ADVERTISED_REBOOT_JOBS]
         session = self._session
         if not peers or not names or session is None:
             return
@@ -1633,7 +1727,18 @@ class ClusterManager(LeadershipBackend):
         )
         first_party[self.node_name][self.instance_id].add("self")
         for peer in self.view.peers.values():
-            if peer.status in _STALE_STATUSES:
+            # Skip STALE peers (no fresh identity this round) AND STATUS_SELF:
+            # a SELF peer is THIS node answering its own listed address, so it
+            # is not independent evidence. record_success classifies a
+            # self-listing that reports no instance_id (an older same-named
+            # build, or a round-robined endpoint during a rolling upgrade) as
+            # the *benign* STATUS_SELF case, but if processed here the block
+            # below would synthesise a second "host:"+host instance key for our
+            # OWN nodeName (peer.instance_id is None) on top of the self seed
+            # above, fabricating a phantom duplicate-nodeName conflict that
+            # fails every Leader job closed cluster-wide. Excluding SELF
+            # mirrors how _agreeing_peers / cluster_size already treat it.
+            if peer.status in _STALE_STATUSES or peer.status == STATUS_SELF:
                 continue
             if peer.node_name is not None:
                 # our own DIRECT observation of this peer's identity (the peer

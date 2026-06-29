@@ -1583,6 +1583,28 @@ def test_manager_self_listing_is_not_conflict(no_tls):
     assert mgr.has_conflict() is False
 
 
+def test_self_listing_without_instance_id_is_not_conflict(no_tls):
+    # H2: a SELF peer reporting OUR name but NO instance_id (an older
+    # same-named build, or a round-robined endpoint briefly hitting a
+    # pre-instance-id replica during a rolling upgrade) is the benign self case
+    # record_success classifies as STATUS_SELF. conflict_names() must EXCLUDE
+    # STATUS_SELF peers: otherwise it synthesised a second "host:"+host
+    # instance key for our own nodeName (since instance_id is None) on top of
+    # the self seed, fabricating a phantom duplicate-nodeName conflict that
+    # would fail every
+    # Leader job closed cluster-wide for the whole upgrade window.
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "self:1"], "node-a")
+    cfg["electLeader"] = True
+    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    _seed_agree(mgr, "b:1", "node-b")
+    selfp = mgr.view.peers["self:1"]
+    selfp.status = STATUS_SELF
+    selfp.node_name = "node-a"
+    selfp.instance_id = None  # the pre-instance-id benign self case
+    assert mgr.conflict_names() == []
+    assert mgr.has_conflict() is False
+
+
 def test_view_dict_reports_conflict(no_tls):
     cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
     cfg["electLeader"] = True

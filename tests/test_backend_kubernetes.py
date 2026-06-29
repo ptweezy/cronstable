@@ -627,6 +627,18 @@ def test_http_transport_static_token_and_no_token(tmp_path):
 # covered by (absent) Docker integration tests.
 
 
+class _StoreNotFound(Exception):
+    """The fake apiserver's 404 on a replace of a deleted Lease.
+
+    Both production transports call ``resp.raise_for_status()`` on a 404, so a
+    PUT against a Lease deleted between observe and write RAISES (the round
+    fails and ``_last_contact_mono`` is left unadvanced -> the holder soon
+    goes non-quorate -> never-skip PreferLeader double-runs). Only a *409* is
+    the soft "lost the resourceVersion race" that returns False. Modelling the
+    404 as a raise (not False) keeps the fence test honest about that path.
+    """
+
+
 class _FakeApiStore:
     def __init__(self):
         self.obj = None
@@ -646,7 +658,12 @@ class _FakeApiStore:
 
     def replace(self, body):
         if self.obj is None:
-            return False  # 404: nothing to replace
+            # 404: the object was deleted between observe and write. The real
+            # transports raise_for_status() here (only a 409 is the soft lost
+            # race), so RAISE rather than returning False -- returning False
+            # would model a deleted-during-renew Lease as a clean self-demote
+            # that KEEPS quorum, hiding the split-brain-relevant path.
+            raise _StoreNotFound()
         rv = (body.get("metadata") or {}).get("resourceVersion")
         if rv != self.obj["metadata"]["resourceVersion"]:
             return False  # 409 conflict -- the fence
@@ -721,6 +738,43 @@ async def test_renew_loses_resourceversion_race_not_leader():
     assert ok is False  # fenced by resourceVersion
     a._apply_round(ACTION_RENEW, ok, state, NOW)
     assert a.is_leader() is False
+
+
+def test_wait_with_deleted_lease_reports_remembered_holder_not_none():
+    # M1: on the deleted-lease WAIT path (state is None because the Lease
+    # object was deleted, but decide_lease_action returned WAIT to keep
+    # deferring to a holder we recently saw whose fence has not expired),
+    # _apply_round must report the REMEMBERED holder, not None. Reporting None
+    # makes leader_name() None, which is_available_leader() reads as "holder
+    # unknown -> run anyway" -- so a quorate follower would run PreferLeader
+    # alongside the still-fenced prior holder, a double-run with NO partition.
+    b = _backend()
+    b._observed_holder = "node-b#held"  # the holder we last observed
+    b._apply_round(ACTION_WAIT, False, None, NOW)  # state None: lease deleted
+    assert b.is_quorate() is True  # we did reach the apiserver this round
+    assert b.is_leader() is False
+    assert b.leader_name() is not None  # remembered holder, NOT None
+    assert b.is_available_leader() is False  # so a follower defers (no run)
+
+
+async def test_replace_against_deleted_lease_raises_not_silent_false():
+    # M9: a replace (RENEW/ACQUIRE PUT) against a Lease deleted between observe
+    # and write must RAISE the apiserver 404, NOT return False. Both real
+    # transports raise_for_status() on a 404 and treat only a 409 as the soft
+    # lost race; returning False here would model a deleted-during-renew Lease
+    # as a clean self-demote that keeps quorum, hiding the path that actually
+    # produces a stale (-> non-quorate -> PreferLeader never-skip) holder.
+    store = _FakeApiStore()
+    a = _store_backend(store, "node-a#1")
+    await a._renew_once()  # create + hold the lease
+    observed = store.get()  # a valid lease object (holder == a.identity)
+    store.obj = None  # deleted out from under us, after we observed it
+    _, body, _ = plan_lease_write(
+        observed, a.lease_name, a.namespace, a.identity, NOW, a.lease_duration,
+        None,
+    )
+    with pytest.raises(_StoreNotFound):
+        await a._transport.write(body, create=False)
 
 
 async def test_deleted_lease_not_recreated_under_live_holder(monkeypatch):

@@ -24,6 +24,11 @@ Files
 Try it
 ------
 
+  # SECURITY NOTE: this demo etcd has no authentication and speaks plaintext
+  # HTTP, so its client port is NOT published to the host; the nodes reach it
+  # only over the compose network (etcd:2379). Never expose an unauthenticated
+  # etcd beyond localhost; for real use enable auth + TLS (see below).
+
   docker compose -f docker-compose.yml up --build
 
   # exactly one instance is the leader; watch the cluster panel:

@@ -45,7 +45,20 @@ EOF
     -out "$CERTS/$n.pem" -days 3650 -extfile "/tmp/$n.ext"
 done
 
-# yacron2 runs as uid 65534 (nobody) and must read these. World-readable is fine
-# for this throwaway demo CA.
-chmod 0644 "$CERTS"/*.pem "$CERTS"/*.key
+# Lock down permissions. yacron2 runs as uid 65534 (nobody) and must read its
+# own leaf key, so hand the private keys to that uid and keep them owner-only
+# (0600) instead of world-readable.
+#
+# The CA SIGNING key (ca.key) is the sensitive one: whoever can read it can mint
+# a cert for ANY node/SAN and impersonate a peer, defeating mTLS, far worse
+# than a leaked public cert. Public material (ca.pem, node *.pem) is meant to be
+# shared and stays 0644.
+#
+# DEMO-ONLY CAVEAT: ca.key lives in this shared volume only because the demo
+# mints certs in place. In production never ship/mount the CA signing key to the
+# nodes; they need only their own leaf key+cert and the CA *public* cert
+# (ca.pem) to verify peers; ca.key belongs only on the (offline) signer.
+chmod 0644 "$CERTS"/*.pem
+chown 65534:65534 "$CERTS"/*.key
+chmod 0600 "$CERTS"/*.key
 echo "done. generated certs for: $NODES"

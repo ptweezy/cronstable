@@ -79,6 +79,13 @@ x-yacron-node: &yacron-node
 services:
   # One-shot: generate the cluster CA + per-node certs into the shared volume,
   # then exit. The nodes wait for this to finish successfully.
+  #
+  # The nodes mount this same `cluster-certs` volume read-only, so the CA signing
+  # key (ca.key) that certgen leaves here is technically visible to them. That is
+  # a demo-only shortcut (certs are minted in place). gen-certs.sh restricts the
+  # private keys to owner-read for the runtime uid; in production keep ca.key off
+  # the nodes entirely; they need only their leaf key+cert and the CA public
+  # cert (ca.pem) to verify peers.
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]

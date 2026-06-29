@@ -26,7 +26,6 @@ network call, and ``is_quorate`` reflects a fresh successful call (stale ->
 import asyncio
 import base64
 import datetime
-import json
 import logging
 import ssl
 import time
@@ -50,11 +49,25 @@ _SKEW_SECONDS = _CLOCK_SKEW.total_seconds()
 # Worst-case number of sequential HTTP POSTs a single renew *cycle* can make,
 # each of which may waste a full per-request timeout on a half-open endpoint
 # before failing over: keepalive (or grant), campaign, then the reboot-ran
-# range + put, plus the re-grant a lease-expiry round adds. The per-request
+# range + CAS txn, plus the re-grant a lease-expiry round adds. The per-request
 # timeout is sized off this (see EtcdBackend.request_timeout) so the whole
 # cycle -- and so the gap between two successful contacts -- stays inside the
 # lease window even when one endpoint is slow.
 _ETCD_POSTS_PER_CYCLE = 5
+
+# Bounded retries for the @reboot-ran compare-and-swap (see
+# _cas_write_reboot_ran): a contended key is re-read and re-merged so two
+# concurrent writers UNION their marks instead of last-writer-wins clobbering.
+_REBOOT_RAN_CAS_ATTEMPTS = 3
+
+# Reported as the holder when we lost a campaign (so a real holder exists) but
+# its identity could not be parsed from the txn response -- only reachable via
+# a non-conformant gateway that drops the failure-branch range value. Reporting
+# a non-None holder keeps leader_name() non-None so a quorate follower defers
+# its PreferLeader jobs (is_available_leader stays False) instead of reading
+# "holder unknown" as "run anyway" and double-running fleet-wide. See
+# _apply_round.
+_UNKNOWN_HOLDER = "<unknown holder>"
 
 
 def _utcnow() -> datetime.datetime:
@@ -113,6 +126,35 @@ def build_campaign_txn(
             }
         ],
         "failure": [{"requestRange": {"key": encoded}}],
+    }
+
+
+def build_reboot_ran_cas_txn(
+    key: str, value: str, mod_revision: str
+) -> Dict[str, Any]:
+    """A compare-and-swap ``put`` on the @reboot-ran key.
+
+    Puts ``value`` only if the key's ``MOD`` revision still equals the one we
+    read this round (``mod_revision``; ``"0"`` matches an absent key, as in
+    :func:`build_campaign_txn`).  If another node wrote the key in between the
+    compare fails and the caller re-reads + re-merges + retries, so two
+    concurrent writers UNION their @reboot-ran marks rather than the later
+    blind ``put`` silently dropping the earlier writer's mark (a lost update).
+    """
+    encoded = _b64(key)
+    return {
+        "compare": [
+            {
+                "key": encoded,
+                "result": "EQUAL",
+                "target": "MOD",
+                "mod_revision": str(mod_revision),
+            }
+        ],
+        "success": [
+            {"requestPut": {"key": encoded, "value": _b64(value)}}
+        ],
+        "failure": [],
     }
 
 
@@ -282,9 +324,10 @@ class EtcdBackend(LeaseBackend):
         contacts always stays within the lease window, so a slow round cannot
         make the holder lapse out of its own lease -- the at-most-once ->
         at-most-zero collapse the Kubernetes ``renew + retry < duration``
-        invariant guards against.  Unlike Kubernetes this needs no config
-        validation: it is derived from the (floored, >= 3s) ttl, so no config
-        can violate it.
+        invariant guards against.  Derived from the (floored, >= 3s) effective
+        ttl, and :attr:`request_timeout` is in turn derived from *this* (no
+        absolute floor), so the per-cycle POST budget always fits regardless of
+        ttl -- including a server-granted ttl below the configured value.
         """
         return max(
             1.0, self._effective_ttl - self.renew_period - _SKEW_SECONDS
@@ -299,15 +342,21 @@ class EtcdBackend(LeaseBackend):
         attempt before failing over to a healthy peer.  Previously each POST
         was bounded only by the much larger ``connectTimeout``, so on the
         default ttl a single slow-but-quorate endpoint made every round overrun
-        the lease window and the leader self-demote every cycle.  Capped at
-        ``connectTimeout`` so an explicitly lower value still applies.
+        the lease window and the leader self-demote every cycle.
+
+        It is exactly ``round_deadline / _ETCD_POSTS_PER_CYCLE`` (capped at
+        ``connectTimeout`` so an explicitly lower value still applies), with NO
+        absolute floor: an earlier ``max(0.5, ...)`` floor broke the invariant
+        at the minimum ttl (and whenever etcd grants a ttl smaller than
+        configured), letting 5 sequential 0.5s POSTs overrun a ~1s round
+        deadline and self-demote a healthy leader each cycle. Without the floor
+        the budget always holds (5 x request_timeout == round_deadline), at the
+        cost of a tighter per-POST timeout at very small ttl -- which is the
+        operator's explicit aggressive choice.
         """
-        return max(
-            0.5,
-            min(
-                float(self.connect_timeout),
-                self.round_deadline / _ETCD_POSTS_PER_CYCLE,
-            ),
+        return min(
+            float(self.connect_timeout),
+            self.round_deadline / _ETCD_POSTS_PER_CYCLE,
         )
 
     # --- pure local-state reads (no I/O) ---------------------------------
@@ -378,6 +427,18 @@ class EtcdBackend(LeaseBackend):
         if mono is None:
             mono = _monotonic()
         self._last_contact_mono = mono
+        if holder is None and not is_leader:
+            # We lost the campaign (a holder exists, bound to another node's
+            # lease) but its identity was unparseable -- only reachable via a
+            # non-conformant gateway that dropped the failure-branch range
+            # value. Reporting holder=None would make leader_name() None, which
+            # is_available_leader() reads as "holder unknown -> run anyway",
+            # double-running each quorate replica's PreferLeader jobs alongside
+            # the real holder. Fence closed instead: keep the last known holder
+            # (or a sentinel) so leader_name() stays non-None and followers
+            # defer. (A genuinely absent key makes the campaign SUCCEED, so
+            # is_leader is True there and this branch is not taken.)
+            holder = self._holder or _UNKNOWN_HOLDER
         self._holder = holder
         self._is_leader = is_leader
         if self._is_leader:
@@ -521,20 +582,23 @@ class EtcdBackend(LeaseBackend):
                     resp.raise_for_status()
                     data: Dict[str, Any] = await resp.json()
                     return data
-            # json.JSONDecodeError (a ValueError) is raised by resp.json() when
-            # the body has a json-ish content-type but an invalid/truncated
-            # body -- a misbehaving proxy/gateway in front of etcd. Treat it as
-            # a failed endpoint like any transport error so it (a) tries the
-            # next endpoint, (b) surfaces as a normal "etcd round failed"
-            # rather than escaping the renew loop's network-error tuple and
-            # either killing the scheduler (the eager reboot-ran persist path
-            # runs outside the run-loop guard) or being mislogged as an
-            # unexpected internal bug.
+            # A bad body from a misbehaving proxy/gateway in front of etcd
+            # makes resp.json() raise a ValueError: json.JSONDecodeError on
+            # invalid/truncated JSON, but ALSO UnicodeDecodeError when the body
+            # declares a charset its bytes are not valid for (aiohttp decodes
+            # before parsing). Both subclass ValueError, so catch ValueError to
+            # cover the whole family (and the binascii.Error a base64 decode of
+            # a malformed value can raise downstream). Treat it as a failed
+            # endpoint like any transport error so it (a) tries the next
+            # endpoint, (b) shows as a normal "etcd round failed" rather than
+            # escaping the renew loop's network-error tuple and either killing
+            # the scheduler (the eager reboot-ran persist path runs outside the
+            # run-loop guard) or being mislogged as an unexpected internal bug.
             except (
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
                 OSError,
-                json.JSONDecodeError,
+                ValueError,
             ) as ex:
                 last_error = ex
                 continue
@@ -654,7 +718,10 @@ class EtcdBackend(LeaseBackend):
 
         Wrapped so an auxiliary read/write failure never fails the leadership
         round (the local set still prevents this node re-running its own one-
-        shot); the next round retries.
+        shot); the next round retries. ValueError is caught too so a malformed
+        stored value (a non-UTF-8 / bad-base64 body from a misbehaving gateway)
+        cannot escape -- this path is reached from start()'s initial round,
+        which catches only the network tuple.
         """
         try:
             # drop our own marks first if the job set changed, so a redefined
@@ -662,41 +729,77 @@ class EtcdBackend(LeaseBackend):
             # re-published under the new job-set id (see
             # LeaseBackend._reconcile_local_reboot_ran).
             self._reconcile_local_reboot_ran()
+            await self._cas_write_reboot_ran()
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+            ValueError,
+        ) as ex:
+            logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
+
+    async def _cas_write_reboot_ran(self) -> None:  # pragma: no cover
+        """Read-modify-write the @reboot-ran key with optimistic concurrency.
+
+        Reads the sibling key (and its ``mod_revision``), folds the stored set
+        into our cache, then writes the union back in a txn guarded on that
+        revision (see :func:`build_reboot_ran_cas_txn`). If a concurrent writer
+        moved the key the compare fails, so we re-read, re-merge and retry --
+        UNIONing both writers' marks instead of the blind ``put`` silently
+        dropping the earlier one's (the lost update a plain put allowed). The
+        write is skipped entirely when the store already holds everything we
+        would write. Bounded retries; on persistent contention the local set
+        still stops this node re-running its own one-shot and the next round
+        retries.
+        """
+        for _attempt in range(_REBOOT_RAN_CAS_ATTEMPTS):
             resp = await self._post(
                 "/v3/kv/range", {"key": _b64(self.reboot_ran_key)}
             )
             kvs = resp.get("kvs") or []
-            raw = (
-                _b64decode(kvs[0]["value"])
-                if kvs and kvs[0].get("value") is not None
-                else None
-            )
+            if kvs and kvs[0].get("value") is not None:
+                raw: Optional[str] = _b64decode(kvs[0]["value"])
+                mod_revision = str(kvs[0].get("mod_revision") or "0")
+            else:
+                raw = None
+                mod_revision = "0"  # absent key: compare MOD == 0 succeeds
             stored_jsid, stored_jobs = decode_reboot_ran(raw)
             self._observe_reboot_ran(stored_jsid, stored_jobs)
-            # re-persist any local marks the store has not yet recorded (a
-            # failed eager _persist_reboot_ran is retried here).
-            if self._reboot_ran_local - self._reboot_ran:
-                await self._write_reboot_ran()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
-            logger.debug("cluster: etcd reboot-ran sync failed: %s", ex)
-
-    async def _write_reboot_ran(self) -> None:  # pragma: no cover - network
-        combined = self._reboot_ran | self._reboot_ran_local
-        value = encode_reboot_ran(self.get_job_set_id(), combined)
-        await asyncio.wait_for(
-            self._post(
-                "/v3/kv/put",
-                {"key": _b64(self.reboot_ran_key), "value": _b64(value)},
-            ),
-            self.connect_timeout,
+            combined = self._reboot_ran | self._reboot_ran_local
+            if not (combined - self._reboot_ran):
+                # the store already holds every mark we would write (after
+                # folding in what we just read): nothing to persist.
+                return
+            value = encode_reboot_ran(self.get_job_set_id(), combined)
+            result = await asyncio.wait_for(
+                self._post(
+                    "/v3/kv/txn",
+                    build_reboot_ran_cas_txn(
+                        self.reboot_ran_key, value, mod_revision
+                    ),
+                ),
+                self.connect_timeout,
+            )
+            if result.get("succeeded"):
+                return
+            # lost the CAS race: another moved the key between our read and
+            # write. Loop to re-read, re-merge, and retry so we union.
+        logger.debug(
+            "cluster: etcd reboot-ran CAS contended out after %d attempts",
+            _REBOOT_RAN_CAS_ATTEMPTS,
         )
 
     async def _persist_reboot_ran(self) -> None:  # pragma: no cover - network
         # eager write on mark_reboot_ran (before the deferred job launches);
         # best-effort -- _sync_reboot_ran retries it each round if it fails.
         try:
-            await self._write_reboot_ran()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            await self._cas_write_reboot_ran()
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+            ValueError,
+        ) as ex:
             logger.debug("cluster: etcd reboot-ran persist failed: %s", ex)
 
     async def stop(self) -> None:  # pragma: no cover - network
