@@ -14,7 +14,7 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A modern, container-friendly cron replacement.
+A modern, distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
