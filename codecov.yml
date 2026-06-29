@@ -1,0 +1,23 @@
+# Coverage is already hard-gated in CI by tox's --cov-fail-under (see tox.ini).
+# Codecov here exists only to publish the merged number for the README badge and
+# PR context, so its own status checks are informational: they annotate PRs but
+# never block them, leaving the tox gate as the single source of pass/fail.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+
+# Each matrix cell uploads under its own flag (os-pyVERSION). carryforward keeps
+# a flag's last result when a given cell doesn't upload on some run, so the
+# combined coverage stays stable instead of dropping when a row is skipped.
+flag_management:
+  default_rules:
+    carryforward: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  require_changes: true
