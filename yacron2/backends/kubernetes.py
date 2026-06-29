@@ -605,9 +605,7 @@ class KubernetesBackend(LeaseBackend):
         # one-time import that must not block the run loop start_stop_cluster
         # awaits us from; probe it in a worker thread.
         native = await asyncio.to_thread(self._native_available)
-        kind = select_transport(
-            self.client_library, native, "kubernetes"
-        )
+        kind = select_transport(self.client_library, native, "kubernetes")
         self._transport = (
             _K8sLibraryTransport(self)
             if kind == TRANSPORT_LIBRARY

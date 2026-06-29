@@ -408,9 +408,7 @@ class EtcdBackend(LeaseBackend):
             # round is swallowed (the loop retries), leaving the not-quorate
             # state -- the genuine "store unreachable" case.
             try:
-                await asyncio.wait_for(
-                    self._renew_once(), self.round_deadline
-                )
+                await asyncio.wait_for(self._renew_once(), self.round_deadline)
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
                 logger.warning("cluster: etcd initial round failed: %s", ex)
             logger.info(
@@ -585,9 +583,7 @@ class EtcdBackend(LeaseBackend):
                 # successful contacts inside the lease window, so a slow/half-
                 # open-but-quorate endpoint cannot make the holder self-demote
                 # every cycle (Leader to at-most-zero, PreferLeader doubles).
-                await asyncio.wait_for(
-                    self._renew_once(), self.round_deadline
-                )
+                await asyncio.wait_for(self._renew_once(), self.round_deadline)
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
