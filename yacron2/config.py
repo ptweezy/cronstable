@@ -2,6 +2,7 @@ import copy
 import datetime
 import logging
 import os
+import re
 import socket
 import sys
 from dataclasses import dataclass
@@ -815,6 +816,7 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     # Fill defaults over the raw (schema-validated) cluster block and validate
     # the numeric fields, mirroring _validate_numeric_ranges for jobs.
     cfg = _cluster_base(raw)
+    _reject_foreign_store_blocks(cfg, "gossip")
     # listen/tls/peers are schema-optional now (so a lease backend need not
     # carry them), but the gossip transport requires all three.
     for key in ("listen", "tls", "peers"):
@@ -926,6 +928,44 @@ def _reject_lease_spread(cfg: dict, backend: str) -> None:
         )
 
 
+# Lease store sub-blocks. Each lease builder reads ONLY its own; a block under
+# the wrong backend is rejected so the operator's intended endpoints/TLS/creds
+# are never silently discarded (see _reject_foreign_store_blocks).
+_LEASE_STORE_KEYS = ("etcd", "kubernetes")
+
+# Kubernetes object-name charsets, used to keep leaseName/leaseNamespace clear
+# of URL path metacharacters ('/', '?', '#', whitespace) that could retarget
+# the apiserver request (see _K8sHttpTransport._lease_url).
+_RFC1123_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_RFC1123_SUBDOMAIN = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+
+
+def _reject_foreign_store_blocks(cfg: dict, backend: str) -> None:
+    """Reject a lease store sub-block that does not match the chosen backend.
+
+    Both store blocks are schema-optional and can be present at once, and each
+    builder consumes ONLY its own -- so a block carried under the wrong
+    ``backend:`` (a copy-paste that changed only ``backend:``, an ``etcd:``
+    block under ``backend: kubernetes``, or a stray store block under
+    ``backend: gossip``) would be silently ignored, discarding the operator's
+    intended endpoints / TLS / credentials and arbitrating leadership against
+    an unintended (default) store -- landing on either failure the subsystem
+    exists to prevent (a job that never runs, or one that double-runs). Fail
+    loudly.
+    """
+    for key in _LEASE_STORE_KEYS:
+        if key == backend:
+            continue
+        if cfg.get(key) is not None:
+            raise ConfigError(
+                "cluster.{} is configured but cluster.backend is {!r}; that "
+                "store block would be silently ignored. Set backend: {} to "
+                "use it, or remove the cluster.{} block.".format(
+                    key, backend, key, key
+                )
+            )
+
+
 # Cluster keys only the gossip transport consumes. A lease backend silently
 # ignores them, so a lease config that carries them (e.g. copied from a gossip
 # example and re-pointed with `backend:`) does not do what it looks like --
@@ -1010,6 +1050,7 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
 def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
     cfg = _cluster_base(raw)
     _reject_lease_spread(cfg, "kubernetes")
+    _reject_foreign_store_blocks(cfg, "kubernetes")
     k8s = dict(DEFAULT_K8S)
     k8s.update(cfg.get("kubernetes") or {})
     cfg["kubernetes"] = k8s
@@ -1017,6 +1058,32 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         # the lease holderIdentity that distinguishes this node; default it to
         # the (already-defaulted) nodeName.
         k8s["identity"] = cfg["nodeName"]
+    # leaseName/leaseNamespace are spliced into the apiserver URL path (see
+    # _K8sHttpTransport._lease_url) and passed to the native client; constrain
+    # them to the Kubernetes RFC1123 charset so a stray '/', '?', '#' or space
+    # cannot retarget the request (silently never acquiring the lease, or
+    # the HTTP and native transports resolve different resources).
+    lease_name = k8s["leaseName"]
+    if not isinstance(lease_name, str) or (
+        len(lease_name) > 253 or not _RFC1123_SUBDOMAIN.match(lease_name)
+    ):
+        raise ConfigError(
+            "cluster.kubernetes.leaseName must be a valid RFC1123 name "
+            "(lowercase alphanumeric, '-' or '.', <= 253 chars); got "
+            "{!r}".format(lease_name)
+        )
+    lease_ns = k8s.get("leaseNamespace")
+    if lease_ns is not None and (
+        not isinstance(lease_ns, str)
+        or len(lease_ns) > 63
+        or not _RFC1123_LABEL.match(lease_ns)
+    ):
+        raise ConfigError(
+            "cluster.kubernetes.leaseNamespace must be a valid RFC1123 label "
+            "(lowercase alphanumeric or '-', <= 63 chars); got {!r}".format(
+                lease_ns
+            )
+        )
     # The apiserver override carries the in-cluster ServiceAccount bearer token
     # on every request; a plaintext http:// target would send that high-value
     # credential in cleartext (aiohttp ignores the SSL context for an http URL)
@@ -1112,6 +1179,7 @@ def _redact_userinfo(url: str) -> str:
 def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     cfg = _cluster_base(raw)
     _reject_lease_spread(cfg, "etcd")
+    _reject_foreign_store_blocks(cfg, "etcd")
     raw_etcd = cfg.get("etcd") or {}
     etcd = copy.deepcopy(DEFAULT_ETCD)
     etcd.update(raw_etcd)
@@ -1142,6 +1210,20 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         raise ConfigError("cluster.etcd.endpoints must list at least one URL")
     for endpoint in etcd["endpoints"]:
         parsed = urlparse(endpoint)
+        # Reject credentials embedded in the URL (user:pass@host) FIRST,
+        # before the scheme/port check below: they would be logged in cleartext
+        # at start() and sent as HTTP Basic auth, bypassing the
+        # username/password block's https-only guard. Checking this first
+        # matters because an endpoint with BOTH embedded credentials AND a bad
+        # scheme/port would otherwise fall into the scheme/port branch and
+        # the raw password; here it is always redacted. Use the structured
+        # cluster.etcd.username/password fields instead.
+        if parsed.username is not None or parsed.password is not None:
+            raise ConfigError(
+                "cluster.etcd.endpoints must not embed credentials in the URL "
+                "(userinfo@host); use cluster.etcd.username/password instead, "
+                "got {!r}".format(_redact_userinfo(endpoint))
+            )
         # urlparse's .port *raises* ValueError on a non-numeric or out-of-range
         # port; guard it so a typo surfaces as a clean ConfigError (config
         # parsing must only ever raise ConfigError) instead of an opaque
@@ -1160,18 +1242,10 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
             or not parsed.hostname
             or bad_port
         ):
+            # redact too (defence in depth): the userinfo check above already
+            # rejected any credentialed endpoint; still, never echo a raw URL.
             raise ConfigError(
                 "cluster.etcd.endpoints must be http(s)://host[:port], "
-                "got {!r}".format(endpoint)
-            )
-        # Reject credentials embedded in the URL (https://user:pass@host): they
-        # would be logged in cleartext at start() and sent as HTTP Basic auth,
-        # bypassing the username/password block's https-only guard below. Use
-        # the structured cluster.etcd.username/password fields instead.
-        if parsed.username is not None or parsed.password is not None:
-            raise ConfigError(
-                "cluster.etcd.endpoints must not embed credentials in the URL "
-                "(userinfo@host); use cluster.etcd.username/password instead, "
                 "got {!r}".format(_redact_userinfo(endpoint))
             )
     # mTLS to etcd needs BOTH the client cert and key; one without the other

@@ -336,6 +336,22 @@ def test_apply_round_lost_key_not_leader():
     assert b._is_leader is False
 
 
+def test_apply_round_lost_with_unparseable_holder_fences_closed():
+    # Defensive: a lost campaign (won=False) whose holder could not be parsed
+    # (holder=None -- only via a non-conformant gateway that drops the
+    # failure-branch range value) must NOT report leader_name()=None while
+    # quorate. None there is read by is_available_leader() as "holder unknown
+    # -> run anyway", double-running PreferLeader on every quorate replica
+    # alongside the real holder. _apply_round substitutes a non-None sentinel
+    # so a follower defers instead.
+    b = _backend()
+    b._apply_round(None, False, NOW)  # contacted, lost, holder unparseable
+    assert b.is_quorate() is True
+    assert b.is_leader() is False
+    assert b.leader_name() is not None  # sentinel, not None
+    assert b.is_available_leader() is False  # so a follower defers
+
+
 def test_view_dict_and_lease_detail():
     b = _backend()
     b._lease_id = "777"

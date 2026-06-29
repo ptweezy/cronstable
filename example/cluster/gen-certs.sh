@@ -55,9 +55,23 @@ EOF
     -out "$CERTS/$n.pem" -days 3650 -extfile "/tmp/$n.ext"
 done
 
-# The yacron2 containers run as uid 65534 (nobody) and must be able to read the
-# CA, certs, and keys. World-readable is fine for this throwaway demo CA.
-chmod 0644 "$CERTS"/*.pem "$CERTS"/*.key
+# Lock down permissions. The yacron2 containers run as uid 65534 (nobody) and
+# must read their own leaf key, so we hand the private keys to that uid and keep
+# them owner-only (0600) instead of world-readable.
+#
+# This matters especially for the CA SIGNING key (ca.key): anyone who can read
+# it can mint a cert for ANY node/SAN and impersonate a peer, defeating the
+# whole mTLS scheme: it is far more dangerous than a leaked public cert. The
+# public material (ca.pem, the node *.pem certs) is meant to be shared, so it
+# stays 0644.
+#
+# DEMO-ONLY CAVEAT: ca.key exists in this shared volume only because the demo
+# mints certs in place. In production never ship or mount the CA signing key to
+# the nodes; they only need their own leaf key+cert and the CA *public* cert
+# (ca.pem) to verify peers; ca.key belongs only on the (offline) signer.
+chmod 0644 "$CERTS"/*.pem
+chown 65534:65534 "$CERTS"/*.key
+chmod 0600 "$CERTS"/*.key
 
 echo "done. generated:"
 ls -l "$CERTS"

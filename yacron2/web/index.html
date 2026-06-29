@@ -233,6 +233,11 @@
 
   /* ---------- table ---------- */
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  /* a card whose data could not be refreshed (e.g. /cluster 5xx or a thrown
+     fetch/parse): dim the body and tint the summary so the panel reads as
+     stale rather than silently freezing on its last healthy frame. */
+  .card.stale { opacity: .6; }
+  .card.stale #clusterSummary { color: var(--fail); }
   .card-label {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 12px; border-bottom: 1px solid var(--border);
@@ -2150,12 +2155,25 @@
       rows || '<tr><td colspan="2">no lease detail yet</td></tr>';
   }
 
+  // Put the cluster panel into an explicit DEGRADED/STALE state when /cluster
+  // cannot be read, instead of leaving it frozen on the last healthy frame
+  // (mirrors loadJobs' setConnected(false)/console.warn on real failures).
+  function clusterStale(why) {
+    const card = $("clusterCard");
+    // only meaningful once the card is actually visible (cluster enabled); a
+    // hidden card has nothing to mislead about.
+    if (card && card.style.display !== "none") card.classList.add("stale");
+    const sum = $("clusterSummary");
+    if (sum) sum.textContent = "cluster status unavailable" + (why ? " (" + why + ")" : "");
+  }
   async function loadCluster() {
     try {
       const r = await apiFetch("/cluster");
-      if (!r.ok) return;
+      if (!r.ok) { console.warn("loadCluster failed: HTTP " + r.status); clusterStale("HTTP " + r.status); return; }
       const data = await r.json();
       const card = $("clusterCard");
+      // a fresh, successful read clears any prior staleness signal.
+      card.classList.remove("stale");
       if (!data.enabled) {
         card.style.display = "none";
         setClusterMeta(null, false);
@@ -2258,7 +2276,12 @@
         "<td>" + esc(p.status) + "</td>" +
         '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
       ).join("");
-    } catch (_) {}
+    } catch (e) {
+      // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
+      // flow (openModal) elsewhere; don't mask it as "unavailable". Any other
+      // throw (fetch/parse/render) leaves the panel stale rather than frozen.
+      if (e.message !== "unauthorized") { console.warn("loadCluster failed:", e); clusterStale(); }
+    }
   }
 
   // ===================================================================

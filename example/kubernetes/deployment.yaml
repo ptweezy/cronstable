@@ -1,8 +1,10 @@
 # Minimal RBAC + Deployment for the Kubernetes Lease leadership backend.
 #
 # The Role grants exactly the verbs the backend needs on the single Lease
-# object: get (observe), create (first acquire), and update (renew / replace /
-# release). Apply with:
+# object "yacron2-leader": get (observe) and update (renew / replace / release)
+# are pinned to that one Lease by resourceNames; create is a separate rule
+# because RBAC does not honor resourceNames on create (the object does not yet
+# exist when create is authorized). Apply with:
 #
 #     kubectl apply -f deployment.yaml
 #
@@ -26,11 +28,21 @@ kind: Role
 metadata:
   name: yacron2-lease
 rules:
+  # get: observe the current holder; update: renew, take over an expired lease,
+  # and release on shutdown. Both are restricted to the one Lease the backend
+  # uses, so a compromised pod cannot read or hijack any other Lease in the
+  # namespace. Keep resourceNames in sync with the lease name (default
+  # "yacron2-leader"; set via cluster.kubernetes.leaseName if you change it).
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    # get: observe the current holder; create: first acquire; update: renew,
-    # take over an expired lease, and release on shutdown.
-    verbs: ["get", "create", "update"]
+    resourceNames: ["yacron2-leader"]
+    verbs: ["get", "update"]
+  # create: first acquire. RBAC cannot scope create by resourceNames (the Lease
+  # does not exist yet), so this is its own rule. It only authorizes creating a
+  # Lease, not reading or modifying existing ones.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

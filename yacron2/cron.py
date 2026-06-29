@@ -1077,7 +1077,21 @@ class Cron:
                 # pending entry and let the new job schedule itself normally.
                 del self._pending_reboot_jobs[name]
                 continue
-            if mgr.reboot_ran(name):
+            try:
+                already_ran = mgr.reboot_ran(name)
+            except Exception:
+                # A backend read must not escape: _process_pending_reboots is
+                # called from spawn_jobs, OUTSIDE run()'s try/except, so a
+                # raise here would kill the whole scheduler. Treat it as "not
+                # known to have run" and keep the job pending (never-lose);
+                # re-evaluate next wakeup. Mirrors the _cluster_allows guard.
+                logger.exception(
+                    "cluster: error checking whether @reboot job %s already "
+                    "ran; keeping it pending",
+                    name,
+                )
+                continue
+            if already_ran:
                 # positive confirmation it already ran in the cluster -> retire
                 # it without re-running (this is what prevents a re-run when
                 # leadership later lands on a node that still held it pending).
@@ -1213,6 +1227,21 @@ class Cron:
         """
         if not self._elect_leader_configured:
             return
+        # spawn_jobs (this method's only caller) runs OUTSIDE run()'s
+        # try/except, so an exception from any backend read below would kill
+        # the whole scheduler -- the failure mode _cluster_allows is hardened
+        # against, but this method runs one step earlier on the same unguarded
+        # path. It only logs, so swallow any backend-read error and keep
+        # scheduling (the run/skip decision stays fail-closed in
+        # _cluster_allows).
+        try:
+            self._emit_cluster_role_logs()
+        except Exception:
+            logger.exception(
+                "cluster: error while logging cluster role; continuing"
+            )
+
+    def _emit_cluster_role_logs(self) -> None:
         mgr = self.cluster_manager
         if mgr is not None:
             # A duplicate nodeName is a misconfiguration that pauses Leader

@@ -19,8 +19,16 @@ services:
       - etcd
       - --listen-client-urls=http://0.0.0.0:2379
       - --advertise-client-urls=http://etcd:2379
-    ports:
-      - "2379:2379"
+    # No `ports:` mapping on purpose. This demo etcd has NO authentication and
+    # speaks plaintext HTTP, so the election key (yacron2/leader) would be
+    # world-writable to anything that can reach the host on 2379 -> trivial
+    # split-brain. The yacron2 nodes reach it over the compose network by its
+    # service name (etcd:2379), so it never needs to be published to the host.
+    # For local etcdctl poking, run it inside the container instead:
+    #   docker compose -f docker-compose.yml exec etcd etcdctl get yacron2/leader
+    # If you must publish the client port, bind it to loopback only
+    # ("127.0.0.1:2379:2379") and never expose this unauthenticated store
+    # beyond localhost.
 
   yacron2-a:
     image: ghcr.io/ptweezy/yacron2:latest

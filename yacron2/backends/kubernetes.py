@@ -44,6 +44,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 
@@ -572,9 +573,20 @@ class KubernetesBackend(LeaseBackend):
         self._last_contact_mono = mono
         if action == ACTION_WAIT:
             self._is_leader = False
-            self._holder = (
-                display_holder(state.holder) if state is not None else None
-            )
+            if state is not None:
+                self._holder = display_holder(state.holder)
+            else:
+                # Deleted-lease WAIT: the Lease object is gone (404) but we are
+                # deferring to a holder we recently saw whose local fence has
+                # not yet expired (decide_lease_action's recreate-race guard).
+                # Report THAT remembered holder, not None -- leaving _holder
+                # None makes leader_name() None, which is_available_leader()
+                # reads as "holder unknown -> run anyway", so a follower
+                # would run PreferLeader jobs alongside the still-fenced prior
+                # holder: a double-run with NO partition. The remembered holder
+                # keeps leader_name() non-None so the follower defers until the
+                # lease reappears.
+                self._holder = display_holder(self._observed_holder)
             return
         if write_ok:
             self._is_leader = True
@@ -1084,6 +1096,28 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         )
         if cert and key and self._ssl is not None:
             self._ssl.load_cert_chain(cert, key)
+        # This hand-rolled HTTP transport understands only a static bearer
+        # token or a client certificate. exec-credential plugins (EKS
+        # aws-iam-authenticator, GKE gke-gcloud-auth-plugin) and the legacy
+        # auth-provider must be EXECUTED, which only the official client can.
+        # Without this check such a kubeconfig yields no Authorization header,
+        # 401s every round, and leaves the node PERMANENTLY non-quorate (Leader
+        # jobs never run; never-skip PreferLeader jobs double-run on every
+        # replica) -- mislogged as a transient "apiserver unreachable". Fail
+        # fast and loudly instead of silently never-leading.
+        if (
+            not self._auth_token
+            and not (cert and key)
+            and (user.get("exec") or user.get("auth-provider"))
+        ):
+            raise ConfigError(
+                "kubernetes backend: kubeconfig user {!r} authenticates via "
+                "an exec-credential plugin or auth-provider, which the "
+                "built-in HTTP transport cannot run. Install the optional "
+                "native client (pip install 'yacron2[kubernetes]') so the "
+                "credential plugin can execute, or use a kubeconfig with a "
+                "static token or client certificate.".format(ctx.get("user"))
+            )
 
     def _material(
         self, path: Optional[str], data: Optional[str]
@@ -1102,10 +1136,19 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         return None
 
     def _lease_url(self, *, collection: bool = False) -> str:
+        # URL-encode the namespace and lease name (config validates leaseName/
+        # leaseNamespace against the RFC1123 charset, but the namespace may
+        # come from a kubeconfig context, and the native client percent-encodes
+        # its path params too -- so encoding here keeps both transports pointed
+        # at the SAME apiserver resource and stops a stray '/', '?' or '#' from
+        # retargeting the request).
+        namespace = quote(self.b.namespace or "", safe="")
         base = "{}/apis/coordination.k8s.io/v1/namespaces/{}/leases".format(
-            self._base_url, self.b.namespace
+            self._base_url, namespace
         )
-        return base if collection else "{}/{}".format(base, self.b.lease_name)
+        if collection:
+            return base
+        return "{}/{}".format(base, quote(self.b.lease_name, safe=""))
 
     async def observe(self) -> Optional[Dict[str, Any]]:
         assert self._session is not None
