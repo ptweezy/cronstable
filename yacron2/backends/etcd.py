@@ -47,6 +47,15 @@ logger = logging.getLogger("yacron2.backends.etcd")
 _CLOCK_SKEW = datetime.timedelta(seconds=1)
 _SKEW_SECONDS = _CLOCK_SKEW.total_seconds()
 
+# Worst-case number of sequential HTTP POSTs a single renew *cycle* can make,
+# each of which may waste a full per-request timeout on a half-open endpoint
+# before failing over: keepalive (or grant), campaign, then the reboot-ran
+# range + put, plus the re-grant a lease-expiry round adds. The per-request
+# timeout is sized off this (see EtcdBackend.request_timeout) so the whole
+# cycle -- and so the gap between two successful contacts -- stays inside the
+# lease window even when one endpoint is slow.
+_ETCD_POSTS_PER_CYCLE = 5
+
 
 def _utcnow() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
@@ -226,8 +235,12 @@ class EtcdBackend(LeaseBackend):
         self.password: Optional[str] = etcd.get("resolved_password")
         self._tls: Dict[str, Optional[str]] = etcd["tls"]
         self.connect_timeout: int = config["connectTimeout"]
-        # keepalive cadence: comfortably within the TTL (>= once a second)
-        self.renew_period: float = max(1.0, self.ttl / 3)
+        # renew_period / round_deadline / request_timeout are derived from the
+        # *effective* ttl (properties below), so they tighten automatically if
+        # etcd grants a shorter lease than requested.
+        # rotates the endpoint probe order each round (see _post), so a single
+        # persistently slow/half-open endpoint is not always tried first.
+        self._endpoint_offset = 0
 
         # live state, written by the renew loop and read by the sync methods
         self._is_leader = False
@@ -245,6 +258,57 @@ class EtcdBackend(LeaseBackend):
         self._session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+
+    # --- derived renew cadence (all track the *effective* lease ttl) ------
+
+    @property
+    def renew_period(self) -> float:
+        """Sleep between renew rounds (the keepalive cadence).
+
+        Tracks the *effective* ttl (etcd may grant a shorter lease than
+        requested), so the cadence follows the real lease window.
+        """
+        return max(1.0, self._effective_ttl / 3)
+
+    @property
+    def round_deadline(self) -> float:
+        """Wall-time bound on a single renew round.
+
+        Mirrors the Kubernetes backend's ``renewDeadline``: a round is
+        abandoned (and retried) before the lease window can close, leaving room
+        for the inter-round :attr:`renew_period` sleep *inside* the effective
+        ttl.  Because ``round_deadline + renew_period == effective_ttl -
+        clock_skew`` by construction, the gap between two successive successful
+        contacts always stays within the lease window, so a slow round cannot
+        make the holder lapse out of its own lease -- the at-most-once ->
+        at-most-zero collapse the Kubernetes ``renew + retry < duration``
+        invariant guards against.  Unlike Kubernetes this needs no config
+        validation: it is derived from the (floored, >= 3s) ttl, so no config
+        can violate it.
+        """
+        return max(
+            1.0, self._effective_ttl - self.renew_period - _SKEW_SECONDS
+        )
+
+    @property
+    def request_timeout(self) -> float:
+        """Per-endpoint request timeout for a renew POST.
+
+        Sized so a round's sequential lease POSTs still fit
+        :attr:`round_deadline` when one endpoint is half-open and wastes a full
+        attempt before failing over to a healthy peer.  Previously each POST
+        was bounded only by the much larger ``connectTimeout``, so on the
+        default ttl a single slow-but-quorate endpoint made every round overrun
+        the lease window and the leader self-demote every cycle.  Capped at
+        ``connectTimeout`` so an explicitly lower value still applies.
+        """
+        return max(
+            0.5,
+            min(
+                float(self.connect_timeout),
+                self.round_deadline / _ETCD_POSTS_PER_CYCLE,
+            ),
+        )
 
     # --- pure local-state reads (no I/O) ---------------------------------
 
@@ -344,9 +408,24 @@ class EtcdBackend(LeaseBackend):
             # round is swallowed (the loop retries), leaving the not-quorate
             # state -- the genuine "store unreachable" case.
             try:
-                await asyncio.wait_for(self._renew_once(), self.ttl)
+                await asyncio.wait_for(
+                    self._renew_once(), self.round_deadline
+                )
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
                 logger.warning("cluster: etcd initial round failed: %s", ex)
+            logger.info(
+                "cluster: etcd backend, identity %r, election key %r, "
+                "ttl %ds, endpoints %s",
+                self.identity,
+                self.election_name,
+                self.ttl,
+                # redact any userinfo (config rejects it, never log a secret).
+                ", ".join(_redact_userinfo(e) for e in self.endpoints),
+            )
+            self._stop.clear()
+            # create the renew task INSIDE the try so a failure here is cleaned
+            # up like any other -- it must not leak the open session/task.
+            self._task = asyncio.create_task(self._renew_loop())
         except BaseException:
             # Honour the "a backend cleans up its own half-started state on
             # failure" contract (as KubernetesBackend.start already does): an
@@ -355,20 +434,12 @@ class EtcdBackend(LeaseBackend):
             # and is never closed (start() never returns, so the caller never
             # stores the manager to stop() it). BaseException also covers a
             # cancellation mid-handshake.
+            if self._task is not None:
+                self._task.cancel()
+                self._task = None
             await self._session.close()
             self._session = None
             raise
-        logger.info(
-            "cluster: etcd backend, identity %r, election key %r, ttl %ds, "
-            "endpoints %s",
-            self.identity,
-            self.election_name,
-            self.ttl,
-            # redact any userinfo (config rejects it, but never log a secret).
-            ", ".join(_redact_userinfo(e) for e in self.endpoints),
-        )
-        self._stop.clear()
-        self._task = asyncio.create_task(self._renew_loop())
 
     def _build_ssl(self) -> Optional[ssl.SSLContext]:  # pragma: no cover
         if not any(self.endpoint_is_https(e) for e in self.endpoints):
@@ -419,12 +490,28 @@ class EtcdBackend(LeaseBackend):
             # member. With no auth configured there is nothing to protect, so
             # all endpoints stay eligible.
             endpoints = [e for e in endpoints if self.endpoint_is_https(e)]
+        # Rotate the probe order each round (see _endpoint_offset) so a single
+        # persistently slow/half-open endpoint is not always tried -- and timed
+        # out on -- first, which would add request_timeout to every POST of
+        # every round. Combined with the per-request timeout below this keeps
+        # the worst-case round inside round_deadline.
+        if len(endpoints) > 1:
+            off = self._endpoint_offset % len(endpoints)
+            endpoints = endpoints[off:] + endpoints[:off]
+        # Bound EACH endpoint attempt (overriding the session-wide default), so
+        # the round's sequential POSTs fail over fast and still fit the round
+        # deadline when one endpoint is half-open; see request_timeout.
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout)
         last_error: Optional[Exception] = None
         for endpoint in endpoints:
             url = endpoint.rstrip("/") + path
             try:
                 async with self._session.post(
-                    url, json=body, ssl=self._ssl, headers=headers
+                    url,
+                    json=body,
+                    ssl=self._ssl,
+                    headers=headers,
+                    timeout=timeout,
                 ) as resp:
                     if resp.status == 401 and self.username and allow_reauth:
                         self._auth_token = await self._authenticate()
@@ -490,14 +577,17 @@ class EtcdBackend(LeaseBackend):
     async def _renew_loop(self) -> None:  # pragma: no cover - network loop
         while not self._stop.is_set():
             try:
-                # Bound the whole round by the ttl: _renew_once makes several
-                # sequential POSTs, each iterating every endpoint, so on
-                # slow/half-open endpoints an unbounded round could block for
-                # far longer than the lease lifetime (N_endpoints x
-                # connectTimeout per call). After ttl the lease has lapsed
-                # anyway (is_leader self-demotes on its monotonic deadline), so
-                # abandon and retry rather than wedge the loop.
-                await asyncio.wait_for(self._renew_once(), self.ttl)
+                # Bound each round by round_deadline (< the effective ttl,
+                # leaving room for the renew_period sleep inside the lease
+                # window) rather than by the full ttl. _renew_once makes a few
+                # sequential POSTs, each bounded by request_timeout; abandoning
+                # at round_deadline and retrying keeps the gap between two
+                # successful contacts inside the lease window, so a slow/half-
+                # open-but-quorate endpoint cannot make the holder self-demote
+                # every cycle (Leader to at-most-zero, PreferLeader doubles).
+                await asyncio.wait_for(
+                    self._renew_once(), self.round_deadline
+                )
             except asyncio.CancelledError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
@@ -525,6 +615,9 @@ class EtcdBackend(LeaseBackend):
         # node's create-if-absent campaign win while we still believe we lead
         # (two leaders running a Leader job). The campaign read below is
         # likewise excluded: its latency must not extend the fence either.
+        #
+        # Advance the endpoint probe rotation for this round (see _post).
+        self._endpoint_offset += 1
         lease_mono: Optional[float] = None
         if self._lease_id is not None:
             lease_mono = _monotonic()

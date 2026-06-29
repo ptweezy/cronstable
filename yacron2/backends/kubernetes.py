@@ -628,25 +628,31 @@ class KubernetesBackend(LeaseBackend):
                 logger.warning(
                     "cluster: kubernetes initial round failed: %s", ex
                 )
+            logger.info(
+                "cluster: kubernetes backend (%s transport), identity %r, "
+                "lease %s/%s (duration %ds, renew %ds, retry %ds)",
+                kind,
+                self.identity,
+                self.namespace,
+                self.lease_name,
+                self.lease_duration,
+                self.renew_deadline,
+                self.retry_period,
+            )
+            self._stop.clear()
+            # create the renew task INSIDE the try so a failure here is cleaned
+            # up like any other -- it must not leak the open session/task.
+            self._task = asyncio.create_task(self._renew_loop())
         except BaseException:
-            # clean up half-started state (an open session, temp cert files)
-            # so a failed start leaks nothing, honouring the caller's contract.
+            # clean up half-started state (an open session, temp cert files, a
+            # created renew task) so a failed start leaks nothing, honouring
+            # the caller's contract.
+            if self._task is not None:
+                self._task.cancel()
+                self._task = None
             await self._transport.close()
             self._transport = None
             raise
-        logger.info(
-            "cluster: kubernetes backend (%s transport), identity %r, lease "
-            "%s/%s (duration %ds, renew %ds, retry %ds)",
-            kind,
-            self.identity,
-            self.namespace,
-            self.lease_name,
-            self.lease_duration,
-            self.renew_deadline,
-            self.retry_period,
-        )
-        self._stop.clear()
-        self._task = asyncio.create_task(self._renew_loop())
 
     async def _renew_loop(self) -> None:  # pragma: no cover - network loop
         assert self._transport is not None
