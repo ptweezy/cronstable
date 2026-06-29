@@ -569,3 +569,48 @@ def test_redact_userinfo_splits_on_last_at():
 
 def test_redact_userinfo_no_userinfo_unchanged():
     assert _redact_userinfo("https://host:2379") == "https://host:2379"
+
+
+# --- F04: scheme-less userinfo + apiServer redaction ----------------------
+
+
+def test_redact_userinfo_schemeless_is_redacted():
+    # F04: a scheme-less user:pass@host -- which urlparse misreads as scheme
+    # 'user' with no username -- must still be redacted, not echoed verbatim.
+    assert (
+        _redact_userinfo("user:s3cret@etcd.internal:2379")
+        == "***@etcd.internal:2379"
+    )
+    assert "s3cret" not in _redact_userinfo("user:s3cret@etcd.internal:2379")
+    # the LAST '@' rule still applies without a scheme
+    assert _redact_userinfo("user:p@ss@host:2379") == "***@host:2379"
+
+
+def test_etcd_rejects_schemeless_credentialed_endpoint_without_leak():
+    # F04: a scheme-less endpoint with embedded credentials must be rejected
+    # AND its password must not appear in the ConfigError (the reload loop logs
+    # str(err); the old parsed.username check missed the scheme-less form and
+    # the fall-through scheme error leaked cleartext).
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - user:s3cret@etcd.internal:2379\n"
+    )
+    with pytest.raises(ConfigError) as ei:
+        _cluster(yaml)
+    assert "s3cret" not in str(ei.value)
+
+
+def test_k8s_apiserver_credentialed_error_redacts_password():
+    # F04: a non-https apiServer is rejected; if it carries embedded userinfo
+    # the password must be redacted from the ConfigError (it was echoed raw via
+    # {!r} before).
+    yaml = _K8S + (
+        "  kubernetes:\n    apiServer: http://tok:s3cret@kube-proxy:8080\n"
+    )
+    with pytest.raises(ConfigError) as ei:
+        _cluster(yaml)
+    assert "apiServer must be an https" in str(ei.value)
+    assert "s3cret" not in str(ei.value)

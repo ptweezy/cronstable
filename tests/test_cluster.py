@@ -17,6 +17,8 @@ from yacron2.cluster import (
     ClusterManager,
     ClusterView,
     _hrw_owner,
+    _parse_members,
+    _parse_str_list,
     _split_host_port,
     elect_available_job_owner,
     elect_available_leader,
@@ -2989,3 +2991,37 @@ async def test_handle_reboot_ran_survives_lagged_job_set_id(no_tls):
     assert mgr.reboot_ran("boot") is True
     await mgr._poll_all()  # same new id -> no clear
     assert mgr.reboot_ran("boot") is True
+
+
+# --- F11: control-character guard on transitive peer-reported strings ------
+
+
+def test_parse_members_drops_control_char_names():
+    # F11: a transitive member's node_name/instance_id flows (via
+    # conflict_names) into operator-facing log lines, so a newline/ANSI-bearing
+    # value from a CA-vouched-but-hostile peer is a log-injection vector. Drop
+    # it, mirroring the isprintable() guard _poll_peer applies to a peer's own
+    # scalar identity fields.
+    good = {"node_name": "node-b", "instance_id": "abc", "agreed": True}
+    bad_name = {
+        "node_name": "victim\n2026-06-29 ERROR forged-log-line",
+        "instance_id": "i1",
+        "agreed": True,
+    }
+    bad_instance = {
+        "node_name": "node-c",
+        "instance_id": "i\x1b[31mred",
+        "agreed": True,
+    }
+    out = _parse_members(
+        [good, bad_name, bad_instance], max_len=256, max_items=64
+    )
+    assert out == [("node-b", "abc", True)]
+
+
+def test_parse_str_list_drops_control_char_entries():
+    # F11: gossiped ran_reboot_jobs names can reach operator logs too.
+    out = _parse_str_list(
+        ["ok-job", "bad\njob", "null\x00job"], max_len=128, max_items=64
+    )
+    assert out == {"ok-job"}

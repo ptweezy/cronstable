@@ -12,10 +12,12 @@ import aiohttp
 import pytest
 
 from yacron2.backends.etcd import (
+    _MIN_USABLE_TTL,
     EtcdBackend,
     _b64,
     _b64decode,
     build_campaign_txn,
+    build_reboot_ran_cas_txn,
     campaign_won,
     holder_from_txn_response,
     lease_id_from_grant,
@@ -233,11 +235,14 @@ def test_renew_cadence_fits_lease_window():
         b = _backend()
         b._effective_ttl = ttl
         assert b.round_deadline + b.renew_period <= ttl - 1 + 1e-9
-        # a round's worst-case sequential lease POSTs still fit the deadline
-        # (so a single slow/half-open endpoint cannot make every round
-        # overrun) wherever the per-request floor does not bind.
-        if b.request_timeout > 0.5:
-            assert b.request_timeout * 5 <= b.round_deadline + 1e-9
+        # F09: a round's worst-case sequential lease POSTs must still fit the
+        # deadline at EVERY ttl (so a single slow/half-open endpoint cannot
+        # make every round overrun). With no per-request floor this holds even
+        # at the minimum ttl=3; assert it unconditionally -- the old
+        # `request_timeout > 0.5` guard skipped exactly the small-ttl boundary
+        # a reintroduced floor would break (the regression the no-floor fix is
+        # for).
+        assert b.request_timeout * 5 <= b.round_deadline + 1e-9
         # never tighter than connectTimeout asked for
         assert b.request_timeout <= b.connect_timeout
 
@@ -473,3 +478,173 @@ async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):
     await b._renew_once()
     assert b._lease_id == "1" and b._effective_ttl == 15
     assert b.is_leader() is True
+
+
+# --- F03: effective-ttl narrowing is safe (honoured, never inflated) -------
+
+
+def test_narrow_effective_ttl_honours_server_value_without_inflating():
+    # F03: a server-granted ttl below the configured one is honoured for the
+    # fence and NOT floored back up to the config minimum -- inflating it would
+    # keep is_leader() true past the real (short) server lease (two leaders).
+    b = _backend()  # configured ttl 15
+    b._narrow_effective_ttl(6)
+    assert b._effective_ttl == 6
+    assert b._ttl_collapsed is False
+
+
+def test_narrow_effective_ttl_below_min_is_honoured_not_inflated(caplog):
+    # F03: below _MIN_USABLE_TTL the leader window collapses; the fence is kept
+    # at the small (safe) value -- Leader fails closed -- rather than inflated
+    # to the configured minimum (which would risk two leaders). Warns, not
+    # silent.
+    import logging
+
+    b = _backend()
+    with caplog.at_level(logging.WARNING, logger="yacron2.backends.etcd"):
+        b._narrow_effective_ttl(1)
+    assert b._effective_ttl == 1  # honoured, NOT inflated to _MIN_USABLE_TTL
+    assert b._effective_ttl < _MIN_USABLE_TTL
+    assert b._ttl_collapsed is True
+    assert any(
+        "usable leader window" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_narrow_effective_ttl_warns_once_then_recovers(caplog):
+    # F03: the collapse warning is per-transition (not every renew round); a
+    # later recovery to a usable ttl clears the collapsed flag.
+    import logging
+
+    b = _backend()
+    with caplog.at_level(logging.WARNING, logger="yacron2.backends.etcd"):
+        b._narrow_effective_ttl(1)
+        b._narrow_effective_ttl(2)  # still collapsed -> no second warning
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    b._narrow_effective_ttl(15)  # recovered
+    assert b._ttl_collapsed is False
+    assert b._effective_ttl == 15
+
+
+def test_etcd_is_self_demoted_holder():
+    # F14: raw win flag set but the monotonic fence lapsed = the self-demotion
+    # window (still quorate, still names self). is_available_leader uses this
+    # so the lapsed-but-quorate former holder keeps running PreferLeader.
+    b = _backend()
+    assert b._is_self_demoted_holder() is False  # fresh: never won
+    b._is_leader = True
+    b._lease_deadline_mono = time.monotonic() - 1  # fence lapsed
+    assert b.is_leader() is False
+    assert b._is_self_demoted_holder() is True
+    b._lease_deadline_mono = time.monotonic() + 100  # fence valid: real leader
+    assert b._is_self_demoted_holder() is False
+    b._is_leader = False
+    assert b._is_self_demoted_holder() is False
+
+
+# --- F02/F12: the @reboot-ran compare-and-swap (union + revision spelling) --
+
+
+def test_build_reboot_ran_cas_txn_structure():
+    # F02/F12: structurally untested before. Compares MOD == the revision read
+    # this round and PUTs the merged value on success; the re-read on a lost
+    # CAS is done by the caller's loop, so the txn's failure branch is empty.
+    txn = build_reboot_ran_cas_txn(
+        "yacron2/leader/reboot-ran", "payload", "42"
+    )
+    key = _b64("yacron2/leader/reboot-ran")
+    assert txn["compare"][0] == {
+        "key": key,
+        "result": "EQUAL",
+        "target": "MOD",
+        "mod_revision": "42",
+    }
+    assert txn["success"][0]["requestPut"] == {
+        "key": key,
+        "value": _b64("payload"),
+    }
+    assert txn["failure"] == []
+
+
+async def test_cas_write_reboot_ran_unions_on_contention(monkeypatch):
+    # F02: two concurrent writers must UNION their @reboot-ran marks, not
+    # last-writer-wins clobber. The first CAS txn loses (another writer moved
+    # the key); the retry must re-read, re-merge, and write the UNION. (The
+    # union/contention path had no unit coverage -- a regression silently
+    # re-runs a deferred @reboot one-shot after a failover.)
+    from yacron2.leadership import decode_reboot_ran, encode_reboot_ran
+
+    b = _backend()  # get_job_set_id -> "v1:job"
+    b._reboot_ran_local = {"mine"}
+    b._reboot_ran_local_job_set_id = "v1:job"
+    txn_values = []
+    calls = {"txn": 0}
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/kv/range":
+            # another writer already stored {"theirs"} under the live job set
+            return {
+                "kvs": [
+                    {
+                        "value": _b64(encode_reboot_ran("v1:job", {"theirs"})),
+                        "mod_revision": "5",
+                    }
+                ]
+            }
+        # /v3/kv/txn: record the value we tried to PUT; fail the first attempt
+        txn_values.append(
+            _b64decode(body["success"][0]["requestPut"]["value"])
+        )
+        calls["txn"] += 1
+        return {"succeeded": calls["txn"] >= 2}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b._cas_write_reboot_ran()
+    assert calls["txn"] == 2  # retried after the first CAS lost the race
+    _jsid, jobs = decode_reboot_ran(txn_values[-1])
+    assert jobs == {"mine", "theirs"}  # UNION, not a clobber
+
+
+async def test_cas_write_reboot_ran_reads_camelcase_mod_revision(monkeypatch):
+    # F12: the etcd gRPC-gateway may marshal mod_revision as camelCase. Reading
+    # only snake_case would fall back to "0", and the MOD==0 compare against an
+    # EXISTING key never succeeds -> the mark is never persisted -> a deferred
+    # one-shot re-runs after failover.
+    from yacron2.leadership import encode_reboot_ran
+
+    b = _backend()
+    b._reboot_ran_local = {"mine"}
+    b._reboot_ran_local_job_set_id = "v1:job"
+    compares = []
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/kv/range":
+            return {
+                "kvs": [
+                    {
+                        "value": _b64(encode_reboot_ran("v1:job", set())),
+                        "modRevision": "9",  # camelCase ONLY
+                    }
+                ]
+            }
+        compares.append(body["compare"][0]["mod_revision"])
+        return {"succeeded": True}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b._cas_write_reboot_ran()
+    assert compares == ["9"]  # the camelCase modRevision was read, not "0"
+
+
+def test_holder_from_txn_response_malformed_base64_raises_valueerror():
+    # F13: a malformed base64 value (a non-conformant gateway) makes the holder
+    # decode raise binascii.Error (a ValueError subclass). start()'s initial
+    # round and the renew loop both catch ValueError so it cannot wedge the
+    # manager start; pin that the decode does raise ValueError (what those
+    # catches rely on).
+    resp = {
+        "succeeded": False,
+        "responses": [{"response_range": {"kvs": [{"value": "Z"}]}}],
+    }
+    with pytest.raises(ValueError):
+        holder_from_txn_response(resp, "node-a")

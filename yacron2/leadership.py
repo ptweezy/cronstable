@@ -202,6 +202,24 @@ class LeadershipBackend(abc.ABC):
 
     # --- never-skip PreferLeader defaults (the locked lease semantics) ----
 
+    def _is_self_demoted_holder(self) -> bool:
+        """Whether this node is the lease holder in its self-demotion window.
+
+        A lease holder stops calling itself :meth:`is_leader` a clock-skew
+        margin BEFORE its lease actually expires server-side, and only learns a
+        peer took over on its next renew round.  In that brief window it is
+        still :meth:`is_quorate`, still observes ITSELF as holder, yet
+        :meth:`is_leader` is already ``False`` -- a state a genuine follower
+        never reaches.  Returns ``True`` only for that lapsed-but-still-quorate
+        former holder, decided from authoritative self-state (never a
+        display-name compare), so :meth:`is_available_leader` can keep running
+        ``PreferLeader`` work there instead of dropping it to at-most-zero on
+        every node.  Default ``False``; the lease backends override it.  Gossip
+        recomputes leadership from live gossip on every call, so it has no such
+        window and leaves this ``False``.
+        """
+        return False
+
     def available_leader_name(self) -> str:
         """The ``PreferLeader`` owner's *display* name, never ``None``.
 
@@ -250,6 +268,14 @@ class LeadershipBackend(abc.ABC):
         if not self.is_quorate():
             return True
         if self.is_leader():
+            return True
+        # The former holder in its self-demotion window (fence lapsed, next
+        # renew not yet landed) is still quorate and still names ITSELF holder;
+        # treat it as the never-skip owner so a PreferLeader job is not dropped
+        # to at-most-zero on every node for that sub-second window (a follower
+        # also still sees the old holder and defers, so nobody else runs it).
+        # Decided from authoritative self-state, not a display-name compare.
+        if self._is_self_demoted_holder():
             return True
         return self.leader_name() is None
 
@@ -321,6 +347,14 @@ class LeaseBackend(LeadershipBackend):
         # job-set id, an @reboot Leader job runs once per job CONFIG on a lease
         # cluster (persisted across restarts), not once per process boot.
         self._reboot_ran: Set[str] = set()
+        # the job-set id under which ``_reboot_ran`` was last observed from the
+        # store (set by _observe_reboot_ran). The READ path (reboot_ran) gates
+        # on it so a reload that redefines an @reboot job -- changing the
+        # job-set id WITHOUT rebuilding this backend, since the cluster section
+        # is unchanged -- does not let a stale store-read mark suppress the
+        # genuinely-new one-shot before the next renew round re-observes it.
+        # None until the first observe.
+        self._reboot_ran_job_set_id: Optional[str] = None
         self._reboot_ran_local: Set[str] = set()
         # the job-set id under which the current ``_reboot_ran_local`` marks
         # were recorded, so they can be dropped when the job set changes (see
@@ -349,9 +383,30 @@ class LeaseBackend(LeadershipBackend):
 
     def reboot_ran(self, job_name: str) -> bool:
         self._reconcile_local_reboot_ran()
+        self._reconcile_observed_reboot_ran()
         return (
             job_name in self._reboot_ran or job_name in self._reboot_ran_local
         )
+
+    def _reconcile_observed_reboot_ran(self) -> None:
+        """Drop the store-read @reboot-ran set when the live job set changed.
+
+        ``_reboot_ran`` is scoped to the job-set id current at OBSERVE time
+        (:meth:`_observe_reboot_ran`, run only inside the renew loop).  A
+        config reload that redefines an @reboot job changes the job-set id but
+        leaves the cluster section unchanged, so
+        :meth:`yacron2.cron.Cron.start_stop_cluster` reuses this backend
+        instance and the next renew round (which would re-observe under the new
+        id) may not have run yet.  Reading the stale set on the READ path would
+        make :meth:`reboot_ran` report the redefined one-shot as already-run
+        and silently drop it.  Gate on the live id here, mirroring the gossip
+        backend's ``advertised_ran_jobs`` read-path guard (and
+        :meth:`_reconcile_local_reboot_ran` for the local set); the next
+        observe re-populates it correctly under the new id.
+        """
+        if self._reboot_ran_job_set_id != self.get_job_set_id():
+            self._reboot_ran = set()
+            self._reboot_ran_job_set_id = None
 
     async def mark_reboot_ran(self, job_name: str) -> None:
         self._reconcile_local_reboot_ran()
@@ -374,11 +429,15 @@ class LeaseBackend(LeadershipBackend):
         A stored set tagged with a DIFFERENT job-set id belongs to an older
         configuration, so it is ignored (the @reboot job runs again under the
         new job set), matching gossip's job-set scoping of ``advertised_ran``.
+        Records the id this set was observed under so the read path
+        (:meth:`_reconcile_observed_reboot_ran`) can drop it if the live job
+        set changes before the next observe.
         """
         if stored_job_set_id == self.get_job_set_id():
             self._reboot_ran = set(stored)
         else:
             self._reboot_ran = set()
+        self._reboot_ran_job_set_id = self.get_job_set_id()
 
     def reboot_ran_annotation(
         self, existing: Optional[Dict[str, str]] = None

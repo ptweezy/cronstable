@@ -834,3 +834,99 @@ async def test_release_preserves_reboot_ran_annotation():
     assert state.holder is None  # released
     _, jobs = decode_reboot_ran(state.annotations.get(REBOOT_RAN_KEY))
     assert jobs == {"migrate"}  # annotation preserved
+
+
+# --- F10: @reboot-ran job-set re-stamping through the real _renew_once -----
+
+
+async def test_renew_once_rescopes_reboot_ran_on_job_set_change():
+    # F10: drive the @reboot-ran job-set scoping through the REAL _renew_once /
+    # Lease write path (the base LeaseBackend scoping is unit-tested in
+    # isolation; this covers the kubernetes wiring). A reload that redefines an
+    # @reboot job changes the live id WITHOUT rebuilding the backend; the next
+    # round must NOT re-stamp the stale mark under the new id (which would
+    # suppress the redefined one-shot cluster-wide).
+    from yacron2.leadership import REBOOT_RAN_KEY, decode_reboot_ran
+
+    live = {"id": "v1:job"}
+    store = _FakeApiStore()
+    b = _store_backend(store, "node-a#1")
+    b.get_job_set_id = lambda: live["id"]
+    await b._renew_once()  # acquire the lease under v1
+    await b.mark_reboot_ran("migrate")  # record + eager-persist under v1
+    stored = parse_lease(store.get())
+    jsid, jobs = decode_reboot_ran(stored.annotations.get(REBOOT_RAN_KEY))
+    assert jsid == "v1:job" and jobs == {"migrate"}
+    # reload redefines the @reboot job -> new id; run another round.
+    live["id"] = "v2:new"
+    await b._renew_once()
+    stored = parse_lease(store.get())
+    jsid, _jobs = decode_reboot_ran(stored.annotations.get(REBOOT_RAN_KEY))
+    # the stale v1 mark is carried forward UNCHANGED (still tagged v1:job), NOT
+    # re-stamped under v2 -- so a node observing it under v2 ignores it.
+    assert jsid == "v1:job"
+    # and the read path reports the redefined one-shot as NOT run under v2.
+    assert b.reboot_ran("migrate") is False
+
+
+# --- F08: a failed start() leaks nothing (cleans up its half-started state) -
+
+
+async def test_start_cleans_up_transport_when_setup_fails(monkeypatch):
+    # F08: a failed start() (the transport's setup() raises -- a transient
+    # apiserver/credential error) must cancel any task and close the transport,
+    # leaving NOTHING for the caller to leak: start() never returns, so
+    # start_stop_cluster never stores the manager to stop() it. Mirrors the
+    # etcd test_start_closes_session_when_authenticate_fails.
+    b = _backend()
+    monkeypatch.setattr(b, "_native_available", lambda: False)  # -> HTTP
+
+    async def boom(self):
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(_K8sHttpTransport, "setup", boom)
+    with pytest.raises(RuntimeError):
+        await b.start()
+    assert b._transport is None  # closed and cleared: no leaked session/task
+    assert b._task is None
+
+
+# --- F05: an in-place TLS cert/CA rotation is detected for a rebuild --------
+
+
+def test_tls_files_changed_detects_in_place_rotation(tmp_path):
+    # F05: the SSLContext is built once at setup() and never reloaded, so the
+    # backend snapshots its on-disk TLS files and reports a change -- letting
+    # start_stop_cluster rebuild it on a cert-manager/Vault in-place rotation.
+    b = _backend()
+    ca = tmp_path / "ca.crt"
+    ca.write_text("old-ca")
+    b._record_tls_files([str(ca)])
+    assert b.tls_files_changed() is False
+    ca.write_text("rotated-new-ca-bytes")  # in-place rotation (size/mtime)
+    assert b.tls_files_changed() is True
+
+
+def test_tls_files_changed_false_when_nothing_tracked():
+    # embedded -data creds / insecure mode: nothing on disk to rotate.
+    b = _backend()
+    assert b.tls_files_changed() is False  # nothing recorded yet
+    b._record_tls_files([None, ""])  # None/empty entries dropped
+    assert b._tls_files == []
+    assert b.tls_files_changed() is False
+
+
+def test_k8s_is_self_demoted_holder():
+    # F14: raw leadership flag set but the monotonic fence lapsed = the
+    # self-demotion window (still quorate, still names self), which
+    # is_available_leader treats as the never-skip owner.
+    b = _backend()
+    assert b._is_self_demoted_holder() is False  # fresh: never held
+    b._is_leader = True
+    b._leader_until_mono = time.monotonic() - 1  # fence lapsed
+    assert b.is_leader() is False
+    assert b._is_self_demoted_holder() is True
+    b._leader_until_mono = time.monotonic() + 100  # fence valid: real leader
+    assert b._is_self_demoted_holder() is False
+    b._is_leader = False
+    assert b._is_self_demoted_holder() is False

@@ -237,6 +237,22 @@ def _deadline_passed(
     return bool(now >= anchor + datetime.timedelta(seconds=duration))
 
 
+def _file_signature(path: str) -> Optional[Tuple[int, int]]:
+    """A cheap ``(st_mtime_ns, st_size)`` fingerprint of one file, or ``None``.
+
+    ``os.stat`` follows symlinks, so the atomic symlink swap Kubernetes uses
+    for a mounted/projected secret is picked up too.  A stat error (e.g. a file
+    briefly absent mid-rotation) is recorded as ``None`` and simply compares
+    unequal once the file is back -- the safe direction (a spurious rebuild,
+    never a missed one).  Mirrors the gossip backend's ``_tls_file_signature``.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
 def decide_lease_action(
     state: Optional[LeaseState],
     identity: str,
@@ -256,7 +272,7 @@ def decide_lease_action(
       lease duration (see :func:`lease_is_expired`) -> ``acquire`` (take over);
     * someone else holds a still-valid lease -> ``wait``.
 
-    The ``last_holder``/``last_observed_at``/``duration`` guard closes a
+    The ``last_holder``/``last_observed_at``/``duration`` guard narrows a
     two-leaders race when the Lease *object* is deleted out from under a live
     holder (``kubectl delete lease`` / a GC or namespace controller): the
     deletion does not touch the prior holder's local monotonic fence, so it
@@ -267,6 +283,19 @@ def decide_lease_action(
     lease has not yet expired from our clock, we ``wait`` it out first.  (Two
     nodes both creating from a genuinely-absent lease stay fenced by the
     apiserver's ``AlreadyExists`` 409 -> ``write_ok`` False -> not leader.)
+
+    RESIDUAL (by design): this guard only fires for a node that REMEMBERS a
+    prior holder.  A fresh process (no observation history -> ``last_holder``
+    is ``None``) cannot tell a genuinely-empty cluster from a Lease just
+    deleted out from under a live holder, so it creates immediately; if a prior
+    holder is still inside its local fence the two briefly co-lead until that
+    holder's next round observes the recreated Lease and stands down (bounded
+    by its retry period, self-healing).  This residual is inherent to the lease
+    model -- deleting the Lease *object* out-of-band can always produce two
+    momentary leaders -- so the Lease object should not be deleted out of band
+    (its absence is recovered automatically).  It is deliberately NOT closed by
+    making a fresh node defer, which would delay every cold-start election by a
+    full lease duration for a rare, self-healing, externally-triggered window.
     """
     if state is None:
         if (
@@ -454,6 +483,44 @@ class KubernetesBackend(LeaseBackend):
         # 409 each other on the shared resourceVersion (a transient false
         # demotion).
         self._lease_write_lock = asyncio.Lock()
+        # on-disk TLS files this backend's transport loaded (an in-cluster
+        # ca.crt, a kubeconfig's CA / client cert / key, the kubeconfig file
+        # itself). Snapshotted at setup() so an in-place cert/CA rotation
+        # (cert-manager / Vault / a projected secret refresh) is detected and
+        # the backend rebuilt via start_stop_cluster, mirroring the gossip
+        # backend -- the SSLContext is built once at setup(), never reloaded,
+        # so without this a rotated client cert/CA silently and permanently
+        # loses leadership. The bearer token is NOT tracked (it self-heals,
+        # re-read per request; see _auth_headers). Empty until setup() records
+        # them, which keeps tls_files_changed() False (nothing on disk to
+        # rotate: embedded -data creds / insecure mode).
+        self._tls_files: List[str] = []
+        self._tls_signature: Dict[str, Optional[Tuple[int, int]]] = {}
+
+    def _record_tls_files(self, paths: List[Optional[str]]) -> None:
+        """Snapshot the on-disk TLS files the transport loaded.
+
+        Called from a transport's ``setup()``; ``None``/empty entries (embedded
+        ``-data`` creds, ``insecure-skip-tls-verify``) are dropped, so nothing
+        on disk to rotate leaves :meth:`tls_files_changed` ``False``.
+        """
+        self._tls_files = [p for p in paths if p]
+        self._tls_signature = {p: _file_signature(p) for p in self._tls_files}
+
+    def tls_files_changed(self) -> bool:
+        """Whether any tracked on-disk TLS file changed since ``setup()``.
+
+        The SSLContext is built once at setup() and never reloaded, so -- as
+        for the gossip backend -- an in-place cert/CA rotation (same paths, new
+        bytes) is otherwise invisible until the process restarts.  Reporting
+        the change lets :meth:`yacron2.cron.Cron.start_stop_cluster` rebuild
+        this backend with the fresh material.  ``False`` when nothing was
+        tracked (embedded creds / insecure mode: nothing on disk to rotate).
+        """
+        if not self._tls_files:
+            return False
+        current = {p: _file_signature(p) for p in self._tls_files}
+        return current != self._tls_signature
 
     # --- pure local-state reads (no I/O) ---------------------------------
 
@@ -470,6 +537,12 @@ class KubernetesBackend(LeaseBackend):
         # self-demotes with no network call, and no wall-clock step can keep us
         # leader past the point the apiserver has expired the lease.
         return _monotonic() < self._leader_until_mono
+
+    def _is_self_demoted_holder(self) -> bool:
+        # raw leadership flag still set (we hold/held the Lease and have not
+        # observed a takeover) but the monotonic fence has lapsed -- the brief
+        # self-demotion window. See LeadershipBackend._is_self_demoted_holder.
+        return self._is_leader and not self.is_leader()
 
     def leader_name(self) -> Optional[str]:
         if not self.is_quorate():
@@ -997,6 +1070,9 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             self._auth_token = self._read_token(self._token_path)
             ca_path = os.path.join(_SA_DIR, "ca.crt")
             self._ssl = ssl.create_default_context(cafile=ca_path)
+            # track the in-cluster CA so a projected-secret CA rotation
+            # rebuilds the backend (token rotates per-request; see above).
+            self.b._record_tls_files([ca_path])
             self.b.namespace = self.b._resolve_namespace(None)
         except OSError as ex:
             raise ConfigError(
@@ -1096,6 +1172,20 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         )
         if cert and key and self._ssl is not None:
             self._ssl.load_cert_chain(cert, key)
+        # Track the on-disk TLS material a cert-manager/Vault rotation would
+        # renew so start_stop_cluster rebuilds the backend: the kubeconfig
+        # itself (an embedded -data cert rotated by rewriting it) plus any
+        # file-referenced CA / client cert / key. Embedded -data forms resolve
+        # to None paths here and are dropped (a -data change is a kubeconfig
+        # rewrite, caught via the kubeconfig path).
+        self.b._record_tls_files(
+            [
+                self.b.kubeconfig,
+                cluster.get("certificate-authority"),
+                user.get("client-certificate"),
+                user.get("client-key"),
+            ]
+        )
         # This hand-rolled HTTP transport understands only a static bearer
         # token or a client certificate. exec-credential plugins (EKS
         # aws-iam-authenticator, GKE gke-gcloud-auth-plugin) and the legacy
@@ -1274,6 +1364,15 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
             )
         self._api_client = client.ApiClient(config_obj)
         self._api = client.CoordinationV1Api(self._api_client)
+        # Track the kubeconfig (whose referenced/embedded certs the native
+        # client loaded) or the in-cluster CA, so a cert/CA rotation rebuilds
+        # the backend via start_stop_cluster (the native client freezes its
+        # ApiClient cert material at construction, like the HTTP transport's
+        # SSLContext).
+        if self.b.kubeconfig:
+            self.b._record_tls_files([self.b.kubeconfig])
+        else:
+            self.b._record_tls_files([os.path.join(_SA_DIR, "ca.crt")])
         return context_namespace
 
     async def observe(self) -> Optional[Dict[str, Any]]:

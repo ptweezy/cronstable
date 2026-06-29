@@ -224,6 +224,13 @@ def _parse_members(
                 len(name) > max_len or len(instance) > max_len
             ):
                 continue
+            # Drop control-character names/instances: a transitive member's
+            # node_name flows (via conflict_names) into operator-facing log
+            # lines, so a newline/ANSI-bearing value from a CA-vouched-but-
+            # hostile peer is a log-injection vector. Mirror the isprintable()
+            # guard _poll_peer applies to a peer's own scalar identity fields.
+            if not (name.isprintable() and instance.isprintable()):
+                continue
             members.append((name, instance, agreed))
             if max_items is not None and len(members) >= max_items:
                 break
@@ -254,6 +261,11 @@ def _parse_str_list(
         if not isinstance(item, str):
             continue
         if max_len is not None and len(item) > max_len:
+            continue
+        # Drop control-character entries: a gossiped ran_reboot_jobs name can
+        # reach operator logs, so reject a newline/ANSI-bearing value from a
+        # CA-vouched-but-hostile peer (see _parse_members / _poll_peer).
+        if not item.isprintable():
             continue
         out.add(item)
         if max_items is not None and len(out) >= max_items:
@@ -696,12 +708,25 @@ def build_server_ssl_context(tls: Dict[str, str]) -> ssl.SSLContext:
     **dedicated, single-purpose cluster CA**, never a shared organisational CA:
     with a shared CA, any holder of any cert that CA ever signed (an unrelated
     web service, say) can speak to ``/peer`` and ``/reboot-ran`` as a member.
-    Peer-reported state is corroboration-checked (see
-    :meth:`ClusterManager.conflict_names`) so one such cert cannot fabricate a
-    cluster-wide ``Leader`` stand-down, but it can still push ``reboot-ran``
-    suppression and read topology. (A future opt-in could pin the client cert
-    SAN/CN against an allowed-name list; not enabled by default because a
-    peer's cert SAN has no required relationship to its listed address.)
+
+    A holder of a CA-signed cert is a trusted *member*; defending against a
+    hostile or buggy member is out of scope (the Byzantine note in the module
+    docstring). Such a member CAN force a fail-closed ``Leader`` stand-down:
+    the conflict gates (duplicate ``nodeName``, a divergent cluster size or
+    coordination policy) deliberately fail *closed* on any divergence so two
+    nodes never both lead, and a single member declaring a divergent size or
+    policy -- a first-party report about *itself* -- trips them. The
+    ``nodeName`` collision gate corroborates a purely *transitive* (hearsay)
+    report across two peers (see :meth:`ClusterManager.conflict_names`), but a
+    first-party divergence is credited from that one member by design: gating
+    it on corroboration would re-open the split-brain the gate exists to close
+    (two members each declaring a different N, each seeing only the other,
+    would then neither stand down). So the trade-off is a member-level
+    availability DoS, never a correctness break (never a double-run); a hostile
+    member can likewise push ``reboot-ran`` suppression and read topology. (A
+    future opt-in could pin the client cert SAN/CN against an allowed-name
+    list; not enabled by default because a peer's cert SAN has no required
+    relationship to its listed address.)
     """
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH, cafile=tls["ca"])
     ctx.load_cert_chain(tls["cert"], tls["key"])
@@ -1863,6 +1888,19 @@ class ClusterManager(LeadershipBackend):
         ``distribution`` / ``electLeader`` and so picking different owners; see
         :meth:`conflicting_policies`).  All three fail the ``Leader`` gate
         closed.
+
+        The size/policy gates fail closed on a SINGLE agreeing peer's
+        divergent declaration (no corroboration), unlike the ``nodeName`` gate
+        which corroborates a purely *transitive* report.  This is deliberate:
+        a divergent size/policy is a first-party report by that member about
+        itself, and requiring corroboration would re-open the split-brain the
+        gate closes (two members each declaring a different N, each seeing only
+        the other, would neither stand down).  The accepted cost is that a
+        single hostile/buggy CA-vouched member can wedge the ``Leader`` gate
+        closed cluster-wide (a member-level availability DoS, never a
+        double-run) -- the same out-of-scope Byzantine class the module
+        docstring notes, and why a dedicated single-purpose cluster CA matters
+        (see :func:`build_server_ssl_context`).
         """
         return (
             bool(self.conflict_names())
