@@ -35,7 +35,7 @@ root-required check happen per job).
 `command` may be either a string or a list of strings, and the form determines
 how the process is launched (`RunningJob.start` in `yacron2/job.py`):
 
-- **String** — run through a shell.
+- **String**: run through a shell.
   - If `shell` is set, yacron2 launches `asyncio.create_subprocess_exec` with
     argv `[shell, "-c", command]`. With the default `shell` on POSIX, that is
     `["/bin/sh", "-c", command]`.
@@ -43,11 +43,11 @@ how the process is launched (`RunningJob.start` in `yacron2/job.py`):
     with the bare command string. On POSIX the default `/bin/sh` makes the
     `exec`-with-`-c` path the one that runs; on Windows the default `shell` is
     empty (`DEFAULT_SHELL` in `yacron2/platform.py`), so the
-    `create_subprocess_shell` path is the default — the command is handed to the
+    `create_subprocess_shell` path is the default: the command is handed to the
     native command processor `cmd.exe` via `%ComSpec%`. Setting `shell:`
     explicitly on Windows takes the `exec`-with-`-c` path with that interpreter.
     See [Running on Windows](Running-on-Windows).
-- **List** — executed directly with `asyncio.create_subprocess_exec`, with no
+- **List**: executed directly with `asyncio.create_subprocess_exec`, with no
   shell involved. The argv is taken verbatim from the list; no word splitting,
   globbing, quoting, or `$VAR` expansion is performed.
 
@@ -177,7 +177,7 @@ LOG_LEVEL=info
 concatenation. In `mergedicts` (`yacron2/config.py`), the `environment` list is
 special-cased: the default's entries and the job's entries are folded into a
 single key-to-value mapping, with the job's value winning on conflict, then
-re-expanded to a `{key, value}` list. The result has **no duplicate keys** — a
+re-expanded to a `{key, value}` list. The result has **no duplicate keys**: a
 job variable overrides the same-named default rather than appearing twice.
 
 ```yaml
@@ -217,18 +217,18 @@ Resolution happens in `JobConfig._resolve_user_group` (`yacron2/config.py`):
 
 ### Resolution rules
 
-- **`user` as a name (`Str`)** — looked up with `getpwnam`. Sets `uid` from
+- **`user` as a name (`Str`)**: looked up with `getpwnam`. Sets `uid` from
   `pw_uid`, `gid` from `pw_gid` (the user's primary group), and the resolved
   login name (`pw_name`). A missing user raises `ConfigError("User not found: ...")`.
-- **`user` as a number (`Int`)** — `uid` is set to the number directly. yacron2
+- **`user` as a number (`Int`)**: `uid` is set to the number directly. yacron2
   additionally looks the uid up with `getpwuid` to derive the user's **primary
   gid** and **login name**; if `group` was not given, the derived primary gid is
   used (so a numeric `user` without `group` does not silently keep yacron2's
   gid 0). If the uid is not in the passwd database, no login name or derived gid
   is available (and that is not an error here).
-- **`group` as a name (`Str`)** — looked up with `getgrnam`; `gid` set from
+- **`group` as a name (`Str`)**: looked up with `getgrnam`; `gid` set from
   `gr_gid`. A missing group raises `ConfigError("Group not found: ...")`.
-- **`group` as a number (`Int`)** — `gid` is set to the number directly.
+- **`group` as a number (`Int`)**: `gid` is set to the number directly.
 - If only `user` is given, the group defaults to the main group of that user.
   An explicit `group` overrides any gid derived from `user`.
 
@@ -248,7 +248,7 @@ On POSIX, any use of `user` **or** `group` therefore requires yacron2 to run as
 root. yacron2 needs no special privileges otherwise; `user`/`group` switching is
 the only feature that requires root. (On Windows `user`/`group` are rejected
 outright with a configuration error, so this root requirement is a POSIX-only
-statement — see the Windows note above.)
+statement; see the Windows note above.)
 
 ```yaml
 jobs:

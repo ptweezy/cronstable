@@ -10,8 +10,8 @@ reporting, retries, concurrency, metrics, and the HTTP API all behave as in
 0.19 except where a breaking change below says otherwise, and yacron2 1.0.0 adds
 new options on top (e.g. the `web.authToken` and `web.socketMode` keys;
 `web.socketMode` only applies to `unix://` listeners and is therefore
-irrelevant on Windows, where unix-socket listeners are unsupported — see
-[Running on Windows](Running-on-Windows)). The
+irrelevant on Windows, where unix-socket listeners are unsupported (see
+[Running on Windows](Running-on-Windows))). The
 breaking changes below are packaging renames, an interpreter floor, two
 security-relevant default/behavior changes, one merge semantics change, and
 dependency-pin changes. No per-job YAML key was removed, renamed, or retyped;

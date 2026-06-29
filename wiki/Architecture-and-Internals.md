@@ -70,7 +70,7 @@ with `call_soon_threadsafe` and ticking a ~0.25s heartbeat timer so the handler
 runs while the loop is blocked in IOCP. `loop.run_until_complete(cron.run())`
 blocks until the main loop returns. See [Running on Windows](Running-on-Windows).
 
-## `Cron.run` — the scheduler main loop
+## `Cron.run`: the scheduler main loop
 
 `Cron.run` first starts the reaper task:
 
@@ -164,7 +164,7 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 1. Drains pending retries: while `self.retry_state` is non-empty, it
    `cancel_job_retries(name)` for every entry concurrently via
    `asyncio.gather`.
-2. `await self._wait_for_running_jobs_task` — awaits the reaper, which only
+2. `await self._wait_for_running_jobs_task` awaits the reaper, which only
    returns once `self.running_jobs` is empty and the stop event is set.
 3. If a cluster manager is running, logs `"Stopping cluster manager"` and
    `await self.cluster_manager.stop()` (which cancels the poll loop and tears
@@ -174,7 +174,7 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 
 `signal_shutdown` simply calls `self._stop_event.set()`; it is invoked from the
 platform shutdown handler (`SIGINT`/`SIGTERM` on POSIX, Ctrl-C/Ctrl-Break on
-Windows — see "The event loop"). Note that `handle_job_failure` early-returns
+Windows; see "The event loop"). Note that `handle_job_failure` early-returns
 when `_stop_event.is_set()`, so jobs that finish during shutdown are not reported
 as failures and do not schedule new retries.
 
@@ -232,16 +232,16 @@ the leader gate is correct even if the manager is absent.
 
 The `ClusterManager` (in `yacron2/cluster.py`) owns two things:
 
-- **The mTLS `/peer` listener** — its own `aiohttp` `AppRunner` on the `cluster`
+- **The mTLS `/peer` listener**: its own `aiohttp` `AppRunner` on the `cluster`
   `listen` address, with a server SSL context that *requires* a CA-signed client
   cert (`ssl.CERT_REQUIRED`). Its `GET /peer` returns the node's `node_name`,
   `job_set_id`, and `scheme_version` plus the attestation fields the gates run
-  on — `instance_id`, declared `cluster_size`, its `members` observations,
+  on: `instance_id`, declared `cluster_size`, its `members` observations,
   `mutual_agreeing`, and `ran_reboot_jobs` (full schema in
   [Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status)).
   It also accepts `POST /reboot-ran` (the eager `@reboot` push). This listener
   is entirely separate from the public web app.
-- **The poll loop** — every `interval` seconds it polls each peer's `/peer` over
+- **The poll loop**: every `interval` seconds it polls each peer's `/peer` over
   mTLS (a client SSL context with `check_hostname=True`, so the peer cert's SAN
   must match the configured host), and feeds each observation into the pure
   `ClusterView`. TLS/cert failures classify the peer as `untrusted`; connect or
@@ -271,7 +271,7 @@ reassigns the affected jobs.
 See [Clustering and Leader Election](Clustering-and-Leader-Election) for the
 operator-facing model and trust boundary.
 
-## The reaper task — `_wait_for_running_jobs`
+## The reaper task: `_wait_for_running_jobs`
 
 A single long-lived task started by `Cron.run` owns all completion handling. It
 maintains a local `wait_tasks` map from `RunningJob` to an `asyncio.Task`
@@ -341,13 +341,13 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
    then `os.setgid(gid)`, then `os.setuid(uid)`. Any failure raises
    `RuntimeError`. (uid/gid resolution and the "must be root" check happen
    earlier in `JobConfig._resolve_user_group`.) This whole privilege-drop path is
-   POSIX-only — there is no setuid/setgid model on Windows; on Windows
+   POSIX-only: there is no setuid/setgid model on Windows; on Windows
    `user`/`group` config is rejected up front with a configuration error (see
    `start()` above), so `_demote` is never reached.
 
 3. **`wait()`** is what the reaper awaits. If there is no process but
    `start_failed` is set, it synthesizes `retcode = 127` (conventional
-   "command not found"), reads streams, and returns — so a failed launch is a
+   "command not found"), reads streams, and returns, so a failed launch is a
    normal job failure, not a reaper bug. With no deadline it awaits
    `proc.wait()` and then `_on_stop()`. With a deadline it awaits
    `asyncio.wait_for(proc.wait(), timeout)`; on `TimeoutError` it logs the
@@ -393,8 +393,8 @@ write with an ASCII-replacement fallback). For retention it keeps the first
 lines in a bounded `save_bottom` deque, incrementing `discarded_lines` for every
 evicted or never-saved line. A `ValueError` from an over-long line (exceeding
 the buffer `limit`) logs a warning and is skipped. `join()` awaits the reader
-task and returns the assembled text — top lines, an optional
-`"[.... N lines discarded ...]"` marker, then bottom lines — plus the discard
+task and returns the assembled text (top lines, an optional
+`"[.... N lines discarded ...]"` marker, then bottom lines) plus the discard
 count. See [Output Capturing](Output-Capturing).
 
 ## Retry state machine
@@ -447,9 +447,9 @@ currently running `RunningJob` instances, so multiple concurrent runs of one
 job are tracked. `maybe_launch_job` consults `concurrencyPolicy` when an
 instance is already running:
 
-- **`Allow`** — launch another instance (the list grows).
-- **`Forbid`** — return without launching.
-- **`Replace`** — for each currently running instance, set
+- **`Allow`**: launch another instance (the list grows).
+- **`Forbid`**: return without launching.
+- **`Replace`**: for each currently running instance, set
   `running_job.replaced = True` *before* `await running_job.cancel()`, so the
   reaper recognizes the forced termination as a replacement rather than a
   failure (`_handle_finished_job` skips reporting/retries for replaced runs),
@@ -486,10 +486,10 @@ call sites and logged as warnings so telemetry never crashes the scheduler. See
 - Reporters run concurrently per job but failures are isolated.
 - Shutdown is cooperative: a signal sets `_stop_event`, the scheduler stops
   spawning, pending retries are cancelled, and the reaper drains in-flight jobs
-  before the process exits. The trigger is platform-specific —
+  before the process exits. The trigger is platform-specific:
   `SIGINT`/`SIGTERM` on POSIX vs Ctrl-C/Ctrl-Break (`SIGINT`/`SIGBREAK`) on
   Windows, both routed through `platform.install_shutdown_handlers` into
-  `signal_shutdown` -> `_stop_event.set()` — but the finish-running-jobs-first
+  `signal_shutdown` -> `_stop_event.set()`. But the finish-running-jobs-first
   behavior is identical on every OS.
 
 For the broader operational picture see

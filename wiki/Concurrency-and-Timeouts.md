@@ -180,7 +180,7 @@ expiry and by `concurrencyPolicy: Replace`. The sequence is:
 escalation; a child can trap SIGTERM to clean up). On Windows both
 `terminate()` and `kill()` call `TerminateProcess`, an immediate ungraceful
 stop in which the child is *not* notified to clean up, so the escalation is
-effectively moot — `killTimeout` still bounds the wait, but the result is the
+effectively moot: `killTimeout` still bounds the wait, but the result is the
 same hard kill. See [Running on Windows](Running-on-Windows).
 
 `killTimeout` defaults to `30` seconds and must be `>= 0`. A value of `0` is
@@ -188,7 +188,7 @@ valid and means SIGKILL is sent almost immediately after SIGTERM (the
 `asyncio.wait_for` with a zero timeout gives the process essentially no grace
 period). The SIGTERM/SIGKILL escalation is POSIX-specific: on Windows both
 `terminate()` and `kill()` map to `TerminateProcess`, an immediate hard kill in
-which the child is not notified, so the escalation is moot — `killTimeout` still
+which the child is not notified, so the escalation is moot: `killTimeout` still
 bounds the wait, but the outcome is the same hard kill.
 
 `killTimeout` gives a job time to flush buffers and clean up after being asked
