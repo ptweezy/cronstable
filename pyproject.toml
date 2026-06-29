@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yacron2"
-description = "A modern, container-friendly cron replacement."
+description = "A modern, distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
