@@ -151,9 +151,7 @@ def build_reboot_ran_cas_txn(
                 "mod_revision": str(mod_revision),
             }
         ],
-        "success": [
-            {"requestPut": {"key": encoded, "value": _b64(value)}}
-        ],
+        "success": [{"requestPut": {"key": encoded, "value": _b64(value)}}],
         "failure": [],
     }
 
