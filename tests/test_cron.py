@@ -1791,6 +1791,37 @@ async def test_deferred_reboot_runs_on_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_deferred_reboot_records_before_launch(monkeypatch):
+    # At-most-once crash safety: the deferred-@reboot owner MUST record
+    # intent-to-run (mark_reboot_ran, which eagerly gossips/persists) BEFORE
+    # spawning the job. A crash in a launch->record window would leave no
+    # peer/store aware it ran, so a failover owner would re-run a Leader
+    # one-shot (a double-run). Pin the RELATIVE ORDER, not just the end state,
+    # so swapping the two production lines (launch then record) fails here.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    events = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: events.append("launch") or _noop(),
+    )
+    mgr = _reboot_mgr(leader="node-a")  # we are the owner
+    orig_mark = mgr.mark_reboot_ran
+
+    async def _recording_mark(name):
+        events.append("record")
+        await orig_mark(name)
+
+    mgr.mark_reboot_ran = _recording_mark
+    job = _reboot_job()
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron.cluster_manager = mgr
+    await cron._process_pending_reboots()
+    assert events == ["record", "launch"]
+
+
+@pytest.mark.asyncio
 async def test_deferred_reboot_leader_runs_when_identity_differs(monkeypatch):
     # H3 regression: a lease backend reports leader_name() as the holder's
     # display *identity* (e.g. cluster.kubernetes.identity), which may

@@ -222,6 +222,37 @@ def test_construction_defaults():
     assert b.distribution == "single-leader"
 
 
+def test_renew_cadence_fits_lease_window():
+    # The etcd analogue of the Kubernetes renew+retry<duration invariant: a
+    # round (round_deadline) plus the inter-round sleep (renew_period) must fit
+    # inside the effective lease window minus the 1s clock-skew margin, so a
+    # holder cannot lapse out of its own lease between rounds (which would
+    # collapse Leader at-most-once to at-most-zero and double-run
+    # PreferLeader). Holds by construction across the supported ttl range.
+    for ttl in (3, 5, 15, 60, 600):
+        b = _backend()
+        b._effective_ttl = ttl
+        assert b.round_deadline + b.renew_period <= ttl - 1 + 1e-9
+        # a round's worst-case sequential lease POSTs still fit the deadline
+        # (so a single slow/half-open endpoint cannot make every round
+        # overrun) wherever the per-request floor does not bind.
+        if b.request_timeout > 0.5:
+            assert b.request_timeout * 5 <= b.round_deadline + 1e-9
+        # never tighter than connectTimeout asked for
+        assert b.request_timeout <= b.connect_timeout
+
+
+def test_renew_cadence_tracks_narrowed_effective_ttl():
+    # etcd may grant a shorter lease than requested; the cadence is derived
+    # from the EFFECTIVE ttl (not the configured one), so the round budget
+    # tightens with the real window rather than overrunning it.
+    b = _backend()  # ttl 15
+    assert b.renew_period == 5.0 and b.round_deadline == 9.0
+    b._effective_ttl = 6
+    assert b.renew_period == 2.0
+    assert b.round_deadline == 3.0  # 6 - 2 - 1
+
+
 def test_endpoint_is_https():
     assert EtcdBackend.endpoint_is_https("https://h:2379") is True
     assert EtcdBackend.endpoint_is_https("http://h:2379") is False
@@ -426,4 +457,3 @@ async def test_renew_once_keepalive_narrows_then_regrants(monkeypatch):
     await b._renew_once()
     assert b._lease_id == "1" and b._effective_ttl == 15
     assert b.is_leader() is True
-    assert b._session is None

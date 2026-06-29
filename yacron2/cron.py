@@ -830,6 +830,14 @@ class Cron:
                 logger.info("cluster: %s, stopping", reason)
                 await mgr.stop()
                 self.cluster_manager = None
+                # The transition flags track the OLD manager's last-logged
+                # state; reset them so the first _log_cluster_role against the
+                # replacement (or against no manager) reflects a clean
+                # transition rather than suppressing or duplicating a log line.
+                self._was_leader = False
+                self._was_quorate = False
+                self._was_conflict = False
+                self._was_size_conflict = False
         if cluster_config is not None and self.cluster_manager is None:
             # Emit non-fatal advisories here (only when a manager is actually
             # (re)started) rather than at parse time, which runs every reload

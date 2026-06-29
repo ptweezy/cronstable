@@ -870,28 +870,38 @@ class ClusterManager(LeadershipBackend):
                 runner, host, port, ssl_context=self._server_ssl
             )
             await site.start()
+            self._runner = runner
+            # one session for the manager's lifetime: peer polls and reboot-ran
+            # pushes reuse it (and its kept-alive mTLS connections) instead of
+            # opening a fresh session -- and re-handshaking -- every round.
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=self.config["connectTimeout"]
+                )
+            )
+            logger.info(
+                "cluster: node %r serving mTLS /peer on %s, polling %d "
+                "peer(s) every %ds",
+                self.node_name,
+                self.config["listen"],
+                len(self.config["peers"]),
+                self.config["interval"],
+            )
+            self._poll_task = asyncio.create_task(self._poll_loop())
         except BaseException:
             # bad listen address (ValueError) or bind failure (OSError, e.g.
-            # the port is already in use) after the runner was set up -- and
-            # cancellation -- must not leak the half-started runner.
+            # the port is already in use) after the runner was set up -- and a
+            # failure creating the session or poll task, and cancellation --
+            # must not leak the half-started runner/session/task.
+            if self._poll_task is not None:
+                self._poll_task.cancel()
+                self._poll_task = None
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
             await runner.cleanup()
+            self._runner = None
             raise
-        self._runner = runner
-        # one session for the manager's lifetime: peer polls and reboot-ran
-        # pushes reuse it (and its kept-alive mTLS connections) instead of
-        # opening a fresh session -- and re-handshaking -- every round.
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.config["connectTimeout"])
-        )
-        logger.info(
-            "cluster: node %r serving mTLS /peer on %s, polling %d peer(s) "
-            "every %ds",
-            self.node_name,
-            self.config["listen"],
-            len(self.config["peers"]),
-            self.config["interval"],
-        )
-        self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
         self._stop.set()
