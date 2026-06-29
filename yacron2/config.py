@@ -1095,7 +1095,10 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         raise ConfigError(
             "cluster.kubernetes.apiServer must be an https:// URL so the "
             "ServiceAccount bearer token is not sent in cleartext; got "
-            "{!r}".format(api_server)
+            # redact any embedded userinfo: a non-https apiServer carrying
+            # credentials (http://tok:secret@host) is echoed into this
+            # ConfigError, which the reload loop logs -- never leak the secret.
+            "{!r}".format(_redact_userinfo(str(api_server)))
         )
     duration = k8s["leaseDurationSeconds"]
     renew = k8s["renewDeadlineSeconds"]
@@ -1162,18 +1165,42 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
     return ClusterConfig(cfg)
 
 
+def _url_has_userinfo(url: str) -> bool:
+    """Whether ``url``'s authority carries ``user[:pass]@`` userinfo.
+
+    Robust to a scheme-less ``user:pass@host:port`` (which urlparse misreads as
+    scheme ``user`` with no username/password), so a credentialed endpoint is
+    detected -- and rejected/redacted -- regardless of whether a scheme is
+    present.  Userinfo only appears in the authority, before the first ``/``.
+    """
+    rest = url.partition("://")[2] or url
+    authority = rest.partition("/")[0]
+    return "@" in authority
+
+
 def _redact_userinfo(url: str) -> str:
-    """Replace ``user:pass@`` userinfo in ``url`` with ``***@`` for logs."""
-    parsed = urlparse(url)
-    if parsed.username is None and parsed.password is None:
+    """Replace ``user:pass@`` userinfo in ``url`` with ``***@`` for logs.
+
+    Deliberately does NOT rely on ``urlparse(...).username``: a scheme-less
+    ``user:pass@host`` parses as scheme ``user`` with username/password both
+    ``None``, so trusting that would echo the secret verbatim (the leak this
+    helper exists to prevent).  Instead the authority is located directly and
+    any userinfo it carries is redacted, so the credential never reaches a log
+    whether or not a scheme is present.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        # scheme-less: urlparse would misread the userinfo as the scheme.
+        scheme, rest = "", url
+    authority, slash, path = rest.partition("/")
+    if "@" not in authority:
         return url
-    after = url.split("://", 1)[1] if "://" in url else url
-    # Split on the LAST '@' (as urlparse does): userinfo ends at the final
-    # '@', so a password that itself contains '@' (e.g. user:p@ss@host) must
-    # not be split on its first '@', which would leave a tail of the secret
-    # ('ss@host') in the "redacted" string -- the leak this helper prevents.
-    hostpart = after.rsplit("@", 1)[1] if "@" in after else after
-    return "{}://***@{}".format(parsed.scheme, hostpart)
+    # Split on the LAST '@': userinfo ends at the final '@', so a password that
+    # itself contains '@' (e.g. user:p@ss@host) is not split on its first '@',
+    # which would leave a tail of the secret ('ss@host') in the output.
+    hostpart = authority.rsplit("@", 1)[1]
+    prefix = "{}://".format(scheme) if scheme else ""
+    return "{}***@{}{}{}".format(prefix, hostpart, slash, path)
 
 
 def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
@@ -1218,7 +1245,11 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         # scheme/port would otherwise fall into the scheme/port branch and
         # the raw password; here it is always redacted. Use the structured
         # cluster.etcd.username/password fields instead.
-        if parsed.username is not None or parsed.password is not None:
+        if _url_has_userinfo(endpoint):
+            # _url_has_userinfo (not parsed.username) so a scheme-less
+            # user:pass@host -- which urlparse misreads as scheme 'user' with
+            # no userinfo -- is still caught here and redacted, instead of
+            # falling through to the scheme/port branch carrying cleartext.
             raise ConfigError(
                 "cluster.etcd.endpoints must not embed credentials in the URL "
                 "(userinfo@host); use cluster.etcd.username/password instead, "

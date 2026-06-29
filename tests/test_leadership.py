@@ -403,3 +403,81 @@ def test_make_backend_gossip_dispatch():
     # files in __init__ -> OSError. We only assert the dispatch path is taken.
     with pytest.raises(OSError):
         make_backend(cfg, lambda: "v1:x")
+
+
+# --- F06: store-read @reboot-ran set is re-gated on the live job set -------
+
+
+def test_observed_reboot_ran_dropped_on_read_after_job_set_change():
+    # F06: _reboot_ran is scoped to the job-set id at OBSERVE time, but a
+    # reload that redefines an @reboot job changes the live id WITHOUT a
+    # re-observe (the cluster section is unchanged, so the backend is reused).
+    # The READ path must re-gate on the live id, or a stale store-read mark
+    # makes reboot_ran() report the redefined one-shot as already-run and the
+    # scheduler silently drops it (cron retires it logging "already ran").
+    live = {"id": "v1:js"}
+    b = _FakeLease()
+    b.get_job_set_id = lambda: live["id"]
+    b._observe_reboot_ran("v1:js", {"migrate"})  # follower reads the holder's
+    assert b.reboot_ran("migrate") is True
+    # reload redefines the @reboot job -> new id, before the next renew round
+    # re-observes under it.
+    live["id"] = "v2:new"
+    assert b.reboot_ran("migrate") is False  # stale store set dropped on read
+    # a subsequent observe under the new id repopulates correctly
+    b._observe_reboot_ran("v2:new", {"migrate"})
+    assert b.reboot_ran("migrate") is True
+
+
+# --- F14: the lapsed-but-quorate former holder keeps running PreferLeader --
+
+
+class _DemotableLease(LeaseBackend):
+    """A lease backend whose self-demotion state is set explicitly."""
+
+    def __init__(self, *, quorate, is_leader, holder, demoted):
+        super().__init__({"nodeName": "node-a"}, lambda: "v1:js")  # type: ignore[arg-type]
+        self._quorate = quorate
+        self._leader_flag = is_leader
+        self._holder = holder
+        self._demoted = demoted
+
+    async def start(self):  # pragma: no cover - not exercised
+        ...
+
+    async def stop(self):  # pragma: no cover - not exercised
+        ...
+
+    def is_leader(self):
+        return self._leader_flag
+
+    def leader_name(self):
+        return self._holder if self._quorate else None
+
+    def is_quorate(self):
+        return self._quorate
+
+    def _is_self_demoted_holder(self):
+        return self._demoted
+
+
+def test_self_demoted_holder_keeps_running_preferleader():
+    # F14: in the holder's self-demotion window (fence lapsed a clock-skew
+    # margin before the server frees the lease, next renew not yet landed) it
+    # is still quorate and still names ITSELF holder, but is_leader() is
+    # already False. Without the _is_self_demoted_holder gate it defers its OWN
+    # PreferLeader job while every follower also defers (they still see the old
+    # holder), so the never-skip job runs on ZERO nodes that tick.
+    demoted = _DemotableLease(
+        quorate=True, is_leader=False, holder="node-a", demoted=True
+    )
+    assert demoted.is_available_leader() is True
+
+
+def test_quorate_follower_still_defers_when_not_self_demoted():
+    # The F14 gate must NOT make a genuine follower run: quorate, sees a real
+    # other holder, not in its own self-demotion window -> still defers.
+    follower = _DemotableLease(
+        quorate=True, is_leader=False, holder="node-b", demoted=False
+    )
+    assert follower.is_available_leader() is False

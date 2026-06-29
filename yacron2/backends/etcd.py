@@ -46,6 +46,17 @@ logger = logging.getLogger("yacron2.backends.etcd")
 _CLOCK_SKEW = datetime.timedelta(seconds=1)
 _SKEW_SECONDS = _CLOCK_SKEW.total_seconds()
 
+# The smallest *effective* lease ttl that still leaves a usable leader window.
+# The fence is (effective_ttl - clock skew), so below this the window collapses
+# toward zero and a node that wins the campaign immediately self-demotes
+# (Leader -> at-most-zero: fail-closed/safe, but no Leader job runs on this
+# node). config.py rejects a CONFIGURED ttl below this; etcd can still GRANT or
+# keepalive a shorter one, which the backend honours for the fence -- never
+# inflating it back up (which would keep is_leader() True past the real server
+# lease and let a second node win the freed key) -- while warning. Kept in sync
+# with config.py's etcd ttl floor.
+_MIN_USABLE_TTL = 3
+
 # Worst-case number of sequential HTTP POSTs a single renew *cycle* can make,
 # each of which may waste a full per-request timeout on a half-open endpoint
 # before failing over: keepalive (or grant), campaign, then the reboot-ran
@@ -269,8 +280,13 @@ class EtcdBackend(LeaseBackend):
         self.ttl: int = etcd["ttl"]
         # the TTL the lease deadline is actually computed from -- etcd may
         # grant/refresh a shorter one (see lease_ttl_from_grant); starts at the
-        # configured value and is narrowed by each grant/keepalive.
+        # configured value and is narrowed by each grant/keepalive (see
+        # _narrow_effective_ttl).
         self._effective_ttl: int = self.ttl
+        # whether the effective ttl is currently below _MIN_USABLE_TTL, so the
+        # warning/recovery in _narrow_effective_ttl is logged once per
+        # transition rather than every renew round.
+        self._ttl_collapsed: bool = False
         self.username: Optional[str] = etcd["username"]
         self.password: Optional[str] = etcd.get("resolved_password")
         self._tls: Dict[str, Optional[str]] = etcd["tls"]
@@ -317,15 +333,18 @@ class EtcdBackend(LeaseBackend):
         Mirrors the Kubernetes backend's ``renewDeadline``: a round is
         abandoned (and retried) before the lease window can close, leaving room
         for the inter-round :attr:`renew_period` sleep *inside* the effective
-        ttl.  Because ``round_deadline + renew_period == effective_ttl -
-        clock_skew`` by construction, the gap between two successive successful
-        contacts always stays within the lease window, so a slow round cannot
-        make the holder lapse out of its own lease -- the at-most-once ->
-        at-most-zero collapse the Kubernetes ``renew + retry < duration``
-        invariant guards against.  Derived from the (floored, >= 3s) effective
-        ttl, and :attr:`request_timeout` is in turn derived from *this* (no
-        absolute floor), so the per-cycle POST budget always fits regardless of
-        ttl -- including a server-granted ttl below the configured value.
+        ttl.  While the effective ttl is at or above ``_MIN_USABLE_TTL``,
+        ``round_deadline + renew_period <= effective_ttl - clock_skew`` by
+        construction, so the gap between two successive successful contacts
+        stays within the lease window and a slow round cannot make the holder
+        lapse out of its own lease -- the at-most-once -> at-most-zero collapse
+        the Kubernetes ``renew + retry < duration`` invariant guards against.
+        (At a smaller server-granted ttl the 1s floors here can exceed that
+        budget, but the fence has by then already collapsed to ~zero so the
+        node is not leading anyway -- fail-closed, never two leaders; see
+        :meth:`_narrow_effective_ttl`.)  :attr:`request_timeout` is in turn
+        derived from this round deadline (no absolute floor), so the per-cycle
+        POST budget always fits regardless of ttl.
         """
         return max(
             1.0, self._effective_ttl - self.renew_period - _SKEW_SECONDS
@@ -372,6 +391,12 @@ class EtcdBackend(LeaseBackend):
         # keep us "leader" past the point etcd has expired the key.
         return _monotonic() < self._lease_deadline_mono
 
+    def _is_self_demoted_holder(self) -> bool:
+        # raw win flag still set (we won the campaign and have not observed a
+        # loss) but the monotonic fence has lapsed -- the brief self-demotion
+        # window. See LeadershipBackend._is_self_demoted_holder.
+        return self._is_leader and not self.is_leader()
+
     def leader_name(self) -> Optional[str]:
         if not self.is_quorate():
             return None
@@ -396,6 +421,39 @@ class EtcdBackend(LeaseBackend):
                 else None
             ),
         }
+
+    def _narrow_effective_ttl(self, ttl: int) -> None:
+        """Adopt a server-granted/keepalived ttl for the cadence and fence.
+
+        etcd may grant or refresh a lease ttl below the requested one; honour
+        it so the local fence never outlives the real server lease.  We do NOT
+        floor it back up to the configured minimum: inflating the fence past
+        the server's lease would keep :meth:`is_leader` ``True`` after etcd has
+        freed the key, letting a second node win it (two leaders).  When the
+        honoured ttl is too small to leave a usable leader window (below
+        ``_MIN_USABLE_TTL``) the fence collapses to ~zero and Leader jobs fail
+        closed on this node -- safe, but otherwise silent -- so surface a
+        warning once per transition (and a recovery once it returns).
+        """
+        effective = max(1, min(self.ttl, ttl))
+        usable = effective >= _MIN_USABLE_TTL
+        if not usable and not self._ttl_collapsed:
+            logger.warning(
+                "cluster: etcd granted a lease ttl of %ds, below the %ds "
+                "needed for a usable leader window; Leader jobs will not run "
+                "on this node until etcd returns a larger ttl (check etcd's "
+                "--min-lease-ttl and load)",
+                effective,
+                _MIN_USABLE_TTL,
+            )
+        elif usable and self._ttl_collapsed:
+            logger.info(
+                "cluster: etcd lease ttl recovered to %ds; leader window "
+                "restored",
+                effective,
+            )
+        self._ttl_collapsed = not usable
+        self._effective_ttl = effective
 
     def _apply_round(
         self,
@@ -468,7 +526,19 @@ class EtcdBackend(LeaseBackend):
             # state -- the genuine "store unreachable" case.
             try:
                 await asyncio.wait_for(self._renew_once(), self.round_deadline)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as ex:
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                # ValueError covers the binascii.Error a base64 decode of a
+                # malformed election-key value (from a non-conformant gateway)
+                # raises in _campaign, OUTSIDE _post's catch. The renew LOOP
+                # already swallows it via its broad `except Exception`; the
+                # initial round must too, or it hits `except BaseException`
+                # below and aborts the whole manager start -- wedging leader
+                # gating off until the next reload. Keeps start() best-effort.
+                ValueError,
+            ) as ex:
                 logger.warning("cluster: etcd initial round failed: %s", ex)
             logger.info(
                 "cluster: etcd backend, identity %r, election key %r, "
@@ -690,12 +760,12 @@ class EtcdBackend(LeaseBackend):
                 lease_mono = None  # re-anchored before the grant POST below
             else:
                 # honour the TTL etcd refreshed to (may be < requested)
-                self._effective_ttl = max(1, min(self.ttl, ttl))
+                self._narrow_effective_ttl(ttl)
         if self._lease_id is None:
             lease_mono = _monotonic()
             self._lease_id, granted = await self._grant_lease()
             if granted is not None:
-                self._effective_ttl = max(1, min(self.ttl, granted))
+                self._narrow_effective_ttl(granted)
         if self._lease_id is None:
             raise aiohttp.ClientError("etcd lease grant returned no id")
         holder, won = await self._campaign(self._lease_id)
@@ -757,7 +827,19 @@ class EtcdBackend(LeaseBackend):
             kvs = resp.get("kvs") or []
             if kvs and kvs[0].get("value") is not None:
                 raw: Optional[str] = _b64decode(kvs[0]["value"])
-                mod_revision = str(kvs[0].get("mod_revision") or "0")
+                # accept BOTH wire spellings: the etcd gRPC-gateway JSON can
+                # marshal multi-word KV fields as snake_case OR camelCase (the
+                # same reason holder_from_txn_response/campaign_won accept
+                # response_range AND responseRange). Reading only mod_revision
+                # would fall back to "0" on a camelCase gateway, making the
+                # MOD==0 compare against an EXISTING key never succeed, so the
+                # CAS contends out and the @reboot-ran mark is never persisted
+                # -- re-running a deferred one-shot after a failover.
+                mod_revision = str(
+                    kvs[0].get("mod_revision")
+                    or kvs[0].get("modRevision")
+                    or "0"
+                )
             else:
                 raw = None
                 mod_revision = "0"  # absent key: compare MOD == 0 succeeds
