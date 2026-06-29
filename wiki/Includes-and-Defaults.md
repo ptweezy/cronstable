@@ -9,7 +9,7 @@ settings inherit from defaults. All behavior here is implemented in
 ## Config loading entry points
 
 yacron2 resolves the `-c`/`--config` argument (default `/etc/yacron2.d` on
-POSIX, `%APPDATA%\yacron2` on Windows — falling back to `~` if APPDATA is
+POSIX, `%APPDATA%\yacron2` on Windows, falling back to `~` if APPDATA is
 unset; see [CLI Reference](CLI-Reference) and [Running on Windows](Running-on-Windows))
 through `parse_config(config_arg)`:
 
@@ -23,7 +23,7 @@ through `parse_config(config_arg)`:
 A single file is read as UTF-8, validated against `CONFIG_SCHEMA` with
 strictyaml, and parsed by `parse_config_string`. The top level accepts an empty
 document (`EmptyDict()`) or a mapping with the optional keys `defaults`, `jobs`,
-`web`, `include`, and `logging` (all `Opt(...)` — none is required). See the
+`web`, `include`, and `logging` (all `Opt(...)`, none is required). See the
 [Configuration Reference](Configuration-Reference) for the per-job and `web`
 schemas, and [Logging Configuration](Logging-Configuration) for the `logging`
 schema.
@@ -33,7 +33,7 @@ schema.
 When `-c` points at a directory, `_parse_config_dir` enumerates the directory's
 entries with `os.scandir` and processes them in sorted filename order (sorting
 makes job ordering and "first config found" error messages deterministic rather
-than dependent on filesystem order — a fix new in 1.0.4).
+than dependent on filesystem order, a fix new in 1.0.4).
 
 For each entry, the name is split into base and extension:
 
@@ -108,15 +108,15 @@ Within a single parsed file (`parse_config_string`), each job's effective
 configuration is built by successively merging with `mergedicts`, in this order
 (later wins):
 
-1. `DEFAULT_CONFIG` — the built-in defaults (e.g. `shell: /bin/sh` on POSIX
+1. `DEFAULT_CONFIG`: the built-in defaults (e.g. `shell: /bin/sh` on POSIX
    (empty on Windows, which routes a string `command` through %ComSpec%/cmd.exe;
    see [Running on Windows](Running-on-Windows)), `captureStderr: true`,
    `utc: true`, `killTimeout: 30`; full list in the
    [Configuration Reference](Configuration-Reference)).
-2. **Included files' defaults** — the `defaults` blocks of any files named by
+2. **Included files' defaults**: the `defaults` blocks of any files named by
    this file's `include` directive, merged together in include order.
 3. **This file's `defaults` block.**
-4. **Per-job overrides** — the keys set on the individual job.
+4. **Per-job overrides**: the keys set on the individual job.
 
 Each job dict is `mergedicts(defaults, config_job)`, where `defaults` is
 `mergedicts(mergedicts(DEFAULT_CONFIG, included_defaults), this_files_defaults)`.
@@ -200,7 +200,7 @@ including file as follows:
   retro-apply to jobs that came from an included file.
 - **Defaults** from included files are merged together (in include order) into
   `inc_defaults_merged`, which is folded into the merge precedence at step 2
-  above — i.e. included defaults affect only this file's **inline** jobs, not
+  above, i.e. included defaults affect only this file's **inline** jobs, not
   the included files' own jobs.
 - **`web`** from an included file is adopted if this file has none; if both
   define `web`, parsing raises `ConfigError("multiple web configs")`.
@@ -251,7 +251,7 @@ directly or transitively, raises a clear
 `ConfigError("include cycle detected at <path>")` instead of recursing until a
 `RecursionError` (a fix new in 1.0.4). The `_seen` set is scoped to a single
 top-level `parse_config_file` call (it starts empty), so two independent files
-that both include a common fragment are **not** flagged as a cycle — diamond
+that both include a common fragment are **not** flagged as a cycle: diamond
 includes are allowed; only true cycles are rejected.
 
 In directory mode, `_seen` is *not* shared across the directory's files: each
@@ -259,10 +259,10 @@ file in the directory is parsed with its own fresh cycle-detection state.
 
 ## Related pages
 
-- [Configuration Reference](Configuration-Reference) — full option schema and
+- [Configuration Reference](Configuration-Reference): full option schema and
   built-in defaults.
-- [Commands and Environment](Commands-and-Environment) — `environment` and
+- [Commands and Environment](Commands-and-Environment): `environment` and
   `env_file`.
-- [Reporting](Reporting) — Sentry `fingerprint` and the report blocks.
-- [Logging Configuration](Logging-Configuration) — the `logging` section.
-- [CLI Reference](CLI-Reference) — the `-c` argument and `--validate-config`.
+- [Reporting](Reporting): Sentry `fingerprint` and the report blocks.
+- [Logging Configuration](Logging-Configuration): the `logging` section.
+- [CLI Reference](CLI-Reference): the `-c` argument and `--validate-config`.

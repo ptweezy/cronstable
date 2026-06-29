@@ -56,7 +56,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config
 | Scheme | Form | Requirements |
 | --- | --- | --- |
 | `http` | `http://host:port` | Both host and port are required. An `http` URL missing either is logged as a warning (`Ignoring web listen url ...: http url needs host and port`) and skipped. |
-| `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. POSIX-only: on Windows `UnixSite` is unavailable (no `create_unix_server` on the Proactor loop), so such a URL is skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform` — use an `http://` listener instead. |
+| `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. POSIX-only: on Windows `UnixSite` is unavailable (no `create_unix_server` on the Proactor loop), so such a URL is skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. |
 
 Any other scheme is logged (`scheme ... not supported`) and skipped. Binding maps to
 `web.TCPSite` for `http` and `web.UnixSite` for `unix` (`web_site_from_url` in
@@ -161,7 +161,7 @@ Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
 (`gossip`, `kubernetes`, or `etcd`; new in 1.2.0) and the node's view: its
 `node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
 `elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
-whether any conflict is pausing `Leader` jobs (`conflict`) — a duplicate
+whether any conflict is pausing `Leader` jobs (`conflict`): a duplicate
 `nodeName` (with the offending names in `conflict_names`) and/or an agreeing peer
 declaring a different cluster size (`size_conflict`, with those divergent sizes
 in `conflicting_sizes`), whether this node is `quorate`, the elected `leader`
@@ -175,7 +175,7 @@ The **lease backends** (`kubernetes` / `etcd`) have no static peer set, so their
 view is lease-shaped: `backend` names the backend, `peers` is empty, `conflict`/
 `size_conflict` are always `false`, `cluster_size`/`quorum` are `1`,
 `elect_leader` is `true`, `distribution` is `single-leader`, and an extra
-`lease` block carries the backend-specific detail — for `kubernetes`
+`lease` block carries the backend-specific detail: for `kubernetes`
 `{name, namespace, identity, holder, expiry}`, for `etcd`
 `{electionName, identity, holder, leaseId, expiry}`. `quorate` is whether the
 node has a fresh successful read of the lease store (stale → `Leader` fails
@@ -337,7 +337,7 @@ If `fromFile` cannot be read (`OSError`), yacron2 also raises a `ConfigError`
 
 ## Unix socket permissions
 
-> **Windows:** this entire feature is POSIX-only — it depends on `unix://`
+> **Windows:** this entire feature is POSIX-only. It depends on `unix://`
 > sockets (which Windows does not support) and on `chmod`. On Windows
 > `socketMode` has no effect and `unix://` listen URLs are skipped with a
 > warning; use an `http://` listener. See [Running on Windows](Running-on-Windows).
@@ -392,9 +392,9 @@ configuration (the new config is not applied).
 
 ## See also
 
-- [Web Dashboard](Web-Dashboard) — the built-in browser UI served by this interface.
-- [Clustering and Leader Election](Clustering-and-Leader-Election) — the `GET /cluster` view and the separate mTLS `/peer` endpoint.
-- [Running on Windows](Running-on-Windows) — `unix://` listeners and `socketMode`
+- [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
+- [Clustering and Leader Election](Clustering-and-Leader-Election): the `GET /cluster` view and the separate mTLS `/peer` endpoint.
+- [Running on Windows](Running-on-Windows): `unix://` listeners and `socketMode`
   behave differently on Windows.
 - [Configuration Reference](Configuration-Reference)
 - [CLI Reference](CLI-Reference)

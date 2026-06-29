@@ -29,8 +29,8 @@ elected leader firing scheduled jobs. It builds directly on the
 ## Choosing a backend
 
 `cluster.backend` selects how leadership is decided. All three present the same
-**per-job** seam to the scheduler — `clusterPolicy` (`Leader` / `PreferLeader` /
-`EveryNode`) means the same thing on every backend — so you pick a point on the
+**per-job** seam to the scheduler: `clusterPolicy` (`Leader` / `PreferLeader` /
+`EveryNode`) means the same thing on every backend, so you pick a point on the
 CAP trade-off without changing how jobs are written. What differs is the
 *coordination* underneath, and therefore how the cluster is **observed**: the
 gossip backend exposes a peer table, quorum count, and conflict gates, while the
@@ -48,14 +48,14 @@ panel and `GET /cluster` render each shape accordingly (see
 | Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd |
 
 How the lease backends talk to their store: **over plain HTTP using the core
-`aiohttp` dependency** — the Kubernetes apiserver's REST API and etcd's v3
+`aiohttp` dependency**, namely the Kubernetes apiserver's REST API and etcd's v3
 gRPC-gateway JSON API. So the **core install gains no new dependency**, and by
 avoiding grpc/protobuf wheels both backends run on the full set of architectures
 yacron2 ships for. The Kubernetes backend can optionally use the **official
 `kubernetes` client** when it is installed
 (`pip install yacron2[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
 (the default) prefers it when importable and otherwise falls back to the
-hand-rolled REST transport — so the choice is automatic per architecture
+hand-rolled REST transport, so the choice is automatic per architecture
 (`library` requires the client, `http` forces the hand-rolled path). etcd always
 uses its own v3 JSON gateway, so it has no optional client.
 
@@ -67,14 +67,14 @@ uses its own v3 JSON gateway, so it has no optional client.
   logically a single holder (`cluster_size` / `quorum` report `1`), and
   `GET /cluster` returns a lease-shaped view (a `lease` block with the holder
   and expiry; an empty `peers` array).
-* **The lease is the fence — not a name.** Leadership is decided by the
+* **The lease is the fence, not a name.** Leadership is decided by the
   *lease*, so a duplicate node identity cannot make two nodes both lead the way
   it can on a naive lease holder: etcd fences on the **bound lease id** (only
   the node whose own lease backs the election key leads), and Kubernetes writes
   a **per-process `holderIdentity` token** so two nodes sharing a `nodeName`
   still write distinct holders. You should still give each node a stable, unique
-  name for clear observability — see
-  [Node identity](#node-identity-for-the-lease-backends).
+  name for clear observability (see
+  [Node identity](#node-identity-for-the-lease-backends)).
 * **Local-expiry safety.** A holder only calls itself leader until a
   *locally-computed* lease deadline (renew time + duration, minus a small
   clock-skew margin), so a node whose renew loop stalls self-demotes **without a
@@ -83,7 +83,7 @@ uses its own v3 JSON gateway, so it has no optional client.
   reach** the coordination store runs a `PreferLeader` job anyway (it may
   double-run); a healthy follower that **can** see the holder defers. `Leader`
   stays fail-closed: it skips while the store is unreachable. This is the
-  deliberate, documented trade — a `PreferLeader` job never skips, at the cost of
+  deliberate, documented trade: a `PreferLeader` job never skips, at the cost of
   a possible double-run during a store outage.
 * **`distribution: spread` is rejected** at config load (a hard `ConfigError`,
   not a silent fallback). A single lease holder cannot also be a per-job owner;
@@ -109,7 +109,7 @@ semantics in [Per-job policy](#per-job-policy), however, apply to every backend.
 | Coordination | none | observe-only attestation | quorum-gated election |
 | mTLS identity required | no | yes | yes |
 | Endpoint | none | `GET /cluster`, `GET /peer` | `GET /cluster`, `GET /peer` |
-| Double-running | n/a | yes (by design) | no for `Leader` jobs in a converged, fully-connected quorum (best-effort — a thin bridge, a same-`N` membership change, or the ~one-`interval` window after a partition can still let two nodes both lead; see [Guarantees and trade-offs](#guarantees-and-trade-offs)) |
+| Double-running | n/a | yes (by design) | no for `Leader` jobs in a converged, fully-connected quorum (best-effort: a thin bridge, a same-`N` membership change, or the ~one-`interval` window after a partition can still let two nodes both lead; see [Guarantees and trade-offs](#guarantees-and-trade-offs)) |
 
 ## The job-set id foundation
 
@@ -161,17 +161,17 @@ The trust model is deliberately small and keeps no shared state:
   nodes the CA vouches for are ever attested. Standard TLS hostname verification
   provides that SAN pinning: the cert presented by `yacron-b.internal:8443`
   must carry `yacron-b.internal` as a Subject Alternative Name. The CA is the
-  *whole* authentication boundary — yacron2 trusts any cert it signs to assert
-  its identity and gossip state — so it **must** be a dedicated, closed CA
+  *whole* authentication boundary (yacron2 trusts any cert it signs to assert
+  its identity and gossip state), so it **must** be a dedicated, closed CA
   issued only to yacron2 nodes, **not** a shared service-mesh or
   organisation-wide CA (any cert that CA admits can otherwise fabricate the
-  `/peer` payload below — fake agreement, trip the conflict gate, or suppress an
+  `/peer` payload below: fake agreement, trip the conflict gate, or suppress an
   `@reboot` job). Provision the certificates from your own dedicated PKI (a
   private cert-manager issuer, an internal CA); yacron2 only consumes them. The
   same per-node cert/key is used both to serve `/peer` and to authenticate as a
   client when polling peers. An **in-place
   renewal** of these files (same paths, new bytes) is detected and applied
-  automatically, with no restart — see [Certificate rotation](#certificate-rotation).
+  automatically, with no restart (see [Certificate rotation](#certificate-rotation)).
 * **Each node keeps its own view.** No node is authoritative: two healthy nodes
   converge to the same picture, and any disagreement is itself the signal.
 * **Drift is debounced.** A reachable peer whose id differs is only reported as
@@ -192,7 +192,7 @@ dashboard panel carries one of these statuses (the constants live in
 | `unreachable` | Connect/timeout/`OSError`: the peer could not be contacted this round. |
 | `untrusted` | TLS/certificate verification failed: the peer is not (or not provably) a cluster member. |
 | `self` | The peer reported *this* node's own `nodeName` **and** its own instance id (an operator listed this node's own address in its peer list). It never counts toward agreement. |
-| `conflict` | The peer reported this node's `nodeName` but a *different* instance id — a **duplicate `nodeName`** (two nodes sharing a name). It never counts toward agreement, and while any conflict is visible `Leader` jobs fail closed. See [Unique node names](#unique-node-names). |
+| `conflict` | The peer reported this node's `nodeName` but a *different* instance id: a **duplicate `nodeName`** (two nodes sharing a name). It never counts toward agreement, and while any conflict is visible `Leader` jobs fail closed. See [Unique node names](#unique-node-names). |
 | `unknown` | Not yet contacted (the initial state before the first poll). |
 
 A peer reported as `unreachable` or `untrusted` resets its drift streak, because
@@ -223,7 +223,7 @@ Every field after the first three is load-bearing for a safety check described
 on this page (mutual agreement, the bridge mitigation, the duplicate-`nodeName`
 and cluster-size conflict gates, `@reboot` de-duplication). A consequence worth
 calling out: **any peer the cluster CA admits can read the full member graph,
-agreement graph, and `@reboot` run state** off `/peer` — and could fabricate
+agreement graph, and `@reboot` run state** off `/peer`, and could fabricate
 those fields. So the cluster CA must be a dedicated, closed boundary issued only
 to yacron2 nodes, **not** a shared service-mesh or organisation-wide CA.
 
@@ -271,7 +271,7 @@ on any node.
   not merely assumed.
 * If you accidentally list a node's own address in its own peer list, that entry
   is recognised at runtime as `self`, never counts toward agreement, and is
-  **excluded from the cluster size** — so a self-listing is harmless: it neither
+  **excluded from the cluster size**, so a self-listing is harmless: it neither
   changes `N`/quorum nor (since `N` stays equal to what other nodes declare)
   trips the size-consistency check below.
 * The computed size, quorum, elected leader, and whether this node is the leader
@@ -281,7 +281,7 @@ on any node.
 
 The quorum gate is what makes this safe with **no shared state**. Two strict
 majorities of `N` cannot be disjoint, so under a clean network partition at most
-one side is quorate, and therefore — within about one poll `interval` — **at
+one side is quorate, and therefore (within about one poll `interval`) **at
 most one leader exists**. (That qualifier matters: a leader just cut off from
 the majority keeps acting on its last, now-stale view until its *own* next poll,
 so for up to one `interval` a clean partition can briefly **double-run** a
@@ -296,7 +296,7 @@ given firing only while a majority of the cluster is up and mutually reachable.
 
 The safety argument above assumes every node has a **distinct `nodeName`**. If
 two nodes shared one, each would compute itself as the lowest name in its live
-set and *both* would elect themselves — a silent double-run, exactly what
+set and *both* would elect themselves: a silent double-run, exactly what
 election is meant to prevent. So `nodeName` uniqueness is a correctness
 requirement, not just a nicety.
 
@@ -304,18 +304,18 @@ yacron2 enforces it at runtime. Each process mints a random **instance id** at
 startup and reports it on `/peer` alongside its `nodeName`. That lets a node
 distinguish two cases that otherwise look identical:
 
-* a **benign self-listing** — an operator put this node's own address in its
-  own peer list — where the peer reports *this* node's name *and* its own
+* a **benign self-listing** (an operator put this node's own address in its
+  own peer list), where the peer reports *this* node's name *and* its own
   instance id (status `self`); from
-* a **duplicate `nodeName`** — a *different* process announcing this node's
-  name — where the instance id differs (status `conflict`). A third node can
+* a **duplicate `nodeName`** (a *different* process announcing this node's
+  name), where the instance id differs (status `conflict`). A third node can
   likewise spot two distinct instances claiming one name.
 
 > **This detection is best-effort.** It relies on some node being able to see
-> both copies — directly, or transitively by unioning peers' reported member
+> both copies, directly, or transitively by unioning peers' reported member
 > lists (one hop). Two copies of a duplicated `nodeName` that sit in **disjoint
 > partitions** (no single node can observe both, even transitively) cannot be
-> reconciled, so each side stays quorate and **both lead** — the same residual
+> reconciled, so each side stays quorate and **both lead**, the same residual
 > class as a same-`N` membership swap (see
 > [Consistent cluster size](#consistent-cluster-size)). So treat unique
 > `nodeName`s as something to **enforce** (distinct cert SANs, the orchestrator's
@@ -325,7 +325,7 @@ While any `conflict` is visible, this node's **`Leader` jobs fail closed**
 (stand down) instead of risking a double-run, and the conflict is surfaced as a
 `conflict` flag on [`GET /cluster`](#observing-the-cluster), a banner in the
 dashboard cluster panel, and an `ERROR` log line. It clears automatically once
-the duplicate is renamed — the gate is self-healing. `PreferLeader` is *not*
+the duplicate is renamed: the gate is self-healing. `PreferLeader` is *not*
 gated on conflicts: it already accepts double-runs as the price of never
 skipping. The default `nodeName` (the system hostname) is already unique per
 host; set an explicit, unique `nodeName` when several nodes might share a
@@ -335,11 +335,11 @@ hostname (e.g. identical container images without distinct hostnames).
 
 The safety argument also assumes every node uses the **same cluster size `N`**.
 "Two strict majorities of `N` cannot be disjoint" is only true for a *single*
-`N` — two majorities of *different* sizes **can** be disjoint. But `N` is each
+`N`: two majorities of *different* sizes **can** be disjoint. But `N` is each
 node's own `len(peers) + 1`, and the [job-set fingerprint](#the-job-set-id-foundation)
 deliberately covers job *definitions* only, **not** the peer list. So two nodes
 with divergent peer lists still see each other `agreed`, each reaches a quorum
-under its *own* `N`, and **both** elect themselves — a silent double-run. An
+under its *own* `N`, and **both** elect themselves: a silent double-run. An
 ordinary cluster **resize** (say rolling 3 → 5 nodes) triggers exactly this:
 mid-roll, the old nodes still carry `N = 3` (quorum 2) while the new ones carry
 `N = 5` (quorum 3), so the old `{a, b}` and new `{c, d, e}` groups are each
@@ -350,13 +350,13 @@ reports its declared `N` on `/peer`, and a peer that **agrees on the job set but
 declares a different `N`** is treated as a first-class `conflict`: this node's
 `Leader` jobs **fail closed** until the cluster reconverges on one `N`. Because a
 resize leaves the job set unchanged, the divergent nodes *are* mutually `agreed`
-and therefore each observe the mismatch — both sides stand down, so no firing
+and therefore each observe the mismatch: both sides stand down, so no firing
 double-runs while the roll-out is in flight. The conflict is surfaced as the
 `size_conflict` / `conflicting_sizes` fields on
 [`GET /cluster`](#observing-the-cluster), a banner in the dashboard cluster
 panel, and an `ERROR` log line, and clears automatically once every node's
 `peers` agree on the member set. As with a `nodeName` conflict, `PreferLeader`
-is *not* gated — it already accepts double-runs as the price of never skipping.
+is *not* gated: it already accepts double-runs as the price of never skipping.
 
 > **Note:** the check compares the declared size `N`, which catches every
 > *resize* (the documented failure above). It does not detect a same-`N` but
@@ -497,23 +497,23 @@ Under `distribution: spread`, described next, the last two lines become "the
 ### `@reboot` jobs under leader election
 
 `@reboot` fires once at startup, which is the one instant the cluster has *not*
-yet converged — no peer has been polled, so there is no quorum and no elected
+yet converged: no peer has been polled, so there is no quorum and no elected
 owner. Running a leader-gated `@reboot` job immediately would misfire: a
 `Leader` job would see no quorum and skip *forever* (`@reboot` never re-fires),
 and a `PreferLeader` job would see only itself on every node and run *everywhere*.
 So under `electLeader` an `@reboot` job with `Leader` or `PreferLeader` policy is
-**deferred** — held until the cluster converges, then run **once** on the owner
+**deferred**: held until the cluster converges, then run **once** on the owner
 that policy resolves to. The deferral exists only to get past that boot-time
 "every node sees only itself" window; **which owner runs it, and whether it runs
 at all without a quorum, follows the job's policy exactly as for a scheduled
 firing**:
 
 * **`Leader`** runs on the **quorum-gated** elected owner. If no quorum ever
-  forms, the deferred job **does not run** (the at-most-once trade — a skip is
+  forms, the deferred job **does not run** (the at-most-once trade: a skip is
   preferred to a double-run), and it also stands down while a `nodeName`/size
   conflict is visible.
-* **`PreferLeader`** runs on the **quorum-free** availability owner — the lowest
-  reachable agreeing node — so it **always resolves to some node and runs even
+* **`PreferLeader`** runs on the **quorum-free** availability owner (the lowest
+  reachable agreeing node), so it **always resolves to some node and runs even
   with no quorum** (an isolated or minority node runs it itself), exactly
   mirroring `PreferLeader`'s never-skip contract for scheduled jobs. The price,
   as ever for `PreferLeader`, is a possible double-run across a partition.
@@ -524,13 +524,13 @@ deferred.
 
 A deferred `@reboot` one-shot is **never silently lost across a reload**.
 Deferral only happens at the boot instant, so a job whose name momentarily
-disappears from the loaded config before the cluster converges — a templating
-glitch, or a remove-then-re-add seen mid-reload — is **kept pending**, not
+disappears from the loaded config before the cluster converges (a templating
+glitch, or a remove-then-re-add seen mid-reload) is **kept pending**, not
 dropped, and runs once the name comes back. The launch is always gated on the
 name being present *and* still a `Leader`/`PreferLeader` `@reboot`, so:
 
 * a job you **deliberately remove** from the config (and leave removed) never
-  runs — its name stays absent;
+  runs, since its name stays absent;
 * a name **reused** for a different `@reboot` job runs the *current* definition,
   never the one captured at boot; and if the reused job is no longer a deferrable
   `@reboot` (it became `EveryNode`, or a real schedule), the original one-shot is
@@ -650,7 +650,7 @@ leader-gated job in [`GET /jobs`](HTTP-API).
 The JSON above is the **gossip** shape. A lease backend returns a lease-shaped
 view instead: `backend` names the backend, `peers` is `[]`,
 `cluster_size`/`quorum` are `1`, `conflict`/`size_conflict` are always `false`,
-and an extra `lease` block carries the holder and expiry — for `kubernetes`
+and an extra `lease` block carries the holder and expiry: for `kubernetes`
 `{name, namespace, identity, holder, expiry}`, for `etcd`
 `{electionName, identity, holder, leaseId, expiry}`. There `quorate` means the
 node has a *fresh read of the lease store* (see
@@ -672,21 +672,21 @@ probes that endpoint on each replica. Useful alerts:
 | Alert when | Field(s) | Means |
 | --- | --- | --- |
 | `quorate` is `false` for more than a few `interval`s | `quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
-| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes` | a duplicate `nodeName` or a cluster-size disagreement is pausing `Leader` jobs — page on this |
+| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes` | a duplicate `nodeName` or a cluster-size disagreement is pausing `Leader` jobs (page on this) |
 | `agreed` peers fall below `quorum − 1` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum |
-| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation — see [Certificate rotation](#certificate-rotation)) |
+| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
 
 A blackbox / JSON-exporter probe (Prometheus `json_exporter`, a Nagios check,
 etc.) scraping `GET /cluster` on every replica covers all of these. The same
-transitions are also **logged** — leadership and quorum changes, conflict
+transitions are also **logged** (leadership and quorum changes, conflict
 onset at `ERROR` (clear at `INFO`), and per-peer `untrusted`/`unreachable`/drift
-at `WARNING` — so a log-based alert is a viable second source.
+at `WARNING`), so a log-based alert is a viable second source.
 
 ### Detecting a double-run
 
 The [best-effort guarantee](#guarantees-and-trade-offs) admits narrow windows
 where two nodes each run the same `Leader` firing (a thin bridge, a >1-hop
-gossip gap, or mid-convergence). This is **not** caught by the `conflict` flag —
+gossip gap, or mid-convergence). This is **not** caught by the `conflict` flag:
 that flag is only for a duplicate `nodeName` or a size disagreement, and by
 construction the two transient leaders cannot see each other, so neither one's
 `GET /cluster` shows anything wrong (each reports `is_leader: true`). There is
@@ -719,7 +719,7 @@ there are narrow windows where behaviour degrades:
 * **Just after a leader dies**, a `Leader` firing may be *skipped* until the
   survivors notice (up to one `interval`) and re-elect.
 * **A leader partitioned away while still alive** keeps electing itself on its
-  last (now-stale) view until its *own* next poll fails — up to one `interval` —
+  last (now-stale) view until its *own* next poll fails (up to one `interval`),
   overlapping the majority's re-election, so a clean partition can briefly
   **double-run** a `Leader` firing, not only skip one. It self-heals once the
   cut-off node re-polls and stands down.
@@ -727,23 +727,23 @@ there are narrow windows where behaviour degrades:
   other can each stay quorate through shared members that *bridge* them. The
   election turns that bridge from cause into cure: each side discovers the other
   through the shared members' gossip and, once it can confirm the other is
-  itself quorate, the lower `nodeName` wins on both sides — so a bridge of at
+  itself quorate, the lower `nodeName` wins on both sides, so a bridge of at
   least `quorum - 1` shared members collapses two would-be leaders back to one.
   A node only ever elects a leader it can confirm is itself quorate, so in a
   *converged* view a **healthy majority is not silently stood down** (it elects
   a node that actually runs). Two deliberate trades come with that liveness:
   two quorate nodes whose bridge is *thinner* than `quorum - 1` shared members,
   are more than one gossip hop apart, or are still converging may each elect
-  themselves and **double-run** a `Leader` job; and symmetrically — because
-  bridge confirmation is only as fresh as the witnesses' last gossip — a
+  themselves and **double-run** a `Leader` job; and symmetrically (because
+  bridge confirmation is only as fresh as the witnesses' last gossip) a
   confirmed candidate that has since become isolated can briefly draw the
   majority into deferring to it, a transient **skip** until the stale gossip
   ages out (~1–2 `interval`s). `spread` behaves the same per job. (Choosing
-  instead to *fail closed* on the double-run — skip rather than double-run —
+  instead to *fail closed* on the double-run (skip rather than double-run)
   would require a lease/consensus store; see below.)
 * **While a resize is rolling out**, nodes briefly disagree on the cluster size
   `N`; `Leader` jobs across the whole cluster stand down (fail closed) until
-  every node's `peers` agree again — the at-most-once-preserving trade-off (see
+  every node's `peers` agree again, the at-most-once-preserving trade-off (see
   [Consistent cluster size](#consistent-cluster-size)).
 * A `PreferLeader` job **may double-run** across a partition (that is the point
   of the policy: it never skips).
@@ -758,35 +758,35 @@ windows at the cost of more polling traffic.
 
 The `gossip` backend builds its mTLS contexts **once**, when the cluster manager
 starts, and loads the CA/cert/key into memory. A long-running process would
-therefore keep serving its *old* certificate after an in-place renewal — the
-exact pattern cert-manager, Vault, and Kubernetes mounted-secret refreshes use
-(same file paths, new bytes) — until the old cert expires and peers begin
+therefore keep serving its *old* certificate after an in-place renewal (the
+exact pattern cert-manager, Vault, and Kubernetes mounted-secret refreshes use,
+same file paths, new bytes) until the old cert expires and peers begin
 rejecting each other, losing quorum **fleet-wide** and all at once.
 
 yacron2 closes this automatically. On each config-reload pass (every minute, at
 the top of the minute), it compares the on-disk CA, cert, and key against what
 it loaded at startup; if any changed, it **restarts the cluster manager** to
 rebuild the TLS contexts with the new material. So an in-place rotation needs
-**no manual restart** — yacron2 picks it up within ~1 minute and reloads
+**no manual restart**: yacron2 picks it up within ~1 minute and reloads
 seamlessly. (`os.stat` follows symlinks, so the atomic symlink swap Kubernetes
 uses for mounted secrets is detected too.) This is `gossip`-only; the lease
 backends do not use per-node mTLS certs.
 
 Before applying a detected rotation, yacron2 first **dry-runs loading** the new
-CA/cert/key into fresh SSL contexts. If they are not yet loadable — a
+CA/cert/key into fresh SSL contexts. If they are not yet loadable (a
 half-written or briefly-absent cert observed mid-rotation, since cert-manager,
-Vault, and Kubernetes secret refreshes are not atomic across all three files —
+Vault, and Kubernetes secret refreshes are not atomic across all three files),
 it **keeps the running manager** (still serving the valid old cert) and retries
 on the next reload, logging a `WARNING`, rather than tearing the cluster down
 and then failing the rebuild. So a transient bad write costs nothing:
 `Leader`/`PreferLeader` jobs keep running on the old, valid cert until the new
 material lands cleanly. (yacron2 does *not* build the replacement manager before
-stopping the old one — both would bind the same `listen` port — so this
+stopping the old one, since both would bind the same `listen` port, so this
 dry-run, not a make-before-break swap, is what keeps the rotation restart safe.)
 
 > **Detection caveat.** Change is detected by comparing each file's
 > `(modification time, size)`. Essentially every renewal tool rewrites the bytes
-> and bumps the mtime, so this is reliable in practice — but a tool that
+> and bumps the mtime, so this is reliable in practice, but a tool that
 > produces a **byte-length-identical** file *and* preserves/resets the mtime
 > (some restore-from-backup or `touch`-style flows) would be missed. If you use
 > such a flow, restart the process after rotation instead.
@@ -825,17 +825,17 @@ and the cluster loses quorum until trust overlaps again.
 
 If peers start showing `untrusted` on `GET /cluster` (or the
 `peer … is untrusted` `WARNING` appears in the logs) after a rotation, certs and
-CA trust have diverged — typically a CA roll that skipped the overlap step, or a
+CA trust have diverged: typically a CA roll that skipped the overlap step, or a
 node whose refresh lagged. Recovery does **not** require restarts:
 
-* Restore the trust overlap — push a CA bundle that includes whichever CA the
-  still-`untrusted` peers were issued from — or finish rolling the lagging nodes
+* Restore the trust overlap (push a CA bundle that includes whichever CA the
+  still-`untrusted` peers were issued from), or finish rolling the lagging nodes
   onto the new CA.
 * Each node reloads within ~1 minute; once certs chain to a trusted CA again,
   peers return to `agreed` and quorum is restored automatically.
 
 `Leader` jobs stand down (fail closed) while quorum is lost, so the cascade
-**skips** firings rather than double-running them — there is no split-brain risk
+**skips** firings rather than double-running them: there is no split-brain risk
 during the recovery, only the missed-firing cost until trust reconverges.
 
 ## Operating the lease backends (Kubernetes and etcd)
@@ -855,7 +855,7 @@ renewing it":
 * **Kubernetes** drives a single `coordination.k8s.io/v1` `Lease`. The holder
   writes its identity into `spec.holderIdentity` and refreshes `spec.renewTime`
   every `retryPeriodSeconds`; if it stops, another node observes the lease go
-  stale and takes it over — the standard client-go leader-election algorithm.
+  stale and takes it over, the standard client-go leader-election algorithm.
   The takeover deadline is anchored to *the challenger's own clock from the
   moment it first saw the record* (client-go's `observedTime`), so it is
   **immune to clock skew** between holder and challenger: a fast clock cannot
@@ -868,7 +868,7 @@ renewing it":
 
 Both gate `is_leader()` on a **locally-computed** lease deadline (renew/keepalive
 time + duration − a 1 s clock-skew margin), so a node whose renew loop stalls
-**self-demotes with no network call** — that local expiry, not the store, is what
+**self-demotes with no network call**: that local expiry, not the store, is what
 guarantees two holders never act at once. Separately, `is_quorate()` reflects
 whether the node has a *fresh successful read* of the store (within one lease
 duration / TTL); when it goes stale, `Leader` jobs fail closed and the never-skip
@@ -878,19 +878,19 @@ duration / TTL); when it goes stale, `Leader` jobs fail closed and the never-ski
 > deadline**, not to the `is_quorate` **freshness window** (the full duration /
 > TTL, no margin). So a follower's *view of who leads* can briefly lag a dead
 > holder by up to one freshness window, while the would-be leader has already
-> self-demoted — bounded and self-healing, and `PreferLeader` never skips during
+> self-demoted: bounded and self-healing, and `PreferLeader` never skips during
 > it.
 
 ### Node identity for the lease backends
 
 Leadership is fenced on the **lease**, but each node still carries an identity:
 
-* **etcd** — the value written at the election key is `cluster.nodeName` (there
+* **etcd**: the value written at the election key is `cluster.nodeName` (there
   is no separate `etcd.identity` key). Leadership is decided on the **bound
   lease id**, not this string, so even two nodes sharing a `nodeName` cannot both
   lead (only the node whose lease backs the key is leader); a shared name only
   makes the *displayed* holder ambiguous.
-* **Kubernetes** — `cluster.kubernetes.identity` (defaulting to `nodeName`) is
+* **Kubernetes**: `cluster.kubernetes.identity` (defaulting to `nodeName`) is
   the human-readable holder; yacron2 appends a **per-process token** to the
   `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes
   sharing an identity still write distinct holders and cannot both renew. The
@@ -898,7 +898,7 @@ Leadership is fenced on the **lease**, but each node still carries an identity:
   `kubectl get lease … -o jsonpath='{.spec.holderIdentity}'` shows the suffixed
   form, while the dashboard shows the clean name).
 
-A duplicate identity therefore no longer silently breaks the fence — but give
+A duplicate identity therefore no longer silently breaks the fence, but give
 each node a **stable, unique name** anyway so the holder shown in the dashboard,
 `kubectl get lease`, or `etcdctl get` unambiguously names one node. In Kubernetes
 both a Deployment and a StatefulSet give each pod a unique hostname; a
@@ -906,7 +906,7 @@ StatefulSet's ordinals just make the holder name predictable across restarts.
 
 ### Kubernetes (`backend: kubernetes`)
 
-No mTLS, no peer list, no odd-replica rule — the apiserver is the authority, not
+No mTLS, no peer list, no odd-replica rule: the apiserver is the authority, not
 a quorum, so a plain `Deployment` with any replica count works:
 
 ```yaml
@@ -944,7 +944,7 @@ cluster:
 * **Transport (`clientLibrary`).** `auto` (default) uses the official
   `kubernetes` client when it is importable (`pip install yacron2[kubernetes]`)
   and otherwise falls back to a hand-rolled apiserver REST transport over the
-  core `aiohttp` dependency — so on an architecture without the client it still
+  core `aiohttp` dependency, so on an architecture without the client it still
   works. `http` forces the REST transport; `library` **requires** the native
   client and fails the backend start (the node then fails closed) if it is not
   importable. Both transports drive the same Lease, so the choice is purely
@@ -972,7 +972,7 @@ cluster:
 ```
 
 * **Transport.** Speaks etcd's v3 gRPC-gateway JSON/HTTP API directly over
-  `aiohttp` — no `etcd3`/grpc client, so no extra dependency and full
+  `aiohttp`: no `etcd3`/grpc client, so no extra dependency and full
   architecture coverage. There is no optional native-client extra for etcd.
 * **Authentication.** For an auth-enabled cluster set `username` and resolve the
   `password` from exactly one of `value` / `fromFile` / `fromEnvVar` (like
@@ -992,7 +992,7 @@ cluster:
 * **Store unreachable** (apiserver / etcd down, or partitioned from this node).
   Within one duration / TTL the node's `is_quorate()` goes stale, so its
   `Leader` jobs **fail closed** (skip) and its `PreferLeader` jobs **run anyway**
-  (the never-skip rule — they may double-run across the outage). When the store
+  (the never-skip rule: they may double-run across the outage). When the store
   returns, leadership re-establishes within ~one duration. This is the lease
   backends' one double-run exposure, and it is the documented `PreferLeader`
   trade, not a fence break.
@@ -1002,7 +1002,7 @@ cluster:
   will never find two while the store is healthy.
 * **Kubernetes optimistic concurrency.** Writes carry the observed
   `resourceVersion`; a node that loses the race gets an HTTP `409`, stands down
-  for that round, and retries. The graceful release is best-effort — if it races
+  for that round, and retries. The graceful release is best-effort: if it races
   a concurrent write the handover may instead wait out `leaseDurationSeconds`.
 * **etcd lease loss.** If a keepalive reports the lease gone (TTL ≤ 0) the holder
   re-grants a fresh lease and re-campaigns, becoming leader again only if it
@@ -1010,8 +1010,8 @@ cluster:
 
 ### Monitoring the lease backends
 
-The gossip alerts on the [Monitoring](#monitoring-and-alerting) table — per-peer
-status, agreed-peers-vs-quorum, `untrusted` certs, the multi-leader scrape — **do
+The gossip alerts on the [Monitoring](#monitoring-and-alerting) table (per-peer
+status, agreed-peers-vs-quorum, `untrusted` certs, the multi-leader scrape) **do
 not apply**: a lease view has `peers: []`, `quorum: 1`, and `conflict` is always
 `false`, and a fenced backend never reports two leaders. The signal that matters
 is **`quorate`**:
@@ -1034,7 +1034,7 @@ unknown until a fresh read); a `PreferLeader` `@reboot` runs on **this** node
 when the store is unreachable (a possible boot-time double-run); `EveryNode` is
 not deferred. There is **no cross-node "already ran" gossip** on a lease backend
 (it is a single-holder store), so a non-owner replica simply does not run the
-deferred one-shot — the holder does.
+deferred one-shot: the holder does.
 
 ## Running multiple replicas on Kubernetes
 
@@ -1043,7 +1043,7 @@ double-running jobs:
 
 * **`backend: kubernetes` (recommended on Kubernetes).** A `coordination.k8s.io`
   `Lease` gives a **fenced, exactly-once** election with no mTLS, no peer list,
-  and no odd-replica requirement — a plain `Deployment` works. See
+  and no odd-replica requirement: a plain `Deployment` works. See
   [Kubernetes (`backend: kubernetes`)](#kubernetes-backend-kubernetes) above and
   [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes).
 * **`backend: gossip` on a StatefulSet.** If you do not want to grant `Lease`
@@ -1118,8 +1118,8 @@ has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 
 ## See also
 
-- [Configuration Reference](Configuration-Reference) — the `cluster` section and `clusterPolicy` option schema.
-- [HTTP Control API](HTTP-API) — the `GET /cluster` endpoint.
-- [Web Dashboard](Web-Dashboard) — the cluster panel and per-job policy display.
-- [Production and Container Deployment](Production-Deployment) — running multiple replicas under Kubernetes.
-- [Architecture and Internals](Architecture-and-Internals) — where `cluster.py` fits in the daemon.
+- [Configuration Reference](Configuration-Reference): the `cluster` section and `clusterPolicy` option schema.
+- [HTTP Control API](HTTP-API): the `GET /cluster` endpoint.
+- [Web Dashboard](Web-Dashboard): the cluster panel and per-job policy display.
+- [Production and Container Deployment](Production-Deployment): running multiple replicas under Kubernetes.
+- [Architecture and Internals](Architecture-and-Internals): where `cluster.py` fits in the daemon.

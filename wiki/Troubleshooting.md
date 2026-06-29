@@ -31,7 +31,7 @@ exist. See [Running on Windows](Running-on-Windows).
 **Fix.** Create `/etc/yacron2.d/` and place `*.yaml`/`*.yml` files in it, or pass an
 explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows the
 default location to create and populate is `%APPDATA%\yacron2` rather than
-`/etc/yacron2.d` — see [Running on Windows](Running-on-Windows). Note the error
+`/etc/yacron2.d`; see [Running on Windows](Running-on-Windows). Note the error
 text is only emitted for the *default* path; an explicit `-c` pointing at a missing
 file instead surfaces as a `ConfigError` (see below). The default changed from
 `/etc/yacron.d` to `/etc/yacron2.d` in 1.0.0; if you upgraded from yacron, move your
@@ -79,7 +79,7 @@ start it unpacks its embedded Python runtime into a temporary directory and load
 shared libraries from there, so it needs a temp directory that is both **writable**
 and **executable**. Under a read-only root filesystem (a hardened container), `/tmp`
 is read-only too, and the unpack/exec fails. This requirement is unique to the
-standalone binary — the published container image and `pip`/`pipx` installs run
+standalone binary. The published container image and `pip`/`pipx` installs run
 yacron2 as an ordinary Python package and never self-extract.
 
 **Fix.** Provide a small writable, executable temp mount. With Docker, note that
@@ -123,9 +123,9 @@ passwd-database behavior below are therefore all POSIX-only (they require the
 **Fix.** Run the daemon as root if you need per-job privilege drop, or remove the
 `user`/`group` fields from the job. Related `ConfigError`s from the same code path:
 
-- `User not found: '<user>'` — a string `user` is not in the passwd database
+- `User not found: '<user>'`: a string `user` is not in the passwd database
   (`getpwnam` raised `KeyError`).
-- `Group not found: '<group>'` — a string `group` is not in the group database.
+- `Group not found: '<group>'`: a string `group` is not in the group database.
 
 A numeric `user` without an explicit `group` derives its primary gid (and login name,
 used for supplementary groups) from the passwd database; if the uid is not in the
@@ -145,8 +145,8 @@ web.authToken is configured but resolved to an empty token; refusing to start th
 ```
 
 **Cause.** `_resolve_web_token` fails closed. If `authToken` is present but resolves
-to an empty string — an unset `fromEnvVar`, an empty/missing `fromFile`, or an empty
-`value` — it raises `ConfigError` rather than silently serving the control API
+to an empty string (an unset `fromEnvVar`, an empty/missing `fromFile`, or an empty
+`value`), it raises `ConfigError` rather than silently serving the control API
 unauthenticated. A `fromFile` that cannot be read raises
 `web.authToken.fromFile could not be read: …`. If `authToken` is entirely absent, the
 API listens without auth (this is the default).
@@ -179,7 +179,7 @@ use an `http://` listener instead. See [Running on Windows](Running-on-Windows).
 `unix://` path, and resolve the bind error. For a `unix://` socket on a read-only
 root filesystem, point it at a writable volume and optionally set `web.socketMode`
 (octal string) for permissions. This `unix://`/`web.socketMode` guidance is
-POSIX-only — on Windows unix sockets are unavailable and `socketMode` is irrelevant
+POSIX-only: on Windows unix sockets are unavailable and `socketMode` is irrelevant
 (it only ever applies to unix sockets); on Windows use an `http://` listener. See
 [Running on Windows](Running-on-Windows).
 
@@ -229,8 +229,8 @@ are treated "as if they aren't there" apart from config validation:
 
 **Symptom.** A schedule object that pins `year` still runs in other years.
 
-**Cause — confirmed behavior.** `_parse_schedule` builds a five-field crontab string
-from `minute`, `hour`, `dayOfMonth`, `month`, and `dayOfWeek` only — it never reads
+**Cause (confirmed behavior).** `_parse_schedule` builds a five-field crontab string
+from `minute`, `hour`, `dayOfMonth`, `month`, and `dayOfWeek` only; it never reads
 the `year` key:
 
 ```text
@@ -270,7 +270,7 @@ uses local time only when `utc: false` (the default `utc` is `true`, i.e. UTC). 
 including a common file are *not* flagged (the set is scoped per top-level parse).
 
 **Fix.** Break the include cycle. Remember that a top-level `defaults` block does not
-retro-apply to jobs pulled in via `include` — included jobs arrive fully constructed
+retro-apply to jobs pulled in via `include`; included jobs arrive fully constructed
 with only their own file's defaults. See
 [Includes, Defaults, and Multi-File Config](Includes-and-Defaults).
 
@@ -307,7 +307,7 @@ such as `failsWhen=nonzeroReturn and retcode=<n>` or
 A job whose command cannot be launched at all (for example, the executable does not
 exist) is reported as an ordinary failure with exit code `127`, not an internal error.
 Note `producesStderr`/`producesStdout` only apply when the corresponding stream is
-captured — and they also fire when output was *discarded* (`saveLimit: 0` still counts
+captured, and they also fire when output was *discarded* (`saveLimit: 0` still counts
 discarded lines as output).
 
 **Fix.** Adjust `failsWhen`. To stop stderr from marking a job failed, set
@@ -435,7 +435,7 @@ N seconds (recorded internally as retcode `-100`). Cancellation sends `SIGTERM`,
 
 **Windows note.** The `SIGTERM`-then-`SIGKILL` escalation is POSIX behavior
 (`terminate()` = `SIGTERM`, graceful and trappable; `kill()` = `SIGKILL`, forceful).
-Windows has no POSIX signals — both `terminate()` and `kill()` call `TerminateProcess`,
+Windows has no POSIX signals: both `terminate()` and `kill()` call `TerminateProcess`,
 an immediate ungraceful stop. The child is not notified to clean up, so the
 terminate->kill escalation is effectively moot (`killTimeout` still bounds the wait,
 but the outcome is the same hard kill). See [Running on Windows](Running-on-Windows).

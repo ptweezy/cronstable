@@ -46,8 +46,8 @@ yacron2 --version
 
 ### Standalone binary (no Python required)
 
-Every release attaches self-contained executables —
-`yacron2-windows-amd64.exe` (x64) and `yacron2-windows-arm64.exe` (ARM64) — on
+Every release attaches self-contained executables
+(`yacron2-windows-amd64.exe` (x64) and `yacron2-windows-arm64.exe` (ARM64)) on
 the [releases page](https://github.com/ptweezy/yacron2/releases). Python is
 **not** required on the target system; the interpreter is embedded in the
 executable. Download the asset for your architecture, then run it:
@@ -62,7 +62,7 @@ self-extracting executable; for the writable-and-executable temp-directory
 detail (which matters only under unusual locked-down filesystems) see
 [Installation](Installation).
 
-There is no Windows container image — the published Docker image is Linux-only.
+There is no Windows container image; the published Docker image is Linux-only.
 See [Installation](Installation) for the Linux image and its supported
 architectures.
 
@@ -77,13 +77,13 @@ platform-specific:
 | Windows | `%APPDATA%\yacron2` (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`) |
 
 On Windows the default is `%APPDATA%\yacron2`, the Windows analog of
-`/etc/yacron2.d`. If `APPDATA` is somehow unset (rare — for example a bare
+`/etc/yacron2.d`. If `APPDATA` is somehow unset (rare, for example a bare
 service account with no roaming profile), yacron2 falls back to the user
 profile directory (`~`, i.e. `os.path.expanduser("~")`) and uses
 `<profile>\yacron2`.
 
-You can point `-c` anywhere — a single YAML file or a directory of `*.yaml` /
-`*.yml` files — exactly as on POSIX:
+You can point `-c` anywhere (a single YAML file or a directory of `*.yaml` /
+`*.yml` files) exactly as on POSIX:
 
 ```shell
 yacron2 -c C:\path\to\yacron2tab.yaml
@@ -120,7 +120,7 @@ field itself works on every OS; only its default differs:
 | Windows | empty | `command` through the native command processor `%ComSpec%` (cmd.exe) |
 
 On Windows the default `shell` is empty. An empty `shell` routes a string
-`command` through the native command processor — `%ComSpec%`, i.e. `cmd.exe` —
+`command` through the native command processor (`%ComSpec%`, i.e. `cmd.exe`)
 via `asyncio.create_subprocess_shell`, the closest equivalent to the POSIX
 `/bin/sh -c` path. A bare string command therefore runs under `cmd.exe` by
 default:
@@ -148,7 +148,7 @@ jobs:
 ```
 
 …or pass `command` as a **list**, which bypasses the shell entirely on every
-platform (the argv is taken verbatim — no word splitting, globbing, quoting, or
+platform (the argv is taken verbatim: no word splitting, globbing, quoting, or
 variable expansion is performed):
 
 ```yaml
@@ -162,8 +162,8 @@ jobs:
     captureStdout: true
 ```
 
-For the full shell-vs.-list semantics — including how `defaults.shell` is
-inherited and how launch failures are handled — see
+For the full shell-vs.-list semantics (including how `defaults.shell` is
+inherited and how launch failures are handled), see
 [Commands and Environment](Commands-and-Environment).
 
 ## Graceful shutdown
@@ -185,20 +185,20 @@ in the [Command-Line Reference](CLI-Reference).
 
 ## Job termination semantics
 
-When yacron2 stops a job — because its `executionTimeout` expired, because of
+When yacron2 stops a job (because its `executionTimeout` expired, because of
 `concurrencyPolicy: Replace`, or because of a cancel request through the
-[HTTP Control API](HTTP-API) — it calls `proc.terminate()`, waits up to
+[HTTP Control API](HTTP-API)) it calls `proc.terminate()`, waits up to
 `killTimeout` seconds, then escalates to `proc.kill()`. The meaning of those two
 calls differs by platform:
 
 | Platform | `terminate()` | `kill()` | Escalation |
 | --- | --- | --- | --- |
-| POSIX | `SIGTERM` (graceful, trappable) | `SIGKILL` (forceful) | Real — a child can trap `SIGTERM` to clean up before `SIGKILL`. |
-| Windows | `TerminateProcess` | `TerminateProcess` | Moot — both calls are the same immediate, ungraceful stop. |
+| POSIX | `SIGTERM` (graceful, trappable) | `SIGKILL` (forceful) | Real: a child can trap `SIGTERM` to clean up before `SIGKILL`. |
+| Windows | `TerminateProcess` | `TerminateProcess` | Moot: both calls are the same immediate, ungraceful stop. |
 
 On Windows there are no POSIX signals: both `terminate()` and `kill()` map to
 `TerminateProcess`, an immediate, ungraceful stop. The child is **not** notified
-to clean up, so the `terminate()` → `kill()` escalation is effectively moot —
+to clean up, so the `terminate()` → `kill()` escalation is effectively moot.
 `killTimeout` still bounds how long yacron2 waits between the two calls, but the
 outcome is the same hard kill either way. A job cannot trap a "please shut down"
 signal on Windows the way it can trap `SIGTERM` on POSIX.
@@ -231,7 +231,7 @@ demotion ordering), see
 
 aiohttp's `UnixSite` needs `create_unix_server`, which the Windows Proactor
 event loop does not provide, so `unix://` web listeners cannot be bound. Such a
-`web.listen` URL is skipped — not fatal — with a warning, verbatim:
+`web.listen` URL is skipped (not fatal) with a warning, verbatim:
 
 ```text
 Ignoring web listen url <url>: unix-socket listeners are not supported on this platform

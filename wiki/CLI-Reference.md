@@ -132,12 +132,12 @@ yacron2 does not force-kill its own running jobs on shutdown. Individual jobs
 have their own kill behavior (`killTimeout`) when they are stopped; see
 [Concurrency and Timeouts](Concurrency-and-Timeouts). Sending a second signal
 does not change the shutdown sequence; if you need an immediate stop, kill the
-process with `SIGKILL` (POSIX-only; there is no Windows equivalent — use Task
+process with `SIGKILL` (POSIX-only; there is no Windows equivalent, so use Task
 Manager or `taskkill /F` there).
 
 On Windows, press Ctrl-C or Ctrl-Break (`SIGINT`/`SIGBREAK`) to trigger the same
 graceful shutdown: it finishes the currently-running jobs first, exactly as
-`SIGTERM` does on POSIX. The wiring differs only internally — `signal.signal`
+`SIGTERM` does on POSIX. The wiring differs only internally: `signal.signal`
 plus a heartbeat timer, because the Proactor loop lacks `add_signal_handler`.
 See [Running on Windows](Running-on-Windows).
 

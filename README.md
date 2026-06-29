@@ -234,7 +234,7 @@ POSIX. A few platform details differ:
 
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
-  and `unix://` web listeners are skipped with a warning — use an `http://`
+  and `unix://` web listeners are skipped with a warning. Use an `http://`
   listener instead.
 
 ## Production container deployment
@@ -1206,8 +1206,8 @@ The trust model is deliberately small and keeps no shared state:
   configured `ca`, and (client side) match the host it was reached at, so only
   nodes the CA vouches for are ever attested; standard TLS hostname
   verification provides that SAN pinning. The CA is the *whole* authentication
-  boundary — yacron2 trusts any cert it signs to assert its own `nodeName`,
-  agreement, and `@reboot` run-state over `/peer` — so it **must** be a
+  boundary (yacron2 trusts any cert it signs to assert its own `nodeName`,
+  agreement, and `@reboot` run-state over `/peer`), so it **must** be a
   dedicated, closed CA issued only to yacron2 nodes, **not** a shared
   service-mesh or organisation-wide CA (any workload that CA admits could
   otherwise forge gossip or suppress jobs). Provision the certificates from your
@@ -1217,7 +1217,7 @@ The trust model is deliberately small and keeps no shared state:
   converge to the same picture, and any disagreement is itself the signal. Each
   peer is reported as `agreed`, `syncing`, `drifted`, `unreachable`,
   `untrusted`, `self` (the node found its own address in the peer list),
-  `conflict` (a duplicate `nodeName`), or `unknown` (not yet contacted) — the
+  `conflict` (a duplicate `nodeName`), or `unknown` (not yet contacted). The
   full table is in the
   [clustering guide](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election#per-peer-status).
 * **Drift is debounced.** A reachable peer whose id differs is only reported as
@@ -1269,7 +1269,7 @@ on any node.
   `nodeName` is the system hostname, which is already unique per host.
 * **The quorum gate is what makes this safe with no shared state.** Two strict
   majorities of `N` can't be disjoint, so under a clean network partition at
-  most one side is quorate and — within about one poll `interval` — at most one
+  most one side is quorate and, within about one poll `interval`, at most one
   leader exists (a leader just cut off from the majority keeps acting on its
   stale view until its own next poll, so a clean partition can briefly
   double-run a `Leader` firing, not only skip one). The trade-off is
@@ -1297,7 +1297,7 @@ other through the bridge (a bridge of `quorum - 1` shared members suffices). A
 node only elects a leader it can confirm is itself quorate, so in a *converged*
 view a healthy majority is **not silently stood down**; the trades are that a
 *thinner* bridge or the convergence window can double-run instead of skipping,
-and — symmetrically — a candidate confirmed from now-stale bridge gossip that
+and, symmetrically, a candidate confirmed from now-stale bridge gossip that
 has since become isolated can briefly draw the majority into deferring to it (a
 transient skip until the gossip ages out). `spread` behaves the same per job. The default `gossip` backend keeps **no
 shared state**, which is what makes it best-effort. If you need a hard
@@ -1314,7 +1314,7 @@ closed** (stays idle) rather than fall back to running everything.
 
 The cluster-wide `electLeader` switch sets the *default* behaviour, but each job
 can override it with `clusterPolicy` to pick its own point on the
-liveness-vs-duplication trade-off. Note that **no option is true exactly-once** —
+liveness-vs-duplication trade-off. Note that **no option is true exactly-once**:
 each gives up one side: `Leader` may *skip*, `PreferLeader` may *double-run*.
 
 | `clusterPolicy` | healthy (quorate) | partitioned / sub-quorum | use for |
@@ -1383,8 +1383,8 @@ every node (like `electLeader`); it is inert without election. In spread mode
 `GET /cluster` reports `distribution`/`quorate` (no single `leader`), and each
 leader-gated job's owner appears as `clusterOwner` in `GET /jobs`. The
 dashboard surfaces it directly: an **Owner** column in the job table (shown
-only under spread) tags every job with its owning node — highlighting the ones
-owned by the node you're viewing — and the cluster panel adds a per-node
+only under spread) tags every job with its owning node (highlighting the ones
+owned by the node you're viewing), and the cluster panel adds a per-node
 **Owns** tally, so you can see which jobs belong to which node at a glance. It
 also appears in each job's drawer.
 

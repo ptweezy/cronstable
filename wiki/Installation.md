@@ -13,8 +13,8 @@ for the Windows-specific details.
 | Requirement | Value |
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10`; 3.10, 3.11, 3.12, 3.13 and 3.14 are supported and tested (`requires-python = ">=3.10"`). For an older Python, use the standalone binary instead. |
-| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows — see [Running on Windows](Running-on-Windows). |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z) — both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
+| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows; see [Running on Windows](Running-on-Windows). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -147,7 +147,7 @@ The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
 (added in 1.0.8) are built inside an Alpine container for musl/Alpine hosts.
 The `i686` and `armv7` builds (added in 1.1.3) and the `ppc64le` and `s390x`
-builds (added in 1.1.4) — both glibc and musl — extend the 64-bit `amd64`/`arm64`
+builds (added in 1.1.4), both glibc and musl, extend the 64-bit `amd64`/`arm64`
 binaries to 32-bit x86, 32-bit ARM, POWER and IBM Z hosts; they build inside a
 container (`i686` natively on the x86-64 runner, the rest under QEMU emulation).
 The `riscv64` builds (added in 1.1.6) cover 64-bit RISC-V for both glibc and
@@ -157,7 +157,7 @@ Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds (added in
 self-contained `.exe` files for x64 (`amd64`) and ARM64; like the other
 binaries they embed Python, so Python is not required on the target.
 
-Download and run (glibc amd64 Linux shown — append `-musl` on Alpine, or use
+Download and run (glibc amd64 Linux shown; append `-musl` on Alpine, or use
 `yacron2-macos-<arch>` on a Mac):
 
 ```shell
@@ -168,7 +168,7 @@ chmod +x yacron2
 ```
 
 On Windows, download `yacron2-windows-amd64.exe` (or `yacron2-windows-arm64.exe`
-on ARM64) and run it directly — no `chmod` is needed:
+on ARM64) and run it directly; no `chmod` is needed:
 
 ```powershell
 .\yacron2-windows-amd64.exe --version
@@ -192,7 +192,7 @@ default `/tmp` already satisfies this, so no extra setup is required.
 
 This matters only when you run the binary under a **read-only root filesystem**
 (for example, a hardened container). With the root filesystem read-only, `/tmp`
-is read-only too, and the binary aborts at startup — `Could not create temporary
+is read-only too, and the binary aborts at startup: `Could not create temporary
 directory`, or `Error loading shared library …: Operation not permitted`. Give
 it a small writable *and executable* temp mount and it runs:
 
@@ -207,11 +207,11 @@ docker run --rm --read-only \
 
 Remedies:
 
-* **Docker** — mount an `rw,exec` tmpfs at `/tmp`. `--tmpfs` defaults to
+* **Docker**: mount an `rw,exec` tmpfs at `/tmp`. `--tmpfs` defaults to
   `noexec`, which fails; pass `exec` explicitly as above.
-* **Kubernetes** — mount an `emptyDir` at `/tmp` (writable and executable by
+* **Kubernetes**: mount an `emptyDir` at `/tmp` (writable and executable by
   default; use `medium: Memory` for a tmpfs).
-* **Any host** — point the binary at another writable, executable directory
+* **Any host**: point the binary at another writable, executable directory
   with `TMPDIR=/path`.
 
 This requirement is unique to the standalone binary. The published container
@@ -235,7 +235,7 @@ yacron2 -c /etc/yacron2.d
 The `-c` default is platform-specific: `/etc/yacron2.d` on POSIX, and
 `%APPDATA%\yacron2` on Windows (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`,
 falling back to the user profile `~` if `APPDATA` is unset). The default `shell`
-also differs — `/bin/sh` on POSIX, and on Windows an empty default that runs a
+also differs: `/bin/sh` on POSIX, and on Windows an empty default that runs a
 string `command` through `%ComSpec%` (`cmd.exe`). On Windows, press Ctrl-C (or
 Ctrl-Break) to stop yacron2 gracefully; it finishes running jobs first, just as
 SIGTERM does on POSIX. Note that per-job `user`/`group` switching and `unix://`

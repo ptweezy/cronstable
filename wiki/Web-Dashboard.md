@@ -3,11 +3,11 @@
 yacron2 includes a **built-in web dashboard**: a single, self-contained HTML page
 (one inline `<script>`, inline styles, no external assets, no build step, and no
 database) served by the optional [HTTP Control API](HTTP-API). It turns the daemon
-into a live, keyboard-driven control room — watch every job's status, tail its
+into a live, keyboard-driven control room. Watch every job's status, tail its
 output as it runs, review run history, and preview upcoming schedules, all from a
 browser.
 
-[![The yacron2 web dashboard — a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
+[![The yacron2 web dashboard, a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
 
 ## Enabling and opening it
 
@@ -21,7 +21,7 @@ web:
     - http://127.0.0.1:8080
 ```
 
-Open the listener's root path in a browser — <http://127.0.0.1:8080/> for the
+Open the listener's root path in a browser, <http://127.0.0.1:8080/> for the
 example above. The page is served at `/` on every `http://` listener and is
 self-contained, so nothing else needs to be installed or hosted.
 
@@ -45,7 +45,7 @@ web:
 The landing page is a single sortable, filterable table of every configured job.
 
 The header carries a live UTC clock, a **connection indicator** (`live` when the
-server is responding, `no signal` when polls are failing — hover it to see how
+server is responding, `no signal` when polls are failing; hover it to see how
 long ago the last successful response arrived), and **summary pills** counting the
 total jobs and how many are running, failing, and OK.
 
@@ -53,21 +53,21 @@ Each row shows:
 
 | Column | What it shows |
 | --- | --- |
-| **Status** | The job's current health — one of **Running**, **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`) — each with a color and glyph. |
+| **Status** | The job's current health: one of **Running**, **Failed**, **OK**, **Pending** (enabled but never run yet), **Cancelled**, or **Disabled** (`enabled: false`), each with a color and glyph. |
 | **Job** | The job `name` and its command. |
 | **Owner** | *(cluster only, under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load))* the node that currently **owns** the job. The jobs owned by the node you're viewing are highlighted in the accent color, so you can see at a glance which work lands here; `EveryNode` jobs read **all nodes**, and a `Leader` job with no quorum reads **no quorum**. The column is hidden entirely outside spread mode. Sortable, so you can group jobs by node. |
 | **Schedule** | The raw schedule string; hover it for a plain-English reading. |
 | **Last run** | How long ago the last run finished (kept fresh every second) and an exit-code badge. |
 | **Took** | The last run's duration. |
 | **Next** | A live countdown to the next scheduled run (`—` while running or disabled). |
-| **Trend** | A **sparkline** of recent runs — one bar per run, height by duration, colored by outcome. |
+| **Trend** | A **sparkline** of recent runs: one bar per run, height by duration, colored by outcome. |
 | **Actions** | One-click **Run** (or **Stop**, for a running job) and **Logs**. |
 
 The toolbar above the table lets you:
 
-- **filter** by typing in the search box (matches name or command — press `/` to focus it);
+- **filter** by typing in the search box (matches name or command; press `/` to focus it);
 - narrow by status with the **all / ok / fail / run / off** segmented control;
-- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header — click again to reverse);
+- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header, clicking again to reverse);
 - **run every failing job at once** with the **run failing** button.
 
 ## The job drawer
@@ -81,11 +81,11 @@ header also shows the job's active **`clusterPolicy`** (`Leader`,
 `PreferLeader`, or `EveryNode`), and under
 [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
 the node that currently **owns** the job (e.g. `cluster: Leader → yacron-c`).
-Jobs are **deep-linkable** —
+Jobs are **deep-linkable**:
 opening a job updates the URL to `#job/<name>`, so you can bookmark or share a
 direct link to it.
 
-### Logs — live output, in your browser
+### Logs: live output, in your browser
 
 [![Live log tailing in the drawer, with ANSI color, line numbers, and an in-log search highlighting every match](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)
 
@@ -107,20 +107,20 @@ want to watch here. (If neither is enabled, the pane says so rather than sitting
 empty.) The view is bounded to the most recent lines so a chatty job can't grow
 the tab without limit.
 
-### History — outcomes and durations over time
+### History: outcomes and durations over time
 
 [![The history tab: a stats grid (runs, success rate, ok/fail, avg/min/max duration), a per-run duration bar chart, and a detailed run table](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)
 
 The History tab summarizes the job's retained run history:
 
-- a **stats grid** — total runs, **success rate**, OK / fail counts, and average / min / max duration. The success rate is computed over runs that ran to completion, so deliberate **cancellations are excluded**;
+- a **stats grid**: total runs, **success rate**, OK / fail counts, and average / min / max duration. The success rate is computed over runs that ran to completion, so deliberate **cancellations are excluded**;
 - a **duration bar chart**, one bar per run (newest on the right), colored by outcome;
-- a **run table** — outcome, exit code, when it finished, how long it took, and a reason for any run that carries one (failed runs, and runs cancelled from the dashboard).
+- a **run table**: outcome, exit code, when it finished, how long it took, and a reason for any run that carries one (failed runs, and runs cancelled from the dashboard).
 
 History is retained **in memory only**, up to the most recent 50 runs per job, and
 resets when yacron2 restarts.
 
-### Schedule — in plain English, in the right timezone
+### Schedule: in plain English, in the right timezone
 
 [![The schedule tab: a plain-English reading of the cron expression and a timezone-aware list of the next run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)
 
@@ -165,7 +165,7 @@ The bullets above describe the **gossip** backend. The
 a **role summary** (`node-name · backend · role`, where the role is **leader**,
 **follower (leader: …)**, **follower**, or **no quorum (store unreachable)**)
 followed by a **key/value lease-detail table** (the lease/election name, the
-holder, the identity, and the expiry) — no status dots, no agreement tally, no
+holder, the identity, and the expiry): no status dots, no agreement tally, no
 quorum count. There `no quorum` means *the lease store is unreachable from this
 node*, not "no majority".
 
@@ -206,8 +206,8 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 The settings panel (and the command palette) expose:
 
-- **Three themes** — amber and green **phosphor CRT**, or a flat **modern** theme. Cycle them with `t`.
-- **CRT effects** — phosphor glow, vignette, and a subtle flicker — and **scanlines**, each toggleable. They apply only to the CRT themes and automatically respect `prefers-reduced-motion`.
+- **Three themes**: amber and green **phosphor CRT**, or a flat **modern** theme. Cycle them with `t`.
+- **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes and automatically respect `prefers-reduced-motion`.
 - **Compact density** for tighter rows.
 - **Desktop notifications** that fire when a job fails (after you grant the browser permission).
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.
@@ -222,7 +222,7 @@ comes back the way you left it.
 ## Authentication
 
 When [bearer-token authentication](HTTP-API#authentication) is enabled
-(`web.authToken`), the dashboard **page itself** loads without a token — it
+(`web.authToken`), the dashboard **page itself** loads without a token: it
 carries no data and no secrets. The first data request returns `401`, and the
 dashboard then prompts you for the token, stores it **only in that browser tab**
 (`sessionStorage`), and attaches it as `Authorization: Bearer …` on every
@@ -247,8 +247,8 @@ cleanly on restart.
 
 ## See also
 
-- [HTTP Control API](HTTP-API) — the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
-- [Clustering and Leader Election](Clustering-and-Leader-Election) — the cluster panel, per-job `clusterPolicy`, and the `GET /cluster` view it polls.
-- [Output Capturing](Output-Capturing) — `captureStdout` / `captureStderr`, which control what the Logs tab can show.
-- [Schedules and Timezones](Schedules-and-Timezones) — the schedule strings and timezones the Schedule tab explains and previews.
-- [Production and Container Deployment](Production-Deployment) — running the interface under a hardened, read-only-root-filesystem deployment.
+- [HTTP Control API](HTTP-API): the REST endpoints, configuration schema, authentication, and Unix-socket options the dashboard is built on.
+- [Clustering and Leader Election](Clustering-and-Leader-Election): the cluster panel, per-job `clusterPolicy`, and the `GET /cluster` view it polls.
+- [Output Capturing](Output-Capturing): `captureStdout` / `captureStderr`, which control what the Logs tab can show.
+- [Schedules and Timezones](Schedules-and-Timezones): the schedule strings and timezones the Schedule tab explains and previews.
+- [Production and Container Deployment](Production-Deployment): running the interface under a hardened, read-only-root-filesystem deployment.

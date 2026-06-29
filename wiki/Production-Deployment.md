@@ -42,7 +42,7 @@ GitHub Container Registry on every release.
 | Env | `PYTHONUNBUFFERED=1`, `PYTHONDONTWRITEBYTECODE=1`, `PATH=/opt/venv/bin:$PATH` |
 
 `PYTHONUNBUFFERED` flushes stdout/stderr immediately (where yacron2 logs) and
-`PYTHONDONTWRITEBYTECODE` prevents `.pyc` writes — both matter under a read-only
+`PYTHONDONTWRITEBYTECODE` prevents `.pyc` writes; both matter under a read-only
 root filesystem.
 
 > A second `python:3.14-slim`-based Dockerfile under `example/docker/` exists for
@@ -80,20 +80,20 @@ COPY yacron2tab.yaml /etc/yacron2.d/yacron2tab.yaml
 The published image satisfies a fully restricted pod security context out of the
 box:
 
-* **`runAsNonRoot` / non-root UID** — the daemon needs no privileges, so it runs
+* **`runAsNonRoot` / non-root UID**: the daemon needs no privileges, so it runs
   as an unprivileged UID (`65534`). Only per-job `user`/`group` switching needs
   root, and that feature is not available here.
-* **`RuntimeDefault` seccomp** — yacron2 makes no exotic syscalls, so the default
+* **`RuntimeDefault` seccomp**: yacron2 makes no exotic syscalls, so the default
   seccomp profile (or an equivalently strict custom one) works.
-* **`readOnlyRootFilesystem`** — no runtime writes are required by the image (or a
+* **`readOnlyRootFilesystem`**: no runtime writes are required by the image (or a
   `pip`/`pipx` install). Mount the crontab read-only. See [Writable-path
   exceptions](#writable-path-exceptions) for the two features that need a small
   writable volume: a Unix-socket web listener (with the image) and the standalone
   binary's self-extraction temp directory (only if you deploy the binary instead
   of the image).
-* **`fsGroup`-mounted config/secrets** — mount config and secret volumes with an
+* **`fsGroup`-mounted config/secrets**: mount config and secret volumes with an
   `fsGroup` (e.g. `65534`) so the non-root process can read them.
-* **`drop: [ALL]` capabilities and `allowPrivilegeEscalation: false`** — yacron2
+* **`drop: [ALL]` capabilities and `allowPrivilegeEscalation: false`**: yacron2
   needs no Linux capabilities and never escalates privileges.
 
 ## Kubernetes Deployment
@@ -160,7 +160,7 @@ Pick a backend by whether you already run a coordination store:
 * **`backend: kubernetes` (recommended on Kubernetes).** A
   `coordination.k8s.io/v1` `Lease` gives a **fenced, exactly-once** election
   while the apiserver is reachable. No mTLS, no peer list, no odd-replica
-  rule — a plain `Deployment` with any replica count works; you only grant the
+  rule: a plain `Deployment` with any replica count works; you only grant the
   `Lease` RBAC (`get`/`create`/`update`). Likewise `backend: etcd` if you run
   etcd. See
   [Operating the lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
@@ -194,7 +194,7 @@ case. Two features need a small writable mount.
 
 If you enable the optional [HTTP Control API](HTTP-API) on a Unix socket
 (`web.listen: [unix:///path/yacron2.sock]`), yacron2 binds a `UnixSite` and
-creates the socket file at that path — a write. Point the socket at a small
+creates the socket file at that path, a write. Point the socket at a small
 writable volume (a Kubernetes `emptyDir`) rather than the root filesystem:
 
 ```yaml
@@ -219,7 +219,7 @@ listeners such as `http://0.0.0.0:8080` need no writable path.) The optional
 > `unix://` web listeners are not supported on Windows (the Proactor event loop
 > lacks `create_unix_server`); such a listen URL is skipped with the warning
 > `Ignoring web listen url <url>: unix-socket listeners are not supported on this
-> platform` — use an `http://` listener instead. `web.socketMode` only applies to
+> platform`. Use an `http://` listener instead. `web.socketMode` only applies to
 > unix sockets, so it is irrelevant on Windows. See
 > [Running on Windows](Running-on-Windows).
 
@@ -237,7 +237,7 @@ at startup with `Could not create temporary directory` or
 `Error loading shared library …: Operation not permitted`. Provide a writable,
 executable temp mount:
 
-* **Docker** — `--tmpfs /tmp:rw,exec,nosuid,nodev,size=64m`. The `exec` is
+* **Docker**: `--tmpfs /tmp:rw,exec,nosuid,nodev,size=64m`. The `exec` is
   required: Docker's `--tmpfs` defaults to `noexec`, but the binary must execute
   the libraries it unpacks.
 
@@ -248,9 +248,9 @@ executable temp mount:
     your-image-with-the-binary -c /etc/yacron2.d
   ```
 
-* **Kubernetes** — mount an `emptyDir` at `/tmp` (writable and executable by
+* **Kubernetes**: mount an `emptyDir` at `/tmp` (writable and executable by
   default; use `medium: Memory` for a tmpfs).
-* **Either** — point the binary at another writable, executable directory with
+* **Either**: point the binary at another writable, executable directory with
   `TMPDIR=/path`.
 
 This requirement is unique to the standalone binary. The published image and
@@ -260,20 +260,20 @@ on disk; they never self-extract and need no writable temp directory. See
 
 ## Operational notes
 
-* **Logging** — yacron2 logs to stdout/stderr; collect logs at the platform
+* **Logging**: yacron2 logs to stdout/stderr; collect logs at the platform
   level (`kubectl logs`, the container runtime's log driver). Adjust verbosity
   with `-l/--log-level` (default `INFO`) or a `logging:` config section.
-* **Shutdown** — on POSIX, yacron2 installs handlers for `SIGINT` and `SIGTERM`
+* **Shutdown**: on POSIX, yacron2 installs handlers for `SIGINT` and `SIGTERM`
   and shuts down gracefully, so the default pod termination path works without
   extra configuration. On Windows (where the Proactor loop has no
   `add_signal_handler`) it instead handles `SIGINT`/`SIGBREAK` via
   `signal.signal` plus a heartbeat timer, so pressing Ctrl-C or Ctrl-Break stops
   it; either way it finishes the currently-running jobs first. See
   [Running on Windows](Running-on-Windows).
-* **Validate before deploy** — `yacron2 -c <path> --validate-config` parses the
+* **Validate before deploy**: `yacron2 -c <path> --validate-config` parses the
   config and exits, useful as a CI/pre-deploy gate. See [Command-Line
   Reference](CLI-Reference).
-* **Config not found** — the default config path is platform-specific:
+* **Config not found**: the default config path is platform-specific:
   `/etc/yacron2.d` on POSIX, `%APPDATA%\yacron2` on Windows (falling back to the
   user profile `~` if `APPDATA` is unset). When `-c` is left at whichever is the
   platform default and that path does not exist, yacron2 prints an error and exits

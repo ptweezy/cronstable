@@ -38,7 +38,7 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The string is passed verbatim to `CronTab(...)`; yacron2 does not pre-validate or rewrite it, so a malformed expression surfaces as whatever `parse-crontab` raises at config-load time. Quote the value in YAML — a bare `*/5 * * * *` is not valid YAML scalar syntax in all positions.
+The string is passed verbatim to `CronTab(...)`; yacron2 does not pre-validate or rewrite it, so a malformed expression surfaces as whatever `parse-crontab` raises at config-load time. Quote the value in YAML: a bare `*/5 * * * *` is not valid YAML scalar syntax in all positions.
 
 ## Form 2: `@reboot`
 
@@ -79,7 +79,7 @@ jobs:
 | `month`      | field 4       | `*`                |
 | `dayOfWeek`  | field 5       | `*`                |
 
-The assembled string is `f"{minute} {hour} {day} {month} {dow}"`. All values are typed `Str()` in the schema, so write `minute: "0"`, not `minute: 0` — although strictyaml will coerce an unquoted scalar to a string here, quoting is the documented convention and avoids surprises with values like `"7"`.
+The assembled string is `f"{minute} {hour} {day} {month} {dow}"`. All values are typed `Str()` in the schema, so write `minute: "0"`, not `minute: 0`. Although strictyaml will coerce an unquoted scalar to a string here, quoting is the documented convention and avoids surprises with values like `"7"`.
 
 ### Caveat: the `year` key is silently dropped
 
@@ -88,7 +88,7 @@ The schema declares `Opt("year"): Str()`, and `README.md` shows a schedule objec
 Consequences:
 
 - A `year` key is accepted by the schema (no validation error) but has **no effect** on scheduling.
-- The README example claiming a job "only on the specific date 2017-07-19" does **not** restrict by year — it runs every July 19th, every year, that matches the other fields.
+- The README example claiming a job "only on the specific date 2017-07-19" does **not** restrict by year: it runs every July 19th, every year, that matches the other fields.
 
 This is a discrepancy between the schema/README and the implementation. Do not rely on `year`. If you need a one-shot run, use `@reboot` plus an external guard, or remove the job after it fires.
 
@@ -139,7 +139,7 @@ The scheduler does not run a per-job timer. It wakes on a fixed cadence and test
 
 - `WAKEUP_INTERVAL = datetime.timedelta(minutes=1)`.
 - `next_sleep_interval()` computes the time until the next minute boundary using **UTC**: `now.replace(second=0) + WAKEUP_INTERVAL`. The daemon therefore wakes aligned to the top of each wall-clock minute (in UTC), not at a fixed N-second period from startup.
-- On each wake, `spawn_jobs` iterates all jobs and calls `job_should_run`. For a `CronTab` job it evaluates `crontab.test(get_now(job.timezone).replace(second=0))` — the current time **truncated to the minute** in the job's resolved timezone.
+- On each wake, `spawn_jobs` iterates all jobs and calls `job_should_run`. For a `CronTab` job it evaluates `crontab.test(get_now(job.timezone).replace(second=0))`: the current time **truncated to the minute** in the job's resolved timezone.
 
 Implications:
 

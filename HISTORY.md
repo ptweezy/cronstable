@@ -113,14 +113,14 @@ project, on which yacron2 is based.
   load (a quorum of 2 needs both up, so it is strictly worse than one replica),
   and an even cluster size is warned about. Individual jobs can override the
   default with a per-job `clusterPolicy`: `Leader` (the default, quorum-gated,
-  at-most-once), `PreferLeader` (lowest reachable node runs it, ignoring quorum
-  — never skips, but may double-run across a partition), or `EveryNode` (run on
+  at-most-once), `PreferLeader` (lowest reachable node runs it, ignoring quorum:
+  never skips, but may double-run across a partition), or `EveryNode` (run on
   every replica, for per-node or idempotent work). `clusterPolicy` is part of
   the job-set id and shown in the dashboard job drawer. Node identities must be
   unique: each process reports a random instance id alongside its `nodeName`,
   so a duplicate `nodeName` (which would otherwise let two nodes each elect
-  themselves and double-run) is detected as a `conflict` — surfaced on
-  `GET /cluster`, in the dashboard panel, and in an error log — and makes
+  themselves and double-run) is detected as a `conflict` (surfaced on
+  `GET /cluster`, in the dashboard panel, and in an error log) and makes
   `Leader` jobs fail closed until it is resolved. An `@reboot` job with
   `Leader`/`PreferLeader` policy is deferred until the cluster elects an owner
   and then run once there, rather than never running (`Leader` saw no quorum at
@@ -164,9 +164,9 @@ project, on which yacron2 is based.
 
 - Add self-contained binaries for two more Linux architectures, bringing
   every release to eight Linux architectures plus macOS: 64-bit RISC-V
-  (`riscv64`) in both glibc and musl flavors — `yacron2-linux-riscv64` and
-  `yacron2-linux-riscv64-musl` — and 32-bit ARMv6 (`armv6`, e.g. Raspberry
-  Pi Zero / Pi 1) in musl only — `yacron2-linux-armv6-musl`. As with the
+  (`riscv64`) in both glibc and musl flavors (`yacron2-linux-riscv64` and
+  `yacron2-linux-riscv64-musl`) and 32-bit ARMv6 (`armv6`, e.g. Raspberry
+  Pi Zero / Pi 1) in musl only (`yacron2-linux-armv6-musl`). As with the
   other binaries, Python is not required on the target system. Neither arch
   has a native GitHub runner, so they build inside a container via
   `docker run --platform` under QEMU emulation.
@@ -209,8 +209,8 @@ package itself.
 
 - Add self-contained binaries for two more Linux architectures to every
   release, in both glibc and musl flavors: little-endian POWER (`ppc64le`)
-  and IBM Z (`s390x`) — `yacron2-linux-ppc64le`, `yacron2-linux-s390x`, and
-  their `-musl` variants — alongside the existing `amd64`, `arm64`, `i686`
+  and IBM Z (`s390x`) (`yacron2-linux-ppc64le`, `yacron2-linux-s390x`, and
+  their `-musl` variants) alongside the existing `amd64`, `arm64`, `i686`
   and `armv7` builds. As with the other binaries, Python is not required on
   the target system. Neither arch has a native GitHub runner, so they build
   inside a container via `docker run --platform` under QEMU emulation; both
@@ -281,7 +281,7 @@ package itself.
   `cancelled` outcome and is neither reported nor retried; the endpoint
   returns `409 Conflict` if the job is not running and `404 Not Found`
   for an unknown job.
-- `GET /jobs` now returns detailed per-job information — schedule,
+- `GET /jobs` now returns detailed per-job information: schedule,
   timezone, enabled/running state, time until the next run, a summary of
   the most recent finished run, and a compact recent-outcome history.
 - Read a job's retained run history and aggregate statistics (success
@@ -745,18 +745,18 @@ This is a tooling and documentation release; there are no changes to the
 ### Credits (trailing upstream changes)
 
 - `web.headers` option to control HTTP response headers on all web
-  endpoints — Gustavo Carneiro (gjcarneiro), commit bde0f0b; merged upstream
+  endpoints, by Gustavo Carneiro (gjcarneiro), commit bde0f0b; merged upstream
   but never released in yacron 0.19.0.
 - Python 3.14 compatibility, including `asyncio.new_event_loop()` and
-  modern-Python lint/format fixes — Gustavo J. A. M. Carneiro (gjcarneiro),
+  modern-Python lint/format fixes, by Gustavo J. A. M. Carneiro (gjcarneiro),
   commit 27a32bc (#100).
-- Switch from black/flake8 to ruff, plus bandit and pre-commit configuration —
-  Gustavo Carneiro (gjcarneiro), commits c656fa6 and 4f7936a.
+- Switch from black/flake8 to ruff, plus bandit and pre-commit configuration,
+  by Gustavo Carneiro (gjcarneiro), commits c656fa6 and 4f7936a.
 - Removal of Travis CI and modernization of the Python/PyInstaller version
-  matrices — upstream yacron (gjcarneiro), commits d9b1ca6, 8d28816, 4e6892a,
+  matrices, by upstream yacron (gjcarneiro), commits d9b1ca6, 8d28816, 4e6892a,
   2941dcf.
 - README logging example fix adding `datefmt: '%Y-%m-%d %H:%M:%S'` to the
-  custom-logging formatter — andreas-wittig, commit 931b186.
+  custom-logging formatter, by andreas-wittig, commit 931b186.
 
 ## 0.19.0 (2023-03-11)
 
