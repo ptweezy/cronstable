@@ -1343,6 +1343,29 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
             )
     cfg["electLeader"] = True
     advisories = _lease_advisories(raw, "etcd")
+    # A small ttl shrinks the renew round's per-request timeout budget
+    # (EtcdBackend.request_timeout ~= round_deadline / 5, where round_deadline
+    # ~= ttl - max(1, ttl/3) renew - 1s clock skew). Below ~1s that budget can
+    # fall under a real cross-AZ/region round-trip to etcd, so every renew POST
+    # times out and the node treats a reachable etcd as unreachable (Leader
+    # jobs fail closed, and at boot they never recover). It is the operator's
+    # explicit ttl choice and a local/low-latency etcd is fine, so warn rather
+    # than reject. (Mirrors the backend's cadence constants: 1s skew, ttl/3
+    # renew period, 5 POSTs per renew cycle.)
+    renew_period = max(1.0, etcd["ttl"] / 3)
+    round_deadline = max(1.0, etcd["ttl"] - renew_period - 1.0)
+    per_post_budget = round_deadline / 5
+    if per_post_budget < 1.0:
+        advisories.append(
+            "cluster.etcd.ttl={}s leaves only a ~{:.1f}s per-request timeout "
+            "for each renew POST to etcd; if a single round-trip is slower "
+            "than that (e.g. a cross-AZ/region endpoint) every renew round "
+            "will time out and this node will treat a reachable etcd as "
+            "unreachable, so Leader jobs fail closed. Raise cluster.etcd.ttl "
+            "unless etcd is local and low-latency.".format(
+                etcd["ttl"], per_post_budget
+            )
+        )
     if advisories:
         cfg["_advisories"] = advisories
     return ClusterConfig(cfg)

@@ -453,6 +453,36 @@ def test_no_warnings_for_lease_backends():
     assert cluster_config_warnings(_cluster(_ETCD)) == []
 
 
+def test_etcd_warns_on_small_ttl_tight_request_budget():
+    # A small etcd ttl collapses the per-request renew timeout (request_timeout
+    # ~= round_deadline/5); below ~1s it can fall under a real cross-AZ/region
+    # round-trip, so every renew POST times out and the node treats a reachable
+    # etcd as unreachable (Leader jobs fail closed, never recovering at boot).
+    # It is the operator's explicit ttl choice and a local etcd is fine, so
+    # warn rather than reject.
+    cfg = _cluster(
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  nodeName: node-a\n"
+        "  etcd:\n"
+        "    ttl: 5\n"
+        "    endpoints:\n"
+        "      - http://127.0.0.1:2379\n"
+    )
+    assert any(
+        "per-request timeout" in w and "cluster.etcd.ttl" in w
+        for w in cluster_config_warnings(cfg)
+    )
+
+
+def test_etcd_no_tight_budget_warning_at_default_ttl():
+    # the default ttl (15) leaves a comfortable ~1.8s per-POST budget; silent.
+    assert not any(
+        "per-request timeout" in w
+        for w in cluster_config_warnings(_cluster(_ETCD))
+    )
+
+
 def test_etcd_warns_on_gossip_only_keys():
     # a lease config carrying gossip transport keys (e.g. copied from a
     # gossip example) silently ignores them; warn -- and call out that

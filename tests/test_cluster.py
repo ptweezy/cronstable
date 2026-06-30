@@ -1354,6 +1354,34 @@ def test_manager_accessors_minority_stands_down(no_tls):
     assert mgr.is_available_leader() is True
 
 
+def test_available_leader_folds_witness_contenders(no_tls):
+    # F-WITNESS-FOLD: two single-leader PreferLeader nodes blind to each other
+    # but sharing a witness must converge on ONE owner, not both self-elect and
+    # double-run. node-m reaches only node-z; node-z gossips a two-way edge to
+    # node-a as well (node-m cannot see node-a directly). Folding node-z's
+    # mutual_agreeing in makes node-m elect the global-min name (node-a) and
+    # defer, while node-a self-elects -- exactly one runner. Without the fold
+    # node-m elected itself and both ran the job on a converged cluster.
+    mgr_m = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["z:1"], "node-m"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr_m, "z:1", "node-z", mutual={"node-m", "node-a"})
+    assert "node-a" in mgr_m._available_contenders()
+    assert mgr_m.available_leader_name() == "node-a"  # folds the contender
+    assert mgr_m.is_available_leader() is False  # ...so node-m defers
+
+    # the symmetric node-a self-elects (it is the global min), so the job runs
+    # on exactly one of the two blind nodes rather than both.
+    mgr_a = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["z:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    _seed_agree(mgr_a, "z:1", "node-z", mutual={"node-m", "node-a"})
+    assert mgr_a.available_leader_name() == "node-a"
+    assert mgr_a.is_available_leader() is True
+
+
 def test_manager_accessors_spread(no_tls):
     cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
     cfg["distribution"] = "spread"
