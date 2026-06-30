@@ -263,6 +263,41 @@ def test_endpoint_is_https():
     assert EtcdBackend.endpoint_is_https("http://h:2379") is False
 
 
+def test_tls_files_changed_detects_in_place_rotation(tmp_path):
+    # F-CERT-ROTATE: the etcd SSLContext is built once at start() and never
+    # reloaded, so an in-place client-cert/CA rotation (same paths, new bytes
+    # from cert-manager / Vault) is invisible unless tls_files_changed()
+    # reports it, as gossip and kubernetes already do. Without it the
+    # fleet silently loses leadership once the old client cert expires.
+    ca = tmp_path / "ca.crt"
+    cert = tmp_path / "client.crt"
+    key = tmp_path / "client.key"
+    for f in (ca, cert, key):
+        f.write_text("x")
+    extra = (
+        "    tls:\n"
+        "      ca: " + str(ca).replace("\\", "/") + "\n"
+        "      cert: " + str(cert).replace("\\", "/") + "\n"
+        "      key: " + str(key).replace("\\", "/") + "\n"
+    )
+    b = _backend(extra=extra, endpoint="https://127.0.0.1:2379")
+    b._record_tls_files()  # snapshot, as start() does after _build_ssl
+    assert b.tls_files_changed() is False
+    # an in-place rotation: same path, new (longer) bytes -> new size/mtime
+    cert.write_text("new-client-cert-material-much-longer")
+    assert b.tls_files_changed() is True
+
+
+def test_tls_files_changed_false_for_plain_http():
+    # plain-http endpoints load no client cert, so there is nothing on disk to
+    # rotate and tls_files_changed stays False (the inherited lease default),
+    # never spuriously rebuilding the backend.
+    b = _backend()  # http endpoint, no tls material
+    b._record_tls_files()
+    assert b._tls_files == []
+    assert b.tls_files_changed() is False
+
+
 def test_is_leader_gated_on_lease_deadline():
     # the fence is a MONOTONIC deadline (immune to wall-clock steps), not the
     # wall-clock _lease_deadline (which is display only).
@@ -272,6 +307,25 @@ def test_is_leader_gated_on_lease_deadline():
     b._lease_deadline_mono = time.monotonic() - 1  # in the past
     assert b.is_leader() is False  # self-demote without a keepalive
     b._lease_deadline_mono = time.monotonic() + 100
+    assert b.is_leader() is True
+
+
+def test_is_leader_fenced_closed_on_known_lease_loss():
+    # F-LEASE-LOST (unit): a keepalive that found the lease already gone sets
+    # _lease_lost, which forces is_leader() False even while the monotonic
+    # deadline is still in the future (etcd may have freed the key, so a second
+    # node could win it). _is_self_demoted_holder() stays True so a never-skip
+    # PreferLeader job keeps running on this former holder; _apply_round (the
+    # single writer) clears the flag once a round re-establishes state.
+    b = _backend()
+    b._is_leader = True
+    b._lease_deadline_mono = time.monotonic() + 100  # fence still ahead
+    assert b.is_leader() is True
+    b._lease_lost = True
+    assert b.is_leader() is False  # fenced closed despite the live deadline
+    assert b._is_self_demoted_holder() is True  # PreferLeader still runs here
+    b._apply_round("node-a", True, NOW)  # a fresh round re-establishes state
+    assert b._lease_lost is False
     assert b.is_leader() is True
 
 
@@ -517,6 +571,89 @@ async def test_renew_once_keepalive_anchors_fence_to_presend(monkeypatch):
     assert b._lease_deadline_mono == pre_keepalive + 15 - 1
     keepalive_landing = pre_keepalive + keepalive_latency
     assert b._lease_deadline_mono != keepalive_landing + 15 - 1
+
+
+async def test_renew_once_lease_lost_then_regrant_fails_self_demotes(
+    monkeypatch,
+):
+    # F-LEASE-LOST (round): when a keepalive reports the lease gone (ttl<=0)
+    # and the re-grant then RAISES this round, the former holder must fence
+    # is_leader() closed (the freed key may already be another node's) yet stay
+    # _is_self_demoted_holder() True, so a never-skip PreferLeader job keeps
+    # running on it this cycle instead of dropping to zero-run fleet-wide.
+    # Previously the keepalive branch cleared _is_leader directly, which made
+    # _is_self_demoted_holder() False -> the PreferLeader job ran nowhere.
+    clock = [100.0]
+    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    b = _backend()  # ttl 15
+    fail_grant = {"on": False}
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        if path == "/v3/lease/grant":
+            if fail_grant["on"]:
+                raise aiohttp.ClientError("etcd unreachable")
+            return {"ID": "1", "TTL": "15"}
+        if path == "/v3/lease/keepalive":
+            return {"result": {"TTL": "0"}}  # lease GONE
+        if path == "/v3/kv/txn":
+            return {"succeeded": True}
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    # round 1: grant + campaign -> we lead and are quorate
+    await b._renew_once()
+    assert b.is_leader() is True
+    # round 2: keepalive says the lease is gone, and the re-grant then fails.
+    fail_grant["on"] = True
+    with pytest.raises(aiohttp.ClientError):
+        await b._renew_once()
+    assert b.is_leader() is False  # fenced closed: the freed key may be taken
+    # ...but still the self-demoted former holder, still quorate from round 1,
+    # so a PreferLeader job runs here this cycle (never-skip), not nowhere.
+    assert b._is_self_demoted_holder() is True
+    assert b.is_quorate() is True
+    assert b.is_available_leader() is True
+
+
+async def test_renew_once_recovers_collapsed_cadence_when_not_quorate(
+    monkeypatch,
+):
+    # F-TTL-WEDGE: a once-narrowed effective ttl shrinks request_timeout, and
+    # that tight per-POST budget can itself prevent the contact needed to widen
+    # the ttl again -- a self-sustaining wedge off a since-recovered etcd.
+    # While NOT quorate (fence already lapsed, no two-leaders risk) the cadence
+    # widened back to the configured ttl at the START of the round, so the
+    # reconnect POSTs run at the full timeout budget rather than the collapsed
+    # ~0.2s a narrowed ttl=3 would give.
+    clock = [100.0]
+    monkeypatch.setattr("yacron2.backends.etcd._monotonic", lambda: clock[0])
+    b = _backend()  # ttl 15
+    # simulate a prior narrowing to the minimum AND lost contact (not quorate)
+    b._effective_ttl = 3
+    b._last_contact_mono = 100.0 - 100  # long stale -> not quorate
+    assert b.is_quorate() is False
+    assert b.request_timeout < 0.3  # the collapsed per-POST budget at ttl 3
+    budget_seen = []
+
+    async def fake_post(path, body, *, allow_reauth=True):
+        budget_seen.append(b.request_timeout)  # the budget the round runs at
+        if path == "/v3/lease/grant":
+            return {"ID": "1", "TTL": "15"}  # etcd has recovered
+        if path == "/v3/kv/txn":
+            return {"succeeded": True}
+        if path == "/v3/kv/range":
+            return {"kvs": []}
+        return {}
+
+    monkeypatch.setattr(b, "_post", fake_post)
+    await b._renew_once()
+    # the grant POST (the first of the round) ran at the widened budget, so a
+    # real reconnect would not have timed out under the collapsed ~0.2s.
+    assert budget_seen[0] >= 1.0
+    assert b._effective_ttl == 15  # widened, then re-narrowed to granted 15
+    assert b.is_leader() is True  # reconnected and re-acquired
 
 
 async def test_sync_reboot_ran_swallows_wrong_shape_response(monkeypatch):

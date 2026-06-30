@@ -2184,9 +2184,23 @@ class ClusterManager(LeadershipBackend):
         return self.leader_name() == self.node_name
 
     def available_leader_name(self) -> str:
-        """Elected leader ignoring quorum (for the ``PreferLeader`` policy)."""
+        """Elected leader ignoring quorum (for the ``PreferLeader`` policy).
+
+        The lowest ``nodeName`` over ourselves, the peers we see agreeing,
+        *and* the reachable co-owners a witness vouches a two-way edge to but
+        we cannot reach directly (:meth:`_available_contenders`) -- the same
+        fold :meth:`available_job_owner` applies for ``spread``.  Without it,
+        two ``PreferLeader`` nodes blind to each other but sharing a witness
+        each elect *themselves* and both run the job on a converged cluster;
+        folding the contenders in makes them agree on one owner.  It cannot
+        zero-run: the election is a ``min`` and the global-minimum node is the
+        minimum of any set containing it, so it always self-elects and runs
+        (the never-skip guarantee), mirroring :meth:`_available_contenders`'s
+        ``max`` argument for spread.
+        """
         return elect_available_leader(
-            self.node_name, self._agreeing_peer_names()
+            self.node_name,
+            [*self._agreeing_peer_names(), *self._available_contenders()],
         )
 
     def _cedes_to_lower_instance(

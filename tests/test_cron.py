@@ -1790,11 +1790,11 @@ def test_is_deferrable_reboot():
         is False
 
 
-def _reboot_job(name="boot", policy="Leader"):
+def _reboot_job(name="boot", policy="Leader", enabled=True):
     import types
 
     return types.SimpleNamespace(
-        name=name, clusterPolicy=policy, schedule="@reboot"
+        name=name, clusterPolicy=policy, schedule="@reboot", enabled=enabled
     )
 
 
@@ -1853,6 +1853,68 @@ async def test_deferred_reboot_runs_on_owner(monkeypatch):
     assert "boot" not in cron._pending_reboot_jobs
     # running it records + advertises the run, so peers won't re-run it
     assert mgr.reboot_ran("boot") is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_disabled_on_owner_is_not_run(monkeypatch):
+    # A deferred @reboot Leader/PreferLeader job DISABLED via a reload while it
+    # sat pending must be retired without running, even on the elected owner --
+    # the same way job_should_run and the manual web trigger refuse a disabled
+    # job. Otherwise an operator-disabled init/migration one-shot still runs
+    # once cluster-wide on convergence.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(enabled=False)  # disabled on reload while pending
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    cron.cluster_manager = _reboot_mgr(leader="node-a")  # we are the owner
+    await cron._process_pending_reboots()
+    assert launched == []  # disabled -> not run...
+    assert "boot" not in cron._pending_reboot_jobs  # ...and retired, not stuck
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_disabled_no_manager_preferleader(monkeypatch):
+    # The never-skip mgr-is-None PreferLeader branch must also refuse a job
+    # disabled on reload (it otherwise runs every such one-shot here).
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = True
+    cron.cluster_manager = None
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(policy="PreferLeader", enabled=False)
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" not in cron._pending_reboot_jobs
+
+
+@pytest.mark.asyncio
+async def test_deferred_reboot_disabled_after_election_removed(monkeypatch):
+    # The election-removed branch (no longer gated) must also refuse a disabled
+    # job rather than running it once on the way out.
+    cron = yacron2.cron.Cron(None)
+    cron._elect_leader_configured = False  # election turned off on reload
+    launched = []
+    monkeypatch.setattr(
+        cron, "launch_scheduled_job",
+        lambda job: launched.append(job.name) or _noop(),
+    )
+    job = _reboot_job(enabled=False)
+    cron.cron_jobs["boot"] = job
+    cron._pending_reboot_jobs["boot"] = job
+    await cron._process_pending_reboots()
+    assert launched == []
+    assert "boot" not in cron._pending_reboot_jobs
 
 
 @pytest.mark.asyncio

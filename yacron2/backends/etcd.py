@@ -27,9 +27,10 @@ import asyncio
 import base64
 import datetime
 import logging
+import os
 import ssl
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -96,6 +97,22 @@ def _monotonic() -> float:
     human-readable expiry shown in the dashboard.
     """
     return time.monotonic()
+
+
+def _file_signature(path: str) -> Optional[Tuple[int, int]]:
+    """A cheap ``(st_mtime_ns, st_size)`` fingerprint of one file, or ``None``.
+
+    Mirrors the kubernetes backend's helper: ``os.stat`` follows symlinks, so
+    the atomic symlink swap cert-manager / a projected secret uses is picked
+    up too.  A stat error (a file briefly absent mid-rotation) records ``None``
+    and simply compares unequal once the file is back -- the safe direction (a
+    spurious rebuild, never a missed one).
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
 
 def _b64(text: str) -> str:
@@ -290,6 +307,17 @@ class EtcdBackend(LeaseBackend):
         self.username: Optional[str] = etcd["username"]
         self.password: Optional[str] = etcd.get("resolved_password")
         self._tls: Dict[str, Optional[str]] = etcd["tls"]
+        # on-disk client-TLS files (ca / cert / key) the SSLContext is built
+        # from. Snapshotted in start() so an in-place cert/CA rotation
+        # (cert-manager / Vault: same paths, new bytes) is detected by
+        # tls_files_changed() and the backend rebuilt via start_stop_cluster --
+        # the context is built once in start() and never reloaded, so without
+        # this a rotated client cert/CA silently and permanently loses
+        # leadership fleet-wide once the old cert expires. Mirrors the
+        # kubernetes and gossip backends. Empty (-> tls_files_changed False)
+        # for plain-http endpoints: nothing on disk to rotate.
+        self._tls_files: List[str] = []
+        self._tls_signature: Dict[str, Optional[Tuple[int, int]]] = {}
         self.connect_timeout: int = config["connectTimeout"]
         # renew_period / round_deadline / request_timeout are derived from the
         # *effective* ttl (properties below), so they tighten automatically if
@@ -300,6 +328,16 @@ class EtcdBackend(LeaseBackend):
 
         # live state, written by the renew loop and read by the sync methods
         self._is_leader = False
+        # set when a keepalive round finds our lease already gone (ttl<=0)
+        # before the re-grant/re-campaign lands: forces is_leader() closed at
+        # once (the local fence must not be trusted past a KNOWN lease loss)
+        # WITHOUT clearing _is_leader, so _is_self_demoted_holder() stays True
+        # and a never-skip PreferLeader job keeps running on this former holder
+        # this cycle rather than dropping to zero-run if the re-grant/re-
+        # campaign raises before _apply_round can run. Cleared by _apply_round
+        # (the single writer of leadership state) once a round re-establishes
+        # it.
+        self._lease_lost = False
         self._holder: Optional[str] = None
         self._lease_id: Optional[str] = None
         # wall-clock expiry, for the dashboard/lease_detail display ONLY
@@ -369,7 +407,13 @@ class EtcdBackend(LeaseBackend):
         deadline and self-demote a healthy leader each cycle. Without the floor
         the budget always holds (5 x request_timeout == round_deadline), at the
         cost of a tighter per-POST timeout at very small ttl -- which is the
-        operator's explicit aggressive choice.
+        operator's explicit aggressive choice.  Two safety nets bound that
+        cost: while a node is not quorate the cadence is widened back to the
+        configured ttl (see :meth:`_renew_once`), so a once-narrowed effective
+        ttl cannot wedge the per-POST budget below a reconnectable value
+        indefinitely; and a configured ttl whose derived budget is below a
+        realistic round-trip is warned about at load time (see
+        :func:`yacron2.config.cluster_config_warnings`).
         """
         return min(
             float(self.connect_timeout),
@@ -385,7 +429,15 @@ class EtcdBackend(LeaseBackend):
         )
 
     def is_leader(self) -> bool:
-        if not self._is_leader or self._lease_deadline_mono is None:
+        if (
+            not self._is_leader
+            or self._lease_deadline_mono is None
+            # a keepalive round that found the lease gone (ttl<=0) fences us
+            # closed immediately: the old monotonic deadline may still be in
+            # the future, but etcd has already freed the key, so trusting it
+            # would let a second node win it (two leaders). See _lease_lost.
+            or self._lease_lost
+        ):
             return False
         # gated on a MONOTONIC deadline so a backward wall-clock step cannot
         # keep us "leader" past the point etcd has expired the key.
@@ -497,6 +549,11 @@ class EtcdBackend(LeaseBackend):
             holder = self._holder or _UNKNOWN_HOLDER
         self._holder = holder
         self._is_leader = is_leader
+        # A completed round re-establishes leadership state, so clear the
+        # mid-round lease-lost flag (see is_leader / _renew_once): if we
+        # re-acquired, is_leader() trusts the fresh fence below again; if we
+        # lost the campaign, _is_leader is now False and the flag is moot.
+        self._lease_lost = False
         if self._is_leader:
             # the fence MUST NOT outlive the server lease (server expiry >=
             # lease_mono + effective_ttl, since lease_mono is a pre-send lower
@@ -512,6 +569,7 @@ class EtcdBackend(LeaseBackend):
 
     async def start(self) -> None:  # pragma: no cover - network/credential I/O
         self._ssl = self._build_ssl()
+        self._record_tls_files()
         timeout = aiohttp.ClientTimeout(total=self.connect_timeout)
         self._session = aiohttp.ClientSession(timeout=timeout)
         try:
@@ -587,6 +645,70 @@ class EtcdBackend(LeaseBackend):
     @staticmethod
     def endpoint_is_https(endpoint: str) -> bool:
         return endpoint.lower().startswith("https://")
+
+    def _tls_file_paths(self) -> List[str]:
+        """The on-disk client-TLS files in use (empty for plain-http only).
+
+        Only meaningful when at least one endpoint is https -- ``_build_ssl``
+        builds no context otherwise, so there is nothing on disk to rotate.
+        """
+        if not any(self.endpoint_is_https(e) for e in self.endpoints):
+            return []
+        paths: List[str] = []
+        for key in ("ca", "cert", "key"):
+            value = self._tls.get(key)
+            if value:
+                paths.append(value)
+        return paths
+
+    def _record_tls_files(self) -> None:  # pragma: no cover - file stat
+        """Snapshot the on-disk client-TLS files the SSLContext was built from.
+
+        Called from :meth:`start` right after ``_build_ssl`` so
+        :meth:`tls_files_changed` can later detect an in-place rotation.  No
+        https endpoint (or no TLS material) leaves the snapshot empty, so
+        :meth:`tls_files_changed` stays ``False``.
+        """
+        self._tls_files = self._tls_file_paths()
+        self._tls_signature = {p: _file_signature(p) for p in self._tls_files}
+
+    def tls_files_changed(self) -> bool:
+        """Whether any tracked on-disk client-TLS file changed since ``start``.
+
+        The SSLContext is built once in :meth:`start` and never reloaded, so --
+        as for the gossip and kubernetes backends -- an in-place cert/CA
+        rotation (same paths, new bytes from cert-manager / Vault) is otherwise
+        invisible until the process restarts, and the fleet silently loses
+        leadership once the old client cert expires.  Reporting the change lets
+        :meth:`yacron2.cron.Cron.start_stop_cluster` rebuild this backend with
+        the fresh material.  ``False`` when nothing was tracked (plain http, or
+        no client cert/CA: nothing on disk to rotate).
+        """
+        if not self._tls_files:
+            return False
+        current = {p: _file_signature(p) for p in self._tls_files}
+        return current != self._tls_signature
+
+    def tls_files_loadable(self) -> bool:  # pragma: no cover - ssl file I/O
+        """Dry-run-load the current on-disk client-TLS material.
+
+        :meth:`yacron2.cron.Cron.start_stop_cluster` consults this before
+        tearing the running backend down to apply a detected rotation: a
+        cert-manager / Vault refresh is not atomic across ca/cert/key, so a
+        reload can observe a half-written or briefly-absent file.  If the new
+        material cannot be loaded yet, keep the running backend (still using
+        the valid old context) and retry next reload, rather than rebuilding
+        into a load failure that would leave no manager and wedge ``Leader`` /
+        ``PreferLeader`` closed for up to a reload -- make-before-break, as the
+        gossip backend does.  (Kubernetes inherits the always-``True`` default;
+        etcd validates because ``_build_ssl`` loads the client chain eagerly,
+        so a half-written key would otherwise abort the rebuild.)
+        """
+        try:
+            self._build_ssl()
+        except (OSError, ssl.SSLError):
+            return False
+        return True
 
     async def _authenticate(self) -> Optional[str]:  # pragma: no cover
         resp = await self._post(
@@ -771,13 +893,35 @@ class EtcdBackend(LeaseBackend):
         #
         # Advance the endpoint probe rotation for this round (see _post).
         self._endpoint_offset += 1
+        # Recover a collapsed cadence: while we are NOT quorate the lease
+        # window (and so the fence) has already lapsed -- is_leader() is False,
+        # so there is no live fence to over-extend here (no two-leaders risk).
+        # A previous round may have narrowed _effective_ttl to a small server-
+        # granted value, which shrinks request_timeout/round_deadline; that
+        # tight per-POST budget is itself what can then prevent the very
+        # contact needed to observe a larger ttl again -- a self-sustaining
+        # wedge that keeps a node off a since-recovered etcd until restart.
+        # Widen the cadence back to the configured ttl so this round's
+        # reconnect POSTs get the full budget; a successful keepalive/grant
+        # re-narrows to whatever etcd actually grants, so the fence is never
+        # computed from this widened value while we hold leadership.
+        if not self.is_quorate() and self._effective_ttl < self.ttl:
+            self._effective_ttl = self.ttl
         lease_mono: Optional[float] = None
         if self._lease_id is not None:
             lease_mono = _monotonic()
             ttl = await self._keepalive(self._lease_id)
             if ttl is None or ttl <= 0:
                 self._lease_id = None  # lease expired; re-grant below
-                self._is_leader = False
+                # Mark the lease lost rather than clearing _is_leader:
+                # is_leader() gates on _lease_lost so it fences closed at once
+                # (we must not trust the old monotonic deadline past a known
+                # lease loss), but _is_leader stays True so
+                # _is_self_demoted_holder() is True and a never-skip
+                # PreferLeader job keeps running on this former holder this
+                # cycle instead of dropping to zero-run if the re-grant/re-
+                # campaign below raises before _apply_round runs.
+                self._lease_lost = True
                 lease_mono = None  # re-anchored before the grant POST below
             else:
                 # honour the TTL etcd refreshed to (may be < requested)

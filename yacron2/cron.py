@@ -818,9 +818,13 @@ class Cron:
                 # the same listen port the old one still holds.)  Only this
                 # reason is gated; a genuine configuration change tears the old
                 # manager down regardless and lets start fail closed as before.
-                # Lease backends never reach here (tls_files_changed is always
-                # false) and default tls_files_loadable to true, so this is
-                # gossip-only.
+                # The etcd backend also reaches here (it tracks client-TLS
+                # rotation and overrides tls_files_loadable to dry-run the new
+                # ca/cert/key), so it gets the same make-before-break. The
+                # kubernetes backend reports tls_files_changed but inherits the
+                # always-true tls_files_loadable default, so it skips the gate
+                # and rebuilds straight away. A backend with neither (plain
+                # http, no tracked files) never reaches here at all.
                 logger.warning(
                     "cluster: TLS certificate files changed but the new "
                     "material is not yet loadable (a partial/half-written "
@@ -1073,7 +1077,19 @@ class Cron:
                 if job is None:
                     continue  # transiently absent -> keep pending, re-check
                 del self._pending_reboot_jobs[name]
-                if isinstance(job.schedule, str) and job.schedule == "@reboot":
+                # a job disabled (enabled: false) on the reload that also
+                # removed election is retired without running, the same way
+                # job_should_run and the manual web trigger refuse a disabled
+                # job rather than running it once on convergence. (enabled is
+                # checked last so a name reused for a non-@reboot job -- which
+                # need not carry the attribute -- short-circuits on the
+                # schedule check, as _is_deferrable_reboot does on the gated
+                # paths.)
+                if (
+                    isinstance(job.schedule, str)
+                    and job.schedule == "@reboot"
+                    and job.enabled
+                ):
                     await self.launch_scheduled_job(job)
             return
         mgr = self.cluster_manager
@@ -1095,8 +1111,11 @@ class Cron:
                 if name not in self.cron_jobs:
                     continue  # transiently absent -> keep pending (never-lose)
                 job = self.cron_jobs[name]
-                if not self._is_deferrable_reboot(job):
-                    # name reused for a non-deferrable job -> retire it
+                if not self._is_deferrable_reboot(job) or not job.enabled:
+                    # name reused for a non-deferrable job, or the job was
+                    # disabled (enabled: false) on a reload while it sat
+                    # pending -> retire it without running, as job_should_run
+                    # refuses a disabled job on the normal scheduled path.
                     del self._pending_reboot_jobs[name]
                     continue
                 if job.clusterPolicy == "PreferLeader":
@@ -1119,10 +1138,12 @@ class Cron:
                 # gated on presence, so a genuinely-removed job never runs.
                 continue
             job = self.cron_jobs[name]
-            if not self._is_deferrable_reboot(job):
+            if not self._is_deferrable_reboot(job) or not job.enabled:
                 # the name was reused for a job that is no longer a deferrable
-                # @reboot (now EveryNode, or a real schedule): retire the stale
-                # pending entry and let the new job schedule itself normally.
+                # @reboot (now EveryNode, or a real schedule), or the job was
+                # disabled (enabled: false) on a reload while it sat pending:
+                # retire the stale entry without running it, mirroring
+                # job_should_run, which refuses a disabled job.
                 del self._pending_reboot_jobs[name]
                 continue
             try:
