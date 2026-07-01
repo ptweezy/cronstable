@@ -561,6 +561,35 @@
   #swimPanel .lead { stroke: #ffbf47; stroke-width: 1.5; }
   #swimPanel .lbl { fill: var(--fg-dim); font-size: 10px; }
   #swimPanel .axl { fill: var(--fg-faint); font-size: 9px; }
+
+  /* ---------- wallboard exit affordance ---------- */
+  .wb-hint { color: var(--fg-faint); font-size: 11px; }
+  .wb-exit { font-size: 12px; }
+
+  /* ---------- BIOS-style boot / POST self-test ---------- */
+  .boot { position: fixed; inset: 0; z-index: 8500; background: var(--bg);
+    display: flex; align-items: center; justify-content: center; transition: opacity .25s ease; }
+  .boot.done { opacity: 0; }
+  .boot-log { margin: 0; width: min(660px, 92vw); font-family: var(--mono); font-size: 13px; line-height: 1.75; color: var(--fg); }
+  body.fx .boot-log { text-shadow: 0 0 6px var(--glow); }
+  .boot-banner { font-weight: 700; letter-spacing: 2px; color: var(--accent); }
+  .boot-sub { color: var(--fg-faint); text-transform: uppercase; letter-spacing: 1px; font-size: 10.5px; margin-bottom: 14px; }
+  .boot-line { white-space: pre-wrap; word-break: break-word; }
+  .boot-line .lbl { color: var(--fg-dim); }
+  .boot-line .val { color: var(--accent); }
+  /* probe rows: "label ······· result" with a CRISP CSS dotted leader. (A run
+     of middot glyphs smears into a fuzzy oval under the phosphor text glow.) */
+  .boot-probe { display: flex; align-items: baseline; white-space: nowrap; }
+  .boot-probe .lbl { flex: 0 0 auto; }
+  .boot-probe .lead { flex: 1 1 auto; align-self: center; border-bottom: 1px dotted var(--fg-faint); opacity: .5; margin: 0 10px; }
+  .boot-probe .res { flex: 0 0 auto; }
+  .boot-line .ok { color: var(--ok); }
+  .boot-line .fail { color: var(--fail); }
+  .boot-ready { margin-top: 10px; font-weight: 700; }
+  .boot-halt { margin-top: 10px; }
+  .boot-hint { margin-top: 14px; color: var(--fg-faint); font-size: 10.5px; }
+  .boot-cur { display: inline-block; width: .6em; color: var(--accent); animation: bootblink 1s steps(1) infinite; }
+  @keyframes bootblink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
 </style>
 </head>
 <body>
@@ -750,6 +779,7 @@
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
       <div class="setrow">
@@ -804,6 +834,11 @@
   <div class="wb-foot" id="wbFoot"></div>
 </div>
 
+<!-- BIOS-style boot / POST self-test -->
+<div id="bootScreen" class="boot" style="display:none" aria-hidden="true" role="status" aria-live="polite">
+  <div class="boot-log" id="bootLog"></div>
+</div>
+
 <script>
 "use strict";
 (function () {
@@ -836,6 +871,7 @@
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false,
+    boot: true,   // BIOS-style boot self-test on load
   };
   function loadPrefs() {
     for (const k of Object.keys(prefs)) {
@@ -874,6 +910,7 @@
     heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
     swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
     clusterLine: null,         // last cluster summary string (wallboard footer)
+    booting: false,            // BIOS boot self-test is on screen (swallows keys)
   };
 
   // ===================================================================
@@ -1567,6 +1604,8 @@
       '<span class="wb-stat off"><b>' + off + "</b>off</span>" +
       (state.clusterLine ? '<span class="wb-stat cl">' + esc(state.clusterLine) + "</span>" : "") +
       '<span class="grow"></span>' +
+      '<span class="wb-hint">esc · w to exit</span>' +
+      '<button class="btn wb-exit" id="wbExit" title="Exit wallboard (Esc / w)">✕ exit</button>' +
       '<span class="wb-clock" id="wbClock">' + esc(utcClock()) + "</span>";
   }
 
@@ -2281,6 +2320,7 @@
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
       { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
+      { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -2381,6 +2421,7 @@
     $("setNotify").checked = prefs.notify;
     $("setSound").checked = prefs.sound;
     $("setVol").value = String(prefs.volume);
+    $("setBoot").checked = prefs.boot;
     $("setPoll").value = String(prefs.pollMs);
     // CRT effects / scanlines do nothing on the flat "modern" theme — disable
     // those toggles there so they aren't inoperative-yet-interactive.
@@ -2506,6 +2547,9 @@
   }
 
   document.addEventListener("keydown", (e) => {
+    // the boot self-test intercepts keys via its own capture-phase listener; be
+    // explicit that no shortcut fires while it is on screen.
+    if (state.booting) return;
     // palette navigation has priority
     if (state.palette.open) {
       if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
@@ -2616,6 +2660,7 @@
     $("radarPanel").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job")); });
     $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
     $("wbGrid").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { setWallboard(false); openDrawer(it.getAttribute("data-job")); } });
+    $("wbFoot").addEventListener("click", (e) => { if (e.target.closest("#wbExit")) setWallboard(false); });
     $("paletteBtn").addEventListener("click", openPalette);
     $("settingsBtn").addEventListener("click", openSettings);
     $("authBtn").addEventListener("click", () => openModal());
@@ -2652,6 +2697,7 @@
     $("setNotify").addEventListener("change", (e) => setNotify(e.target.checked));
     $("setSound").addEventListener("change", (e) => setSound(e.target.checked));
     $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
+    $("setBoot").addEventListener("change", (e) => setBoot(e.target.checked));
     $("setPoll").addEventListener("change", (e) => setPoll(parseInt(e.target.value, 10)));
     $("openHelp").addEventListener("click", () => { closeSettings(); openHelp(); });
     $("settingsWrap").addEventListener("click", (e) => { if (e.target === $("settingsWrap")) closeSettings(); });
@@ -2895,6 +2941,149 @@
   }
 
   // ===================================================================
+  //  BIOS-style boot / POST self-test
+  // ===================================================================
+  function setBoot(v) { prefs.boot = v; savePref("boot"); syncSettings(); }
+  // Compose the CLUSTER readout for every backend/role shape: standalone, gossip
+  // (leader/follower/spread/no-quorum), and the lease backends. Red when election
+  // is on but the node is not quorate (Leader jobs fail closed there).
+  function bootClusterLine(d) {
+    if (!d || !d.enabled) return '<span class="lbl">standalone (no cluster)</span>';
+    const parts = [d.backend || "gossip"];
+    if (d.node_name) parts.push("node=" + d.node_name);
+    if (d.elect_leader) {
+      // a conflict (duplicate nodeName / size / policy) fails the Leader gate
+      // closed regardless of quorum/leader, so it dominates the readout — else
+      // we'd print a healthy "leader" while Leader jobs are actually paused.
+      if (d.conflict) parts.push("conflict (Leader jobs paused)");
+      else if (d.distribution === "spread") parts.push(d.quorate ? "spread/quorate" : "spread/no-quorum");
+      else if (d.is_leader) parts.push("leader");
+      else if (d.quorate && d.leader) parts.push("follower→" + d.leader);
+      else if (d.quorate) parts.push("follower");
+      else parts.push("no-quorum");
+    }
+    const bad = d.elect_leader && (d.conflict || !d.quorate);
+    return '<span class="' + (bad ? "fail" : "val") + '">' + esc(parts.join(" / ")) + "</span>";
+  }
+  // The POST screen: each line resolves as its REAL fetch completes, so it is a
+  // genuine readiness check, not a cosmetic animation. Skippable with any key /
+  // click; on completion (or skip / failure) it tears down and calls `done`
+  // (the normal first-load path). It never blocks startup: a thrown fetch or a
+  // caught error still reaches the finally that runs `done`.
+  async function runBootSequence(done) {
+    state.booting = true;
+    const screen = $("bootScreen"), log = $("bootLog");
+    log.innerHTML = "";
+    screen.style.display = "flex";
+    screen.setAttribute("aria-hidden", "false");
+    let finished = false, skipped = false;
+    const finish = () => {
+      if (finished) return; finished = true;
+      state.booting = false;
+      document.removeEventListener("keydown", onSkip, true);
+      screen.removeEventListener("pointerdown", onSkip);
+      screen.classList.add("done");
+      setTimeout(() => {
+        screen.style.display = "none";
+        screen.setAttribute("aria-hidden", "true");
+        screen.classList.remove("done");
+      }, 260);
+      try { done(); } catch (e) { console.warn(e); }
+    };
+    const onSkip = (e) => { if (e) { e.preventDefault(); e.stopPropagation(); } skipped = true; finish(); };
+    document.addEventListener("keydown", onSkip, true);
+    screen.addEventListener("pointerdown", onSkip);
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+    const cur = () => '<span class="boot-cur">█</span>';
+    const line = (label) => {
+      const div = el("div", "boot-line boot-probe");
+      div.innerHTML = '<span class="lbl">' + esc(label) + '</span><span class="lead"></span><span class="res">' + cur() + "</span>";
+      log.appendChild(div);
+      return div;
+    };
+    const res = (div, html) => { const r = div.querySelector(".res"); if (r) r.innerHTML = html; };
+    // one probe; never throws — maps outcomes to {ok, status, r}. Bounded by a
+    // timeout so a half-open socket (daemon accepts but never answers) still
+    // resolves to OFFLINE and lets the sequence finish rather than hanging the
+    // overlay forever.
+    const probe = async (path, opts) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const r = await apiFetch(path, Object.assign({ signal: ctrl.signal }, opts));
+        return r.ok ? { ok: true, r: r } : { ok: false, status: "FAIL (HTTP " + r.status + ")" };
+      } catch (e) {
+        return { ok: false, status: e.message === "unauthorized" ? "UNAUTHORIZED" : "OFFLINE" };
+      } finally { clearTimeout(timer); }
+    };
+    // a red halt line + hint; the finally-block finish() then reveals whatever
+    // apiFetch surfaced (the token modal on 401) and starts the app degraded.
+    const halt = async (div, label, note) => {
+      res(div, '<span class="fail">' + esc(label) + "</span>");
+      const h = el("div", "boot-line boot-halt");
+      h.innerHTML = '<span class="fail">■ HALTED</span> <span class="lbl">— ' + esc(note) + "</span>";
+      log.appendChild(h);
+      const hint = el("div", "boot-hint"); hint.textContent = "press any key to continue";
+      log.appendChild(hint);
+      await pause(1200);
+    };
+    try {
+      const banner = el("div", "boot-banner"); banner.textContent = "YACRON2 CONTROL TERMINAL";
+      const sub = el("div", "boot-sub"); sub.textContent = "power-on self test";
+      log.appendChild(banner); log.appendChild(sub);
+      await pause(220); if (skipped) return;
+
+      // 1) connectivity + firmware version (/version doubles as the reachability probe)
+      const l1 = line("CONNECTING TO DAEMON");
+      const v = await probe("/version"); if (skipped) return;
+      if (v.status === "UNAUTHORIZED") { await halt(l1, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (!v.ok) { await halt(l1, v.status === "OFFLINE" ? "FAIL — daemon unreachable" : v.status, "continuing in degraded mode"); return; }
+      res(l1, '<span class="ok">OK</span>');
+      const version = (await v.r.text()).trim();
+      await pause(130); if (skipped) return;
+
+      const l2 = line("FIRMWARE VERSION");
+      res(l2, '<span class="val">v' + esc(version) + "</span>");
+      await pause(110); if (skipped) return;
+
+      // 2) job-set id + job count (one JSON call)
+      const l3 = line("JOB SET");
+      const js = await probe("/job-set-id", { headers: { Accept: "application/json" } }); if (skipped) return;
+      if (js.status === "UNAUTHORIZED") { await halt(l3, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (js.ok) {
+        const d = await js.r.json();
+        res(l3, '<span class="val">#' + esc(shortId(d.job_set_id || "")) + '</span> <span class="lbl">[' + esc(d.jobs != null ? d.jobs : "?") + " jobs]</span>");
+      } else res(l3, '<span class="fail">' + esc(js.status) + "</span>");
+      await pause(130); if (skipped) return;
+
+      // 3) cluster role / quorum
+      const l4 = line("CLUSTER");
+      const cl = await probe("/cluster"); if (skipped) return;
+      if (cl.status === "UNAUTHORIZED") { await halt(l4, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (cl.ok) { res(l4, bootClusterLine(await cl.r.json())); }
+      else res(l4, '<span class="fail">' + esc(cl.status) + "</span>");
+      await pause(130); if (skipped) return;
+
+      // 4) scan schedules (a genuine /jobs read)
+      const l5 = line("SCANNING SCHEDULES");
+      const jb = await probe("/jobs"); if (skipped) return;
+      if (jb.status === "UNAUTHORIZED") { await halt(l5, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (jb.ok) { const arr = await jb.r.json(); res(l5, '<span class="ok">OK</span> <span class="lbl">[' + (Array.isArray(arr) ? arr.length : "?") + " scheduled]</span>"); }
+      else res(l5, '<span class="fail">' + esc(jb.status) + "</span>");
+      await pause(240); if (skipped) return;
+
+      const ready = el("div", "boot-line boot-ready");
+      ready.innerHTML = '<span class="ok">READY.</span> ' + cur();
+      log.appendChild(ready);
+      await pause(650);
+    } catch (e) {
+      console.warn("boot self-test error:", e);
+    } finally {
+      finish();
+    }
+  }
+
+  // ===================================================================
   //  boot
   // ===================================================================
   loadPrefs();
@@ -2924,19 +3113,29 @@
   };
   document.addEventListener("pointerdown", resumeAudio);
   document.addEventListener("keydown", resumeAudio);
-  if (!window.matchMedia || !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    document.body.classList.add("booting");
-    setTimeout(() => document.body.classList.remove("booting"), 600);
+  // first-load hydration + steady-state polling; runs after the boot self-test
+  // (or immediately when the POST screen is disabled / motion-suppressed).
+  function startApp() {
+    loadVersion();
+    loadJobSetId();
+    loadCluster();
+    loadJobs().then(openFromHash);
+    restartPolling();
   }
-  loadVersion();
-  loadJobSetId();
-  loadCluster();
-  loadJobs().then(openFromHash);
-  restartPolling();
   setInterval(tick, 1000);
   setInterval(alarmTick, 6000);                               // standing failure alarm
   setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
   tick();
+  const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  if (prefs.boot && !reducedMotion) {
+    runBootSequence(startApp);          // POST screen types out, then starts the app
+  } else {
+    if (!reducedMotion) {               // otherwise keep the quick power-on sweep
+      document.body.classList.add("booting");
+      setTimeout(() => document.body.classList.remove("booting"), 600);
+    }
+    startApp();
+  }
 })();
 </script>
 </body>
