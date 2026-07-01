@@ -409,6 +409,123 @@ propagated. If the `statsd` block is absent, no metrics are emitted at all.
 and verify the host resolves and the UDP path is open. See
 [Metrics with statsd](Metrics-with-Statsd).
 
+## Clustering
+
+These cover the optional `cluster` section (peer attestation, leader election,
+and the lease backends). For the full model see
+[Clustering and Leader Election](Clustering-and-Leader-Election).
+
+### `quorate: false` and `Leader` jobs stop running
+
+**Symptom.** `GET /cluster` reports `"quorate": false` and `Leader`-policy jobs
+stop firing on every replica (`PreferLeader` jobs keep running).
+
+**Cause.** This node cannot see a quorum (a strict majority) of the cluster, so
+it deliberately **stands down** rather than risk a second leader. On the
+`gossip` backend that means a minority-side network partition or too many peers
+`unreachable`/`untrusted`. On a **lease** backend (`kubernetes`/`etcd`) it means
+the coordination store is unreachable or the last read has gone stale (past one
+`leaseDurationSeconds`/`ttl`); `quorate` there means "has a fresh read of the
+store", not "sees a majority". Either way `Leader` **fails closed** (skips) while
+`PreferLeader` keeps running (it may double-run during the outage).
+
+**Fix.** Restore a quorum: heal the partition or bring failed peers back so a
+majority is mutually reachable (gossip), or restore reachability to the apiserver
+/ etcd (lease backends). See
+[Why the quorum gate is safe](Clustering-and-Leader-Election#why-the-quorum-gate-is-safe)
+and, for the lease backends, [Failure modes](Clustering-and-Leader-Election#failure-modes).
+
+### Duplicate `nodeName` conflict (`conflict: true` with `conflict_names`)
+
+**Symptom.** `GET /cluster` shows `"conflict": true` with the offending name in
+`"conflict_names"`, one or more peers show status `conflict`, a banner appears in
+the dashboard cluster panel, and an `ERROR` log line reports the duplicate.
+`Leader` jobs stand down.
+
+**Cause.** Two processes are running with the **same `nodeName`** (distinguished
+by their random per-process instance ids). Because each would elect itself as the
+lowest name in its own view, both could lead: a silent double-run. yacron2
+detects this and **fails `Leader` jobs closed** until it clears (`PreferLeader`
+and `EveryNode` are not gated).
+
+**Fix.** Give every node a distinct `nodeName` (or distinct hostnames, since the
+default `nodeName` is the system hostname). The gate is self-healing: it clears
+automatically once the duplicate is renamed. See
+[Unique node names](Clustering-and-Leader-Election#unique-node-names).
+
+### Coordination-policy conflict (`policy_conflict: true` with `conflicting_policies`)
+
+**Symptom.** `GET /cluster` shows `"policy_conflict": true` with the differing
+descriptors in `"conflicting_policies"` (and the umbrella `"conflict": true`), a
+banner appears in the dashboard cluster panel, and `Leader` jobs stand down.
+
+**Cause.** A quorate peer is advertising a different `distribution` or
+`elect_leader` setting than this node. Because those are cluster-wide coordination
+settings (not part of the job-set id, so they do not surface as drift), a mismatch
+would let nodes coordinate differently and double-run. It is the **third** trigger
+of the umbrella `conflict` flag, alongside a duplicate `nodeName`
+(`conflict_names`) and a cluster-size disagreement (`size_conflict` /
+`conflicting_sizes`); all three stand `Leader` jobs down.
+
+**Fix.** Align `electLeader` and `distribution` across every node and roll the
+change out uniformly (one node at a time). The gate clears automatically once the
+cluster reconverges on one policy. See
+[Distribution: one leader, or spread the load](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+and [Consistent cluster size](Clustering-and-Leader-Election#consistent-cluster-size).
+
+### A peer shows `untrusted`
+
+**Symptom.** A peer's status on `GET /cluster` is `untrusted` (with a TLS error in
+`last_error`), and the `peer … is untrusted` `WARNING` appears in the logs. That
+peer never counts toward agreement, so quorum can drop.
+
+**Cause (gossip only).** The peer's certificate did not verify: it does not chain
+to the configured `tls.ca`, or its SAN/hostname does not match the address it was
+reached at (standard TLS hostname pinning, e.g. the cert at
+`yacron-b.internal:8443` must carry `yacron-b.internal` as a SAN). This most often
+follows a botched CA roll (the overlap step was skipped) or a node whose cert
+refresh lagged.
+
+**Fix.** Restore trust overlap (distribute a CA bundle covering whichever CA the
+`untrusted` peers were issued from) or finish rolling the lagging nodes; ensure
+each node's cert SAN matches its peer-list host. Each node reloads within ~1
+minute and peers return to `agreed`. See
+[Cluster peer attestation](Clustering-and-Leader-Election#cluster-peer-attestation)
+and [Cluster certificate operations](Production-Deployment#cluster-certificate-operations).
+
+### `electLeader` on a 2-node cluster refuses to start
+
+**Symptom.** Startup fails with a `ConfigError`:
+
+```text
+cluster.electLeader needs a fault-tolerant cluster, but this config declares
+only 2 nodes (1 peer). A quorum of 2 requires both nodes up for either to run,
+so it is strictly worse than a single replica. …
+```
+
+**Cause.** With `electLeader` and a 2-node cluster the quorum is 2, so **both**
+nodes must be up for either to run: lower availability than a single replica and
+no failover. yacron2 refuses it outright rather than silently degrade. (A 2-node
+cluster is fine for attestation-only, without `electLeader`.)
+
+**Fix.** Use 3 or more nodes (an odd count is best), or run a single replica
+without `electLeader`. See
+[Sizing the cluster](Clustering-and-Leader-Election#sizing-the-cluster).
+
+### Even-size warning with `electLeader`
+
+**Symptom.** Startup logs a warning that an even cluster size tolerates no more
+failures than the next-lower odd size.
+
+**Cause.** For `size > 2` an even size (4, 6, 10, …) needs the same quorum as the
+odd size below it, so the extra node only adds something that can fail; its
+`P(runs)` is equal-or-worse, never better. This is a non-fatal advisory (unlike
+the 2-node case above, which is rejected).
+
+**Fix.** Prefer an odd size: shrink by one for the same tolerance with one fewer
+node, or grow by one to tolerate an extra failure. See
+[Sizing the cluster](Clustering-and-Leader-Election#sizing-the-cluster).
+
 ## Concurrency and termination
 
 ### Overlapping runs, skipped runs, or a job killed mid-run

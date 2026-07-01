@@ -250,6 +250,11 @@ Because `web.socketMode` only ever applies to `unix://` sockets, it is
 irrelevant on Windows. See the [HTTP Control API](HTTP-API) for the listener
 configuration and [Web Dashboard](Web-Dashboard) for the browser UI.
 
+Note that this limitation is specific to `unix://` **web** listeners. Gossip
+clustering (the mTLS peer listener) does work on Windows: `cluster.listen` binds
+a TCP `host:port`, not a unix socket, so the Proactor unix-socket restriction
+does not apply. See [Clustering and Leader Election](Clustering-and-Leader-Election).
+
 ## Everything else behaves identically
 
 Apart from the differences above, yacron2 behaves the same on Windows as on

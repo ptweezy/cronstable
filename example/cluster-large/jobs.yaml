@@ -111,7 +111,9 @@ jobs:
     clusterPolicy: PreferLeader
 
   # ---- Manual only: scheduled ~never, run it with "Run now" on any node;
-  #      manual triggers are not leader-gated. ----------------------------
+  #      manual triggers are not leader-gated, so the clusterPolicy below is
+  #      irrelevant for the manual run (it would only gate the ~never schedule);
+  #      it is left at Leader to show the default. -----------------------
   - name: run-anywhere
     command: echo "🚀 run-anywhere launched on $HOSTNAME at $(date -u +%H:%M:%S)"
     schedule: "0 0 1 1 *"

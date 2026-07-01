@@ -14,7 +14,7 @@ elected leader firing scheduled jobs. It builds directly on the
 `yacron2/cluster.py` (the `ClusterManager`, `ClusterView`, and the pure
 `elect_leader`/`quorum_size` functions).
 
-*New in version 1.1.8. Pluggable backends (`kubernetes` / `etcd`) new in 1.2.0.*
+*New in version 1.2.0.*
 
 > **The default `gossip` backend is best-effort coordination, not fenced
 > exactly-once.** It keeps no shared state, so it is simple to operate and
@@ -26,18 +26,102 @@ elected leader firing scheduled jobs. It builds directly on the
 > [Choosing a backend](#choosing-a-backend) and
 > [Guarantees and trade-offs](#guarantees-and-trade-offs).
 
+**Terms used on this page.** A **job-set id** is an order-independent
+fingerprint of the jobs a node runs (two nodes match iff they hold the same job
+set). A **quorum** is a strict majority of the cluster, `⌊N / 2⌋ + 1` nodes. A
+node is **quorate** when it currently sees a quorum of agreeing members.
+**Fenced** means a shared store guarantees a single holder (the lease backends).
+A **lease** is a short-lived, auto-expiring claim on that store that the holder
+keeps renewing.
+
+## Quickstart: a minimal 3-node cluster
+
+The fastest way to see a leader-electing cluster is the bundled three-node demo,
+which mints a throwaway CA and per-node certs for you:
+
+```shell
+docker compose -f docker-compose-cluster.yml up --build
+# then open http://localhost:8080/ , :8081 , :8082 and watch the cluster panel
+```
+
+See [Trying it locally](#trying-it-locally) for the fuller walkthrough (failing
+the leader, losing quorum, drift, per-policy behaviour).
+
+To build one by hand, each node gets the same job set plus a per-node `cluster`
+block. This is a complete leader-electing gossip node (`yacron-a` of three):
+
+```yaml
+cluster:
+  listen: "0.0.0.0:8443"                  # this node's mTLS /peer listener
+  tls:
+    ca:   /etc/yacron2/cluster-ca.pem     # shared cluster CA (trust anchor)
+    cert: /etc/yacron2/yacron-a.pem       # this node's cert (SAN = yacron-a)
+    key:  /etc/yacron2/yacron-a.key
+  peers:                                  # every OTHER member -> size = 3
+    - host: yacron-b.internal:8443
+    - host: yacron-c.internal:8443
+  nodeName: yacron-a                      # unique, stable per node
+  electLeader: true                       # only the elected leader runs jobs
+```
+
+**The quorum rule in one paragraph.** List every *other* node in `peers` (never
+this node itself), so the cluster size is `len(peers) + 1` and every node
+computes the same `N`. A node acts as leader only while it sees a **quorum**, a
+strict majority (`⌊N / 2⌋ + 1`), of agreeing members. So a 3-node cluster
+tolerates one node down; give each node a distinct `nodeName` and a matching
+peer list.
+
+Most clusters want the **default single leader**: enable
+[`distribution: spread`](#distribution-one-leader-or-spread-the-load) only when
+one leader cannot carry all the scheduled work.
+
+**On Kubernetes**, skip the certs and peer list entirely and set
+`cluster.backend: kubernetes` so a `Lease` fences leadership instead (see
+[Choosing a backend](#choosing-a-backend)).
+
+## From one node to a cluster
+
+To grow a single instance into a cluster without a double-run flag day, add
+attestation first, verify it is healthy, then turn on election:
+
+1. **Pick a unique, stable `nodeName`** per replica (the orchestrator's stable
+   hostname, a StatefulSet ordinal, or an explicit value). Reusing one across
+   nodes silently double-runs; see [Unique node names](#unique-node-names).
+2. **Provision the coordination material.** For `gossip`, issue per-node
+   certs from a dedicated cluster CA (see
+   [Cluster peer attestation](#cluster-peer-attestation)); for a lease backend,
+   set up the `Lease` RBAC or etcd credentials
+   ([Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd)).
+3. **Add the `cluster` block with `electLeader: false` first** (attestation
+   only). Every replica still runs every job, so nothing changes operationally,
+   and you can confirm the peers reach `agreed` on `GET /cluster` before trusting
+   the topology.
+4. **Run `yacron2 --validate-config`** to catch a bad peer list, TLS paths, or
+   lease ordering at rest; see the [Command-Line Reference](CLI-Reference).
+5. **Roll the replicas one at a time**, letting each converge to `agreed` before
+   the next (change membership incrementally so majorities always overlap; see
+   [Consistent cluster size](#consistent-cluster-size)).
+6. **Set `electLeader: true`.** Enabling election only once attestation is
+   already healthy means the switch itself is a clean transition, not a flag day.
+
+### Reverting to a single instance
+
+To collapse back to one instance, scale to `replicas: 1`, or set
+`electLeader: false` (keep attestation) or remove the `cluster` block entirely.
+The `gossip` backend keeps no shared state, so there is nothing to clean up; a
+lease backend releases its lease on a graceful stop, so a survivor (if any) takes
+over at once.
+
 ## Choosing a backend
 
-`cluster.backend` selects how leadership is decided. All three present the same
-**per-job** seam to the scheduler: `clusterPolicy` (`Leader` / `PreferLeader` /
-`EveryNode`) means the same thing on every backend, so you pick a point on the
-CAP trade-off without changing how jobs are written. What differs is the
-*coordination* underneath, and therefore how the cluster is **observed**: the
-gossip backend exposes a peer table, quorum count, and conflict gates, while the
-lease backends expose a single holder and lease expiry. The dashboard cluster
-panel and `GET /cluster` render each shape accordingly (see
-[Observing the cluster](#observing-the-cluster) and
-[Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd)).
+`cluster.backend` selects how leadership is decided. **The decision rule:** stay
+on the default `gossip` when you want zero-dependency replicas and can tolerate
+an occasional skip or double-run in narrow windows; pick `kubernetes` (already on
+Kubernetes) or `etcd` (already run etcd) when you need a **fenced, exactly-once**
+guarantee and already run that store. All three present the same **per-job** seam
+(`clusterPolicy`) to the scheduler, so switching backends does not change how
+jobs are written; only the *coordination* underneath, and therefore how the
+cluster is **observed**, differs.
 
 | | `gossip` *(default)* | `kubernetes` | `etcd` |
 | --- | --- | --- | --- |
@@ -46,48 +130,6 @@ panel and `GET /cluster` render each shape accordingly (see
 | Extra dependency | none | none (optional `yacron2[kubernetes]`) | none |
 | Needs | per-node mTLS certs + a static peer list | in-cluster (or kubeconfig) apiserver access + a Lease RBAC | reachable etcd endpoint(s) |
 | Best when | zero-dependency replicas, occasional skip/dup tolerable | already on Kubernetes and want a hard guarantee | already run etcd |
-
-How the lease backends talk to their store: **over plain HTTP using the core
-`aiohttp` dependency**, namely the Kubernetes apiserver's REST API and etcd's v3
-gRPC-gateway JSON API. So the **core install gains no new dependency**, and by
-avoiding grpc/protobuf wheels both backends run on the full set of architectures
-yacron2 ships for. The Kubernetes backend can optionally use the **official
-`kubernetes` client** when it is installed
-(`pip install yacron2[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
-(the default) prefers it when importable and otherwise falls back to the
-hand-rolled REST transport, so the choice is automatic per architecture
-(`library` requires the client, `http` forces the hand-rolled path). etcd always
-uses its own v3 JSON gateway, so it has no optional client.
-
-### Lease backends at a glance
-
-* **No peer list, no mTLS, no quorum math.** The store is the single source of
-  truth, so `listen`/`tls`/`peers` are not used; `electLeader` is implied
-  (configuring a lease backend *is* opting into leadership). The cluster is
-  logically a single holder (`cluster_size` / `quorum` report `1`), and
-  `GET /cluster` returns a lease-shaped view (a `lease` block with the holder
-  and expiry; an empty `peers` array).
-* **The lease is the fence, not a name.** Leadership is decided by the
-  *lease*, so a duplicate node identity cannot make two nodes both lead the way
-  it can on a naive lease holder: etcd fences on the **bound lease id** (only
-  the node whose own lease backs the election key leads), and Kubernetes writes
-  a **per-process `holderIdentity` token** so two nodes sharing a `nodeName`
-  still write distinct holders. You should still give each node a stable, unique
-  name for clear observability (see
-  [Node identity](#node-identity-for-the-lease-backends)).
-* **Local-expiry safety.** A holder only calls itself leader until a
-  *locally-computed* lease deadline (renew time + duration, minus a small
-  clock-skew margin), so a node whose renew loop stalls self-demotes **without a
-  network round-trip**, and never two holders act at once.
-* **`PreferLeader` keeps never-skip semantics.** A node that currently **cannot
-  reach** the coordination store runs a `PreferLeader` job anyway (it may
-  double-run); a healthy follower that **can** see the holder defers. `Leader`
-  stays fail-closed: it skips while the store is unreachable. This is the
-  deliberate, documented trade: a `PreferLeader` job never skips, at the cost of
-  a possible double-run during a store outage.
-* **`distribution: spread` is rejected** at config load (a hard `ConfigError`,
-  not a silent fallback). A single lease holder cannot also be a per-job owner;
-  use the gossip backend if you need per-job spread.
 
 The per-backend config keys (`cluster.kubernetes.*`, `cluster.etcd.*`) are in the
 [Configuration Reference](Configuration-Reference#cluster); deployment, RBAC,
@@ -147,12 +189,16 @@ cluster:
   peers:
     - host: yacron-b.internal:8443
     - host: yacron-c.internal:8443
-  nodeName: node-a                        # optional; defaults to the system hostname
+  nodeName: yacron-a                      # optional; defaults to the system hostname
   interval: 30                            # optional; seconds per round (default 30)
   driftAfter: 3                           # optional; rounds before "drifted" (default 3)
   connectTimeout: 10                      # optional; seconds per peer request (default 10)
   electLeader: false                      # optional; run jobs on the leader only (see below)
 ```
+
+Run `yacron2 --validate-config` before deploying to catch a bad `cluster`
+section (peer list, TLS paths, lease ordering) at rest rather than at startup;
+see the [Command-Line Reference](CLI-Reference).
 
 The trust model is deliberately small and keeps no shared state:
 
@@ -199,42 +245,20 @@ A peer reported as `unreachable` or `untrusted` resets its drift streak, because
 the streak only counts *reachable-but-mismatched* rounds.
 
 The `/peer` endpoint is served **only** on the separate mTLS `listen` address,
-never on the public [web API](HTTP-API). It returns a JSON document carrying
-everything a polling peer needs to drive attestation, the quorum gate, and the
-conflict checks:
+never on the public [web API](HTTP-API). It returns a small JSON document with
+everything a polling peer needs: the reporter's `node_name` and `job_set_id`
+(the agreement key), a per-process `instance_id` (so a duplicate `nodeName` is
+distinguishable from a self-listing), the declared `cluster_size` and the
+`distribution` / `elect_leader` descriptors (the conflict gates), plus its own
+`members` view, `mutual_agreeing` / `quorate_vouched` sets (bridge discovery and
+`spread` owner deferral), and `ran_reboot_jobs` (deferred-`@reboot`
+de-duplication).
 
-```jsonc
-{
-  "node_name": "node-b",          // this node's nodeName
-  "job_set_id": "v1:…",           // its job-set fingerprint (the agreement key)
-  "scheme_version": "v1",         // fingerprint scheme; ids compare only within one
-  "instance_id": "a1b2…",         // random per-process id → duplicate-nodeName detection
-  "cluster_size": 3,              // its declared N → the size-divergence gate
-  "members": [                    // its own per-peer observations → mutual agreement
-    {"node_name": "node-a", "instance_id": "…", "agreed": true}
-    // …one entry per node it holds a fresh view of → transitive conflict detection
-  ],
-  "mutual_agreeing": ["node-a"],  // peers it *two-way* agrees with → bridge discovery
-  "ran_reboot_jobs": ["boot"]     // @reboot one-shots known run → deferred-@reboot retirement
-}
-```
-
-Every field after the first three is load-bearing for a safety check described
-on this page (mutual agreement, the bridge mitigation, the duplicate-`nodeName`
-and cluster-size conflict gates, `@reboot` de-duplication). A consequence worth
-calling out: **any peer the cluster CA admits can read the full member graph,
-agreement graph, and `@reboot` run state** off `/peer`, and could fabricate
-those fields. So the cluster CA must be a dedicated, closed boundary issued only
-to yacron2 nodes, **not** a shared service-mesh or organisation-wide CA.
-
-Individual `/peer` requests are bounded (a per-request size cap and the
-`connectTimeout`), but the listener places **no cap on concurrent
-connections**, so a CA-admitted peer that has been compromised or misconfigured
-could exhaust file descriptors / coroutines. This is a residual of trusting
-CA-vouched peers (the same boundary as the fabrication risk above); if that
-concerns you, front the `listen` port with an upstream connection limit. A
-non-CA-admitted client is rejected at the TLS handshake and never reaches the
-handler.
+The full annotated payload, the per-field safety role, and the trust-model notes
+(any CA-admitted peer can read and could fabricate the whole member and
+agreement graph, so the cluster CA must be a dedicated, closed boundary, and the
+listener caps request size but not concurrent connections) are in
+[Architecture and Internals](Architecture-and-Internals#the-peer-attestation-payload).
 
 ## Leader election
 
@@ -368,43 +392,16 @@ is *not* gated: it already accepts double-runs as the price of never skipping.
 ### Sizing the cluster
 
 A `Leader` job fires successfully only while a quorum is up and mutually
-reachable. If each node is independently up with probability `p`, and the quorum
-is `q = ⌊N/2⌋ + 1`, then the chance a given firing runs is the probability that
-**at least `q` of `N` nodes are up**, which is a binomial tail:
+reachable, so **pick an odd size**: each odd size adds one failure of headroom
+(3 tolerates 1, 5 tolerates 2, 7 tolerates 3), while an even size needs the same
+quorum as the odd size below it yet has an extra node that can fail, so yacron2
+warns on even sizes (for `N > 2`). A 2-node cluster is strictly worse than a
+single replica (both must be up, with no failover upside), so yacron2 **refuses
+to start** with `electLeader` and 2 nodes (a `ConfigError`); a 2-node cluster is
+fine for attestation-only.
 
-```text
-P(runs) = Σ (from k=q to N)  C(N, k) · p^k · (1 − p)^(N − k)
-```
-
-The table below evaluates that for a few realistic per-node availabilities, as a
-fraction and as "nines" (`−log₁₀(1 − P)`). "Tol." is how many simultaneous node
-failures the size survives (`N − q`).
-
-| N | Quorum | Tol. | P(runs), p=0.9 | p=0.99 | p=0.999 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | 1 | 0 | 0.9000 (1.0 nines) | 0.9900 (2.0) | 0.99900 (3.0) |
-| 2 | 2 | 0 | 0.8100 (0.7) | 0.9801 (1.7) | 0.99800 (2.7) |
-| **3** | 2 | **1** | 0.9720 (1.6) | 0.99970 (3.5) | 0.9999970 (5.5) |
-| 4 | 3 | 1 | 0.9477 (1.3) | 0.99941 (3.2) | 0.9999940 (5.2) |
-| **5** | 3 | **2** | 0.9914 (2.1) | 0.999990 (5.0) | ≈1 (8.0) |
-| 7 | 4 | 3 | 0.9973 (2.6) | ≈1 (6.5) | ≈1 (10.5) |
-
-How to read it:
-
-* **Odd sizes are the sweet spot.** Each odd size adds one failure of headroom
-  over the previous odd size: 3 tolerates 1, 5 tolerates 2, 7 tolerates 3.
-* **Even sizes are equal-or-worse, never better.** N=4 still needs a quorum of
-  3, so it tolerates the same single failure as N=3, but it has an extra node
-  that can fail, so its P(runs) is actually slightly *lower* (0.99941 vs 0.99970
-  at p=0.99). yacron2 warns on even sizes for exactly this reason.
-* **2 is worse than 1.** A 2-node quorum is 2, so both must be up: P = p²
-  (0.9801 at p=0.99), below a single node's `p` (0.99), with no failover upside.
-  yacron2 **refuses to start** with `electLeader` and a 2-node cluster, raising a
-  `ConfigError` ("...strictly worse than a single replica..."). The same 2-node
-  cluster is fine for attestation-only (without `electLeader`).
-
-The same numbers as expected **skipped firings** for an hourly `Leader` job
-(8760 firings/year), which is often the more intuitive framing:
+Framed as expected **skipped firings** for an hourly `Leader` job (8760
+firings/year), which is often the more intuitive view:
 
 | N | p=0.99 | p=0.999 |
 | --- | --- | --- |
@@ -412,16 +409,9 @@ The same numbers as expected **skipped firings** for an hourly `Leader` job
 | 3 | ≈2.6 skips/yr | ≈0.03 skips/yr |
 | 5 | ≈0.09 skips/yr | negligible |
 
-Caveats on the math:
-
-* It assumes **independent** failures. Correlated failures (a bad config push, a
-  shared host, zone, or power domain) break that assumption, and then more nodes
-  can even hurt. Spread the nodes across independent failure domains; `p` should
-  be realistic uptime *including* deploys and restarts, not raw hardware MTBF.
-* It only models "is a quorum up". It does *not* capture the narrow
-  membership-change windows in [Guarantees and trade-offs](#guarantees-and-trade-offs)
-  (a firing may still slip through them), nor `PreferLeader` duplication, which
-  is about partitions rather than node-up probability.
+The binomial derivation and full availability tables are in the
+[Appendix: cluster sizing math](#appendix-cluster-sizing-math) at the bottom of
+this page.
 
 ### Failure handling
 
@@ -482,17 +472,21 @@ The decision for one node, one firing, is exactly:
 ```text
 election off  -> run (every node runs everything)
 EveryNode     -> run (always, even if the manager failed to start)
-conflict      -> skip (fail closed; a duplicate nodeName OR a cluster-size disagreement is visible)
-no manager    -> skip (fail closed)
+conflict      -> skip (fail closed; a duplicate nodeName, a cluster-size disagreement, OR a coordination-policy mismatch is visible)
+no manager    -> skip (fail closed; the leadership listener failed to start)
 PreferLeader  -> run only if this node is the lowest reachable agreeing node
 Leader        -> run only if this node is the quorum-gated elected leader
 ```
 
-(The `conflict` row applies to `Leader` only; `PreferLeader` and `EveryNode`
-are gated on neither a duplicate `nodeName` nor a cluster-size disagreement.
-Under `distribution: spread`, described next, the last two lines become "the
-*per-job owner* among the reachable agreeing nodes" and "the quorum-gated
-*per-job owner*" respectively.)
+(The `conflict` row applies to `Leader` only; `PreferLeader` and `EveryNode` are
+gated on none of a duplicate `nodeName`, a cluster-size disagreement, or a
+coordination-policy mismatch. A coordination-policy conflict is a quorate peer
+advertising a different `distribution` or `elect_leader` setting, surfaced as
+`policy_conflict: true` with the differing descriptors in `conflicting_policies`;
+it is the third trigger of the umbrella `conflict` flag alongside `conflict_names`
+and `size_conflict`. Under `distribution: spread`, described next, the last two
+lines become "the *per-job owner* among the reachable agreeing nodes" and "the
+quorum-gated *per-job owner*" respectively.)
 
 ### `@reboot` jobs under leader election
 
@@ -535,6 +529,13 @@ name being present *and* still a `Leader`/`PreferLeader` `@reboot`, so:
   never the one captured at boot; and if the reused job is no longer a deferrable
   `@reboot` (it became `EveryNode`, or a real schedule), the original one-shot is
   considered gone and the new job is left to its own scheduling.
+
+On a **lease backend** the same deferral applies, translated to lease vocabulary:
+a `Leader` `@reboot` runs once **on the lease holder** (and skips while the store
+is unreachable), a `PreferLeader` `@reboot` runs on **this** node when the store
+is unreachable (a possible boot-time double-run), and `EveryNode` is not
+deferred. There is no cross-node "already ran" gossip on a single-holder store,
+so a non-owner replica simply does not run the deferred one-shot.
 
 ## Distribution: one leader, or spread the load
 
@@ -589,11 +590,16 @@ What to know:
   when a single node cannot comfortably carry all the scheduled work; for light
   workloads the default single leader is simpler and equally correct.
 * **Keep it consistent.** Every node must agree on `distribution` (just like the
-  peer list and `electLeader`). A node left on `single-leader` while the others
-  run `spread` would run every job itself. `distribution` is *not* part of the
-  job-set id (it is cluster config, not a job property), so a mismatch does not
-  show up as drift; treat it like `electLeader` and roll it out uniformly. It is
-  inert without `electLeader` (and yacron2 warns if you set it anyway).
+  peer list and `electLeader`). A quorate peer that agrees on the job set but
+  advertises a different `distribution` (or `electLeader`) is treated as a
+  first-class **coordination-policy conflict**: it surfaces as
+  `policy_conflict: true` (with the differing descriptors in
+  `conflicting_policies`) and, as the third trigger of the umbrella `conflict`
+  flag, **stands this node's `Leader` jobs down** (fail closed) until every node
+  reconverges on one policy. `distribution` is *not* part of the job-set id (it
+  is cluster config, not a job property), so a mismatch does not show up as
+  drift; treat it like `electLeader` and roll it out uniformly. It is inert
+  without `electLeader` (and yacron2 warns if you set it anyway).
 
 ### Worked example
 
@@ -628,7 +634,7 @@ JSON. When no `cluster` section is configured it returns
 {
   "enabled": true,
   "backend": "gossip",             // the active cluster.backend
-  "node_name": "node-a",
+  "node_name": "yacron-a",
   "job_set_id": "v1:…",
   "cluster_size": 3,
   "quorum": 2,
@@ -638,12 +644,14 @@ JSON. When no `cluster` section is configured it returns
   "conflict_names": [],            // the duplicated nodeName(s), if any
   "size_conflict": false,          // true if an agreeing peer declares a different N
   "conflicting_sizes": [],         // those divergent cluster sizes, if any
+  "policy_conflict": false,        // true if an agreeing peer declares a different distribution/elect_leader
+  "conflicting_policies": [],      // those differing coordination-policy descriptors, if any
   "quorate": true,                 // whether this node sees a quorum
-  "leader": "node-a",              // null when not quorate, or always in spread mode
+  "leader": "yacron-a",            // null when not quorate, or always in spread mode
   "is_leader": true,               // always false in spread mode (no single leader)
   "peers": [
     {"host": "yacron-b.internal:8443", "status": "agreed",
-     "node_name": "node-b", "job_set_id": "v1:…",
+     "node_name": "yacron-b", "job_set_id": "v1:…",
      "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null,
      "mismatch_streak": 0},
     {"host": "yacron-c.internal:8443", "status": "unreachable",
@@ -661,7 +669,8 @@ leader-gated job in [`GET /jobs`](HTTP-API).
 
 The JSON above is the **gossip** shape. A lease backend returns a lease-shaped
 view instead: `backend` names the backend, `peers` is `[]`,
-`cluster_size`/`quorum` are `1`, `conflict`/`size_conflict` are always `false`,
+`cluster_size`/`quorum` are `1`, `conflict`/`size_conflict`/`policy_conflict`
+are always `false`,
 and an extra `lease` block carries the holder and expiry: for `kubernetes`
 `{name, namespace, identity, holder, expiry}`, for `etcd`
 `{electionName, identity, holder, leaseId, expiry}`. There `quorate` means the
@@ -676,6 +685,11 @@ The same view is rendered as a **cluster panel** in the
 
 ### Monitoring and alerting
 
+**`quorate` is the field to alert on for every backend** (on gossip it means "this
+node sees a majority"; on a lease backend it means "this node has a fresh read of
+the store"). This section covers the gossip signals; the lease equivalents are in
+[Monitoring the lease backends](#monitoring-the-lease-backends).
+
 yacron2 does not export cluster state to statsd (the
 [statsd integration](Metrics-with-Statsd) is per-job); instead every signal you
 would alert on is a pre-derived field on `GET /cluster`, so the simplest monitor
@@ -684,7 +698,7 @@ probes that endpoint on each replica. Useful alerts:
 | Alert when | Field(s) | Means |
 | --- | --- | --- |
 | `quorate` is `false` for more than a few `interval`s | `quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
-| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes` | a duplicate `nodeName` or a cluster-size disagreement is pausing `Leader` jobs (page on this) |
+| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
 | `agreed` peers fall below `quorum − 1` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum |
 | any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
 
@@ -709,7 +723,7 @@ one calls itself the leader:
 
 ```shell
 # across all replicas, count how many believe they are the leader
-for url in node-a:8080 node-b:8080 node-c:8080; do
+for url in yacron-a:8080 yacron-b:8080 yacron-c:8080; do
   curl -s "http://$url/cluster" \
     | python -c 'import sys,json; print(str(json.load(sys.stdin).get("is_leader")).lower())'
 done | grep -c '^true$'     # > 1 means a transient double-leader
@@ -723,10 +737,26 @@ single replica, not the gossip backend.
 
 ## Guarantees and trade-offs
 
-This design intentionally keeps **no shared state**, which is what makes it easy
-to run, but it means the guarantee is *best-effort*, not fenced exactly-once.
-Because each node acts on a view only as fresh as its last poll (`interval`),
-there are narrow windows where behaviour degrades:
+The delivery guarantee each `clusterPolicy` gives depends on the backend. The
+matrix below is the one-word summary (fuller wording follows); "fenced" is the
+hard, single-holder guarantee, "best-effort" admits the narrow gossip windows,
+and "may skip" / "may dup" name the side each policy gives up:
+
+| `clusterPolicy` | `gossip` | `kubernetes` | `etcd` |
+| --- | --- | --- | --- |
+| `Leader` | best-effort (may skip; rare dup) | fenced (may skip) | fenced (may skip) |
+| `PreferLeader` | never-skip (may dup) | never-skip (may dup) | never-skip (may dup) |
+| `EveryNode` | every-node | every-node | every-node |
+
+On the lease backends "fenced" holds while the store is reachable; a store
+outage is the one window a `Leader` job skips and a `PreferLeader` job may
+double-run (see [Failure modes](#failure-modes)). `EveryNode` is never gated on
+any backend.
+
+This gossip design intentionally keeps **no shared state**, which is what makes
+it easy to run, but it means the guarantee is *best-effort*, not fenced
+exactly-once. Because each node acts on a view only as fresh as its last poll
+(`interval`), there are narrow windows where behaviour degrades:
 
 * **Just after a leader dies**, a `Leader` firing may be *skipped* until the
   survivors notice (up to one `interval`) and re-elect.
@@ -768,87 +798,19 @@ windows at the cost of more polling traffic.
 
 ## Certificate rotation
 
-The `gossip` backend builds its mTLS contexts **once**, when the cluster manager
-starts, and loads the CA/cert/key into memory. A long-running process would
-therefore keep serving its *old* certificate after an in-place renewal (the
-exact pattern cert-manager, Vault, and Kubernetes mounted-secret refreshes use,
-same file paths, new bytes) until the old cert expires and peers begin
-rejecting each other, losing quorum **fleet-wide** and all at once.
+**Rotation is automatic** on the `gossip` backend: yacron2 reloads its mTLS
+contexts when the mounted CA/cert/key change in place. On each config-reload pass
+(every minute) it compares the on-disk CA, cert, and key against what it loaded
+at startup and, if any changed, restarts the cluster manager to rebuild the TLS
+contexts with the new material, so an in-place renewal (the cert-manager, Vault,
+or Kubernetes mounted-secret pattern of same paths, new bytes) needs **no manual
+restart**. A detected change is dry-run loaded first, so a half-written cert
+observed mid-rotation is retried rather than tearing the cluster down. This is
+`gossip`-only; the lease backends use no per-node mTLS certs.
 
-yacron2 closes this automatically. On each config-reload pass (every minute, at
-the top of the minute), it compares the on-disk CA, cert, and key against what
-it loaded at startup; if any changed, it **restarts the cluster manager** to
-rebuild the TLS contexts with the new material. So an in-place rotation needs
-**no manual restart**: yacron2 picks it up within ~1 minute and reloads
-seamlessly. (`os.stat` follows symlinks, so the atomic symlink swap Kubernetes
-uses for mounted secrets is detected too.) This is `gossip`-only; the lease
-backends do not use per-node mTLS certs.
-
-Before applying a detected rotation, yacron2 first **dry-runs loading** the new
-CA/cert/key into fresh SSL contexts. If they are not yet loadable (a
-half-written or briefly-absent cert observed mid-rotation, since cert-manager,
-Vault, and Kubernetes secret refreshes are not atomic across all three files),
-it **keeps the running manager** (still serving the valid old cert) and retries
-on the next reload, logging a `WARNING`, rather than tearing the cluster down
-and then failing the rebuild. So a transient bad write costs nothing:
-`Leader`/`PreferLeader` jobs keep running on the old, valid cert until the new
-material lands cleanly. (yacron2 does *not* build the replacement manager before
-stopping the old one, since both would bind the same `listen` port, so this
-dry-run, not a make-before-break swap, is what keeps the rotation restart safe.)
-
-> **Detection caveat.** Change is detected by comparing each file's
-> `(modification time, size)`. Essentially every renewal tool rewrites the bytes
-> and bumps the mtime, so this is reliable in practice, but a tool that
-> produces a **byte-length-identical** file *and* preserves/resets the mtime
-> (some restore-from-backup or `touch`-style flows) would be missed. If you use
-> such a flow, restart the process after rotation instead.
-
-### Rotating a node's certificate
-
-Per-node leaf certs (renewed by your PKI on their own schedule) are the common
-case and need no coordination as long as every cert chains to the **same** CA:
-when a node's cert is rewritten in place, that node reloads within ~1 minute and
-its peers keep trusting it (same CA). Provision certs with a comfortable overlap
-(issue the new one well before the old expires) so a slow refresh never leaves a
-node serving an expired cert.
-
-### Rolling the cluster CA
-
-Changing the CA itself is the case that needs care, because a node only trusts
-peers whose certs chain to the CA bundle **it currently holds**. Roll it so trust
-always overlaps:
-
-1. Build a **bundle CA** file containing *both* the old and new CA certificates,
-   and distribute it as the `tls.ca` on **every** node first. Each node reloads
-   within ~1 minute and now trusts certs signed by either CA.
-2. Confirm every node still shows its peers `agreed` on `GET /cluster` (no
-   `untrusted`).
-3. Re-issue each node's leaf cert from the **new** CA, **one node at a time**,
-   watching `GET /cluster` after each: the rotated node and its peers must
-   return to `agreed` before you proceed to the next.
-4. Once every node presents a new-CA cert, narrow the bundle back to the **new**
-   CA alone and distribute it everywhere.
-
-Never cut over the CA in a single step: if some nodes trust only the new CA
-while others still present old-CA certs, they reject each other as `untrusted`
-and the cluster loses quorum until trust overlaps again.
-
-### Recovering from an `untrusted` cascade
-
-If peers start showing `untrusted` on `GET /cluster` (or the
-`peer … is untrusted` `WARNING` appears in the logs) after a rotation, certs and
-CA trust have diverged: typically a CA roll that skipped the overlap step, or a
-node whose refresh lagged. Recovery does **not** require restarts:
-
-* Restore the trust overlap (push a CA bundle that includes whichever CA the
-  still-`untrusted` peers were issued from), or finish rolling the lagging nodes
-  onto the new CA.
-* Each node reloads within ~1 minute; once certs chain to a trusted CA again,
-  peers return to `agreed` and quorum is restored automatically.
-
-`Leader` jobs stand down (fail closed) while quorum is lost, so the cascade
-**skips** firings rather than double-running them: there is no split-brain risk
-during the recovery, only the missed-firing cost until trust reconverges.
+For the operational runbooks (leaf-cert rotation, rolling the cluster **CA** with
+trust overlap, and recovering from an `untrusted` cascade), see
+[Cluster certificate operations](Production-Deployment#cluster-certificate-operations).
 
 ## Operating the lease backends (Kubernetes and etcd)
 
@@ -858,6 +820,52 @@ is reachable. They share one code path (`yacron2.leadership.LeaseBackend`) and
 differ only in which store they talk to. This section covers how they elect, how
 to deploy each, their failure modes, and how to monitor them; the config keys
 are in the [Configuration Reference](Configuration-Reference#cluster).
+
+How the lease backends talk to their store: **over plain HTTP using the core
+`aiohttp` dependency**, namely the Kubernetes apiserver's REST API and etcd's v3
+gRPC-gateway JSON API. So the **core install gains no new dependency**, and by
+avoiding grpc/protobuf wheels both backends run on the full set of architectures
+yacron2 ships for. The Kubernetes backend can optionally use the **official
+`kubernetes` client** when it is installed
+(`pip install yacron2[kubernetes]`): `cluster.kubernetes.clientLibrary: auto`
+(the default) prefers it when importable and otherwise falls back to the
+hand-rolled REST transport, so the choice is automatic per architecture
+(`library` requires the client, `http` forces the hand-rolled path). etcd always
+uses its own v3 JSON gateway, so it has no optional client.
+
+### Lease backends at a glance
+
+* **No peer list, no mTLS, no quorum math.** The store is the single source of
+  truth, so the gossip-only keys `listen`, `tls`, `peers`, `interval`, and
+  `driftAfter` are ignored (each logs a one-line startup advisory). A lease
+  backend **always elects**, so `electLeader` is implied and `electLeader: false`
+  is likewise ignored with an advisory (configuring a lease backend *is* opting
+  into leadership). The cluster is logically a single holder (`cluster_size` /
+  `quorum` report `1`), and `GET /cluster` returns a lease-shaped view; its full
+  field list is under [Observing the cluster](#observing-the-cluster).
+* **The lease is the fence, not a name.** Leadership is decided by the
+  *lease*, so a duplicate node identity cannot make two nodes both lead the way
+  it can on a naive lease holder: etcd fences on the **bound lease id** (only
+  the node whose own lease backs the election key leads), and Kubernetes writes
+  a **per-process `holderIdentity` token** so two nodes sharing a `nodeName`
+  still write distinct holders. You should still give each node a stable, unique
+  name for clear observability (see
+  [Node identity](#node-identity-for-the-lease-backends)).
+* **Local-expiry safety.** A holder only calls itself leader until a
+  *locally-computed* lease deadline (renew time + duration, minus a small
+  clock-skew margin), so a node whose renew loop stalls self-demotes **without a
+  network round-trip**, and never two holders act at once.
+* **`PreferLeader` keeps never-skip semantics.** A node that currently **cannot
+  reach** the coordination store runs a `PreferLeader` job anyway (it may
+  double-run); a healthy follower that **can** see the holder defers. `Leader`
+  stays fail-closed: it skips while the store is unreachable. This is the
+  deliberate, documented trade: a `PreferLeader` job never skips, at the cost of
+  a possible double-run during a store outage.
+* **`distribution: spread`** (an opt-in, gossip-only mode that fans jobs across
+  nodes instead of one leader; see [Distribution](#distribution-one-leader-or-spread-the-load))
+  **is rejected** at config load on a lease backend (a hard `ConfigError`, not a
+  silent fallback). A single lease holder cannot also be a per-job owner; use the
+  gossip backend if you need per-job spread.
 
 ### How a lease backend elects
 
@@ -929,12 +937,22 @@ cluster:
     # leaseNamespace: null         # default: the pod's own namespace
     leaseDurationSeconds: 15        # failover happens within ~this long
     renewDeadlineSeconds: 10        # must be < leaseDurationSeconds
-    retryPeriodSeconds: 2           # renew/observe cadence
+    retryPeriodSeconds: 2           # renew/observe cadence; must be < renewDeadlineSeconds
     # clientLibrary: auto          # auto | http | library (see below)
 ```
 
-* **RBAC (required).** The backend needs `get` (observe), `create` (first
-  acquire), and `update` (renew / take over / release) on the one `Lease`:
+The three timings are cross-checked **at config load** (a `ConfigError`
+otherwise): `renewDeadlineSeconds > 0`,
+`leaseDurationSeconds > renewDeadlineSeconds`, `0 < retryPeriodSeconds <
+renewDeadlineSeconds`, and `renewDeadlineSeconds + retryPeriodSeconds <
+leaseDurationSeconds` (so a renew that just misses its deadline still leaves a
+retry inside the lease window). Run `yacron2 --validate-config` to check them
+before deploying; see the [Command-Line Reference](CLI-Reference).
+
+* **RBAC (required).** The backend needs `get` (observe) and `update` (renew /
+  take over / release) on the one named `Lease`, plus `create` on `leases` to
+  first acquire it. `create` cannot be scoped by `resourceNames`, so it is a
+  second, unscoped rule:
 
   ```yaml
   apiVersion: rbac.authorization.k8s.io/v1
@@ -942,12 +960,18 @@ cluster:
   rules:
     - apiGroups: ["coordination.k8s.io"]
       resources: ["leases"]
-      verbs: ["get", "create", "update"]
+      resourceNames: ["yacron2-leader"]   # keep in sync with cluster.kubernetes.leaseName
+      verbs: ["get", "update"]
+    - apiGroups: ["coordination.k8s.io"]
+      resources: ["leases"]
+      verbs: ["create"]                    # create cannot be scoped by resourceNames
   ```
 
   A ready-to-apply `ServiceAccount` + `Role` + `RoleBinding` + 3-replica
   `Deployment` is in
   [`example/kubernetes/deployment.yaml`](https://github.com/ptweezy/yacron2/blob/develop/example/kubernetes/deployment.yaml).
+  Run `yacron2 --validate-config` on the config before applying the manifests;
+  see the [Command-Line Reference](CLI-Reference).
 * **Credentials.** In-cluster, the pod's service-account token, CA, and
   namespace file are used automatically (`leaseNamespace` defaults to the pod's
   own namespace). For out-of-cluster / local testing set
@@ -964,8 +988,12 @@ cluster:
 * **Failover timing.** A holder that dies is replaced within
   ~`leaseDurationSeconds`. On a *graceful* shutdown the holder clears
   `holderIdentity` so a survivor takes over immediately. Shorter durations fail
-  over faster at the cost of more apiserver traffic; keep
-  `leaseDurationSeconds > renewDeadlineSeconds` (enforced at config load).
+  over faster at the cost of more apiserver traffic. All three timings are
+  ordered and **enforced at config load**:
+  `leaseDurationSeconds > renewDeadlineSeconds`,
+  `retryPeriodSeconds < renewDeadlineSeconds`, and
+  `renewDeadlineSeconds + retryPeriodSeconds < leaseDurationSeconds` (so a
+  renew that just misses its deadline still leaves a retry inside the window).
 
 ### etcd (`backend: etcd`)
 
@@ -977,7 +1005,7 @@ cluster:
   etcd:
     endpoints: [http://etcd-0:2379, http://etcd-1:2379]
     electionName: yacron2/leader   # the key; its value is the holder's nodeName
-    ttl: 15                         # lease TTL, seconds (keepalive every ~ttl/3)
+    ttl: 15                         # lease TTL, seconds (>= 3; keepalive every ~ttl/3)
     # username: root               # for an auth-enabled cluster …
     # password: { fromEnvVar: ETCD_PASSWORD }
     # tls: { ca: /etc/etcd/ca.pem, cert: /etc/etcd/client.pem, key: /etc/etcd/client.key }
@@ -997,7 +1025,10 @@ cluster:
 * **Failover timing.** A dead holder is replaced within ~`ttl`. On a *graceful*
   shutdown the holder **revokes** its lease, deleting the key at once for
   immediate failover. The value at `electionName` is the holder's `nodeName`, so
-  `etcdctl get yacron2/leader` shows who leads.
+  `etcdctl get yacron2/leader` shows who leads. `ttl` must be **>= 3** (a smaller
+  value is rejected at config load). etcd may *grant* a smaller TTL than
+  requested (its `--min-lease-ttl`, load), which the backend honours: a smaller
+  server-granted TTL narrows the effective leader window accordingly.
 
 ### Failure modes
 
@@ -1019,14 +1050,21 @@ cluster:
 * **etcd lease loss.** If a keepalive reports the lease gone (TTL ≤ 0) the holder
   re-grants a fresh lease and re-campaigns, becoming leader again only if it
   re-wins the key.
+* **etcd TTL below the floor.** If the server-honoured TTL ever drops below the
+  usable floor (3 s), the fence collapses to ~zero and this node's `Leader` jobs
+  fail closed (safe, but it can no longer lead). yacron2 logs a **one-time
+  warning** on that transition (and a recovery once the granted TTL returns above
+  the floor); check etcd's `--min-lease-ttl` and load if you see it.
 
 ### Monitoring the lease backends
 
-The gossip alerts on the [Monitoring](#monitoring-and-alerting) table (per-peer
+**`quorate` is the field to alert on for every backend**; on a lease backend it
+means this node has a fresh read of the store, not that it sees a majority. The
+gossip alerts on the [Monitoring](#monitoring-and-alerting) table (per-peer
 status, agreed-peers-vs-quorum, `untrusted` certs, the multi-leader scrape) **do
 not apply**: a lease view has `peers: []`, `quorum: 1`, and `conflict` is always
-`false`, and a fenced backend never reports two leaders. The signal that matters
-is **`quorate`**:
+`false`, and a fenced backend never reports two leaders. So the signal that
+matters is **`quorate`**:
 
 | Alert when | Field(s) | Means |
 | --- | --- | --- |
@@ -1037,38 +1075,12 @@ Probe `GET /cluster` on each replica, or watch the store directly
 (`kubectl get lease <name> -o jsonpath='{.spec.holderIdentity}'`,
 `etcdctl get <electionName>`). The same leadership transitions are logged.
 
-### `@reboot` jobs on a lease backend
+The lease-backend `@reboot` behaviour is covered inline in the main
+[`@reboot` section](#reboot-jobs-under-leader-election).
 
-The [`@reboot` deferral](#reboot-jobs-under-leader-election) works the same way,
-translated to lease vocabulary: a `Leader` `@reboot` one-shot runs **once on the
-lease holder** (and skips while the store is unreachable, since the holder is
-unknown until a fresh read); a `PreferLeader` `@reboot` runs on **this** node
-when the store is unreachable (a possible boot-time double-run); `EveryNode` is
-not deferred. There is **no cross-node "already ran" gossip** on a lease backend
-(it is a single-holder store), so a non-owner replica simply does not run the
-deferred one-shot: the holder does.
-
-## Running multiple replicas on Kubernetes
-
-On Kubernetes you have two ways to run more than one replica without
-double-running jobs:
-
-* **`backend: kubernetes` (recommended on Kubernetes).** A `coordination.k8s.io`
-  `Lease` gives a **fenced, exactly-once** election with no mTLS, no peer list,
-  and no odd-replica requirement: a plain `Deployment` works. See
-  [Kubernetes (`backend: kubernetes`)](#kubernetes-backend-kubernetes) above and
-  [`example/kubernetes/`](https://github.com/ptweezy/yacron2/tree/develop/example/kubernetes).
-* **`backend: gossip` on a StatefulSet.** If you do not want to grant `Lease`
-  RBAC (or want to keep the no-coordination-store model), the gossip backend
-  pairs naturally with a StatefulSet: its stable ordinal hostnames (`yacron2-0`,
-  `yacron2-1`, …) make both the certificate SANs and the peer list
-  straightforward and give each pod a stable `nodeName`. Use an **odd**
-  `replicas` count, spread pods across nodes/zones with
-  `topologySpreadConstraints`, and provision the per-pod certificates from your
-  own PKI (e.g. cert-manager). This keeps the best-effort guarantee.
-
-See [Production and Container Deployment](Production-Deployment) for the
-deployment walkthrough.
+For running multiple replicas on Kubernetes (both `backend: kubernetes` and
+`backend: gossip` on a StatefulSet), see
+[Production and Container Deployment](Production-Deployment).
 
 ## Trying it locally
 
@@ -1082,11 +1094,17 @@ mutually-attesting nodes with `electLeader: true` and one job of each
 ```shell
 docker compose -f docker-compose-cluster.yml up --build
 # then open http://localhost:8080/ , :8081 , :8082 and watch the cluster panel
-docker compose -f docker-compose-cluster.yml stop yacron-a   # watch leadership move to node-b
+docker compose -f docker-compose-cluster.yml stop yacron-a   # watch leadership move to yacron-b
 ```
 
 The compose file's header comments document the full set of things to try
 (losing quorum, drift, the per-policy job behaviour).
+
+**A full showcase.** For the fullest end-to-end demo (`distribution: spread`,
+all three `clusterPolicy` values, and mTLS together), the repository ships
+[`docker-compose-acme.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-acme.yml);
+its walkthrough is in
+[`example/acme-platform/README.md`](https://github.com/ptweezy/yacron2/blob/develop/example/acme-platform/README.md).
 
 ### A larger, CPU-heavy cluster
 
@@ -1135,3 +1153,53 @@ has the RBAC + `Deployment` to apply against any cluster (k3d/kind for local).
 - [Web Dashboard](Web-Dashboard): the cluster panel and per-job policy display.
 - [Production and Container Deployment](Production-Deployment): running multiple replicas under Kubernetes.
 - [Architecture and Internals](Architecture-and-Internals): where `cluster.py` fits in the daemon.
+
+## Appendix: cluster sizing math
+
+This expands the practical rule in [Sizing the cluster](#sizing-the-cluster) with
+the underlying probability. A `Leader` job fires successfully only while a quorum
+is up and mutually reachable. If each node is independently up with probability
+`p`, and the quorum is `q = ⌊N/2⌋ + 1`, then the chance a given firing runs is
+the probability that **at least `q` of `N` nodes are up**, a binomial tail:
+
+```text
+P(runs) = Σ (from k=q to N)  C(N, k) · p^k · (1 − p)^(N − k)
+```
+
+The table evaluates that for a few realistic per-node availabilities, as a
+fraction and as "nines" (`−log₁₀(1 − P)`). "Tol." is how many simultaneous node
+failures the size survives (`N − q`).
+
+| N | Quorum | Tol. | P(runs), p=0.9 | p=0.99 | p=0.999 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 0 | 0.9000 (1.0 nines) | 0.9900 (2.0) | 0.99900 (3.0) |
+| 2 | 2 | 0 | 0.8100 (0.7) | 0.9801 (1.7) | 0.99800 (2.7) |
+| **3** | 2 | **1** | 0.9720 (1.6) | 0.99970 (3.5) | 0.9999970 (5.5) |
+| 4 | 3 | 1 | 0.9477 (1.3) | 0.99941 (3.2) | 0.9999940 (5.2) |
+| **5** | 3 | **2** | 0.9914 (2.1) | 0.999990 (5.0) | ≈1 (8.0) |
+| 7 | 4 | 3 | 0.9973 (2.6) | ≈1 (6.5) | ≈1 (10.5) |
+
+How to read it:
+
+* **Odd sizes are the sweet spot.** Each odd size adds one failure of headroom
+  over the previous odd size: 3 tolerates 1, 5 tolerates 2, 7 tolerates 3.
+* **Even sizes are equal-or-worse, never better.** N=4 still needs a quorum of
+  3, so it tolerates the same single failure as N=3, but it has an extra node
+  that can fail, so its P(runs) is actually slightly *lower* (0.99941 vs 0.99970
+  at p=0.99). yacron2 warns on even sizes for exactly this reason.
+* **2 is worse than 1.** A 2-node quorum is 2, so both must be up: P = p²
+  (0.9801 at p=0.99), below a single node's `p` (0.99), with no failover upside.
+  yacron2 **refuses to start** with `electLeader` and a 2-node cluster, raising a
+  `ConfigError` ("...strictly worse than a single replica..."). The same 2-node
+  cluster is fine for attestation-only (without `electLeader`).
+
+Caveats on the math:
+
+* It assumes **independent** failures. Correlated failures (a bad config push, a
+  shared host, zone, or power domain) break that assumption, and then more nodes
+  can even hurt. Spread the nodes across independent failure domains; `p` should
+  be realistic uptime *including* deploys and restarts, not raw hardware MTBF.
+* It only models "is a quorum up". It does *not* capture the narrow
+  membership-change windows in [Guarantees and trade-offs](#guarantees-and-trade-offs)
+  (a firing may still slip through them), nor `PreferLeader` duplication, which
+  is about partitions rather than node-up probability.

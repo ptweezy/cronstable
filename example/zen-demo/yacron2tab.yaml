@@ -4,6 +4,10 @@
 # the dashboard's zen all-clear screensaver, which only appears when a wallboard
 # is idle AND healthy: nothing Running and nothing Failing.
 #
+# This is a single, non-clustered node (no `cluster:` section), so unlike the
+# clustered ACME demo there is no cluster panel here: no Owner column, no
+# quorum/leader status. Just one node's jobs.
+#
 # HOW TO SEE ZEN
 #   1. Open http://localhost:8080/
 #   2. (optional, for speed) Settings -> "Zen idle" -> 10s

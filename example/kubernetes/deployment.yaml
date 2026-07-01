@@ -27,6 +27,13 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: yacron2-lease
+  # A Role is namespaced: it only grants access to Leases in its OWN namespace
+  # (the one you apply it to). If you point the backend at a Lease in a
+  # different namespace (cluster.kubernetes.leaseNamespace, see yacron2tab.yaml),
+  # the ServiceAccount has no rights there: every lease call 403s, the node
+  # never becomes quorate, and Leader jobs never run (mislogged as "apiserver
+  # unreachable"). Put this Role + RoleBinding in THAT namespace (metadata.
+  # namespace on both), or convert them to a ClusterRole + ClusterRoleBinding.
 rules:
   # get: observe the current holder; update: renew, take over an expired lease,
   # and release on shutdown. Both are restricted to the one Lease the backend
@@ -74,6 +81,14 @@ spec:
         app: yacron2
     spec:
       serviceAccountName: yacron2
+      # On a graceful stop yacron2 clears its holderIdentity (releases the
+      # Lease) so a survivor takes over at once instead of waiting out
+      # leaseDurationSeconds. That release is a live apiserver call, so the pod
+      # needs time to make it during termination: keep terminationGracePeriod-
+      # Seconds comfortably above renewDeadlineSeconds (the release is bounded
+      # by it). Lowering it below silently loses the fast handoff -- the pod is
+      # SIGKILLed mid-release and the peer waits out the full lease instead.
+      terminationGracePeriodSeconds: 30
       containers:
         - name: yacron2
           image: ghcr.io/ptweezy/yacron2:latest

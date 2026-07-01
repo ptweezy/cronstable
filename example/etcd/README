@@ -57,3 +57,8 @@ password from a value / file / env var (like `web.authToken`):
         ca: /etc/etcd/ca.pem
         cert: /etc/etcd/client.pem
         key: /etc/etcd/client.key
+
+`ca` alone is enough to trust the server over an `https://` endpoint; add
+`cert` + `key` only for mutual TLS (client-certificate auth). `cert` and `key`
+are all-or-nothing: set both or neither (a client certificate needs its private
+key, so config load rejects one without the other).

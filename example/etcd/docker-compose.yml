@@ -29,12 +29,26 @@ services:
     # If you must publish the client port, bind it to loopback only
     # ("127.0.0.1:2379:2379") and never expose this unauthenticated store
     # beyond localhost.
+    # The healthcheck lets the yacron2 nodes wait for etcd to be READY (see
+    # their depends_on condition), not merely started. Without it the short-form
+    # `depends_on: [etcd]` only waits for the container to start, so on first
+    # boot the nodes race ahead and their logs show a few transient
+    # "etcd round failed: ... connection refused" warnings until etcd is
+    # listening. That is harmless and self-heals within a renew period, but the
+    # gate keeps first-boot logs clean.
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
 
   yacron2-a:
     image: ghcr.io/ptweezy/yacron2:latest
     command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
     hostname: yacron2-a          # becomes cluster.nodeName / the lease identity
-    depends_on: [etcd]
+    depends_on:
+      etcd:
+        condition: service_healthy
     ports:
       - "8080:8080"
     volumes:
@@ -44,7 +58,9 @@ services:
     image: ghcr.io/ptweezy/yacron2:latest
     command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
     hostname: yacron2-b
-    depends_on: [etcd]
+    depends_on:
+      etcd:
+        condition: service_healthy
     ports:
       - "8081:8080"
     volumes:

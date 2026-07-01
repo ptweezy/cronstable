@@ -7,7 +7,7 @@
 #   docker compose -f docker-compose-cluster-large.yml down -v         # stop + wipe
 #
 # Ten nodes (yacron-a .. yacron-j) are deployed from one identical job set
-# (example/cluster-large/jobs.yaml, ~15 jobs, six CPU-heavy). Each node's cluster
+# (example/cluster-large/jobs.yaml, 14 jobs, six CPU-heavy). Each node's cluster
 # config is generated at start by example/cluster-large/node-entrypoint.sh from
 # environment variables, so the compose file needs no per-node peer lists: every
 # node shares one CLUSTER_HOSTS list and drops itself by NODE_NAME.
@@ -15,7 +15,7 @@
 # Dashboards: yacron-a..j on host ports 8080..8089 (e.g. http://localhost:8080/).
 #
 # DISTRIBUTION (defaults to "spread"): with spread, each leader-gated job gets
-# its own per-job owner via rendezvous hashing, so the ~13 Leader/PreferLeader
+# its own per-job owner via rendezvous hashing, so the 12 Leader/PreferLeader
 # jobs (and the CPU-heavy ones) fan out across the ten nodes. Watch `docker
 # stats` and you'll see CPU spread around. Flip to a single leader to see the
 # contrast (ONE node runs every Leader job and all CPU burns at once):

@@ -25,14 +25,23 @@ operator-facing walkthrough.
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`), and `JobRetryState`. |
 | `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
-| `yacron2/cluster.py` | Cluster peer attestation and leader election: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop), the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
+| `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`) via deferred imports. New in version 1.2.0. |
+| `yacron2/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). New in version 1.2.0. |
+| `yacron2/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. New in version 1.2.0. |
+| `yacron2/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). New in version 1.2.0. |
+| `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. New in version 1.2.0. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
-`fingerprint`, `cluster`) -> (`statsd`, `config`). `cluster.py` depends on
-`config` and `fingerprint` only; `config.py` has no dependency on `cron.py` or
-`job.py`.
+`fingerprint`, `leadership`) -> (`statsd`, `config`). `cron.py` imports
+`make_backend` from `leadership`, so the leadership seam fans out as
+`cron` -> `leadership` -> {`cluster` (gossip), `backends.kubernetes`,
+`backends.etcd`}; those backend modules are imported lazily by `make_backend`,
+so `backends/` never enters the import graph unless `cluster.backend` selects a
+lease backend. `cluster.py` depends on `config` and `fingerprint` only; both
+lease backends depend on `config` and `leadership`; `config.py` has no
+dependency on `cron.py` or `job.py`.
 `platform.py` is a leaf module with no yacron2 dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
 
@@ -95,13 +104,16 @@ in order:
    config. (See "Web control app".)
 
 3. **Cluster start/stop.** `await self.start_stop_cluster(config.cluster_config)`
-   reconciles the `ClusterManager` against the (possibly changed) `cluster`
-   config, mirroring the web-app reconcile: the manager is stopped when the
+   reconciles the leadership backend (`self.cluster_manager`, typed
+   `Optional[LeadershipBackend]`, so it may be the gossip `ClusterManager` or a
+   `KubernetesBackend`/`EtcdBackend`) against the (possibly changed) `cluster`
+   config, mirroring the web-app reconcile: the backend is stopped when the
    section is removed or changed, and (re)started when present. It also records
    `_elect_leader_configured` up front so the leader gate can fail closed even
-   when the manager is absent or failed to start. A start failure (bad cert
-   files, bad listen address, port in use) is logged and the reload continues.
-   The id the manager reports tracks reloads on its own (it calls
+   when the backend is absent or failed to start. A start failure (bad
+   cert/credential files, a bad listen address, a port in use, or a lease store
+   the backend cannot reach or authenticate to) is logged and the reload
+   continues. The id the backend reports tracks reloads on its own (it calls
    `self.job_set_id` each round), so only a change to the cluster section itself
    needs a restart. (See "Cluster manager" and
    [Clustering and Leader Election](Clustering-and-Leader-Election).)
@@ -137,10 +149,23 @@ pass (see below).
 job)` **and** `self._cluster_allows(job)` are true (and first logs any
 leadership transition via `_log_cluster_role`). `_cluster_allows` is always
 `True` unless `cluster.electLeader` is configured; then it consults the job's
-`clusterPolicy` against the elected-leader state: `EveryNode` always runs,
-`Leader`/`PreferLeader` fail closed when no manager is running, and otherwise
-gate on `is_leader()` / `is_available_leader()`. Manual (API) triggers and
-retries go through `maybe_launch_job` and are **not** gated. See
+`clusterPolicy` against the elected-leader state: `EveryNode` always runs;
+`Leader`/`PreferLeader` fail closed when no backend is running (except
+`PreferLeader`, which is never-skip and runs anyway). Otherwise, under the
+default `distribution: single-leader` it gates on `is_available_leader()` for
+`PreferLeader` and, for `Leader`, checks `has_conflict()` **first** (fail closed
+if true, see below) and then `is_leader()`. Under `distribution: spread` the
+same shape applies to the per-job variants (`is_available_job_owner(name)` for
+`PreferLeader`, then `has_conflict()`/`is_job_owner(name)` for `Leader`), so
+leader-gated work fans out across the quorate nodes by rendezvous hashing. The
+`has_conflict()` fail-closed-first case stands `Leader` jobs down whenever a
+quorate peer makes the election unsafe (a duplicate `nodeName`, a cluster-size
+disagreement, or a coordination-policy conflict); `PreferLeader` is left running
+since it already accepts double-runs. A backend read is wrapped in a `try`, and
+any exception fails the gate closed (skip this cycle) so a backend bug cannot
+kill the unguarded `spawn_jobs` path. Manual (API) triggers and retries go
+through `maybe_launch_job` and are **not** gated (though `schedule_retry_job`
+re-checks the gate before relaunching a scheduled-job retry). See
 [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy).
 `job_should_run`:
 
@@ -166,9 +191,10 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
    `asyncio.gather`.
 2. `await self._wait_for_running_jobs_task` awaits the reaper, which only
    returns once `self.running_jobs` is empty and the stop event is set.
-3. If a cluster manager is running, logs `"Stopping cluster manager"` and
-   `await self.cluster_manager.stop()` (which cancels the poll loop and tears
-   down the mTLS `/peer` listener).
+3. If a leadership backend is running, logs `"Stopping cluster manager"` and
+   `await self.cluster_manager.stop()` (which releases leadership best-effort for
+   fast failover: gossip cancels the poll loop and tears down the mTLS `/peer`
+   listener; a lease backend cancels its renew loop and releases its lease).
 4. If a web server is running, logs `"Stopping http server"` and
    `await self.web_runner.cleanup()`.
 
@@ -222,25 +248,67 @@ See [HTTP Control API](HTTP-API) for the request/response contract.
 
 ## Cluster manager
 
-`start_stop_cluster(cluster_config)` reconciles a single `ClusterManager`,
-mirroring the web-app reconcile: the manager is stopped when the `cluster`
-section is removed or differs from the running one, and (re)started when present
-and none is running. A start failure (`OSError`, `ssl.SSLError`, `ValueError`:
-bad cert files, a bad listen address, a port already in use) is logged and the
-reload continues (jobs keep running). `_elect_leader_configured` is set first, so
-the leader gate is correct even if the manager is absent.
+Leader election sits behind a pluggable-backend seam (new in version 1.2.0). The
+scheduler never talks to a concrete cluster implementation directly: it only ever
+asks *am I allowed to run this job?* through a handful of methods on whatever
+object `cluster.backend` selected. That seam is the `LeadershipBackend` ABC in
+`yacron2/leadership.py`, and `make_backend(cluster_config, get_job_set_id)` is the
+factory that builds the chosen one (via deferred imports, so a lease backend
+never enters the import graph for the common gossip case):
 
-The `ClusterManager` (in `yacron2/cluster.py`) owns two things:
+- **`gossip`** (default) -> `cluster.ClusterManager`, the original mTLS,
+  no-shared-state, best-effort quorum election (detailed below). Zero new
+  dependencies.
+- **`kubernetes`** -> `backends.kubernetes.KubernetesBackend`, a
+  `coordination.k8s.io/v1` `Lease`. Fenced, exactly-once while the lease store is
+  reachable.
+- **`etcd`** -> `backends.etcd.EtcdBackend`, a lease-backed key/election against
+  an etcd cluster, same fenced guarantee.
+
+The `LeadershipBackend` surface is split three ways so a new lease backend stays
+tiny: the *core abstract* methods every backend implements (`start`, `stop`,
+`is_leader`, `leader_name`, `is_quorate`, `view_dict`); *defaulted* bodies a
+single-holder lease backend inherits unchanged (per-job ownership collapses to
+the leader, there are no gossip-style conflicts, the cluster is logically size 1,
+`@reboot` gossip is a no-op, TLS rotation does not apply); and the *never-skip*
+`available_*` family, defaulted to the locked lease semantics (a node that
+currently cannot reach the store runs a `PreferLeader` job anyway, while a node
+that can see the holder defers; `Leader` stays fail-closed). Gossip overrides
+every defaulted method with its richer behaviour, so the gossip path is
+byte-identical to before the seam existed. The two lease backends share
+`LeaseBackend`, which pins `distribution` to `"single-leader"` and provides the
+common lease-shaped `view_dict()`; both talk to their store over plain HTTP via
+the core `aiohttp` dependency (no grpc/protobuf wheels), keeping the wide
+architecture coverage intact. See
+[Clustering and Leader Election](Clustering-and-Leader-Election) for the
+operator-facing model and the lease backends' fencing.
+
+`start_stop_cluster(cluster_config)` reconciles the single backend held in
+`self.cluster_manager` (typed `Optional[LeadershipBackend]`), mirroring the
+web-app reconcile: the backend is stopped when the `cluster` section is removed
+or differs from the running one, and (re)started (via `make_backend` inside a
+`try`) when present and none is running. A start failure is caught as `OSError`,
+`ssl.SSLError`, `ValueError`, `ConfigError`, `aiohttp.ClientError`, or
+`asyncio.TimeoutError`, logged, and the reload continues (jobs keep running).
+`OSError`/`ssl.SSLError`/`ValueError` cover the gossip case (bad cert files, a bad
+listen address, a port already in use); `ConfigError`, `aiohttp.ClientError`, and
+`asyncio.TimeoutError` additionally cover a lease backend that cannot reach or
+authenticate to its store at `start()` (a `ClientResponseError` on a rejected
+token is an `aiohttp.ClientError`, not an `OSError`), so these operational
+misconfigurations are logged rather than escaping to the run loop's generic
+"please report this as a bug" handler. `_elect_leader_configured` is set first, so
+the leader gate is correct even if the backend is absent.
+
+### The gossip backend: `ClusterManager`
+
+The gossip concrete (`ClusterManager` in `yacron2/cluster.py`) owns two things:
 
 - **The mTLS `/peer` listener**: its own `aiohttp` `AppRunner` on the `cluster`
   `listen` address, with a server SSL context that *requires* a CA-signed client
-  cert (`ssl.CERT_REQUIRED`). Its `GET /peer` returns the node's `node_name`,
-  `job_set_id`, and `scheme_version` plus the attestation fields the gates run
-  on: `instance_id`, declared `cluster_size`, its `members` observations,
-  `mutual_agreeing`, and `ran_reboot_jobs` (full schema in
-  [Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status)).
-  It also accepts `POST /reboot-ran` (the eager `@reboot` push). This listener
-  is entirely separate from the public web app.
+  cert (`ssl.CERT_REQUIRED`). Its `GET /peer` returns the full attestation
+  payload (see "The peer attestation payload" below). It also accepts
+  `POST /reboot-ran` (the eager `@reboot` push). This listener is entirely
+  separate from the public web app.
 - **The poll loop**: every `interval` seconds it polls each peer's `/peer` over
   mTLS (a client SSL context with `check_hostname=True`, so the peer cert's SAN
   must match the configured host), and feeds each observation into the pure
@@ -268,8 +336,86 @@ unchanged. Because the owner is a deterministic function of the job name and the
 agreeing member set, all quorate nodes agree, and a membership change only
 reassigns the affected jobs.
 
-See [Clustering and Leader Election](Clustering-and-Leader-Election) for the
-operator-facing model and trust boundary.
+### The peer attestation payload
+
+A gossip node's `GET /peer` handler (`ClusterManager._handle_peer`) returns a
+single JSON object that a polling peer feeds into its `ClusterView` and its
+election. The full body:
+
+```jsonc
+{
+  // this node's stable, human-readable identity (the configured nodeName,
+  // defaulting to the hostname). The election's key: elect_leader picks the
+  // minimum live name, so two nodes sharing this is a conflict_names conflict.
+  "node_name": "yacron-a",
+  // the order-independent job-set fingerprint (fingerprint.canonical_job);
+  // peers with a different value are "drifted" (running a different config).
+  "job_set_id": "3f2a...c9",
+  // the fingerprint scheme version (fingerprint.SCHEME_VERSION), so a peer on a
+  // newer hashing scheme is recognised rather than silently treated as drifted.
+  "scheme_version": "v1",
+  // a per-process-boot random token: lets a poller distinguish a genuine
+  // restart of this node from a second node fraudulently reusing node_name,
+  // and dedupes a node reachable at two addresses.
+  "instance_id": "b17e...",
+  // this node's declared cluster size (len(peers)+1). The election's safety
+  // assumes every node shares one N; a peer declaring a different one is a
+  // size_conflict (conflicting_sizes) and fails Leader closed.
+  "cluster_size": 3,
+  // this node's own per-peer observations (itself first, always agreeing), each
+  // tagged with node_name, instance_id, and whether it is currently seen
+  // agreed, so the poller can confirm the edge is two-way (mutual agreement)
+  // and spot a duplicate nodeName transitively (one name, two instance_ids).
+  "members": [
+    { "node_name": "yacron-a", "instance_id": "b17e...", "agreed": true },
+    { "node_name": "yacron-b", "instance_id": "6c40...", "agreed": true }
+  ],
+  // the peers this node MUTUALLY agrees with (witnessed two-way edges): the
+  // poller uses this as sound evidence that a transitively-reached node is
+  // itself quorate, driving bridge-discovery deferral.
+  "mutual_agreeing": ["yacron-b", "yacron-c"],
+  // @reboot one-shots already run in the cluster (this node's, plus any it
+  // learned from agreed peers), so a poller can retire its matching deferred
+  // job without re-running it. Capped to MAX_ADVERTISED_REBOOT_JOBS.
+  "ran_reboot_jobs": ["nightly-migrate"],
+  // this node's coordination policy: neither is in the job-set fingerprint, so
+  // a peer declaring a different distribution or elect_leader is a
+  // policy_conflict (conflicting_policies) and fails Leader closed.
+  "distribution": "single-leader",
+  "elect_leader": true,
+  // the nodes THIS node can confirm are themselves quorate (its eligible
+  // candidates): stronger than mutual_agreeing. A poller folds these into its
+  // spread Leader-path owner set, so it only ever defers a job to a node
+  // vouched able to run it.
+  "quorate_vouched": ["yacron-a", "yacron-b", "yacron-c"]
+}
+```
+
+The `distribution`, `elect_leader`, and `cluster_size` fields make coordination
+policy and cluster size part of the attested payload precisely so a disagreement
+becomes a detectable conflict rather than a silent split-brain: a differing
+`distribution`/`elect_leader` surfaces as `policy_conflict: true`, a differing
+`cluster_size` as `size_conflict: true`, and both (like a duplicate `node_name`)
+stand `Leader` jobs down through the umbrella `conflict` flag.
+
+**Threat model.** The listener requires a CA-signed client cert
+(`ssl.CERT_REQUIRED`) and the poller pins the peer cert's SAN
+(`check_hostname=True`), so only a node holding a cert your CA issued can join the
+gossip. But mTLS authenticates the *transport*, not the *claims*: every field
+above is self-asserted, so a validly-signed node can lie about its own state
+(advertise a different `job_set_id`, claim `quorate_vouched` peers it cannot
+reach, or reuse another node's `node_name`). This is why the election is
+best-effort and why the conflict gates fail `Leader` closed on any disagreement
+rather than trusting a single peer's word. The `instance_id` blunts the crudest
+fabrication (a second node reusing a `node_name` shows a different `instance_id`,
+surfacing the duplicate). Responses are size-capped (`ran_reboot_jobs` truncated
+to `MAX_ADVERTISED_REBOOT_JOBS`, the whole body bounded by
+`MAX_PEER_RESPONSE_BYTES`) so a peer cannot exhaust a poller's memory with an
+inflated payload, and poll failures are bounded by timeouts (classified
+`unreachable`) so a slow or hung peer cannot exhaust file descriptors or wedge the
+loop. See
+[Clustering and Leader Election](Clustering-and-Leader-Election) for the
+operator-facing trust boundary.
 
 ## The reaper task: `_wait_for_running_jobs`
 

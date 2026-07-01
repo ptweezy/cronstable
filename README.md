@@ -14,7 +14,7 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A modern, distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
+A modern, optionally-distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
@@ -37,11 +37,11 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
-* **Cluster peer attestation**: optionally have instances confirm over mutual
-  TLS that a configured set of peers is running the same job set (see
-  [Cluster peer attestation](#cluster-peer-attestation)), and **elect a leader**
-  so several replicas can run from one config without double-running jobs (see
-  [Leader election](#leader-election))
+* **Opt-in clustering and leader election**: optionally have instances confirm
+  over mutual TLS that a configured set of peers is running the same job set, and
+  **elect a leader** so several replicas can run from one config without
+  double-running jobs (see
+  [Clustering and leader election](#clustering-and-leader-election))
 * Arbitrary timezone support
 * Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 
@@ -356,6 +356,8 @@ Three built-in themes (amber and green phosphor CRT, or a flat **modern** look),
 | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
 
 Run history and live logs are kept **in memory only**, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
+
+**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live.
 
 ## Usage
 
@@ -1175,14 +1177,18 @@ It is available three ways:
 * **Logs**: it is logged once at startup, and again whenever a config reload
   changes it.
 
-### Cluster peer attestation
+### Clustering and leader election
 
-(new in version 1.1.8)
+(new in version 1.2.0)
 
-An optional `cluster` section lets an instance confirm that a static set of
-peers is running the *same* job set as itself. It builds directly on the
-[job-set id](#job-set-id): each node serves a small `GET /peer` endpoint over
-**mutual TLS** and periodically polls every configured peer, comparing ids.
+By default yacron2 runs as a single instance and every replica runs every job.
+An optional `cluster` section lets several replicas coordinate: each node serves
+a small `GET /peer` endpoint over **mutual TLS** and periodically polls its
+configured peers, comparing [job-set ids](#job-set-id) so they can confirm they
+are running the *same* set of jobs (cluster peer attestation). Turning on
+`electLeader` promotes that same attestation into a **quorum-gated leader
+election**, so you can run more than one replica from one config without
+double-running scheduled jobs:
 
 ```yaml
 cluster:
@@ -1194,128 +1200,24 @@ cluster:
   peers:
     - host: yacron-b.internal:8443
     - host: yacron-c.internal:8443
-  nodeName: node-a                # optional; defaults to the system hostname
+  nodeName: yacron-a              # optional; defaults to the system hostname
   interval: 30                    # optional; seconds per round (default 30)
+  connectTimeout: 10              # optional; per-peer connect timeout (default 10)
   driftAfter: 3                   # optional; rounds before "drifted" (default 3)
-  electLeader: false              # optional; run jobs on the leader only (see below)
-```
-
-The trust model is deliberately small and keeps no shared state:
-
-* **mTLS is the membership boundary.** A peer's certificate must chain to the
-  configured `ca`, and (client side) match the host it was reached at, so only
-  nodes the CA vouches for are ever attested; standard TLS hostname
-  verification provides that SAN pinning. The CA is the *whole* authentication
-  boundary (yacron2 trusts any cert it signs to assert its own `nodeName`,
-  agreement, and `@reboot` run-state over `/peer`), so it **must** be a
-  dedicated, closed CA issued only to yacron2 nodes, **not** a shared
-  service-mesh or organisation-wide CA (any workload that CA admits could
-  otherwise forge gossip or suppress jobs). Provision the certificates from your
-  own dedicated PKI (e.g. a private cert-manager issuer or internal CA); yacron2
-  only consumes them.
-* **Each node keeps its own view.** No node is authoritative: two healthy nodes
-  converge to the same picture, and any disagreement is itself the signal. Each
-  peer is reported as `agreed`, `syncing`, `drifted`, `unreachable`,
-  `untrusted`, `self` (the node found its own address in the peer list),
-  `conflict` (a duplicate `nodeName`), or `unknown` (not yet contacted). The
-  full table is in the
-  [clustering guide](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election#per-peer-status).
-* **Drift is debounced.** A reachable peer whose id differs is only reported as
-  `drifted` after `driftAfter` consecutive rounds, so a rolling deploy (a brief,
-  legitimate mismatch) does not raise a false alarm.
-
-The current view is available at `GET /cluster` on the
-[web interface](#remote-webhttp-interface) and is shown as a panel in the
-dashboard. The `/peer` endpoint is served only on the separate mTLS `listen`
-address, never on the public web API.
-
-### Leader election
-
-(new in version 1.1.8)
-
-By default a `cluster` section is *observe-only*: every instance still runs
-every job, and attestation just tells you whether they agree. Setting
-`electLeader: true` turns the same attestation into a **quorum-gated leader
-election**, so you can run more than one replica from the same config without
-double-running jobs:
-
-```yaml
-cluster:
-  listen: "0.0.0.0:8443"
-  tls: { ca: /etc/yacron2/cluster-ca.pem, cert: /etc/yacron2/this-node.pem, key: /etc/yacron2/this-node.key }
-  peers:
-    - host: yacron-b.internal:8443
-    - host: yacron-c.internal:8443
-  electLeader: true
+  electLeader: true               # observe-only if false (the default)
 ```
 
 Each node independently elects, as leader, the lowest `nodeName` among the
-members it currently sees *agreeing* on the job-set id, but only if that set
-is a **quorum** (a strict majority) of the cluster. **Only the leader runs
-*scheduled* jobs.** Manual runs via the API (`POST /jobs/{name}/start`) and
-automatic retries are deliberately *not* gated, so you can still trigger a job
-on any node.
+members it currently sees agreeing on the job-set id, but only if that set is a
+**quorum** (a strict majority) of the cluster, so under a clean partition at
+most one side leads. This is best-effort (the default `gossip` backend keeps no
+shared state); for a fenced, exactly-once guarantee set
+`cluster.backend: kubernetes` or `cluster.backend: etcd` (new in version 1.2.0)
+to elect through a `coordination.k8s.io/v1` `Lease` or a lease-bound etcd key
+instead.
 
-* **List every *other* member in `peers`** (not this node itself). The cluster
-  size is `len(peers) + 1`, and the quorum is `⌊size / 2⌋ + 1`, so the peer
-  lists must be consistent across nodes. The computed size, quorum, elected
-  leader, and whether this node is the leader are all shown at `GET /cluster`
-  and in the dashboard panel.
-* **Give every node a unique `nodeName`.** The election's safety depends on it
-  (two nodes sharing a name would each elect themselves and double-run). Each
-  process reports a random instance id alongside its name, so a duplicate is
-  detected and shown as a `conflict`; while one is visible, `Leader` jobs
-  **fail closed** (stand down) rather than risk a double-run. The default
-  `nodeName` is the system hostname, which is already unique per host.
-* **The quorum gate is what makes this safe with no shared state.** Two strict
-  majorities of `N` can't be disjoint, so under a clean network partition at
-  most one side is quorate and, within about one poll `interval`, at most one
-  leader exists (a leader just cut off from the majority keeps acting on its
-  stale view until its own next poll, so a clean partition can briefly
-  double-run a `Leader` firing, not only skip one). The trade-off is
-  liveness: a node that can't see a majority deliberately **stands down** (runs
-  nothing) rather than risk a second leader. A job therefore runs on a given
-  firing only while a majority of the cluster is up and mutually reachable.
-* **Use an odd cluster size.** With per-node availability `p`, the chance a
-  firing runs is the probability a majority is up: ~`3p² − 2p³` for 3 nodes,
-  higher for 5. **3 nodes** tolerate one simultaneous failure (≈4 nines of
-  "runs" at `p = 0.99`); **5 nodes** tolerate two (≈5 nines). Even sizes buy no
-  extra fault tolerance (4 tolerates the same one failure as 3; yacron2 *warns*
-  on an even size), and **2 nodes is worse than 1** (a majority of 2 is 2, so
-  both must be up): yacron2 **refuses to start** with `electLeader` and a
-  2-node cluster, since it can only lower availability with no upside. Spread
-  the nodes across independent failure domains. Correlated failures (a bad
-  config push, a shared host/AZ) defeat the math regardless of `N`.
-
-**This is best-effort, not fenced exactly-once.** Because each node acts on a
-view only as fresh as its last poll (`interval`), there are narrow windows
-where behaviour degrades: just after a leader dies, a firing may be *skipped*
-until survivors notice; and asymmetric or partial reachability can briefly
-double-run a `Leader` job. Two nodes that never agree with each other but are
-bridged by shared members collapse back to one leader once each confirms the
-other through the bridge (a bridge of `quorum - 1` shared members suffices). A
-node only elects a leader it can confirm is itself quorate, so in a *converged*
-view a healthy majority is **not silently stood down**; the trades are that a
-*thinner* bridge or the convergence window can double-run instead of skipping,
-and, symmetrically, a candidate confirmed from now-stale bridge gossip that
-has since become isolated can briefly draw the majority into deferring to it (a
-transient skip until the gossip ages out). `spread` behaves the same per job. The default `gossip` backend keeps **no
-shared state**, which is what makes it best-effort. If you need a hard
-exactly-once guarantee **and** already run a coordination store, set
-`cluster.backend: kubernetes` or `cluster.backend: etcd` to elect through a
-fenced `coordination.k8s.io/v1` `Lease` or a lease-bound etcd key instead (both
-talk to their store over plain HTTP via the existing `aiohttp` dependency, so
-the core install gains no dependency; see
-[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election#choosing-a-backend)).
-If election is configured but the backend fails to start, the node **fails
-closed** (stays idle) rather than fall back to running everything.
-
-#### Per-job policy
-
-The cluster-wide `electLeader` switch sets the *default* behaviour, but each job
-can override it with `clusterPolicy` to pick its own point on the
-liveness-vs-duplication trade-off. Note that **no option is true exactly-once**:
-each gives up one side: `Leader` may *skip*, `PreferLeader` may *double-run*.
+Each job can override the cluster-wide default with a per-job `clusterPolicy`,
+picking its own point on the liveness-vs-duplication trade-off:
 
 | `clusterPolicy` | healthy (quorate) | partitioned / sub-quorum | use for |
 | --- | --- | --- | --- |
@@ -1323,70 +1225,13 @@ each gives up one side: `Leader` may *skip*, `PreferLeader` may *double-run*.
 | `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | important **and** idempotent jobs that should never skip |
 | `EveryNode` | every node runs | every reachable node runs | genuinely per-node work (local log rotation), or fully idempotent jobs |
 
-```yaml
-jobs:
-  - name: charge-cards          # must not double-charge; skip-tolerant
-    command: ./charge.sh
-    schedule: "0 * * * *"
-    clusterPolicy: Leader       # the default; can be omitted
-
-  - name: refresh-cache         # idempotent, but must not be skipped
-    command: ./refresh.sh
-    schedule: "*/5 * * * *"
-    clusterPolicy: PreferLeader
-
-  - name: rotate-local-logs     # inherently per-node
-    command: ./rotate.sh
-    schedule: "@daily"
-    clusterPolicy: EveryNode
-```
-
-`clusterPolicy` is inert unless `cluster.electLeader` is on (without election,
-every job runs on every instance regardless). `EveryNode` jobs are independent
-of cluster health, so they keep firing even if the cluster listener failed to
-start; `Leader`/`PreferLeader` jobs fail closed there. The active policy for
-each job (when election is on) is shown in the dashboard's job drawer and in the
-`GET /jobs` payload, and it is part of the [job-set id](#job-set-id), so
-replicas that disagree on a job's policy show up as drift.
-
-An `@reboot` job with `Leader`/`PreferLeader` policy is **deferred** until the
-cluster converges and then runs **once** on the elected owner (rather than never
-running, or running on every node at boot). Use `EveryNode` for `@reboot` work
-that must run on every node at startup. A deferred one-shot is never silently
-lost across a reload: a name that momentarily vanishes from the config before
-the cluster converges is kept pending and runs when it returns, while a job you
-deliberately remove (or reuse for a non-`@reboot` job) never runs.
-
-#### Distribution: one leader, or spread the load
-
-By default (`distribution: single-leader`) the one elected leader runs *every*
-`Leader` job, so the other replicas are pure standby for scheduled work. Setting
-`cluster.distribution: spread` keeps the same quorum gate but gives each
-leader-gated job its own owner via rendezvous (highest-random-weight) hashing of
-the job name against the agreeing members, so the workload fans out roughly
-evenly across the quorate cluster instead of piling onto one node:
-
-```yaml
-cluster:
-  # ...listen / tls / peers...
-  electLeader: true
-  distribution: spread       # default is single-leader
-```
-
-This is a *load* optimization, not a stronger guarantee: under a clean partition
-every quorate node sees the same member set and computes the same owner for each
-job, so it stays at-most-once; a membership change only reassigns the affected
-jobs (the defining property of rendezvous hashing). It pays off when one node
-cannot comfortably carry all the scheduled work; for light workloads the default
-single leader is simpler and equally correct. Set `distribution` consistently on
-every node (like `electLeader`); it is inert without election. In spread mode
-`GET /cluster` reports `distribution`/`quorate` (no single `leader`), and each
-leader-gated job's owner appears as `clusterOwner` in `GET /jobs`. The
-dashboard surfaces it directly: an **Owner** column in the job table (shown
-only under spread) tags every job with its owning node (highlighting the ones
-owned by the node you're viewing), and the cluster panel adds a per-node
-**Owns** tally, so you can see which jobs belong to which node at a glance. It
-also appears in each job's drawer.
+The current view (members, elected leader, quorum, and any conflicts) is
+available at `GET /cluster` and shown as a panel in the dashboard. This is a
+teaser: the full trust model, per-peer status table, quorum math, sizing
+guidance, `distribution: spread` load-balancing, and the fenced lease backends
+are all covered in depth in the
+[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election)
+guide in the wiki. To watch it live, see [Try it](#web-dashboard) below.
 
 ### Includes
 
