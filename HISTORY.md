@@ -87,56 +87,6 @@ project, on which yacron2 is based.
   (`GET /job-set-id`, also `application/json`), and the dashboard header; it is
   logged once at startup and again whenever a config reload changes it. The
   scheme is versioned (a `v1:` prefix) so ids are only compared within a scheme.
-- **Cluster peer attestation.** An optional `cluster` section lets an instance
-  confirm that a static list of peers is running the same job set. Each node
-  serves a small `GET /peer` endpoint over mutual TLS and periodically polls
-  its configured peers to compare job-set ids, building a per-node view
-  (`agreed`/`syncing`/`drifted`/`unreachable`/`untrusted`) exposed at
-  `GET /cluster` and as a dashboard panel. mTLS (a cluster CA plus a per-node
-  cert/key) is the membership boundary, and drift is debounced over
-  `driftAfter` rounds so a rolling deploy does not false-alarm.
-- **Leader election.** Setting `cluster.electLeader: true` makes the same
-  attestation drive a quorum-gated leader election, so replicas deployed from
-  one config can finally run with more than one instance without double-running
-  jobs. Each node independently elects the lowest `nodeName` among the agreeing
-  peers it can see, but only when that set is a strict majority (*quorum*) of
-  the cluster; only the leader runs *scheduled* jobs (manual API triggers and
-  retries are unaffected). The quorum gate keeps this safe with no shared
-  state: two majorities can't be disjoint, so a clean partition elects at most
-  one leader. The cost is liveness: a minority partition stands down rather
-  than risk a second leader. Use an odd cluster size (3 tolerates one failure,
-  5 tolerates two); even sizes buy no extra fault tolerance. Leadership is
-  exposed at `GET /cluster`, shown in the dashboard panel, and logged on each
-  transition. If election is enabled but the cluster manager isn't running, the
-  node fails closed (stays idle) rather than risk every replica firing. As a
-  guardrail, enabling `electLeader` on a 2-node cluster is rejected at config
-  load (a quorum of 2 needs both up, so it is strictly worse than one replica),
-  and an even cluster size is warned about. Individual jobs can override the
-  default with a per-job `clusterPolicy`: `Leader` (the default, quorum-gated,
-  at-most-once), `PreferLeader` (lowest reachable node runs it, ignoring quorum:
-  never skips, but may double-run across a partition), or `EveryNode` (run on
-  every replica, for per-node or idempotent work). `clusterPolicy` is part of
-  the job-set id and shown in the dashboard job drawer. Node identities must be
-  unique: each process reports a random instance id alongside its `nodeName`,
-  so a duplicate `nodeName` (which would otherwise let two nodes each elect
-  themselves and double-run) is detected as a `conflict` (surfaced on
-  `GET /cluster`, in the dashboard panel, and in an error log) and makes
-  `Leader` jobs fail closed until it is resolved. An `@reboot` job with
-  `Leader`/`PreferLeader` policy is deferred until the cluster elects an owner
-  and then run once there, rather than never running (`Leader` saw no quorum at
-  boot) or running on every node (`PreferLeader` saw only itself).
-- **Spread distribution (opt-in).** A `cluster.distribution` option chooses how
-  leader-gated jobs spread across the quorate cluster: the default
-  `single-leader` keeps one elected leader running every `Leader` job, while
-  `spread` gives each job its own owner via rendezvous (highest-random-weight)
-  hashing, so the scheduled workload fans out roughly evenly instead of piling
-  onto one node. It keeps the same quorum gate and the same best-effort
-  guarantee (under a clean partition every quorate node computes the same owner
-  per job, so still at-most-once); a membership change only reassigns the
-  affected jobs. Purely a load optimization for clusters with many or heavy
-  jobs; inert without `electLeader`. In spread mode `GET /cluster` reports
-  `distribution`/`quorate` (no single `leader`), and `GET /jobs` plus the
-  dashboard drawer show each job's `clusterOwner`.
 
 ## 1.1.7 (2026-06-23)
 

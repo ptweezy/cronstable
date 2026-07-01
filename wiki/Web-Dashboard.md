@@ -133,41 +133,80 @@ The Schedule tab turns the cron expression into something you can read at a glan
 
 ## Cluster panel
 
-*New in version 1.1.8.* When a [`cluster`](Clustering-and-Leader-Election)
+*New in version 1.2.0.* When a [`cluster`](Clustering-and-Leader-Election)
 section is configured, the dashboard shows a **cluster panel** below the job
 table (it stays hidden otherwise). The panel polls `GET /cluster` alongside the
 job list and renders:
 
-- a **summary line** with this node's name and the agreement tally (e.g.
-  `node-a · 2/2 agreed`); when [leader election](Clustering-and-Leader-Election#leader-election)
+> **Try it:** the bundled Compose demos bring the dashboard up with one command.
+> [`docker-compose-cluster.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-cluster.yml)
+> starts the three-node gossip cluster (`yacron-a` / `yacron-b` / `yacron-c`) so
+> you can watch the peer table, roles, and leadership move live; stop a node to
+> see the summary and dots react. For the ambient wallboard view (including the
+> "zen" all-clear screensaver),
+> [`docker-compose-zen.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-zen.yml)
+> runs a single deliberately calm node.
+
+- a **summary line** with this node's name (e.g. `yacron-a`) and the agreement
+  tally (e.g. `yacron-a · 2/2 agreed`); when
+  [leader election](Clustering-and-Leader-Election#leader-election)
   is on, it also shows the live quorum count and this node's role: **leader**,
   **follower** (with the current leader's name), or **no quorum** when the node
   has stood down. Under [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
   there is no single leader, so the role reads **spread (per-job owner)** while
   quorate, or **spread (no quorum)** otherwise. Under spread the summary also
-  reports how many jobs **this** node owns (e.g. `… · owns 3`);
-- a **per-peer table** listing each peer's host, reported node name, status, and
-  the short form of its job-set id, with a coloured **status dot**: green for
-  `agreed`, amber for `syncing`, red for `drifted`/`untrusted`, grey for
-  `unreachable`, and blue for `self`. Under
-  [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
-  the table gains an **Owns** column counting how many jobs each node owns, so
-  the whole job-to-node distribution is visible at a glance (it pairs with the
-  per-job **Owner** column in the job table above).
+  reports how many jobs **this** node owns (e.g. `… · owns 3`). When the cluster
+  is in **conflict** the role instead reads **standing down (conflict)**, because
+  the conflict fails `Leader` jobs closed regardless of who holds the lead, and
+  the summary appends a loud **`⚠ … — Leader jobs paused`** note naming the
+  cause, one of three: a **duplicate `nodeName`** (two peers advertising the same
+  name), a **cluster size mismatch** (peers declaring different cluster sizes,
+  e.g. mid-resize), or a **coordination policy mismatch** (a peer running a
+  different `distribution` / `elect_leader`). See
+  [Clustering and Leader Election](Clustering-and-Leader-Election) for what each
+  conflict means and how to clear it;
+- a **per-peer table** with the on-screen headers **Peer** | **Node** | **Owns**
+  | **Status** | **Job set**, listing each peer's address, reported node name,
+  status, and the short form of its job-set id, with a coloured **status dot**:
+  green for `agreed`, amber for `syncing`, red for `drifted` / `untrusted` /
+  `conflict`, grey for `unreachable`, blue for `self`, and a faint-grey dot for a
+  peer that is `unknown` (configured but not yet contacted, so no status has come
+  back). The **Owns** column (counting how many jobs each node owns) is present
+  only under
+  [`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load),
+  so the whole job-to-node distribution is visible at a glance (it pairs with the
+  per-job **Owner** column in the job table above); outside spread it reads `—`.
 
 Peers the node has listed as its own address (`self`) are excluded from the
 agreement tally. This makes it easy to watch a rolling deploy (`syncing` →
 `agreed`), spot drift, or watch leadership move when a node goes down.
+
+A **`▚ timeline`** button in the panel header toggles a per-peer **swimlane**: a
+lane per peer, coloured by status over time, that accumulates in the browser
+while the tab is open (so you can see a `syncing` → `agreed` convergence or a
+flapping peer as a stripe rather than a single instant). It charts the gossip
+peer set only, so it is hidden entirely for the lease backends.
+
+Separately from the in-panel summary, a cluster incident also raises the
+page-level **CLUSTER ALERT** bar at the top of the dashboard: a red incident
+banner shown whenever this node reports a cluster conflict (duplicate `nodeName`,
+size mismatch, or coordination policy mismatch) or has **lost quorum**, so the
+alert is visible without scrolling down to the panel. It names the cause and,
+under a lease backend, phrases quorum loss as the lease store being unreachable.
 
 The bullets above describe the **gossip** backend. The
 [lease backends](Clustering-and-Leader-Election#operating-the-lease-backends-kubernetes-and-etcd)
 (`kubernetes` / `etcd`) have no peer set, so the panel renders a different shape:
 a **role summary** (`node-name · backend · role`, where the role is **leader**,
 **follower (leader: …)**, **follower**, or **no quorum (store unreachable)**)
-followed by a **key/value lease-detail table** (the lease/election name, the
-holder, the identity, and the expiry): no status dots, no agreement tally, no
-quorum count. There `no quorum` means *the lease store is unreachable from this
-node*, not "no majority".
+followed by a **key/value lease-detail table**: no status dots, no agreement
+tally, no quorum count. The table renders every non-null key the backend reports,
+so beyond the lease/election name, the holder, the identity, and the expiry it
+also surfaces the kubernetes `namespace` or the etcd `leaseId` when present. There
+`no quorum` means *the lease store is unreachable from this node*, not "no
+majority". See
+[Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster)
+for the full `GET /cluster` field semantics.
 
 ## Command palette
 

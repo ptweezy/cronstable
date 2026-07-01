@@ -20,6 +20,10 @@ cluster:
     leaseName: yacron2-leader
     # leaseNamespace defaults to the pod's own namespace (the service-account
     # namespace file); set it only to use a Lease in a different namespace.
+    # A non-default namespace also needs the RBAC (Role + RoleBinding in
+    # deployment.yaml) to live in THAT namespace, or a ClusterRole +
+    # ClusterRoleBinding; a namespaced Role only covers its own namespace, so
+    # otherwise every lease call 403s and Leader jobs never run.
     leaseDurationSeconds: 15
     renewDeadlineSeconds: 10
     retryPeriodSeconds: 2

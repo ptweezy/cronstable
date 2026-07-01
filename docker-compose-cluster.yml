@@ -46,9 +46,16 @@
 #    a follower's dashboard (8081/8082) — it runs there. Manual triggers and
 #    retries are never leader-gated.
 #
-# 6. Cause drift. Edit example/cluster/jobs.yaml on ONE node only by pointing its
-#    jobs volume at a different file, restart it, and watch its peers report
-#    "drifted" (after driftAfter=2 rounds) on the others' cluster panels.
+# 6. Cause drift. Drift is a mismatched SHARED job set (jobs.yaml), not the
+#    per-node cluster section, so give ONE node a different jobs.yaml:
+#        cp example/cluster/jobs.yaml example/cluster/jobs-drift.yaml
+#        # edit jobs-drift.yaml: change any job (e.g. its command or schedule)
+#    then point yacron-c at it by editing this file's yacron-c jobs bind mount:
+#        ./example/cluster/jobs-drift.yaml:/etc/yacron2.d/jobs.yaml:ro
+#    and recreate just that node:
+#        docker compose -f docker-compose-cluster.yml up -d yacron-c
+#    yacron-c's job-set id now differs, so yacron-a and yacron-b report it
+#    "drifted" (after driftAfter=2 rounds) on their cluster panels.
 #
 # 7. Spread the load. By default ONE leader (yacron-a) runs every Leader job.
 #    Uncomment `distribution: spread` in ALL THREE example/cluster/node-*.yaml

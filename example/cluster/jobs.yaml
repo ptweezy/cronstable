@@ -58,7 +58,10 @@ jobs:
 
   # A manual-only job (scheduled once a year, so in practice never). Manual
   # triggers via "Run now" / POST /jobs/{name}/start are NOT leader-gated, so
-  # you can launch this on any node regardless of who the leader is.
+  # you can launch this on any node regardless of who the leader is. The
+  # clusterPolicy below is therefore irrelevant for the manual trigger (it would
+  # only gate the effectively-never scheduled run); it is left at Leader just to
+  # show the default value.
   - name: run-me-anywhere
     command: echo "🚀 $HOSTNAME launched me on demand at $(date -u +%H:%M:%S) UTC"
     schedule: "0 0 1 1 *"

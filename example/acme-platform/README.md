@@ -10,22 +10,24 @@ mail, and a **statsd exporter** receives job metrics.
 
 ## Run it
 
+This is the deep end. For a gentler start, try a single node
+(`example/demo` / `docker-compose.yml`), a plainer 3-node cluster
+(`docker-compose-cluster.yml`), or a larger CPU-spread 10-node cluster
+(`docker-compose-cluster-large.yml`).
+
 ```console
 docker compose -f docker-compose-acme.yml up --build
 ```
 
 - Node dashboards: <http://localhost:8080/> (yacron-a), …8081–8084 (b–e)
 - On-call inbox (Mailpit): <http://localhost:8025/>
-- Job metrics (Prometheus): <http://localhost:9102/metrics>
+- Job metrics (statsd, re-exported as Prometheus): <http://localhost:9102/metrics>
 
 Stop and wipe (including the throwaway certs):
 
 ```console
 docker compose -f docker-compose-acme.yml down -v
 ```
-
-For a smaller/plainer cluster see `docker-compose-cluster.yml` (3 nodes) and
-`docker-compose-cluster-large.yml` (10 nodes, CPU-spread focused).
 
 ## yacron2 features exercised
 

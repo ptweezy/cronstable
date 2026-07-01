@@ -4,6 +4,9 @@
 # (nothing Running, nothing Failing). This config keeps the board calm so you can
 # actually see it.
 #
+# This is a single, non-clustered node, so (unlike the clustered ACME demo) the
+# dashboard shows no cluster panel: no Owner column and no quorum/leader status.
+#
 #   docker compose -f docker-compose-zen.yml up --build      # start
 #   docker compose -f docker-compose-zen.yml down            # stop and remove
 #

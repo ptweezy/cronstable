@@ -41,7 +41,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `jobs` | `Seq(Map)` of job definitions | No | The list of cron jobs. Each entry is validated against the per-job schema below. |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
-| `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). New in version 1.1.8. |
+| `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). New in version 1.2.0. |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
 
 ### `web`
@@ -68,7 +68,7 @@ be exactly one `cluster` block across the whole configuration; a duplicate in an
 included file or a second config-directory file raises a `ConfigError`. Defaults
 come from `DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` for the lease
 backends) and are applied only when a `cluster` section is present. New in
-version 1.1.8; `backend` and the lease backends are new in 1.2.0.
+version 1.2.0.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -92,23 +92,24 @@ required **only for this backend**:
 | `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With `backend: kubernetes`/`etcd` a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
 Gossip load-time validation (in addition to the numeric ranges above): with
-`electLeader: true`, a **2-node** cluster (one peer) is rejected with a
-`ConfigError` (a quorum of 2 needs both up, strictly worse than one replica),
-and an **even** cluster size is allowed but logs a warning.
+`electLeader: true`, a **2-node** cluster (one peer) is rejected outright with a
+`ConfigError` (a quorum of 2 needs both up, strictly worse than one replica);
+an **even** cluster size **greater than 2** is allowed but logs a warning (an
+odd count is best for a clean majority).
 
 **Kubernetes backend** (`backend: kubernetes`), under `cluster.kubernetes`. A
 `coordination.k8s.io/v1` `Lease` is the fence. Defaults from `DEFAULT_K8S`:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `leaseName` | `Str` | `yacron2-leader` | Name of the `Lease` object the replicas contend for. |
-| `leaseNamespace` | `Str` or null | null → in-cluster namespace | Namespace of the `Lease`; defaults to the pod's own namespace (the service-account namespace file). |
+| `leaseName` | `Str` | `yacron2-leader` | Name of the `Lease` object the replicas contend for. Must be a valid RFC1123 subdomain (lowercase alphanumerics, `-` and `.`; `<=253` chars), checked at load; it is spliced into the apiserver URL path, so a stray `/`, `?`, `#`, or space is rejected. |
+| `leaseNamespace` | `Str` or null | null → in-cluster namespace | Namespace of the `Lease`; defaults to the pod's own namespace (the service-account namespace file). When set, must be a valid RFC1123 label (lowercase alphanumerics and `-`; `<=63` chars), checked at load. |
 | `leaseDurationSeconds` | `Int` | `15` | How long a renewal keeps the lease valid. Must be `> renewDeadlineSeconds`. |
 | `renewDeadlineSeconds` | `Int` | `10` | Per-round renew/observe deadline: a round that exceeds it is abandoned and retried next round, so a stuck apiserver call cannot run out the full lease. Must be `> 0` and `< leaseDurationSeconds`. |
-| `retryPeriodSeconds` | `Int` | `2` | Seconds between renew/observe rounds. Must be `> 0`. |
+| `retryPeriodSeconds` | `Int` | `2` | Seconds between renew/observe rounds. Must be `> 0` and `< renewDeadlineSeconds` (a holder must be able to attempt a renew before its own deadline). Additionally, `renewDeadlineSeconds + retryPeriodSeconds < leaseDurationSeconds` is enforced at load, so the worst-case interval between two successful refreshes still fits inside the lease. |
 | `identity` | `Str` or null | null → `nodeName` | The human-readable holder for this node (shown in the dashboard / `GET /cluster`). yacron2 appends a **per-process token** to the `holderIdentity` it actually writes (`<identity>#<token>`), so two nodes sharing an `identity`/`nodeName` still write distinct holders and cannot both believe they hold the `Lease`. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
-| `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. |
-| `apiServer` | `Str` or null | null | Override the apiserver URL (else the in-cluster `KUBERNETES_SERVICE_*` env or the kubeconfig). |
+| `kubeconfig` | `Str` or null | null → in-cluster | Path to a kubeconfig for out-of-cluster / local testing; otherwise the in-cluster service-account credentials are used. On the hand-rolled HTTP transport a kubeconfig user that relies on an `exec` credential plugin or an `auth-provider` raises a `ConfigError` (those must be executed, which only the native client can do); use `clientLibrary: library` (`yacron2[kubernetes]`) or a kubeconfig with a static token / client certificate instead. `insecure-skip-tls-verify` is honored (the apiserver certificate is not validated) but logs a warning. |
+| `apiServer` | `Str` or null | null | Override the apiserver URL (else the in-cluster `KUBERNETES_SERVICE_*` env or the kubeconfig). When set, must be an `https://` URL: a non-https value is a `ConfigError` at load, since the ServiceAccount bearer token must not travel in cleartext. |
 | `clientLibrary` | `Enum(["auto", "http", "library"])` | `auto` | Transport selection. `auto` uses the official `kubernetes` client when it is importable (install `yacron2[kubernetes]`) and otherwise falls back to a hand-rolled apiserver REST transport over `aiohttp`; `library` requires the native client (a `ConfigError` if absent); `http` forces the hand-rolled transport. |
 
 **etcd backend** (`backend: etcd`), under `cluster.etcd`. A lease-bound key is
@@ -117,12 +118,25 @@ native client). Defaults from `DEFAULT_ETCD`:
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `endpoints` | `Seq(Str)` | `["http://127.0.0.1:2379"]` | etcd client URLs (`http(s)://host:port`), tried in order for failover. Each must be a well-formed URL with a host and port. |
+| `endpoints` | `Seq(Str)` | `["http://127.0.0.1:2379"]` | etcd client URLs, tried in order for failover. Each must be `http(s)://host[:port]`; the port is optional (defaults to the scheme's port, e.g. `443` behind an https ingress) and only an explicitly out-of-range port is rejected. Credentials embedded in the URL are refused. |
 | `electionName` | `Str` | `yacron2/leader` | The etcd key contended for; its value is the holder's `nodeName`. There is **no separate `identity` key** for etcd (the holder identity is always `cluster.nodeName`), but leadership is fenced on the **bound lease id**, not this string, so a duplicate `nodeName` cannot make two nodes both lead. See [Node identity](Clustering-and-Leader-Election#node-identity-for-the-lease-backends). |
-| `ttl` | `Int` | `15` | Lease time-to-live, seconds. Must be `> 0`. The keepalive cadence is ~`ttl/3`. |
+| `ttl` | `Int` | `15` | Lease time-to-live, seconds. Must be `>= 3`: the leader holds the key only until `ttl` minus a 1s clock-skew margin, so a smaller `ttl` would make a fresh winner treat its own lease as already expired (no `Leader` job would ever run). The keepalive cadence is ~`ttl/3` against the **effective** ttl, which etcd may grant smaller than requested (a smaller granted TTL narrows the fence window). |
 | `username` | `Str` or null | null | etcd auth username (omit for an auth-less cluster). Pair it with a resolvable `password`. The auth token is re-fetched automatically when it expires (re-auth on a `401`). |
-| `password` | `Map` | unset | etcd auth password, resolved like `web.authToken` from exactly one of `value` / `fromFile` / `fromEnvVar`; a configured-but-empty source fails closed. |
-| `tls.ca` / `tls.cert` / `tls.key` | `Str` or null | null | Optional client TLS for `https://` endpoints. |
+| `password` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | unset | etcd auth password source, resolved like `web.authToken` from exactly one of `value` / `fromFile` / `fromEnvVar`; a configured-but-empty source fails closed. |
+| `tls.ca` / `tls.cert` / `tls.key` | `Str` or null | null | Optional client TLS for `https://` endpoints. `tls.cert` and `tls.key` are all-or-nothing (a client certificate needs its private key), enforced at load. |
+
+etcd load-time guards: any TLS material (`tls.ca`/`tls.cert`/`tls.key`) requires
+at least one `https://` endpoint (otherwise it would be silently ignored and
+traffic sent in cleartext, a `ConfigError`). Likewise a `username` or resolved
+`password` requires **every** endpoint to be `https://`, so the credentials and
+bearer token are never POSTed in cleartext; a `username` without a resolvable
+`password` is also rejected.
+
+Because the cluster schema has many load-time rejections (the ordering rules,
+the RFC1123 and https guards, the credential-over-plaintext refusals above),
+check a cluster config before deploying with `yacron2 --validate-config`, which
+runs the full load path and prints the first `ConfigError` without starting the
+scheduler. See [Command-Line Reference](CLI-Reference).
 
 Full behavior, the trust model, quorum math, the lease backends' guarantees,
 and per-job `clusterPolicy` are documented in
@@ -180,7 +194,7 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
-| `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). New in version 1.1.8. See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
+| `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). New in version 1.2.0. See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
 | `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). New in version 0.4. |
 | `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). New in version 0.4. |
 

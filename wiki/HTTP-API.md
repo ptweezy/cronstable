@@ -47,7 +47,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port` or `unix:///path`. An empty list disables the server. |
-| `headers` | map of string→string | (none) | Extra HTTP headers added to the success responses (including the 409 conflict body and the empty start-job response, but not the 404 or 401). |
+| `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the 409 conflict body, but not the 404 or 401. |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 
@@ -77,9 +77,12 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/cluster` | `_web_get_cluster` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 
-The configured `headers` map is applied to the `200` responses of these
-handlers and to the `409` body of `/jobs/{name}/start`. The `404` (unknown job)
-and `401` (authentication failure) responses are raised without it.
+This table lists a subset of the routes (the primary control endpoints); the
+dashboard-supporting routes below are served too. The configured `headers` map
+is applied to every `200` success response across all routes (including
+`/cluster` and `/job-set-id`) and to the `409` conflict body of
+`/jobs/{name}/start`. The `404` (unknown job) and `401` (authentication failure)
+responses are raised without it.
 
 > The control API also serves the **[Web Dashboard](Web-Dashboard)** and several
 > dashboard-supporting routes (`/job-set-id`, `/jobs`, `/jobs/{name}/runs`,
@@ -155,31 +158,45 @@ Content-Type: application/json; charset=utf-8
 ### `GET /cluster`
 
 Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
-*New in version 1.1.8.* When no `cluster` section is configured, it returns
+*New in version 1.2.0.* When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus a `backend` field naming the active leadership backend
-(`gossip`, `kubernetes`, or `etcd`; new in 1.2.0) and the node's view: its
+(`gossip`, `kubernetes`, or `etcd`) and the node's view: its
 `node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
 `elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
-whether any conflict is pausing `Leader` jobs (`conflict`): a duplicate
-`nodeName` (with the offending names in `conflict_names`) and/or an agreeing peer
-declaring a different cluster size (`size_conflict`, with those divergent sizes
-in `conflicting_sizes`), whether this node is `quorate`, the elected `leader`
+whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
+whether this node is `quorate`, the elected `leader`
 (`null` when this node is not quorate, and always `null` in `spread` mode) and
 `is_leader` (always `false` in `spread` mode), and a `peers` array (each with
 `host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
 `mismatch_streak`). Under `distribution: spread`, per-job owners instead appear
 as a `clusterOwner` field on each leader-gated job in `GET /jobs`.
 
+The umbrella `conflict` flag is set by any of three triggers, each with its own
+detail list, and all three stand `Leader` jobs down: a duplicate `nodeName` (the
+offending names in `conflict_names`); an agreeing peer declaring a different
+cluster size (`size_conflict: true`, the divergent sizes in `conflicting_sizes`);
+and a quorate peer advertising a different `distribution` or `elect_leader`
+setting, a coordination-policy conflict surfaced as `policy_conflict: true` with
+the differing descriptors in `conflicting_policies`.
+
 The **lease backends** (`kubernetes` / `etcd`) have no static peer set, so their
-view is lease-shaped: `backend` names the backend, `peers` is empty, `conflict`/
-`size_conflict` are always `false`, `cluster_size`/`quorum` are `1`,
-`elect_leader` is `true`, `distribution` is `single-leader`, and an extra
-`lease` block carries the backend-specific detail: for `kubernetes`
-`{name, namespace, identity, holder, expiry}`, for `etcd`
-`{electionName, identity, holder, leaseId, expiry}`. `quorate` is whether the
-node has a fresh successful read of the lease store (stale → `Leader` fails
-closed; the never-skip `PreferLeader` default then runs the job anyway).
+view is lease-shaped: `backend` names the backend, `peers` is empty,
+`cluster_size`/`quorum` are `1`, `elect_leader` is `true`, `distribution` is
+`single-leader`, all three conflict flags (`conflict`, `size_conflict`,
+`policy_conflict`) are always `false`, and an extra `lease` block carries the
+backend-specific detail. This is an endpoint-reference view; the field
+semantics (what `quorate` means for a lease backend, the `lease` block contents,
+and the `expiry` rules below) are documented once in
+[Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster).
+For `kubernetes` the block is `{name, namespace, identity, holder, expiry}` and
+for `etcd` `{electionName, identity, holder, leaseId, expiry}`. The `expiry` is
+populated only while **this** node holds the lease: a follower reports
+`expiry: null`. (For `kubernetes` it is the local lease deadline while this node
+leads; for `etcd` it is the current lease deadline, or `null` when this node is
+not the holder.) `quorate` is whether the node has a fresh successful read of the
+lease store (stale → `Leader` fails closed; the never-skip `PreferLeader` default
+then runs the job anyway).
 
 ```shell
 $ http get http://127.0.0.1:8080/cluster Accept:application/json
@@ -199,6 +216,8 @@ Content-Type: application/json; charset=utf-8
     "conflict_names": [],
     "size_conflict": false,
     "conflicting_sizes": [],
+    "policy_conflict": false,
+    "conflicting_policies": [],
     "quorate": true,
     "leader": "node-a",
     "is_leader": true,
@@ -222,6 +241,7 @@ A lease backend (here `kubernetes`) returns the lease-shaped view instead:
     "distribution": "single-leader",
     "conflict": false, "conflict_names": [],
     "size_conflict": false, "conflicting_sizes": [],
+    "policy_conflict": false, "conflicting_policies": [],
     "quorate": true,
     "leader": "yacron2-0",
     "is_leader": true,
@@ -269,11 +289,12 @@ Content-Length: 0
 ## Response headers
 
 The `web.headers` map (*released in yacron2 1.0.0*; merged upstream but never
-released in yacron 0.19) is a string→string map applied to the responses from
-`/version`, `/status`, the `409` body of `/jobs/{name}/start`, and the `200` of
-`/jobs/{name}/start`. It is not applied to the `404` (unknown job) or `401`
-(authentication failure) responses, which are raised without the configured
-headers. Example:
+released in yacron 0.19) is a string→string map applied to every `200` success
+response across all routes (`/version`, `/status`, `/cluster`, `/job-set-id`,
+the other dashboard-supporting routes, and the `200` of `/jobs/{name}/start`) and
+to the `409` conflict body of `/jobs/{name}/start`. It is not applied to the
+`404` (unknown job) or `401` (authentication failure) responses, which are raised
+without the configured headers. Example:
 
 ```yaml
 web:
