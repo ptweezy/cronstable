@@ -74,6 +74,22 @@
     --glow:     rgba(121, 192, 255, .0);
     --selbg:    rgba(121, 192, 255, .12);
   }
+  /* Carolina Blue CRT phosphor — #4B9CD3 is the hero (seated as --fg-dim) */
+  html[data-theme="carolina"] {
+    --bg:       #04070b;
+    --bg2:      #060c13;
+    --panel:    #081019;
+    --panel2:   #0b1620;
+    --hover:    #0f1e2b;
+    --border:   #173347;
+    --border2:  #22506e;
+    --fg:       #5cabde;
+    --fg-dim:   #4b9cd3;
+    --fg-faint: #5a90b0;
+    --accent:   #b5ddf5;
+    --glow:     rgba(92, 171, 222, .5);
+    --selbg:    rgba(75, 156, 211, .12);
+  }
 
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -372,6 +388,7 @@
   }
   html[data-theme="amber"] .term { background: #070502; color: #e8c98a; }
   html[data-theme="green"] .term { background: #030806; color: #b6ffce; }
+  html[data-theme="carolina"] .term { background: #030609; color: #9fd0ee; }
   .term.nowrap { white-space: pre; word-break: normal; }
   .term .ln { display: block; }
   .term .ln.stderr { color: var(--fail); }
@@ -774,6 +791,7 @@
           <option value="amber">amber</option>
           <option value="green">green</option>
           <option value="modern">modern (no CRT)</option>
+          <option value="carolina">carolina</option>
         </select>
       </div>
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
@@ -2398,7 +2416,7 @@
     document.body.classList.toggle("scan", prefs.scan && fxAllowed);
   }
   function setTheme(v) { prefs.theme = v; savePref("theme"); applyTheme(); syncSettings(); }
-  function cycleTheme() { const order = ["amber", "green", "modern"]; setTheme(order[(order.indexOf(prefs.theme) + 1) % order.length]); toast("info", "theme: " + prefs.theme); }
+  function cycleTheme() { const order = ["amber", "green", "modern", "carolina"]; setTheme(order[(order.indexOf(prefs.theme) + 1) % order.length]); toast("info", "theme: " + prefs.theme); }
   function setFx(v) { prefs.fx = v; savePref("fx"); applyTheme(); syncSettings(); }
   function setScan(v) { prefs.scan = v; savePref("scan"); applyTheme(); syncSettings(); }
   function setDensity(v) { prefs.density = v; savePref("density"); document.body.classList.toggle("density-compact", v); syncSettings(); }
