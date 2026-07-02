@@ -2,10 +2,11 @@
 
 yacron2 exposes an optional [aiohttp](https://docs.aiohttp.org/) REST control API,
 enabled by adding a top-level `web` section to the configuration. It serves
-endpoints for querying the daemon version, inspecting job status, triggering a
-job on demand, and (when a `cluster` section is configured) reporting the cluster
-view. This page documents the configuration schema, the endpoints, bearer-token
-authentication, Unix-socket permissions, and lifecycle behavior.
+endpoints for querying the daemon version, inspecting job status, starting and
+cancelling jobs on demand, reading per-job run history, tailing captured job
+output live, and (when a `cluster` section is configured) reporting the cluster
+and fleet views. This page documents the configuration schema, every endpoint,
+bearer-token authentication, Unix-socket permissions, and lifecycle behavior.
 
 The interface is inherited from upstream yacron; `web.authToken` and
 `web.socketMode` are yacron2 additions.
@@ -73,22 +74,24 @@ All routes are registered in `start_stop_web_app`:
 | Method | Path | Handler | Success status |
 | --- | --- | --- | --- |
 | `GET` | `/version` | `_web_get_version` | `200` |
-| `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/job-set-id` | `_web_job_set_id` | `200` |
 | `GET` | `/cluster` | `_web_get_cluster` | `200` |
 | `GET` | `/fleet` | `_web_get_fleet` | `200` |
+| `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/jobs` | `_web_list_jobs` | `200` |
+| `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
+| `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
+| `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
+| `GET` | `/` | `_web_index` | `200` (dashboard page; omitted when `ui: false`) |
 
-This table lists a subset of the routes (the primary control endpoints); the
-dashboard-supporting routes below are served too. The configured `headers` map
-is applied to every `200` success response across all routes (including
-`/cluster` and `/job-set-id`) and to the `409` conflict body of
-`/jobs/{name}/start`. The `404` (unknown job) and `401` (authentication failure)
-responses are raised without it.
+The configured `headers` map is applied to every `200` success response across
+all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
+bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. The `404` (unknown
+job) and `401` (authentication failure) responses are raised without it.
 
-> The control API also serves the **[Web Dashboard](Web-Dashboard)** and several
-> dashboard-supporting routes (`/job-set-id`, `/jobs`, `/jobs/{name}/runs`,
-> `/jobs/{name}/logs`, `/jobs/{name}/cancel`). This page documents the primary
-> control endpoints; the [Web Dashboard](Web-Dashboard) page covers the rest.
+> The same interface serves the **[Web Dashboard](Web-Dashboard)** at `/`; that
+> page is the visual tour of the UI these endpoints feed.
 
 ### `GET /version`
 
@@ -352,15 +355,191 @@ HTTP/1.1 200 OK
 Content-Length: 0
 ```
 
+### `POST /jobs/{name}/cancel`
+
+Terminates every currently-running instance of the named job, using the same
+graceful terminate-then-kill sequence yacron2 uses elsewhere (honoring the
+job's `killTimeout`; see [Concurrency and Timeouts](Concurrency-and-Timeouts)).
+Instances are cancelled concurrently, so a job with several running instances
+costs at most one `killTimeout`, not one per instance.
+
+| Condition | Response |
+| --- | --- |
+| No job with that name. | `404 Not Found`. |
+| The job exists but no instance is running. | `409 Conflict`, body `job '<name>' is not running`. |
+| Otherwise. | `200 OK`, empty body; all running instances are cancelled. |
+
+A run cancelled this way is recorded in the job's history with the outcome
+`cancelled`. Cancellation is a deliberate operator action, not a job failure,
+so it is **not** reported (`onFailure` does not fire) and does **not** trigger
+retries.
+
+```shell
+$ http post http://127.0.0.1:8080/jobs/test-03/cancel
+HTTP/1.1 200 OK
+```
+
+### `GET /jobs`
+
+Returns a JSON array describing every job: its schedule and timezone, whether
+it is enabled and running, the time until its next scheduled run, a summary of
+its most recent finished run, and a compact tail of recent outcomes. This is
+the endpoint the [Web Dashboard](Web-Dashboard) polls.
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `enabled`, `schedule`, `command` | The job's name and `enabled` flag, its schedule as a crontab string, and its command (argv lists are joined for display). |
+| `captureStdout`, `captureStderr` | Which output streams the job captures, and therefore which are available from `/jobs/{name}/logs`. |
+| `utc`, `timezone` | The schedule's reference frame: `utc` (default `true`) and the IANA `timezone` name, or `null`. |
+| `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
+| `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
+| `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
+| `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
+
+```shell
+$ http get http://127.0.0.1:8080/jobs
+[
+    {
+        "name": "test-01",
+        "enabled": true,
+        "schedule": "*/5 * * * *",
+        "command": "echo foobar",
+        "captureStdout": true,
+        "captureStderr": true,
+        "utc": true,
+        "timezone": "UTC",
+        "running": false,
+        "pids": [],
+        "scheduled_in": 42.1,
+        "last_run": {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        },
+        "history": [
+            {"outcome": "success", "duration": 0.98},
+            {"outcome": "failure", "duration": 1.21},
+            {"outcome": "success", "duration": 1.02}
+        ]
+    }
+]
+```
+
+### `GET /jobs/{name}/runs`
+
+Returns the job's retained run history (oldest first, bounded, and held in
+memory only) together with aggregate statistics. Returns `404 Not Found` for
+an unknown job.
+
+Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
+(`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
+`fail_reason`). `stats` summarizes them:
+
+| `stats` field | Meaning |
+| --- | --- |
+| `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
+| `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
+| `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. |
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01/runs
+{
+    "name": "test-01",
+    "runs": [
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        }
+    ],
+    "stats": {
+        "total": 1,
+        "success": 1,
+        "failure": 0,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "avg_duration": 1.02,
+        "min_duration": 1.02,
+        "max_duration": 1.02,
+        "last_duration": 1.02
+    }
+}
+```
+
+### `GET /jobs/{name}/logs`
+
+A [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+stream of a job's captured output. Returns `404 Not Found` for an unknown job.
+The stream begins with the lines already buffered (from the most recent running
+instance, or else the last finished run's retained output), then follows a
+running job's new lines live, and finishes with an `end` event:
+
+- Each line arrives as an `event: line` whose `data` is a JSON object
+  `{"stream": "stdout"|"stderr", "line": "..."}`.
+- When the run finishes, the server sends `event: end` with data `{}`. If the
+  job has no captured output at all yet, the stream ends immediately with
+  `event: end` and data `{"reason": "no-output"}`.
+- During quiet periods the server writes an SSE comment (`: ping`) every 15
+  seconds as a keep-alive, which also detects disconnected clients.
+
+Only the streams a job captures (`captureStdout` / `captureStderr`) appear
+here; see [Output Capturing](Output-Capturing). The response carries
+`X-Accel-Buffering: no` so reverse proxies (e.g. nginx) do not buffer the
+stream.
+
+```shell
+$ curl -N http://127.0.0.1:8080/jobs/test-01/logs
+event: line
+data: {"stream": "stdout", "line": "foobar"}
+
+event: end
+data: {}
+```
+
+### `GET /job-set-id`
+
+Returns this instance's job-set id: the order-independent fingerprint of every
+job's effective configuration that replicas compare to confirm they hold the
+same set of jobs (see
+[the job-set id foundation](Clustering-and-Leader-Election#the-job-set-id-foundation)).
+The response is `text/plain` by default; with `Accept: application/json` it is
+a JSON object that also carries the job count.
+
+```shell
+$ http get http://127.0.0.1:8080/job-set-id
+v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
+
+$ http get http://127.0.0.1:8080/job-set-id Accept:application/json
+{"job_set_id": "v1:b834d7…51ce90b", "jobs": 3}
+```
+
+### `GET /` (the dashboard page)
+
+Serves the single-page [Web Dashboard](Web-Dashboard). Set `ui: false` in the
+`web` section to disable the page and expose only the REST endpoints. The page
+is served with secure default headers (a strict Content-Security-Policy,
+anti-clickjacking, and nosniff) with any operator `web.headers` merged on top,
+so a deliberately-set operator header wins. When `web.authToken` is enabled,
+the page itself loads without a token (it holds no data); it prompts for the
+token in the browser and authenticates every data request with it (see
+[Authentication](#authentication)).
+
 ## Response headers
 
 The `web.headers` map (merged upstream but never released in yacron 0.19) is a
 string→string map applied to every `200` success
 response across all routes (`/version`, `/status`, `/cluster`, `/job-set-id`,
-the other dashboard-supporting routes, and the `200` of `/jobs/{name}/start`) and
-to the `409` conflict body of `/jobs/{name}/start`. It is not applied to the
-`404` (unknown job) or `401` (authentication failure) responses, which are raised
-without the configured headers. Example:
+the job routes, and the `200` of `/jobs/{name}/start`) and to the `409`
+conflict bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. It is not
+applied to the `404` (unknown job) or `401` (authentication failure) responses,
+which are raised without the configured headers. Example:
 
 ```yaml
 web:

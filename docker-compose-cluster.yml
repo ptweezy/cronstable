@@ -21,9 +21,10 @@
 #
 # THINGS TO TRY
 # -------------
-# 1. Watch it converge. On startup each node reports its peers "unreachable",
-#    then "agreed" within ~10s (the poll interval). The leader is "yacron-a"
-#    (the lowest node name). Confirm with:
+# 1. Watch it converge. On startup each node reports its peers "unknown" (not
+#    yet polled; "unreachable" if a poll fails while a container is still
+#    starting), then "agreed" within ~10s (the poll interval). The leader is
+#    "yacron-a" (the lowest node name). Confirm with:
 #        curl -s localhost:8080/cluster | jq        # is_leader: true
 #        curl -s localhost:8081/cluster | jq        # leader: "yacron-a"
 #

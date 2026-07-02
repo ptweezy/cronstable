@@ -30,7 +30,28 @@ set). A **quorum** is a strict majority of the cluster, `⌊N / 2⌋ + 1` nodes.
 node is **quorate** when it currently sees a quorum of agreeing members.
 **Fenced** means a shared store guarantees a single holder (the lease backends).
 A **lease** is a short-lived, auto-expiring claim on that store that the holder
-keeps renewing.
+keeps renewing. A **bridge** is a set of members that two mutually-unreachable
+nodes can both still reach (the sides see the bridge, not each other); a
+**thin bridge** is one of fewer than `quorum - 1` shared members, too thin for
+the two sides to confirm each other through it (see
+[Guarantees and trade-offs](#guarantees-and-trade-offs)).
+
+**On this page:**
+[Quickstart](#quickstart-a-minimal-3-node-cluster) ·
+[From one node to a cluster](#from-one-node-to-a-cluster) ·
+[Choosing a backend](#choosing-a-backend) ·
+[At a glance](#at-a-glance) ·
+[The job-set id foundation](#the-job-set-id-foundation) ·
+[Cluster peer attestation](#cluster-peer-attestation) ·
+[Leader election](#leader-election) ·
+[Per-job policy](#per-job-policy) ·
+[Distribution](#distribution-one-leader-or-spread-the-load) ·
+[Observing the cluster](#observing-the-cluster) ·
+[Guarantees and trade-offs](#guarantees-and-trade-offs) ·
+[Certificate rotation](#certificate-rotation) ·
+[Operating the lease backends](#operating-the-lease-backends-kubernetes-and-etcd) ·
+[Trying it locally](#trying-it-locally) ·
+[Cluster sizing math](#appendix-cluster-sizing-math)
 
 ## Quickstart: a minimal 3-node cluster
 
@@ -61,6 +82,9 @@ cluster:
   nodeName: yacron-a                      # unique, stable per node
   electLeader: true                       # only the elected leader runs jobs
 ```
+
+(The certificate paths are yours to choose; the bundled compose demo, for
+example, mounts its generated certs at `/certs/ca.pem` / `/certs/yacron-a.pem`.)
 
 **The quorum rule in one paragraph.** List every *other* node in `peers` (never
 this node itself), so the cluster size is `len(peers) + 1` and every node
@@ -239,8 +263,11 @@ dashboard panel carries one of these statuses (the constants live in
 | `conflict` | The peer reported this node's `nodeName` but a *different* instance id: a **duplicate `nodeName`** (two nodes sharing a name). It never counts toward agreement, and while any conflict is visible `Leader` jobs fail closed. See [Unique node names](#unique-node-names). |
 | `unknown` | Not yet contacted (the initial state before the first poll). |
 
-A peer reported as `unreachable` or `untrusted` resets its drift streak, because
-the streak only counts *reachable-but-mismatched* rounds.
+A failed round (`unreachable` or `untrusted`) neither advances nor resets the
+drift streak: the streak counts *reachable-but-mismatched* rounds, and only a
+confirmed agreement (an `agreed` round, or the benign `self` case) clears it,
+so a genuinely drifting peer cannot postpone its `drifted` label by flapping in
+and out of reach.
 
 The `/peer` endpoint is served **only** on the separate mTLS `listen` address,
 never on the public [web API](HTTP-API). It returns a small JSON document with
@@ -734,8 +761,8 @@ enabled / next fire / last finished run) on its `/peer` response, capped so it
 can never push the response past the gossip byte limit. Every node therefore
 holds a fleet-wide picture of *what ran where* that is at most one `interval`
 stale per peer, served as [`GET /fleet`](HTTP-API#get-fleet) and rendered as
-the dashboard's [fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane)
-— the single pane of glass for `spread` mode, where each job's runs land on a
+the dashboard's [fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane),
+the single pane of glass for `spread` mode, where each job's runs land on a
 different node. The summaries are display-only: election, quorum, and every
 run/skip decision ignore them, and a malformed summary from a peer degrades to
 "no data for that node". The lease backends exchange nothing node-to-node, so
@@ -1085,8 +1112,9 @@ cluster:
   immediate failover. The value at `electionName` is the holder's `nodeName`, so
   `etcdctl get yacron2/leader` shows who leads. `ttl` must be **>= 3** (a smaller
   value is rejected at config load). etcd may *grant* a smaller TTL than
-  requested (its `--min-lease-ttl`, load), which the backend honours: a smaller
-  server-granted TTL narrows the effective leader window accordingly.
+  requested (its `--min-lease-ttl` setting, or server load), which the backend
+  honours: a smaller server-granted TTL narrows the effective leader window
+  accordingly.
 
 ### Failure modes
 

@@ -71,16 +71,16 @@ The optional columns:
 
 | Column | What it shows |
 | --- | --- |
-| **Policy** | *(cluster only)* the job's [`clusterPolicy`](Clustering-and-Leader-Election#per-job-policy) — `Leader`, `PreferLeader`, or `EveryNode`; hover for what the policy means. Standalone daemons show `—`. Sortable, to group jobs by policy. |
+| **Policy** | *(cluster only)* the job's [`clusterPolicy`](Clustering-and-Leader-Election#per-job-policy): `Leader`, `PreferLeader`, or `EveryNode`; hover for what the policy means. Standalone daemons show `—`. Sortable, to group jobs by policy. |
 | **TZ** | The schedule's reference frame: `UTC` (the default), the job's IANA `timezone` (e.g. `America/Los_Angeles`), or `local` (`utc: false`). Handy when a fleet mixes frames. |
-| **Next at** | The next run as a wall-clock time in *your browser's* timezone (`04:00`, `tom 04:00`, `Jul 12 04:00`) — the absolute complement to **Next**'s countdown. |
-| **Rate** | The success percentage over the recent runs the sparkline draws, colored green / amber / red — a numeric complement to **Trend**. |
+| **Next at** | The next run as a wall-clock time in *your browser's* timezone (`04:00`, `tom 04:00`, `Jul 12 04:00`), the absolute complement to **Next**'s countdown. |
+| **Rate** | The success percentage over the recent runs the sparkline draws, colored green / amber / red, a numeric complement to **Trend**. |
 
 The toolbar above the table lets you:
 
 - **filter** by typing in the search box (matches name or command; press `/` to focus it);
 - narrow by status with the **all / ok / fail / run / off** segmented control;
-- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header — including the optional columns — clicking again to reverse);
+- **sort** by name, status, last run, next run, or duration (from the dropdown, or by clicking a column header, including the optional columns; clicking again reverses);
 - **run every failing job at once** with the **run failing** button.
 
 ## The job drawer
@@ -209,7 +209,7 @@ a job that last ran on a peer shows nothing here. The **`⊞ fleet`** button in
 the cluster panel header opens the **fleet view**, a jobs × nodes matrix that
 closes that gap: one row per job (the union of every node's advertised jobs,
 so a mid-deploy peer's new job shows up too), one column per node, each cell
-that node's state for the job — **▶ running**, the last outcome with its age
+that node's state for the job: **▶ running**, the last outcome with its age
 (`● ok 3m`, `✗ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
 there, `—` for not configured there, and `·` when the node has reported no
 data at all. Hovering a cell reveals the exit code, finish time, duration, and
@@ -224,15 +224,15 @@ per-job summary (running / enabled / next fire / last run) to the mutual-TLS
 [`/peer` response](Clustering-and-Leader-Election#cluster-peer-attestation) it
 already serves, so each node absorbs the whole fleet's state through the peer
 polls it already makes, and the dashboard reads the merged result from
-[`GET /fleet`](HTTP-API#get-fleet) on its usual poll — no extra traffic
+[`GET /fleet`](HTTP-API#get-fleet) on its usual poll: no extra traffic
 towards the peers, and any node can serve the single pane of glass. The cost
 of that design is freshness: a peer column is up to one gossip `interval`
 stale (30 s by default), so every column header shows its node's status dot
 and data age (`live` for the serving node, `41s ago` for a peer). A briefly
 unreachable peer keeps its last-known cells with a growing age instead of
 going blank, and a node whose job set exceeds the gossip payload cap (512
-jobs) is flagged **partial**. Summaries are observability data only — they
-never influence election or run decisions — and like the swimlane, the view
+jobs) is flagged **partial**. Summaries are observability data only (they
+never influence election or run decisions), and like the swimlane, the view
 is gossip-only: lease backends carry no summaries, so the button is hidden
 there.
 
@@ -261,7 +261,7 @@ for the full `GET /cluster` field semantics.
 
 The **`≋ tail`** toolbar button opens the **multi-tail console**: several jobs'
 log streams merged into one live pane, each line prefixed with its job name in
-a stable identity colour — like tailing a set of pods. It is built for
+a stable identity colour, like tailing a set of pods. It is built for
 correlated incidents: the incident verdict bar and the mitigate console each
 carry a `≋ tail` button that opens it pre-loaded with the failing set, and the
 command palette offers a per-job **Tail: …** action plus **failing** /
@@ -285,6 +285,95 @@ command palette offers a per-job **Tail: …** action plus **failing** /
 - As with the drawer's [Logs tab](#logs-live-output-in-your-browser), output
   appears only for the streams a job captures
   ([`captureStdout` / `captureStderr`](Output-Capturing)).
+
+## Incident tools: verdict bar, timeline, and mitigate console
+
+None of these need a cluster; they all work on a single node.
+
+When something is failing, a **verdict bar** appears at the top of the page and
+distills the situation into one line. A single failure reads
+`JOB FAILING — <name> · exit <code> · <reason>`. When several jobs are failing,
+a correlation pass groups them by exit code and failure reason and headlines
+either `FLEET EVENT — N jobs failing, K share exit=… — likely one cause` or
+"likely independent", so the first thing you read is whether this is one
+incident or many. A cluster quorum, leadership, or conflict problem escalates
+the bar to the red **CLUSTER ALERT** severity described
+[above](#cluster-panel). The bar carries `▤ timeline`, `▸ mitigate`, and
+`≋ tail` buttons scoped to the incident set.
+
+The **incident timeline** (press `i`, or *Incident timeline* in the command
+palette) lists every job's most recent finished run, newest first, each with
+its relative time, outcome glyph, failure reason, exit code, and duration. A
+**failing only** filter narrows it, and the correlated blast-radius set from
+the verdict bar is highlighted, so you can read "what happened, in what order"
+at a glance.
+
+The **mitigate console** (*Mitigate failing jobs* in the palette, or the
+verdict bar's `▸ mitigate` button) acts on the failing set in bulk: guarded
+**start all** / **cancel all** actions fire the per-job
+[start/cancel endpoints](HTTP-API#post-jobsnamestart) staggered a few hundred
+milliseconds apart (gentle on the daemon), abortable mid-run, with a live
+per-job ✓/✗ result log and a final tally. It can also open a
+[multi-tail](#merged-multi-tail) of the set, and copy a ready-made **Markdown
+incident summary** (timestamp, host, version, cluster state, and a per-job
+table) for your incident channel or ticket.
+
+## Wallboard / TV mode
+
+Press `w` (or *Wallboard / TV mode* in the palette, or open the page with a
+`#tv` hash) for a full-screen kiosk view built for a wall monitor: every job as
+a large tile, sorted worst-first (failing, then running, then the rest), each
+with its status glyph, next-fire countdown, and sparkline, plus a footer tally
+and a live UTC clock. Clicking a tile exits to that job's drawer; `Esc` or `w`
+exits.
+
+Because the normal header (and its connection indicator) is hidden, the
+wallboard judges its own freshness: if no successful poll lands for ~15 seconds
+(or three refresh intervals), the grid dims behind a loud `▚ NO SIGNAL` /
+`▚ STALE DATA` banner, so a wedged screen reads as broken rather than as a
+frozen healthy frame.
+
+When everything is healthy and the wallboard has been idle for a while (30
+seconds by default; configurable in Settings), the **zen screensaver** drifts
+in: an `ALL SYSTEMS NOMINAL` field where every enabled job is a small dot that
+pulses as its real next-fire instant arrives, with a subtitle counting the jobs
+armed and naming the next one due. Any input wakes it. It deliberately refuses
+to show the all-green field on stale data (an unverified all-clear is `NO
+SIGNAL`, not nominal) and respects `prefers-reduced-motion`. The
+`docker-compose-zen.yml` demo boots a single calm node to show it off.
+
+## Activity heatmap
+
+The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
+adds a punchcard card: one row per job, 24 time buckets across a **6h / 24h /
+7d** window, each cell colored by the worst outcome in that bucket and shaded
+by run volume. Hover a cell for the bucket's tally (e.g. `3 ok / 1 fail`);
+click a cell or a job name to open that job. It is built by fetching each
+job's [run history](HTTP-API#get-jobsnameruns) (capped and cached in the
+browser), so its horizon is bounded by the daemon's in-memory history.
+
+## Cron sandbox
+
+*Cron sandbox* in the palette opens a scratchpad for schedule expressions: type
+any five-field cron expression or `@macro`, pick a timezone frame, and it
+validates the expression, describes it in plain English, breaks out the five
+fields, and previews the **next 12 fire times** with wall-clock and relative
+labels (impossible schedules and `@reboot` are called out). It cross-references
+your live jobs to show which ones use the same schedule, and keeps a
+browser-local list of recent expressions. The same engine powers the
+dashboard's schedule advisories (overlap, thundering-herd, and DST warnings).
+
+## Run ledger
+
+The daemon keeps at most the last 50 runs per job in memory. The opt-in **run
+ledger** (a Settings toggle, or *Toggle run ledger* in the palette) extends
+that horizon in your browser: while a tab is open it records each newly
+finished run into IndexedDB, computes robust per-job duration baselines
+(median plus deviation over successful runs), and flags runs that are
+unusually slow with a `◱ slow` chip on the job row. Settings shows the storage
+used, with one-click **export** (a JSON dump) and **purge**. The ledger lives
+only in that browser: it grows only while a tab is open, and it never sends
+anything back to the daemon.
 
 ## Command palette
 
@@ -314,6 +403,8 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 | `c` | Copy the selected job's command |
 | `g` | Refresh now |
 | `t` | Cycle the theme |
+| `w` | Toggle the [wallboard / TV mode](#wallboard--tv-mode) |
+| `i` | Open the [incident timeline](#incident-tools-verdict-bar-timeline-and-mitigate-console) |
 | `?` | Show the shortcut list |
 | `Esc` | Close the open panel or drawer |
 
@@ -328,6 +419,8 @@ The settings panel (and the command palette) expose:
 - **Compact density** for tighter rows.
 - **Desktop notifications** that fire when a job fails (after you grant the browser permission).
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.
+- The **zen screensaver** toggle and its idle delay, for the [wallboard](#wallboard--tv-mode).
+- The opt-in **[run ledger](#run-ledger)**, with its storage stats, export, and purge buttons.
 
 All preferences are remembered in the browser's `localStorage`, so the dashboard
 comes back the way you left it.
@@ -353,7 +446,7 @@ The dashboard is a thin client over the [HTTP Control API](HTTP-API):
 - it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline);
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
 - while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);
-- opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats);
+- opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) batches the same endpoint across jobs (capped, with a short-lived cache);
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
 - the [multi-tail console](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
