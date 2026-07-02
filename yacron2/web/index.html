@@ -169,7 +169,7 @@
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
   .brand .mark { color: var(--fg); font-weight: 700; cursor: default; user-select: none;
     display: inline-block; }
-  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; }
+  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; user-select: none; }
   .brand .tag { font-size: 11px; color: var(--fg-faint); }
   .brand .ver { font-size: 10.5px; color: var(--fg-faint); }
   .spacer { flex: 1; }
@@ -3715,7 +3715,7 @@
       const dt = Math.min((t - markLast) / 1000, 0.1);
       markLast = t;
       markDeg = (markDeg + markVel * dt) % 360;
-      markVel *= Math.pow(0.45, dt);
+      markVel *= Math.pow(0.757822222, dt);
       mark.style.transform = `rotate(${markDeg}deg)`;
       if (markVel > 3) { markRaf = requestAnimationFrame(spinMark); }
       else { markVel = 0; markRaf = 0; }
