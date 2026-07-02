@@ -3,9 +3,9 @@
 This page documents how yacron2 produces its own diagnostic log output: the
 default behavior driven by `-l/--log-level`, and the optional `logging:` config
 section that applies a full Python `logging.config` dictionary schema. It does
-not cover capturing a job's stdout/stderr — see
-[Output Capturing](Output-Capturing) — nor sending notifications on
-job success/failure — see [Reporting](Reporting).
+not cover capturing a job's stdout/stderr (see
+[Output Capturing](Output-Capturing)), nor sending notifications on
+job success/failure (see [Reporting](Reporting)).
 
 ## Default logging (no `logging:` section)
 
@@ -87,7 +87,7 @@ caught at config-parse time; it surfaces when `dictConfig` runs (see
 | `root` | mapping | optional | Configuration of the root logger (`level`, `handlers`). Contents unvalidated by strictyaml. |
 
 The defaults shown for `incremental` and `disable_existing_loggers` are the
-defaults of `logging.config.dictConfig` itself — they are *not* defined in
+defaults of `logging.config.dictConfig` itself; they are *not* defined in
 yacron2's `DEFAULT_CONFIG`. yacron2 supplies no values for any logging key; what
 you write is passed through verbatim. Only `version` is required by the schema;
 all other keys are optional (strictyaml `Opt(...)`).
@@ -102,6 +102,7 @@ tune their levels independently, or rely on `root:` to catch them all:
 | `yacron2` | `cron.py`, `job.py` | Scheduler lifecycle, job start/spawn/exit, retries, web server start/stop, shutdown, and most operational messages. |
 | `yacron2.config` | `config.py` | Configuration parsing diagnostics (e.g. the converted schedule string at `DEBUG`). |
 | `statsd` | `statsd.py` | statsd metric-writer diagnostics. See [Metrics with statsd](Metrics-with-Statsd). |
+| `prometheus` | `prometheus.py` | Prometheus `/metrics` endpoint diagnostics (e.g. a cluster-backend read failing during a scrape). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 
 Because `yacron2.config` is a child of `yacron2`, configuring the `yacron2`
 logger affects it too (subject to `propagate`). The `statsd` logger is a
@@ -123,11 +124,11 @@ in `cron.py`:
   the dictConfig schema documentation, and including the offending config) and
   does **not** record it as applied.
 - Consequently, a `logging:` section that was **broken and then fixed** is
-  picked up on the next reload **without restarting yacron2** — because the
+  picked up on the next reload **without restarting yacron2**, because the
   broken version was never marked applied, the corrected version still counts as
   "changed" and is retried.
 
-This behavior — re-apply on change, mark applied only on success — was
+This behavior (re-apply on change, mark applied only on success) was
 introduced as a fix so a logging section fixed after an error, or changed at
 runtime, is picked up without a restart.
 

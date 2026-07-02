@@ -31,11 +31,11 @@ exist. See [Running on Windows](Running-on-Windows).
 **Fix.** Create `/etc/yacron2.d/` and place `*.yaml`/`*.yml` files in it, or pass an
 explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows the
 default location to create and populate is `%APPDATA%\yacron2` rather than
-`/etc/yacron2.d` — see [Running on Windows](Running-on-Windows). Note the error
+`/etc/yacron2.d`; see [Running on Windows](Running-on-Windows). Note the error
 text is only emitted for the *default* path; an explicit `-c` pointing at a missing
-file instead surfaces as a `ConfigError` (see below). The default changed from
-`/etc/yacron.d` to `/etc/yacron2.d` in 1.0.0; if you upgraded from yacron, move your
-config directory. See [Migration from yacron](Migration-from-yacron) and the
+file instead surfaces as a `ConfigError` (see below). yacron2's default is
+`/etc/yacron2.d` rather than yacron's `/etc/yacron.d`; if you upgraded from yacron,
+move your config directory. See [Migration from yacron](Migration-from-yacron) and the
 [Command-Line Reference](CLI-Reference).
 
 ### "Configuration error" / a missing or unreadable explicit config file
@@ -79,7 +79,7 @@ start it unpacks its embedded Python runtime into a temporary directory and load
 shared libraries from there, so it needs a temp directory that is both **writable**
 and **executable**. Under a read-only root filesystem (a hardened container), `/tmp`
 is read-only too, and the unpack/exec fails. This requirement is unique to the
-standalone binary — the published container image and `pip`/`pipx` installs run
+standalone binary. The published container image and `pip`/`pipx` installs run
 yacron2 as an ordinary Python package and never self-extract.
 
 **Fix.** Provide a small writable, executable temp mount. With Docker, note that
@@ -123,9 +123,9 @@ passwd-database behavior below are therefore all POSIX-only (they require the
 **Fix.** Run the daemon as root if you need per-job privilege drop, or remove the
 `user`/`group` fields from the job. Related `ConfigError`s from the same code path:
 
-- `User not found: '<user>'` — a string `user` is not in the passwd database
+- `User not found: '<user>'`: a string `user` is not in the passwd database
   (`getpwnam` raised `KeyError`).
-- `Group not found: '<group>'` — a string `group` is not in the group database.
+- `Group not found: '<group>'`: a string `group` is not in the group database.
 
 A numeric `user` without an explicit `group` derives its primary gid (and login name,
 used for supplementary groups) from the passwd database; if the uid is not in the
@@ -145,8 +145,8 @@ web.authToken is configured but resolved to an empty token; refusing to start th
 ```
 
 **Cause.** `_resolve_web_token` fails closed. If `authToken` is present but resolves
-to an empty string — an unset `fromEnvVar`, an empty/missing `fromFile`, or an empty
-`value` — it raises `ConfigError` rather than silently serving the control API
+to an empty string (an unset `fromEnvVar`, an empty/missing `fromFile`, or an empty
+`value`), it raises `ConfigError` rather than silently serving the control API
 unauthenticated. A `fromFile` that cannot be read raises
 `web.authToken.fromFile could not be read: …`. If `authToken` is entirely absent, the
 API listens without auth (this is the default).
@@ -179,7 +179,7 @@ use an `http://` listener instead. See [Running on Windows](Running-on-Windows).
 `unix://` path, and resolve the bind error. For a `unix://` socket on a read-only
 root filesystem, point it at a writable volume and optionally set `web.socketMode`
 (octal string) for permissions. This `unix://`/`web.socketMode` guidance is
-POSIX-only — on Windows unix sockets are unavailable and `socketMode` is irrelevant
+POSIX-only: on Windows unix sockets are unavailable and `socketMode` is irrelevant
 (it only ever applies to unix sockets); on Windows use an `http://` listener. See
 [Running on Windows](Running-on-Windows).
 
@@ -219,7 +219,7 @@ expression or schedule object otherwise. See
 as `disabled`; `POST /jobs/<name>/start` returns `409 Conflict`
 (`job '<name>' is disabled`).
 
-**Cause.** `enabled` defaults to `true` (new in yacron2 0.18). `enabled: false` jobs
+**Cause.** `enabled` defaults to `true`. `enabled: false` jobs
 are treated "as if they aren't there" apart from config validation:
 `job_should_run` short-circuits to `False`, and the web API refuses to launch them.
 
@@ -229,8 +229,8 @@ are treated "as if they aren't there" apart from config validation:
 
 **Symptom.** A schedule object that pins `year` still runs in other years.
 
-**Cause — confirmed behavior.** `_parse_schedule` builds a five-field crontab string
-from `minute`, `hour`, `dayOfMonth`, `month`, and `dayOfWeek` only — it never reads
+**Cause (confirmed behavior).** `_parse_schedule` builds a five-field crontab string
+from `minute`, `hour`, `dayOfMonth`, `month`, and `dayOfWeek` only; it never reads
 the `year` key:
 
 ```text
@@ -256,7 +256,7 @@ that lack the system tz database, yacron2 depends on the bundled `tzdata` packag
 resolve names.
 
 **Fix.** Use a valid IANA name (for example `America/Los_Angeles`). The `timezone`
-option (since yacron2 0.11) takes precedence over `utc`; with neither set, scheduling
+option takes precedence over `utc`; with neither set, scheduling
 uses local time only when `utc: false` (the default `utc` is `true`, i.e. UTC). See
 [Schedules and Timezones](Schedules-and-Timezones).
 
@@ -270,7 +270,7 @@ uses local time only when `utc: false` (the default `utc` is `true`, i.e. UTC). 
 including a common file are *not* flagged (the set is scoped per top-level parse).
 
 **Fix.** Break the include cycle. Remember that a top-level `defaults` block does not
-retro-apply to jobs pulled in via `include` — included jobs arrive fully constructed
+retro-apply to jobs pulled in via `include`; included jobs arrive fully constructed
 with only their own file's defaults. See
 [Includes, Defaults, and Multi-File Config](Includes-and-Defaults).
 
@@ -279,12 +279,15 @@ with only their own file's defaults. See
 **Symptom.** Some files in the `-c` directory are silently ignored.
 
 **Cause.** `_parse_config_dir` skips a directory entry when the base name's first
-character is `_` or `.` (so `_inc.yaml` and dotfiles are excluded), or when the
-extension is not `.yml` or `.yaml`. Entries are processed in sorted filename order.
+character is `_` or `.` (so `_inc.yaml` and dotfiles are excluded), or when its name
+is neither YAML (`.yml`/`.yaml` extension) nor a classic crontab (`.crontab`/`.cron`
+extension, or a file named `crontab`; see [Classic Crontabs](Classic-Crontabs)).
+Entries are processed in sorted filename order.
 
 **Fix.** Name loadable configs with a non-`_`/non-`.` leading character and a
-`.yml`/`.yaml` extension. Files meant only to be `include`d (conventionally `_*.yaml`)
-are intentionally skipped as top-level configs and pulled in by the file that includes
+recognised name (`.yml`/`.yaml` for YAML, `.crontab`/`.cron`/`crontab` for classic
+crontabs). Files meant only to be `include`d (conventionally `_*.yaml`) are
+intentionally skipped as top-level configs and pulled in by the file that includes
 them.
 
 ## Failure detection and output
@@ -307,7 +310,7 @@ such as `failsWhen=nonzeroReturn and retcode=<n>` or
 A job whose command cannot be launched at all (for example, the executable does not
 exist) is reported as an ordinary failure with exit code `127`, not an internal error.
 Note `producesStderr`/`producesStdout` only apply when the corresponding stream is
-captured — and they also fire when output was *discarded* (`saveLimit: 0` still counts
+captured, and they also fire when output was *discarded* (`saveLimit: 0` still counts
 discarded lines as output).
 
 **Fix.** Adjust `failsWhen`. To stop stderr from marking a job failed, set
@@ -365,8 +368,8 @@ set, `onFailure.retry.maximumRetries >= -1` (`-1` = retry forever),
 **Symptom.** Mail that delivered fine under yacron now fails with a TLS/certificate
 validation error.
 
-**Cause.** In yacron2 1.0.0 the mail `validate_certs` default changed to `True`
-(`_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
+**Cause.** yacron2's mail `validate_certs` default is `True` (a change from yacron;
+`_REPORT_DEFAULTS["mail"]["validate_certs"] = True`). The mail reporter passes
 `validate_certs=mail["validate_certs"]` to `aiosmtplib.SMTP`, so delivery to servers
 with self-signed or otherwise invalid certificates that previously worked silently now
 fails.
@@ -403,11 +406,160 @@ an empty rendered body is also skipped.
 
 **Cause.** statsd is best-effort: metrics go out over fire-and-forget UDP, and an
 `OSError` on send (for example an unresolvable host) is logged as a warning rather than
-propagated. If the `statsd` block is absent, no metrics are emitted at all.
+propagated. If the `statsd` block is absent, no statsd metrics are emitted at
+all (the [Prometheus endpoint](Metrics-with-Prometheus) is independent of it).
 
 **Fix.** Configure the job's `statsd` block (`host`, `port`, `prefix`, all required)
 and verify the host resolves and the UDP path is open. See
 [Metrics with statsd](Metrics-with-Statsd).
+
+### Prometheus scrapes return 401
+
+**Symptom.** Prometheus marks the yacron2 target down with
+`server returned HTTP status 401 Unauthorized`; `curl http://host:port/metrics`
+returns `401`.
+
+**Cause.** `web.authToken` is configured, and `GET /metrics` requires the bearer
+token like every other data endpoint. The only exemption is
+`web.metrics.public: true`, which exempts `/metrics` (and only `/metrics`) from
+authentication.
+
+**Fix.** Send the token from the scrape configuration (an `authorization` block
+with `type: Bearer` and `credentials`), or set `web.metrics.public: true` if the
+scraper cannot send credentials -- everything else stays gated. See
+[Metrics with Prometheus](Metrics-with-Prometheus).
+
+### `/metrics` returns 404
+
+**Symptom.** `GET /metrics` returns `404 Not Found`, or nothing listens on the
+expected port at all.
+
+**Cause.** The endpoint is served by the web API and is on by default whenever
+the web API is enabled, so a `404` means it was disabled explicitly
+(`web.metrics: false`, or `web.metrics.enabled: false` in the map form). If the
+connection is refused instead, there is no `web` section (or no working
+`web.listen` entry), so no web API -- and no `/metrics` -- is served.
+
+**Fix.** Remove the `metrics: false` / `enabled: false` override (`web.metrics`
+left unset means enabled), and make sure a `web.listen` entry binds
+successfully. See [Metrics with Prometheus](Metrics-with-Prometheus).
+
+## Clustering
+
+These cover the optional `cluster` section (peer attestation, leader election,
+and the lease backends). For the full model see
+[Clustering and Leader Election](Clustering-and-Leader-Election).
+
+### `quorate: false` and `Leader` jobs stop running
+
+**Symptom.** `GET /cluster` reports `"quorate": false` and `Leader`-policy jobs
+stop firing on every replica (`PreferLeader` jobs keep running).
+
+**Cause.** This node cannot see a quorum (a strict majority) of the cluster, so
+it deliberately **stands down** rather than risk a second leader. On the
+`gossip` backend that means a minority-side network partition or too many peers
+`unreachable`/`untrusted`. On a **lease** backend (`kubernetes`/`etcd`) it means
+the coordination store is unreachable or the last read has gone stale (past one
+`leaseDurationSeconds`/`ttl`); `quorate` there means "has a fresh read of the
+store", not "sees a majority". Either way `Leader` **fails closed** (skips) while
+`PreferLeader` keeps running (it may double-run during the outage).
+
+**Fix.** Restore a quorum: heal the partition or bring failed peers back so a
+majority is mutually reachable (gossip), or restore reachability to the apiserver
+/ etcd (lease backends). See
+[Why the quorum gate is safe](Clustering-and-Leader-Election#why-the-quorum-gate-is-safe)
+and, for the lease backends, [Failure modes](Clustering-and-Leader-Election#failure-modes).
+
+### Duplicate `nodeName` conflict (`conflict: true` with `conflict_names`)
+
+**Symptom.** `GET /cluster` shows `"conflict": true` with the offending name in
+`"conflict_names"`, one or more peers show status `conflict`, a banner appears in
+the dashboard cluster panel, and an `ERROR` log line reports the duplicate.
+`Leader` jobs stand down.
+
+**Cause.** Two processes are running with the **same `nodeName`** (distinguished
+by their random per-process instance ids). Because each would elect itself as the
+lowest name in its own view, both could lead: a silent double-run. yacron2
+detects this and **fails `Leader` jobs closed** until it clears (`PreferLeader`
+and `EveryNode` are not gated).
+
+**Fix.** Give every node a distinct `nodeName` (or distinct hostnames, since the
+default `nodeName` is the system hostname). The gate is self-healing: it clears
+automatically once the duplicate is renamed. See
+[Unique node names](Clustering-and-Leader-Election#unique-node-names).
+
+### Coordination-policy conflict (`policy_conflict: true` with `conflicting_policies`)
+
+**Symptom.** `GET /cluster` shows `"policy_conflict": true` with the differing
+descriptors in `"conflicting_policies"` (and the umbrella `"conflict": true`), a
+banner appears in the dashboard cluster panel, and `Leader` jobs stand down.
+
+**Cause.** A quorate peer is advertising a different `distribution` or
+`elect_leader` setting than this node. Because those are cluster-wide coordination
+settings (not part of the job-set id, so they do not surface as drift), a mismatch
+would let nodes coordinate differently and double-run. It is the **third** trigger
+of the umbrella `conflict` flag, alongside a duplicate `nodeName`
+(`conflict_names`) and a cluster-size disagreement (`size_conflict` /
+`conflicting_sizes`); all three stand `Leader` jobs down.
+
+**Fix.** Align `electLeader` and `distribution` across every node and roll the
+change out uniformly (one node at a time). The gate clears automatically once the
+cluster reconverges on one policy. See
+[Distribution: one leader, or spread the load](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+and [Consistent cluster size](Clustering-and-Leader-Election#consistent-cluster-size).
+
+### A peer shows `untrusted`
+
+**Symptom.** A peer's status on `GET /cluster` is `untrusted` (with a TLS error in
+`last_error`), and the `peer … is untrusted` `WARNING` appears in the logs. That
+peer never counts toward agreement, so quorum can drop.
+
+**Cause (gossip only).** The peer's certificate did not verify: it does not chain
+to the configured `tls.ca`, or its SAN/hostname does not match the address it was
+reached at (standard TLS hostname pinning, e.g. the cert at
+`yacron-b.internal:8443` must carry `yacron-b.internal` as a SAN). This most often
+follows a botched CA roll (the overlap step was skipped) or a node whose cert
+refresh lagged.
+
+**Fix.** Restore trust overlap (distribute a CA bundle covering whichever CA the
+`untrusted` peers were issued from) or finish rolling the lagging nodes; ensure
+each node's cert SAN matches its peer-list host. Each node reloads within ~1
+minute and peers return to `agreed`. See
+[Cluster peer attestation](Clustering-and-Leader-Election#cluster-peer-attestation)
+and [Cluster certificate operations](Production-Deployment#cluster-certificate-operations).
+
+### `electLeader` on a 2-node cluster refuses to start
+
+**Symptom.** Startup fails with a `ConfigError`:
+
+```text
+cluster.electLeader needs a fault-tolerant cluster, but this config declares
+only 2 nodes (1 peer). A quorum of 2 requires both nodes up for either to run,
+so it is strictly worse than a single replica. …
+```
+
+**Cause.** With `electLeader` and a 2-node cluster the quorum is 2, so **both**
+nodes must be up for either to run: lower availability than a single replica and
+no failover. yacron2 refuses it outright rather than silently degrade. (A 2-node
+cluster is fine for attestation-only, without `electLeader`.)
+
+**Fix.** Use 3 or more nodes (an odd count is best), or run a single replica
+without `electLeader`. See
+[Sizing the cluster](Clustering-and-Leader-Election#sizing-the-cluster).
+
+### Even-size warning with `electLeader`
+
+**Symptom.** Startup logs a warning that an even cluster size tolerates no more
+failures than the next-lower odd size.
+
+**Cause.** For `size > 2` an even size (4, 6, 10, …) needs the same quorum as the
+odd size below it, so the extra node only adds something that can fail; its
+`P(runs)` is equal-or-worse, never better. This is a non-fatal advisory (unlike
+the 2-node case above, which is rejected).
+
+**Fix.** Prefer an odd size: shrink by one for the same tolerance with one fewer
+node, or grow by one to tolerate an extra failure. See
+[Sizing the cluster](Clustering-and-Leader-Election#sizing-the-cluster).
 
 ## Concurrency and termination
 
@@ -435,7 +587,7 @@ N seconds (recorded internally as retcode `-100`). Cancellation sends `SIGTERM`,
 
 **Windows note.** The `SIGTERM`-then-`SIGKILL` escalation is POSIX behavior
 (`terminate()` = `SIGTERM`, graceful and trappable; `kill()` = `SIGKILL`, forceful).
-Windows has no POSIX signals — both `terminate()` and `kill()` call `TerminateProcess`,
+Windows has no POSIX signals: both `terminate()` and `kill()` call `TerminateProcess`,
 an immediate ungraceful stop. The child is not notified to clean up, so the
 terminate->kill escalation is effectively moot (`killTimeout` still bounds the wait,
 but the outcome is the same hard kill). See [Running on Windows](Running-on-Windows).

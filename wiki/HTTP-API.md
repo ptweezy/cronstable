@@ -1,13 +1,15 @@
 # HTTP Control API
 
 yacron2 exposes an optional [aiohttp](https://docs.aiohttp.org/) REST control API,
-enabled by adding a top-level `web` section to the configuration. It serves three
-endpoints for querying the daemon version, inspecting job status, and triggering a
-job on demand. This page documents the configuration schema, the endpoints, bearer-token
-authentication, Unix-socket permissions, and lifecycle behavior.
+enabled by adding a top-level `web` section to the configuration. It serves
+endpoints for querying the daemon version, inspecting job status, starting and
+cancelling jobs on demand, reading per-job run history, tailing captured job
+output live, exposing [Prometheus metrics](Metrics-with-Prometheus), and (when
+a `cluster` section is configured) reporting the cluster and fleet views. This page documents the configuration schema, every endpoint,
+bearer-token authentication, Unix-socket permissions, and lifecycle behavior.
 
-The interface is *new in version 0.10*; `web.authToken` and `web.socketMode` are new
-in yacron2 1.0.0.
+The interface is inherited from upstream yacron; `web.authToken` and
+`web.socketMode` are yacron2 additions.
 
 > **Looking for the browser UI?** The same HTTP interface also serves the
 > built-in **[Web Dashboard](Web-Dashboard)** at `/` on every `http://` listener
@@ -46,7 +48,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port` or `unix:///path`. An empty list disables the server. |
-| `headers` | map of string→string | (none) | Extra HTTP headers added to the success responses (including the 409 conflict body and the empty start-job response, but not the 404 or 401). |
+| `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the 409 conflict body, but not the 404 or 401. |
 | `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 
@@ -55,7 +57,7 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `yacron2/config
 | Scheme | Form | Requirements |
 | --- | --- | --- |
 | `http` | `http://host:port` | Both host and port are required. An `http` URL missing either is logged as a warning (`Ignoring web listen url ...: http url needs host and port`) and skipped. |
-| `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. POSIX-only: on Windows `UnixSite` is unavailable (no `create_unix_server` on the Proactor loop), so such a URL is skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform` — use an `http://` listener instead. |
+| `unix` | `unix:///path/to/socket` | Binds an `aiohttp` `UnixSite` at the given filesystem path. POSIX-only: on Windows `UnixSite` is unavailable (no `create_unix_server` on the Proactor loop), so such a URL is skipped with the warning `Ignoring web listen url <url>: unix-socket listeners are not supported on this platform`. Use an `http://` listener instead. |
 
 Any other scheme is logged (`scheme ... not supported`) and skipped. Binding maps to
 `web.TCPSite` for `http` and `web.UnixSite` for `unix` (`web_site_from_url` in
@@ -72,12 +74,25 @@ All routes are registered in `start_stop_web_app`:
 | Method | Path | Handler | Success status |
 | --- | --- | --- | --- |
 | `GET` | `/version` | `_web_get_version` | `200` |
+| `GET` | `/job-set-id` | `_web_job_set_id` | `200` |
+| `GET` | `/cluster` | `_web_get_cluster` | `200` |
+| `GET` | `/fleet` | `_web_get_fleet` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/jobs` | `_web_list_jobs` | `200` |
+| `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
+| `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
+| `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
+| `GET` | `/metrics` | `_web_metrics` | `200` (Prometheus exposition; omitted when `metrics: false`) |
+| `GET` | `/` | `_web_index` | `200` (dashboard page; omitted when `ui: false`) |
 
-The configured `headers` map is applied to the `200` responses of all three
-handlers and to the `409` body of `/jobs/{name}/start`. The `404` (unknown job)
-and `401` (authentication failure) responses are raised without it.
+The configured `headers` map is applied to every `200` success response across
+all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
+bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. The `404` (unknown
+job) and `401` (authentication failure) responses are raised without it.
+
+> The same interface serves the **[Web Dashboard](Web-Dashboard)** at `/`; that
+> page is the visual tour of the UI these endpoints feed.
 
 ### `GET /version`
 
@@ -112,8 +127,8 @@ For `scheduled` jobs, `scheduled_in` is the number of seconds until the next run
 (a float, computed from the job's crontab in the job's timezone). For an `@reboot`
 schedule, `scheduled_in` is the literal string `"@reboot"`.
 
-The `disabled` status (*new in 1.0.1*) is reported honestly instead of an
-inapplicable `scheduled (in N seconds)`.
+The `disabled` status is reported honestly instead of an inapplicable
+`scheduled (in N seconds)`.
 
 Text form:
 
@@ -145,6 +160,177 @@ Content-Type: application/json; charset=utf-8
 ]
 ```
 
+### `GET /cluster`
+
+Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
+When no `cluster` section is configured, it returns
+`{"enabled": false, "peers": []}`. When a cluster section is present it returns
+`enabled: true` plus a `backend` field naming the active leadership backend
+(`gossip`, `kubernetes`, or `etcd`) and the node's view: its
+`node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
+`elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
+whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
+whether this node is `quorate`, the elected `leader`
+(`null` when this node is not quorate, and always `null` in `spread` mode) and
+`is_leader` (always `false` in `spread` mode), and a `peers` array (each with
+`host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
+`mismatch_streak`). Under `distribution: spread`, per-job owners instead appear
+as a `clusterOwner` field on each leader-gated job in `GET /jobs`.
+
+The umbrella `conflict` flag is set by any of three triggers, each with its own
+detail list, and all three stand `Leader` jobs down: a duplicate `nodeName` (the
+offending names in `conflict_names`); an agreeing peer declaring a different
+cluster size (`size_conflict: true`, the divergent sizes in `conflicting_sizes`);
+and a quorate peer advertising a different `distribution` or `elect_leader`
+setting, a coordination-policy conflict surfaced as `policy_conflict: true` with
+the differing descriptors in `conflicting_policies`.
+
+The **lease backends** (`kubernetes` / `etcd`) have no static peer set, so their
+view is lease-shaped: `backend` names the backend, `peers` is empty,
+`cluster_size`/`quorum` are `1`, `elect_leader` is `true`, `distribution` is
+`single-leader`, all three conflict flags (`conflict`, `size_conflict`,
+`policy_conflict`) are always `false`, and an extra `lease` block carries the
+backend-specific detail. This is an endpoint-reference view; the field
+semantics (what `quorate` means for a lease backend, the `lease` block contents,
+and the `expiry` rules below) are documented once in
+[Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster).
+For `kubernetes` the block is `{name, namespace, identity, holder, expiry}` and
+for `etcd` `{electionName, identity, holder, leaseId, expiry}`. The `expiry` is
+populated only while **this** node holds the lease: a follower reports
+`expiry: null`. (For `kubernetes` it is the local lease deadline while this node
+leads; for `etcd` it is the current lease deadline, or `null` when this node is
+not the holder.) `quorate` is whether the node has a fresh successful read of the
+lease store (stale → `Leader` fails closed; the never-skip `PreferLeader` default
+then runs the job anyway).
+
+```shell
+$ http get http://127.0.0.1:8080/cluster Accept:application/json
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "enabled": true,
+    "backend": "gossip",
+    "node_name": "node-a",
+    "job_set_id": "v1:…",
+    "cluster_size": 3,
+    "quorum": 2,
+    "elect_leader": true,
+    "distribution": "single-leader",
+    "conflict": false,
+    "conflict_names": [],
+    "size_conflict": false,
+    "conflicting_sizes": [],
+    "policy_conflict": false,
+    "conflicting_policies": [],
+    "quorate": true,
+    "leader": "node-a",
+    "is_leader": true,
+    "peers": [
+        {"host": "yacron-b.internal:8443", "status": "agreed", "node_name": "node-b", "job_set_id": "v1:…", "last_seen": "2026-06-23T19:00:00+00:00", "last_error": null, "mismatch_streak": 0}
+    ]
+}
+```
+
+A lease backend (here `kubernetes`) returns the lease-shaped view instead:
+
+```jsonc
+{
+    "enabled": true,
+    "backend": "kubernetes",
+    "node_name": "yacron2-0",
+    "job_set_id": "v1:…",
+    "cluster_size": 1,
+    "quorum": 1,
+    "elect_leader": true,
+    "distribution": "single-leader",
+    "conflict": false, "conflict_names": [],
+    "size_conflict": false, "conflicting_sizes": [],
+    "policy_conflict": false, "conflicting_policies": [],
+    "quorate": true,
+    "leader": "yacron2-0",
+    "is_leader": true,
+    "peers": [],
+    "lease": {"name": "yacron2-leader", "namespace": "default",
+              "identity": "yacron2-0", "holder": "yacron2-0",
+              "expiry": "2026-06-24T19:00:14.000000Z"}
+}
+```
+
+The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
+`untrusted`, `self`, `conflict`, `unknown`) are documented in
+[Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status).
+
+> The separate `GET /peer` attestation endpoint is **not** part of this web API.
+> It is served only on the cluster's own mutual-TLS `listen` address (default
+> port `8443`), never on the public `web` listeners. See
+> [Clustering and Leader Election](Clustering-and-Leader-Election).
+
+### `GET /fleet`
+
+Returns the cluster-wide per-job run view that backs the dashboard's
+[fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane): one entry
+per node, each carrying that node's per-job run summaries. It is answered
+entirely from state this node already holds. Every gossip node piggybacks a
+compact summary of its own jobs (running / enabled / seconds to next fire /
+last finished run) on its mutual-TLS `/peer` response, so the summaries arrive
+with the peer polls this node is already making; serving `/fleet` triggers no
+peer traffic. Any node can therefore serve the whole fleet's picture, at most
+one gossip `interval` stale per peer.
+
+When no `cluster` section is configured, or the backend is a lease backend
+(`kubernetes` / `etcd`, which carry only a lease and know nothing about what
+other nodes run), it returns `{"enabled": false, "nodes": []}`.
+
+For the gossip backend it returns `enabled: true`, the serving node's
+`node_name`, the `distribution` and `elect_leader` policy, the gossip
+`interval` in seconds (the peer-data freshness bound), and a `nodes` array.
+The serving node is always first (`self: true`, status `self`, `as_of` stamped
+at request time); each configured peer follows with the `status` and `host`
+from the peer table and the summaries absorbed from its last successful poll
+(`as_of` = `last_seen`). Self-listings are skipped and two addresses that
+answer as the same process are deduplicated.
+
+Per node: `jobs` maps each job name to
+`{running, enabled, scheduled_in, last}`, where `last` is
+`{outcome, finished_at, duration, exit_code}` or `null` for a job that has not
+run since that node started. `jobs: null` (as opposed to `{}`) means no
+snapshot is held for that node at all: it was never reached, or it runs an
+older build that does not gossip summaries. `truncated: true` flags a node
+with more jobs than the per-payload cap (512), whose advertised set is the
+sorted-name prefix. A briefly unreachable peer keeps its last-known summaries
+with the old `as_of` rather than being blanked, so stale data is visibly stale
+instead of silently missing.
+
+```shell
+$ http get http://127.0.0.1:8080/fleet Accept:application/json
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "enabled": true,
+    "backend": "gossip",
+    "node_name": "node-a",
+    "distribution": "spread",
+    "elect_leader": true,
+    "interval": 30,
+    "nodes": [
+        {"node_name": "node-a", "host": null, "self": true, "status": "self",
+         "as_of": "2026-06-23T19:00:02+00:00", "truncated": false,
+         "jobs": {"backup": {"running": false, "enabled": true, "scheduled_in": 1042.5,
+                             "last": {"outcome": "success", "finished_at": "2026-06-23T18:00:01+00:00",
+                                      "duration": 12.4, "exit_code": 0}}}},
+        {"node_name": "node-b", "host": "yacron-b.internal:8443", "self": false, "status": "agreed",
+         "as_of": "2026-06-23T18:59:45+00:00", "truncated": false,
+         "jobs": {"backup": {"running": true, "enabled": true, "scheduled_in": null, "last": null}}}
+    ]
+}
+```
+
+The summaries are observability data only: they never feed leader election or
+any run/skip decision, and a malformed or hostile peer payload degrades to
+"no data for that node" rather than poisoning the view.
+
 ### `POST /jobs/{name}/start`
 
 Launches the named job immediately, regardless of its schedule. `{name}` is the
@@ -156,7 +342,7 @@ job's `name`.
 | The job exists but has `enabled: false`. | `409 Conflict`, body `job '<name>' is disabled`. |
 | Otherwise. | `200 OK`, empty body; the job is launched via the normal launch path. |
 
-The `409` behavior is *new in 1.0.1*: a disabled job behaves as if it is not there,
+The `409` is deliberate: a disabled job behaves as if it is not there,
 so the API refuses to launch it manually rather than overriding the config.
 
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
@@ -170,14 +356,245 @@ HTTP/1.1 200 OK
 Content-Length: 0
 ```
 
+### `POST /jobs/{name}/cancel`
+
+Terminates every currently-running instance of the named job, using the same
+graceful terminate-then-kill sequence yacron2 uses elsewhere (honoring the
+job's `killTimeout`; see [Concurrency and Timeouts](Concurrency-and-Timeouts)).
+Instances are cancelled concurrently, so a job with several running instances
+costs at most one `killTimeout`, not one per instance.
+
+| Condition | Response |
+| --- | --- |
+| No job with that name. | `404 Not Found`. |
+| The job exists but no instance is running. | `409 Conflict`, body `job '<name>' is not running`. |
+| Otherwise. | `200 OK`, empty body; all running instances are cancelled. |
+
+A run cancelled this way is recorded in the job's history with the outcome
+`cancelled`. Cancellation is a deliberate operator action, not a job failure,
+so it is **not** reported (`onFailure` does not fire) and does **not** trigger
+retries.
+
+```shell
+$ http post http://127.0.0.1:8080/jobs/test-03/cancel
+HTTP/1.1 200 OK
+```
+
+### `GET /jobs`
+
+Returns a JSON array describing every job: its schedule and timezone, whether
+it is enabled and running, the time until its next scheduled run, a summary of
+its most recent finished run, and a compact tail of recent outcomes. This is
+the endpoint the [Web Dashboard](Web-Dashboard) polls.
+
+| Field | Meaning |
+| --- | --- |
+| `name`, `enabled`, `schedule`, `command` | The job's name and `enabled` flag, its schedule as a crontab string, and its command (argv lists are joined for display). |
+| `captureStdout`, `captureStderr` | Which output streams the job captures, and therefore which are available from `/jobs/{name}/logs`. |
+| `utc`, `timezone` | The schedule's reference frame: `utc` (default `true`) and the IANA `timezone` name, or `null`. |
+| `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
+| `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
+| `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
+| `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
+
+```shell
+$ http get http://127.0.0.1:8080/jobs
+[
+    {
+        "name": "test-01",
+        "enabled": true,
+        "schedule": "*/5 * * * *",
+        "command": "echo foobar",
+        "captureStdout": true,
+        "captureStderr": true,
+        "utc": true,
+        "timezone": "UTC",
+        "running": false,
+        "pids": [],
+        "scheduled_in": 42.1,
+        "last_run": {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        },
+        "history": [
+            {"outcome": "success", "duration": 0.98},
+            {"outcome": "failure", "duration": 1.21},
+            {"outcome": "success", "duration": 1.02}
+        ]
+    }
+]
+```
+
+### `GET /jobs/{name}/runs`
+
+Returns the job's retained run history (oldest first, bounded, and held in
+memory only) together with aggregate statistics. Returns `404 Not Found` for
+an unknown job.
+
+Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
+(`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
+`fail_reason`). `stats` summarizes them:
+
+| `stats` field | Meaning |
+| --- | --- |
+| `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
+| `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
+| `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. |
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01/runs
+{
+    "name": "test-01",
+    "runs": [
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "started_at": "2026-06-21T12:00:00+00:00",
+            "finished_at": "2026-06-21T12:00:01+00:00",
+            "duration": 1.02,
+            "fail_reason": null
+        }
+    ],
+    "stats": {
+        "total": 1,
+        "success": 1,
+        "failure": 0,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "avg_duration": 1.02,
+        "min_duration": 1.02,
+        "max_duration": 1.02,
+        "last_duration": 1.02
+    }
+}
+```
+
+### `GET /jobs/{name}/logs`
+
+A [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
+stream of a job's captured output. Returns `404 Not Found` for an unknown job.
+The stream begins with the lines already buffered (from the most recent running
+instance, or else the last finished run's retained output), then follows a
+running job's new lines live, and finishes with an `end` event:
+
+- Each line arrives as an `event: line` whose `data` is a JSON object
+  `{"stream": "stdout"|"stderr", "line": "..."}`.
+- When the run finishes, the server sends `event: end` with data `{}`. If the
+  job has no captured output at all yet, the stream ends immediately with
+  `event: end` and data `{"reason": "no-output"}`.
+- During quiet periods the server writes an SSE comment (`: ping`) every 15
+  seconds as a keep-alive, which also detects disconnected clients.
+
+Only the streams a job captures (`captureStdout` / `captureStderr`) appear
+here; see [Output Capturing](Output-Capturing). The response carries
+`X-Accel-Buffering: no` so reverse proxies (e.g. nginx) do not buffer the
+stream.
+
+```shell
+$ curl -N http://127.0.0.1:8080/jobs/test-01/logs
+event: line
+data: {"stream": "stdout", "line": "foobar"}
+
+event: end
+data: {}
+```
+
+### `GET /job-set-id`
+
+Returns this instance's job-set id: the order-independent fingerprint of every
+job's effective configuration that replicas compare to confirm they hold the
+same set of jobs (see
+[the job-set id foundation](Clustering-and-Leader-Election#the-job-set-id-foundation)).
+The response is `text/plain` by default; with `Accept: application/json` it is
+a JSON object that also carries the job count.
+
+```shell
+$ http get http://127.0.0.1:8080/job-set-id
+v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
+
+$ http get http://127.0.0.1:8080/job-set-id Accept:application/json
+{"job_set_id": "v1:b834d7…51ce90b", "jobs": 3}
+```
+
+### `GET /metrics`
+
+Exposes yacron2's native [Prometheus](Metrics-with-Prometheus) metrics: daemon
+info, per-job run counters and duration histograms, live per-job gauges, and
+(when a `cluster` section is configured) the cluster health series that mirror
+`GET /cluster`. The exposition is generated by yacron2 itself, with no
+exporter sidecar and no extra dependency. This section covers the endpoint
+mechanics; the full metric reference lives in
+[Metrics with Prometheus](Metrics-with-Prometheus).
+
+The response format depends on the request's `Accept` header:
+
+- By default the response is the classic Prometheus text format
+  (`text/plain; version=0.0.4`).
+- If `Accept` advertises `application/openmetrics-text`, the response is
+  OpenMetrics 1.0 (terminated by `# EOF`), as modern Prometheus servers
+  request.
+
+The configured `web.headers` are applied to the response as on every other
+route, except `Content-Type`, which this endpoint owns: the exposition
+format's contract always wins over an operator-configured header.
+
+The endpoint is enabled by default whenever the web API is on. The
+`web.metrics` option tunes or disables it, accepting either a boolean
+shorthand (`metrics: false` disables the endpoint) or a map:
+
+| Sub-option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Serve `GET /metrics`. |
+| `public` | bool | `false` | Exempt `/metrics` (and only `/metrics`) from `web.authToken` bearer-token authentication (see [Authentication](#authentication)). |
+| `durationBuckets` | sequence of floats | `0.1, 0.5, 1, 5, 15, 60, 300, 900, 3600` | Upper bounds (seconds) of the `yacron2_job_duration_seconds` histogram. Bounds must be finite, positive, and strictly increasing; anything else raises a `ConfigError`. |
+
+The metric registry is owned by the daemon rather than the web app, so
+counters survive config reloads (including ones that restart the web server)
+and reset only when the process restarts; series for jobs removed by a reload
+are pruned.
+
+```shell
+$ curl http://127.0.0.1:8080/metrics
+# HELP yacron2_info yacron2 build information.
+# TYPE yacron2_info gauge
+yacron2_info{version="1.0.13"} 1
+# HELP yacron2_jobs Number of configured jobs by enablement state.
+# TYPE yacron2_jobs gauge
+yacron2_jobs{state="enabled"} 2
+yacron2_jobs{state="disabled"} 1
+# HELP yacron2_job_runs_total Finished job runs by outcome, as recorded in the run history.
+# TYPE yacron2_job_runs_total counter
+yacron2_job_runs_total{job_name="test-01",status="success"} 12
+yacron2_job_runs_total{job_name="test-01",status="failure"} 1
+yacron2_job_runs_total{job_name="test-01",status="cancelled"} 0
+...
+```
+
+### `GET /` (the dashboard page)
+
+Serves the single-page [Web Dashboard](Web-Dashboard). Set `ui: false` in the
+`web` section to disable the page and expose only the REST endpoints. The page
+is served with secure default headers (a strict Content-Security-Policy,
+anti-clickjacking, and nosniff) with any operator `web.headers` merged on top,
+so a deliberately-set operator header wins. When `web.authToken` is enabled,
+the page itself loads without a token (it holds no data); it prompts for the
+token in the browser and authenticates every data request with it (see
+[Authentication](#authentication)).
+
 ## Response headers
 
-The `web.headers` map (*released in yacron2 1.0.0*; merged upstream but never
-released in yacron 0.19) is a string→string map applied to the responses from
-`/version`, `/status`, the `409` body of `/jobs/{name}/start`, and the `200` of
-`/jobs/{name}/start`. It is not applied to the `404` (unknown job) or `401`
-(authentication failure) responses, which are raised without the configured
-headers. Example:
+The `web.headers` map (merged upstream but never released in yacron 0.19) is a
+string→string map applied to every `200` success
+response across all routes (`/version`, `/status`, `/cluster`, `/job-set-id`,
+the job routes, and the `200` of `/jobs/{name}/start`) and to the `409`
+conflict bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. It is not
+applied to the `404` (unknown job) or `401` (authentication failure) responses,
+which are raised without the configured headers. Example:
 
 ```yaml
 web:
@@ -207,11 +624,16 @@ When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) require
 `Authorization: Bearer <token>` on every route:
 
 - The auth scheme is compared case-insensitively (`Bearer`, `bearer`, etc.) per
-  RFC 7235 (*case-insensitive matching new in 1.0.4*).
+  RFC 7235.
 - The presented token is compared against the configured token in constant time via
   `hmac.compare_digest`.
 - A missing/malformed `Authorization` header, a wrong scheme, or a non-matching
   token returns `401 Unauthorized`.
+
+The one configurable exception: setting `web.metrics.public: true` exempts
+`/metrics` (and only `/metrics`) from the bearer token, for scrapers that
+cannot send credentials; every other route stays gated (see
+[`GET /metrics`](#get-metrics)).
 
 ```yaml
 web:
@@ -230,7 +652,7 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 
 If `authToken` is configured but resolves to an empty token, yacron2 raises a
 `ConfigError` and refuses to start the web server, rather than silently serving
-the control API with no authentication (*new in 1.0.1*). This happens when:
+the control API with no authentication. This happens when:
 
 - `value`, `fromFile`, and `fromEnvVar` are all empty/absent;
 - `fromEnvVar` names a variable that is unset (resolves to `""`);
@@ -241,12 +663,12 @@ If `fromFile` cannot be read (`OSError`), yacron2 also raises a `ConfigError`
 
 ## Unix socket permissions
 
-> **Windows:** this entire feature is POSIX-only — it depends on `unix://`
+> **Windows:** this entire feature is POSIX-only. It depends on `unix://`
 > sockets (which Windows does not support) and on `chmod`. On Windows
 > `socketMode` has no effect and `unix://` listen URLs are skipped with a
 > warning; use an `http://` listener. See [Running on Windows](Running-on-Windows).
 
-`web.socketMode` (*new in 1.0.0*) is an octal-string file mode applied with `chmod`
+`web.socketMode` is an octal-string file mode applied with `chmod`
 to each `unix://` listen socket after it starts (`_apply_socket_mode`):
 
 ```yaml
@@ -280,7 +702,7 @@ reload from the scheduler loop:
 - Each `listen` address is bound independently. A bad URL (`ValueError`) or a bind
   failure (`OSError`, e.g. address already in use) on one address is logged as a
   warning (`web: could not listen on <addr>: ...`) and skipped; the remaining
-  addresses still bind, and the config update is not aborted (*new in 1.0.1*).
+  addresses still bind, and the config update is not aborted.
 - The `web: started listening on <addr>` log line is emitted only after the bind
   succeeds.
 - On shutdown, the running server is stopped after currently running jobs finish.
@@ -290,14 +712,20 @@ reload from the scheduler loop:
   [Running on Windows](Running-on-Windows).
 
 A `ConfigError` raised while resolving `authToken` (empty token or unreadable
-`fromFile`) propagates out of `start_stop_web_app` and is caught by the reload loop,
-which logs the configuration error and keeps running the previously-loaded
-configuration (the new config is not applied).
+`fromFile`) propagates out of `start_stop_web_app` and is caught by the reload
+loop's dedicated web-app handler, which logs `Error in the web configuration, so
+not starting the web API` and leaves the web API down until a later reload fixes
+it. The rest of the new configuration (jobs, cluster, logging) is still applied:
+the web app starts under its own error handling, after the cluster manager, so a
+web misconfiguration cannot skip the cluster gate (which would otherwise fail
+open and run every `Leader` job on every node).
 
 ## See also
 
-- [Web Dashboard](Web-Dashboard) — the built-in browser UI served by this interface.
-- [Running on Windows](Running-on-Windows) — `unix://` listeners and `socketMode`
+- [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
+- [Metrics with Prometheus](Metrics-with-Prometheus): the full metric reference behind `GET /metrics` and Prometheus scrape configuration.
+- [Clustering and Leader Election](Clustering-and-Leader-Election): the `GET /cluster` view and the separate mTLS `/peer` endpoint.
+- [Running on Windows](Running-on-Windows): `unix://` listeners and `socketMode`
   behave differently on Windows.
 - [Configuration Reference](Configuration-Reference)
 - [CLI Reference](CLI-Reference)
