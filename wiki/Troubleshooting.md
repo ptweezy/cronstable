@@ -233,9 +233,11 @@ seems to run once a minute.
 **Cause.** Second-level scheduling requires a **seven-field** crontab string
 (`second minute hour dayOfMonth month dayOfWeek year`) or the object `second:` key.
 A common mistake is writing a **six-field** string like `"*/15 * * * * *"` expecting
-"every 15 seconds": parse-crontab reads the sixth field as the **year**, not the
-second, so that schedule is minute-granular (and pins an impossible year). Add the
-seventh field (`"*/15 * * * * * *"`), or use the object form (`second: "*/15"`).
+"every 15 seconds". A six-field line has no seconds column: its *leading* field is
+still the **minute**, and the extra *trailing* sixth field is the **year** (`*` =
+any year). So `"*/15 * * * * *"` actually runs every 15 **minutes** (at second 0),
+not every 15 seconds. Add the seventh field (`"*/15 * * * * * *"`, whose leading
+field is the second), or use the object form (`second: "*/15"`).
 
 **Fix.** Use the object `second:` key, or a full seven-field string. See
 [Second-level schedules](Schedules-and-Timezones#second-level-schedules). Note that
