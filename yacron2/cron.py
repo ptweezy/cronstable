@@ -31,6 +31,7 @@ from yacron2.config import (
     cluster_config_warnings,
     parse_config,
     parse_config_string,
+    schedule_object_to_crontab,
 )
 from yacron2.fingerprint import job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
@@ -181,9 +182,10 @@ def schedule_str(job: JobConfig) -> str:
     unparsed = job.schedule_unparsed
     if isinstance(unparsed, str):
         return unparsed
-    # the object form: rebuild the familiar five-field crontab line
-    order = ("minute", "hour", "dayOfMonth", "month", "dayOfWeek")
-    return " ".join(str(unparsed.get(field, "*")) for field in order)
+    # the object form: rebuild the crontab line (5 fields normally, or 6/7 when
+    # a year/second column is used) via the shared builder so it matches what
+    # the scheduler and fingerprint compute.
+    return schedule_object_to_crontab(unparsed)
 
 
 def command_str(command: Union[str, List[str]]) -> str:
@@ -219,10 +221,36 @@ def get_now(timezone: Optional[datetime.tzinfo]) -> datetime.datetime:
     return datetime.datetime.now(timezone)
 
 
-def next_sleep_interval() -> float:
+def next_sleep_interval(subminute: bool = False) -> float:
+    """Seconds to sleep until the next scheduling tick.
+
+    Minute mode (``subminute`` False, the default and the historical behaviour)
+    snaps to the top of the next minute.  When any enabled job pins specific
+    seconds the scheduler switches to ``subminute`` mode and snaps to the next
+    whole-second boundary instead, so a second-level schedule can fire on time.
+    """
     now = get_now(datetime.timezone.utc)
-    target = now.replace(second=0) + WAKEUP_INTERVAL
+    if subminute:
+        target = now.replace(microsecond=0) + datetime.timedelta(seconds=1)
+    else:
+        target = now.replace(second=0) + WAKEUP_INTERVAL
     return (target - now).total_seconds()
+
+
+def schedule_slot(job: JobConfig) -> datetime.datetime:
+    """The scheduling instant to test ``job`` against on this tick.
+
+    Truncated to the job's own resolution -- the whole second for a
+    second-level job (``has_seconds``), otherwise the top of the minute, which
+    reproduces the historical minute-tick behaviour exactly.  Used both to
+    decide whether the job is due (:meth:`Cron.job_should_run`) and to
+    de-duplicate launches (:meth:`Cron.spawn_jobs`): microseconds are always
+    zeroed so two ticks within one slot compare equal and the job fires once.
+    """
+    now = get_now(job.timezone)
+    if job.has_seconds:
+        return now.replace(microsecond=0)
+    return now.replace(second=0, microsecond=0)
 
 
 def web_site_from_url(runner: web.AppRunner, url: str) -> web.BaseSite:
@@ -270,6 +298,16 @@ class Cron:
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
+        # name -> the last scheduling slot (a datetime at the job's resolution)
+        # we launched it in, so a job fires at most once per slot even when the
+        # scheduler ticks every second to service sub-minute schedules. Pruned
+        # on reload; initialised before update_config() runs below. See
+        # spawn_jobs / schedule_slot.
+        self._last_run_slot = {}  # type: Dict[str, datetime.datetime]
+        # wall-clock minute of the last housekeeping pass (config reload,
+        # cluster/web (re)start, logging). Gates that work to once per minute
+        # even while ticking per-second. See run().
+        self._last_housekeeping_minute: Optional[datetime.datetime] = None
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -323,67 +361,88 @@ class Cron:
         startup = True
         applied_logging_config: Optional[LoggingConfig] = None
         while not self._stop_event.is_set():
-            # None until update_config succeeds this iteration; on failure we
-            # keep running the previously-loaded jobs (update_config only
-            # overwrites self.cron_jobs on success) and must not dereference an
-            # unbound config below.
+            # Housekeeping -- reloading the config from disk, (re)starting the
+            # cluster manager and web app, applying logging config -- runs at
+            # most once per wall-clock minute. When a sub-minute schedule makes
+            # the loop tick every second (see the sleep below), rereading and
+            # reparsing the config 60 times a minute would be pointless IO/CPU,
+            # so gate it: config-reload latency stays ~1 minute, exactly as in
+            # the minute-tick era. In pure minute-tick mode (no second-level
+            # job) `not self._needs_subminute()` forces housekeeping every
+            # iteration, so behaviour there is byte-identical to before -- and
+            # a frozen-clock test still reloads every loop.
+            now_minute = get_now(datetime.timezone.utc).replace(
+                second=0, microsecond=0
+            )
+            # None when housekeeping is skipped this tick, or until
+            # update_config succeeds; on failure we keep running the previously
+            # loaded jobs (update_config only overwrites self.cron_jobs on
+            # success) and must not dereference an unbound config below.
             config: Optional[Yacron2Config] = None
-            try:
-                config = self.update_config()
-                self._log_job_set_id()
-                await self.start_stop_cluster(config.cluster_config)
-            except ConfigError as err:
-                logger.error(
-                    "Error in configuration file(s), so not updating "
-                    "any of the config.:\n%s",
-                    str(err),
-                )
-            except Exception:  # pragma: nocover
-                logger.exception("please report this as a bug (1)")
-            if config is not None:
-                # The web app starts AFTER the cluster and under its OWN
-                # error handling: a web misconfiguration raising ConfigError
-                # (e.g. an authToken that resolves empty) used to share the
-                # try/except above and skip start_stop_cluster entirely, so
-                # _elect_leader_configured stayed False and every node ran
-                # every Leader job ungated -- the gate failed OPEN on an
-                # unrelated web error, on startup and on every reload
-                # iteration. The cluster gate must engage regardless of the
-                # web app's fate.
+            if (
+                startup
+                or not self._needs_subminute()
+                or now_minute != self._last_housekeeping_minute
+            ):
+                self._last_housekeeping_minute = now_minute
                 try:
-                    await self.start_stop_web_app(config.web_config)
+                    config = self.update_config()
+                    self._log_job_set_id()
+                    await self.start_stop_cluster(config.cluster_config)
                 except ConfigError as err:
                     logger.error(
-                        "Error in the web configuration, so not starting "
-                        "the web API:\n%s",
+                        "Error in configuration file(s), so not updating "
+                        "any of the config.:\n%s",
                         str(err),
                     )
                 except Exception:  # pragma: nocover
-                    logger.exception("please report this as a bug (4)")
-            if (
-                config is not None
-                and config.logging_config is not None
-                and config.logging_config != applied_logging_config
-            ):
-                try:
-                    logging.config.dictConfig(config.logging_config)
-                except Exception as ex:
-                    logger.error(
-                        "Error while configuring logging: %s\n"
-                        "Check for correct format at "
-                        "https://docs.python.org/3/library/logging.config.html"
-                        "#dictionary-schema-details\n%s",
-                        ex,
-                        config.logging_config,
-                    )
-                else:
-                    # only mark applied on success, and re-apply when the
-                    # config changes, so a fixed-after-error logging section
-                    # is picked up on reload without a restart.
-                    applied_logging_config = config.logging_config
+                    logger.exception("please report this as a bug (1)")
+                if config is not None:
+                    # The web app starts AFTER the cluster and under its OWN
+                    # error handling: a web misconfiguration raising a
+                    # ConfigError (an authToken that resolves empty) used to
+                    # share the try/except above and skip start_stop_cluster
+                    # entirely, so _elect_leader_configured stayed False and
+                    # every node ran every Leader job ungated -- the gate
+                    # failed OPEN on an unrelated web error, on startup and on
+                    # every reload iteration. The cluster gate must engage
+                    # regardless of the web app's fate.
+                    try:
+                        await self.start_stop_web_app(config.web_config)
+                    except ConfigError as err:
+                        logger.error(
+                            "Error in the web configuration, so not starting "
+                            "the web API:\n%s",
+                            str(err),
+                        )
+                    except Exception:  # pragma: nocover
+                        logger.exception("please report this as a bug (4)")
+                if (
+                    config is not None
+                    and config.logging_config is not None
+                    and config.logging_config != applied_logging_config
+                ):
+                    try:
+                        logging.config.dictConfig(config.logging_config)
+                    except Exception as ex:
+                        logger.error(
+                            "Error while configuring logging: %s\n"
+                            "Check for correct format at "
+                            "https://docs.python.org/3/library/logging.config"
+                            ".html#dictionary-schema-details\n%s",
+                            ex,
+                            config.logging_config,
+                        )
+                    else:
+                        # only mark applied on success, and re-apply when the
+                        # config changes, so a fixed-after-error logging
+                        # section is picked up on reload without a restart.
+                        applied_logging_config = config.logging_config
             await self.spawn_jobs(startup)
             startup = False
-            sleep_interval = next_sleep_interval()
+            # Recompute after spawn_jobs so a reload that just added (or
+            # removed) a second-level job switches cadence on this same tick.
+            sleep_interval = next_sleep_interval(self._needs_subminute())
             logger.debug("Will sleep for %.1f seconds", sleep_interval)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), sleep_interval)
@@ -445,6 +504,16 @@ class Cron:
         # the series from zero (a phantom counter reset); the reload after
         # the run ends prunes it for good.
         self.metrics.prune(set(self.cron_jobs) | set(self.running_jobs))
+        # Drop de-dup slots for jobs no longer in the config, so churning job
+        # names cannot grow this map without bound. A removed-but-still-running
+        # job keeps its slot until it finishes and the next reload prunes it,
+        # matching how the metrics accumulators above are pruned.
+        keep = set(self.cron_jobs) | set(self.running_jobs)
+        self._last_run_slot = {
+            name: slot
+            for name, slot in self._last_run_slot.items()
+            if name in keep
+        }
         return config
 
     def job_set_id(self) -> str:
@@ -1192,11 +1261,37 @@ class Cron:
                 ex,
             )
 
+    def _needs_subminute(self) -> bool:
+        """Whether any enabled job needs the scheduler to tick every second.
+
+        Drives the loop cadence and the housekeeping gate in :meth:`run`. Only
+        enabled jobs count: a disabled second-level job never runs, so it must
+        not pay the per-second-tick cost on its behalf.
+        """
+        return any(
+            job.has_seconds for job in self.cron_jobs.values() if job.enabled
+        )
+
     async def spawn_jobs(self, startup: bool) -> None:
         self._log_cluster_role()
         for job in self.cron_jobs.values():
             if not self.job_should_run(startup, job):
                 continue
+            if not startup:
+                # De-duplicate within a scheduling slot. When a second-level
+                # job makes the scheduler tick every second, a minute-level job
+                # tests "due" on every one of the 60 ticks of its due minute
+                # (job_should_run truncates to the minute), and even a
+                # second-level job could see two ticks land in one second. Fire
+                # each job at most once per slot. Recorded whether or not the
+                # cluster gate below lets THIS node run it, so a leader-gated
+                # job is evaluated exactly once per slot -- once per minute as
+                # before. @reboot startup runs are exempt (they fire once by
+                # construction and carry no crontab slot).
+                slot = schedule_slot(job)
+                if self._last_run_slot.get(job.name) == slot:
+                    continue
+                self._last_run_slot[job.name] = slot
             if startup and self._is_deferrable_reboot(job):
                 # @reboot + Leader/PreferLeader under election: at the startup
                 # instant the cluster has not converged, so we cannot tell who
@@ -1630,7 +1725,10 @@ class Cron:
                 return False
         if isinstance(job.schedule, CronTab):
             crontab = job.schedule  # type: CronTab
-            if crontab.test(get_now(job.timezone).replace(second=0)):
+            # schedule_slot truncates to the job's resolution: the top of the
+            # minute for a minute-level job (identical to the old
+            # replace(second=0)), or the whole second for a second-level one.
+            if crontab.test(schedule_slot(job)):
                 logger.debug(
                     "Job %s (%s) is scheduled for now",
                     job.name,
