@@ -35,6 +35,9 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
+  metrics), covering run outcomes, durations, retries, schedules, and cluster
+  health (see [Metrics](#metrics))
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
@@ -725,7 +728,24 @@ command is captured and interpreted as html and placed in the email message:
 
 ### Metrics
 
-Yacron2 has builtin support for writing job metrics to [Statsd](https://github.com/etsy/statsd):
+Yacron2 natively exposes Prometheus metrics whenever the
+[HTTP REST API](https://github.com/ptweezy/yacron2/wiki/HTTP-API) is enabled --
+no exporter sidecar needed:
+
+```yaml
+web:
+  listen:
+    - http://127.0.0.1:8080
+```
+
+`GET /metrics` then serves job run outcomes, duration histograms, retries,
+next-run times, config-reload health, and cluster/leader-election state, in
+both the Prometheus text format and OpenMetrics. See
+[Metrics with Prometheus](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Prometheus)
+for the full metric reference, scrape configuration, and example alert rules.
+
+Yacron2 also has builtin support for pushing per-job metrics to
+[Statsd](https://github.com/etsy/statsd):
 
 ```yaml
 jobs:

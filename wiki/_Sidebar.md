@@ -19,6 +19,7 @@
   - [Clustering and Leader Election](Clustering-and-Leader-Election)
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell)](Reporting)
+  - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)
   - [Web Dashboard](Web-Dashboard)

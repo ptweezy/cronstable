@@ -2,6 +2,7 @@ import copy
 import datetime
 import ipaddress
 import logging
+import math
 import os
 import re
 import socket
@@ -346,6 +347,19 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("socketMode"): Str(),
                 # serve the browser dashboard at "/" (default true)
                 Opt("ui"): Bool(),
+                # native Prometheus exposition at GET /metrics (default on
+                # whenever the web API is on). `metrics: false` disables it;
+                # the map form additionally exempts /metrics from authToken
+                # (public) and overrides the duration-histogram buckets.
+                # See yacron2/prometheus.py.
+                Opt("metrics"): Bool()
+                | Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("public"): Bool(),
+                        Opt("durationBuckets"): Seq(Float()),
+                    }
+                ),
             }
         ),
         # Optional cluster section: gate scheduled jobs on a leadership
@@ -1537,6 +1551,30 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     return warnings
 
 
+def _validate_web_config(webconf: WebConfig) -> None:
+    """Range checks the schema cannot express, mirroring the cluster
+    builders: fail at parse time (so ``--validate-config`` catches it)
+    rather than when the first scrape arrives."""
+    metrics = webconf.get("metrics")
+    if not isinstance(metrics, dict):
+        return
+    buckets = metrics.get("durationBuckets")
+    if buckets is None:
+        return
+    if not buckets:
+        raise ConfigError("web.metrics.durationBuckets must not be empty")
+    previous = 0.0
+    for bound in buckets:
+        # finite, positive, strictly increasing: anything else produces an
+        # invalid or duplicate-le histogram exposition.
+        if not math.isfinite(bound) or bound <= previous:
+            raise ConfigError(
+                "web.metrics.durationBuckets must be finite, positive and "
+                "strictly increasing (got {!r})".format(buckets)
+            )
+        previous = bound
+
+
 @dataclass
 class Yacron2Config:
     jobs: List[JobConfig]
@@ -1589,6 +1627,10 @@ def _config_from_doc(
     inc_defaults_merged: dict = {}
     jobs = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
+    if webconf is not None:
+        # (an included file's web section was already validated when that
+        # file was parsed, so validating the inline one here covers all)
+        _validate_web_config(webconf)
     clusterconf = (
         _build_cluster_config(doc["cluster"]) if "cluster" in doc else None
     )

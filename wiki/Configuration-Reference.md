@@ -61,6 +61,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, yacron2 refuses to start. |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
+| `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (bool shorthand) disables it; the map form sets `enabled` (default `true`), `public` (default `false`; exempts only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 
 `listen` is the only required key. Full behavior, authentication, and endpoint
 semantics are documented in [HTTP Control API](HTTP-API).
@@ -342,7 +343,10 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 | --- | --- | --- | --- |
 | `statsd` | `Map({"prefix": Str, "host": Str, "port": Int})` | none | When set, emit start/stop/success/duration metrics over UDP. All three keys are required. |
 
-See [Metrics with statsd](Metrics-with-Statsd).
+See [Metrics with statsd](Metrics-with-Statsd). Prometheus metrics are not
+configured per job: the `GET /metrics` endpoint is global, tuned under
+`web.metrics` in the `web` section above. See
+[Metrics with Prometheus](Metrics-with-Prometheus).
 
 ## Load-time numeric validation
 

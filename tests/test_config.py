@@ -740,3 +740,85 @@ def test_user_group_requires_superuser(monkeypatch):
     )
     with pytest.raises(ConfigError, match="not running as superuser"):
         _parse_user_group("user: svc")
+
+
+# ---------------------------------------------------------------------------
+# web.metrics (the native Prometheus endpoint; see yacron2/prometheus.py)
+# ---------------------------------------------------------------------------
+
+_WEB_METRICS_BASE = """
+web:
+  listen:
+    - http://127.0.0.1:8080
+"""
+
+
+def test_web_metrics_absent_by_default():
+    conf = config.parse_config_string(_WEB_METRICS_BASE, "")
+    # the key is simply absent; enabled-by-default is applied at the use
+    # site (yacron2.prometheus.resolve_metrics_config)
+    assert "metrics" not in conf.web_config
+
+
+def test_web_metrics_bool_shorthand():
+    conf = config.parse_config_string(
+        _WEB_METRICS_BASE + "  metrics: false\n", ""
+    )
+    assert conf.web_config["metrics"] is False
+
+
+def test_web_metrics_map_form():
+    conf = config.parse_config_string(
+        _WEB_METRICS_BASE
+        + "  metrics:\n"
+        + "    public: true\n"
+        + "    durationBuckets:\n"
+        + "      - 0.5\n"
+        + "      - 30\n",
+        "",
+    )
+    metrics = conf.web_config["metrics"]
+    assert metrics["public"] is True
+    assert metrics["durationBuckets"] == [0.5, 30.0]
+
+
+def test_web_metrics_buckets_must_increase():
+    with pytest.raises(ConfigError, match="strictly increasing"):
+        config.parse_config_string(
+            _WEB_METRICS_BASE
+            + "  metrics:\n"
+            + "    durationBuckets:\n"
+            + "      - 10\n"
+            + "      - 5\n",
+            "",
+        )
+
+
+def test_web_metrics_buckets_must_be_positive():
+    with pytest.raises(ConfigError, match="strictly increasing"):
+        config.parse_config_string(
+            _WEB_METRICS_BASE
+            + "  metrics:\n"
+            + "    durationBuckets:\n"
+            + "      - -1\n"
+            + "      - 5\n",
+            "",
+        )
+
+
+def test_web_metrics_buckets_must_not_be_empty():
+    # strictyaml cannot express an empty block sequence, so the empty case
+    # is validated directly against the builder-level check
+    with pytest.raises(ConfigError, match="must not be empty"):
+        config._validate_web_config(
+            config.WebConfig({"metrics": {"durationBuckets": []}})
+        )
+
+
+def test_web_metrics_buckets_must_be_finite():
+    with pytest.raises(ConfigError, match="finite"):
+        config._validate_web_config(
+            config.WebConfig(
+                {"metrics": {"durationBuckets": [1.0, float("inf")]}}
+            )
+        )

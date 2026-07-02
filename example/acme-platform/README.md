@@ -21,6 +21,7 @@ docker compose -f docker-compose-acme.yml up --build
 
 - Node dashboards: <http://localhost:8080/> (yacron-a), …8081–8084 (b–e)
 - On-call inbox (Mailpit): <http://localhost:8025/>
+- Native Prometheus metrics (per node): <http://localhost:8080/metrics>
 - Job metrics (statsd, re-exported as Prometheus): <http://localhost:9102/metrics>
 
 Stop and wipe (including the throwaway certs):
@@ -47,6 +48,7 @@ docker compose -f docker-compose-acme.yml down -v
 | `captureStdout`/`captureStderr` off | `silent-cleanup` |
 | `saveLimit` (short history) | `audit-log-ship` |
 | `statsd` metrics | `etl-build-facts`, `queue-depth-probe` |
+| Native Prometheus `/metrics` endpoint (on by default with the web dashboard) | every node, e.g. <http://localhost:8080/metrics> |
 
 ## Dashboard demos (self-driving, UTC)
 

@@ -1,6 +1,6 @@
 # Metrics with statsd
 
-yacron2 can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format yacron2 emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop).
+yacron2 can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format yacron2 emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop). statsd is the push-side metrics option; for pull-side scraping, yacron2 also serves a native [Prometheus endpoint](Metrics-with-Prometheus) on the web API, and both can be enabled at once.
 
 ## Enabling statsd for a job
 
@@ -96,6 +96,7 @@ This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a 
 
 ## See also
 
+- [Metrics with Prometheus](Metrics-with-Prometheus): the pull-side sibling; a scrapeable `/metrics` endpoint on the web API.
 - [Configuration Reference](Configuration-Reference): full per-job option list.
 - [Reporting (Mail, Sentry, Shell)](Reporting): the other outbound notification channels.
 - [Failure Detection and Retries](Failure-Detection-and-Retries): how `job.failed` (and thus `success:0`/`success:1`) is determined.

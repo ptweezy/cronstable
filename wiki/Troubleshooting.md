@@ -406,11 +406,43 @@ an empty rendered body is also skipped.
 
 **Cause.** statsd is best-effort: metrics go out over fire-and-forget UDP, and an
 `OSError` on send (for example an unresolvable host) is logged as a warning rather than
-propagated. If the `statsd` block is absent, no metrics are emitted at all.
+propagated. If the `statsd` block is absent, no statsd metrics are emitted at
+all (the [Prometheus endpoint](Metrics-with-Prometheus) is independent of it).
 
 **Fix.** Configure the job's `statsd` block (`host`, `port`, `prefix`, all required)
 and verify the host resolves and the UDP path is open. See
 [Metrics with statsd](Metrics-with-Statsd).
+
+### Prometheus scrapes return 401
+
+**Symptom.** Prometheus marks the yacron2 target down with
+`server returned HTTP status 401 Unauthorized`; `curl http://host:port/metrics`
+returns `401`.
+
+**Cause.** `web.authToken` is configured, and `GET /metrics` requires the bearer
+token like every other data endpoint. The only exemption is
+`web.metrics.public: true`, which exempts `/metrics` (and only `/metrics`) from
+authentication.
+
+**Fix.** Send the token from the scrape configuration (an `authorization` block
+with `type: Bearer` and `credentials`), or set `web.metrics.public: true` if the
+scraper cannot send credentials -- everything else stays gated. See
+[Metrics with Prometheus](Metrics-with-Prometheus).
+
+### `/metrics` returns 404
+
+**Symptom.** `GET /metrics` returns `404 Not Found`, or nothing listens on the
+expected port at all.
+
+**Cause.** The endpoint is served by the web API and is on by default whenever
+the web API is enabled, so a `404` means it was disabled explicitly
+(`web.metrics: false`, or `web.metrics.enabled: false` in the map form). If the
+connection is refused instead, there is no `web` section (or no working
+`web.listen` entry), so no web API -- and no `/metrics` -- is served.
+
+**Fix.** Remove the `metrics: false` / `enabled: false` override (`web.metrics`
+left unset means enabled), and make sure a `web.listen` entry binds
+successfully. See [Metrics with Prometheus](Metrics-with-Prometheus).
 
 ## Clustering
 
