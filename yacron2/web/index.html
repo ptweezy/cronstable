@@ -139,19 +139,8 @@
     0%,100% { opacity: 1; } 97% { opacity: 1; }
     97.5% { opacity: .82; } 98% { opacity: 1; } 98.5% { opacity: .9; }
   }
-  /* one-shot power-on sweep */
-  body.booting::after {
-    content: ""; position: fixed; inset: 0; z-index: 9500; pointer-events: none;
-    background: var(--fg); opacity: .0; animation: poweron .55s ease-out;
-  }
-  @keyframes poweron {
-    0% { opacity: .9; transform: scaleY(.004); }
-    40% { opacity: .25; transform: scaleY(.02); }
-    100% { opacity: 0; transform: scaleY(1); }
-  }
   @media (prefers-reduced-motion: reduce) {
     body.fx.flicker #crt { animation: none; }
-    body.booting::after { animation: none; }
     .dot.run, .dot.live, .blink { animation: none !important; }
     .iconbtn.spin svg { animation: none !important; }
     .toast { animation: none; }
@@ -4827,7 +4816,7 @@
     syncSettings();
   }
   // The full POST screen replays only after a cooldown has elapsed since it
-  // last ran; in-between visits get the quick power-on sweep instead.
+  // last ran; in-between visits start the app directly.
   const BOOT_SEEN_KEY = PREF_PREFIX + "bootShownAt";
   const BOOT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
   function bootDue() {
@@ -5028,10 +5017,6 @@
   if (prefs.boot && !reducedMotion && bootDue()) {
     runBootSequence(startApp);          // POST screen types out, then starts the app
   } else {
-    if (!reducedMotion) {               // otherwise keep the quick power-on sweep
-      document.body.classList.add("booting");
-      setTimeout(() => document.body.classList.remove("booting"), 600);
-    }
     startApp();
   }
 })();
