@@ -36,8 +36,8 @@ The first match wins; later conditions are not evaluated. The resulting string i
 
 Two synthetic exit codes are set by the runtime rather than the child process:
 
-- **`127`** — the subprocess could not be launched at all (e.g. the command does not exist, or the argv could not be encoded). `RunningJob` sets `start_failed` and, in `wait()`, assigns `retcode = 127` so the run is treated as an ordinary failure rather than raising an internal error. With the default `nonzeroReturn: true`, this is a failure.
-- **`-100`** — the run exceeded its `executionTimeout` and was cancelled. `wait()` sets `retcode = -100` before terminating the process. With the default `nonzeroReturn: true`, this is a failure. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
+- **`127`**: the subprocess could not be launched at all (e.g. the command does not exist, or the argv could not be encoded). `RunningJob` sets `start_failed` and, in `wait()`, assigns `retcode = 127` so the run is treated as an ordinary failure rather than raising an internal error. With the default `nonzeroReturn: true`, this is a failure.
+- **`-100`**: the run exceeded its `executionTimeout` and was cancelled. `wait()` sets `retcode = -100` before terminating the process. With the default `nonzeroReturn: true`, this is a failure. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
 A run cancelled to make way for a newer instance (`concurrencyPolicy: Replace`) is marked `replaced` and is *not* evaluated for failure, reported, or retried.
 
@@ -89,10 +89,11 @@ The first retry waits `initialDelay`; each subsequent retry waits the previous d
 ### Retry lifecycle
 
 - A retry state is created only when `maximumRetries` is truthy (non-zero). With `maximumRetries: 0` no state is created and a failed run goes straight to permanent failure.
-- `launch_scheduled_job` calls `cancel_job_retries(name)` before starting a scheduled run, then creates a fresh `JobRetryState`. A scheduled run therefore resets any in-progress retry sequence for that job. A manually triggered run (`POST /jobs/{name}/start`, see [HTTP Control API](HTTP-API)) goes through `maybe_launch_job` directly and does *not* reset or create retry state — it reuses whatever retry state currently exists.
+- `launch_scheduled_job` calls `cancel_job_retries(name)` before starting a scheduled run, then creates a fresh `JobRetryState`. A scheduled run therefore resets any in-progress retry sequence for that job. A manually triggered run (`POST /jobs/{name}/start`, see [HTTP Control API](HTTP-API)) goes through `maybe_launch_job` directly and does *not* reset or create retry state; it reuses whatever retry state currently exists.
 - On each failed run, `handle_job_failure` fires `onFailure` reporting, then: if no retry state exists or it was cancelled, fires `onPermanentFailure` and stops; otherwise, if `count >= maximumRetries` and `maximumRetries != -1`, cancels the retry state and fires `onPermanentFailure`; otherwise schedules the next retry after `next_delay()` seconds.
 - A success (`handle_job_success`) calls `cancel_job_retries` and fires `onSuccess`, ending the sequence.
 - If a job is removed from the configuration while a retry is pending, `schedule_retry_job` logs a warning, discards the stale retry state, and skips the run cleanly (no exception).
+- When leader election is enabled (`cluster.electLeader`), `schedule_retry_job` re-checks the cluster gate before relaunching. A transient fail-closed condition (lost quorum, a detected conflict, a rebuilt gossip manager's still-converging view, a backend read error) does *not* end the sequence: the retry state is kept and the gate is re-checked after another delay of the same length (floored at one second; the first deferral of a wait is logged at INFO, repeats at DEBUG), so a keep-alive job survives the blip. Only when another node is *positively* identified as the job's owner is the pending retry **abandoned**: the retry state is cancelled and discarded, a WARNING is logged, and the abandonment is recorded in the run history as `cancelled`. An abandoned sequence ends without firing `onPermanentFailure`, and the failed attempt is not re-run elsewhere: the new owner only picks up the job's *future scheduled firings*, which an `@reboot` one-shot does not have (its boot run is already recorded, so an abandoned `@reboot` keep-alive ends cluster-wide). See [Clustering and Leader Election](Clustering-and-Leader-Election).
 - On shutdown, all pending retries are cancelled before yacron2 exits.
 
 ### Retry example
@@ -118,7 +119,7 @@ jobs:
 
 ### Restart a long-running process
 
-A schedule of `@reboot` runs the job once at yacron2 startup. Combined with `maximumRetries: -1`, this re-launches the process whenever it exits with a failure, indefinitely — a way to keep a long-running process alive under yacron2.
+A schedule of `@reboot` runs the job once at yacron2 startup. Combined with `maximumRetries: -1`, this re-launches the process whenever it exits with a failure, indefinitely: a way to keep a long-running process alive under yacron2.
 
 ```yaml
 jobs:

@@ -1,0 +1,63 @@
+yacron2 large clustering demo
+=============================
+
+A bigger, CPU-heavy ten-node yacron2 cluster with mutual-TLS peer attestation
+and leader election, built to watch `distribution: spread` fan a real workload
+out across the cluster (vs single-leader, where one node runs all of it at
+once). Spread is ON by default here. Brought up by
+../../docker-compose-cluster-large.yml:
+
+    docker compose -f docker-compose-cluster-large.yml up --build
+
+Watch the load fan out with `docker stats` while the CPU-heavy jobs run.
+
+Files
+-----
+  jobs.yaml            The shared job set, mounted IDENTICALLY into all ten
+                       nodes (14 jobs: 12 Leader/PreferLeader, of which six are
+                       CPU-heavy, plus two EveryNode). The job-set id is a
+                       fingerprint of this file, so it must be identical on every
+                       node for them to agree.
+  node-entrypoint.sh   Generates each node's `cluster` section from environment
+                       variables at start, so the compose file needs no
+                       hand-written per-node peer lists. See the env contract
+                       below.
+  gen-certs.sh         Generates a throwaway cluster CA + per-node certs (SAN =
+                       service name) into the shared `cluster-large-certs` volume
+                       on first start.
+
+The node env-var contract (node-entrypoint.sh)
+----------------------------------------------
+Every node runs the same entrypoint and shares one CLUSTER_HOSTS list, dropping
+itself by NODE_NAME. The variables it reads:
+
+  NODE_NAME      this node's name (also its cert name and TLS SAN); required
+  CLUSTER_HOSTS  comma/space list of ALL members as host:port (self included; it
+                 is filtered out); required
+  DISTRIBUTION   single-leader | spread          (default spread)
+  ELECT_LEADER   true | false                    (default true)
+  INTERVAL       poll seconds                     (default 10)
+  DRIFT_AFTER    rounds before a peer is "drifted" (default 2)
+
+The compose file sets DISTRIBUTION via `${DISTRIBUTION:-spread}`, so the
+defaults above are what you get unless you override them in the environment.
+
+Dashboards: yacron-a .. yacron-j on host ports 8080 .. 8089 (e.g.
+http://localhost:8080/). Scroll to the "cluster" panel on any dashboard to watch
+attestation, leadership, and per-job ownership.
+
+Spread vs single-leader
+-----------------------
+By default each leader-gated job gets its own per-job owner via rendezvous
+hashing, so the twelve Leader/PreferLeader jobs (and the CPU burns) fan out
+across the ten nodes. To see the contrast, where ONE elected leader runs every
+Leader job and all CPU burns at once, start with single-leader:
+
+    DISTRIBUTION=single-leader docker compose -f docker-compose-cluster-large.yml up -d
+
+Same quorum gate and same guarantee either way; spread is purely a load
+optimization.
+
+These certificates are for local experimentation only. For real deployments
+provision per-node certs from your own PKI; see the wiki page
+"Clustering and Leader Election".

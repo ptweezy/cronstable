@@ -288,6 +288,24 @@ jobs:
     assert _id(disabled) != _id(enabled)
 
 
+def test_cluster_policy_changes_id():
+    # clusterPolicy is behaviour-affecting and host-independent, so two
+    # configs differing only in it must fingerprint differently (replicas
+    # disagreeing on it should surface as drift, not coordinate differently).
+    leader = """
+jobs:
+  - name: a
+    command: echo a
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+"""
+    every = leader.replace("Leader", "EveryNode")
+    assert _id(leader) != _id(every)
+    # the default is Leader, so omitting it matches an explicit Leader
+    omitted = leader.replace('    clusterPolicy: Leader\n', "")
+    assert _id(omitted) == _id(leader)
+
+
 def test_shell_command_vs_argv_do_not_collide():
     as_shell = """
 jobs:
@@ -433,10 +451,10 @@ jobs:
 """
 
 GOLDEN_JOB_SET_ID = (
-    "v1:a9f2f815d95b5d2a8a098bb7ea65f4d41fb415cfe8bbf89f27d84ab5ad38ee15"
+    "v1:5601a2694521dfcf0142773137469da34b57f672d84f3ed7e32c90c55f5b9386"
 )
 GOLDEN_ALPHA_DIGEST = (
-    "bd4f380c66dff46676accb37c1d8a5ebae76964346a1bcf0a38f5410efc8ac59"
+    "e00b231a852202bf3e71b91e1502ee69436967ea8af54b27e77066a0284d6d4f"
 )
 
 
@@ -458,6 +476,7 @@ EXPECTED_CANONICAL_FIELDS = frozenset(
         "schedule",
         "shell",
         "concurrencyPolicy",
+        "clusterPolicy",
         "captureStderr",
         "captureStdout",
         "streamPrefix",

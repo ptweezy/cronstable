@@ -7,6 +7,7 @@
   - [Production and Container Deployment](Production-Deployment)
 - **Configuration**
   - [Configuration Reference](Configuration-Reference)
+  - [Classic Crontabs](Classic-Crontabs)
   - [Schedules and Timezones](Schedules-and-Timezones)
   - [Commands and Environment](Commands-and-Environment)
   - [Output Capturing](Output-Capturing)
@@ -15,8 +16,10 @@
 - **Job Behavior**
   - [Concurrency and Timeouts](Concurrency-and-Timeouts)
   - [Failure Detection and Retries](Failure-Detection-and-Retries)
+  - [Clustering and Leader Election](Clustering-and-Leader-Election)
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell)](Reporting)
+  - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)
   - [Web Dashboard](Web-Dashboard)
