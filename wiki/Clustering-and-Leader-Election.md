@@ -728,6 +728,19 @@ The same view is rendered as a **cluster panel** in the
 (when election is on) the quorum count and this node's role (leader, follower,
 "no quorum", or, in spread mode, "spread (per-job owner)").
 
+Beyond agreement and roles, the gossip exchange also carries **observability
+payload**: each node piggybacks a compact per-job run summary (running /
+enabled / next fire / last finished run) on its `/peer` response, capped so it
+can never push the response past the gossip byte limit. Every node therefore
+holds a fleet-wide picture of *what ran where* that is at most one `interval`
+stale per peer, served as [`GET /fleet`](HTTP-API#get-fleet) and rendered as
+the dashboard's [fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane)
+— the single pane of glass for `spread` mode, where each job's runs land on a
+different node. The summaries are display-only: election, quorum, and every
+run/skip decision ignore them, and a malformed summary from a peer degrades to
+"no data for that node". The lease backends exchange nothing node-to-node, so
+`/fleet` reports `enabled: false` there.
+
 ### Monitoring and alerting
 
 **`quorate` is the field to alert on for every backend** (on gossip it means "this

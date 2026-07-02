@@ -75,6 +75,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/version` | `_web_get_version` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/cluster` | `_web_get_cluster` | `200` |
+| `GET` | `/fleet` | `_web_get_fleet` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 
 This table lists a subset of the routes (the primary control endpoints); the
@@ -260,6 +261,71 @@ The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
 > It is served only on the cluster's own mutual-TLS `listen` address (default
 > port `8443`), never on the public `web` listeners. See
 > [Clustering and Leader Election](Clustering-and-Leader-Election).
+
+### `GET /fleet`
+
+Returns the cluster-wide per-job run view that backs the dashboard's
+[fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane): one entry
+per node, each carrying that node's per-job run summaries. It is answered
+entirely from state this node already holds. Every gossip node piggybacks a
+compact summary of its own jobs (running / enabled / seconds to next fire /
+last finished run) on its mutual-TLS `/peer` response, so the summaries arrive
+with the peer polls this node is already making; serving `/fleet` triggers no
+peer traffic. Any node can therefore serve the whole fleet's picture, at most
+one gossip `interval` stale per peer.
+
+When no `cluster` section is configured, or the backend is a lease backend
+(`kubernetes` / `etcd`, which carry only a lease and know nothing about what
+other nodes run), it returns `{"enabled": false, "nodes": []}`.
+
+For the gossip backend it returns `enabled: true`, the serving node's
+`node_name`, the `distribution` and `elect_leader` policy, the gossip
+`interval` in seconds (the peer-data freshness bound), and a `nodes` array.
+The serving node is always first (`self: true`, status `self`, `as_of` stamped
+at request time); each configured peer follows with the `status` and `host`
+from the peer table and the summaries absorbed from its last successful poll
+(`as_of` = `last_seen`). Self-listings are skipped and two addresses that
+answer as the same process are deduplicated.
+
+Per node: `jobs` maps each job name to
+`{running, enabled, scheduled_in, last}`, where `last` is
+`{outcome, finished_at, duration, exit_code}` or `null` for a job that has not
+run since that node started. `jobs: null` (as opposed to `{}`) means no
+snapshot is held for that node at all: it was never reached, or it runs an
+older build that does not gossip summaries. `truncated: true` flags a node
+with more jobs than the per-payload cap (512), whose advertised set is the
+sorted-name prefix. A briefly unreachable peer keeps its last-known summaries
+with the old `as_of` rather than being blanked, so stale data is visibly stale
+instead of silently missing.
+
+```shell
+$ http get http://127.0.0.1:8080/fleet Accept:application/json
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "enabled": true,
+    "backend": "gossip",
+    "node_name": "node-a",
+    "distribution": "spread",
+    "elect_leader": true,
+    "interval": 30,
+    "nodes": [
+        {"node_name": "node-a", "host": null, "self": true, "status": "self",
+         "as_of": "2026-06-23T19:00:02+00:00", "truncated": false,
+         "jobs": {"backup": {"running": false, "enabled": true, "scheduled_in": 1042.5,
+                             "last": {"outcome": "success", "finished_at": "2026-06-23T18:00:01+00:00",
+                                      "duration": 12.4, "exit_code": 0}}}},
+        {"node_name": "node-b", "host": "yacron-b.internal:8443", "self": false, "status": "agreed",
+         "as_of": "2026-06-23T18:59:45+00:00", "truncated": false,
+         "jobs": {"backup": {"running": true, "enabled": true, "scheduled_in": null, "last": null}}}
+    ]
+}
+```
+
+The summaries are observability data only: they never feed leader election or
+any run/skip decision, and a malformed or hostile peer payload degrades to
+"no data for that node" rather than poisoning the view.
 
 ### `POST /jobs/{name}/start`
 

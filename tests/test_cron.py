@@ -3279,3 +3279,47 @@ def test_sigterm_triggers_graceful_shutdown():
             remove()
     finally:
         loop.close()
+
+
+@pytest.mark.asyncio
+async def test_fleet_job_summaries_snapshot():
+    # the compact per-job snapshot gossiped to peers for the fleet view:
+    # lean fixed-shape entries only -- notably no fail_reason (arbitrary
+    # operator text) and no command line, which stay on this node's own API.
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    out = JobOutputStream()
+    out.close()
+    cron.last_run["alpha"] = yacron2.cron.JobRunInfo(
+        outcome="failure",
+        exit_code=3,
+        started_at=DT(1999, 12, 31, 11, 59, 58, tzinfo=UTC),
+        finished_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
+        fail_reason="boom",
+        output=out,
+    )
+    summaries = cron.fleet_job_summaries()
+    assert set(summaries) == {"alpha", "beta"}
+    alpha = summaries["alpha"]
+    assert alpha["running"] is False
+    assert alpha["enabled"] is True
+    assert isinstance(alpha["scheduled_in"], float)
+    assert alpha["last"] == {
+        "outcome": "failure",
+        "finished_at": "1999-12-31T12:00:00+00:00",
+        "duration": 2.0,
+        "exit_code": 3,
+    }
+    assert "fail_reason" not in alpha["last"]
+    # beta is disabled (and an @reboot one-shot): no next fire, no last run
+    beta = summaries["beta"]
+    assert beta == {
+        "running": False,
+        "enabled": False,
+        "scheduled_in": None,
+        "last": None,
+    }
+    # a running instance flips the flag and suppresses the next-fire estimate
+    cron.running_jobs["alpha"] = ["sentinel"]
+    alpha = cron.fleet_job_summaries()["alpha"]
+    assert alpha["running"] is True
+    assert alpha["scheduled_in"] is None

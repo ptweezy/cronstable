@@ -857,6 +857,91 @@ async def test_web_cluster_endpoint_enabled():
     assert data["peers"][0]["status"] == "agreed"
 
 
+@pytest.mark.asyncio
+async def test_web_fleet_endpoint_disabled_without_cluster():
+    import json
+
+    import yacron2.cron
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    resp = await cron._web_get_fleet(_Req())
+    assert json.loads(resp.text) == {"enabled": False, "nodes": []}
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_endpoint_disabled_for_lease_backends():
+    # a lease backend inherits the seam default fleet_view() -> None (it knows
+    # only the lease holder, not what any node runs), and the endpoint then
+    # reports the feature unavailable so the dashboard hides its fleet view.
+    import json
+
+    import yacron2.cron
+
+    class StubLease:
+        def fleet_view(self):
+            return None
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubLease()
+    resp = await cron._web_get_fleet(_Req())
+    assert json.loads(resp.text) == {"enabled": False, "nodes": []}
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_endpoint_passes_through_gossip_view():
+    import json
+
+    import yacron2.cron
+
+    class StubManager:
+        def fleet_view(self):
+            return {
+                "enabled": True,
+                "backend": "gossip",
+                "node_name": "n",
+                "nodes": [{"node_name": "n", "self": True, "jobs": {}}],
+            }
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    resp = await cron._web_get_fleet(_Req())
+    data = json.loads(resp.text)
+    assert data["enabled"] is True
+    assert data["nodes"][0]["self"] is True
+
+
+def test_lease_backend_seam_defaults_for_fleet():
+    # the ABC defaults: no summaries channel (set_provider is a no-op that
+    # must still accept the scheduler's install call) and no fleet view.
+    from yacron2.leadership import LeadershipBackend
+
+    class Minimal(LeadershipBackend):
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        def is_leader(self):
+            return False
+
+        def leader_name(self):
+            return None
+
+        def is_quorate(self):
+            return False
+
+        def view_dict(self):
+            return {"backend": "minimal"}
+
+    backend = Minimal()
+    backend.set_job_summaries_provider(lambda: {"a": {}})  # accepted, unused
+    assert backend.fleet_view() is None
+
+
 # --------------------------------------------------------------------------
 # quorum + leader election (pure)
 # --------------------------------------------------------------------------
@@ -4069,3 +4154,380 @@ def test_parse_str_list_drops_control_char_entries():
         ["ok-job", "bad\njob", "null\x00job"], max_len=128, max_items=64
     )
     assert out == {"ok-job"}
+
+
+# --------------------------------------------------------------------------
+# fleet view: per-job run summaries gossiped in /peer + the merged /fleet view
+# --------------------------------------------------------------------------
+
+
+def test_parse_job_summaries_absent_vs_empty():
+    from yacron2.cluster import _parse_job_summaries
+
+    # absent / malformed (an older build, or junk) -> None, so the fleet view
+    # can tell "gossips no summaries" from "genuinely has zero jobs" ({}).
+    assert _parse_job_summaries(None) is None
+    assert _parse_job_summaries(["not", "a", "dict"]) is None
+    assert _parse_job_summaries("junk") is None
+    assert _parse_job_summaries({}) == {}
+
+
+def test_parse_job_summaries_rebuilds_expected_shape_only():
+    from yacron2.cluster import _parse_job_summaries
+
+    parsed = _parse_job_summaries(
+        {
+            "good": {
+                "running": True,
+                "enabled": False,
+                "scheduled_in": 12.5,
+                "last": {
+                    "outcome": "failure",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "duration": 1.5,
+                    "exit_code": 2,
+                },
+                "extra": {"nested": "junk"},  # unknown keys are not copied
+            },
+            "bare": {},  # every field absent -> neutral values
+            "": {"running": True},  # empty name dropped
+            "bad\nname": {},  # control characters dropped (log injection)
+            "x" * 200: {},  # over-long name dropped
+            "notadict": "hi",  # non-object entry dropped
+        }
+    )
+    assert set(parsed) == {"good", "bare"}
+    assert parsed["good"] == {
+        "running": True,
+        "enabled": False,
+        "scheduled_in": 12.5,
+        "last": {
+            "outcome": "failure",
+            "finished_at": "2026-01-01T00:00:00+00:00",
+            "duration": 1.5,
+            "exit_code": 2,
+        },
+    }
+    assert parsed["bare"] == {
+        "running": False,
+        "enabled": True,
+        "scheduled_in": None,
+        "last": None,
+    }
+
+
+def test_parse_job_summaries_hostile_fields_degrade_not_poison():
+    from yacron2.cluster import _parse_job_summaries
+
+    parsed = _parse_job_summaries(
+        {
+            "j": {
+                "running": "yes",  # non-bool -> False
+                "enabled": "no",  # non-bool -> True (fail-open display)
+                # json.loads happily parses Infinity/NaN and json.dumps
+                # re-emits them -- but they are NOT valid JSON, so one planted
+                # here would make our /fleet response unparseable to every
+                # browser. Must degrade to None.
+                "scheduled_in": float("inf"),
+                "last": {"outcome": "exploded", "finished_at": "t"},
+            },
+            "k": {
+                "last": {"outcome": "success", "finished_at": "x" * 65}
+            },
+            "m": {
+                "last": {
+                    "outcome": "success",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "duration": float("nan"),
+                    "exit_code": True,  # bool is not an exit code
+                }
+            },
+        }
+    )
+    assert parsed["j"] == {
+        "running": False,
+        "enabled": True,
+        "scheduled_in": None,
+        "last": None,
+    }
+    assert parsed["k"]["last"] is None  # over-long timestamp
+    assert parsed["m"]["last"] == {
+        "outcome": "success",
+        "finished_at": "2026-01-01T00:00:00+00:00",
+        "duration": None,
+        "exit_code": None,
+    }
+
+
+def test_parse_job_summaries_caps_cardinality():
+    from yacron2.cluster import (
+        MAX_ADVERTISED_JOB_SUMMARIES,
+        _parse_job_summaries,
+    )
+
+    raw = {
+        "job-%05d" % i: {}
+        for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 50)
+    }
+    parsed = _parse_job_summaries(raw)
+    assert parsed is not None
+    assert len(parsed) == MAX_ADVERTISED_JOB_SUMMARIES
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_advertises_job_summaries(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    # no provider installed yet (the scheduler installs it before start()):
+    # an empty block, never a crash
+    payload = json.loads((await mgr._handle_peer(_Req())).text)
+    assert payload["job_summaries"] == {}
+    assert payload["job_summaries_truncated"] is False
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "alpha": {
+                "running": True,
+                "enabled": True,
+                "scheduled_in": None,
+                "last": None,
+            },
+            "beta": {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": 5.0,
+                "last": None,
+            },
+        }
+    )
+    payload = json.loads((await mgr._handle_peer(_Req())).text)
+    assert set(payload["job_summaries"]) == {"alpha", "beta"}
+    assert payload["job_summaries"]["alpha"]["running"] is True
+    assert payload["job_summaries_truncated"] is False
+
+
+def test_advertised_job_summaries_caps_deterministically(no_tls):
+    from yacron2.cluster import (
+        MAX_ADVERTISED_JOB_SUMMARIES,
+        MAX_JOB_SUMMARY_NAME_LEN,
+    )
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    names = [
+        "job-%05d" % i for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 5)
+    ]
+    overlong = "x" * (MAX_JOB_SUMMARY_NAME_LEN + 1)
+    mgr.set_job_summaries_provider(
+        lambda: {name: {} for name in names + [overlong]}
+    )
+    block, truncated = mgr._advertised_job_summaries()
+    assert truncated is True
+    assert len(block) == MAX_ADVERTISED_JOB_SUMMARIES
+    # the sorted-name prefix: a stable subset across rounds, not a flapping one
+    assert sorted(block) == names[:MAX_ADVERTISED_JOB_SUMMARIES]
+    assert overlong not in block
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_absorbs_job_summaries(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "inst-b",
+                    "members": [
+                        {
+                            "node_name": "node-a",
+                            "instance_id": mgr.instance_id,
+                            "agreed": True,
+                        }
+                    ],
+                    "job_summaries": {"alpha": {"running": True}},
+                    "job_summaries_truncated": False,
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.job_summaries == {
+        "alpha": {
+            "running": True,
+            "enabled": True,
+            "scheduled_in": None,
+            "last": None,
+        }
+    }
+    assert peer.job_summaries_truncated is False
+
+
+def test_job_summaries_survive_failed_poll_and_old_build():
+    # Observability data prefers last-known-aged-by-last_seen over blanking:
+    # a failed round keeps the snapshot (the status still flips, so the fleet
+    # view shows it as unreachable-with-old-data), and a later response that
+    # omits the field entirely (a peer downgraded to an older build) leaves
+    # the absorbed snapshot in place too.
+    snapshot = {
+        "alpha": {
+            "running": False,
+            "enabled": True,
+            "scheduled_in": None,
+            "last": None,
+        }
+    }
+    view = ClusterView(["b:1"], 3)
+    view.record_success(
+        "b:1",
+        "node-b",
+        "v1:mine",
+        SCHEME_VERSION,
+        "v1:mine",
+        NOW,
+        "node-a",
+        peer_instance="inst-b",
+        my_instance="inst-a",
+        peer_job_summaries=snapshot,
+        peer_job_summaries_truncated=True,
+    )
+    peer = view.peers["b:1"]
+    assert peer.job_summaries == snapshot
+    assert peer.job_summaries_truncated is True
+    view.record_failure("b:1", "boom", untrusted=False)
+    assert peer.status == STATUS_UNREACHABLE
+    assert peer.job_summaries == snapshot  # kept, unlike members/mutual
+    view.record_success(
+        "b:1",
+        "node-b",
+        "v1:mine",
+        SCHEME_VERSION,
+        "v1:mine",
+        NOW,
+        "node-a",
+        peer_instance="inst-b",
+        my_instance="inst-a",
+        peer_job_summaries=None,  # an older build advertises no summaries
+    )
+    assert peer.job_summaries == snapshot  # still the last real report
+
+
+def test_fleet_view_merges_self_and_peers(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "alpha": {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": 3.0,
+                "last": None,
+            }
+        }
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    peer_b = mgr.view.peers["b:1"]
+    peer_b.last_seen = NOW
+    peer_b.job_summaries = {
+        "alpha": {
+            "running": True,
+            "enabled": True,
+            "scheduled_in": None,
+            "last": None,
+        }
+    }
+    fleet = mgr.fleet_view()
+    assert fleet["enabled"] is True
+    assert fleet["backend"] == "gossip"
+    assert fleet["interval"] == mgr.config["interval"]
+    # this node first, live, with its own provider snapshot
+    self_node = fleet["nodes"][0]
+    assert self_node["self"] is True
+    assert self_node["node_name"] == "node-a"
+    assert self_node["status"] == STATUS_SELF
+    assert self_node["jobs"]["alpha"]["scheduled_in"] == 3.0
+    assert self_node["as_of"]  # stamped now
+    by_host = {n["host"]: n for n in fleet["nodes"][1:]}
+    assert by_host["b:1"]["node_name"] == "node-b"
+    assert by_host["b:1"]["jobs"]["alpha"]["running"] is True
+    assert by_host["b:1"]["as_of"] == NOW.isoformat()
+    # c was never reached: listed with no data (jobs null) rather than
+    # silently dropped -- the fleet pane must show the hole
+    assert by_host["c:1"]["jobs"] is None
+    assert by_host["c:1"]["as_of"] is None
+    assert by_host["c:1"]["status"] == "unknown"
+
+
+def test_fleet_view_skips_self_listing_and_dedupes_instances(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1", "b2:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    # a:1 answered as THIS node (the operator listed our own address)
+    peer_a = mgr.view.peers["a:1"]
+    peer_a.status = STATUS_SELF
+    peer_a.self_confirmed = True
+    peer_a.node_name = "node-a"
+    # b:1 and b2:1 are two addresses for the SAME running process
+    _seed_agree(mgr, "b:1", "node-b", instance="inst-b")
+    _seed_agree(mgr, "b2:1", "node-b", instance="inst-b")
+    fleet = mgr.fleet_view()
+    hosts = [n["host"] for n in fleet["nodes"]]
+    assert None in hosts  # the self entry
+    assert "a:1" not in hosts  # self-listing skipped
+    assert hosts.count("b2:1") + hosts.count("b:1") == 1  # deduped
+    assert len(fleet["nodes"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_mtls_round_trip_job_summaries(tmp_path):
+    # end-to-end over the real mTLS channel: b advertises its scheduler
+    # snapshot, a absorbs it and can serve a merged fleet view naming b's
+    # failing job -- the single-pane-of-glass path.
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
+        lambda: "v1:same",
+    )
+    b = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
+        lambda: "v1:same",
+    )
+    b.set_job_summaries_provider(
+        lambda: {
+            "beta": {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": 30.0,
+                "last": {
+                    "outcome": "failure",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "duration": 2.0,
+                    "exit_code": 1,
+                },
+            }
+        }
+    )
+    await b.start()
+    await a.start()
+    try:
+        await a._poll_all()
+        peer = a.view.peers[f"localhost:{pb}"]
+        assert peer.status == STATUS_AGREED
+        assert peer.job_summaries is not None
+        assert peer.job_summaries["beta"]["last"]["outcome"] == "failure"
+        fleet = a.fleet_view()
+        by_name = {n["node_name"]: n for n in fleet["nodes"]}
+        assert by_name["node-b"]["jobs"]["beta"]["last"]["exit_code"] == 1
+    finally:
+        await a.stop()
+        await b.stop()

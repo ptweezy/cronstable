@@ -167,7 +167,8 @@
     border-bottom: 1px solid var(--border);
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-  .brand .mark { color: var(--fg); font-weight: 700; }
+  .brand .mark { color: var(--fg); font-weight: 700; cursor: default; user-select: none;
+    display: inline-block; }
   .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; }
   .brand .tag { font-size: 11px; color: var(--fg-faint); }
   .brand .ver { font-size: 10.5px; color: var(--fg-faint); }
@@ -638,6 +639,32 @@
   #swimPanel .lbl { fill: var(--fg-dim); font-size: 10px; }
   #swimPanel .axl { fill: var(--fg-faint); font-size: 9px; }
 
+  /* ---------- fleet view (jobs × nodes matrix) ---------- */
+  #fleetPanel { border-top: 1px solid var(--border); padding: 8px 12px; }
+  #fleetPanel .fleetbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; font-size: 11px; color: var(--fg-dim); }
+  #fleetPanel .fleetbar .warn { color: var(--fail); }
+  #fleetPanel .fleetwrap { overflow: auto; max-height: 48vh; }
+  #fleetPanel table { border-collapse: collapse; min-width: 100%; }
+  #fleetPanel th, #fleetPanel td { padding: 3px 12px; white-space: nowrap; font-size: 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  #fleetPanel thead th { position: sticky; top: 0; background: var(--panel); z-index: 2; vertical-align: bottom; }
+  #fleetPanel .jobcol { position: sticky; left: 0; background: var(--panel); z-index: 1; max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+  #fleetPanel thead .jobcol { z-index: 3; }
+  #fleetPanel td.jobcol { cursor: pointer; color: var(--fg); }
+  #fleetPanel td.jobcol:hover { color: var(--accent); text-decoration: underline; }
+  #fleetPanel tr.disabled td.jobcol { color: var(--fg-faint); }
+  #fleetPanel .nname2 { font-weight: 700; }
+  #fleetPanel .nname2.selfcol { color: var(--accent); }
+  #fleetPanel .nsub { display: block; font-weight: 400; font-size: 10px; color: var(--fg-faint); }
+  #fleetPanel .nsub .cdot { margin-right: 4px; }
+  #fleetPanel .cell .age { color: var(--fg-faint); font-size: 10.5px; margin-left: 5px; }
+  #fleetPanel .cell.ok { color: var(--ok); }
+  #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
+  #fleetPanel .cell.cancelled { color: var(--fg-dim); }
+  #fleetPanel .cell.run { color: var(--accent); }
+  #fleetPanel .cell.none { color: var(--fg-faint); }
+  #fleetPanel td.owner { box-shadow: inset 2px 0 0 var(--accent); }
+  #fleetPanel .fleet-note { color: var(--fg-faint); font-size: 11px; padding: 6px 0 2px; }
+
   /* ---------- wallboard exit affordance ---------- */
   .wb-hint { color: var(--fg-faint); font-size: 11px; }
   .wb-exit { font-size: 12px; }
@@ -728,6 +755,28 @@
   .mitlog { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); padding: 8px 16px; max-height: 16vh; overflow: auto; white-space: pre-wrap; }
   .mitact { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 
+  /* ---------- merged multi-tail console ---------- */
+  .tailpanel { place-self: start center; margin-top: 5vh; width: min(1080px, 96vw); height: 88vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
+  .tailhead { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tailhead h3 { margin: 0; font-size: 14px; letter-spacing: .5px; flex: none; }
+  .tailadd { display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); }
+  .tailadd:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
+  .tailadd input { border: 0; outline: 0; background: transparent; width: 140px; }
+  .tailadd .prompt { color: var(--accent); }
+  .tailchips { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  .tailchips .none { color: var(--fg-faint); font-style: italic; font-size: 11px; }
+  .tchip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 4px 2px 8px; border-radius: var(--radius);
+    background: var(--panel); border: 1px solid var(--border); font-size: 11.5px; }
+  .tchip .cdotc { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .tchip .tnm { color: var(--fg); cursor: pointer; }
+  .tchip .tnm:hover { text-decoration: underline; }
+  .tchip button { background: transparent; border: 0; color: var(--fg-faint); cursor: pointer; padding: 0 4px; font-size: 11px; }
+  .tchip button:hover { color: var(--fail); }
+  /* per-line job prefix in the merged view */
+  .term .ln .tj { font-weight: 700; margin-right: 9px; cursor: pointer; }
+  .term .ln .tj:hover { text-decoration: underline; }
+
   /* ---------- cron sandbox ---------- */
   .sbxpanel { place-self: start center; margin-top: 7vh; width: min(680px, 95vw); max-height: 84vh; display: flex; flex-direction: column;
     background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
@@ -807,7 +856,7 @@
 
 <header>
   <div class="brand">
-    <span class="mark glow">▚</span>
+    <span class="mark glow" id="mark">▚</span>
     <h1 class="glow">yacron2</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
@@ -846,6 +895,7 @@
     <span class="grow"></span>
     <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
     <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
+    <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
     <select class="mini" id="sortSel" title="Sort">
@@ -863,6 +913,7 @@
     <div class="vbody"><div class="vhead" id="vHead"></div><div class="vsub" id="vSub"></div></div>
     <div class="vact">
       <button class="btn" id="vTimeline" title="Incident timeline (i)">▤ timeline</button>
+      <button class="btn" id="vTail" title="Tail the failing jobs' output live">≋ tail</button>
       <button class="btn primary" id="vMitigate" title="Bulk run/cancel the failing set">▸ mitigate</button>
     </div>
   </div>
@@ -923,7 +974,7 @@
   </div>
 
   <div class="card" id="clusterCard" style="display:none">
-    <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
+    <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="fleetBtn" title="Fleet view: every node's runs in one pane" style="display:none">⊞ fleet</button><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
     <table id="clusterTable">
       <thead><tr><th>Peer</th><th>Node</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
       <tbody id="clusterRows"></tbody>
@@ -931,6 +982,7 @@
     <table id="clusterLease" style="display:none">
       <tbody id="clusterLeaseRows"></tbody>
     </table>
+    <div id="fleetPanel" style="display:none"></div>
     <div id="swimPanel" style="display:none"></div>
   </div>
 </main>
@@ -985,6 +1037,35 @@
     </section>
   </div>
 </aside>
+
+<!-- merged multi-tail console: kept FIRST among the .overlay surfaces —
+     they share a z-index, so DOM order stacks them, and everything that can
+     open over the console (⌘K palette, the 401 token modal, settings) must
+     paint above it, not under it with focus. -->
+<div class="overlay" id="tailWrap">
+  <div class="tailpanel" role="dialog" aria-label="Multi-tail console">
+    <div class="tailhead">
+      <h3>multi-tail</h3>
+      <span class="faint" id="tailMeta"></span>
+      <span class="grow"></span>
+      <button class="ghostbtn mini" id="tailAddFailing" title="Tail every failing job">+ failing</button>
+      <button class="ghostbtn mini" id="tailAddRunning" title="Tail every running job">+ running</button>
+      <label class="tailadd"><span class="prompt">+</span><input id="tailAddInput" list="tailJobList" placeholder="add job…" autocomplete="off" spellcheck="false"><datalist id="tailJobList"></datalist></label>
+      <button class="iconbtn" id="tailClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="tailchips" id="tailChips"></div>
+    <div class="drawer-tools">
+      <span class="logsearch"><span class="faint">/</span><input id="tailSearch" type="text" placeholder="search" autocomplete="off" spellcheck="false"><span class="count" id="tailCount"></span></span>
+      <span class="grow"></span>
+      <label class="toggle"><input type="checkbox" id="tailFollow" checked> follow</label>
+      <label class="toggle"><input type="checkbox" id="tailWrapOpt" checked> wrap</label>
+      <label class="toggle"><input type="checkbox" id="tailTs"> timestamps</label>
+      <button class="iconbtn" id="tailDownload" title="Download merged view"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg></button>
+      <button class="iconbtn" id="tailClearBtn" title="Clear view"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>
+    </div>
+    <pre class="term" id="tailTerm"></pre>
+  </div>
+</div>
 
 <!-- command palette -->
 <div class="overlay" id="paletteWrap">
@@ -1092,6 +1173,7 @@
     <div class="mitact">
       <button class="btn cancel" id="mitCancelAll">■ cancel all</button>
       <button class="btn run" id="mitStartAll">▶ start all now</button>
+      <button class="btn" id="mitTail" title="Watch these jobs' output in the multi-tail console">≋ tail output</button>
       <button class="btn" id="mitCopy">❏ copy summary</button>
       <button class="btn" id="mitAbort" style="display:none;margin-left:auto">✕ abort</button>
       <button class="btn" id="mitClose" style="margin-left:auto">close</button>
@@ -1169,7 +1251,7 @@
     theme: "amber", fx: true, scan: true, density: false, notify: false,
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
-    sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false,
+    sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
     boot: true,   // BIOS-style boot self-test on load
     // opt-in run ledger (IndexedDB) + wallboard zen screensaver + alarm escalation
     ledger: false, zen: true, escalate: true, zenIdle: 30000,
@@ -1213,6 +1295,10 @@
     wallboard: false,          // TV kiosk mode active
     heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
     swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
+    fleet: { data: null, failOnly: false },    // fleet view: last /fleet payload + failing-only filter
+    // merged multi-tail console: tailed job names, per-job stream state,
+    // per-job identity colors, and the merged line buffer
+    tail: { open: false, jobs: [], streams: {}, colors: {}, lines: [], total: 0 },
     clusterLine: null,         // last cluster summary string (wallboard footer)
     booting: false,            // BIOS boot self-test is on screen (swallows keys)
     // --- add-on features ---
@@ -2296,6 +2382,140 @@
   }
 
   // ===================================================================
+  //  fleet view — every node's runs in one pane (jobs × nodes matrix)
+  //  Each node piggybacks a per-job run summary on its gossip /peer
+  //  response, so this node can answer GET /fleet entirely from state it
+  //  already holds — no browser-to-peer polling (CSP confines this page
+  //  to its own origin) and no server fan-out. Peer columns are therefore
+  //  at most one cluster poll interval stale; each is aged so old data
+  //  reads as old, never as current. Gossip-only, the same gate as the
+  //  swimlane: lease backends carry no summaries.
+  // ===================================================================
+  function agoShort(iso) {
+    if (!iso) return "";
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return Math.floor(s) + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  }
+  function setFleet(v) {
+    prefs.fleet = v; savePref("fleet");
+    // first open with nothing cached: fetch, and let loadFleet render
+    if (v && !state.fleet.data) { loadFleet(); return; }
+    renderFleet();
+  }
+  // Same out-of-order guard as loadCluster: fired without awaiting from the
+  // poll path, so a delayed OLDER response must not overwrite a newer one.
+  let fleetReqSeq = 0, fleetAppliedSeq = 0;
+  async function loadFleet() {
+    const seq = ++fleetReqSeq;
+    try {
+      const r = await apiFetch("/fleet");
+      if (seq < fleetAppliedSeq) return;
+      if (!r.ok) { fleetAppliedSeq = seq; console.warn("loadFleet failed: HTTP " + r.status); return; }
+      const data = await r.json();
+      if (seq < fleetAppliedSeq) return;
+      fleetAppliedSeq = seq;
+      state.fleet.data = data.enabled ? data : null;
+      renderFleet();
+    } catch (e) {
+      // a 401 drives the re-auth flow elsewhere; anything else leaves the
+      // last frame on screen (its ages keep growing, which reads as stale)
+      if (e.message !== "unauthorized" && seq >= fleetAppliedSeq) {
+        fleetAppliedSeq = seq;
+        console.warn("loadFleet failed:", e);
+      }
+    }
+  }
+  function renderFleet() {
+    const box = $("fleetPanel");
+    $("fleetBtn").classList.toggle("on", prefs.fleet);
+    const data = prefs.fleet ? state.fleet.data : null;
+    if (!data) { box.style.display = "none"; return; }
+    box.style.display = "";
+    const nodes = data.nodes || [];
+    const spread = !!data.elect_leader && data.distribution === "spread";
+    // rows = the union of every node's advertised job names: a drifted peer
+    // mid-deploy may carry jobs this node does not know — show them anyway,
+    // that is the point of a fleet pane
+    const names = new Set();
+    for (const n of nodes) if (n.jobs) for (const j of Object.keys(n.jobs)) names.add(j);
+    let rows = Array.from(names).sort((a, b) => a.localeCompare(b));
+    const failing = (j) => nodes.some((n) => {
+      const s = n.jobs && n.jobs[j];
+      return !!(s && !s.running && s.last && s.last.outcome === "failure");
+    });
+    const failCount = rows.filter(failing).length;
+    if (state.fleet.failOnly) rows = rows.filter(failing);
+    let runningCells = 0;
+    for (const n of nodes) if (n.jobs) for (const j of Object.keys(n.jobs)) if (n.jobs[j].running) runningCells++;
+    const truncatedNodes = nodes.filter((n) => n.truncated).map((n) => n.node_name || n.host || "?");
+    let html = '<div class="fleetbar">' +
+      "<span>" + nodes.length + " node" + (nodes.length === 1 ? "" : "s") +
+      " · " + names.size + " job" + (names.size === 1 ? "" : "s") +
+      " · " + runningCells + " running</span>" +
+      (failCount ? '<span class="warn">' + failCount + " failing</span>" : "") +
+      '<label class="toggle"><input type="checkbox" id="fleetFailOnly"' + (state.fleet.failOnly ? " checked" : "") + "> failing only</label>" +
+      (truncatedNodes.length ? '<span class="warn" title="' + escAttr(truncatedNodes.join(", ")) + '">⚠ partial data from ' + truncatedNodes.length + " node" + (truncatedNodes.length === 1 ? "" : "s") + "</span>" : "") +
+      '<span class="grow"></span>' +
+      "<span>peer data rides gossip" + (data.interval ? " (every " + esc(String(data.interval)) + "s)" : "") + "</span>" +
+      "</div>";
+    const th = nodes.map((n) => {
+      const st = n.self ? "self" : (n.status || "unknown");
+      const age = n.self ? "live" : (n.as_of ? agoShort(n.as_of) + " ago" : "never reached");
+      return '<th><span class="nname2' + (n.self ? " selfcol" : "") + '">' + esc(n.node_name || n.host || "?") + "</span>" +
+        '<span class="nsub"><span class="cdot ' + esc(st) + '"></span>' + esc(n.self ? "this node" : st) + " · " + esc(age) +
+        (n.truncated ? " · partial" : "") + "</span></th>";
+    }).join("");
+    html += '<div class="fleetwrap"><table><thead><tr><th class="jobcol">job</th>' + th + "</tr></thead><tbody>";
+    for (const j of rows) {
+      const local = state.byName[j];
+      // spread ownership as THIS node computes it (from its own /jobs);
+      // rendezvous hashing is deterministic, so every quorate node agrees
+      const owner = spread && local ? local.clusterOwner : null;
+      const offEverywhere = nodes.every((n) => { const s = n.jobs && n.jobs[j]; return !s || s.enabled === false; });
+      html += "<tr" + (offEverywhere ? ' class="disabled"' : "") + '><td class="jobcol" data-job="' + escAttr(j) + '" title="' + escAttr(j) + '">' + esc(j) + "</td>";
+      for (const n of nodes) {
+        const s = n.jobs ? n.jobs[j] : undefined;
+        const own = owner != null && n.node_name === owner;
+        let cls = "cell none", body = "·", tip;
+        if (!n.jobs) { tip = "no data from this node yet"; }
+        else if (!s) { body = "—"; tip = n.truncated ? "not in this node's advertised subset (its summary set was truncated)" : "not configured on this node"; }
+        else if (s.running) { cls = "cell run"; body = GLYPH.run + " running"; tip = "running now"; }
+        else if (s.last) {
+          const k = outcomeCls(s.last.outcome);
+          const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : GLYPH.ok;
+          cls = "cell " + k;
+          body = g + " " + esc(s.last.outcome === "success" ? "ok" : s.last.outcome) +
+            '<span class="age">' + esc(agoShort(s.last.finished_at)) + "</span>";
+          tip = s.last.outcome + (s.last.exit_code != null ? " (exit " + s.last.exit_code + ")" : "") +
+            " · finished " + fmtAgo(s.last.finished_at) +
+            (s.last.duration != null ? " · took " + fmtDuration(s.last.duration) : "");
+        } else if (s.enabled === false) { body = GLYPH.disabled + " off"; tip = "disabled on this node"; }
+        else { body = GLYPH.pending; tip = "never ran on this node"; }
+        if (s && !s.running && s.scheduled_in != null) tip += " · next in " + fmtDuration(s.scheduled_in);
+        if (own) tip += " · owner (spread)";
+        html += '<td class="' + cls + (own ? " owner" : "") + '" title="' + escAttr(tip) + '">' + body + "</td>";
+      }
+      html += "</tr>";
+    }
+    html += "</tbody></table></div>";
+    if (!rows.length) html += '<div class="fleet-note">' + (state.fleet.failOnly && names.size ? "nothing failing — clear the filter to see the fleet" : "no jobs advertised yet (peer summaries arrive with the next gossip round)") + "</div>";
+    // The rebuild replaces the scroll container, which would snap a matrix
+    // the user has scrolled (tall job list / many nodes) back to the top on
+    // every poll. Carry the offsets (and the filter checkbox's keyboard
+    // focus) across the innerHTML swap.
+    const oldWrap = box.querySelector(".fleetwrap");
+    const sx = oldWrap ? oldWrap.scrollLeft : 0, sy = oldWrap ? oldWrap.scrollTop : 0;
+    const hadFocus = document.activeElement && document.activeElement.id === "fleetFailOnly";
+    box.innerHTML = html;
+    const wrap = box.querySelector(".fleetwrap");
+    if (wrap) { wrap.scrollLeft = sx; wrap.scrollTop = sy; }
+    if (hadFocus) { const cb = $("fleetFailOnly"); if (cb) cb.focus(); }
+  }
+
+  // ===================================================================
   //  data loading + notifications
   // ===================================================================
   let refreshing = false;
@@ -2317,6 +2537,7 @@
       fleetSound(jobs, first);
       updateIncidents(jobs);
       ledgerRecord(jobs);
+      tailGovernor();
       renderSummary();
       renderRows();
       renderVerdict();
@@ -2648,8 +2869,9 @@
   function stripAnsi(line) { return line.replace(/\x1b\[[0-9;]*m/g, ""); }
 
   // build innerHTML for one log line's text honoring ansi + search highlight
-  function lineContentHtml(text, q) {
-    const useAnsi = $("optAnsi").checked;
+  // (ansiOn defaults to the drawer's checkbox; the multi-tail passes the pref)
+  function lineContentHtml(text, q, ansiOn) {
+    const useAnsi = ansiOn == null ? $("optAnsi").checked : ansiOn;
     const segs = useAnsi ? ansiSegments(text) : [{ text: stripAnsi(text), style: {} }];
     let html = "";
     for (const sg of segs) {
@@ -2764,20 +2986,17 @@
     cur.scrollIntoView({ block: "center" });
   }
 
-  async function startStream(name, clear) {
-    stopStream();
-    if (clear) clearTerm();
-    const job = state.byName[name];
-    if (job && !job.captureStdout && !job.captureStderr) {
-      appendLine("", "This job does not capture stdout or stderr — no logs to display. Enable captureStdout / captureStderr in its config.", "sys");
-      return;
-    }
-    const ctrl = new AbortController();
-    state.stream = ctrl;
+  // Read one job's /logs SSE stream until the server closes it or the
+  // controller aborts (fetch + manual parse: EventSource cannot attach the
+  // Authorization header). hooks: line(stream, text) per output line;
+  // end(sawAnyLine, reason) per server end event (reason "no-output" = the
+  // job has no output buffer at all); err(msg) on failure, with msg null for
+  // a 401 (the re-auth flow is already driven by apiFetch's modal).
+  async function readLogStream(name, ctrl, hooks) {
     let gotLine = false;
     try {
       const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/logs", { signal: ctrl.signal });
-      if (!res.ok || !res.body) { appendLine("", "Could not open log stream (HTTP " + res.status + ").", "sys"); return; }
+      if (!res.ok || !res.body) { hooks.err("Could not open log stream (HTTP " + res.status + ")."); return; }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
@@ -2796,14 +3015,35 @@
             else if (ln.startsWith("data:")) data += ln.slice(5).trim();
           });
           if (ev === "line" && data) {
-            try { const o = JSON.parse(data); gotLine = true; appendLine(o.stream, o.line, null); } catch (_) {}
+            try { const o = JSON.parse(data); gotLine = true; hooks.line(o.stream, o.line); } catch (_) {}
           } else if (ev === "end") {
-            if (!gotLine) appendLine("", "(no output captured for the latest run)", "sys");
+            let reason = null;
+            try { reason = (JSON.parse(data || "{}") || {}).reason || null; } catch (_) {}
+            hooks.end(gotLine, reason);
           }
         }
       }
     } catch (e) {
-      if (e.name !== "AbortError" && e.message !== "unauthorized") appendLine("", "Log stream ended: " + e.message, "sys");
+      if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Log stream ended: " + e.message);
+    }
+  }
+
+  async function startStream(name, clear) {
+    stopStream();
+    if (clear) clearTerm();
+    const job = state.byName[name];
+    if (job && !job.captureStdout && !job.captureStderr) {
+      appendLine("", "This job does not capture stdout or stderr — no logs to display. Enable captureStdout / captureStderr in its config.", "sys");
+      return;
+    }
+    const ctrl = new AbortController();
+    state.stream = ctrl;
+    try {
+      await readLogStream(name, ctrl, {
+        line: (stream, text) => appendLine(stream, text, null),
+        end: (sawLine) => { if (!sawLine) appendLine("", "(no output captured for the latest run)", "sys"); },
+        err: (msg) => { if (msg) appendLine("", msg, "sys"); },
+      });
     } finally {
       if (state.stream === ctrl) state.stream = null;
     }
@@ -2818,6 +3058,266 @@
     a.download = "yacron2-" + name + "-logs.txt";
     document.body.appendChild(a); a.click();
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  }
+
+  // ===================================================================
+  //  merged multi-tail — several jobs' SSE streams in one console, each
+  //  line prefixed with its job in a stable identity color
+  //
+  //  The daemon serves one SSE stream per job, and the server closes it
+  //  when the tailed run's output ends — so a continuous tail must
+  //  reconnect for the next run. Reconnects are poll-paced (the governor
+  //  below) and lossless in practice: attaching replays the run's whole
+  //  in-memory buffer, so a reconnect that lands mid-run still shows the
+  //  run's start.
+  // ===================================================================
+  // Browsers cap HTTP/1.1 connections at ~6 per origin, and every tailed
+  //  job holds one open — leave headroom for the /jobs + /cluster polls
+  //  and the action POSTs, or the whole dashboard starves behind the tails.
+  const TAIL_MAX = 4;
+  const TAIL_RETRY_MS = 5000;              // throttle reconnects after a stream error
+  const TAIL_COLORS = ["#4aa8ff", "#3fd271", "#ffbf47", "#c98bff", "#56d4dd", "#ff8783",
+                       "#ffd47a", "#7ee2a0", "#83c0ff", "#dcaaff", "#8be4ea", "#f0a1c2"];
+  function tailTermEl() { return $("tailTerm"); }
+  function tailQuery() {
+    const q = $("tailSearch").value;
+    return q ? { text: q.toLowerCase(), raw: q } : null;
+  }
+  function tailColor(name) {
+    const c = state.tail.colors;
+    if (!c[name]) c[name] = TAIL_COLORS[Object.keys(c).length % TAIL_COLORS.length];
+    return c[name];
+  }
+  function buildTailNode(item, q) {
+    const node = el("span", "ln " + (item.kind || item.stream || ""));
+    let inner = '<span class="gut">' + (item.n || 0) + "</span>";
+    if (prefs.ts && item.ts) inner += '<span class="ts">' + fmtClock(item.ts) + "</span>";
+    inner += '<span class="tj" data-job="' + escAttr(item.job) + '" style="color:' + item.color +
+      '" title="open ' + escAttr(item.job) + '">' + esc(item.job) + "</span>";
+    if (item.kind === "sys") inner += esc(item.text);
+    else inner += lineContentHtml(item.text, q, prefs.ansi);
+    node.innerHTML = inner;
+    return node;
+  }
+  function appendTailLine(job, stream, text, kind) {
+    if (!state.tail.open) return;
+    const t = tailTermEl();
+    const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 50;
+    const emptyNode = t.querySelector(".term-empty");
+    if (emptyNode) t.innerHTML = "";
+    const item = { job, color: tailColor(job), stream, text, kind, ts: Date.now(), n: ++state.tail.total };
+    state.tail.lines.push(item);
+    if (state.tail.lines.length > MAX_LOG_LINES) {
+      state.tail.lines.shift();
+      const first = t.firstElementChild;
+      if (first) first.remove();
+    }
+    t.appendChild(buildTailNode(item, tailQuery()));
+    if ($("tailFollow").checked && (atBottom || kind === "sys")) t.scrollTop = t.scrollHeight;
+    renderTailMeta();
+    updateTailCount();
+  }
+  function renderTailTerm() {
+    const t = tailTermEl();
+    const q = tailQuery();
+    t.classList.toggle("nowrap", !prefs.wrap);
+    t.innerHTML = "";
+    if (!state.tail.lines.length) {
+      t.innerHTML = '<span class="term-empty">' + (state.tail.jobs.length
+        ? "waiting for output…"
+        : "no jobs tailed — use + failing / + running, or add a job above.") + "</span>";
+      updateTailCount();
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    state.tail.lines.forEach((item) => frag.appendChild(buildTailNode(item, q)));
+    t.appendChild(frag);
+    if ($("tailFollow").checked) t.scrollTop = t.scrollHeight;
+    updateTailCount();
+  }
+  function updateTailCount() {
+    const q = tailQuery(), c = $("tailCount");
+    if (!q) { c.textContent = ""; return; }
+    let n = 0;
+    for (const it of state.tail.lines) if (!it.kind && lineMatches(it.text, q)) n++;
+    c.textContent = n + (n === 1 ? " match" : " matches");
+  }
+  function renderTailMeta() {
+    $("tailMeta").textContent = state.tail.jobs.length + "/" + TAIL_MAX + " jobs · " + state.tail.lines.length + " lines";
+  }
+  function renderTailChips() {
+    $("tailChips").innerHTML = state.tail.jobs.length
+      ? state.tail.jobs.map((n) =>
+          '<span class="tchip"><span class="cdotc" style="background:' + tailColor(n) + '"></span>' +
+          '<span class="tnm" data-job="' + escAttr(n) + '" title="open ' + escAttr(n) + '">' + esc(n) + "</span>" +
+          '<button data-untail="' + escAttr(n) + '" title="stop tailing ' + escAttr(n) + '">✕</button></span>'
+        ).join("")
+      : '<span class="none">no jobs tailed</span>';
+    $("tailJobList").innerHTML = state.jobs
+      .filter((j) => state.tail.jobs.indexOf(j.name) < 0)
+      .map((j) => '<option value="' + escAttr(j.name) + '">').join("");
+    renderTailMeta();
+  }
+  function tailConnect(name) {
+    const st = state.tail.streams[name], job = state.byName[name];
+    if (!st || st.ctrl || !job) return;
+    if (!job.captureStdout && !job.captureStderr) return;   // nothing to attach to
+    const ctrl = new AbortController();
+    st.ctrl = ctrl; st.err = false; st.retryAt = 0;
+    st.sawRunning = !!job.running;   // were we ever attached to a LIVE run?
+    readLogStream(name, ctrl, {
+      line: (stream, text) => appendTailLine(name, stream, text, null),
+      end: (sawLine, reason) => {
+        const s = state.tail.streams[name];
+        if (!s || s.ctrl !== ctrl) return;
+        if (reason === "no-output") {
+          // the job has no output buffer yet (with capture on: it has never
+          // run) — the governor attaches once a run exists
+          if (s.first) appendTailLine(name, "", "no captured output yet — will attach when a run produces some", "sys");
+          s.first = false;
+          return;
+        }
+        appendTailLine(name, "", sawLine ? "── end of run output ──" : "── end of run output (none captured) ──", "sys");
+        // Reconcile what we just streamed with the poll's record, so the
+        // governor neither replays it as missed nor skips a run we never saw:
+        //  - attached while the run was live → its finished_at lands on a
+        //    later poll: adopt it then (awaitFin). A second run fitting
+        //    entirely inside that window is adopted unseen — the same blind
+        //    spot the poll itself has.
+        //  - the poll already advanced past our record → that IS the run we
+        //    just replayed: adopt it now.
+        //  - otherwise we replayed the run already on record: nothing to do.
+        const job2 = state.byName[name];
+        const finNow = job2 && job2.last_run ? job2.last_run.finished_at : null;
+        if (s.sawRunning || (job2 && job2.running)) s.awaitFin = true;
+        else if (finNow !== s.sinceFin) { s.sinceFin = finNow; s.awaitFin = false; }
+        s.sawRunning = false;
+        s.first = false;
+      },
+      err: (msg) => {
+        const s = state.tail.streams[name];
+        if (!s || s.ctrl !== ctrl) return;
+        s.err = true; s.retryAt = Date.now() + TAIL_RETRY_MS;
+        // a reconnect after a mid-stream drop replays the current buffer, so
+        // lines already shown may repeat — say so once per distinct failure
+        if (msg && msg !== s.lastErr) { appendTailLine(name, "", msg + " — retrying (replay may repeat lines)", "sys"); s.lastErr = msg; }
+      },
+    }).then(() => {
+      const s = state.tail.streams[name];
+      if (s && s.ctrl === ctrl) s.ctrl = null;
+    });
+  }
+  function resetTailStream(name) {
+    const old = state.tail.streams[name];
+    if (old && old.ctrl) old.ctrl.abort();
+    const job = state.byName[name];
+    state.tail.streams[name] = {
+      ctrl: null, err: false, retryAt: 0, lastErr: null, first: true,
+      awaitFin: false, sawRunning: false,
+      sinceFin: job && job.last_run ? job.last_run.finished_at : null,
+    };
+    if (job && !job.captureStdout && !job.captureStderr) {
+      appendTailLine(name, "", "captures no output — enable captureStdout / captureStderr to tail it", "sys");
+      return;
+    }
+    tailConnect(name);
+  }
+  // Poll-paced reconnect governor: a job's stream ends with its run, so
+  // re-attach when the job is running again or a run we never saw has
+  // finished. Runs on every successful /jobs poll.
+  function tailGovernor() {
+    if (!state.tail.open) return;
+    const now = Date.now();
+    for (const name of state.tail.jobs) {
+      const st = state.tail.streams[name], job = state.byName[name];
+      if (!st || !job) continue;
+      // while a stream is live, just note whether its run was ever observed
+      // running (the end hook uses it to reconcile the run's finished_at)
+      if (st.ctrl) { if (job.running) st.sawRunning = true; continue; }
+      if (!job.captureStdout && !job.captureStderr) continue;
+      if (st.retryAt && now < st.retryAt) continue;
+      const fin = job.last_run ? job.last_run.finished_at : null;
+      if (st.err) { tailConnect(name); continue; }          // heal after a failure (throttled above)
+      if (st.awaitFin) {
+        if (job.running) tailConnect(name);                 // next run already started: its buffer is fresh
+        else if (fin !== st.sinceFin) { st.sinceFin = fin; st.awaitFin = false; }
+        continue;
+      }
+      if (job.running || (fin && fin !== st.sinceFin)) tailConnect(name);
+    }
+  }
+  // returns false only when the stream cap blocked the add
+  function addTailJob(name) {
+    if (!state.byName[name] || state.tail.jobs.indexOf(name) >= 0) return true;
+    if (state.tail.jobs.length >= TAIL_MAX) return false;
+    state.tail.jobs.push(name);
+    tailColor(name);
+    resetTailStream(name);
+    return true;
+  }
+  function removeTailJob(name) {
+    const st = state.tail.streams[name];
+    if (st && st.ctrl) st.ctrl.abort();
+    delete state.tail.streams[name];
+    state.tail.jobs = state.tail.jobs.filter((n) => n !== name);
+    renderTailChips();
+    if (!state.tail.lines.length) renderTailTerm();
+  }
+  function openTail(names) {
+    const fresh = !state.tail.open;
+    if (fresh) {
+      pushFocus();
+      state.tail.open = true;
+      $("tailWrap").classList.add("open");
+      // a fresh console starts empty: reconnecting replays each job's
+      // current buffer, so keeping the old lines would duplicate them
+      state.tail.lines = []; state.tail.total = 0;
+      $("tailSearch").value = "";
+      $("tailFollow").checked = prefs.follow;
+      $("tailWrapOpt").checked = prefs.wrap;
+      $("tailTs").checked = prefs.ts;
+      tailTermEl().classList.toggle("nowrap", !prefs.wrap);
+      tailTermEl().innerHTML = "";
+      for (const n of state.tail.jobs) resetTailStream(n);   // jobs kept from the last session
+    }
+    let blocked = 0;
+    for (const n of names || []) if (!addTailJob(n)) blocked++;
+    if (blocked) toast("info", "stream cap " + TAIL_MAX + " reached — " + blocked + " job" + (blocked > 1 ? "s" : "") + " not added");
+    renderTailChips();
+    if (!state.tail.lines.length) renderTailTerm();
+    if (fresh) setTimeout(() => $("tailAddInput").focus(), 30);
+  }
+  function closeTail() {
+    if (!state.tail.open) return;
+    for (const name of state.tail.jobs) {
+      const st = state.tail.streams[name];
+      if (st && st.ctrl) { st.ctrl.abort(); st.ctrl = null; }
+    }
+    state.tail.open = false;
+    $("tailWrap").classList.remove("open");
+    popFocus();
+  }
+  function tailPreset(kind) {
+    const names = state.jobs
+      .filter((j) => (kind === "run" ? j.running : health(j).key === "fail"))
+      .map((j) => j.name);
+    if (!names.length) { toast("info", "no " + (kind === "run" ? "running" : "failing") + " jobs"); return; }
+    openTail(names);
+  }
+  function tailDownload() {
+    const lines = state.tail.lines.filter((l) => !l.kind)
+      .map((l) => (prefs.ts && l.ts ? fmtClock(l.ts) + " " : "") + "[" + l.job + "] " + stripAnsi(l.text));
+    const blob = new Blob([lines.join("\n") + "\n"], { type: "text/plain" });
+    const a = el("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "yacron2-multitail.txt";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  }
+  function tailClear() {
+    state.tail.lines = [];
+    renderTailTerm();
+    renderTailMeta();
   }
 
   // ===================================================================
@@ -2836,6 +3336,10 @@
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
       { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
       { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
+      { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
+      { ic: "≋", lbl: "Multi-tail console", run: () => openTail([]) },
+      { ic: "≋", lbl: "Multi-tail: failing jobs", run: () => tailPreset("fail") },
+      { ic: "≋", lbl: "Multi-tail: running jobs", run: () => tailPreset("run") },
       { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
       { ic: "▤", lbl: "Incident timeline", hint: "i", run: openTimeline },
       { ic: "▸", lbl: "Mitigate failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") },
@@ -2856,6 +3360,7 @@
       if (j.running) out.push({ ic: "■", lbl: "Cancel: " + j.name, run: () => cancelJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
+      out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "multi-tail", run: () => openTail([j.name]) });
     }
     return out;
   }
@@ -3041,7 +3546,7 @@
     return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
   }
   function anyOverlayOpen() {
-    return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open ||
+    return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open || state.tail.open ||
       ["settingsWrap", "helpWrap", "modalWrap"].some((id) => $(id).classList.contains("open"));
   }
   // ---- focus management (trap + restore) for modal surfaces ----
@@ -3059,6 +3564,7 @@
     if (state.sandbox.open) return $("sandboxWrap");
     if (state.timeline.open) return $("timelineWrap");
     if (state.palette.open) return $("paletteWrap");
+    if (state.tail.open) return $("tailWrap");   // DOM-first overlay: everything above outranks it
     if (state.drawerJob) return $("drawer");
     return null;
   }
@@ -3115,6 +3621,7 @@
       if (state.mitigate.open) return closeMitigate();
       if (state.sandbox.open) return closeSandbox();
       if (state.timeline.open) return closeTimeline();
+      if (state.tail.open) return closeTail();
       if (state.drawerJob) return closeDrawer();
       if (state.wallboard) return setWallboard(false);
       return;
@@ -3202,12 +3709,39 @@
       applyCols();
     });
     document.addEventListener("click", () => toggleColsMenu(false));
+    const mark = $("mark");
+    let markDeg = 0, markVel = 0, markRaf = 0, markLast = 0;
+    const spinMark = (t) => {
+      const dt = Math.min((t - markLast) / 1000, 0.1);
+      markLast = t;
+      markDeg = (markDeg + markVel * dt) % 360;
+      markVel *= Math.pow(0.45, dt);
+      mark.style.transform = `rotate(${markDeg}deg)`;
+      if (markVel > 3) { markRaf = requestAnimationFrame(spinMark); }
+      else { markVel = 0; markRaf = 0; }
+    };
+    mark.addEventListener("click", () => {
+      markVel += 360;
+      if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
+    });
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
     $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
+    $("tailBtn").addEventListener("click", () => { if (state.tail.open) closeTail(); else openTail([]); });
     $("tvBtn").addEventListener("click", () => setWallboard(!state.wallboard));
     $("swimBtn").addEventListener("click", () => setSwim(!prefs.swim));
+    $("fleetBtn").addEventListener("click", () => setFleet(!prefs.fleet));
+    $("fleetPanel").addEventListener("change", (e) => {
+      if (e.target.id === "fleetFailOnly") { state.fleet.failOnly = e.target.checked; renderFleet(); }
+    });
+    // a job-name click opens the drawer — but only for jobs this node knows
+    // (a row can exist purely from a peer's summary; there is nothing local
+    // to open for it)
+    $("fleetPanel").addEventListener("click", (e) => {
+      const it = e.target.closest("[data-job]");
+      if (it && state.byName[it.getAttribute("data-job")]) openDrawer(it.getAttribute("data-job"));
+    });
     $("heatWindow").addEventListener("change", (e) => { prefs.heatWindow = e.target.value; savePref("heatWindow"); renderHeatmap(); });
     $("radarPanel").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job")); });
     $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
@@ -3220,6 +3754,7 @@
     // incident cockpit: verdict bar → timeline / mitigate
     $("verdictBar").addEventListener("click", (e) => {
       if (e.target.closest("#vMitigate")) { openMitigate(state.incidentSet, "failing jobs"); return; }
+      if (e.target.closest("#vTail")) { openTail(state.incidentSet); return; }
       openTimeline();   // the timeline button and the bar body both open the timeline
     });
     $("tlClose").addEventListener("click", closeTimeline);
@@ -3230,10 +3765,56 @@
     // mitigate console
     $("mitCancelAll").addEventListener("click", () => bulkAction("cancel"));
     $("mitStartAll").addEventListener("click", () => bulkAction("start"));
+    $("mitTail").addEventListener("click", () => { const set = state.mitigate.set.slice(); closeMitigate(); openTail(set); });
     $("mitCopy").addEventListener("click", copyIncidentSummary);
     $("mitAbort").addEventListener("click", () => { state.mitigate.abort = true; });
     $("mitClose").addEventListener("click", closeMitigate);
     $("mitigateWrap").addEventListener("click", (e) => { if (e.target === $("mitigateWrap")) closeMitigate(); });
+
+    // merged multi-tail console
+    $("tailClose").addEventListener("click", closeTail);
+    $("tailWrap").addEventListener("click", (e) => { if (e.target === $("tailWrap")) closeTail(); });
+    $("tailAddFailing").addEventListener("click", () => tailPreset("fail"));
+    $("tailAddRunning").addEventListener("click", () => tailPreset("run"));
+    // Enter adds the typed job; "change" catches a datalist pick by mouse
+    const tailAddFromInput = () => {
+      const v = $("tailAddInput").value.trim();
+      if (!v) return;
+      if (!state.byName[v]) { toast("err", "unknown job: " + v); return; }
+      openTail([v]);
+      $("tailAddInput").value = "";
+    };
+    $("tailAddInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); tailAddFromInput(); } });
+    $("tailAddInput").addEventListener("change", tailAddFromInput);
+    $("tailChips").addEventListener("click", (e) => {
+      const un = e.target.closest("[data-untail]");
+      if (un) { removeTailJob(un.getAttribute("data-untail")); return; }
+      const nm = e.target.closest(".tnm[data-job]");
+      if (nm) { const n = nm.getAttribute("data-job"); closeTail(); openDrawer(n, "logs"); }
+    });
+    // a line's job prefix jumps to that job's own drawer
+    $("tailTerm").addEventListener("click", (e) => {
+      const tj = e.target.closest(".tj[data-job]");
+      if (tj) { const n = tj.getAttribute("data-job"); closeTail(); openDrawer(n, "logs"); }
+    });
+    $("tailSearch").addEventListener("input", debounce(renderTailTerm, 130));
+    // the view toggles share the drawer's persisted prefs; keep its
+    // checkboxes in step so the two surfaces never disagree
+    $("tailFollow").addEventListener("change", (e) => {
+      prefs.follow = e.target.checked; savePref("follow"); $("optFollow").checked = prefs.follow;
+      if (prefs.follow) { const t = tailTermEl(); t.scrollTop = t.scrollHeight; }
+    });
+    $("tailWrapOpt").addEventListener("change", (e) => {
+      prefs.wrap = e.target.checked; savePref("wrap"); $("optWrap").checked = prefs.wrap;
+      tailTermEl().classList.toggle("nowrap", !prefs.wrap);
+      termEl().classList.toggle("nowrap", !prefs.wrap);
+    });
+    $("tailTs").addEventListener("change", (e) => {
+      prefs.ts = e.target.checked; savePref("ts"); $("optTs").checked = prefs.ts;
+      renderTailTerm();
+    });
+    $("tailDownload").addEventListener("click", tailDownload);
+    $("tailClearBtn").addEventListener("click", tailClear);
 
     // cron sandbox
     $("sbxInput").addEventListener("input", debounce(renderSandbox, 120));
@@ -3385,9 +3966,13 @@
     const line = (data.node_name || "?") + " · " + data.backend + " · " + role;
     $("clusterSummary").textContent = line;
     state.clusterLine = line;
-    // the swimlane charts the gossip peer set; lease backends have none.
+    // the swimlane and fleet view both chart the gossip peer set; lease
+    // backends have none (and gossip no summaries).
     $("swimBtn").style.display = "none";
     $("swimPanel").style.display = "none";
+    state.fleet.data = null;
+    $("fleetBtn").style.display = "none";
+    $("fleetPanel").style.display = "none";
     const lease = data.lease || {};
     const rows = Object.keys(lease)
       .filter((k) => lease[k] !== null && lease[k] !== undefined)
@@ -3436,6 +4021,9 @@
         state.clusterLine = null;
         $("swimBtn").style.display = "none";
         $("swimPanel").style.display = "none";
+        state.fleet.data = null;
+        $("fleetBtn").style.display = "none";
+        $("fleetPanel").style.display = "none";
         return;
       }
       card.style.display = "";
@@ -3540,6 +4128,11 @@
       $("swimBtn").style.display = "";
       recordSwim(data, peers);
       renderSwim();
+      // the fleet view rides the same poll; /fleet is answered from state
+      // the daemon already holds, but there is no need to read it while the
+      // panel is closed (renderFleet then just keeps everything hidden)
+      $("fleetBtn").style.display = "";
+      if (prefs.fleet) loadFleet(); else renderFleet();
     } catch (e) {
       // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
       // flow (openModal) elsewhere; don't mask it as "unavailable". Any other

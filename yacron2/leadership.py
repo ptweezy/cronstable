@@ -221,6 +221,31 @@ class LeadershipBackend(abc.ABC):
         """
         return True
 
+    def set_job_summaries_provider(  # noqa: B027
+        self, provider: Callable[[], Dict[str, Any]]
+    ) -> None:
+        """Install the scheduler's per-job run-summary snapshot callable.
+
+        The provider returns ``{job_name: summary}`` for this node's own jobs
+        (see :meth:`yacron2.cron.Cron.fleet_job_summaries`).  The gossip
+        backend overrides this to piggyback the snapshot on its ``/peer``
+        response, which is what makes the dashboard's fleet view possible.
+        Default no-op: a lease backend has no node-to-node channel to carry
+        summaries on (it only ever talks to its lease store), so there is
+        nothing to install.
+        """
+
+    def fleet_view(self) -> Optional[Dict[str, Any]]:
+        """The merged per-node job-summary view for ``GET /fleet``.
+
+        ``None`` means this backend cannot provide one -- the lease backends
+        know only the lease holder, not what any node is running -- and the
+        endpoint then reports the feature unavailable so the dashboard hides
+        its fleet view (the same gate as the gossip-only swimlane/ring
+        panels).  The gossip backend overrides it.
+        """
+        return None
+
     # --- never-skip PreferLeader defaults (the locked lease semantics) ----
 
     def _is_self_demoted_holder(self) -> bool:

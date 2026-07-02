@@ -158,6 +158,7 @@ import datetime
 import hashlib
 import json
 import logging
+import math
 import os
 import ssl
 import uuid
@@ -226,6 +227,23 @@ MAX_PEER_FIELD_LEN = 256  # node_name, job_set_id, instance_id, ...
 MAX_MEMBER_ENTRIES = 4096  # members[] / mutual_agreeing[] cardinality
 MAX_REBOOT_JOB_NAME_LEN = 128  # a single @reboot job name
 MAX_ADVERTISED_REBOOT_JOBS = 512  # ran-set cardinality stored + re-advertised
+
+# Bounds on the fleet-view job_summaries block gossiped in /peer. Unlike
+# ran_reboot_jobs, absorbed peer summaries are never re-advertised (each node
+# only ever emits its OWN scheduler's snapshot), so these bound two different
+# things: what we EMIT -- a node with a huge job set must not push its own
+# /peer response past MAX_PEER_RESPONSE_BYTES, which honest peers reject as
+# oversized and would drop it from THEIR quorum -- and what we STORE from a
+# CA-vouched-but-untrusted peer. The budget: a summary entry is the job name
+# plus ~150 bytes of fixed-shape fields, so 512 entries of <=128-char names is
+# comfortably under half the byte cap even before compression, leaving the
+# members list (one short entry per node) plenty of headroom.
+MAX_JOB_SUMMARY_NAME_LEN = 128  # a single job name in job_summaries
+MAX_ADVERTISED_JOB_SUMMARIES = 512  # per-node job_summaries cardinality
+MAX_JOB_SUMMARY_TS_LEN = 64  # an ISO-8601 finished_at timestamp
+
+# the only run outcomes a peer summary may carry (mirrors JobRunInfo.outcome)
+_SUMMARY_OUTCOMES = frozenset({"success", "failure", "cancelled"})
 
 
 def _parse_members(
@@ -307,6 +325,81 @@ def _parse_str_list(
             continue
         out.add(item)
         if max_items is not None and len(out) >= max_items:
+            break
+    return out
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    """An untrusted JSON value as a finite float, else ``None``.
+
+    Rejects bools (an int subclass) and non-finite floats: Python's json
+    module happily parses ``Infinity``/``NaN`` AND re-emits them, but they are
+    not valid JSON -- a hostile peer could otherwise plant one in a summary
+    and make our /fleet response unparseable to every browser (JSON.parse
+    rejects it), blanking the dashboard's fleet view cluster-wide.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    out = float(value)
+    return out if math.isfinite(out) else None
+
+
+def _parse_job_summaries(raw: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Validate a peer's gossiped ``job_summaries`` block, field by field.
+
+    A peer is CA-vouched but otherwise untrusted, so every field is
+    type-checked and re-built into a fresh dict of the exact expected shape
+    (never stored as-received): a malformed entry is dropped, a malformed
+    field degrades to its absent value, and anything else -- extra keys,
+    nested junk -- is simply not copied. Job names are length-capped,
+    control-character-free (they are reflected into the authenticated
+    GET /fleet JSON) and the entry count is capped, mirroring the other
+    absorbed peer sets. Returns ``None`` (not ``{}``) when the field is
+    absent or not an object, so "an older build that gossips no summaries"
+    stays distinguishable from "a node with zero jobs" in the fleet view.
+    """
+    if not isinstance(raw, dict):
+        return None
+    out: Dict[str, Dict[str, Any]] = {}
+    for name, entry in raw.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > MAX_JOB_SUMMARY_NAME_LEN
+            or not name.isprintable()
+            or not isinstance(entry, dict)
+        ):
+            continue
+        summary: Dict[str, Any] = {
+            "running": entry.get("running") is True,
+            "enabled": entry.get("enabled") is not False,
+            "scheduled_in": _finite_number(entry.get("scheduled_in")),
+            "last": None,
+        }
+        last = entry.get("last")
+        if isinstance(last, dict):
+            outcome = last.get("outcome")
+            finished_at = last.get("finished_at")
+            exit_code = last.get("exit_code")
+            if (
+                outcome in _SUMMARY_OUTCOMES
+                and isinstance(finished_at, str)
+                and len(finished_at) <= MAX_JOB_SUMMARY_TS_LEN
+                and finished_at.isprintable()
+            ):
+                summary["last"] = {
+                    "outcome": outcome,
+                    "finished_at": finished_at,
+                    "duration": _finite_number(last.get("duration")),
+                    "exit_code": (
+                        exit_code
+                        if isinstance(exit_code, int)
+                        and not isinstance(exit_code, bool)
+                        else None
+                    ),
+                }
+        out[name] = summary
+        if len(out) >= MAX_ADVERTISED_JOB_SUMMARIES:
             break
     return out
 
@@ -580,6 +673,20 @@ class PeerState:
     # nothing -- the safe direction: it cannot cause a zero-run, only forgo a
     # deferral, i.e. lean toward running like the rest of the upgrade path).
     quorate_vouched: Optional["set[str]"] = None
+    # the peer's advertised per-job run summaries (its scheduler's snapshot),
+    # feeding the fleet view (GET /fleet). Observability only -- never an
+    # election or safety input. Unlike members/mutual_agreeing (which a stale
+    # read could poison), this is deliberately NOT cleared on a failed poll:
+    # the fleet view shows a briefly-unreachable node's last-known state aged
+    # by last_seen rather than blanking it. None = never reported (an older
+    # build, or never successfully polled). Internal; not in to_dict (the
+    # fleet view has its own shape, see ClusterManager.fleet_view).
+    job_summaries: Optional[Dict[str, Dict[str, Any]]] = None
+    # whether the peer said it truncated its advertised summaries at its cap
+    # (a node with more jobs than MAX_ADVERTISED_JOB_SUMMARIES), so the fleet
+    # view can label that node's column as partial instead of implying the
+    # missing jobs do not exist there.
+    job_summaries_truncated: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -630,6 +737,8 @@ class ClusterView:
         peer_distribution: Optional[str] = None,
         peer_elect_leader: Optional[bool] = None,
         peer_reports_members: bool = True,
+        peer_job_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
+        peer_job_summaries_truncated: bool = False,
     ) -> None:
         peer = self.peers[host]
         peer.last_seen = now
@@ -638,6 +747,13 @@ class ClusterView:
         peer.node_name = peer_name
         peer.instance_id = peer_instance
         peer.members = peer_members
+        # fleet-view summaries: None (an older build that gossips none) leaves
+        # any previously-absorbed snapshot in place -- like a failed poll, the
+        # fleet view prefers last-known-aged-by-last_seen over blanking -- so
+        # only a real report overwrites.
+        if peer_job_summaries is not None:
+            peer.job_summaries = peer_job_summaries
+            peer.job_summaries_truncated = peer_job_summaries_truncated
         # whether this response actually carried a members list (current build)
         # or omitted it (a legacy peer mid rolling upgrade); drives the one-
         # directional fallback in _agreeing_peers. Defaults True so existing
@@ -734,6 +850,9 @@ class ClusterView:
         peer.ran_reboot_jobs = None
         peer.mutual_agreeing = None
         peer.quorate_vouched = None
+        # job_summaries is deliberately KEPT: it is observability-only (never
+        # an election input), and the fleet view shows a briefly-unreachable
+        # node's last-known state aged by last_seen instead of blanking it.
         # no fresh response this round, so make no legacy/current claim about
         # the peer's members field either (it is not AGREED while failed, so
         # _agreeing_peers skips it regardless; reset for tidiness).
@@ -957,10 +1076,54 @@ class ClusterManager(LeadershipBackend):
         # emit-once latch for the degenerate 2-of-2 self-listing warning
         # (see _maybe_warn_degenerate_self_listing).
         self._warned_degenerate_self = False
+        # the scheduler's per-job run-summary snapshot callable, piggybacked
+        # on the /peer response for the fleet view (installed by
+        # Cron.start_stop_cluster before start(); None until then, and /peer
+        # then simply advertises no summaries).
+        self._job_summaries_provider: Optional[
+            Callable[[], Dict[str, Any]]
+        ] = None
+
+    def set_job_summaries_provider(
+        self, provider: Callable[[], Dict[str, Any]]
+    ) -> None:
+        self._job_summaries_provider = provider
+
+    def _advertised_job_summaries(
+        self,
+    ) -> "tuple[Dict[str, Any], bool]":
+        """Our own gossiped per-job summaries: ``(block, truncated)``.
+
+        The provider's snapshot is local, trusted input (it comes from our own
+        config and scheduler state), so no field validation happens here --
+        only the emit-side caps that keep our /peer response under
+        MAX_PEER_RESPONSE_BYTES: entries beyond MAX_ADVERTISED_JOB_SUMMARIES
+        are dropped (deterministically, by sorted name, so the advertised
+        subset is stable across rounds rather than flapping) and over-long
+        names are skipped. Truncation is flagged so the fleet view can label
+        this node's data as partial.
+        """
+        provider = self._job_summaries_provider
+        if provider is None:
+            return {}, False
+        summaries = provider()
+        names = sorted(
+            name
+            for name in summaries
+            if len(name) <= MAX_JOB_SUMMARY_NAME_LEN
+        )
+        truncated = len(names) > MAX_ADVERTISED_JOB_SUMMARIES or len(
+            names
+        ) < len(summaries)
+        return {
+            name: summaries[name]
+            for name in names[:MAX_ADVERTISED_JOB_SUMMARIES]
+        }, truncated
 
     # --- the mTLS /peer server -------------------------------------------
 
     async def _handle_peer(self, request: web.Request) -> web.Response:
+        job_summaries, summaries_truncated = self._advertised_job_summaries()
         return web.json_response(
             {
                 "node_name": self.node_name,
@@ -1012,6 +1175,14 @@ class ClusterManager(LeadershipBackend):
                 # mutual_agreeing, which lists every two-way edge including
                 # ones to sub-quorum nodes that stand a deferred job down.
                 "quorate_vouched": sorted(self._eligible_candidates()),
+                # this node's per-job run summaries (the scheduler's snapshot:
+                # running/enabled/next-fire plus the last finished run), for
+                # the polling peer's fleet view. Observability only -- a peer
+                # never feeds these into election or run/skip decisions --
+                # and capped so a huge job set cannot push this response past
+                # MAX_PEER_RESPONSE_BYTES (see _advertised_job_summaries).
+                "job_summaries": job_summaries,
+                "job_summaries_truncated": summaries_truncated,
             }
         )
 
@@ -1587,6 +1758,17 @@ class ClusterManager(LeadershipBackend):
                 data.get("quorate_vouched"),
                 max_len=MAX_PEER_FIELD_LEN,
                 max_items=MAX_MEMBER_ENTRIES,
+            ),
+            # the peer's per-job run summaries for the fleet view, re-built
+            # field-by-field from the untrusted payload (see
+            # _parse_job_summaries). None (absent/malformed -- an older build)
+            # keeps any previously-absorbed snapshot rather than blanking the
+            # node in the fleet view.
+            peer_job_summaries=_parse_job_summaries(
+                data.get("job_summaries")
+            ),
+            peer_job_summaries_truncated=(
+                data.get("job_summaries_truncated") is True
             ),
         )
 
@@ -2569,6 +2751,69 @@ class ClusterManager(LeadershipBackend):
                 elect_available_job_owner(job_name, name, view) == name
             )
         )
+
+    def fleet_view(self) -> Dict[str, Any]:
+        """The merged per-node job-summary view for ``GET /fleet``.
+
+        One entry per distinct node: this node first (live scheduler state,
+        stamped now), then every configured peer with whatever snapshot its
+        last successful poll absorbed, aged by ``as_of`` (= last_seen) so the
+        dashboard can show data freshness per node. Peer freshness is bounded
+        by the poll ``interval``: the summaries ride the existing gossip
+        round, no extra fan-out happens here. Self-listings are skipped and
+        peers are deduped by instance_id (two configured addresses answering
+        as the same process appear once), mirroring cluster_size's dedup.
+        ``jobs: null`` means no snapshot was ever absorbed (never reached, or
+        a build that predates fleet gossip); the dashboard renders that as
+        "no data" rather than "no jobs".
+        """
+        job_summaries, summaries_truncated = self._advertised_job_summaries()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        nodes: List[Dict[str, Any]] = [
+            {
+                "node_name": self.node_name,
+                "host": None,
+                "self": True,
+                "status": STATUS_SELF,
+                "as_of": now.isoformat(),
+                "jobs": job_summaries,
+                "truncated": summaries_truncated,
+            }
+        ]
+        seen_instances = {self.instance_id}
+        for peer in self.view.peers.values():
+            if peer.status == STATUS_SELF or peer.self_confirmed:
+                continue
+            if peer.instance_id is not None:
+                if peer.instance_id in seen_instances:
+                    continue
+                seen_instances.add(peer.instance_id)
+            nodes.append(
+                {
+                    "node_name": peer.node_name,
+                    "host": peer.host,
+                    "self": False,
+                    "status": peer.status,
+                    "as_of": (
+                        peer.last_seen.isoformat()
+                        if peer.last_seen is not None
+                        else None
+                    ),
+                    "jobs": peer.job_summaries,
+                    "truncated": peer.job_summaries_truncated,
+                }
+            )
+        return {
+            "enabled": True,
+            "backend": "gossip",
+            "node_name": self.node_name,
+            "distribution": self.distribution,
+            "elect_leader": bool(self.config.get("electLeader")),
+            # the peer-poll cadence, so the dashboard can set expectations
+            # for how stale a healthy peer's as_of may legitimately be
+            "interval": self.config["interval"],
+            "nodes": nodes,
+        }
 
     def view_dict(self) -> Dict[str, Any]:
         leader = self.leader_name()
