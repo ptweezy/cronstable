@@ -849,7 +849,7 @@
 <header>
   <div class="brand">
     <span class="mark glow" id="mark">▚</span>
-    <h1 class="glow">yacron2</h1>
+    <h1 class="glow" id="brandName">yacron2</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
@@ -2047,7 +2047,7 @@
     if (sec >= 3600) { const m0 = Math.round(sec / 60), h = Math.floor(m0 / 60), m = m0 % 60; return h + "h" + pad2(m) + "m"; }
     return pad2(Math.floor(sec / 60)) + ":" + pad2(sec % 60);
   }
-  function fmtWall(c) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi); }
+  function fmtWall(c, withSeconds) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi) + (withSeconds ? ":" + pad2(c.se || 0) : ""); }
   // Recompute each enabled job's next fire instant. Cheap (parseCron is cached,
   // nextRuns(n=1) is bounded), but only called when the panel is open or the
   // soonest fire has already elapsed.
@@ -2090,7 +2090,7 @@
       $("radarFeed").innerHTML = feed.length
         ? feed.map((x) => {
             const j = state.byName[x.name];
-            const title = fmtWall(x.c) + (j ? " · " + describeCron(j.schedule) : "");
+            const title = fmtWall(x.c, j && parseCron(j.schedule).hasSeconds) + (j ? " · " + describeCron(j.schedule) : "");
             return '<li data-job="' + escAttr(x.name) + '" title="' + escAttr(title) + '">' +
               '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
               '<span class="nm">' + esc(x.name) + "</span></li>";
@@ -2833,8 +2833,7 @@
       else {
         html += '<div class="card-label" style="padding-left:0;border:0">next runs</div><ul class="nextruns">';
         for (const r of runs) {
-          const c = r.c;
-          const when = c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi);
+          const when = fmtWall(r.c, parsed.hasSeconds);
           const rel = fmtIn((r.t - Date.now()) / 1000);
           html += "<li><span class='when'>" + esc(when) + "</span><span class='rel'>" + esc(rel) + "</span></li>";
         }
@@ -3757,10 +3756,13 @@
       if (markVel > 3) { markRaf = requestAnimationFrame(spinMark); }
       else { markVel = 0; markRaf = 0; }
     };
-    mark.addEventListener("click", () => {
+    const bumpMark = () => {
       markVel += 360;
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
-    });
+    };
+    mark.addEventListener("click", bumpMark);
+    // clicking the wordmark spins the logo too
+    $("brandName").addEventListener("click", bumpMark);
     // header text is unselectable; these chips hand out their value on click
     $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
     $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });
@@ -4633,21 +4635,28 @@
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when yacron2 starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
-      html += '<p class="sbx-desc sbx-bad">Not a valid 5-field cron expression or known @macro.</p>';
+      html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';
     } else {
       const runs = nextRuns(parsed, 12, frame, Date.now());
       const impossible = !runs.length;
       html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
       const low = expr.toLowerCase();
       const f = (MACROS[low] || expr).split(/\s+/);
-      const labels = ["min", "hour", "day-of-month", "month", "day-of-week"];
+      // Label each present column by parse-crontab's end-column rule: 5 fields
+      // are minute..dow, a 6th adds a trailing year, a 7th adds a leading
+      // second. Mislabelling these (or dropping the second/year columns) would
+      // contradict the plain-English description above.
+      let cols;
+      if (f.length === 6) cols = [["min", f[0]], ["hour", f[1]], ["day-of-month", f[2]], ["month", f[3]], ["day-of-week", f[4]], ["year", f[5]]];
+      else if (f.length === 7) cols = [["second", f[0]], ["min", f[1]], ["hour", f[2]], ["day-of-month", f[3]], ["month", f[4]], ["day-of-week", f[5]], ["year", f[6]]];
+      else cols = [["min", f[0]], ["hour", f[1]], ["day-of-month", f[2]], ["month", f[3]], ["day-of-week", f[4]]];
       html += '<div class="sbx-flds">';
-      for (let i = 0; i < 5; i++) html += '<div class="sbx-fld"><div class="fk">' + labels[i] + '</div><div class="fv">' + esc(f[i] || "*") + "</div></div>";
+      for (const [k, v] of cols) html += '<div class="sbx-fld"><div class="fk">' + k + '</div><div class="fv">' + esc(v || "*") + "</div></div>";
       html += "</div>";
       if (runs.length) {
         html += '<div class="card-label" style="padding-left:0;border:0">next ' + runs.length + " fires · " + esc(frame === "LOCAL" ? "local" : frame) + '</div><ul class="nextruns">';
         for (const r of runs)
-          html += "<li><span class='when'>" + esc(fmtWall(r.c)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
+          html += "<li><span class='when'>" + esc(fmtWall(r.c, parsed.hasSeconds)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
         html += "</ul>";
       }
       const users = state.jobs.filter((j) => sameSchedule(j.schedule, expr));
