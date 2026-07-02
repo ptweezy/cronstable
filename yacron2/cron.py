@@ -471,6 +471,28 @@ class Cron:
         payload["enabled"] = True
         return web.json_response(payload, headers=headers)
 
+    async def _web_get_fleet(self, request: web.Request) -> web.Response:
+        """The cluster-wide per-job run view (the dashboard's fleet view).
+
+        Merged entirely from state this node already holds: its own scheduler
+        snapshot plus the per-job summaries each peer piggybacked on the
+        gossip exchanges this node has already made (see
+        :meth:`yacron2.cluster.ClusterManager.fleet_view`) -- serving this
+        endpoint triggers no peer traffic.  ``enabled: false`` when there is
+        no cluster, or the backend has no node-to-node channel to have
+        carried summaries (the lease backends); the dashboard then hides its
+        fleet view.
+        """
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        mgr = self.cluster_manager
+        fleet = mgr.fleet_view() if mgr is not None else None
+        if fleet is None:
+            return web.json_response(
+                {"enabled": False, "nodes": []}, headers=headers
+            )
+        return web.json_response(fleet, headers=headers)
+
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         out = []
@@ -623,16 +645,59 @@ class Cron:
             headers=self._security_headers(),
         )
 
+    def _scheduled_in(self, job: JobConfig, running: bool) -> Optional[float]:
+        """Seconds until the job's next scheduled run.
+
+        ``None`` when not applicable: disabled, currently running, or a
+        one-off ``@reboot`` schedule (a string, not a crontab).
+        """
+        if not job.enabled or running:
+            return None
+        crontab = job.schedule  # type: Union[CronTab, str]
+        if not isinstance(crontab, CronTab):
+            return None
+        now = get_now(job.timezone)
+        seconds: Optional[float] = crontab.next(now=now, default_utc=job.utc)
+        return seconds
+
+    def fleet_job_summaries(self) -> Dict[str, Any]:
+        """Compact per-job snapshot gossiped to peers for the fleet view.
+
+        Installed on the leadership backend as its job-summaries provider
+        (see :meth:`start_stop_cluster`); the gossip backend piggybacks it on
+        every ``/peer`` response, which is how the dashboard's fleet view can
+        show runs happening on other nodes.  Deliberately lean -- one small
+        fixed-shape entry per job -- because it travels in a byte-capped
+        gossip payload: no command line, no ``fail_reason`` (arbitrary-length
+        operator text), no run history.  Those stay on the owning node's own
+        API.
+        """
+        out: Dict[str, Any] = {}
+        for name, job in self.cron_jobs.items():
+            running = bool(self.running_jobs.get(name))
+            last = self.last_run.get(name)
+            out[name] = {
+                "running": running,
+                "enabled": job.enabled,
+                "scheduled_in": self._scheduled_in(job, running),
+                "last": (
+                    None
+                    if last is None
+                    else {
+                        "outcome": last.outcome,
+                        "finished_at": last.finished_at.isoformat(),
+                        "duration": last.duration,
+                        "exit_code": last.exit_code,
+                    }
+                ),
+            }
+        return out
+
     def _job_to_dict(self, name: str, job: JobConfig) -> Dict[str, Any]:
         running = self.running_jobs.get(name) or []
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).
-        scheduled_in: Optional[float] = None
-        if job.enabled and not running:
-            crontab = job.schedule  # type: Union[CronTab, str]
-            if isinstance(crontab, CronTab):
-                now = get_now(job.timezone)
-                scheduled_in = crontab.next(now=now, default_utc=job.utc)
+        scheduled_in = self._scheduled_in(job, bool(running))
 
         last = self.last_run.get(name)
         last_run = last.to_dict() if last is not None else None
@@ -806,6 +871,7 @@ class Cron:
                 web.get("/version", self._web_get_version),
                 web.get("/job-set-id", self._web_job_set_id),
                 web.get("/cluster", self._web_get_cluster),
+                web.get("/fleet", self._web_get_fleet),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
@@ -968,6 +1034,12 @@ class Cron:
                 # not bugs -- so they must not escape to the run loop's generic
                 # "please report this as a bug" handler.
                 manager = make_backend(cluster_config, self.job_set_id)
+                # Install the fleet-view summaries provider BEFORE start():
+                # start() runs a full poll round up front, during which peers
+                # may already be polling us back, and their very first
+                # absorbed snapshot should carry our jobs rather than an
+                # empty block. No-op for the lease backends.
+                manager.set_job_summaries_provider(self.fleet_job_summaries)
                 await manager.start()
             except (
                 OSError,

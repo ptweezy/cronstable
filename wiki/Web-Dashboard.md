@@ -200,6 +200,42 @@ while the tab is open (so you can see a `syncing` → `agreed` convergence or a
 flapping peer as a stripe rather than a single instant). It charts the gossip
 peer set only, so it is hidden entirely for the lease backends.
 
+### Fleet view: every node's runs in one pane
+
+The dashboard normally shows one node's truth: `/jobs` reports the runs *this*
+node made, so under
+[`distribution: spread`](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load)
+a job that last ran on a peer shows nothing here. The **`⊞ fleet`** button in
+the cluster panel header opens the **fleet view**, a jobs × nodes matrix that
+closes that gap: one row per job (the union of every node's advertised jobs,
+so a mid-deploy peer's new job shows up too), one column per node, each cell
+that node's state for the job — **▶ running**, the last outcome with its age
+(`● ok 3m`, `✗ failure 12s`), `◌ off` for disabled-there, `◔` for never ran
+there, `—` for not configured there, and `·` when the node has reported no
+data at all. Hovering a cell reveals the exit code, finish time, duration, and
+next fire; clicking a job name opens its drawer. A **failing only** filter
+collapses the matrix to the rows that are red anywhere in the fleet, and under
+spread the cell belonging to each job's current owner carries an accent
+marker, so "who *should* run this next" and "who ran it last" sit side by
+side.
+
+The data arrives by piggyback, not fan-out: every node attaches a compact
+per-job summary (running / enabled / next fire / last run) to the mutual-TLS
+[`/peer` response](Clustering-and-Leader-Election#cluster-peer-attestation) it
+already serves, so each node absorbs the whole fleet's state through the peer
+polls it already makes, and the dashboard reads the merged result from
+[`GET /fleet`](HTTP-API#get-fleet) on its usual poll — no extra traffic
+towards the peers, and any node can serve the single pane of glass. The cost
+of that design is freshness: a peer column is up to one gossip `interval`
+stale (30 s by default), so every column header shows its node's status dot
+and data age (`live` for the serving node, `41s ago` for a peer). A briefly
+unreachable peer keeps its last-known cells with a growing age instead of
+going blank, and a node whose job set exceeds the gossip payload cap (512
+jobs) is flagged **partial**. Summaries are observability data only — they
+never influence election or run decisions — and like the swimlane, the view
+is gossip-only: lease backends carry no summaries, so the button is hidden
+there.
+
 Separately from the in-panel summary, a cluster incident also raises the
 page-level **CLUSTER ALERT** bar at the top of the dashboard: a red incident
 banner shown whenever this node reports a cluster conflict (duplicate `nodeName`,
@@ -220,6 +256,35 @@ also surfaces the kubernetes `namespace` or the etcd `leaseId` when present. The
 majority". See
 [Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster)
 for the full `GET /cluster` field semantics.
+
+## Merged multi-tail
+
+The **`≋ tail`** toolbar button opens the **multi-tail console**: several jobs'
+log streams merged into one live pane, each line prefixed with its job name in
+a stable identity colour — like tailing a set of pods. It is built for
+correlated incidents: the incident verdict bar and the mitigate console each
+carry a `≋ tail` button that opens it pre-loaded with the failing set, and the
+command palette offers a per-job **Tail: …** action plus **failing** /
+**running** presets.
+
+- Add jobs with the **+ failing** / **+ running** presets or the add box
+  (which autocompletes to the configured jobs); remove one from its chip.
+  Clicking a chip or a line's job prefix jumps to that job's drawer.
+- The console holds at most **4 concurrent streams**. Browsers allow only ~6
+  HTTP/1.1 connections per origin and every tailed job keeps one open, so the
+  cap leaves the dashboard's own polling room to breathe.
+- The daemon closes a job's log stream when the tailed run's output ends, so
+  the console **re-attaches automatically** for the job's next run (paced by
+  the refresh interval). Attaching replays the run's buffered output from the
+  start, so a re-attach that lands mid-run still shows the whole run, and runs
+  are delimited with an `── end of run output ──` marker.
+- The view offers **follow**, **wrap**, and **timestamps** toggles (shared
+  with the drawer's Logs tab), a plain-text **search** with a live match
+  count, one-click **download** of the merged view (lines prefixed `[job]`),
+  and a **clear** button.
+- As with the drawer's [Logs tab](#logs-live-output-in-your-browser), output
+  appears only for the streams a job captures
+  ([`captureStdout` / `captureStderr`](Output-Capturing)).
 
 ## Command palette
 
@@ -287,8 +352,10 @@ The dashboard is a thin client over the [HTTP Control API](HTTP-API):
 
 - it polls `GET /jobs` on the refresh interval for the overview (each job carries a compact tail of recent runs for the sparkline);
 - it polls `GET /cluster` on the same interval for the [cluster panel](#cluster-panel) (the panel stays hidden unless a cluster section is configured);
+- while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);
 - opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats);
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
+- the [multi-tail console](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
 - the **Run** / **Stop** buttons call `POST /jobs/{name}/start` and `POST /jobs/{name}/cancel`;
 - the version in the header comes from `GET /version`.
 
