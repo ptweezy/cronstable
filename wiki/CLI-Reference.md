@@ -20,7 +20,7 @@ process supervisor (systemd, a container runtime, etc.); see
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. When a directory, every `*.yml`/`*.yaml` file in it is loaded (entries whose name starts with `_` or `.` are skipped). See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
+| `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. When a directory, every `*.yml`/`*.yaml` file, plus every classic crontab (`*.crontab`, `*.cron`, or a file named `crontab`), is loaded (entries whose name starts with `_` or `.` are skipped). See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) and [Classic Crontabs](Classic-Crontabs). |
 | `-l`, `--log-level` | string | `INFO` | Root log level. Passed to `logging.basicConfig(level=getattr(logging, LOG_LEVEL))`, so the value must name an attribute of the `logging` module (e.g. `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit. Exits `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
 | `--version` | flag | off | Print the yacron2 version to stdout and exit `0`. |
@@ -38,13 +38,18 @@ the [Configuration Reference](Configuration-Reference).
 
 ### `-c` / `--config`
 
-The argument may be a single YAML file or a directory:
+The argument may be a single file or a directory:
 
-- **File:** parsed directly. An I/O error (for example, the file does not exist)
-  is reported as a configuration error and exits `1`.
-- **Directory:** each non-hidden `*.yml`/`*.yaml` entry is parsed in
-  name-sorted order. An empty directory (or one whose files are all skipped)
-  yields an empty configuration with no jobs rather than an error.
+- **File:** parsed directly. YAML by default; a classic crontab when the name
+  says so (`*.crontab`, `*.cron`, or a file named `crontab`, e.g. a
+  `crontab -l > crontab` export) or, for a file with a neutral name such as
+  `-c /var/spool/cron/crontabs/root`, when the content unmistakably is one
+  (see [Classic Crontabs](Classic-Crontabs); the six-field *system* crontab
+  format of `/etc/crontab` is not supported). An I/O error (for example, the
+  file does not exist) is reported as a configuration error and exits `1`.
+- **Directory:** each non-hidden `*.yml`/`*.yaml` or crontab-named entry is
+  parsed in name-sorted order. An empty directory (or one whose files are all
+  skipped) yields an empty configuration with no jobs rather than an error.
 
 #### Default-path special case
 
@@ -132,12 +137,12 @@ yacron2 does not force-kill its own running jobs on shutdown. Individual jobs
 have their own kill behavior (`killTimeout`) when they are stopped; see
 [Concurrency and Timeouts](Concurrency-and-Timeouts). Sending a second signal
 does not change the shutdown sequence; if you need an immediate stop, kill the
-process with `SIGKILL` (POSIX-only; there is no Windows equivalent — use Task
+process with `SIGKILL` (POSIX-only; there is no Windows equivalent, so use Task
 Manager or `taskkill /F` there).
 
 On Windows, press Ctrl-C or Ctrl-Break (`SIGINT`/`SIGBREAK`) to trigger the same
 graceful shutdown: it finishes the currently-running jobs first, exactly as
-`SIGTERM` does on POSIX. The wiring differs only internally — `signal.signal`
+`SIGTERM` does on POSIX. The wiring differs only internally: `signal.signal`
 plus a heartbeat timer, because the Proactor loop lacks `add_signal_handler`.
 See [Running on Windows](Running-on-Windows).
 

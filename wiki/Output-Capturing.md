@@ -36,13 +36,13 @@ strictyaml schema and `DEFAULT_CONFIG`.
 |---|---|---|---|
 | `captureStdout` | boolean | `false` | Capture the job's standard output: read, prefix, re-emit to yacron2's stdout, and retain for reports/failure checks. |
 | `captureStderr` | boolean | `true` | Capture the job's standard error: read, prefix, re-emit to yacron2's stderr, and retain for reports/failure checks. |
-| `streamPrefix` | string | `"[{job_name} {stream_name}] "` | Format string prepended to each re-emitted captured line. Supports `{job_name}` and `{stream_name}`. Set to `""` to disable. New in version 0.16. |
+| `streamPrefix` | string | `"[{job_name} {stream_name}] "` | Format string prepended to each re-emitted captured line. Supports `{job_name}` and `{stream_name}`. Set to `""` to disable. |
 | `saveLimit` | integer | `4096` | Maximum number of lines retained per captured stream for reporting. Must be `>= 0`; `0` retains nothing but still counts discarded lines. |
 | `maxLineLength` | integer | `16777216` (16 MiB) | Maximum length, in bytes, of a single line the underlying asyncio reader will buffer. Must be `> 0`. Lines exceeding it are skipped with a warning. |
 
 `saveLimit` and `maxLineLength` are validated at config load time: a non-integer
 fails the strictyaml schema, and `saveLimit < 0` or `maxLineLength <= 0` raises
-a `ConfigError`. (Range validation new in yacron2 1.0.)
+a `ConfigError`.
 
 ## What "capture" means
 
@@ -74,8 +74,8 @@ string and is unaffected by this console fallback.
 `streamPrefix` is a Python `str.format` template applied once per
 `StreamReader`. Two placeholders are substituted:
 
-- `{job_name}` — the job's `name`.
-- `{stream_name}` — `"stdout"` or `"stderr"`.
+- `{job_name}`: the job's `name`.
+- `{stream_name}`: `"stdout"` or `"stderr"`.
 
 With the default `"[{job_name} {stream_name}] "`, a job named `test-01` emits
 lines such as `[test-01 stdout] hello`.
@@ -92,8 +92,8 @@ jobs:
     streamPrefix: "[{job_name} job] "
 ```
 
-To remove the prefix entirely — for example when the job emits structured JSON
-log lines that should pass through unmodified — set it to the empty string:
+To remove the prefix entirely (for example when the job emits structured JSON
+log lines that should pass through unmodified), set it to the empty string:
 
 ```yaml
 jobs:
@@ -132,8 +132,8 @@ discards occurred and when the bottom buffer is non-empty.
 
 ### saveLimit = 0
 
-`saveLimit` may be set to `0`. (New in version 0.6.) With `saveLimit: 0`, no
-lines are retained at all — every line is counted as discarded. The lines are
+`saveLimit` may be set to `0`. With `saveLimit: 0`, no
+lines are retained at all: every line is counted as discarded. The lines are
 still decoded and re-emitted with their prefix as usual; only the in-memory
 retention for reports is suppressed. The discard count is preserved, which
 matters for failure detection (below).
@@ -157,8 +157,8 @@ re-emitted, and is **not** counted as a discarded line.
 The `producesStdout` and `producesStderr` checks in `failsWhen` (see
 [Failure Detection and Retries](Failure-Detection-and-Retries)) consider a
 stream non-empty if it has **either** retained output **or** a non-zero discard
-count. Consequently, output that was produced but discarded — including all
-output when `saveLimit: 0` — still triggers these failure conditions. Lines
+count. Consequently, output that was produced but discarded (including all
+output when `saveLimit: 0`) still triggers these failure conditions. Lines
 skipped because they exceeded `maxLineLength` are not counted as discards and
 therefore do not, on their own, satisfy these checks.
 
@@ -197,10 +197,10 @@ jobs:
 
 ## See also
 
-- [Reporting (Mail, Sentry, Shell)](Reporting) — how captured `stdout`/`stderr`
+- [Reporting (Mail, Sentry, Shell)](Reporting): how captured `stdout`/`stderr`
   appear in report templates and shell-reporter environment variables.
-- [Failure Detection and Retries](Failure-Detection-and-Retries) —
+- [Failure Detection and Retries](Failure-Detection-and-Retries):
   `failsWhen.producesStdout` / `producesStderr`.
-- [Configuration Reference](Configuration-Reference) — full option list.
-- [Logging Configuration](Logging-Configuration) — yacron2's own logging, which
+- [Configuration Reference](Configuration-Reference): full option list.
+- [Logging Configuration](Logging-Configuration): yacron2's own logging, which
   is separate from job output capturing.

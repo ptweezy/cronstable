@@ -1,0 +1,68 @@
+# Shared job set for the docker-compose-cluster.yml demo.
+#
+# This file is mounted IDENTICALLY into all three nodes. That is the whole
+# point: two instances agree (and a quorum/leader can form) only if their
+# job-set ids match, and the job-set id is a fingerprint of exactly this set of
+# jobs. The per-node bits (node name, peers, TLS identity) live in the separate
+# node-a.yaml / node-b.yaml / node-c.yaml files, which do NOT change the
+# job-set id.
+#
+# Each job below uses a different `clusterPolicy` so you can watch the three
+# behaviours side by side across the three dashboards (ports 8080/8081/8082).
+# Node identity in the output comes from $HOSTNAME (set by Docker at runtime),
+# never from this file — so the config stays byte-for-byte identical everywhere.
+
+defaults:
+  # Capture both streams so output shows up in each node's dashboard log tail.
+  captureStdout: true
+  captureStderr: true
+
+web:
+  # 0.0.0.0 so each node's dashboard is reachable through its published port.
+  listen:
+    - http://0.0.0.0:8080
+
+jobs:
+  # @reboot greeting — EveryNode, so every replica announces itself on start.
+  - name: welcome
+    command: echo "👋 $HOSTNAME joined the cluster at $(date -u +%H:%M:%S) UTC"
+    schedule: "@reboot"
+    clusterPolicy: EveryNode
+
+  # EveryNode: runs on ALL three nodes every minute. You will see this job's
+  # history advance on every dashboard (8080, 8081, 8082) — the policy for
+  # genuinely per-node or fully idempotent work.
+  - name: tick-every-node
+    command: echo "[EveryNode] $HOSTNAME ran at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # Leader (the default): runs on the elected leader ONLY, and only while a
+  # quorum is up. With all three nodes healthy the leader is "yacron-a" (the
+  # lowest node name), so this job's history advances on 8080 alone. Stop
+  # yacron-a and watch it move to yacron-b. Stop a second node (no quorum) and
+  # it stops running anywhere — at-most-once, may skip.
+  - name: tick-leader-only
+    command: echo "[Leader] $HOSTNAME is the leader and ran at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  # PreferLeader: the lowest *reachable* agreeing node runs it, ignoring quorum.
+  # Healthy, it behaves like Leader (runs on yacron-a). But if a node is
+  # partitioned off on its own it will STILL run there — never skips, may
+  # double-run across a partition. Good for important-but-idempotent work.
+  - name: tick-prefer-leader
+    command: echo "[PreferLeader] $HOSTNAME ran at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+    clusterPolicy: PreferLeader
+
+  # A manual-only job (scheduled once a year, so in practice never). Manual
+  # triggers via "Run now" / POST /jobs/{name}/start are NOT leader-gated, so
+  # you can launch this on any node regardless of who the leader is. The
+  # clusterPolicy below is therefore irrelevant for the manual trigger (it would
+  # only gate the effectively-never scheduled run); it is left at Leader just to
+  # show the default value.
+  - name: run-me-anywhere
+    command: echo "🚀 $HOSTNAME launched me on demand at $(date -u +%H:%M:%S) UTC"
+    schedule: "0 0 1 1 *"
+    clusterPolicy: Leader
