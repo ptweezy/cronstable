@@ -102,6 +102,7 @@ tune their levels independently, or rely on `root:` to catch them all:
 | `yacron2` | `cron.py`, `job.py` | Scheduler lifecycle, job start/spawn/exit, retries, web server start/stop, shutdown, and most operational messages. |
 | `yacron2.config` | `config.py` | Configuration parsing diagnostics (e.g. the converted schedule string at `DEBUG`). |
 | `statsd` | `statsd.py` | statsd metric-writer diagnostics. See [Metrics with statsd](Metrics-with-Statsd). |
+| `prometheus` | `prometheus.py` | Prometheus `/metrics` endpoint diagnostics (e.g. a cluster-backend read failing during a scrape). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 
 Because `yacron2.config` is a child of `yacron2`, configuring the `yacron2`
 logger affects it too (subject to `propagate`). The `statsd` logger is a

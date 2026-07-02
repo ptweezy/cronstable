@@ -372,6 +372,7 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
         config=SimpleNamespace(name="test"),
         replaced=False,
         cancelled=False,
+        start_failed=False,
         fail_reason="failsWhen=nonzeroReturn and retcode=2",
         retcode=2,
         stdout=None,

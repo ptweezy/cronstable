@@ -35,6 +35,12 @@ from yacron2.config import (
 from yacron2.fingerprint import job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
 from yacron2.leadership import LeadershipBackend, make_backend
+from yacron2.prometheus import (
+    CONTENT_TYPE_OPENMETRICS,
+    CONTENT_TYPE_TEXT,
+    PrometheusMetrics,
+    resolve_metrics_config,
+)
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
@@ -254,6 +260,11 @@ class Cron:
     def __init__(
         self, config_arg: Optional[str], *, config_yaml: Optional[str] = None
     ) -> None:
+        # Prometheus accumulators (GET /metrics). Owned here -- not by the
+        # web app -- so counters survive web-app restarts and cluster-manager
+        # rebuilds; created before update_config so the first parse result is
+        # already recorded. See yacron2.prometheus.
+        self.metrics = PrometheusMetrics()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
         # list of cron jobs already running
@@ -418,8 +429,22 @@ class Cron:
                 job_defaults=JobDefaults({}),
                 logging_config=None,
             )
-        config = parse_config(self.config_arg)
+        try:
+            config = parse_config(self.config_arg)
+        except ConfigError:
+            # feeds yacron2_config_last_reload_successful, the standard
+            # "config broken on disk" alert signal.
+            self.metrics.config_parse(False)
+            raise
+        self.metrics.config_parse(True)
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
+        # Drop metric series for jobs removed from the config, so a renamed
+        # job does not leave a stale twin behind forever. A removed job with
+        # an instance still running keeps its accumulator until the run
+        # finishes: pruning it mid-run would let the finishing run recreate
+        # the series from zero (a phantom counter reset); the reload after
+        # the run ends prunes it for good.
+        self.metrics.prune(set(self.cron_jobs) | set(self.running_jobs))
         return config
 
     def job_set_id(self) -> str:
@@ -492,6 +517,28 @@ class Cron:
                 {"enabled": False, "nodes": []}, headers=headers
             )
         return web.json_response(fleet, headers=headers)
+
+    async def _web_metrics(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        accept = request.headers.get("Accept", "")
+        openmetrics = "application/openmetrics-text" in accept
+        body = self.metrics.render(self, openmetrics=openmetrics)
+        headers = {}  # type: Dict[str, str]
+        custom = self.web_config.get("headers", None)
+        if custom:
+            headers.update(custom)
+            # Unlike the other handlers, the Content-Type is the endpoint's
+            # contract (scrapers parse it for the format version), so it
+            # wins over an operator-configured web.headers Content-Type --
+            # in ANY spelling: header names are case-insensitive on the
+            # wire but this dict is not, and a case-variant leftover would
+            # be emitted as a second, conflicting Content-Type header.
+            for key in [k for k in headers if k.lower() == "content-type"]:
+                del headers[key]
+        headers["Content-Type"] = (
+            CONTENT_TYPE_OPENMETRICS if openmetrics else CONTENT_TYPE_TEXT
+        )
+        return web.Response(body=body.encode("utf-8"), headers=headers)
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -858,14 +905,21 @@ class Cron:
             and self.web_runner is None
         ):
             ui_enabled = web_config.get("ui", True)
+            metrics_config = resolve_metrics_config(web_config)
             middlewares = []
             token = self._resolve_web_token(web_config)
             if token is not None:
                 logger.info("web: requiring bearer-token authentication")
                 # the UI page is served unauthenticated (it holds no data); the
                 # browser then sends the token on every data request.
-                public = WEB_PUBLIC_PATHS if ui_enabled else frozenset()
-                middlewares.append(self._make_auth_middleware(token, public))
+                public = set(WEB_PUBLIC_PATHS) if ui_enabled else set()
+                if metrics_config is not None and metrics_config["public"]:
+                    # deliberate operator opt-out for scrapers that cannot
+                    # send a bearer token; everything else stays gated.
+                    public.add("/metrics")
+                middlewares.append(
+                    self._make_auth_middleware(token, frozenset(public))
+                )
             app = web.Application(middlewares=middlewares)
             routes = [
                 web.get("/version", self._web_get_version),
@@ -879,6 +933,13 @@ class Cron:
                 web.post("/jobs/{name}/cancel", self._web_cancel_job),
                 web.get("/jobs/{name}/logs", self._web_job_logs),
             ]
+            if metrics_config is not None:
+                # buckets apply from here on; a changed bucket set restarts
+                # the histograms (an ordinary counter reset to Prometheus).
+                self.metrics.set_duration_buckets(
+                    metrics_config["durationBuckets"]
+                )
+                routes.append(web.get("/metrics", self._web_metrics))
             if ui_enabled:
                 routes.append(web.get("/", self._web_index))
             app.add_routes(routes)
@@ -995,11 +1056,15 @@ class Cron:
                 # replacement manager comes up and re-logs). Only fires when
                 # election was on (the flags are only ever set then).
                 if self._was_leader:
+                    # a real leadership loss (the rebuilt manager re-elects
+                    # from scratch), so it counts as a transition too
+                    self.metrics.cluster_leader_transition()
                     logger.info(
                         "cluster: this node lost scheduled-job leadership "
                         "(leadership manager stopped for reload)"
                     )
                 if self._was_quorate:
+                    self.metrics.cluster_quorum_transition()
                     logger.info(
                         "cluster: this node left quorum (leadership manager "
                         "stopped for reload); Leader jobs cannot run until it "
@@ -1514,6 +1579,7 @@ class Cron:
         spread = mgr is not None and mgr.distribution == "spread"
         quorate = mgr is not None and mgr.is_quorate()
         if quorate != self._was_quorate:
+            self.metrics.cluster_quorum_transition()
             if spread and quorate:
                 logger.info(
                     "cluster: this node joined quorum; "
@@ -1536,6 +1602,7 @@ class Cron:
             return  # no single leader in spread mode
         leader = mgr is not None and mgr.is_leader()
         if leader != self._was_leader:
+            self.metrics.cluster_leader_transition()
             logger.info(
                 "cluster: this node %s scheduled-job leadership",
                 "acquired" if leader else "lost",
@@ -1596,7 +1663,13 @@ class Cron:
 
         await self.maybe_launch_job(job)
 
-    async def maybe_launch_job(self, job: JobConfig) -> None:
+    async def maybe_launch_job(self, job: JobConfig) -> bool:
+        """Launch ``job`` unless concurrencyPolicy forbids it.
+
+        Returns whether a new instance was actually launched (False only
+        for the ``Forbid`` skip), so a caller accounting for launches --
+        the retry metric -- does not count a swallowed one.
+        """
         if self.running_jobs[job.name]:
             logger.warning(
                 "Job %s: still running and concurrencyPolicy is %s",
@@ -1606,7 +1679,7 @@ class Cron:
             if job.concurrencyPolicy == "Allow":
                 pass
             elif job.concurrencyPolicy == "Forbid":
-                return
+                return False
             elif job.concurrencyPolicy == "Replace":
                 for running_job in self.running_jobs[job.name]:
                     # mark before cancelling so the reaper treats the forced
@@ -1621,6 +1694,7 @@ class Cron:
         self.running_jobs[job.name].append(running_job)
         logger.info("Job %s spawned", job.name)
         self._jobs_running.set()
+        return True
 
     # continually watches for the running jobs, clean them up when they exit
     async def _wait_for_running_jobs(self) -> None:
@@ -1671,6 +1745,9 @@ class Cron:
         # history (for the dashboard's history/stats view); in-memory only.
         self.last_run[name] = info
         self.run_history[name].append(info)
+        # every recorded run also feeds the Prometheus counters/histogram,
+        # so /metrics and the run-history API always agree on outcomes.
+        self.metrics.job_run_recorded(name, info.outcome, info.duration)
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
         jobs_list = self.running_jobs[job.config.name]
@@ -1705,6 +1782,13 @@ class Cron:
             )
             await self.cancel_job_retries(job.config.name)
             return
+
+        if job.start_failed:
+            # counted separately from ordinary failures: a command that
+            # cannot launch at all (recorded below as a failure with the
+            # conventional exit code 127) is usually a deploy/config bug,
+            # not a job bug.
+            self.metrics.job_start_failed(job.config.name)
 
         fail_reason = job.fail_reason
         logger.info(
@@ -1749,6 +1833,7 @@ class Cron:
         # Handle retries...
         state = job.retry_state
         if state is None or state.cancelled:
+            self.metrics.job_permanent_failure(job.config.name)
             await job.report_permanent_failure()
             return
 
@@ -1766,6 +1851,7 @@ class Cron:
             and retry["maximumRetries"] != -1
         ):
             await self.cancel_job_retries(job.config.name)
+            self.metrics.job_permanent_failure(job.config.name)
             await job.report_permanent_failure()
         else:
             retry_delay = state.next_delay()
@@ -1843,7 +1929,11 @@ class Cron:
                 recheck,
             )
             await asyncio.sleep(recheck)
-        await self.maybe_launch_job(job)
+        # counted on the launch result (not where the retry is armed) so the
+        # counter reports retries actually launched -- net of cancellations,
+        # abandonments, and a concurrencyPolicy=Forbid skip.
+        if await self.maybe_launch_job(job):
+            self.metrics.job_retry_launched(job_name)
 
     def _cluster_owner_moved(self, job: JobConfig) -> bool:
         """Whether another node is *positively* identified as ``job``'s owner.

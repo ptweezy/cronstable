@@ -31,6 +31,7 @@ operator-facing walkthrough.
 | `yacron2/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). |
 | `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
+| `yacron2/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
@@ -42,6 +43,9 @@ so `backends/` never enters the import graph unless `cluster.backend` selects a
 lease backend. `cluster.py` depends on `config` and `fingerprint` only; both
 lease backends depend on `config` and `leadership`; `config.py` has no
 dependency on `cron.py` or `job.py`.
+`prometheus.py` is a leaf module like `statsd.py`: it imports only
+`yacron2.version` at module scope, `cron.py` imports it, and its renderer
+late-imports `yacron2.cron` helpers at scrape time to break the cycle.
 `platform.py` is a leaf module with no yacron2 dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
 
@@ -642,6 +646,23 @@ endpoint with `StatsdClientProtocol`, which sends in `connection_made` and is
 immediately closed. Send failures are caught as `OSError` at the `RunningJob`
 call sites and logged as warnings so telemetry never crashes the scheduler. See
 [Metrics with statsd](Metrics-with-Statsd).
+
+## Prometheus metrics
+
+The pull-side sibling of statsd is the `PrometheusMetrics` registry in
+`yacron2/prometheus.py`, owned by the `Cron` object rather than the web app, so
+counters survive web-app restarts and cluster-manager rebuilds across reloads
+(they reset only on process restart; `update_config` prunes series for jobs
+removed from the config). Cumulative state is recorded by synchronous in-memory
+hooks in `cron.py`: `_record_run` (run outcomes and the duration histogram),
+`schedule_retry_job` (retries actually launched), the permanent-failure
+branches, `update_config` (reload success/failure), and the leadership- and
+quorum-transition latches. Gauges are not stored at all: `Cron._web_metrics`
+calls the renderer, which computes them at scrape time from `cron_jobs`,
+`running_jobs`, `last_run`, and `cluster_manager.view_dict()`. If a backend
+read fails during a scrape, the cluster block degrades to
+`yacron2_cluster_enabled` alone instead of failing the whole scrape. See
+[Metrics with Prometheus](Metrics-with-Prometheus).
 
 ## Concurrency model summary
 

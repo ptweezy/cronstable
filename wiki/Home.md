@@ -1,6 +1,6 @@
 # yacron2 Wiki
 
-yacron2 is a cron replacement built on asyncio that runs natively on Linux, macOS, and Windows. Its "crontab" is written in YAML ([classic Vixie crontabs](Classic-Crontabs) are accepted as-is too), so jobs, schedules, and behavior are all declared in configuration: it reports job failures by email, Sentry, or shell command; retries failing jobs with exponential backoff; emits job metrics to statsd; and can expose an optional HTTP control API and a built-in [web dashboard](Web-Dashboard) to watch, run, cancel, and tail jobs live. When one instance is not enough, opt-in [clustering and leader election](Clustering-and-Leader-Election) lets several replicas run one config without double-running jobs, coordinated by mTLS gossip or fenced through a Kubernetes or etcd lease. It runs in the foreground, logs to stdout/stderr, and supports arbitrary timezones, which suits Docker, Kubernetes, and 12-factor deployments. yacron2 is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
+yacron2 is a cron replacement built on asyncio that runs natively on Linux, macOS, and Windows. Its "crontab" is written in YAML ([classic Vixie crontabs](Classic-Crontabs) are accepted as-is too), so jobs, schedules, and behavior are all declared in configuration: it reports job failures by email, Sentry, or shell command; retries failing jobs with exponential backoff; emits job metrics to statsd and serves them natively to Prometheus; and can expose an optional HTTP control API and a built-in [web dashboard](Web-Dashboard) to watch, run, cancel, and tail jobs live. When one instance is not enough, opt-in [clustering and leader election](Clustering-and-Leader-Election) lets several replicas run one config without double-running jobs, coordinated by mTLS gossip or fenced through a Kubernetes or etcd lease. It runs in the foreground, logs to stdout/stderr, and supports arbitrary timezones, which suits Docker, Kubernetes, and 12-factor deployments. yacron2 is a fork of [gjcarneiro/yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
 ## Contents
 
@@ -31,6 +31,7 @@ yacron2 is a cron replacement built on asyncio that runs natively on Linux, macO
 
 - [Reporting (Mail, Sentry, Shell)](Reporting): `onFailure`/`onSuccess` reporting via email, Sentry, and shell, with jinja2 templating.
 - [Metrics with statsd](Metrics-with-Statsd): Emitting start/stop/success/duration metrics over UDP to statsd.
+- [Metrics with Prometheus](Metrics-with-Prometheus): The `/metrics` endpoint on the web API, with job, scheduler, and cluster metrics in Prometheus or OpenMetrics format.
 - [HTTP Control API](HTTP-API): The optional REST interface for status and on-demand job starts.
 - [Web Dashboard](Web-Dashboard): The built-in browser dashboard: live status, live log tailing, run history, and timezone-aware schedule previews.
 

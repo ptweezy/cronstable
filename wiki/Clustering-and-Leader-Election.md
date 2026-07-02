@@ -775,20 +775,31 @@ node sees a majority"; on a lease backend it means "this node has a fresh read o
 the store"). This section covers the gossip signals; the lease equivalents are in
 [Monitoring the lease backends](#monitoring-the-lease-backends).
 
-yacron2 does not export cluster state to statsd (the
-[statsd integration](Metrics-with-Statsd) is per-job); instead every signal you
-would alert on is a pre-derived field on `GET /cluster`, so the simplest monitor
-probes that endpoint on each replica. Useful alerts:
+Every signal you would alert on is exported natively at `GET /metrics` (see
+[Metrics with Prometheus](Metrics-with-Prometheus)) as `yacron2_cluster_*`
+series -- `yacron2_cluster_quorate`, `yacron2_cluster_is_leader`,
+`yacron2_cluster_conflict{kind}`, `yacron2_cluster_peers{status}`,
+`yacron2_cluster_size` / `yacron2_cluster_quorum`, plus the
+`yacron2_cluster_leader_transitions_total` and
+`yacron2_cluster_quorum_transitions_total` counters -- each mirroring a
+pre-derived field on `GET /cluster` (the
+[statsd integration](Metrics-with-Statsd) is still per-job). Useful alerts:
 
-| Alert when | Field(s) | Means |
-| --- | --- | --- |
-| `quorate` is `false` for more than a few `interval`s | `quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
-| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
-| `agreed` peers fall below `quorum` | count of `peers[].status == "agreed"` vs `quorum` | the cluster is one failure from losing quorum (this node counts itself toward quorum, so `quorum − 1` agreed peers is the last quorate state; any fewer duplicates the `quorate` alert) |
-| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
+| Alert when | Field(s) | Metric(s) | Means |
+| --- | --- | --- | --- |
+| `quorate` is `false` for more than a few `interval`s | `quorate` | `yacron2_cluster_quorate` | this node cannot see a majority, so its `Leader` jobs are standing down |
+| `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | `yacron2_cluster_conflict{kind}` (`kind="nodename"` / `"size"` / `"policy"`) | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
+| `agreed` peers fall below `quorum` | count of `peers[].status == "agreed"` vs `quorum` | `yacron2_cluster_peers{status="agreed"}` vs `yacron2_cluster_quorum` | the cluster is one failure from losing quorum (this node counts itself toward quorum, so `quorum − 1` agreed peers is the last quorate state; any fewer duplicates the `quorate` alert) |
+| any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | `yacron2_cluster_peers{status="untrusted"}` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
 
-A blackbox / JSON-exporter probe (Prometheus `json_exporter`, a Nagios check,
-etc.) scraping `GET /cluster` on every replica covers all of these. The same
+The [example alerts](Metrics-with-Prometheus#example-alerts) on the Prometheus
+page include the quorum rule and the split-brain check
+(`sum(yacron2_cluster_is_leader) > 1`). A blackbox / JSON-exporter probe
+(Prometheus `json_exporter`, a Nagios check, etc.) scraping `GET /cluster` on
+every replica remains a valid alternative, and is the only source for the
+detail fields the metrics do not carry (per-peer `last_seen` and `last_error`,
+`conflict_names`, `conflicting_sizes`, `conflicting_policies`; the leader's
+name surfaces only as the `yacron2_cluster_leader_info{leader}` label). The same
 transitions are also **logged** (leadership and quorum changes, conflict
 onset at `ERROR` (clear at `INFO`), and per-peer `untrusted`/`unreachable`/drift
 at `WARNING`), so a log-based alert is a viable second source.
