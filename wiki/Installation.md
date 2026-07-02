@@ -57,8 +57,10 @@ with the interpreter on disk and never self-extract.
 ## Run with Docker
 
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
-`linux/arm/v7`, `linux/ppc64le` and `linux/s390x`) images are
-published to the GitHub Container Registry on every release. Mount your crontab
+`linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`) images are
+published on every release to two registries: the GitHub Container Registry
+(`ghcr.io/ptweezy/yacron2`) and Docker Hub (`docker.io/ptweezy/yacron2`). The
+images are identical; pull from whichever you prefer. Mount your crontab
 and run:
 
 ```shell
@@ -88,6 +90,41 @@ self-contained venv into the runtime stage) and sets `PYTHONUNBUFFERED=1` and
 Kubernetes/Docker setup (read-only root filesystem, dropped capabilities,
 `fsGroup`).
 
+### Distro variants
+
+The default `latest` (and `<version>`) image is built on **Debian** (slim). The
+same release is also published on several other bases, so you can match a
+specific one to your environment: a familiar userland, an image-provenance
+policy that mandates a particular vendor, or the smallest possible image. Each
+variant adds a `-<distro>` suffix to the tag (and the default Debian image is
+also available explicitly as `-debian`):
+
+| Tag suffix | Base image | Python | Notes |
+| --- | --- | --- | --- |
+| *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
+| `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
+| `-ubuntu` | `ubuntu:24.04` | 3.12 | Ubuntu LTS userland. |
+| `-rhel` | UBI 9 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
+| `-fedora` | `fedora:41` | 3.13 | Leading-edge RPM userland. |
+| `-opensuse` | `opensuse/leap:15.6` | 3.11 | SUSE / SLES family. |
+| `-amazonlinux` | `amazonlinux:2023` | 3.11 | AWS-centric deployments. |
+| `-distroless` | `gcr.io/distroless/python3` | 3.11 | No shell or package manager; minimal attack surface. |
+
+```shell
+# e.g. the Alpine variant, pinned to a version:
+docker run --rm \
+  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
+  ghcr.io/ptweezy/yacron2:1.0.14-alpine
+```
+
+yacron2 is a pure-Python app that supports any Python >= 3.10, so behavior is
+identical across variants. Pick the base, not the interpreter version. The
+Debian default covers the most architectures; each variant covers the arches
+its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
+openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon
+Linux covers `amd64` and `arm64`). All variants share the same non-root,
+read-only-friendly hardening as the default image.
+
 ## Install using pip
 
 yacron2 requires Python >= 3.10. Install it in a virtual environment:
@@ -101,6 +138,12 @@ pip install yacron2
 This installs the `yacron2` console script (entry point
 `yacron2.__main__:main`). For systems with an older Python, use the standalone
 binary instead.
+
+If you plan to use the Kubernetes leadership backend with the optional native
+client library (`cluster.kubernetes.clientLibrary: native`), install the extra:
+`pip install "yacron2[kubernetes]"`. The default HTTP transport needs no extra
+dependency; see
+[Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ## Install using pipx
 

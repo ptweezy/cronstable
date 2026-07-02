@@ -23,10 +23,15 @@ The file *name* decides whenever it can:
 | Name | Treated as |
 | --- | --- |
 | `*.crontab`, `*.cron` (case-insensitive) | classic crontab |
-| a file named exactly `crontab` (case-insensitive), e.g. `/etc/crontab` or a `crontab -l > crontab` export | classic crontab |
+| a file named exactly `crontab` (case-insensitive), e.g. a `crontab -l > crontab` export | classic crontab |
 | `*.yml`, `*.yaml` | YAML, always; never content-sniffed |
-| anything else, passed explicitly with `-c` | content-sniffed (below) |
+| anything else, passed explicitly with `-c` or pulled in with `include:` | content-sniffed (below) |
 | anything else, inside a config directory | skipped, as before |
+
+Name recognition also fires on `/etc/crontab`, but note that *system*
+crontabs (`/etc/crontab`, `/etc/cron.d`) carry a sixth user column that
+yacron2 does not parse; only the five-field *user*-crontab format runs as-is
+(see [deviations](#deviations-from-cron)).
 
 In a config directory, crontab-named files load right alongside
 `*.yml`/`*.yaml` files, in the same name-sorted order, and the usual skip
@@ -144,7 +149,7 @@ defaults never cross files (see
 ### Job names
 
 Entries are named `<file name>:<line number>`, for example
-`legacy.crontab:7`. The name is unique within a file, stable across reloads
+`legacy.crontab:9`. The name is unique within a file, stable across reloads
 while the file is unchanged, shows up in logs, the dashboard, and the HTTP
 API like any other job name, and points you straight at the source line.
 Inserting or removing lines renumbers the entries below the edit, which

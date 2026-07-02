@@ -41,10 +41,11 @@ the [Configuration Reference](Configuration-Reference).
 The argument may be a single file or a directory:
 
 - **File:** parsed directly. YAML by default; a classic crontab when the name
-  says so (`*.crontab`, `*.cron`, or a file named `crontab`, e.g.
-  `-c /etc/crontab`) or, for a file with a neutral name such as
+  says so (`*.crontab`, `*.cron`, or a file named `crontab`, e.g. a
+  `crontab -l > crontab` export) or, for a file with a neutral name such as
   `-c /var/spool/cron/crontabs/root`, when the content unmistakably is one
-  (see [Classic Crontabs](Classic-Crontabs)). An I/O error (for example, the
+  (see [Classic Crontabs](Classic-Crontabs); the six-field *system* crontab
+  format of `/etc/crontab` is not supported). An I/O error (for example, the
   file does not exist) is reported as a configuration error and exits `1`.
 - **Directory:** each non-hidden `*.yml`/`*.yaml` or crontab-named entry is
   parsed in name-sorted order. An empty directory (or one whose files are all
