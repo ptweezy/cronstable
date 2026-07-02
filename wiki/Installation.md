@@ -4,7 +4,7 @@ This page covers every way to install yacron2: the published container image,
 `pip`, `pipx`, and the self-contained PyInstaller binaries. It documents the
 Python and platform requirements, the runtime dependencies, the exact binary
 release assets, and the writable-and-executable temp-directory requirement that
-applies to the standalone binary only. As of 1.2.0 yacron2 runs natively on
+applies to the standalone binary only. yacron2 runs natively on
 Windows in addition to Linux and macOS; see [Running on Windows](Running-on-Windows)
 for the Windows-specific details.
 
@@ -13,8 +13,8 @@ for the Windows-specific details.
 | Requirement | Value |
 | --- | --- |
 | Python (pip/pipx) | `>= 3.10`; 3.10, 3.11, 3.12, 3.13 and 3.14 are supported and tested (`requires-python = ">=3.10"`). For an older Python, use the standalone binary instead. |
-| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows — see [Running on Windows](Running-on-Windows). |
-| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z) — both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
+| Operating system | Linux, macOS, and Windows. OS-specific behavior is isolated in `yacron2/platform.py`; `grp`/`pwd` are only imported on POSIX. A few features differ on Windows; see [Running on Windows](Running-on-Windows). |
+| CPU architectures | Linux: `amd64` (x86_64), `arm64`, `i686` (32-bit x86), `armv7` (32-bit ARM), `ppc64le` (POWER) and `s390x` (IBM Z), both the container image and the prebuilt binaries; the prebuilt binaries also cover `riscv64` (glibc and musl) and `armv6` (musl-only). macOS: `amd64` and `arm64` (prebuilt binaries). Windows: `amd64` (x64) and `arm64` (ARM64) (prebuilt binaries). |
 
 Python is required only for the `pip`/`pipx` installs. The container image
 bundles its own interpreter, and the standalone binaries embed Python, so
@@ -57,8 +57,10 @@ with the interpreter on disk and never self-extract.
 ## Run with Docker
 
 Prebuilt, multi-architecture (`linux/amd64`, `linux/arm64`, `linux/386`,
-`linux/arm/v7`, `linux/ppc64le` and `linux/s390x`) images are
-published to the GitHub Container Registry on every release. Mount your crontab
+`linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`) images are
+published on every release to two registries: the GitHub Container Registry
+(`ghcr.io/ptweezy/yacron2`) and Docker Hub (`docker.io/ptweezy/yacron2`). The
+images are identical; pull from whichever you prefer. Mount your crontab
 and run:
 
 ```shell
@@ -88,6 +90,41 @@ self-contained venv into the runtime stage) and sets `PYTHONUNBUFFERED=1` and
 Kubernetes/Docker setup (read-only root filesystem, dropped capabilities,
 `fsGroup`).
 
+### Distro variants
+
+The default `latest` (and `<version>`) image is built on **Debian** (slim). The
+same release is also published on several other bases, so you can match a
+specific one to your environment: a familiar userland, an image-provenance
+policy that mandates a particular vendor, or the smallest possible image. Each
+variant adds a `-<distro>` suffix to the tag (and the default Debian image is
+also available explicitly as `-debian`):
+
+| Tag suffix | Base image | Python | Notes |
+| --- | --- | --- | --- |
+| *(none)* / `-debian` | `python:3.14-slim` | 3.14 | Default. Widest architecture coverage. |
+| `-alpine` | `python:3.14-alpine` | 3.14 | musl libc; smallest image. |
+| `-ubuntu` | `ubuntu:24.04` | 3.12 | Ubuntu LTS userland. |
+| `-rhel` | UBI 9 (`ubi-minimal`) | 3.12 | Red Hat base for RHEL / OpenShift. |
+| `-fedora` | `fedora:41` | 3.13 | Leading-edge RPM userland. |
+| `-opensuse` | `opensuse/leap:15.6` | 3.11 | SUSE / SLES family. |
+| `-amazonlinux` | `amazonlinux:2023` | 3.11 | AWS-centric deployments. |
+| `-distroless` | `gcr.io/distroless/python3` | 3.11 | No shell or package manager; minimal attack surface. |
+
+```shell
+# e.g. the Alpine variant, pinned to a version:
+docker run --rm \
+  -v "$PWD/yacron2tab.yaml:/etc/yacron2.d/yacron2tab.yaml:ro" \
+  ghcr.io/ptweezy/yacron2:1.0.14-alpine
+```
+
+yacron2 is a pure-Python app that supports any Python >= 3.10, so behavior is
+identical across variants. Pick the base, not the interpreter version. The
+Debian default covers the most architectures; each variant covers the arches
+its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
+openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon
+Linux covers `amd64` and `arm64`). All variants share the same non-root,
+read-only-friendly hardening as the default image.
+
 ## Install using pip
 
 yacron2 requires Python >= 3.10. Install it in a virtual environment:
@@ -101,6 +138,12 @@ pip install yacron2
 This installs the `yacron2` console script (entry point
 `yacron2.__main__:main`). For systems with an older Python, use the standalone
 binary instead.
+
+If you plan to use the Kubernetes leadership backend with the optional native
+client library (`cluster.kubernetes.clientLibrary: native`), install the extra:
+`pip install "yacron2[kubernetes]"`. The default HTTP transport needs no extra
+dependency; see
+[Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ## Install using pipx
 
@@ -145,19 +188,19 @@ following assets, built natively on a matching runner:
 
 The glibc Linux builds target glibc 2.39 (the Ubuntu 24.04 runner's libc) and
 work on any Linux host with glibc 2.39 or newer on the matching CPU. The musl builds
-(added in 1.0.8) are built inside an Alpine container for musl/Alpine hosts.
-The `i686` and `armv7` builds (added in 1.1.3) and the `ppc64le` and `s390x`
-builds (added in 1.1.4) — both glibc and musl — extend the 64-bit `amd64`/`arm64`
+are built inside an Alpine container for musl/Alpine hosts.
+The `i686` and `armv7` builds and the `ppc64le` and `s390x`
+builds, both glibc and musl, extend the 64-bit `amd64`/`arm64`
 binaries to 32-bit x86, 32-bit ARM, POWER and IBM Z hosts; they build inside a
 container (`i686` natively on the x86-64 runner, the rest under QEMU emulation).
-The `riscv64` builds (added in 1.1.6) cover 64-bit RISC-V for both glibc and
+The `riscv64` builds cover 64-bit RISC-V for both glibc and
 musl, and the musl-only `armv6` build extends to older 32-bit ARM (e.g.
-Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds (added in
-1.0.10) cover both Apple Silicon and Intel. The Windows binaries are
+Raspberry Pi 1/Zero); there is no glibc `armv6` build. macOS builds cover both
+Apple Silicon and Intel. The Windows binaries are
 self-contained `.exe` files for x64 (`amd64`) and ARM64; like the other
 binaries they embed Python, so Python is not required on the target.
 
-Download and run (glibc amd64 Linux shown — append `-musl` on Alpine, or use
+Download and run (glibc amd64 Linux shown; append `-musl` on Alpine, or use
 `yacron2-macos-<arch>` on a Mac):
 
 ```shell
@@ -168,7 +211,7 @@ chmod +x yacron2
 ```
 
 On Windows, download `yacron2-windows-amd64.exe` (or `yacron2-windows-arm64.exe`
-on ARM64) and run it directly — no `chmod` is needed:
+on ARM64) and run it directly; no `chmod` is needed:
 
 ```powershell
 .\yacron2-windows-amd64.exe --version
@@ -176,23 +219,22 @@ on ARM64) and run it directly — no `chmod` is needed:
 
 ### macOS signing and notarization
 
-Since 1.0.11 the macOS binaries are Developer ID code-signed (hardened runtime)
+The macOS binaries are Developer ID code-signed (hardened runtime)
 and notarized by Apple, so Gatekeeper accepts them and they run without first
-clearing the quarantine attribute. The earlier 1.0.10 macOS binaries were
-unsigned and required `xattr -d com.apple.quarantine` before first run; that
-step is no longer needed.
+clearing the quarantine attribute; no `xattr -d com.apple.quarantine` step is
+needed before first run.
 
 ### Standalone binary temp-directory requirement
 
 The standalone binary is a self-extracting executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared
 libraries from there. It therefore needs a temporary directory that is both
-**writable and executable** (documented in 1.0.9). On an ordinary system the
+**writable and executable**. On an ordinary system the
 default `/tmp` already satisfies this, so no extra setup is required.
 
 This matters only when you run the binary under a **read-only root filesystem**
 (for example, a hardened container). With the root filesystem read-only, `/tmp`
-is read-only too, and the binary aborts at startup — `Could not create temporary
+is read-only too, and the binary aborts at startup: `Could not create temporary
 directory`, or `Error loading shared library …: Operation not permitted`. Give
 it a small writable *and executable* temp mount and it runs:
 
@@ -207,11 +249,11 @@ docker run --rm --read-only \
 
 Remedies:
 
-* **Docker** — mount an `rw,exec` tmpfs at `/tmp`. `--tmpfs` defaults to
+* **Docker**: mount an `rw,exec` tmpfs at `/tmp`. `--tmpfs` defaults to
   `noexec`, which fails; pass `exec` explicitly as above.
-* **Kubernetes** — mount an `emptyDir` at `/tmp` (writable and executable by
+* **Kubernetes**: mount an `emptyDir` at `/tmp` (writable and executable by
   default; use `medium: Memory` for a tmpfs).
-* **Any host** — point the binary at another writable, executable directory
+* **Any host**: point the binary at another writable, executable directory
   with `TMPDIR=/path`.
 
 This requirement is unique to the standalone binary. The published container
@@ -235,7 +277,7 @@ yacron2 -c /etc/yacron2.d
 The `-c` default is platform-specific: `/etc/yacron2.d` on POSIX, and
 `%APPDATA%\yacron2` on Windows (e.g. `C:\Users\<you>\AppData\Roaming\yacron2`,
 falling back to the user profile `~` if `APPDATA` is unset). The default `shell`
-also differs — `/bin/sh` on POSIX, and on Windows an empty default that runs a
+also differs: `/bin/sh` on POSIX, and on Windows an empty default that runs a
 string `command` through `%ComSpec%` (`cmd.exe`). On Windows, press Ctrl-C (or
 Ctrl-Break) to stop yacron2 gracefully; it finishes running jobs first, just as
 SIGTERM does on POSIX. Note that per-job `user`/`group` switching and `unix://`

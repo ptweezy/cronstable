@@ -7,8 +7,7 @@
 <title>yacron2 // job scheduler</title>
 <style>
   /* ============================================================= *
-   *  yacron2 dashboard — retro-CRT theme, single self-contained   *
-   *  page.                                                        *
+   *  yacron2 dashboard                                     *
    * ============================================================= */
 
   /* ---------- phosphor palettes ---------- */
@@ -73,6 +72,22 @@
     --accent:   #79c0ff;
     --glow:     rgba(121, 192, 255, .0);
     --selbg:    rgba(121, 192, 255, .12);
+  }
+  /* Carolina Blue CRT phosphor — #4B9CD3 is the hero (seated as --fg-dim) */
+  html[data-theme="carolina"] {
+    --bg:       #04070b;
+    --bg2:      #060c13;
+    --panel:    #081019;
+    --panel2:   #0b1620;
+    --hover:    #0f1e2b;
+    --border:   #173347;
+    --border2:  #22506e;
+    --fg:       #5cabde;
+    --fg-dim:   #4b9cd3;
+    --fg-faint: #5a90b0;
+    --accent:   #b5ddf5;
+    --glow:     rgba(92, 171, 222, .5);
+    --selbg:    rgba(75, 156, 211, .12);
   }
 
   * { box-sizing: border-box; }
@@ -152,8 +167,9 @@
     border-bottom: 1px solid var(--border);
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-  .brand .mark { color: var(--fg); font-weight: 700; }
-  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; }
+  .brand .mark { color: var(--fg); font-weight: 700; cursor: default; user-select: none;
+    display: inline-block; }
+  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; user-select: none; }
   .brand .tag { font-size: 11px; color: var(--fg-faint); }
   .brand .ver { font-size: 10.5px; color: var(--fg-faint); }
   .spacer { flex: 1; }
@@ -203,7 +219,9 @@
   }
 
   /* ---------- layout ---------- */
-  main { max-width: var(--maxw); margin: 0 auto; padding: 16px 18px 60px; }
+  /* --colsw widens the page by the net width of opted-in extra table columns
+     (set by applyCols); the classic column set leaves it at 0. */
+  main { max-width: calc(var(--maxw) + var(--colsw, 0px)); margin: 0 auto; padding: 16px 18px 60px; transition: max-width .15s ease; }
   .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   .search {
     flex: 1; min-width: 200px; max-width: 360px;
@@ -233,12 +251,20 @@
 
   /* ---------- table ---------- */
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  /* a card whose data could not be refreshed (e.g. /cluster 5xx or a thrown
+     fetch/parse): dim the body and tint the summary so the panel reads as
+     stale rather than silently freezing on its last healthy frame. */
+  .card.stale { opacity: .6; }
+  .card.stale #clusterSummary { color: var(--fail); }
   .card-label {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 12px; border-bottom: 1px solid var(--border);
     color: var(--fg-faint); font-size: 10.5px; letter-spacing: 1px; text-transform: uppercase;
   }
   table { width: 100%; border-collapse: collapse; }
+  /* horizontal-scroll fallback for the jobs table when the enabled columns
+     outgrow even the widened page (the .card's own overflow stays hidden) */
+  .twrap { overflow-x: auto; }
   thead th {
     text-align: left; font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase;
     color: var(--fg-faint); padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
@@ -275,9 +301,41 @@
   .muted { color: var(--fg-dim); }
   .faint { color: var(--fg-faint); }
   .nowrap { white-space: nowrap; }
+
+  /* per-job cluster owner (distribution: spread) — the Owner column and its
+     header only appear once a job carries ownership data (table.show-owner). */
+  .col-owner { display: none; }
+  table.show-owner .col-owner { display: table-cell; }
+  /* configurable columns: every toggleable column starts hidden and applyCols()
+     stamps a show-* class on the table per the "cols" pref (the defaults
+     reproduce the classic layout). Owner stays data-driven, not pref-driven. */
+  .col-sched, .col-last, .col-dur, .col-next, .col-trend,
+  .col-policy, .col-tz, .col-nextat, .col-rate { display: none; }
+  table.show-sched .col-sched, table.show-last .col-last, table.show-dur .col-dur,
+  table.show-next .col-next, table.show-trend .col-trend, table.show-policy .col-policy,
+  table.show-tz .col-tz, table.show-nextat .col-nextat, table.show-rate .col-rate { display: table-cell; }
+  .owner {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+    padding: 1px 7px; border-radius: var(--radius); white-space: nowrap;
+    background: var(--bg2); border: 1px solid var(--border); color: var(--fg-dim);
+  }
+  .owner .nd { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-faint); flex: none; }
+  /* this node owns the job — highlight in the accent colour so an operator can
+     see at a glance which jobs land on the node they're looking at. */
+  .owner.self { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .owner.self .nd { background: var(--accent); }
+  .owner.none { color: var(--fg-faint); border-style: dashed; }      /* no quorum: nobody owns it */
+  .owner.every .nd { background: var(--ok); }                        /* EveryNode: runs on all */
+  /* per-node ownership tally in the cluster panel (spread only) */
+  .col-owns { display: none; text-align: right; }
+  #clusterTable.show-owns .col-owns { display: table-cell; }
   .exit { font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-left: 6px; }
   .exit.zero { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
   .exit.nonzero { color: var(--fail); background: color-mix(in srgb, var(--fail) 16%, transparent); }
+  /* success-rate column (share of ok runs in the recent-history tail) */
+  .rate.ok { color: var(--ok); }
+  .rate.warn { color: var(--pending); }
+  .rate.fail { color: var(--fail); }
 
   /* sparkline */
   .spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 16px; }
@@ -347,6 +405,7 @@
   }
   html[data-theme="amber"] .term { background: #070502; color: #e8c98a; }
   html[data-theme="green"] .term { background: #030806; color: #b6ffce; }
+  html[data-theme="carolina"] .term { background: #030609; color: #9fd0ee; }
   .term.nowrap { white-space: pre; word-break: normal; }
   .term .ln { display: block; }
   .term .ln.stderr { color: var(--fail); }
@@ -440,10 +499,356 @@
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
   @media (max-width: 820px) {
-    .col-cmd, .col-sched, .col-dur, .col-next, .col-trend { display: none; }
+    /* narrow screens keep the essential set (status / job / last run / actions)
+       regardless of which columns were opted into on desktop */
+    table.show-sched .col-sched, table.show-dur .col-dur, table.show-next .col-next,
+    table.show-trend .col-trend, table.show-policy .col-policy, table.show-tz .col-tz,
+    table.show-nextat .col-nextat, table.show-rate .col-rate,
+    table.show-owner .col-owner { display: none; }
     .summary .pill.opt { display: none; }
     .clock, .brand .ver { display: none; }
   }
+  /* cluster panel */
+  .cdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--fg-faint); }
+  .cdot.agreed { background: #3fb950; }
+  .cdot.syncing { background: #d29922; }
+  .cdot.drifted { background: #f85149; }
+  .cdot.untrusted { background: #f85149; }
+  .cdot.conflict { background: #f85149; }
+  .cdot.unreachable { background: #8b949e; }
+  .cdot.self { background: #58a6ff; }
+
+  /* ============================================================= *
+   *  add-on panels: next-fire radar · wallboard · heatmap ·        *
+   *  cluster peer swimlane                                         *
+   * ============================================================= */
+
+  /* toggled view buttons in the toolbar / cluster header */
+  .ghostbtn.on { background: var(--selbg); }
+  .ghostbtn.mini { height: 24px; min-width: 0; font-size: 10.5px; padding: 0 8px; }
+
+  /* jobs-table column picker (anchored in the card header; the card-label's
+     uppercase/letter-spacing styling is reset inside the menu) */
+  .colwrap { position: relative; display: inline-flex; }
+  /* .card clips overflow for its rounded corners, which would truncate the
+     popover on a short table — lift the clip only while the menu is open */
+  .card:has(.colmenu.open) { overflow: visible; }
+  .colmenu {
+    display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 40; min-width: 180px;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius);
+    box-shadow: var(--shadow-lg); padding: 5px; flex-direction: column; gap: 1px;
+    text-transform: none; letter-spacing: normal; font-size: 12px;
+  }
+  .colmenu.open { display: flex; }
+  .colmenu label { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: var(--radius); cursor: pointer; color: var(--fg-dim); white-space: nowrap; }
+  .colmenu label:hover { background: var(--hover); color: var(--fg); }
+  .colmenu input[type=checkbox] { accent-color: var(--accent); margin: 0; }
+
+  /* ---------- next-fire radar ---------- */
+  .radar { margin-bottom: 12px; }
+  .radar-body { display: flex; gap: 14px; align-items: stretch; padding: 10px 12px; flex-wrap: wrap; }
+  .radar-feed { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; flex: 1 1 260px; }
+  .radar-feed li { display: inline-flex; align-items: center; gap: 7px; padding: 3px 9px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); cursor: pointer; white-space: nowrap; }
+  .radar-feed li:hover { background: var(--hover); border-color: var(--border2); }
+  .radar-feed .cd { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+  .radar-feed .nm { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; max-width: 170px; }
+  .radar-feed .empty { color: var(--fg-faint); font-style: italic; cursor: default; }
+  .radar-track { position: relative; flex: 1 1 320px; min-width: 260px; height: 44px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); overflow: hidden; }
+  .rt-grid { position: absolute; top: 0; bottom: 0; }
+  .rt-grid i { position: absolute; top: 0; bottom: 14px; width: 1px; background: var(--border); }
+  .rt-grid b { position: absolute; bottom: 1px; left: 2px; font-size: 9px; font-weight: 400; color: var(--fg-faint); white-space: nowrap; }
+  .rt-mk { position: absolute; top: 3px; bottom: 15px; width: 2px; margin-left: -1px; background: var(--accent); cursor: pointer; border-radius: 1px; }
+  .rt-mk:hover { background: var(--fg); box-shadow: 0 0 6px var(--glow); }
+
+  /* ---------- wallboard / TV kiosk ---------- */
+  .wallboard { position: fixed; inset: 0; z-index: 8000; background: var(--bg); display: flex; flex-direction: column; }
+  body.fx .wallboard { background: radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 82%); }
+  .wb-grid { flex: 1; min-height: 0; overflow: auto; padding: 18px; display: grid; gap: 12px;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); grid-auto-rows: minmax(98px, auto); align-content: start; }
+  .wb-tile { border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); padding: 12px 14px;
+    display: flex; flex-direction: column; gap: 5px; cursor: pointer; overflow: hidden; }
+  .wb-tile:hover { border-color: var(--border2); }
+  .wb-glyph { font-size: 30px; line-height: 1; }
+  .wb-name { font-weight: 700; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wb-next { color: var(--fg-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; margin-top: auto; }
+  .wb-tile.st-fail { border-color: color-mix(in srgb, var(--fail) 55%, var(--border)); }
+  .wb-tile.st-fail .wb-glyph { color: var(--fail); }
+  .wb-tile.st-run .wb-glyph { color: var(--run); }
+  .wb-tile.st-ok .wb-glyph { color: var(--ok); }
+  .wb-tile.st-pending .wb-glyph { color: var(--pending); }
+  .wb-tile.st-cancelled .wb-glyph { color: var(--cancelled); }
+  .wb-tile.st-disabled { opacity: .55; }
+  .wb-tile.st-disabled .wb-glyph { color: var(--disabled); }
+  body.fx .wb-tile.st-fail { box-shadow: 0 0 16px color-mix(in srgb, var(--fail) 30%, transparent); }
+  .wb-tile.flip { animation: wbflip .7s ease-out; }
+  @keyframes wbflip { 0% { background: var(--fail); } 100% { background: var(--panel); } }
+  .wb-foot { display: flex; align-items: center; gap: 16px; padding: 10px 18px; border-top: 1px solid var(--border);
+    background: var(--panel); font-size: 13px; flex-wrap: wrap; }
+  .wb-stat { color: var(--fg-dim); } .wb-stat b { color: var(--fg); font-size: 16px; margin-right: 4px; }
+  .wb-stat.fail b { color: var(--fail); } .wb-stat.run b { color: var(--run); } .wb-stat.ok b { color: var(--ok); }
+  .wb-stat.cl { color: var(--fg-faint); }
+  .wb-clock { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+  /* stale/no-signal treatment -- the header connection dot is hidden in TV
+     mode, so when polls stop landing the wallboard itself must go loud
+     (banner + dimmed tiles) instead of freezing on its last healthy frame.
+     Mirrors the cluster card's .card.stale path. */
+  .wb-nosignal { display: none; position: relative; z-index: 5;
+    align-items: center; justify-content: center; padding: 10px 18px;
+    font-size: 15px; font-weight: 700; letter-spacing: 2px;
+    color: var(--fail); background: color-mix(in srgb, var(--fail) 14%, var(--bg));
+    border-bottom: 1px solid var(--fail); }
+  .wallboard.stale .wb-nosignal { display: flex; }
+  .wallboard.stale .wb-grid, .wallboard.stale .wb-foot { opacity: .45; }
+  body.fx .wallboard.stale .wb-nosignal { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
+  body.tv > header, body.tv > main { display: none; }
+  /* Surfaces the app can open while the wallboard is up -- the auto-opened 401
+     token modal, the ⌘K palette, the drawer, toasts -- must stack ABOVE its
+     z-index 8000. At their base 40/50/60/80 they would render behind it while
+     keeping keyboard focus: an invisible focus trap on a kiosk. Same relative
+     order as the base stack, lifted wholesale above the wallboard. */
+  body.tv .scrim { z-index: 8040; }
+  body.tv .drawer { z-index: 8050; }
+  body.tv .overlay { z-index: 8060; }
+  body.tv .toasts { z-index: 8080; }
+  @media (prefers-reduced-motion: reduce) { .wb-tile.flip { animation: none; } }
+
+  /* ---------- activity heatmap ---------- */
+  .heat { margin-bottom: 12px; }
+  .heat-body { overflow-x: auto; padding: 8px 12px 12px; }
+  .heat-row { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 8px; margin-bottom: 2px; min-width: 520px; }
+  .heat-row.axis { color: var(--fg-faint); font-size: 9.5px; margin-bottom: 6px; }
+  .heat-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-dim); cursor: pointer; }
+  .heat-name:hover { color: var(--fg); }
+  .heat-cells, .heat-axis { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 2px; }
+  .heat-cells { height: 15px; }
+  .heat-axis span { overflow: visible; white-space: nowrap; }
+  .heat-cell { border-radius: 1px; background: color-mix(in srgb, var(--fg-faint) 12%, transparent); }
+  .heat-cell.ok { background: var(--ok); }
+  .heat-cell.fail { background: var(--fail); }
+  .heat-cell.cancelled { background: var(--cancelled); }
+  .heat-cell.act { cursor: pointer; }
+
+  /* ---------- cluster peer swimlane ---------- */
+  #swimPanel { border-top: 1px solid var(--border); padding: 10px 12px; }
+  #swimPanel .swim-note { color: var(--fg-faint); font-style: italic; font-size: 11px; }
+  #swimPanel svg { width: 100%; display: block; }
+  #swimPanel .lane-bg { fill: var(--bg2); }
+  #swimPanel .seg { shape-rendering: crispEdges; }
+  #swimPanel .qlost { fill: color-mix(in srgb, var(--fail) 15%, transparent); }
+  #swimPanel .lead { stroke: #ffbf47; stroke-width: 1.5; }
+  #swimPanel .lbl { fill: var(--fg-dim); font-size: 10px; }
+  #swimPanel .axl { fill: var(--fg-faint); font-size: 9px; }
+
+  /* ---------- fleet view (jobs × nodes matrix) ---------- */
+  #fleetPanel { border-top: 1px solid var(--border); padding: 8px 12px; }
+  #fleetPanel .fleetbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; font-size: 11px; color: var(--fg-dim); }
+  #fleetPanel .fleetbar .warn { color: var(--fail); }
+  #fleetPanel .fleetwrap { overflow: auto; max-height: 48vh; }
+  #fleetPanel table { border-collapse: collapse; min-width: 100%; }
+  #fleetPanel th, #fleetPanel td { padding: 3px 12px; white-space: nowrap; font-size: 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  #fleetPanel thead th { position: sticky; top: 0; background: var(--panel); z-index: 2; vertical-align: bottom; }
+  #fleetPanel .jobcol { position: sticky; left: 0; background: var(--panel); z-index: 1; max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+  #fleetPanel thead .jobcol { z-index: 3; }
+  #fleetPanel td.jobcol { cursor: pointer; color: var(--fg); }
+  #fleetPanel td.jobcol:hover { color: var(--accent); text-decoration: underline; }
+  #fleetPanel tr.disabled td.jobcol { color: var(--fg-faint); }
+  #fleetPanel .nname2 { font-weight: 700; }
+  #fleetPanel .nname2.selfcol { color: var(--accent); }
+  #fleetPanel .nsub { display: block; font-weight: 400; font-size: 10px; color: var(--fg-faint); }
+  #fleetPanel .nsub .cdot { margin-right: 4px; }
+  #fleetPanel .cell .age { color: var(--fg-faint); font-size: 10.5px; margin-left: 5px; }
+  #fleetPanel .cell.ok { color: var(--ok); }
+  #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
+  #fleetPanel .cell.cancelled { color: var(--fg-dim); }
+  #fleetPanel .cell.run { color: var(--accent); }
+  #fleetPanel .cell.none { color: var(--fg-faint); }
+  #fleetPanel td.owner { box-shadow: inset 2px 0 0 var(--accent); }
+  #fleetPanel .fleet-note { color: var(--fg-faint); font-size: 11px; padding: 6px 0 2px; }
+
+  /* ---------- wallboard exit affordance ---------- */
+  .wb-hint { color: var(--fg-faint); font-size: 11px; }
+  .wb-exit { font-size: 12px; }
+
+  /* ---------- BIOS-style boot / POST self-test ---------- */
+  .boot { position: fixed; inset: 0; z-index: 8500; background: var(--bg);
+    display: flex; align-items: center; justify-content: center; transition: opacity .25s ease; }
+  .boot.done { opacity: 0; }
+  .boot-log { margin: 0; width: min(660px, 92vw); font-family: var(--mono); font-size: 13px; line-height: 1.75; color: var(--fg); }
+  body.fx .boot-log { text-shadow: 0 0 6px var(--glow); }
+  .boot-banner { font-weight: 700; letter-spacing: 2px; color: var(--accent); }
+  .boot-sub { color: var(--fg-faint); text-transform: uppercase; letter-spacing: 1px; font-size: 10.5px; margin-bottom: 14px; }
+  .boot-line { white-space: pre-wrap; word-break: break-word; }
+  .boot-line .lbl { color: var(--fg-dim); }
+  .boot-line .val { color: var(--accent); }
+  /* probe rows: "label ······· result" with a CRISP CSS dotted leader. (A run
+     of middot glyphs smears into a fuzzy oval under the phosphor text glow.) */
+  .boot-probe { display: flex; align-items: baseline; white-space: nowrap; }
+  .boot-probe .lbl { flex: 0 0 auto; }
+  .boot-probe .lead { flex: 1 1 auto; align-self: center; border-bottom: 1px dotted var(--fg-faint); opacity: .5; margin: 0 10px; }
+  .boot-probe .res { flex: 0 0 auto; }
+  .boot-line .ok { color: var(--ok); }
+  .boot-line .fail { color: var(--fail); }
+  .boot-ready { margin-top: 10px; font-weight: 700; }
+  .boot-halt { margin-top: 10px; }
+  .boot-hint { margin-top: 14px; color: var(--fg-faint); font-size: 10.5px; }
+  .boot-cur { display: inline-block; width: .6em; color: var(--accent); animation: bootblink 1s steps(1) infinite; }
+  @keyframes bootblink { 0%, 50% { opacity: 1; } 50.01%, 100% { opacity: 0; } }
+
+  /* ============================================================= *
+   *  add-on features: incident cockpit · mitigate console ·        *
+   *  cron sandbox · run ledger · zen screensaver + alarm           *
+   * ============================================================= */
+
+  /* ---------- incident verdict bar ---------- */
+  .verdict {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 12px;
+    padding: 10px 14px; border-radius: var(--radius);
+    background: var(--panel); border: 1px solid var(--border);
+    border-left: 3px solid var(--fg-faint); cursor: pointer;
+  }
+  .verdict.sev-warn { border-left-color: var(--pending); background: color-mix(in srgb, var(--pending) 7%, var(--panel)); }
+  .verdict.sev-crit { border-left-color: var(--fail); background: color-mix(in srgb, var(--fail) 8%, var(--panel)); }
+  body.fx .verdict.sev-crit { box-shadow: 0 0 18px color-mix(in srgb, var(--fail) 22%, transparent); }
+  .verdict .vg { font-size: 20px; line-height: 1; flex: none; }
+  .verdict.sev-warn .vg { color: var(--pending); }
+  .verdict.sev-crit .vg { color: var(--fail); }
+  .verdict .vbody { flex: 1; min-width: 0; }
+  .verdict .vhead { font-weight: 700; color: var(--fg); letter-spacing: .3px; }
+  .verdict .vsub { color: var(--fg-dim); font-size: 11.5px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; }
+  .verdict .vact { display: flex; gap: 6px; flex: none; }
+  .verdict.sev-crit .vhead { color: var(--fail); }
+
+  /* ---------- incident timeline overlay ---------- */
+  .tlpanel {
+    place-self: start center; margin-top: 7vh; width: min(760px, 95vw);
+    max-height: 84vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden;
+  }
+  .tlhead { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .tlhead h3 { margin: 0; font-size: 14px; letter-spacing: .5px; }
+  .tlhead .tlnow { color: var(--fg-dim); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .tlbody { overflow: auto; padding: 6px 0; }
+  .tlrow { display: grid; grid-template-columns: 74px 20px 1fr auto; align-items: baseline; gap: 10px; padding: 6px 16px; cursor: pointer; border-left: 2px solid transparent; }
+  .tlrow:hover { background: var(--hover); border-left-color: var(--accent); }
+  .tlrow .tlt { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .tlrow .tlg { text-align: center; }
+  .tlrow.ok .tlg { color: var(--ok); } .tlrow.fail .tlg { color: var(--fail); } .tlrow.cancelled .tlg { color: var(--cancelled); }
+  .tlrow .tlnm { font-weight: 600; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tlrow .tlre { color: var(--fg-faint); font-size: 11px; }
+  .tlrow .tlmeta { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
+  .tlrow.corr { background: color-mix(in srgb, var(--fail) 6%, transparent); }
+  .tlempty { padding: 26px; text-align: center; color: var(--fg-faint); font-style: italic; }
+  .tlnote { padding: 8px 16px; color: var(--fg-faint); font-size: 10.5px; border-top: 1px solid var(--border); }
+
+  /* ---------- mitigate console ---------- */
+  .mitpanel { place-self: center; width: min(560px, 95vw); max-height: 86vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
+  .mithead { padding: 13px 16px; border-bottom: 1px solid var(--border); }
+  .mithead h3 { margin: 0 0 3px; font-size: 14px; }
+  .mithead p { margin: 0; color: var(--fg-dim); font-size: 11.5px; }
+  .mitlist { overflow: auto; max-height: 30vh; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+  .mitlist .mj { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .mitlist .mj .g { width: 1.2ch; text-align: center; }
+  .mitlist .mj.ok .g { color: var(--ok); } .mitlist .mj.fail .g { color: var(--fail); } .mitlist .mj.cancelled .g { color: var(--cancelled); } .mitlist .mj.run .g { color: var(--run); }
+  .mitlist .mj .mn { flex: 1; color: var(--fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mitlist .mj .ms { color: var(--fg-faint); font-size: 10.5px; }
+  .mitlog { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); padding: 8px 16px; max-height: 16vh; overflow: auto; white-space: pre-wrap; }
+  .mitact { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
+
+  /* ---------- merged multi-tail console ---------- */
+  .tailpanel { place-self: start center; margin-top: 5vh; width: min(1080px, 96vw); height: 88vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
+  .tailhead { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tailhead h3 { margin: 0; font-size: 14px; letter-spacing: .5px; flex: none; }
+  .tailadd { display: flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); }
+  .tailadd:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
+  .tailadd input { border: 0; outline: 0; background: transparent; width: 140px; }
+  .tailadd .prompt { color: var(--accent); }
+  .tailchips { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  .tailchips .none { color: var(--fg-faint); font-style: italic; font-size: 11px; }
+  .tchip { display: inline-flex; align-items: center; gap: 6px; padding: 2px 4px 2px 8px; border-radius: var(--radius);
+    background: var(--panel); border: 1px solid var(--border); font-size: 11.5px; }
+  .tchip .cdotc { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .tchip .tnm { color: var(--fg); cursor: pointer; }
+  .tchip .tnm:hover { text-decoration: underline; }
+  .tchip button { background: transparent; border: 0; color: var(--fg-faint); cursor: pointer; padding: 0 4px; font-size: 11px; }
+  .tchip button:hover { color: var(--fail); }
+  /* per-line job prefix in the merged view */
+  .term .ln .tj { font-weight: 700; margin-right: 9px; cursor: pointer; }
+  .term .ln .tj:hover { text-decoration: underline; }
+
+  /* ---------- cron sandbox ---------- */
+  .sbxpanel { place-self: start center; margin-top: 7vh; width: min(680px, 95vw); max-height: 84vh; display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
+  .sbxhead { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .sbxhead h3 { margin: 0; font-size: 14px; flex: none; }
+  .sbxin { flex: 1; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: var(--radius); background: var(--bg2); border: 1px solid var(--border); }
+  .sbxin:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--selbg); }
+  .sbxin input { flex: 1; border: 0; outline: 0; background: transparent; font-size: 13px; }
+  .sbxin .prompt { color: var(--accent); }
+  .sbxbody { overflow: auto; padding: 14px 16px; }
+  .sbx-desc { font-size: 15px; color: var(--accent); margin: 0 0 6px; }
+  .sbx-bad { color: var(--fail); }
+  .sbx-flds { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin: 10px 0; }
+  .sbx-fld { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; text-align: center; }
+  .sbx-fld .fk { font-size: 9.5px; color: var(--fg-faint); text-transform: uppercase; letter-spacing: .5px; }
+  .sbx-fld .fv { font-size: 12px; color: var(--fg); margin-top: 2px; word-break: break-all; }
+  .sbx-uses { margin: 8px 0; }
+  .sbx-uses .chip { cursor: pointer; margin: 2px 4px 2px 0; }
+  .sbx-recent { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+  .sbx-recent .chip { cursor: pointer; }
+
+  /* ---------- schedule-tab foot-gun warnings ---------- */
+  .sched-warn { margin: 12px 0; border: 1px solid color-mix(in srgb, var(--pending) 40%, var(--border)); border-radius: var(--radius); overflow: hidden; }
+  .sched-warn .sw { display: flex; gap: 9px; padding: 8px 11px; border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent); font-size: 11.5px; }
+  .sched-warn .sw:last-child { border-bottom: 0; }
+  .sched-warn .sw .wi { flex: none; }
+  .sched-warn .sw.warn { background: color-mix(in srgb, var(--pending) 8%, transparent); }
+  .sched-warn .sw.warn .wi { color: var(--pending); }
+  .sched-warn .sw.crit { background: color-mix(in srgb, var(--fail) 8%, transparent); }
+  .sched-warn .sw.crit .wi { color: var(--fail); }
+  .sched-warn .sw .wt b { color: var(--fg); }
+
+  /* ---------- run ledger: degraded chip + settings ---------- */
+  .slow-chip {
+    display: inline-flex; align-items: center; gap: 4px; margin-left: 7px;
+    font-size: 10px; padding: 0 6px; border-radius: 3px; white-space: nowrap;
+    color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border));
+  }
+  .stor { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .stor small { color: var(--fg-faint); }
+
+  /* ---------- zen all-clear screensaver (inside the wallboard) ---------- */
+  .zen { position: absolute; inset: 0; z-index: 3; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 22px;
+    background: radial-gradient(ellipse at center, var(--bg2) 0%, var(--bg) 78%);
+    cursor: pointer; }
+  .zen-field { position: relative; width: min(720px, 82vw); height: min(300px, 40vh); }
+  .zen-dot { position: absolute; width: 7px; height: 7px; border-radius: 50%; transform: translate(-50%, -50%);
+    background: var(--fg-faint); opacity: .35; transition: opacity .5s ease; }
+  .zen-dot.due { opacity: 1; box-shadow: 0 0 10px 2px var(--glow); animation: zenpulse .9s ease-out; }
+  @keyframes zenpulse { 0% { transform: translate(-50%,-50%) scale(2.6); opacity: 1; } 100% { transform: translate(-50%,-50%) scale(1); opacity: 1; } }
+  .zen-title { font-size: clamp(20px, 4vw, 40px); font-weight: 700; letter-spacing: 3px; color: var(--ok); text-align: center; }
+  body.fx .zen-title { text-shadow: 0 0 14px color-mix(in srgb, var(--ok) 60%, transparent); }
+  .zen-sub { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: 15px; text-align: center; }
+  .zen-hint { position: absolute; bottom: 16px; color: var(--fg-faint); font-size: 11px; }
+  @media (prefers-reduced-motion: reduce) { .zen-dot.due { animation: none; } }
+
+  /* ---------- adaptive alarm escalation (wallboard) ---------- */
+  #wbAlarm { position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 0;
+    background: radial-gradient(ellipse at center, transparent 40%, color-mix(in srgb, var(--fail) 70%, transparent) 100%);
+    transition: opacity .8s ease; }
+  .wb-incident { position: absolute; top: 14px; left: 18px; z-index: 4; pointer-events: none;
+    color: var(--fail); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
+  body.fx .wb-incident { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
+  .wb-incident.ackd { color: var(--pending); }
+  .wb-tile.st-fail.escalate { animation: tilebreathe 1.6s ease-in-out infinite; }
+  @keyframes tilebreathe {
+    0%, 100% { box-shadow: 0 0 8px color-mix(in srgb, var(--fail) 25%, transparent); }
+    50% { box-shadow: 0 0 22px color-mix(in srgb, var(--fail) 65%, transparent); border-color: var(--fail); }
+  }
+  @media (prefers-reduced-motion: reduce) { .wb-tile.st-fail.escalate { animation: none; } #wbAlarm { transition: none; } }
 </style>
 </head>
 <body>
@@ -451,7 +856,7 @@
 
 <header>
   <div class="brand">
-    <span class="mark glow">▚</span>
+    <span class="mark glow" id="mark">▚</span>
     <h1 class="glow">yacron2</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
@@ -488,6 +893,10 @@
       <button data-f="disabled">off</button>
     </div>
     <span class="grow"></span>
+    <button class="ghostbtn" id="radarBtn" title="Next-fire radar">⌁ radar</button>
+    <button class="ghostbtn" id="heatBtn" title="Activity heatmap">▦ heat</button>
+    <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
+    <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
     <select class="mini" id="sortSel" title="Sort">
       <option value="name">sort: name</option>
@@ -498,27 +907,83 @@
     </select>
   </div>
 
+  <!-- incident cockpit: fleet verdict bar (hidden while healthy) -->
+  <div class="verdict" id="verdictBar" style="display:none" title="Open the incident timeline (i)">
+    <span class="vg" id="vGlyph">▲</span>
+    <div class="vbody"><div class="vhead" id="vHead"></div><div class="vsub" id="vSub"></div></div>
+    <div class="vact">
+      <button class="btn" id="vTimeline" title="Incident timeline (i)">▤ timeline</button>
+      <button class="btn" id="vTail" title="Tail the failing jobs' output live">≋ tail</button>
+      <button class="btn primary" id="vMitigate" title="Bulk run/cancel the failing set">▸ mitigate</button>
+    </div>
+  </div>
+
+  <div class="card radar" id="radarPanel" style="display:none">
+    <div class="card-label"><span>┌─ next fires</span><span class="grow"></span><span class="faint" id="radarMeta"></span></div>
+    <div class="radar-body">
+      <ul class="radar-feed" id="radarFeed"></ul>
+      <div class="radar-track" id="radarTrack"></div>
+    </div>
+  </div>
+
+  <div class="card heat" id="heatCard" style="display:none">
+    <div class="card-label"><span>┌─ activity heatmap</span><span class="grow"></span>
+      <select class="mini" id="heatWindow" title="time window">
+        <option value="6h">last 6h</option>
+        <option value="24h">last 24h</option>
+        <option value="7d">last 7d</option>
+      </select>
+      <span class="faint" id="heatMeta"></span>
+    </div>
+    <div class="heat-body" id="heatBody"></div>
+  </div>
+
   <div class="card">
-    <div class="card-label"><span>┌─ jobs</span><span class="grow"></span><span id="countLabel"></span></div>
-    <table>
+    <div class="card-label"><span>┌─ jobs</span><span class="grow"></span>
+      <span class="colwrap">
+        <button class="ghostbtn mini" id="colsBtn" title="Choose table columns" aria-haspopup="true">⊞ cols</button>
+        <div class="colmenu" id="colsMenu" role="menu" aria-label="Table columns"></div>
+      </span>
+      <span id="countLabel"></span></div>
+    <div class="twrap">
+    <table id="jobsTable">
       <thead>
         <tr>
           <th class="sortable" data-sort="status">Status</th>
           <th class="sortable" data-sort="name">Job</th>
+          <th class="col-owner sortable" data-sort="owner">Owner</th>
+          <th class="col-policy sortable" data-sort="policy">Policy</th>
           <th class="col-sched">Schedule</th>
+          <th class="col-tz">TZ</th>
           <th class="sortable col-last" data-sort="last">Last run</th>
           <th class="col-dur sortable" data-sort="duration">Took</th>
           <th class="col-next sortable" data-sort="next">Next</th>
+          <th class="col-nextat sortable" data-sort="nextat">Next at</th>
+          <th class="col-rate sortable" data-sort="rate">Rate</th>
           <th class="col-trend">Trend</th>
           <th style="text-align:right">Actions</th>
         </tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
+    </div>
     <div class="empty" id="emptyState" style="display:none">
       <div class="big">▙▟</div>
       <div id="emptyMsg">No jobs configured.</div>
     </div>
+  </div>
+
+  <div class="card" id="clusterCard" style="display:none">
+    <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="fleetBtn" title="Fleet view: every node's runs in one pane" style="display:none">⊞ fleet</button><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
+    <table id="clusterTable">
+      <thead><tr><th>Peer</th><th>Node</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
+      <tbody id="clusterRows"></tbody>
+    </table>
+    <table id="clusterLease" style="display:none">
+      <tbody id="clusterLeaseRows"></tbody>
+    </table>
+    <div id="fleetPanel" style="display:none"></div>
+    <div id="swimPanel" style="display:none"></div>
   </div>
 </main>
 
@@ -573,6 +1038,35 @@
   </div>
 </aside>
 
+<!-- merged multi-tail console: kept FIRST among the .overlay surfaces —
+     they share a z-index, so DOM order stacks them, and everything that can
+     open over the console (⌘K palette, the 401 token modal, settings) must
+     paint above it, not under it with focus. -->
+<div class="overlay" id="tailWrap">
+  <div class="tailpanel" role="dialog" aria-label="Multi-tail console">
+    <div class="tailhead">
+      <h3>multi-tail</h3>
+      <span class="faint" id="tailMeta"></span>
+      <span class="grow"></span>
+      <button class="ghostbtn mini" id="tailAddFailing" title="Tail every failing job">+ failing</button>
+      <button class="ghostbtn mini" id="tailAddRunning" title="Tail every running job">+ running</button>
+      <label class="tailadd"><span class="prompt">+</span><input id="tailAddInput" list="tailJobList" placeholder="add job…" autocomplete="off" spellcheck="false"><datalist id="tailJobList"></datalist></label>
+      <button class="iconbtn" id="tailClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="tailchips" id="tailChips"></div>
+    <div class="drawer-tools">
+      <span class="logsearch"><span class="faint">/</span><input id="tailSearch" type="text" placeholder="search" autocomplete="off" spellcheck="false"><span class="count" id="tailCount"></span></span>
+      <span class="grow"></span>
+      <label class="toggle"><input type="checkbox" id="tailFollow" checked> follow</label>
+      <label class="toggle"><input type="checkbox" id="tailWrapOpt" checked> wrap</label>
+      <label class="toggle"><input type="checkbox" id="tailTs"> timestamps</label>
+      <button class="iconbtn" id="tailDownload" title="Download merged view"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg></button>
+      <button class="iconbtn" id="tailClearBtn" title="Clear view"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></button>
+    </div>
+    <pre class="term" id="tailTerm"></pre>
+  </div>
+</div>
+
 <!-- command palette -->
 <div class="overlay" id="paletteWrap">
   <div class="palette" role="dialog" aria-label="Command palette">
@@ -592,12 +1086,22 @@
           <option value="amber">amber</option>
           <option value="green">green</option>
           <option value="modern">modern (no CRT)</option>
+          <option value="carolina">carolina</option>
         </select>
       </div>
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load (replays after 12h)</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
+      <div class="setrow">
+        <span class="lab">Cue volume</span>
+        <select class="mini" id="setVol">
+          <option value="25">25%</option><option value="50">50%</option>
+          <option value="75">75%</option><option value="100">100%</option>
+        </select>
+      </div>
       <div class="setrow">
         <span class="lab">Refresh interval</span>
         <select class="mini" id="setPoll">
@@ -606,6 +1110,16 @@
           <option value="10000">10s</option><option value="0">paused</option>
         </select>
       </div>
+      <div class="setrow"><span class="lab">Run ledger<small>accumulate long-term run history in this browser (IndexedDB)</small></span><label class="switch"><input type="checkbox" id="setLedger"><span class="sl"></span></label></div>
+      <div class="setrow" id="ledgerStatRow" style="display:none"><span class="lab">Ledger storage<small>only grows while a tab is open; latest run per poll</small></span><span class="stor"><small id="ledgerStat">—</small><button class="ghostbtn mini" id="ledgerExport">export</button><button class="ghostbtn mini" id="ledgerPurge">purge</button></span></div>
+      <div class="setrow"><span class="lab">Zen screensaver<small>drift an idle, healthy wallboard into a live all-clear field</small></span><label class="switch"><input type="checkbox" id="setZen"><span class="sl"></span></label></div>
+      <div class="setrow"><span class="lab">Zen idle<small>how long a calm wallboard waits before zen engages</small></span>
+        <select class="mini" id="setZenIdle">
+          <option value="5000">5s</option><option value="10000">10s</option>
+          <option value="30000">30s</option><option value="60000">1m</option><option value="120000">2m</option>
+        </select>
+      </div>
+      <div class="setrow"><span class="lab">Alarm escalation<small>wallboard reddens &amp; the alarm quickens the longer a failure goes unacked (a)</small></span><label class="switch"><input type="checkbox" id="setEscalate"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Keyboard shortcuts</span><button class="ghostbtn" id="openHelp">view (?)</button></div>
     </div>
   </div>
@@ -635,7 +1149,76 @@
   </div>
 </div>
 
+<!-- incident timeline overlay -->
+<div class="overlay" id="timelineWrap">
+  <div class="tlpanel" role="dialog" aria-label="Incident timeline">
+    <div class="tlhead">
+      <h3>incident timeline</h3>
+      <span class="grow"></span>
+      <label class="toggle"><input type="checkbox" id="tlFailOnly"> failures only</label>
+      <span class="tlnow" id="tlNow"></span>
+      <button class="iconbtn" id="tlClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="tlbody" id="tlBody"></div>
+    <div class="tlnote">Newest finish per job, from the live poll (each job's most recent run). History is in-memory; this is the current fleet frame, not a full audit log.</div>
+  </div>
+</div>
+
+<!-- mitigate console -->
+<div class="overlay" id="mitigateWrap">
+  <div class="mitpanel" role="dialog" aria-modal="true" aria-label="Mitigate">
+    <div class="mithead"><h3 id="mitTitle">Mitigate</h3><p id="mitDesc"></p></div>
+    <div class="mitlist" id="mitList"></div>
+    <pre class="mitlog" id="mitLog" style="display:none"></pre>
+    <div class="mitact">
+      <button class="btn cancel" id="mitCancelAll">■ cancel all</button>
+      <button class="btn run" id="mitStartAll">▶ start all now</button>
+      <button class="btn" id="mitTail" title="Watch these jobs' output in the multi-tail console">≋ tail output</button>
+      <button class="btn" id="mitCopy">❏ copy summary</button>
+      <button class="btn" id="mitAbort" style="display:none;margin-left:auto">✕ abort</button>
+      <button class="btn" id="mitClose" style="margin-left:auto">close</button>
+    </div>
+  </div>
+</div>
+
+<!-- cron sandbox -->
+<div class="overlay" id="sandboxWrap">
+  <div class="sbxpanel" role="dialog" aria-label="Cron sandbox">
+    <div class="sbxhead">
+      <h3>cron sandbox</h3>
+      <label class="sbxin"><span class="prompt">◴</span><input id="sbxInput" type="text" placeholder="* * * * *  or  @daily" autocomplete="off" spellcheck="false"></label>
+      <select class="mini" id="sbxFrame" title="timezone frame"></select>
+      <button class="iconbtn" id="sbxClose" title="Close (Esc)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div class="sbxbody" id="sbxBody"></div>
+  </div>
+</div>
+
 <div class="toasts" id="toasts"></div>
+
+<!-- wallboard / TV kiosk -->
+<div id="wallboard" class="wallboard" style="display:none" aria-hidden="true" role="region" aria-label="Wallboard">
+  <div id="wbAlarm"></div>
+  <!-- no-signal banner: shown (with the grid dimmed) while wallboard data is
+       stale. The verdict lives in its own span so the role="status" live
+       region announces only on a real change; the per-second age counter is
+       aria-hidden (screen readers would otherwise hear it every tick). -->
+  <div class="wb-nosignal" id="wbNoSignal" role="status"><span id="wbNoSignalMsg"></span><span id="wbNoSignalAge" aria-hidden="true"></span></div>
+  <div class="wb-grid" id="wbGrid"></div>
+  <div class="wb-foot" id="wbFoot"></div>
+  <!-- zen all-clear screensaver: appears over an idle, healthy wallboard -->
+  <div class="zen" id="zen" style="display:none" aria-hidden="true">
+    <div class="zen-field" id="zenField"></div>
+    <div class="zen-title">ALL SYSTEMS NOMINAL</div>
+    <div class="zen-sub" id="zenSub"></div>
+    <div class="zen-hint">move / press a key to wake · esc to exit</div>
+  </div>
+</div>
+
+<!-- BIOS-style boot / POST self-test -->
+<div id="bootScreen" class="boot" style="display:none" aria-hidden="true" role="status" aria-live="polite">
+  <div class="boot-log" id="bootLog"></div>
+</div>
 
 <script>
 "use strict";
@@ -667,6 +1250,14 @@
   const prefs = {
     theme: "amber", fx: true, scan: true, density: false, notify: false,
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
+    // add-on panels + audible cues
+    sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
+    boot: true,   // BIOS-style boot self-test on load
+    // opt-in run ledger (IndexedDB) + wallboard zen screensaver + alarm escalation
+    ledger: false, zen: true, escalate: true, zenIdle: 30000,
+    // jobs-table column visibility overrides, keyed by COLUMNS k. Untouched
+    // columns have no entry, so ones added later still get their default.
+    cols: {},
   };
   function loadPrefs() {
     for (const k of Object.keys(prefs)) {
@@ -691,9 +1282,36 @@
     prevFail: {},              // name -> finished_at of last seen failure (notifications)
     seenFirst: false,
     connected: true,
+    clusterNode: null,         // this node's name (from /cluster), for owner self-highlight
+    clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     palette: { open: false, items: [], cur: 0 },
     lastRowSig: null,          // signature of the last rendered table (skip redundant rebuilds)
     focusStack: [],            // saved focus per open overlay/drawer (restore on close)
+    // audible cues + standing alarm
+    prevFin: {},               // name -> finished_at last seen (cue poll-diff)
+    justFailed: null,          // Set of names that flipped to failure THIS poll (wallboard flicker)
+    anyFailing: false, alarmAck: false,
+    radar: { items: [], sig: null },   // next-fire radar: [{name, t, c}] sorted by instant (+ render signature)
+    wallboard: false,          // TV kiosk mode active
+    heat: { cache: {}, loading: false },   // activity heatmap: name -> {at, runs:[{t,o}]}
+    swim: { key: null, buf: [] },          // cluster peer swimlane ring buffer
+    fleet: { data: null, failOnly: false },    // fleet view: last /fleet payload + failing-only filter
+    // merged multi-tail console: tailed job names, per-job stream state,
+    // per-job identity colors, and the merged line buffer
+    tail: { open: false, jobs: [], streams: {}, colors: {}, lines: [], total: 0 },
+    clusterLine: null,         // last cluster summary string (wallboard footer)
+    booting: false,            // BIOS boot self-test is on screen (swallows keys)
+    // --- add-on features ---
+    clusterAlert: null,        // {bad, reason} distilled from /cluster for the verdict bar
+    incidentSet: [],           // job names in the current blast radius (mitigate target)
+    verdictSig: null,          // last-rendered verdict signature (skip redundant DOM writes)
+    ledger: { on: false, ready: false, runs: {}, seen: {}, stats: {}, count: 0 },
+    timeline: { open: false, failOnly: false },
+    mitigate: { open: false, running: false, abort: false, set: [] },
+    sandbox: { open: false },
+    failSince: {},             // name -> ms this browser first saw the job failing
+    lastAlarmAt: 0,            // adaptive-alarm gate (ms)
+    zen: { on: false, idleSince: 0, sig: null },
   };
 
   // ===================================================================
@@ -1009,6 +1627,132 @@
     return html + "</span>";
   }
 
+  // The per-job owning node under distribution: spread. `clusterOwner` is only
+  // present in the payload for leader-gated jobs in spread mode (null = the
+  // node has no quorum, so nobody owns it); EveryNode jobs carry a policy but
+  // no owner (they run everywhere). Outside spread mode neither is present and
+  // the whole column stays hidden.
+  function ownerCell(job) {
+    if (!("clusterOwner" in job)) {
+      if (job.clusterPolicy === "EveryNode")
+        return '<span class="owner every" title="runs on every node"><span class="nd"></span>all nodes</span>';
+      return '<span class="faint">—</span>';
+    }
+    const o = job.clusterOwner;
+    if (o == null) return '<span class="owner none" title="no quorum — owner undecided">no quorum</span>';
+    const self = !!state.clusterNode && o === state.clusterNode;
+    return '<span class="owner' + (self ? " self" : "") +
+      '" title="owned by ' + escAttr(o) + (self ? " (this node)" : "") + '">' +
+      '<span class="nd"></span>' + esc(o) + "</span>";
+  }
+  // Sort key for the Owner column. A leading digit groups the categories so
+  // real owners (0) sort first — alphabetically among themselves — then
+  // no-quorum (1), then EveryNode (2) and not-owned (3) park at the end.
+  function ownerSortKey(j) {
+    if (!("clusterOwner" in j)) return j.clusterPolicy === "EveryNode" ? "2" : "3";
+    return j.clusterOwner == null ? "1" : "0" + j.clusterOwner.toLowerCase();
+  }
+
+  // ---- configurable columns (⊞ cols) ----
+  // The toggleable jobs-table columns; `on` is the out-of-the-box visibility
+  // and prefs.cols[k] overrides it. Status, Job and Actions are structural,
+  // and the Owner column stays data-driven (spread mode) — none are listed.
+  // `w` is the column's rough rendered width, used to widen the page so extra
+  // columns get real room instead of squeezing the classic set.
+  const COLUMNS = [
+    { k: "policy", lbl: "Cluster policy",   w: 110 },
+    { k: "sched",  lbl: "Schedule",         w: 130, on: true },
+    { k: "tz",     lbl: "Timezone",         w: 110 },
+    { k: "last",   lbl: "Last run",         w: 140, on: true },
+    { k: "dur",    lbl: "Took",             w: 80,  on: true },
+    { k: "next",   lbl: "Next (countdown)", w: 90,  on: true },
+    { k: "nextat", lbl: "Next (wall clock)", w: 100 },
+    { k: "rate",   lbl: "Success rate",     w: 70 },
+    { k: "trend",  lbl: "Trend",            w: 110, on: true },
+  ];
+  // Overrides map, hardened against a corrupt stored pref (must be an object).
+  function colPrefs() { if (!prefs.cols || typeof prefs.cols !== "object") prefs.cols = {}; return prefs.cols; }
+  function colOn(k) {
+    const o = colPrefs();
+    if (o[k] != null) return !!o[k];
+    const c = COLUMNS.find((x) => x.k === k);
+    return !!(c && c.on);
+  }
+  // Visibility is pure CSS (cells render unconditionally), so toggling a
+  // column never needs a row rebuild — same mechanism as show-owner.
+  function applyCols() {
+    const t = $("jobsTable");
+    let extra = 0;
+    for (const c of COLUMNS) {
+      const on = colOn(c.k);
+      t.classList.toggle("show-" + c.k, on);
+      if (on !== !!c.on) extra += (on ? 1 : -1) * c.w;
+    }
+    // Widen the page by the net width of the columns beyond the classic set,
+    // so opting in adds room instead of squeezing (hiding classic columns
+    // buys extras space for free; never shrink below the classic width).
+    // .twrap scroll is the fallback when the viewport can't give more.
+    document.documentElement.style.setProperty("--colsw", Math.max(0, extra) + "px");
+  }
+  function renderColsMenu() {
+    $("colsMenu").innerHTML = COLUMNS.map((c) =>
+      '<label><input type="checkbox" data-col="' + c.k + '"' + (colOn(c.k) ? " checked" : "") + ">" + esc(c.lbl) + "</label>"
+    ).join("");
+  }
+  function toggleColsMenu(open) {
+    const m = $("colsMenu");
+    const want = open == null ? !m.classList.contains("open") : !!open;
+    if (want === m.classList.contains("open")) return;
+    if (want) renderColsMenu();
+    m.classList.toggle("open", want);
+    $("colsBtn").classList.toggle("on", want);
+  }
+
+  // Cluster policy chip. The daemon includes clusterPolicy only when leader
+  // election is configured, so a standalone daemon shows a quiet dash.
+  function policyCell(job) {
+    const p = job.clusterPolicy;
+    if (!p) return '<span class="faint">—</span>';
+    const hint = p === "EveryNode" ? "runs on every node"
+      : p === "PreferLeader" ? "runs on the leader, but keeps firing without quorum"
+      : "runs only on the leader (or the job's owner under spread)";
+    return '<span class="chip" title="' + escAttr(hint) + '">' + esc(p) + "</span>";
+  }
+  // The schedule's reference frame: an explicit IANA zone wins, then the utc
+  // flag (true is the daemon default; false means the daemon host's local time).
+  function tzCell(job) {
+    if (job.timezone) return esc(job.timezone);
+    return job.utc === false ? "local" : "UTC";
+  }
+  // Success share of the recent-history tail (the same runs the sparkline
+  // draws, capped server-side). Cancelled runs count against it; null = no runs.
+  function rateOf(j) {
+    const h = j.history || [];
+    if (!h.length) return null;
+    return h.filter((r) => r.outcome === "success").length / h.length;
+  }
+  function rateCell(job) {
+    const h = job.history || [], r = rateOf(job);
+    if (r == null) return '<span class="faint">—</span>';
+    const cls = r === 1 ? "ok" : r >= 0.8 ? "warn" : "fail";
+    return '<span class="rate ' + cls + '" title="' + Math.round(r * h.length) + " of the last " + h.length +
+      ' runs succeeded">' + Math.round(r * 100) + "%</span>";
+  }
+  // Absolute browser-local label for a future instant: HH:MM today, "tom"
+  // for tomorrow, month + day beyond that.
+  function fmtAt(ms) {
+    const d = new Date(ms), now = new Date();
+    const hm = pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+    if (d.toDateString() === now.toDateString()) return hm;
+    if (d.toDateString() === new Date(now.getTime() + 86400000).toDateString()) return "tom " + hm;
+    return MONTHS[d.getMonth() + 1].slice(0, 3) + " " + d.getDate() + " " + hm;
+  }
+  function fmtAtTitle(ms) {
+    const d = new Date(ms);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) + " " +
+      pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + " browser time";
+  }
+
   function computeView() {
     const f = state.filter.toLowerCase();
     let v = state.jobs.filter((j) => {
@@ -1023,8 +1767,14 @@
       if (key === "name") r = a.name.localeCompare(b.name);
       else if (key === "status") r = STATUS_ORDER[health(a).key] - STATUS_ORDER[health(b).key];
       else if (key === "last") r = (lastTs(a) - lastTs(b));
-      else if (key === "next") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
+      else if (key === "next" || key === "nextat") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
       else if (key === "duration") r = ((a.last_run && a.last_run.duration) || 0) - ((b.last_run && b.last_run.duration) || 0);
+      else if (key === "owner") r = ownerSortKey(a).localeCompare(ownerSortKey(b));
+      // "~" sorts non-clustered jobs after every policy name
+      else if (key === "policy") r = (a.clusterPolicy || "~").localeCompare(b.clusterPolicy || "~");
+      // 1.5 parks no-history jobs past 100%, so the default ascending click
+      // leads with the flakiest jobs and ends with the unknowns
+      else if (key === "rate") { const ra = rateOf(a), rb = rateOf(b); r = (ra == null ? 1.5 : ra) - (rb == null ? 1.5 : rb); }
       if (r === 0) r = a.name.localeCompare(b.name);
       return r * dir;
     });
@@ -1036,6 +1786,14 @@
   function renderRows() {
     const tbody = $("rows");
     const jobs = computeView();
+    // Reveal the Owner column only under distribution: spread. The reliable
+    // signals are a `clusterOwner` key on any job (the daemon adds it only in
+    // spread mode) or the /cluster view reporting spread (covers the degenerate
+    // all-EveryNode cluster, whose jobs carry no owner). NOT clusterPolicy
+    // alone — that is present under single-leader too. Toggled before the
+    // signature early-return so the column tracks the data on any poll.
+    const showOwner = !!state.clusterSpread || jobs.some((j) => "clusterOwner" in j);
+    $("jobsTable").classList.toggle("show-owner", showOwner);
     $("emptyState").style.display = jobs.length ? "none" : "block";
     $("emptyMsg").textContent = state.jobs.length ? "No jobs match your filter." : "No jobs configured.";
     $("countLabel").textContent = jobs.length + (jobs.length === 1 ? " job" : " jobs") +
@@ -1050,11 +1808,27 @@
     const sig = JSON.stringify({
       f: state.filter, s: state.statusFilter, so: state.sort, sd: state.sortDir,
       sel: state.selected, dr: state.drawerJob,
+      // owner column visibility + this node's name (for the self highlight)
+      ow: showOwner, cn: state.clusterNode,
       j: jobs.map((j) => [
-        j.name, j.enabled, j.running, j.scheduled_in == null,
+        j.name, j.enabled, j.running,
+        // the absolute fire minute — stable between polls (the countdown ticks
+        // client-side) but changes exactly when the target run changes, which
+        // re-renders the "next at" cell (it has no per-second tick).
+        j.scheduled_in == null ? "-" : Math.round((Date.now() / 1000 + nextRunSeconds(j)) / 60),
+        // schedule + reference frame render as cells, and a config reload can
+        // change either without touching any run-derived field.
+        j.schedule, tzCell(j),
         j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
         j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
         (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
+        // ownership can change between polls (a node joins/leaves); track it so
+        // the row re-renders. "in" check distinguishes absent from a null owner.
+        // The policy rides along even when an owner is present — a reload can
+        // flip it independently and it renders as its own cell now.
+        ("clusterOwner" in j ? "o:" + (j.clusterOwner || "") : "") + "|" + (j.clusterPolicy || ""),
+        // ledger anomaly marker (only meaningful while the ledger is on)
+        state.ledger.on && ledgerFlag(j.name) ? "slow" : "",
       ]),
     });
     if (sig === state.lastRowSig) return;
@@ -1073,6 +1847,10 @@
       const next = (job.running || !job.enabled)
         ? '<span class="faint">—</span>'
         : '<span class="nowrap" data-next="' + escAttr(job.name) + '">' + fmtIn(nsec) + "</span>";
+      const atMs = nsec == null ? null : Date.now() + nsec * 1000;
+      const nextAt = (job.running || !job.enabled || atMs == null)
+        ? '<span class="faint">—</span>'
+        : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
       const rowCls = (state.drawerJob === job.name ? " active" : "") + (state.selected === job.name ? " sel" : "");
       const runBtn = job.running
         ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>Stop</button>'
@@ -1080,13 +1858,18 @@
           '><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>';
       return (
         '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
-          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span></td>" +
+          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + "</td>" +
           '<td><div class="jobname">' + esc(job.name) + "</div>" +
               '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
+          '<td class="col-owner">' + ownerCell(job) + "</td>" +
+          '<td class="col-policy">' + policyCell(job) + "</td>" +
           '<td class="col-sched"><span class="chip" title="' + escAttr(describeCron(job.schedule)) + '">' + esc(job.schedule) + "</span></td>" +
+          '<td class="col-tz muted nowrap">' + tzCell(job) + "</td>" +
           '<td class="col-last">' + last + "</td>" +
           '<td class="col-dur muted nowrap">' + (lr ? fmtDuration(lr.duration) : "—") + "</td>" +
           '<td class="col-next muted nowrap">' + next + "</td>" +
+          '<td class="col-nextat muted nowrap">' + nextAt + "</td>" +
+          '<td class="col-rate">' + rateCell(job) + "</td>" +
           '<td class="col-trend">' + sparkline(job) + "</td>" +
           '<td><div class="actions">' + runBtn +
             '<button class="btn" data-logs="' + escAttr(job.name) + '">Logs</button>' +
@@ -1107,13 +1890,629 @@
   // per-second tick for relative cells (no full rerender)
   function tick() {
     document.querySelectorAll("[data-ago]").forEach((e) => { e.textContent = fmtAgo(e.getAttribute("data-ago")); });
+    // a stale wallboard must not keep counting its tiles down toward runs it
+    // cannot verify (they'd tick to "now" and stick) -- freeze those cells at
+    // an explicit marker instead. body.tv hides the job table, so while the
+    // wallboard is up every visible [data-next] is a wallboard tile.
+    const wbStale = state.wallboard && wallboardStale();
     document.querySelectorAll("[data-next]").forEach((e) => {
       const job = state.byName[e.getAttribute("data-next")];
-      if (job) e.textContent = fmtIn(nextRunSeconds(job));
+      // running/disabled tiles keep their "—" (wallboard attaches data-next to
+      // every tile; the job table only attaches it to jobs with a live countdown)
+      if (!job) return;
+      if (job.running || !job.enabled) { e.textContent = "—"; return; }
+      e.textContent = wbStale ? "stale" : fmtIn(nextRunSeconds(job));
     });
-    const now = new Date();
-    $("clock").textContent = pad2(now.getUTCHours()) + ":" + pad2(now.getUTCMinutes()) + ":" + pad2(now.getUTCSeconds()) + " UTC";
+    $("clock").textContent = utcClock();
+    if (prefs.radar) renderRadar();
+    if (state.timeline.open) $("tlNow").textContent = utcClock();
+    if (state.wallboard) {
+      const wc = $("wbClock"); if (wc) wc.textContent = utcClock();
+      wallboardSignalTick();       // NO SIGNAL banner + dimming when polls stop landing
+      zenGovernor();               // drift to / from the zen screensaver on idle
+      if (state.zen.on) zenTick();  // pulse the field on real next-fire instants
+      escalationTick();             // grow the alarm the longer a failure is unacked
+    }
     updateConnTooltip();
+  }
+
+  // ===================================================================
+  //  audible control-room cues  (WebAudio, off by default)
+  // ===================================================================
+  let audioCtx = null;
+  // Lazily create/resume the AudioContext. Returns null when cues are off or
+  // WebAudio is absent — every caller no-ops on null. Creating it inside the
+  // enable-toggle (a user gesture) satisfies the browser autoplay policy.
+  function audio() {
+    if (!prefs.sound) return null;
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+      return audioCtx;
+    } catch (_) { return null; }
+  }
+  // Each cue is a short sequence of tone steps — oscillators + gain envelopes
+  // only, no sample assets, so nothing to load and nothing for CSP to block.
+  const CUES = {
+    ok:    [{ f0: 880, d: 0.06, type: "sine", g: 0.5 }],
+    start: [{ f0: 520, f1: 860, d: 0.11, type: "triangle", g: 0.6 }],
+    fail:  [{ f0: 420, d: 0.13, type: "sawtooth", g: 0.9 }, { f0: 200, d: 0.22, type: "sawtooth", g: 0.9, gap: 0.02 }],
+    alarm: [{ f0: 300, d: 0.11, type: "square", g: 0.7 }, { f0: 300, d: 0.11, type: "square", g: 0.7, gap: 0.08 }],
+  };
+  function playCue(kind) {
+    const ctx = audio();
+    if (!ctx) return;
+    const seq = CUES[kind];
+    if (!seq) return;
+    const vol = Math.max(0, Math.min(1, (prefs.volume == null ? 50 : prefs.volume) / 100));
+    const master = 0.16 * vol;                 // keep cues gentle even at 100%
+    if (master <= 0) return;
+    let t = ctx.currentTime + 0.01;
+    for (const s of seq) {
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = s.type || "sine";
+      osc.frequency.setValueAtTime(s.f0, t);
+      if (s.f1 != null) osc.frequency.linearRampToValueAtTime(s.f1, t + s.d);
+      const peak = Math.max(0.0002, master * (s.g || 1));
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.linearRampToValueAtTime(peak, t + 0.008);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + s.d);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + s.d + 0.03);
+      t += s.d + (s.gap || 0);
+    }
+  }
+  // Poll-diff for cues + the fleet failing/alarm state. Runs every poll; the
+  // prevFin map is updated even when sound is off so enabling mid-session never
+  // replays a backlog. `justFailed` (names that flipped to failure THIS poll)
+  // is computed regardless of the sound pref — the wallboard uses it for the
+  // fail-flip flicker. playCue() itself no-ops when sound is off.
+  function fleetSound(jobs, first) {
+    const justFailed = new Set();
+    const nextFin = {};                 // rebuilt each poll so vanished job names are pruned
+    for (const j of jobs) {
+      const lr = j.last_run;
+      const fin = lr ? lr.finished_at : null;
+      const prev = state.prevFin[j.name];
+      if (!first && fin && prev !== undefined && prev !== fin) {
+        if (lr.outcome === "failure") { justFailed.add(j.name); playCue("fail"); }
+        else if (lr.outcome === "success") playCue("ok");
+        // cancelled: no cue
+      }
+      if (fin) nextFin[j.name] = fin;
+      else if (prev !== undefined) nextFin[j.name] = prev;   // keep last-seen for a currently-outputless job
+    }
+    state.prevFin = nextFin;
+    state.justFailed = justFailed;
+    const nowFailing = jobs.some((j) => j.last_run && j.last_run.outcome === "failure");
+    if (justFailed.size) state.alarmAck = false;   // a fresh failure re-arms the alarm
+    if (!nowFailing) state.alarmAck = false;        // all-clear: re-arm for next time
+    state.anyFailing = nowFailing;
+  }
+  // The standing-alarm pulse lives with the escalation logic further down
+  // (alarmTick, adaptive cadence). ackAlarm silences it until the next failure.
+  function ackAlarm() {
+    if (state.anyFailing && !state.alarmAck) { state.alarmAck = true; toast("info", "◔ alarm acknowledged"); }
+  }
+  function setSound(v) {
+    prefs.sound = v; savePref("sound"); syncSettings();
+    if (v) { audio(); playCue("ok"); }             // enable is a gesture: unlock + confirm
+    else if (audioCtx) { try { audioCtx.suspend(); } catch (_) {} }
+  }
+  function setVolume(v) { prefs.volume = v; savePref("volume"); syncSettings(); if (prefs.sound) playCue("ok"); }
+
+  // ===================================================================
+  //  next-fire radar — fleet-wide "what fires in the next 10 minutes"
+  // ===================================================================
+  const RADAR_HORIZON = 10 * 60 * 1000;      // 10 minutes
+  function fmtCountdown(sec) {
+    sec = Math.max(0, Math.round(sec));
+    // round to whole minutes first, then split, so 7199s -> 2h00m (not 1h60m)
+    if (sec >= 3600) { const m0 = Math.round(sec / 60), h = Math.floor(m0 / 60), m = m0 % 60; return h + "h" + pad2(m) + "m"; }
+    return pad2(Math.floor(sec / 60)) + ":" + pad2(sec % 60);
+  }
+  function fmtWall(c) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi); }
+  // Recompute each enabled job's next fire instant. Cheap (parseCron is cached,
+  // nextRuns(n=1) is bounded), but only called when the panel is open or the
+  // soonest fire has already elapsed.
+  function computeRadar() {
+    const now = Date.now();
+    const items = [];
+    for (const j of state.jobs) {
+      if (!j.enabled) continue;
+      const parsed = parseCron(j.schedule);
+      if (parsed.type !== "fields") continue;
+      const runs = nextRuns(parsed, 1, frameOf(j), now);
+      if (runs.length) items.push({ name: j.name, t: runs[0].t, c: runs[0].c });
+    }
+    items.sort((a, b) => a.t - b.t);
+    state.radar.items = items;
+  }
+  function renderRadar() {
+    const panel = $("radarPanel");
+    if (!prefs.radar) { panel.style.display = "none"; return; }
+    panel.style.display = "";
+    const now = Date.now();
+    // Recompute only when a known-soonest fire has actually elapsed. Population
+    // of an empty/first set is driven by the poll loop + setRadar (both call
+    // computeRadar), so the per-second tick never rescans a fleet that has
+    // nothing upcoming (e.g. all interval-only schedules the cron engine can't
+    // preview).
+    if (state.radar.items.length && state.radar.items[0].t <= now) computeRadar();
+    const upcoming = state.radar.items.filter((x) => x.t >= now);
+    const feed = upcoming.slice(0, 8);
+    const inWin = [];
+    for (const x of upcoming) if (x.t - now <= RADAR_HORIZON) inWin.push(x);
+    const byName = {};
+    for (const x of upcoming) byName[x.name] = x;
+    // Rebuild the DOM only when the visible set/order changes; otherwise relabel
+    // the countdowns and nudge the marks in place, so hover survives and there
+    // is no per-second teardown of every <li> and mark.
+    const sig = feed.map((x) => x.name).join("|") + "##" + inWin.map((x) => x.name).join("|");
+    if (sig !== state.radar.sig) {
+      state.radar.sig = sig;
+      $("radarFeed").innerHTML = feed.length
+        ? feed.map((x) => {
+            const j = state.byName[x.name];
+            const title = fmtWall(x.c) + (j ? " · " + describeCron(j.schedule) : "");
+            return '<li data-job="' + escAttr(x.name) + '" title="' + escAttr(title) + '">' +
+              '<span class="cd">' + fmtCountdown((x.t - now) / 1000) + "</span>" +
+              '<span class="nm">' + esc(x.name) + "</span></li>";
+          }).join("")
+        : '<li class="empty">no jobs scheduled to fire soon</li>';
+      // timeline over the next 10 minutes (HTML — crisp text at any width)
+      let marks = "";
+      for (let m = 0; m <= 10; m += 2) {
+        marks += '<span class="rt-grid" style="left:' + (m * 10) + '%"><i></i>' +
+          (m < 10 ? "<b>" + (m === 0 ? "now" : "+" + m + "m") + "</b>" : "") + "</span>";
+      }
+      for (const x of inWin) {
+        const left = ((x.t - now) / RADAR_HORIZON) * 100;
+        marks += '<span class="rt-mk" data-job="' + escAttr(x.name) + '" style="left:' + left.toFixed(2) +
+          '%" title="' + escAttr(x.name + " · " + fmtCountdown((x.t - now) / 1000)) + '"></span>';
+      }
+      $("radarTrack").innerHTML = marks;
+    } else {
+      $("radarFeed").querySelectorAll("li[data-job]").forEach((li) => {
+        const x = byName[li.getAttribute("data-job")], cd = li.querySelector(".cd");
+        if (x && cd) cd.textContent = fmtCountdown((x.t - now) / 1000);
+      });
+      $("radarTrack").querySelectorAll(".rt-mk").forEach((mk) => {
+        const x = byName[mk.getAttribute("data-job")];
+        if (!x) return;
+        mk.style.left = (((x.t - now) / RADAR_HORIZON) * 100).toFixed(2) + "%";
+        mk.title = x.name + " · " + fmtCountdown((x.t - now) / 1000);
+      });
+    }
+    $("radarMeta").textContent = upcoming.length + " upcoming";
+  }
+  function setRadar(v) { prefs.radar = v; savePref("radar"); $("radarBtn").classList.toggle("on", v); if (v) computeRadar(); renderRadar(); }
+
+  // ===================================================================
+  //  wallboard / TV kiosk mode
+  // ===================================================================
+  const WB_ORDER = { fail: 0, run: 1, pending: 2, cancelled: 3, ok: 4, disabled: 5 };
+  function utcClock() { const n = new Date(); return pad2(n.getUTCHours()) + ":" + pad2(n.getUTCMinutes()) + ":" + pad2(n.getUTCSeconds()) + " UTC"; }
+  // The wallboard's staleness gate. TV mode hides the header (and with it the
+  // #conn indicator), so the surface must judge freshness itself: stale when
+  // the last poll failed outright, when nothing has been fetched yet, or when
+  // no successful poll has landed for several intervals (throttled background
+  // tab, paused polling, a fetch wedged without rejecting).
+  const WB_STALE_AFTER = 15000;              // floor; scales with slow poll intervals
+  function wallboardStale() {
+    if (!state.connected) return true;
+    if (!state.fetchedAt) return true;       // no data received yet
+    const age = performance.now() - state.fetchedAt;
+    return age > Math.max(WB_STALE_AFTER, (prefs.pollMs || 0) * 3);
+  }
+  // Per-second reflection of that gate onto the TV surface: toggle the
+  // banner + dimming, and keep the "last update" age current -- mirrors the
+  // cluster card's clusterStale() rather than freezing on a healthy frame.
+  function wallboardSignalTick() {
+    const stale = wallboardStale();
+    $("wallboard").classList.toggle("stale", stale);
+    if (!stale) return;
+    // write the verdict span only on a real change so the role="status" live
+    // region announces once; the age counter ticks every second inside an
+    // aria-hidden span (screen readers would otherwise hear it each tick).
+    const msg = state.connected ? "▚ STALE DATA" : "▚ NO SIGNAL";
+    const verdict = $("wbNoSignalMsg");
+    if (verdict.textContent !== msg) verdict.textContent = msg;
+    $("wbNoSignalAge").textContent =
+      state.fetchedAt
+        ? " · last update " + agoWords((performance.now() - state.fetchedAt) / 1000)
+        : " · no data received yet";
+  }
+  function setWallboard(on) {
+    // Close any open drawer on entry: it drives the jobs-table UI that
+    // body.tv hides, and leaving it open would desync the #tv hash state.
+    // (Visibility is not the issue -- body.tv stacks .drawer above the
+    // wallboard, so overlays that DO open in TV mode are seen.)
+    if (on && state.drawerJob) closeDrawer();
+    state.wallboard = on;
+    const wb = $("wallboard");
+    wb.style.display = on ? "" : "none";
+    wb.setAttribute("aria-hidden", on ? "false" : "true");
+    document.body.classList.toggle("tv", on);
+    $("tvBtn").classList.toggle("on", on);
+    setHashTv(on);
+    if (on) renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
+    else { $("wbGrid").innerHTML = ""; zenOff(); state.zen.idleSince = 0; }
+  }
+  function renderWallboard() {
+    if (!state.wallboard) return;
+    const jobs = state.jobs.slice().sort((a, b) => {
+      const r = WB_ORDER[health(a).key] - WB_ORDER[health(b).key];
+      return r !== 0 ? r : a.name.localeCompare(b.name);
+    });
+    const stale = wallboardStale();
+    $("wbGrid").innerHTML = jobs.map((job) => {
+      const h = health(job);
+      const nextTxt = (job.running || !job.enabled) ? "—" : stale ? "stale" : fmtIn(nextRunSeconds(job));
+      const flip = state.justFailed && state.justFailed.has(job.name) ? " flip" : "";
+      return '<div class="wb-tile st-' + h.key + flip + '" data-job="' + escAttr(job.name) + '">' +
+        '<div class="wb-glyph">' + GLYPH[h.key] + "</div>" +
+        '<div class="wb-name" title="' + escAttr(job.name) + '">' + esc(job.name) + "</div>" +
+        '<div class="wb-next" data-next="' + escAttr(job.name) + '">' + esc(nextTxt) + "</div>" +
+        '<div class="wb-spark">' + sparkline(job) + "</div>" +
+      "</div>";
+    }).join("");
+    renderWbFoot();
+    // fresh paint = fresh verdict: a recovery poll clears the stale banner
+    // and dimming NOW rather than up to a second later at the next tick.
+    wallboardSignalTick();
+  }
+  function renderWbFoot() {
+    const j = state.jobs;
+    const fail = j.filter((x) => health(x).key === "fail").length;
+    const run = j.filter((x) => x.running).length;
+    const ok = j.filter((x) => health(x).key === "ok").length;
+    const off = j.filter((x) => !x.enabled).length;
+    $("wbFoot").innerHTML =
+      '<span class="wb-stat"><b>' + j.length + "</b>jobs</span>" +
+      '<span class="wb-stat fail"><b>' + fail + "</b>fail</span>" +
+      '<span class="wb-stat run"><b>' + run + "</b>run</span>" +
+      '<span class="wb-stat ok"><b>' + ok + "</b>ok</span>" +
+      '<span class="wb-stat off"><b>' + off + "</b>off</span>" +
+      (state.clusterLine ? '<span class="wb-stat cl">' + esc(state.clusterLine) + "</span>" : "") +
+      '<span class="grow"></span>' +
+      '<span class="wb-hint">esc · w to exit</span>' +
+      '<button class="btn wb-exit" id="wbExit" title="Exit wallboard (Esc / w)">✕ exit</button>' +
+      '<span class="wb-clock" id="wbClock">' + esc(utcClock()) + "</span>";
+  }
+
+  // ===================================================================
+  //  activity heatmap — per-job run-outcome punchcard
+  // ===================================================================
+  const HEAT_MAX_JOBS = 80;                  // cap the per-job fan-out
+  const HEAT_TTL = 45 * 1000;                // re-fetch a job's runs at most this often
+  const HEAT_COLS = 24;
+  const HEAT_WINDOWS = { "6h": 6 * 3600e3, "24h": 24 * 3600e3, "7d": 7 * 86400e3 };
+  // Lazily fetch each job's /runs (sequentially, to avoid a request storm),
+  // cached with a TTL. Only ever runs while the panel is open.
+  async function loadHeatmap(force) {
+    if (!prefs.heat || state.heat.loading) return;
+    state.heat.loading = true;
+    try {
+      const jobs = state.jobs.slice(0, HEAT_MAX_JOBS);
+      for (const j of jobs) {
+        if (!prefs.heat) break;                    // panel closed mid-fetch
+        const c = state.heat.cache[j.name];
+        if (!force && c && (performance.now() - c.at) < HEAT_TTL) continue;
+        try {
+          const r = await apiFetch("/jobs/" + encodeURIComponent(j.name) + "/runs");
+          if (r.ok) {
+            const d = await r.json();
+            state.heat.cache[j.name] = { at: performance.now(), runs: (d.runs || []).map((x) => ({ t: x.started_at, o: x.outcome })) };
+          }
+        } catch (e) { if (e.message === "unauthorized") return; }
+      }
+      renderHeatmap();
+    } finally { state.heat.loading = false; }
+  }
+  function relLabel(msAgo) {
+    const s = Math.round(msAgo / 1000);
+    if (s < 3600) return Math.round(s / 60) + "m";
+    if (s < 86400) return Math.round(s / 3600) + "h";
+    return Math.round(s / 86400) + "d";
+  }
+  function bucketLabel(startMs, bucketMs) {
+    const hm = (d) => pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+    return hm(new Date(startMs)) + "–" + hm(new Date(startMs + bucketMs));
+  }
+  function renderHeatmap() {
+    if (!prefs.heat) { $("heatCard").style.display = "none"; return; }
+    $("heatCard").style.display = "";
+    const jobs = state.jobs.slice(0, HEAT_MAX_JOBS);
+    const span = HEAT_WINDOWS[prefs.heatWindow] || HEAT_WINDOWS["24h"];
+    const now = Date.now(), start = now - span, bucketMs = span / HEAT_COLS;
+    let html = '<div class="heat-row axis"><span></span><div class="heat-axis">';
+    for (let i = 0; i < HEAT_COLS; i++) {
+      const label = (i % 6 === 0) ? relLabel(now - (start + i * bucketMs)) : "";
+      html += "<span>" + esc(label) + "</span>";
+    }
+    html += "</div></div>";
+    for (const job of jobs) {
+      const c = state.heat.cache[job.name];
+      const buckets = new Array(HEAT_COLS).fill(null);
+      if (c) for (const run of c.runs) {
+        if (!run.t) continue;                       // never-launched run: no timestamp
+        const tt = Date.parse(run.t);
+        if (isNaN(tt) || tt < start || tt > now) continue;
+        let bi = Math.floor((tt - start) / bucketMs);
+        if (bi < 0) bi = 0; else if (bi >= HEAT_COLS) bi = HEAT_COLS - 1;
+        const b = buckets[bi] || (buckets[bi] = { ok: 0, fail: 0, cancelled: 0, total: 0 });
+        b.total++;
+        if (run.o === "failure") b.fail++;
+        else if (run.o === "cancelled") b.cancelled++;
+        else b.ok++;
+      }
+      const maxTotal = buckets.reduce((m, b) => (b && b.total > m ? b.total : m), 1);
+      let cells = "";
+      for (let i = 0; i < HEAT_COLS; i++) {
+        const b = buckets[i];
+        const win = bucketLabel(start + i * bucketMs, bucketMs);
+        if (!b) { cells += '<span class="heat-cell" title="' + escAttr(win + " · no runs") + '"></span>'; continue; }
+        const worst = b.fail ? "fail" : b.cancelled ? "cancelled" : "ok";
+        const op = (0.35 + 0.65 * (b.total / maxTotal)).toFixed(2);
+        const tip = job.name + " · " + win + " · " + b.ok + " ok / " + b.fail + " fail" + (b.cancelled ? " / " + b.cancelled + " cancelled" : "");
+        cells += '<span class="heat-cell act ' + worst + '" data-job="' + escAttr(job.name) + '" style="opacity:' + op + '" title="' + escAttr(tip) + '"></span>';
+      }
+      html += '<div class="heat-row"><span class="heat-name" data-job="' + escAttr(job.name) + '" title="' + escAttr(job.name) +
+        '">' + esc(job.name) + '</span><div class="heat-cells">' + cells + "</div></div>";
+    }
+    $("heatBody").innerHTML = html;
+    const dropped = state.jobs.length - jobs.length;
+    $("heatMeta").textContent = "recent activity (in-memory, ≤50 runs/job)" +
+      (dropped > 0 ? " · showing first " + jobs.length + " of " + state.jobs.length + " jobs" : "");
+  }
+  function setHeat(v) {
+    prefs.heat = v; savePref("heat"); $("heatBtn").classList.toggle("on", v);
+    if (v) { renderHeatmap(); loadHeatmap(true); } else $("heatCard").style.display = "none";
+  }
+
+  // ===================================================================
+  //  cluster peer status swimlane  (client-accumulated timeline)
+  // ===================================================================
+  const PEER_COLOR = {
+    agreed: "#3fb950", syncing: "#d29922", drifted: "#f85149", untrusted: "#f85149",
+    conflict: "#f85149", unreachable: "#8b949e", self: "#58a6ff", unknown: "#7d8590",
+  };
+  const SWIM_KEY = "yacron2.swim", SWIM_MAX = 400, SWIM_WINDOW = 20 * 60 * 1000;
+  function loadSwimBuf(jsid) {
+    try {
+      const raw = localStorage.getItem(SWIM_KEY);
+      if (!raw) return [];
+      const o = JSON.parse(raw);
+      return (o && o.key === jsid && Array.isArray(o.buf)) ? o.buf : [];
+    } catch (_) { return []; }
+  }
+  function saveSwimBuf(jsid, buf) {
+    try { localStorage.setItem(SWIM_KEY, JSON.stringify({ key: jsid, buf: buf })); } catch (_) {}
+  }
+  // Append one gossip peer-view snapshot. Runs every cluster poll (even while
+  // the panel is collapsed) so the timeline is already populated when opened.
+  // Bounded by count + age; a single localStorage key holds only the current
+  // job-set's buffer, so a config rollover naturally evicts the old one.
+  function recordSwim(data, peers) {
+    const jsid = data.job_set_id || "";
+    if (state.swim.key !== jsid) { state.swim.key = jsid; state.swim.buf = loadSwimBuf(jsid); }
+    const now = Date.now();
+    state.swim.buf.push({
+      t: now,
+      leader: data.leader || null,
+      quorate: !!data.quorate,
+      peers: peers.filter((p) => p.status !== "self").map((p) => ({ h: p.host, s: p.status, e: p.last_error || null })),
+    });
+    const cutoff = now - SWIM_WINDOW, b = state.swim.buf;
+    while (b.length && (b.length > SWIM_MAX || b[0].t < cutoff)) b.shift();
+    // in-memory recording is unconditional (so the timeline is ready on open),
+    // but only persist while the panel is open — no per-poll localStorage write
+    // when the timeline is collapsed. setSwim() flushes once on open.
+    if (prefs.swim) saveSwimBuf(jsid, b);
+  }
+  function renderSwim() {
+    const box = $("swimPanel");
+    $("swimBtn").classList.toggle("on", prefs.swim);
+    if (!prefs.swim) { box.style.display = "none"; return; }
+    box.style.display = "";
+    const buf = state.swim.buf;
+    if (buf.length < 2) { box.innerHTML = '<div class="swim-note">collecting peer history… (accumulates while this tab is open)</div>'; return; }
+    const t0 = buf[0].t, t1 = Date.now(), span = Math.max(1000, t1 - t0);
+    const hosts = [];
+    for (const snap of buf) for (const p of snap.peers) if (hosts.indexOf(p.h) < 0) hosts.push(p.h);
+    hosts.sort();
+    if (!hosts.length) { box.innerHTML = '<div class="swim-note">no peers to chart yet.</div>'; return; }
+    const W = 1000, gutter = 150, plotW = W - gutter - 8, top = 20, laneH = 18;
+    const H = top + hosts.length * laneH + 6;
+    const X = (t) => gutter + ((t - t0) / span) * plotW;
+    let svg = '<svg viewBox="0 0 ' + W + " " + H + '" role="img" aria-label="peer status timeline">';
+    // quorum-lost shading, behind the lanes
+    let qStart = null;
+    for (let i = 0; i < buf.length; i++) {
+      const lost = !buf[i].quorate;
+      if (lost && qStart === null) qStart = buf[i].t;
+      if ((!lost || i === buf.length - 1) && qStart !== null) {
+        const end = lost ? t1 : buf[i].t;
+        svg += '<rect class="qlost" x="' + X(qStart).toFixed(1) + '" y="' + top + '" width="' +
+          Math.max(1, X(end) - X(qStart)).toFixed(1) + '" height="' + (hosts.length * laneH) + '"><title>quorum lost</title></rect>';
+        qStart = null;
+      }
+    }
+    // per-peer lanes: coalesce consecutive equal-status snapshots into segments
+    hosts.forEach((host, li) => {
+      const y = top + li * laneH;
+      svg += '<rect class="lane-bg" x="' + gutter + '" y="' + (y + 1) + '" width="' + plotW + '" height="' + (laneH - 3) + '"/>';
+      svg += '<text class="lbl" x="0" y="' + (y + laneH / 2 + 3) + '">' + esc(host.length > 22 ? host.slice(0, 21) + "…" : host) + "</text>";
+      let segStart = null, segStatus = null, segErr = null;
+      const flush = (end) => {
+        if (segStatus === null) return;
+        const x = X(segStart), w = Math.max(0.5, X(end) - x);
+        const tip = segStatus + (segErr ? " · " + segErr : "") + " · since " + fmtClock(segStart);
+        svg += '<rect class="seg" x="' + x.toFixed(1) + '" y="' + (y + 1) + '" width="' + w.toFixed(1) + '" height="' +
+          (laneH - 3) + '" fill="' + (PEER_COLOR[segStatus] || PEER_COLOR.unknown) + '"><title>' + escAttr(tip) + "</title></rect>";
+      };
+      for (let i = 0; i < buf.length; i++) {
+        const p = buf[i].peers.find((x) => x.h === host);
+        const st = p ? p.s : "unknown";
+        if (st !== segStatus) { flush(buf[i].t); segStatus = st; segStart = buf[i].t; segErr = p ? p.e : null; }
+      }
+      flush(t1);
+    });
+    // leadership-change markers (full height, on top)
+    for (let i = 1; i < buf.length; i++) {
+      if (buf[i].leader !== buf[i - 1].leader) {
+        const x = X(buf[i].t).toFixed(1);
+        svg += '<line class="lead" x1="' + x + '" y1="' + top + '" x2="' + x + '" y2="' + (top + hosts.length * laneH) +
+          '"><title>' + escAttr("leader: " + (buf[i - 1].leader || "none") + " → " + (buf[i].leader || "none")) + "</title></line>";
+      }
+    }
+    svg += '<text class="axl" x="' + gutter + '" y="12">' + esc(agoWords((t1 - t0) / 1000)) + "</text>";
+    svg += '<text class="axl" x="' + W + '" y="12" text-anchor="end">now</text>';
+    svg += "</svg>";
+    box.innerHTML = svg;
+  }
+  function setSwim(v) {
+    prefs.swim = v; savePref("swim");
+    if (v && state.swim.key !== null) saveSwimBuf(state.swim.key, state.swim.buf);  // flush current buffer on open
+    renderSwim();
+  }
+
+  // ===================================================================
+  //  fleet view — every node's runs in one pane (jobs × nodes matrix)
+  //  Each node piggybacks a per-job run summary on its gossip /peer
+  //  response, so this node can answer GET /fleet entirely from state it
+  //  already holds — no browser-to-peer polling (CSP confines this page
+  //  to its own origin) and no server fan-out. Peer columns are therefore
+  //  at most one cluster poll interval stale; each is aged so old data
+  //  reads as old, never as current. Gossip-only, the same gate as the
+  //  swimlane: lease backends carry no summaries.
+  // ===================================================================
+  function agoShort(iso) {
+    if (!iso) return "";
+    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 60) return Math.floor(s) + "s";
+    if (s < 3600) return Math.floor(s / 60) + "m";
+    if (s < 86400) return Math.floor(s / 3600) + "h";
+    return Math.floor(s / 86400) + "d";
+  }
+  function setFleet(v) {
+    prefs.fleet = v; savePref("fleet");
+    // first open with nothing cached: fetch, and let loadFleet render
+    if (v && !state.fleet.data) { loadFleet(); return; }
+    renderFleet();
+  }
+  // Same out-of-order guard as loadCluster: fired without awaiting from the
+  // poll path, so a delayed OLDER response must not overwrite a newer one.
+  let fleetReqSeq = 0, fleetAppliedSeq = 0;
+  async function loadFleet() {
+    const seq = ++fleetReqSeq;
+    try {
+      const r = await apiFetch("/fleet");
+      if (seq < fleetAppliedSeq) return;
+      if (!r.ok) { fleetAppliedSeq = seq; console.warn("loadFleet failed: HTTP " + r.status); return; }
+      const data = await r.json();
+      if (seq < fleetAppliedSeq) return;
+      fleetAppliedSeq = seq;
+      state.fleet.data = data.enabled ? data : null;
+      renderFleet();
+    } catch (e) {
+      // a 401 drives the re-auth flow elsewhere; anything else leaves the
+      // last frame on screen (its ages keep growing, which reads as stale)
+      if (e.message !== "unauthorized" && seq >= fleetAppliedSeq) {
+        fleetAppliedSeq = seq;
+        console.warn("loadFleet failed:", e);
+      }
+    }
+  }
+  function renderFleet() {
+    const box = $("fleetPanel");
+    $("fleetBtn").classList.toggle("on", prefs.fleet);
+    const data = prefs.fleet ? state.fleet.data : null;
+    if (!data) { box.style.display = "none"; return; }
+    box.style.display = "";
+    const nodes = data.nodes || [];
+    const spread = !!data.elect_leader && data.distribution === "spread";
+    // rows = the union of every node's advertised job names: a drifted peer
+    // mid-deploy may carry jobs this node does not know — show them anyway,
+    // that is the point of a fleet pane
+    const names = new Set();
+    for (const n of nodes) if (n.jobs) for (const j of Object.keys(n.jobs)) names.add(j);
+    let rows = Array.from(names).sort((a, b) => a.localeCompare(b));
+    const failing = (j) => nodes.some((n) => {
+      const s = n.jobs && n.jobs[j];
+      return !!(s && !s.running && s.last && s.last.outcome === "failure");
+    });
+    const failCount = rows.filter(failing).length;
+    if (state.fleet.failOnly) rows = rows.filter(failing);
+    let runningCells = 0;
+    for (const n of nodes) if (n.jobs) for (const j of Object.keys(n.jobs)) if (n.jobs[j].running) runningCells++;
+    const truncatedNodes = nodes.filter((n) => n.truncated).map((n) => n.node_name || n.host || "?");
+    let html = '<div class="fleetbar">' +
+      "<span>" + nodes.length + " node" + (nodes.length === 1 ? "" : "s") +
+      " · " + names.size + " job" + (names.size === 1 ? "" : "s") +
+      " · " + runningCells + " running</span>" +
+      (failCount ? '<span class="warn">' + failCount + " failing</span>" : "") +
+      '<label class="toggle"><input type="checkbox" id="fleetFailOnly"' + (state.fleet.failOnly ? " checked" : "") + "> failing only</label>" +
+      (truncatedNodes.length ? '<span class="warn" title="' + escAttr(truncatedNodes.join(", ")) + '">⚠ partial data from ' + truncatedNodes.length + " node" + (truncatedNodes.length === 1 ? "" : "s") + "</span>" : "") +
+      '<span class="grow"></span>' +
+      "<span>peer data rides gossip" + (data.interval ? " (every " + esc(String(data.interval)) + "s)" : "") + "</span>" +
+      "</div>";
+    const th = nodes.map((n) => {
+      const st = n.self ? "self" : (n.status || "unknown");
+      const age = n.self ? "live" : (n.as_of ? agoShort(n.as_of) + " ago" : "never reached");
+      return '<th><span class="nname2' + (n.self ? " selfcol" : "") + '">' + esc(n.node_name || n.host || "?") + "</span>" +
+        '<span class="nsub"><span class="cdot ' + esc(st) + '"></span>' + esc(n.self ? "this node" : st) + " · " + esc(age) +
+        (n.truncated ? " · partial" : "") + "</span></th>";
+    }).join("");
+    html += '<div class="fleetwrap"><table><thead><tr><th class="jobcol">job</th>' + th + "</tr></thead><tbody>";
+    for (const j of rows) {
+      const local = state.byName[j];
+      // spread ownership as THIS node computes it (from its own /jobs);
+      // rendezvous hashing is deterministic, so every quorate node agrees
+      const owner = spread && local ? local.clusterOwner : null;
+      const offEverywhere = nodes.every((n) => { const s = n.jobs && n.jobs[j]; return !s || s.enabled === false; });
+      html += "<tr" + (offEverywhere ? ' class="disabled"' : "") + '><td class="jobcol" data-job="' + escAttr(j) + '" title="' + escAttr(j) + '">' + esc(j) + "</td>";
+      for (const n of nodes) {
+        const s = n.jobs ? n.jobs[j] : undefined;
+        const own = owner != null && n.node_name === owner;
+        let cls = "cell none", body = "·", tip;
+        if (!n.jobs) { tip = "no data from this node yet"; }
+        else if (!s) { body = "—"; tip = n.truncated ? "not in this node's advertised subset (its summary set was truncated)" : "not configured on this node"; }
+        else if (s.running) { cls = "cell run"; body = GLYPH.run + " running"; tip = "running now"; }
+        else if (s.last) {
+          const k = outcomeCls(s.last.outcome);
+          const g = s.last.outcome === "failure" ? GLYPH.fail : s.last.outcome === "cancelled" ? GLYPH.cancelled : GLYPH.ok;
+          cls = "cell " + k;
+          body = g + " " + esc(s.last.outcome === "success" ? "ok" : s.last.outcome) +
+            '<span class="age">' + esc(agoShort(s.last.finished_at)) + "</span>";
+          tip = s.last.outcome + (s.last.exit_code != null ? " (exit " + s.last.exit_code + ")" : "") +
+            " · finished " + fmtAgo(s.last.finished_at) +
+            (s.last.duration != null ? " · took " + fmtDuration(s.last.duration) : "");
+        } else if (s.enabled === false) { body = GLYPH.disabled + " off"; tip = "disabled on this node"; }
+        else { body = GLYPH.pending; tip = "never ran on this node"; }
+        if (s && !s.running && s.scheduled_in != null) tip += " · next in " + fmtDuration(s.scheduled_in);
+        if (own) tip += " · owner (spread)";
+        html += '<td class="' + cls + (own ? " owner" : "") + '" title="' + escAttr(tip) + '">' + body + "</td>";
+      }
+      html += "</tr>";
+    }
+    html += "</tbody></table></div>";
+    if (!rows.length) html += '<div class="fleet-note">' + (state.fleet.failOnly && names.size ? "nothing failing — clear the filter to see the fleet" : "no jobs advertised yet (peer summaries arrive with the next gossip round)") + "</div>";
+    // The rebuild replaces the scroll container, which would snap a matrix
+    // the user has scrolled (tall job list / many nodes) back to the top on
+    // every poll. Carry the offsets (and the filter checkbox's keyboard
+    // focus) across the innerHTML swap.
+    const oldWrap = box.querySelector(".fleetwrap");
+    const sx = oldWrap ? oldWrap.scrollLeft : 0, sy = oldWrap ? oldWrap.scrollTop : 0;
+    const hadFocus = document.activeElement && document.activeElement.id === "fleetFailOnly";
+    box.innerHTML = html;
+    const wrap = box.querySelector(".fleetwrap");
+    if (wrap) { wrap.scrollLeft = sx; wrap.scrollTop = sy; }
+    if (hadFocus) { const cb = $("fleetFailOnly"); if (cb) cb.focus(); }
   }
 
   // ===================================================================
@@ -1133,9 +2532,21 @@
       jobs.forEach((j) => { state.byName[j.name] = j; });
       state.fetchedAt = performance.now();
       setConnected(true);
+      const first = !state.seenFirst;
       maybeNotify(jobs);
+      fleetSound(jobs, first);
+      updateIncidents(jobs);
+      ledgerRecord(jobs);
+      tailGovernor();
       renderSummary();
       renderRows();
+      renderVerdict();
+      if (state.timeline.open) renderTimeline();
+      if (state.mitigate.open) renderMitList();
+      if (prefs.radar) { computeRadar(); renderRadar(); }
+      if (state.wallboard) renderWallboard();
+      zenGovernor();
+      loadCluster();
       if (state.drawerJob) renderDrawerMeta();
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
@@ -1278,6 +2689,13 @@
       if (lr.duration != null) parts.push("<span>took " + fmtDuration(lr.duration) + "</span>");
     }
     if (caps.length) parts.push('<span class="faint">capture: ' + esc(caps.join(", ")) + "</span>");
+    // clusterPolicy is only present in the payload when leader election is on
+    if (job.clusterPolicy) {
+      var cl = "cluster: <b>" + esc(job.clusterPolicy) + "</b>";
+      // clusterOwner is present only under distribution: spread; null = no quorum
+      if ("clusterOwner" in job) cl += " → " + esc(job.clusterOwner || "no quorum");
+      parts.push('<span class="faint">' + cl + "</span>");
+    }
     $("dMeta").innerHTML = parts.join("");
     $("dRun").disabled = !job.enabled || job.running;
     $("dCancel").disabled = !job.running;
@@ -1331,7 +2749,22 @@
       "</tr>";
     }
     const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th><th>Reason</th></tr></thead><tbody>' + rows + "</tbody></table>";
-    box.innerHTML = stats + bars + table;
+    // opt-in run ledger: long-horizon totals this browser has accumulated,
+    // beyond the server's in-memory 50-run window shown above.
+    let ledgerNote = "";
+    if (state.ledger.on) {
+      const lg = state.ledger.runs[name] || [];
+      if (lg.length) {
+        const ok = lg.filter((r) => r.o === "success").length, fa = lg.filter((r) => r.o === "failure").length;
+        const st = state.ledger.stats[name] || {};
+        ledgerNote = '<div class="tlnote" style="border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px">◱ ledger (this browser): <b>' +
+          lg.length + "</b> runs · " + ok + " ok / " + fa + " fail · oldest " + esc(fmtAgo(lg[0].iso)) +
+          (st.median != null ? " · median " + esc(fmtDuration(st.median)) : "") +
+          (st.slow ? ' · <span style="color:var(--pending)">latest run slow</span>' : "") +
+          (st.regressed ? ' · <span style="color:var(--fail)">regression</span>' : "") + "</div>";
+      }
+    }
+    box.innerHTML = stats + ledgerNote + bars + table;
   }
   function stat(k, v, cls) { return '<div class="stat"><div class="k">' + esc(k) + '</div><div class="v ' + (cls || "") + '">' + esc(v == null ? "—" : v) + "</div></div>"; }
 
@@ -1351,6 +2784,12 @@
     let html =
       '<p class="sched-desc">' + esc(desc) + "</p>" +
       '<div class="sched-sub">schedule <span class="chip">' + esc(job.schedule) + '</span> · times shown in <b>' + esc(frame === "LOCAL" ? "local" : frame) + "</b></div>";
+
+    // foot-gun advisories: self-overlap, thundering-herd collisions, DST
+    const warns = scheduleWarnings(job);
+    if (warns.length)
+      html += '<div class="sched-warn">' + warns.map((w) =>
+        '<div class="sw ' + w.sev + '"><span class="wi">⚠</span><span class="wt">' + w.t + "</span></div>").join("") + "</div>";
 
     if (parsed.type === "reboot") {
       html += '<div class="term-empty">This job runs once, when yacron2 starts.</div>';
@@ -1430,8 +2869,9 @@
   function stripAnsi(line) { return line.replace(/\x1b\[[0-9;]*m/g, ""); }
 
   // build innerHTML for one log line's text honoring ansi + search highlight
-  function lineContentHtml(text, q) {
-    const useAnsi = $("optAnsi").checked;
+  // (ansiOn defaults to the drawer's checkbox; the multi-tail passes the pref)
+  function lineContentHtml(text, q, ansiOn) {
+    const useAnsi = ansiOn == null ? $("optAnsi").checked : ansiOn;
     const segs = useAnsi ? ansiSegments(text) : [{ text: stripAnsi(text), style: {} }];
     let html = "";
     for (const sg of segs) {
@@ -1546,20 +2986,17 @@
     cur.scrollIntoView({ block: "center" });
   }
 
-  async function startStream(name, clear) {
-    stopStream();
-    if (clear) clearTerm();
-    const job = state.byName[name];
-    if (job && !job.captureStdout && !job.captureStderr) {
-      appendLine("", "This job does not capture stdout or stderr — no logs to display. Enable captureStdout / captureStderr in its config.", "sys");
-      return;
-    }
-    const ctrl = new AbortController();
-    state.stream = ctrl;
+  // Read one job's /logs SSE stream until the server closes it or the
+  // controller aborts (fetch + manual parse: EventSource cannot attach the
+  // Authorization header). hooks: line(stream, text) per output line;
+  // end(sawAnyLine, reason) per server end event (reason "no-output" = the
+  // job has no output buffer at all); err(msg) on failure, with msg null for
+  // a 401 (the re-auth flow is already driven by apiFetch's modal).
+  async function readLogStream(name, ctrl, hooks) {
     let gotLine = false;
     try {
       const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/logs", { signal: ctrl.signal });
-      if (!res.ok || !res.body) { appendLine("", "Could not open log stream (HTTP " + res.status + ").", "sys"); return; }
+      if (!res.ok || !res.body) { hooks.err("Could not open log stream (HTTP " + res.status + ")."); return; }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = "";
@@ -1578,14 +3015,35 @@
             else if (ln.startsWith("data:")) data += ln.slice(5).trim();
           });
           if (ev === "line" && data) {
-            try { const o = JSON.parse(data); gotLine = true; appendLine(o.stream, o.line, null); } catch (_) {}
+            try { const o = JSON.parse(data); gotLine = true; hooks.line(o.stream, o.line); } catch (_) {}
           } else if (ev === "end") {
-            if (!gotLine) appendLine("", "(no output captured for the latest run)", "sys");
+            let reason = null;
+            try { reason = (JSON.parse(data || "{}") || {}).reason || null; } catch (_) {}
+            hooks.end(gotLine, reason);
           }
         }
       }
     } catch (e) {
-      if (e.name !== "AbortError" && e.message !== "unauthorized") appendLine("", "Log stream ended: " + e.message, "sys");
+      if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Log stream ended: " + e.message);
+    }
+  }
+
+  async function startStream(name, clear) {
+    stopStream();
+    if (clear) clearTerm();
+    const job = state.byName[name];
+    if (job && !job.captureStdout && !job.captureStderr) {
+      appendLine("", "This job does not capture stdout or stderr — no logs to display. Enable captureStdout / captureStderr in its config.", "sys");
+      return;
+    }
+    const ctrl = new AbortController();
+    state.stream = ctrl;
+    try {
+      await readLogStream(name, ctrl, {
+        line: (stream, text) => appendLine(stream, text, null),
+        end: (sawLine) => { if (!sawLine) appendLine("", "(no output captured for the latest run)", "sys"); },
+        err: (msg) => { if (msg) appendLine("", msg, "sys"); },
+      });
     } finally {
       if (state.stream === ctrl) state.stream = null;
     }
@@ -1603,6 +3061,266 @@
   }
 
   // ===================================================================
+  //  merged multi-tail — several jobs' SSE streams in one console, each
+  //  line prefixed with its job in a stable identity color
+  //
+  //  The daemon serves one SSE stream per job, and the server closes it
+  //  when the tailed run's output ends — so a continuous tail must
+  //  reconnect for the next run. Reconnects are poll-paced (the governor
+  //  below) and lossless in practice: attaching replays the run's whole
+  //  in-memory buffer, so a reconnect that lands mid-run still shows the
+  //  run's start.
+  // ===================================================================
+  // Browsers cap HTTP/1.1 connections at ~6 per origin, and every tailed
+  //  job holds one open — leave headroom for the /jobs + /cluster polls
+  //  and the action POSTs, or the whole dashboard starves behind the tails.
+  const TAIL_MAX = 4;
+  const TAIL_RETRY_MS = 5000;              // throttle reconnects after a stream error
+  const TAIL_COLORS = ["#4aa8ff", "#3fd271", "#ffbf47", "#c98bff", "#56d4dd", "#ff8783",
+                       "#ffd47a", "#7ee2a0", "#83c0ff", "#dcaaff", "#8be4ea", "#f0a1c2"];
+  function tailTermEl() { return $("tailTerm"); }
+  function tailQuery() {
+    const q = $("tailSearch").value;
+    return q ? { text: q.toLowerCase(), raw: q } : null;
+  }
+  function tailColor(name) {
+    const c = state.tail.colors;
+    if (!c[name]) c[name] = TAIL_COLORS[Object.keys(c).length % TAIL_COLORS.length];
+    return c[name];
+  }
+  function buildTailNode(item, q) {
+    const node = el("span", "ln " + (item.kind || item.stream || ""));
+    let inner = '<span class="gut">' + (item.n || 0) + "</span>";
+    if (prefs.ts && item.ts) inner += '<span class="ts">' + fmtClock(item.ts) + "</span>";
+    inner += '<span class="tj" data-job="' + escAttr(item.job) + '" style="color:' + item.color +
+      '" title="open ' + escAttr(item.job) + '">' + esc(item.job) + "</span>";
+    if (item.kind === "sys") inner += esc(item.text);
+    else inner += lineContentHtml(item.text, q, prefs.ansi);
+    node.innerHTML = inner;
+    return node;
+  }
+  function appendTailLine(job, stream, text, kind) {
+    if (!state.tail.open) return;
+    const t = tailTermEl();
+    const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 50;
+    const emptyNode = t.querySelector(".term-empty");
+    if (emptyNode) t.innerHTML = "";
+    const item = { job, color: tailColor(job), stream, text, kind, ts: Date.now(), n: ++state.tail.total };
+    state.tail.lines.push(item);
+    if (state.tail.lines.length > MAX_LOG_LINES) {
+      state.tail.lines.shift();
+      const first = t.firstElementChild;
+      if (first) first.remove();
+    }
+    t.appendChild(buildTailNode(item, tailQuery()));
+    if ($("tailFollow").checked && (atBottom || kind === "sys")) t.scrollTop = t.scrollHeight;
+    renderTailMeta();
+    updateTailCount();
+  }
+  function renderTailTerm() {
+    const t = tailTermEl();
+    const q = tailQuery();
+    t.classList.toggle("nowrap", !prefs.wrap);
+    t.innerHTML = "";
+    if (!state.tail.lines.length) {
+      t.innerHTML = '<span class="term-empty">' + (state.tail.jobs.length
+        ? "waiting for output…"
+        : "no jobs tailed — use + failing / + running, or add a job above.") + "</span>";
+      updateTailCount();
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    state.tail.lines.forEach((item) => frag.appendChild(buildTailNode(item, q)));
+    t.appendChild(frag);
+    if ($("tailFollow").checked) t.scrollTop = t.scrollHeight;
+    updateTailCount();
+  }
+  function updateTailCount() {
+    const q = tailQuery(), c = $("tailCount");
+    if (!q) { c.textContent = ""; return; }
+    let n = 0;
+    for (const it of state.tail.lines) if (!it.kind && lineMatches(it.text, q)) n++;
+    c.textContent = n + (n === 1 ? " match" : " matches");
+  }
+  function renderTailMeta() {
+    $("tailMeta").textContent = state.tail.jobs.length + "/" + TAIL_MAX + " jobs · " + state.tail.lines.length + " lines";
+  }
+  function renderTailChips() {
+    $("tailChips").innerHTML = state.tail.jobs.length
+      ? state.tail.jobs.map((n) =>
+          '<span class="tchip"><span class="cdotc" style="background:' + tailColor(n) + '"></span>' +
+          '<span class="tnm" data-job="' + escAttr(n) + '" title="open ' + escAttr(n) + '">' + esc(n) + "</span>" +
+          '<button data-untail="' + escAttr(n) + '" title="stop tailing ' + escAttr(n) + '">✕</button></span>'
+        ).join("")
+      : '<span class="none">no jobs tailed</span>';
+    $("tailJobList").innerHTML = state.jobs
+      .filter((j) => state.tail.jobs.indexOf(j.name) < 0)
+      .map((j) => '<option value="' + escAttr(j.name) + '">').join("");
+    renderTailMeta();
+  }
+  function tailConnect(name) {
+    const st = state.tail.streams[name], job = state.byName[name];
+    if (!st || st.ctrl || !job) return;
+    if (!job.captureStdout && !job.captureStderr) return;   // nothing to attach to
+    const ctrl = new AbortController();
+    st.ctrl = ctrl; st.err = false; st.retryAt = 0;
+    st.sawRunning = !!job.running;   // were we ever attached to a LIVE run?
+    readLogStream(name, ctrl, {
+      line: (stream, text) => appendTailLine(name, stream, text, null),
+      end: (sawLine, reason) => {
+        const s = state.tail.streams[name];
+        if (!s || s.ctrl !== ctrl) return;
+        if (reason === "no-output") {
+          // the job has no output buffer yet (with capture on: it has never
+          // run) — the governor attaches once a run exists
+          if (s.first) appendTailLine(name, "", "no captured output yet — will attach when a run produces some", "sys");
+          s.first = false;
+          return;
+        }
+        appendTailLine(name, "", sawLine ? "── end of run output ──" : "── end of run output (none captured) ──", "sys");
+        // Reconcile what we just streamed with the poll's record, so the
+        // governor neither replays it as missed nor skips a run we never saw:
+        //  - attached while the run was live → its finished_at lands on a
+        //    later poll: adopt it then (awaitFin). A second run fitting
+        //    entirely inside that window is adopted unseen — the same blind
+        //    spot the poll itself has.
+        //  - the poll already advanced past our record → that IS the run we
+        //    just replayed: adopt it now.
+        //  - otherwise we replayed the run already on record: nothing to do.
+        const job2 = state.byName[name];
+        const finNow = job2 && job2.last_run ? job2.last_run.finished_at : null;
+        if (s.sawRunning || (job2 && job2.running)) s.awaitFin = true;
+        else if (finNow !== s.sinceFin) { s.sinceFin = finNow; s.awaitFin = false; }
+        s.sawRunning = false;
+        s.first = false;
+      },
+      err: (msg) => {
+        const s = state.tail.streams[name];
+        if (!s || s.ctrl !== ctrl) return;
+        s.err = true; s.retryAt = Date.now() + TAIL_RETRY_MS;
+        // a reconnect after a mid-stream drop replays the current buffer, so
+        // lines already shown may repeat — say so once per distinct failure
+        if (msg && msg !== s.lastErr) { appendTailLine(name, "", msg + " — retrying (replay may repeat lines)", "sys"); s.lastErr = msg; }
+      },
+    }).then(() => {
+      const s = state.tail.streams[name];
+      if (s && s.ctrl === ctrl) s.ctrl = null;
+    });
+  }
+  function resetTailStream(name) {
+    const old = state.tail.streams[name];
+    if (old && old.ctrl) old.ctrl.abort();
+    const job = state.byName[name];
+    state.tail.streams[name] = {
+      ctrl: null, err: false, retryAt: 0, lastErr: null, first: true,
+      awaitFin: false, sawRunning: false,
+      sinceFin: job && job.last_run ? job.last_run.finished_at : null,
+    };
+    if (job && !job.captureStdout && !job.captureStderr) {
+      appendTailLine(name, "", "captures no output — enable captureStdout / captureStderr to tail it", "sys");
+      return;
+    }
+    tailConnect(name);
+  }
+  // Poll-paced reconnect governor: a job's stream ends with its run, so
+  // re-attach when the job is running again or a run we never saw has
+  // finished. Runs on every successful /jobs poll.
+  function tailGovernor() {
+    if (!state.tail.open) return;
+    const now = Date.now();
+    for (const name of state.tail.jobs) {
+      const st = state.tail.streams[name], job = state.byName[name];
+      if (!st || !job) continue;
+      // while a stream is live, just note whether its run was ever observed
+      // running (the end hook uses it to reconcile the run's finished_at)
+      if (st.ctrl) { if (job.running) st.sawRunning = true; continue; }
+      if (!job.captureStdout && !job.captureStderr) continue;
+      if (st.retryAt && now < st.retryAt) continue;
+      const fin = job.last_run ? job.last_run.finished_at : null;
+      if (st.err) { tailConnect(name); continue; }          // heal after a failure (throttled above)
+      if (st.awaitFin) {
+        if (job.running) tailConnect(name);                 // next run already started: its buffer is fresh
+        else if (fin !== st.sinceFin) { st.sinceFin = fin; st.awaitFin = false; }
+        continue;
+      }
+      if (job.running || (fin && fin !== st.sinceFin)) tailConnect(name);
+    }
+  }
+  // returns false only when the stream cap blocked the add
+  function addTailJob(name) {
+    if (!state.byName[name] || state.tail.jobs.indexOf(name) >= 0) return true;
+    if (state.tail.jobs.length >= TAIL_MAX) return false;
+    state.tail.jobs.push(name);
+    tailColor(name);
+    resetTailStream(name);
+    return true;
+  }
+  function removeTailJob(name) {
+    const st = state.tail.streams[name];
+    if (st && st.ctrl) st.ctrl.abort();
+    delete state.tail.streams[name];
+    state.tail.jobs = state.tail.jobs.filter((n) => n !== name);
+    renderTailChips();
+    if (!state.tail.lines.length) renderTailTerm();
+  }
+  function openTail(names) {
+    const fresh = !state.tail.open;
+    if (fresh) {
+      pushFocus();
+      state.tail.open = true;
+      $("tailWrap").classList.add("open");
+      // a fresh console starts empty: reconnecting replays each job's
+      // current buffer, so keeping the old lines would duplicate them
+      state.tail.lines = []; state.tail.total = 0;
+      $("tailSearch").value = "";
+      $("tailFollow").checked = prefs.follow;
+      $("tailWrapOpt").checked = prefs.wrap;
+      $("tailTs").checked = prefs.ts;
+      tailTermEl().classList.toggle("nowrap", !prefs.wrap);
+      tailTermEl().innerHTML = "";
+      for (const n of state.tail.jobs) resetTailStream(n);   // jobs kept from the last session
+    }
+    let blocked = 0;
+    for (const n of names || []) if (!addTailJob(n)) blocked++;
+    if (blocked) toast("info", "stream cap " + TAIL_MAX + " reached — " + blocked + " job" + (blocked > 1 ? "s" : "") + " not added");
+    renderTailChips();
+    if (!state.tail.lines.length) renderTailTerm();
+    if (fresh) setTimeout(() => $("tailAddInput").focus(), 30);
+  }
+  function closeTail() {
+    if (!state.tail.open) return;
+    for (const name of state.tail.jobs) {
+      const st = state.tail.streams[name];
+      if (st && st.ctrl) { st.ctrl.abort(); st.ctrl = null; }
+    }
+    state.tail.open = false;
+    $("tailWrap").classList.remove("open");
+    popFocus();
+  }
+  function tailPreset(kind) {
+    const names = state.jobs
+      .filter((j) => (kind === "run" ? j.running : health(j).key === "fail"))
+      .map((j) => j.name);
+    if (!names.length) { toast("info", "no " + (kind === "run" ? "running" : "failing") + " jobs"); return; }
+    openTail(names);
+  }
+  function tailDownload() {
+    const lines = state.tail.lines.filter((l) => !l.kind)
+      .map((l) => (prefs.ts && l.ts ? fmtClock(l.ts) + " " : "") + "[" + l.job + "] " + stripAnsi(l.text));
+    const blob = new Blob([lines.join("\n") + "\n"], { type: "text/plain" });
+    const a = el("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "yacron2-multitail.txt";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  }
+  function tailClear() {
+    state.tail.lines = [];
+    renderTailTerm();
+    renderTailMeta();
+  }
+
+  // ===================================================================
   //  command palette
   // ===================================================================
   function baseCommands() {
@@ -1613,7 +3331,21 @@
       { ic: "▤", lbl: "Toggle CRT effects", run: () => setFx(!prefs.fx) },
       { ic: "≡", lbl: "Toggle scanlines", run: () => setScan(!prefs.scan) },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
+      { ic: "⊞", lbl: "Choose table columns", run: () => toggleColsMenu(true) },
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
+      { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
+      { ic: "⌁", lbl: "Toggle next-fire radar", run: () => setRadar(!prefs.radar) },
+      { ic: "▦", lbl: "Toggle activity heatmap", run: () => setHeat(!prefs.heat) },
+      { ic: "⊞", lbl: "Toggle fleet view", sub: "every node's runs", run: () => setFleet(!prefs.fleet) },
+      { ic: "≋", lbl: "Multi-tail console", run: () => openTail([]) },
+      { ic: "≋", lbl: "Multi-tail: failing jobs", run: () => tailPreset("fail") },
+      { ic: "≋", lbl: "Multi-tail: running jobs", run: () => tailPreset("run") },
+      { ic: "▣", lbl: "Wallboard / TV mode", hint: "w", run: () => setWallboard(!state.wallboard) },
+      { ic: "▤", lbl: "Incident timeline", hint: "i", run: openTimeline },
+      { ic: "▸", lbl: "Mitigate failing jobs", run: () => openMitigate(state.jobs.filter((j) => health(j).key === "fail").map((j) => j.name), "failing jobs") },
+      { ic: "◴", lbl: "Cron sandbox", run: () => openSandbox() },
+      { ic: "◱", lbl: "Toggle run ledger", run: () => setLedger(!prefs.ledger) },
+      { ic: "▮", lbl: "Toggle boot self-test", run: () => setBoot(!prefs.boot) },
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
@@ -1628,6 +3360,7 @@
       if (j.running) out.push({ ic: "■", lbl: "Cancel: " + j.name, run: () => cancelJob(j.name) });
       out.push({ ic: "❏", lbl: "Copy command: " + j.name, run: () => copyText(j.command, "command") });
       out.push({ ic: "◴", lbl: "Schedule: " + j.name, run: () => openDrawer(j.name, "schedule") });
+      out.push({ ic: "≋", lbl: "Tail: " + j.name, sub: "multi-tail", run: () => openTail([j.name]) });
     }
     return out;
   }
@@ -1691,7 +3424,7 @@
     document.body.classList.toggle("scan", prefs.scan && fxAllowed);
   }
   function setTheme(v) { prefs.theme = v; savePref("theme"); applyTheme(); syncSettings(); }
-  function cycleTheme() { const order = ["amber", "green", "modern"]; setTheme(order[(order.indexOf(prefs.theme) + 1) % order.length]); toast("info", "theme: " + prefs.theme); }
+  function cycleTheme() { const order = ["amber", "green", "modern", "carolina"]; setTheme(order[(order.indexOf(prefs.theme) + 1) % order.length]); toast("info", "theme: " + prefs.theme); }
   function setFx(v) { prefs.fx = v; savePref("fx"); applyTheme(); syncSettings(); }
   function setScan(v) { prefs.scan = v; savePref("scan"); applyTheme(); syncSettings(); }
   function setDensity(v) { prefs.density = v; savePref("density"); document.body.classList.toggle("density-compact", v); syncSettings(); }
@@ -1712,7 +3445,15 @@
     $("setScan").checked = prefs.scan;
     $("setDensity").checked = prefs.density;
     $("setNotify").checked = prefs.notify;
+    $("setSound").checked = prefs.sound;
+    $("setVol").value = String(prefs.volume);
+    $("setBoot").checked = prefs.boot;
     $("setPoll").value = String(prefs.pollMs);
+    $("setLedger").checked = prefs.ledger;
+    $("setZen").checked = prefs.zen;
+    $("setZenIdle").value = String(prefs.zenIdle);
+    $("setEscalate").checked = prefs.escalate;
+    refreshLedgerStat();
     // CRT effects / scanlines do nothing on the flat "modern" theme — disable
     // those toggles there so they aren't inoperative-yet-interactive.
     const crt = prefs.theme !== "modern";
@@ -1774,7 +3515,13 @@
     const h = name ? "#job/" + encodeURIComponent(name) : "";
     if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
   }
+  // the wallboard owns the hash while active; clearing it drops back to "".
+  function setHashTv(on) {
+    const h = on ? "#tv" : "";
+    if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
+  }
   function openFromHash() {
+    if (location.hash === "#tv") { setWallboard(true); return; }
     const m = location.hash.match(/^#job\/(.+)$/);
     if (m) { const name = decodeURIComponent(m[1]); if (state.byName[name]) openDrawer(name); }
   }
@@ -1799,7 +3546,7 @@
     return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
   }
   function anyOverlayOpen() {
-    return state.palette.open ||
+    return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open || state.tail.open ||
       ["settingsWrap", "helpWrap", "modalWrap"].some((id) => $(id).classList.contains("open"));
   }
   // ---- focus management (trap + restore) for modal surfaces ----
@@ -1813,7 +3560,11 @@
     if ($("modalWrap").classList.contains("open")) return $("modalWrap");
     if ($("settingsWrap").classList.contains("open")) return $("settingsWrap");
     if ($("helpWrap").classList.contains("open")) return $("helpWrap");
+    if (state.mitigate.open) return $("mitigateWrap");
+    if (state.sandbox.open) return $("sandboxWrap");
+    if (state.timeline.open) return $("timelineWrap");
     if (state.palette.open) return $("paletteWrap");
+    if (state.tail.open) return $("tailWrap");   // DOM-first overlay: everything above outranks it
     if (state.drawerJob) return $("drawer");
     return null;
   }
@@ -1831,6 +3582,12 @@
   }
 
   document.addEventListener("keydown", (e) => {
+    // the boot self-test intercepts keys via its own capture-phase listener; be
+    // explicit that no shortcut fires while it is on screen.
+    if (state.booting) return;
+    // any key wakes the zen screensaver back to the live wallboard grid (without
+    // consuming the key — Esc still exits the wallboard, w/a still work below).
+    if (state.zen.on) zenWake();
     // palette navigation has priority
     if (state.palette.open) {
       if (e.key === "Escape") { e.preventDefault(); closePalette(); return; }
@@ -1857,10 +3614,16 @@
     if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K" || e.key === "p" || e.key === "P")) { e.preventDefault(); openPalette(); return; }
 
     if (e.key === "Escape") {
+      if ($("colsMenu").classList.contains("open")) return toggleColsMenu(false);
       if ($("modalWrap").classList.contains("open")) return closeModal();
       if ($("settingsWrap").classList.contains("open")) return closeSettings();
       if ($("helpWrap").classList.contains("open")) return closeHelp();
+      if (state.mitigate.open) return closeMitigate();
+      if (state.sandbox.open) return closeSandbox();
+      if (state.timeline.open) return closeTimeline();
+      if (state.tail.open) return closeTail();
       if (state.drawerJob) return closeDrawer();
+      if (state.wallboard) return setWallboard(false);
       return;
     }
 
@@ -1869,7 +3632,18 @@
       if (e.key === "Enter") { e.preventDefault(); jumpMatch(e.shiftKey ? -1 : 1); }
       return;
     }
-    if (inField(e) || anyOverlayOpen()) return;
+    // wallboard toggle + alarm-ack must work even while the wallboard is up, but
+    // not while typing in a field or with an overlay open.
+    if (!inField(e) && !anyOverlayOpen()) {
+      if (e.key === "w") { e.preventDefault(); setWallboard(!state.wallboard); return; }
+      if (e.key === "a") { e.preventDefault(); ackAlarm(); return; }
+    }
+    // the wallboard is a full-screen surface: suppress the list shortcuts --
+    // j/k/Enter/r/x drive the jobs table, which body.tv hides (and an opened
+    // drawer would desync the #tv hash). Overlays that DO open here (⌘K
+    // palette, 401 token modal) stack above the wallboard via the body.tv
+    // z-index overrides, so they are visible and keep their own key handling.
+    if (inField(e) || anyOverlayOpen() || state.wallboard) return;
 
     switch (e.key) {
       case "/": e.preventDefault(); $("search").focus(); break;
@@ -1878,6 +3652,7 @@
       case "k": case "ArrowUp": e.preventDefault(); moveSelection(-1); break;
       case "g": e.preventDefault(); loadJobs(); break;
       case "t": e.preventDefault(); cycleTheme(); break;
+      case "i": e.preventDefault(); openTimeline(); break;
       case "Enter": { const j = selectedJob(); if (j) openDrawer(j.name); break; }
       case "r": { const j = selectedJob(); if (j && j.enabled && !j.running) runJob(j.name); break; }
       case "x": { const j = selectedJob(); if (j && j.running) cancelJob(j.name); break; }
@@ -1922,11 +3697,141 @@
       $("sortSel").value = ["name", "status", "last", "next", "duration"].includes(k) ? k : $("sortSel").value;
       renderRows();
     }));
+    // jobs-table column picker: the button and menu stop propagation so the
+    // document-level click (anywhere else) is what dismisses the popover
+    $("colsBtn").addEventListener("click", (e) => { e.stopPropagation(); toggleColsMenu(); });
+    $("colsMenu").addEventListener("click", (e) => e.stopPropagation());
+    $("colsMenu").addEventListener("change", (e) => {
+      const k = e.target.getAttribute("data-col");
+      if (!k) return;
+      colPrefs()[k] = e.target.checked;
+      savePref("cols");
+      applyCols();
+    });
+    document.addEventListener("click", () => toggleColsMenu(false));
+    const mark = $("mark");
+    let markDeg = 0, markVel = 0, markRaf = 0, markLast = 0;
+    const spinMark = (t) => {
+      const dt = Math.min((t - markLast) / 1000, 0.1);
+      markLast = t;
+      markDeg = (markDeg + markVel * dt) % 360;
+      markVel *= Math.pow(0.757822222, dt);
+      mark.style.transform = `rotate(${markDeg}deg)`;
+      if (markVel > 3) { markRaf = requestAnimationFrame(spinMark); }
+      else { markVel = 0; markRaf = 0; }
+    };
+    mark.addEventListener("click", () => {
+      markVel += 360;
+      if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
+    });
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
+    $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
+    $("heatBtn").addEventListener("click", () => setHeat(!prefs.heat));
+    $("tailBtn").addEventListener("click", () => { if (state.tail.open) closeTail(); else openTail([]); });
+    $("tvBtn").addEventListener("click", () => setWallboard(!state.wallboard));
+    $("swimBtn").addEventListener("click", () => setSwim(!prefs.swim));
+    $("fleetBtn").addEventListener("click", () => setFleet(!prefs.fleet));
+    $("fleetPanel").addEventListener("change", (e) => {
+      if (e.target.id === "fleetFailOnly") { state.fleet.failOnly = e.target.checked; renderFleet(); }
+    });
+    // a job-name click opens the drawer — but only for jobs this node knows
+    // (a row can exist purely from a peer's summary; there is nothing local
+    // to open for it)
+    $("fleetPanel").addEventListener("click", (e) => {
+      const it = e.target.closest("[data-job]");
+      if (it && state.byName[it.getAttribute("data-job")]) openDrawer(it.getAttribute("data-job"));
+    });
+    $("heatWindow").addEventListener("change", (e) => { prefs.heatWindow = e.target.value; savePref("heatWindow"); renderHeatmap(); });
+    $("radarPanel").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job")); });
+    $("heatBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) openDrawer(it.getAttribute("data-job"), "history"); });
+    $("wbGrid").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { setWallboard(false); openDrawer(it.getAttribute("data-job")); } });
+    $("wbFoot").addEventListener("click", (e) => { if (e.target.closest("#wbExit")) setWallboard(false); });
     $("paletteBtn").addEventListener("click", openPalette);
     $("settingsBtn").addEventListener("click", openSettings);
     $("authBtn").addEventListener("click", () => openModal());
+
+    // incident cockpit: verdict bar → timeline / mitigate
+    $("verdictBar").addEventListener("click", (e) => {
+      if (e.target.closest("#vMitigate")) { openMitigate(state.incidentSet, "failing jobs"); return; }
+      if (e.target.closest("#vTail")) { openTail(state.incidentSet); return; }
+      openTimeline();   // the timeline button and the bar body both open the timeline
+    });
+    $("tlClose").addEventListener("click", closeTimeline);
+    $("tlFailOnly").addEventListener("change", (e) => { state.timeline.failOnly = e.target.checked; renderTimeline(); });
+    $("tlBody").addEventListener("click", (e) => { const it = e.target.closest("[data-job]"); if (it) { closeTimeline(); openDrawer(it.getAttribute("data-job")); } });
+    $("timelineWrap").addEventListener("click", (e) => { if (e.target === $("timelineWrap")) closeTimeline(); });
+
+    // mitigate console
+    $("mitCancelAll").addEventListener("click", () => bulkAction("cancel"));
+    $("mitStartAll").addEventListener("click", () => bulkAction("start"));
+    $("mitTail").addEventListener("click", () => { const set = state.mitigate.set.slice(); closeMitigate(); openTail(set); });
+    $("mitCopy").addEventListener("click", copyIncidentSummary);
+    $("mitAbort").addEventListener("click", () => { state.mitigate.abort = true; });
+    $("mitClose").addEventListener("click", closeMitigate);
+    $("mitigateWrap").addEventListener("click", (e) => { if (e.target === $("mitigateWrap")) closeMitigate(); });
+
+    // merged multi-tail console
+    $("tailClose").addEventListener("click", closeTail);
+    $("tailWrap").addEventListener("click", (e) => { if (e.target === $("tailWrap")) closeTail(); });
+    $("tailAddFailing").addEventListener("click", () => tailPreset("fail"));
+    $("tailAddRunning").addEventListener("click", () => tailPreset("run"));
+    // Enter adds the typed job; "change" catches a datalist pick by mouse
+    const tailAddFromInput = () => {
+      const v = $("tailAddInput").value.trim();
+      if (!v) return;
+      if (!state.byName[v]) { toast("err", "unknown job: " + v); return; }
+      openTail([v]);
+      $("tailAddInput").value = "";
+    };
+    $("tailAddInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); tailAddFromInput(); } });
+    $("tailAddInput").addEventListener("change", tailAddFromInput);
+    $("tailChips").addEventListener("click", (e) => {
+      const un = e.target.closest("[data-untail]");
+      if (un) { removeTailJob(un.getAttribute("data-untail")); return; }
+      const nm = e.target.closest(".tnm[data-job]");
+      if (nm) { const n = nm.getAttribute("data-job"); closeTail(); openDrawer(n, "logs"); }
+    });
+    // a line's job prefix jumps to that job's own drawer
+    $("tailTerm").addEventListener("click", (e) => {
+      const tj = e.target.closest(".tj[data-job]");
+      if (tj) { const n = tj.getAttribute("data-job"); closeTail(); openDrawer(n, "logs"); }
+    });
+    $("tailSearch").addEventListener("input", debounce(renderTailTerm, 130));
+    // the view toggles share the drawer's persisted prefs; keep its
+    // checkboxes in step so the two surfaces never disagree
+    $("tailFollow").addEventListener("change", (e) => {
+      prefs.follow = e.target.checked; savePref("follow"); $("optFollow").checked = prefs.follow;
+      if (prefs.follow) { const t = tailTermEl(); t.scrollTop = t.scrollHeight; }
+    });
+    $("tailWrapOpt").addEventListener("change", (e) => {
+      prefs.wrap = e.target.checked; savePref("wrap"); $("optWrap").checked = prefs.wrap;
+      tailTermEl().classList.toggle("nowrap", !prefs.wrap);
+      termEl().classList.toggle("nowrap", !prefs.wrap);
+    });
+    $("tailTs").addEventListener("change", (e) => {
+      prefs.ts = e.target.checked; savePref("ts"); $("optTs").checked = prefs.ts;
+      renderTailTerm();
+    });
+    $("tailDownload").addEventListener("click", tailDownload);
+    $("tailClearBtn").addEventListener("click", tailClear);
+
+    // cron sandbox
+    $("sbxInput").addEventListener("input", debounce(renderSandbox, 120));
+    $("sbxInput").addEventListener("keydown", (e) => { if (e.key === "Enter") { sbxPushRecent($("sbxInput").value); renderSandbox(); } });
+    $("sbxFrame").addEventListener("change", renderSandbox);
+    $("sbxClose").addEventListener("click", closeSandbox);
+    $("sbxBody").addEventListener("click", (e) => {
+      const ex = e.target.closest("[data-expr]");
+      if (ex) { $("sbxInput").value = ex.getAttribute("data-expr"); renderSandbox(); $("sbxInput").focus(); return; }
+      const jb = e.target.closest("[data-job]");
+      if (jb) { closeSandbox(); openDrawer(jb.getAttribute("data-job"), "schedule"); }
+    });
+    $("sandboxWrap").addEventListener("click", (e) => { if (e.target === $("sandboxWrap")) closeSandbox(); });
+
+    // zen screensaver: a click / pointer move wakes it back to the grid
+    $("zen").addEventListener("pointerdown", zenWake);
+    document.addEventListener("pointermove", () => { if (state.zen.on) zenWake(); });
 
     // drawer
     $("dClose").addEventListener("click", closeDrawer);
@@ -1958,7 +3863,16 @@
     $("setScan").addEventListener("change", (e) => setScan(e.target.checked));
     $("setDensity").addEventListener("change", (e) => setDensity(e.target.checked));
     $("setNotify").addEventListener("change", (e) => setNotify(e.target.checked));
+    $("setSound").addEventListener("change", (e) => setSound(e.target.checked));
+    $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
+    $("setBoot").addEventListener("change", (e) => setBoot(e.target.checked));
     $("setPoll").addEventListener("change", (e) => setPoll(parseInt(e.target.value, 10)));
+    $("setLedger").addEventListener("change", (e) => setLedger(e.target.checked));
+    $("setZen").addEventListener("change", (e) => { prefs.zen = e.target.checked; savePref("zen"); if (!prefs.zen) zenOff(); });
+    $("setZenIdle").addEventListener("change", (e) => { prefs.zenIdle = parseInt(e.target.value, 10); savePref("zenIdle"); state.zen.idleSince = 0; });
+    $("setEscalate").addEventListener("change", (e) => { prefs.escalate = e.target.checked; savePref("escalate"); });
+    $("ledgerExport").addEventListener("click", ledgerExport);
+    $("ledgerPurge").addEventListener("click", ledgerPurge);
     $("openHelp").addEventListener("click", () => { closeSettings(); openHelp(); });
     $("settingsWrap").addEventListener("click", (e) => { if (e.target === $("settingsWrap")) closeSettings(); });
     $("helpWrap").addEventListener("click", (e) => { if (e.target === $("helpWrap")) closeHelp(); });
@@ -1986,6 +3900,8 @@
       ["r", "Run selected job"], ["x", "Cancel selected (running) job"],
       ["c", "Copy selected command"],
       ["g", "Refresh now"], ["t", "Cycle theme"],
+      ["i", "Incident timeline"],
+      ["w", "Wallboard (TV) mode"], ["a", "Acknowledge failure alarm"],
       ["?", "This help"], ["Esc", "Close panel / drawer"],
     ];
     $("helpGrid").innerHTML = rows.map((r) =>
@@ -2010,11 +3926,1048 @@
     } catch (_) {}
   }
 
+  function shortId(id) {
+    return id ? id.replace(/^v\d+:/, "").slice(0, 12) : "—";
+  }
+
+  // Record this node's name and whether spread is active (from /cluster). Both
+  // feed the job table's Owner column — the node name for the self-highlight,
+  // the flag to reveal the column even for an all-EveryNode cluster — so a
+  // change re-renders the rows. No-op when unchanged (steady-state poll).
+  function setClusterMeta(node, spread) {
+    if (state.clusterNode === node && state.clusterSpread === spread) return;
+    state.clusterNode = node;
+    state.clusterSpread = spread;
+    renderRows();
+  }
+
+  // How many jobs each node currently owns under spread, keyed by node name.
+  // Only resolved string owners count: an EveryNode job has no owner and a
+  // no-quorum job's owner is null, so neither is attributed to any node.
+  function ownerCounts() {
+    const m = {};
+    for (const j of state.jobs) {
+      const o = j.clusterOwner;
+      if (o) m[o] = (m[o] || 0) + 1;
+    }
+    return m;
+  }
+
+  // Render the lease-backend (kubernetes/etcd) cluster view: a role summary
+  // plus the backend's lease detail block, in place of the gossip peer table.
+  function loadClusterLease(data) {
+    $("clusterTable").style.display = "none";
+    $("clusterLease").style.display = "";
+    let role;
+    if (data.is_leader) role = "leader";
+    else if (data.quorate && data.leader) role = "follower (leader: " + data.leader + ")";
+    else if (data.quorate) role = "follower";
+    else role = "no quorum (store unreachable)";
+    const line = (data.node_name || "?") + " · " + data.backend + " · " + role;
+    $("clusterSummary").textContent = line;
+    state.clusterLine = line;
+    // the swimlane and fleet view both chart the gossip peer set; lease
+    // backends have none (and gossip no summaries).
+    $("swimBtn").style.display = "none";
+    $("swimPanel").style.display = "none";
+    state.fleet.data = null;
+    $("fleetBtn").style.display = "none";
+    $("fleetPanel").style.display = "none";
+    const lease = data.lease || {};
+    const rows = Object.keys(lease)
+      .filter((k) => lease[k] !== null && lease[k] !== undefined)
+      .map((k) => "<tr><td>" + esc(k) + "</td><td>" + esc(String(lease[k])) + "</td></tr>")
+      .join("");
+    $("clusterLeaseRows").innerHTML =
+      rows || '<tr><td colspan="2">no lease detail yet</td></tr>';
+  }
+
+  // Put the cluster panel into an explicit DEGRADED/STALE state when /cluster
+  // cannot be read, instead of leaving it frozen on the last healthy frame
+  // (mirrors loadJobs' setConnected(false)/console.warn on real failures).
+  function clusterStale(why) {
+    const card = $("clusterCard");
+    // only meaningful once the card is actually visible (cluster enabled); a
+    // hidden card has nothing to mislead about.
+    if (card && card.style.display !== "none") card.classList.add("stale");
+    const sum = $("clusterSummary");
+    if (sum) sum.textContent = "cluster status unavailable" + (why ? " (" + why + ")" : "");
+  }
+  // loadCluster() is fired without awaiting (from loadJobs' success path), so
+  // overlapping /cluster requests can resolve out of order -- and a delayed
+  // OLDER response would regress the leader/quorum badge and append a stale
+  // snapshot to the swimlane with a newer timestamp (failover history recorded
+  // backwards). Stamp each request with a sequence number and drop, whole, any
+  // response older than the newest one already applied (UI, alert, swimlane).
+  let clusterReqSeq = 0, clusterAppliedSeq = 0;
+  async function loadCluster() {
+    const seq = ++clusterReqSeq;
+    try {
+      const r = await apiFetch("/cluster");
+      if (seq < clusterAppliedSeq) return;   // a newer response already applied
+      if (!r.ok) { clusterAppliedSeq = seq; console.warn("loadCluster failed: HTTP " + r.status); clusterStale("HTTP " + r.status); return; }
+      const data = await r.json();
+      if (seq < clusterAppliedSeq) return;   // overtaken while reading the body
+      clusterAppliedSeq = seq;
+      const card = $("clusterCard");
+      // a fresh, successful read clears any prior staleness signal.
+      card.classList.remove("stale");
+      // feed the incident verdict bar the cluster's health signal every poll
+      setClusterAlert(data);
+      renderVerdict();
+      if (!data.enabled) {
+        card.style.display = "none";
+        setClusterMeta(null, false);
+        state.clusterLine = null;
+        $("swimBtn").style.display = "none";
+        $("swimPanel").style.display = "none";
+        state.fleet.data = null;
+        $("fleetBtn").style.display = "none";
+        $("fleetPanel").style.display = "none";
+        return;
+      }
+      card.style.display = "";
+      // spread is per-job ownership and only meaningful with election on; this
+      // mirrors the daemon's own gate for emitting clusterOwner in /jobs.
+      const spread = !!data.elect_leader && data.distribution === "spread";
+      setClusterMeta(data.node_name || null, spread);
+      // Lease backends (kubernetes/etcd) have no static peer set: the lease
+      // store is authoritative. Render the lease/role detail instead of a peer
+      // tally. (They are always single-leader, so spread is false above.)
+      if (data.backend && data.backend !== "gossip") {
+        loadClusterLease(data);
+        return;
+      }
+      $("clusterTable").style.display = "";
+      $("clusterLease").style.display = "none";
+      const peers = data.peers || [];
+      // Per-node ownership counts need the /jobs payload. loadCluster() now
+      // fires only from loadJobs' success path (state.jobs already set), but
+      // keep the state.fetchedAt > 0 guard so a caller added ahead of the
+      // first /jobs payload renders neutral placeholders rather than a bogus
+      // 0. Computed once and reused by the summary and the per-peer Owns
+      // column.
+      const ownsCounts = (spread && state.fetchedAt > 0) ? ownerCounts() : null;
+      // "self" entries are this node listed in its own peers; exclude from the
+      // agreement tally.
+      const counted = peers.filter((p) => p.status !== "self");
+      const agreed = counted.filter((p) => p.status === "agreed").length;
+      let summary =
+        (data.node_name || "?") + " · " + agreed + "/" + counted.length + " agreed";
+      if (data.elect_leader) {
+        // Quorum is authoritative from the backend: data.quorate is the gate's
+        // own is_quorate() (leader_name() is not None). The directional "agreed"
+        // tally above cannot reproduce it — it ignores mutual agreement, bridge
+        // candidates, and per-process dedup — so trust the backend rather than
+        // recomputing a number that both over- and under-counts.
+        const quorate = !!data.quorate;
+        // Any conflict (duplicate nodeName / size / coordination policy) fails
+        // the Leader gate closed regardless of leader/quorum, so it dominates
+        // the role: rendering "leader" while jobs are actually paused is
+        // self-contradictory. The detailed ⚠ lines below name the conflict.
+        const conflict = !!data.conflict;
+        let role;
+        if (conflict) {
+          role = "standing down (conflict)";
+        } else if (data.distribution === "spread") {
+          // no single leader: per-job ownership, gated on quorum
+          role = quorate ? "spread (per-job owner)" : "spread (no quorum)";
+        } else {
+          role = data.is_leader
+            ? "leader"
+            : data.leader
+              ? "follower (leader: " + data.leader + ")"
+              : quorate ? "follower" : "no quorum";
+        }
+        summary +=
+          " · quorum " + (quorate ? "ok" : "lost") +
+          " (need " + (data.quorum || "?") + ")" +
+          " · " + role;
+        // under spread, how many jobs this node itself currently owns (omitted
+        // until the jobs payload is known — see ownsCounts above)
+        if (ownsCounts) summary += " · owns " + (ownsCounts[data.node_name] || 0);
+      }
+      // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
+      if (data.conflict_names && data.conflict_names.length) {
+        summary +=
+          " · ⚠ duplicate nodeName (" + data.conflict_names.join(", ") +
+          ") — Leader jobs paused";
+      }
+      // a cluster-size disagreement (divergent peer lists, e.g. mid-resize)
+      // breaks the quorum proof the same way; surface it just as loudly.
+      if (data.size_conflict) {
+        var sizes = (data.conflicting_sizes || []).join(", ");
+        summary +=
+          " · ⚠ cluster size mismatch" +
+          (sizes ? " (peers declare " + sizes + " vs our " +
+            (data.cluster_size || "?") + ")" : "") +
+          " — Leader jobs paused";
+      }
+      // a coordination-policy mismatch (a peer running a different
+      // distribution / electLeader) picks different owners and would
+      // double-run or drop Leader jobs; surface it just as loudly.
+      if (data.policy_conflict) {
+        var policies = (data.conflicting_policies || []).join("; ");
+        summary +=
+          " · ⚠ coordination policy mismatch" +
+          (policies ? " (" + policies + ")" : "") +
+          " — Leader jobs paused";
+      }
+      $("clusterSummary").textContent = summary;
+      state.clusterLine = summary;
+      // the Owns column lists each peer's job count; reveal it only under spread
+      $("clusterTable").classList.toggle("show-owns", spread);
+      $("clusterRows").innerHTML = peers.map((p) =>
+        '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
+        "<td>" + esc(p.node_name || "—") + "</td>" +
+        '<td class="col-owns">' + (ownsCounts && p.node_name ? esc(ownsCounts[p.node_name] || 0) : "—") + "</td>" +
+        "<td>" + esc(p.status) + "</td>" +
+        '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
+      ).join("");
+      // accumulate this snapshot into the peer swimlane and (re)draw it
+      $("swimBtn").style.display = "";
+      recordSwim(data, peers);
+      renderSwim();
+      // the fleet view rides the same poll; /fleet is answered from state
+      // the daemon already holds, but there is no need to read it while the
+      // panel is closed (renderFleet then just keeps everything hidden)
+      $("fleetBtn").style.display = "";
+      if (prefs.fleet) loadFleet(); else renderFleet();
+    } catch (e) {
+      // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
+      // flow (openModal) elsewhere; don't mask it as "unavailable". Any other
+      // throw (fetch/parse/render) leaves the panel stale rather than frozen --
+      // unless a newer response already applied, in which case this failure is
+      // old news and must not stamp "stale" over fresh data.
+      if (e.message !== "unauthorized" && seq >= clusterAppliedSeq) {
+        clusterAppliedSeq = seq;
+        console.warn("loadCluster failed:", e);
+        clusterStale();
+      }
+    }
+  }
+
+  // ===================================================================
+  //  run ledger — opt-in long-horizon history (IndexedDB)
+  //  Defeats the server's 50-run in-memory cap without touching the
+  //  read-only root filesystem: IndexedDB is the sanctioned client home.
+  //  Records the LATEST finished run per job per poll (dedup by
+  //  finished_at); accumulates only while a tab is open. Every IDB call is
+  //  best-effort — a failure (private mode / quota / no IndexedDB) just
+  //  means the ledger doesn't persist, and nothing else breaks.
+  // ===================================================================
+  const LEDGER_DB = "yacron2-ledger", LEDGER_STORE = "runs";
+  const LEDGER_PERJOB = 600;     // in-memory rows kept per job (analysis window)
+  const LEDGER_MIN = 8;          // min completed runs before flagging anomalies
+  const LEDGER_SLOW_K = 3.5;     // slow := latest > median + K*MAD (and > 1.5x median)
+  let _ledgerDB = null, _ledgerOpening = null;
+
+  function ledgerDBHandle() {
+    if (_ledgerDB) return Promise.resolve(_ledgerDB);
+    if (_ledgerOpening) return _ledgerOpening;
+    _ledgerOpening = new Promise((resolve) => {
+      let req;
+      try { req = indexedDB.open(LEDGER_DB, 1); } catch (_) { resolve(null); return; }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(LEDGER_STORE)) {
+          const os = db.createObjectStore(LEDGER_STORE, { keyPath: "id" });
+          os.createIndex("job", "job", { unique: false });
+        }
+      };
+      req.onsuccess = () => { _ledgerDB = req.result; resolve(_ledgerDB); };
+      req.onerror = () => resolve(null);
+    });
+    return _ledgerOpening;
+  }
+  function ledgerPut(rows) {
+    if (!rows.length) return;
+    ledgerDBHandle().then((db) => {
+      if (!db) return;
+      try {
+        const os = db.transaction(LEDGER_STORE, "readwrite").objectStore(LEDGER_STORE);
+        for (const r of rows) os.put(r);
+      } catch (_) {}
+    });
+  }
+  // Load every persisted row back into the in-memory mirror on enable / first
+  // load, so analysis + the History pane stay synchronous.
+  async function ledgerLoad() {
+    const db = await ledgerDBHandle();
+    state.ledger.runs = {}; state.ledger.count = 0;
+    if (db) {
+      await new Promise((resolve) => {
+        let req;
+        try { req = db.transaction(LEDGER_STORE, "readonly").objectStore(LEDGER_STORE).openCursor(); }
+        catch (_) { resolve(); return; }
+        req.onsuccess = () => {
+          const cur = req.result;
+          if (!cur) { resolve(); return; }
+          const r = cur.value;
+          (state.ledger.runs[r.job] || (state.ledger.runs[r.job] = [])).push(r);
+          state.ledger.count++;
+          cur.continue();
+        };
+        req.onerror = () => resolve();
+      });
+    }
+    for (const name in state.ledger.runs) {
+      const arr = state.ledger.runs[name];
+      arr.sort((a, b) => a.fin - b.fin);
+      if (arr.length > LEDGER_PERJOB) arr.splice(0, arr.length - LEDGER_PERJOB);
+      const last = arr[arr.length - 1];
+      if (last) state.ledger.seen[name] = last.iso;   // don't re-record on reload
+    }
+    state.ledger.ready = true;
+    ledgerAnalyze();
+  }
+  // Poll-diff: append each job's newest finished run when finished_at advances.
+  function ledgerRecord(jobs) {
+    if (!state.ledger.on || !state.ledger.ready) return;
+    const add = [];
+    for (const j of jobs) {
+      const lr = j.last_run;
+      if (!lr || !lr.finished_at) continue;
+      if (state.ledger.seen[j.name] === lr.finished_at) continue;
+      state.ledger.seen[j.name] = lr.finished_at;
+      const row = {
+        id: j.name + "|" + lr.finished_at, job: j.name, iso: lr.finished_at,
+        fin: Date.parse(lr.finished_at) || 0, o: lr.outcome,
+        x: (lr.exit_code == null ? null : lr.exit_code),
+        d: (lr.duration == null ? null : lr.duration),
+        r: lr.fail_reason || null,
+      };
+      const arr = state.ledger.runs[j.name] || (state.ledger.runs[j.name] = []);
+      arr.push(row);
+      if (arr.length > LEDGER_PERJOB) arr.shift();
+      state.ledger.count++;
+      add.push(row);
+    }
+    if (add.length) { ledgerPut(add); ledgerAnalyze(); refreshLedgerStat(); }
+  }
+  function median(xs) {
+    if (!xs.length) return null;
+    const s = xs.slice().sort((a, b) => a - b), m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+  // Robust per-job baselines: median + MAD of SUCCESSFUL run durations.
+  function ledgerAnalyze() {
+    const stats = {};
+    for (const name in state.ledger.runs) {
+      const arr = state.ledger.runs[name];
+      const durs = [];
+      for (const r of arr) if (r.o === "success" && r.d != null) durs.push(r.d);
+      const st = { n: arr.length, samples: durs.length, slow: false, ratio: null, regressed: false, median: null };
+      if (durs.length >= LEDGER_MIN) {
+        const med = median(durs);
+        const mad = median(durs.map((d) => Math.abs(d - med))) || 0;
+        st.median = med;
+        let latest = null;
+        for (let i = arr.length - 1; i >= 0; i--) if (arr[i].d != null && arr[i].o !== "cancelled") { latest = arr[i]; break; }
+        if (latest && med > 0) {
+          st.ratio = latest.d / med;
+          if (latest.o === "success" && latest.d > med + LEDGER_SLOW_K * mad && latest.d > med * 1.5) st.slow = true;
+        }
+      }
+      const last = arr[arr.length - 1];
+      if (last && last.o === "failure") {
+        let streak = 0;
+        for (let i = arr.length - 2; i >= 0 && arr[i].o === "success"; i--) streak++;
+        if (streak >= LEDGER_MIN) st.regressed = true;
+      }
+      stats[name] = st;
+    }
+    state.ledger.stats = stats;
+  }
+  // synchronous accessor used by the row renderer + its signature
+  function ledgerFlag(name) {
+    if (!state.ledger.on) return null;
+    const s = state.ledger.stats[name];
+    return s && s.slow ? { kind: "slow", ratio: s.ratio } : null;
+  }
+  function slowChip(job) {
+    const f = ledgerFlag(job.name);
+    if (!f || job.running) return "";
+    const r = f.ratio ? "×" + f.ratio.toFixed(1) : "";
+    return '<span class="slow-chip" title="latest successful run ran unusually slow vs its ledger baseline">◱ slow ' + esc(r) + "</span>";
+  }
+  function fmtBytes(b) {
+    if (b < 1024) return b + " B";
+    if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
+    return (b / 1048576).toFixed(1) + " MB";
+  }
+  function refreshLedgerStat() {
+    const row = $("ledgerStatRow"), out = $("ledgerStat");
+    if (!row || !out) return;
+    row.style.display = state.ledger.on ? "" : "none";
+    if (!state.ledger.on) return;
+    const jobs = Object.keys(state.ledger.runs).length;
+    out.textContent = state.ledger.count + " runs · " + jobs + " jobs · ~" + fmtBytes(state.ledger.count * 90);
+  }
+  function setLedger(v) {
+    prefs.ledger = v; savePref("ledger"); state.ledger.on = v; syncSettings();
+    if (v) { state.ledger.ready = false; ledgerLoad().then(() => { refreshLedgerStat(); renderRows(); }); }
+    else { state.ledger.stats = {}; refreshLedgerStat(); renderRows(); }
+  }
+  function ledgerExport() {
+    const out = { schema: "yacron2-ledger/1", exported_at: new Date().toISOString(), runs: {} };
+    for (const name in state.ledger.runs)
+      out.runs[name] = state.ledger.runs[name].map((r) => ({ finished_at: r.iso, outcome: r.o, exit_code: r.x, duration: r.d, fail_reason: r.r }));
+    const blob = new Blob([JSON.stringify(out, null, 2)], { type: "application/json" });
+    const a = el("a"); a.href = URL.createObjectURL(blob); a.download = "yacron2-run-ledger.json";
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+    toast("ok", "exported " + state.ledger.count + " runs");
+  }
+  function ledgerPurge() {
+    state.ledger.runs = {}; state.ledger.seen = {}; state.ledger.stats = {}; state.ledger.count = 0;
+    ledgerDBHandle().then((db) => { if (!db) return; try { db.transaction(LEDGER_STORE, "readwrite").objectStore(LEDGER_STORE).clear(); } catch (_) {} });
+    refreshLedgerStat(); renderRows(); toast("info", "ledger purged");
+  }
+
+  // ===================================================================
+  //  incident cockpit — fleet verdict + correlated-failure clustering
+  // ===================================================================
+  const CORR_WINDOW = 60000;   // failures within this window may share a cause
+
+  // Distill the /cluster view into one alert signal for the verdict bar.
+  function setClusterAlert(data) {
+    if (!data || !data.enabled) { state.clusterAlert = null; return; }
+    let bad = false, reason = "";
+    if (data.elect_leader) {
+      if (data.conflict) {
+        reason = (data.conflict_names && data.conflict_names.length) ? "duplicate nodeName"
+          : data.size_conflict ? "cluster size mismatch"
+          : data.policy_conflict ? "coordination policy mismatch" : "conflict";
+        reason += " — Leader jobs paused"; bad = true;
+      } else if (!data.quorate) {
+        reason = (data.backend && data.backend !== "gossip")
+          ? "lease store unreachable — Leader jobs failing closed" : "no quorum — Leader jobs paused";
+        bad = true;
+      }
+    }
+    state.clusterAlert = { bad: bad, reason: reason, node: data.node_name || null };
+  }
+  // Group failing jobs by (exit_code, fail_reason); the dominant group whose
+  // finishes fall inside CORR_WINDOW is the correlation headline + blast radius.
+  function correlate(failing) {
+    const groups = {};
+    for (const j of failing) {
+      const lr = j.last_run || {};
+      const key = (lr.exit_code == null ? "?" : lr.exit_code) + "|" + (lr.fail_reason || "");
+      (groups[key] || (groups[key] = [])).push(j);
+    }
+    let best = null;
+    for (const key in groups) {
+      const g = groups[key];
+      if (g.length < 2) continue;
+      const times = g.map((j) => Date.parse(j.last_run.finished_at) || 0).filter(Boolean);
+      const span = times.length ? Math.max.apply(null, times) - Math.min.apply(null, times) : 0;
+      if (!best || g.length > best.n) best = { n: g.length, span: span, exit: g[0].last_run.exit_code, reason: g[0].last_run.fail_reason, jobs: g };
+    }
+    return best;
+  }
+  function renderVerdict() {
+    const bar = $("verdictBar");
+    const failing = state.jobs.filter((j) => health(j).key === "fail");
+    const alert = state.clusterAlert;
+    const corr = failing.length > 1 ? correlate(failing) : null;
+    state.incidentSet = (corr && corr.n >= 2 ? corr.jobs : failing).map((j) => j.name);
+    let sev, glyph = "▲", head = "", sub = "";
+    if (alert && alert.bad) {
+      sev = "crit"; glyph = "☢";
+      head = "CLUSTER ALERT — " + alert.reason.toUpperCase();
+      sub = (alert.node ? "this node: " + alert.node + " · " : "") +
+        (failing.length ? failing.length + " job" + (failing.length > 1 ? "s" : "") + " also failing" : "leadership / quorum degraded");
+    } else if (failing.length === 0) {
+      state.incidentSet = [];
+      if (state.verdictSig !== "hidden") { state.verdictSig = "hidden"; bar.style.display = "none"; bar.className = "verdict"; }
+      return;
+    } else if (failing.length === 1) {
+      sev = "warn";
+      const j = failing[0], lr = j.last_run || {};
+      head = "JOB FAILING — " + j.name;
+      sub = "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "") + " · " + fmtAgo(lr.finished_at);
+    } else {
+      sev = "crit";
+      head = "FLEET EVENT — " + failing.length + " jobs failing";
+      sub = corr
+        ? "×" + corr.n + " share exit=" + (corr.exit == null ? "?" : corr.exit) + (corr.reason ? " (" + corr.reason + ")" : "") +
+          (corr.span <= CORR_WINDOW ? " within " + Math.max(1, Math.round(corr.span / 1000)) + "s" : "") + " — likely one cause"
+        : "no shared failure signature — likely independent";
+    }
+    const sig = sev + "|" + head + "|" + sub;
+    if (sig === state.verdictSig) return;
+    state.verdictSig = sig;
+    bar.className = "verdict sev-" + sev;
+    bar.style.display = "";
+    $("vGlyph").textContent = glyph;
+    $("vHead").textContent = head;
+    $("vSub").textContent = sub;
+  }
+
+  // ---- incident timeline overlay (hotkey i) ----
+  function openTimeline() {
+    if (state.timeline.open) { closeTimeline(); return; }
+    pushFocus();
+    state.timeline.open = true;
+    $("timelineWrap").classList.add("open");
+    $("tlFailOnly").checked = state.timeline.failOnly;
+    renderTimeline();
+    focusFirst($("timelineWrap"));
+  }
+  function closeTimeline() {
+    if (!state.timeline.open) return;
+    state.timeline.open = false;
+    $("timelineWrap").classList.remove("open");
+    popFocus();
+  }
+  function renderTimeline() {
+    if (!state.timeline.open) return;
+    $("tlNow").textContent = utcClock();
+    const events = [];
+    for (const j of state.jobs) {
+      const lr = j.last_run;
+      if (!lr || !lr.finished_at) continue;
+      const cls = lr.outcome === "failure" ? "fail" : lr.outcome === "cancelled" ? "cancelled" : "ok";
+      if (state.timeline.failOnly && cls !== "fail") continue;
+      events.push({ name: j.name, cls: cls, fin: Date.parse(lr.finished_at) || 0, iso: lr.finished_at, x: lr.exit_code, d: lr.duration, r: lr.fail_reason || "" });
+    }
+    events.sort((a, b) => b.fin - a.fin);
+    const corr = correlate(state.jobs.filter((j) => health(j).key === "fail"));
+    const corrSet = corr && corr.n >= 2 ? corr.jobs.map((j) => j.name) : [];
+    const body = $("tlBody");
+    if (!events.length) { body.innerHTML = '<div class="tlempty">No runs recorded yet.</div>'; return; }
+    body.innerHTML = events.map((e) => {
+      const meta = (e.x == null ? "" : "exit " + esc(e.x)) + (e.d != null ? " · " + fmtDuration(e.d) : "");
+      return '<div class="tlrow ' + e.cls + (corrSet.indexOf(e.name) >= 0 ? " corr" : "") + '" data-job="' + escAttr(e.name) + '" title="' + escAttr(new Date(e.fin).toString()) + '">' +
+        '<span class="tlt" data-ago="' + escAttr(e.iso) + '">' + esc(fmtAgo(e.iso)) + "</span>" +
+        '<span class="tlg">' + GLYPH[e.cls] + "</span>" +
+        '<span class="tlnm">' + esc(e.name) + (e.r ? ' <span class="tlre">' + esc(e.r) + "</span>" : "") + "</span>" +
+        '<span class="tlmeta">' + meta + "</span>" +
+      "</div>";
+    }).join("");
+  }
+
+  // ===================================================================
+  //  mitigate console — guarded, staggered bulk run/cancel + writeup
+  // ===================================================================
+  const MIT_STAGGER = 300;   // ms between actions (gentle on the daemon)
+  function openMitigate(names, label) {
+    names = (names || []).filter((n) => state.byName[n]);
+    if (!names.length) { toast("info", "nothing to mitigate — no target jobs"); return; }
+    if (!state.mitigate.open) pushFocus();
+    state.mitigate.open = true; state.mitigate.set = names; state.mitigate.abort = false;
+    $("mitTitle").textContent = "Mitigate — " + (label || (names.length + " jobs"));
+    $("mitDesc").textContent = "Acts on these " + names.length + " job" + (names.length > 1 ? "s" : "") +
+      ". Bulk actions are staggered and abortable; each uses the same token as a single action.";
+    $("mitLog").style.display = "none"; $("mitLog").textContent = "";
+    $("mitAbort").style.display = "none";
+    renderMitList();
+    $("mitigateWrap").classList.add("open");
+    focusFirst($("mitigateWrap"));
+  }
+  function renderMitList() {
+    $("mitList").innerHTML = state.mitigate.set.map((n) => {
+      const j = state.byName[n]; if (!j) return "";
+      const k = health(j).key, lr = j.last_run || {};
+      const s = k === "fail" ? "exit " + (lr.exit_code == null ? "?" : lr.exit_code) + (lr.fail_reason ? " · " + lr.fail_reason : "")
+        : j.running ? "running" : (lr.finished_at ? fmtAgo(lr.finished_at) : "pending");
+      return '<div class="mj ' + k + '"><span class="g">' + GLYPH[k] + '</span><span class="mn">' + esc(n) + '</span><span class="ms">' + esc(s) + "</span></div>";
+    }).join("");
+  }
+  function closeMitigate() {
+    if (!state.mitigate.open) return;
+    state.mitigate.abort = true; state.mitigate.open = false;
+    $("mitigateWrap").classList.remove("open");
+    popFocus();
+  }
+  function mitLog(line) {
+    const box = $("mitLog"); box.style.display = "";
+    box.textContent += line + "\n"; box.scrollTop = box.scrollHeight;
+  }
+  async function bulkAction(kind) {
+    if (state.mitigate.running) return;
+    const targets = state.mitigate.set.filter((n) => {
+      const j = state.byName[n]; if (!j) return false;
+      return kind === "cancel" ? j.running : (j.enabled && !j.running);
+    });
+    const verb = kind === "cancel" ? "cancel" : "start";
+    if (!targets.length) { mitLog("nothing to " + verb + " (no eligible jobs)"); return; }
+    state.mitigate.running = true; state.mitigate.abort = false;
+    $("mitAbort").style.display = "";
+    $("mitCancelAll").disabled = $("mitStartAll").disabled = true;
+    mitLog("— " + verb + "ing " + targets.length + " job" + (targets.length > 1 ? "s" : "") + " —");
+    let done = 0, failed = 0;
+    for (const n of targets) {
+      if (state.mitigate.abort) { mitLog("aborted (" + done + "/" + targets.length + " sent)"); break; }
+      try {
+        const res = await apiFetch("/jobs/" + encodeURIComponent(n) + "/" + verb, { method: "POST" });
+        if (res.ok) { done++; mitLog("  ✓ " + verb + " " + n); }
+        else { failed++; mitLog("  ✗ " + n + " (HTTP " + res.status + ")"); }
+      } catch (e) {
+        failed++;
+        if (e.message === "unauthorized") { mitLog("  ! unauthorized — set a token"); break; }
+        mitLog("  ✗ " + n + " (error)");
+      }
+      await new Promise((r) => setTimeout(r, MIT_STAGGER));
+    }
+    mitLog("done: " + done + " ok" + (failed ? ", " + failed + " failed" : ""));
+    state.mitigate.running = false;
+    $("mitAbort").style.display = "none";
+    $("mitCancelAll").disabled = $("mitStartAll").disabled = false;
+    toast(failed ? "err" : "ok", verb + ": " + done + " ok" + (failed ? ", " + failed + " failed" : ""));
+    setTimeout(loadJobs, 400);
+  }
+  function copyIncidentSummary() {
+    const names = state.mitigate.set;
+    const lines = ["# yacron2 incident", "",
+      "- when: " + new Date().toISOString(),
+      "- host: " + location.host,
+      "- version: " + ($("ver").textContent || "?")];
+    if (state.clusterLine) lines.push("- cluster: " + state.clusterLine);
+    lines.push("", "| job | status | exit | reason | when |", "| --- | --- | --- | --- | --- |");
+    for (const n of names) {
+      const j = state.byName[n]; if (!j) continue;
+      const lr = j.last_run || {};
+      lines.push("| " + n + " | " + health(j).label + " | " + (lr.exit_code == null ? "" : lr.exit_code) +
+        " | " + (lr.fail_reason || "").replace(/\|/g, "\\|") + " | " + (lr.finished_at ? fmtAgo(lr.finished_at) : "") + " |");
+    }
+    copyText(lines.join("\n"), "incident summary");
+  }
+
+  // ===================================================================
+  //  cron sandbox — decode any expression, preview fires, find users
+  // ===================================================================
+  const SBX_RECENT_KEY = "yacron2.sbxRecent", SBX_RECENT_MAX = 10;
+  function sbxRecent() { try { return JSON.parse(localStorage.getItem(SBX_RECENT_KEY)) || []; } catch (_) { return []; } }
+  function sbxPushRecent(expr) {
+    expr = String(expr || "").trim(); if (!expr) return;
+    let list = sbxRecent().filter((x) => x !== expr); list.unshift(expr);
+    try { localStorage.setItem(SBX_RECENT_KEY, JSON.stringify(list.slice(0, SBX_RECENT_MAX))); } catch (_) {}
+  }
+  function sbxFrames() {
+    const set = ["UTC", "LOCAL"];
+    for (const j of state.jobs) { const f = frameOf(j); if (set.indexOf(f) < 0) set.push(f); }
+    return set;
+  }
+  function sameSchedule(a, b) {
+    a = String(a || "").trim().toLowerCase(); b = String(b || "").trim().toLowerCase();
+    return a === b || (MACROS[a] || a) === (MACROS[b] || b);
+  }
+  function openSandbox(prefillExpr, prefillFrame) {
+    if (!state.sandbox.open) pushFocus();
+    state.sandbox.open = true;
+    const sel = $("sbxFrame");
+    sel.innerHTML = sbxFrames().map((f) => '<option value="' + escAttr(f) + '">' + esc(f === "LOCAL" ? "local" : f) + "</option>").join("");
+    const sj = selectedJob();
+    if (prefillFrame) sel.value = prefillFrame; else if (sj) sel.value = frameOf(sj);
+    $("sbxInput").value = prefillExpr != null ? prefillExpr : (sj ? sj.schedule : "");
+    $("sandboxWrap").classList.add("open");
+    renderSandbox();
+    setTimeout(() => $("sbxInput").focus(), 30);
+  }
+  function closeSandbox() {
+    if (!state.sandbox.open) return;
+    state.sandbox.open = false; $("sandboxWrap").classList.remove("open"); popFocus();
+  }
+  function sbxRecentHtml() {
+    const list = sbxRecent();
+    if (!list.length) return "";
+    return '<div class="sbx-uses"><span class="faint">recent:</span><div class="sbx-recent">' +
+      list.map((x) => '<span class="chip" data-expr="' + escAttr(x) + '">' + esc(x) + "</span>").join("") + "</div></div>";
+  }
+  function renderSandbox() {
+    const expr = $("sbxInput").value.trim();
+    const frame = $("sbxFrame").value || "UTC";
+    const body = $("sbxBody");
+    if (!expr) { body.innerHTML = '<div class="tlempty">Type a cron expression or a @macro.</div>' + sbxRecentHtml(); return; }
+    const parsed = parseCron(expr);
+    let html = "";
+    if (parsed.type === "reboot") {
+      html += '<p class="sbx-desc">Runs once, when yacron2 starts (@reboot).</p>';
+    } else if (parsed.type !== "fields") {
+      html += '<p class="sbx-desc sbx-bad">Not a valid 5-field cron expression or known @macro.</p>';
+    } else {
+      const runs = nextRuns(parsed, 12, frame, Date.now());
+      const impossible = !runs.length;
+      html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
+      const low = expr.toLowerCase();
+      const f = (MACROS[low] || expr).split(/\s+/);
+      const labels = ["min", "hour", "day-of-month", "month", "day-of-week"];
+      html += '<div class="sbx-flds">';
+      for (let i = 0; i < 5; i++) html += '<div class="sbx-fld"><div class="fk">' + labels[i] + '</div><div class="fv">' + esc(f[i] || "*") + "</div></div>";
+      html += "</div>";
+      if (runs.length) {
+        html += '<div class="card-label" style="padding-left:0;border:0">next ' + runs.length + " fires · " + esc(frame === "LOCAL" ? "local" : frame) + '</div><ul class="nextruns">';
+        for (const r of runs)
+          html += "<li><span class='when'>" + esc(fmtWall(r.c)) + "</span><span class='rel'>" + esc(fmtIn((r.t - Date.now()) / 1000)) + "</span></li>";
+        html += "</ul>";
+      }
+      const users = state.jobs.filter((j) => sameSchedule(j.schedule, expr));
+      if (users.length)
+        html += '<div class="sbx-uses"><span class="faint">used by:</span> ' +
+          users.map((j) => '<span class="chip" data-job="' + escAttr(j.name) + '">' + esc(j.name) + "</span>").join("") + "</div>";
+    }
+    html += sbxRecentHtml();
+    body.innerHTML = html;
+  }
+
+  // ---- schedule foot-gun analysis (client-side, best-effort) ----
+  // observed duration estimate: prefer last_run, fall back to the inline history
+  // tail (max) — both already in the /jobs payload.
+  function jobDurEstimate(job) {
+    let m = null;
+    if (job.last_run && job.last_run.duration != null) m = job.last_run.duration;
+    for (const h of (job.history || [])) if (h.duration != null) m = Math.max(m == null ? 0 : m, h.duration);
+    return m;
+  }
+  // tightest gap (seconds) between consecutive fires — how densely runs can stack
+  function minFireGap(parsed, frame) {
+    const runs = nextRuns(parsed, 8, frame, Date.now());
+    if (runs.length < 2) return null;
+    let g = Infinity;
+    for (let i = 1; i < runs.length; i++) g = Math.min(g, (runs[i].t - runs[i - 1].t) / 1000);
+    return g === Infinity ? null : g;
+  }
+  // how many OTHER enabled jobs fire in the same minute as this job's next fire
+  function nextCollisions(job, parsed, frame) {
+    const runs = nextRuns(parsed, 1, frame, Date.now());
+    if (!runs.length) return null;
+    const minuteOf = (t) => Math.floor(t / 60000);
+    const target = minuteOf(runs[0].t);
+    const others = [];
+    let scanned = 0;
+    for (const j of state.jobs) {
+      if (j.name === job.name || !j.enabled) continue;
+      if (scanned++ > 200) break;                 // hard cap on the fan-out
+      const p = parseCron(j.schedule);
+      if (p.type !== "fields") continue;
+      const r = nextRuns(p, 1, frameOf(j), Date.now());
+      if (r.length && minuteOf(r[0].t) === target) others.push(j.name);
+    }
+    return { at: runs[0].c, others: others };
+  }
+  // DST advisory: does the job's frame cross a UTC-offset transition within a
+  // year, at a fixed local hour a transition could skip or repeat? Conservative:
+  // names the date + direction, does not over-claim which fire is affected.
+  function dstAdvisory(parsed, frame) {
+    // only for an explicit IANA zone: UTC never shifts, and LOCAL is the
+    // browser's zone (already flagged "approximate"), which may not match the
+    // server's — so a DST claim there could mislead.
+    if (frame === "UTC" || frame === "LOCAL" || parsed.type !== "fields" || !parsed.hour.restricted) return null;
+    const now = Date.now(), DAY = 86400000;
+    let prev = tzOffset(frame, now);
+    for (let i = 1; i <= 400; i++) {
+      const tt = now + i * DAY, off = tzOffset(frame, tt);
+      if (off !== prev) {
+        let lo = tt - DAY, hi = tt;
+        while (hi - lo > 60000) { const mid = (lo + hi) / 2; (tzOffset(frame, mid) === prev) ? (lo = mid) : (hi = mid); }
+        const date = wallParts(new Date(hi), frame);
+        return { date: date.Y + "-" + pad2(date.Mo) + "-" + pad2(date.D), dir: (off - prev) > 0 ? "forward" : "back" };
+      }
+      prev = off;
+    }
+    return null;
+  }
+  function scheduleWarnings(job) {
+    const parsed = parseCron(job.schedule);
+    if (parsed.type !== "fields") return [];
+    const frame = frameOf(job);
+    const out = [];
+    const gap = minFireGap(parsed, frame), est = jobDurEstimate(job);
+    if (gap != null && est != null && est >= gap)
+      out.push({ sev: "crit", t: "<b>Runs may overlap.</b> Fires as often as every " + esc(fmtDuration(gap)) +
+        ", but a run has taken up to " + esc(fmtDuration(est)) + ". Check this job's <b>concurrencyPolicy</b>." });
+    else if (gap != null && est != null && est >= gap * 0.7)
+      out.push({ sev: "warn", t: "<b>Runs pack tightly.</b> Fires every " + esc(fmtDuration(gap)) +
+        " and has taken up to " + esc(fmtDuration(est)) + " — little headroom before overlap." });
+    const col = nextCollisions(job, parsed, frame);
+    if (col && col.others.length)
+      out.push({ sev: "warn", t: "<b>Thundering herd.</b> Next fire at <b>" + pad2(col.at.h) + ":" + pad2(col.at.mi) +
+        "</b> coincides with " + col.others.length + " other job" + (col.others.length > 1 ? "s" : "") + " (" +
+        esc(col.others.slice(0, 4).join(", ")) + (col.others.length > 4 ? ", …" : "") + ")." });
+    const dst = dstAdvisory(parsed, frame);
+    if (dst)
+      out.push({ sev: "warn", t: "<b>DST transition ahead.</b> " + esc(frame) + " shifts clocks " + dst.dir +
+        " on <b>" + esc(dst.date) + "</b>; a fixed local time near the change may be skipped or run twice. Verify around that date." });
+    return out;
+  }
+
+  // ===================================================================
+  //  zen all-clear screensaver + adaptive alarm escalation (wallboard)
+  // ===================================================================
+  const ZEN_IDLE = 30000;                        // default idle before zen (overridable in Settings)
+  const ALARM_BASE = 6000, ALARM_FLOOR = 1600;   // adaptive alarm interval bounds
+  const reduceMotion = () => !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  function anyRunning() { return state.jobs.some((j) => j.running); }
+
+  // track when this browser first observed each job failing (honest age basis)
+  function updateIncidents(jobs) {
+    const since = state.failSince, nowMs = Date.now();
+    const failing = {};
+    for (const j of jobs) if (health(j).key === "fail") { failing[j.name] = true; if (!since[j.name]) since[j.name] = nowMs; }
+    for (const n in since) if (!failing[n]) delete since[n];
+  }
+  function incidentAge() {
+    let oldest = 0, nowMs = Date.now();
+    for (const n in state.failSince) { const a = nowMs - state.failSince[n]; if (a > oldest) oldest = a; }
+    return oldest;
+  }
+  // adaptive alarm (replaces the fixed 6s cadence): interval shrinks with the
+  // unacked incident age; ack (a) silences it. Called every second.
+  function alarmTick() {
+    if (!(prefs.sound && state.anyFailing && !state.alarmAck)) return;
+    const nowMs = Date.now();
+    let interval = ALARM_BASE;
+    if (prefs.escalate) {
+      const k = Math.min(1, incidentAge() / 600000);   // ramp to FLOOR by ~10min
+      interval = ALARM_BASE - (ALARM_BASE - ALARM_FLOOR) * k;
+    }
+    if (nowMs - state.lastAlarmAt >= interval) { state.lastAlarmAt = nowMs; playCue("alarm"); }
+  }
+  // per-second wallboard escalation visuals (vignette + incident timer + breathe)
+  function escalationTick() {
+    if (!state.wallboard) return;
+    const alarm = $("wbAlarm");
+    let inc = $("wbIncident");
+    if (!(state.anyFailing && prefs.escalate)) {
+      if (alarm) alarm.style.opacity = "0";
+      document.querySelectorAll(".wb-tile.escalate").forEach((t) => t.classList.remove("escalate"));
+      if (inc) inc.remove();
+      return;
+    }
+    const age = incidentAge(), acked = state.alarmAck;
+    const count = Object.keys(state.failSince).length;
+    let level = Math.min(1, (Math.min(count, 6) / 6) * 0.5 + Math.min(1, age / 600000) * 0.5);
+    if (acked) level = Math.min(level, 0.22);
+    if (alarm) alarm.style.opacity = reduceMotion() ? "0.16" : (0.12 + 0.55 * level).toFixed(2);
+    document.querySelectorAll(".wb-tile.st-fail").forEach((t) => t.classList.toggle("escalate", !acked && !reduceMotion()));
+    if (!inc) { inc = document.createElement("span"); inc.id = "wbIncident"; inc.className = "wb-incident"; $("wallboard").appendChild(inc); }
+    inc.classList.toggle("ackd", acked);
+    inc.textContent = "◉ INCIDENT +" + fmtCountdown(age / 1000) + (acked ? " · ack" : "");
+  }
+  function zenOn() {
+    if (state.zen.on) return;
+    state.zen.on = true;
+    const z = $("zen"); z.style.display = "flex"; z.setAttribute("aria-hidden", "false");
+    renderZenField();
+  }
+  function zenOff() {
+    if (!state.zen.on) return;
+    state.zen.on = false;
+    const z = $("zen"); z.style.display = "none"; z.setAttribute("aria-hidden", "true");
+  }
+  function renderZenField() {
+    const field = $("zenField");
+    const jobs = state.jobs.filter((j) => j.enabled).slice(0, 240);
+    // deterministic scatter from the job name (stable across renders, no RNG)
+    const hash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0); };
+    field.innerHTML = jobs.map((j) => {
+      const x = (hash(j.name) % 1000) / 10, y = (hash(j.name + "#y") % 1000) / 10;
+      return '<span class="zen-dot" data-job="' + escAttr(j.name) + '" style="left:' + x + '%;top:' + y + '%"></span>';
+    }).join("");
+    state.zen.sig = jobs.map((j) => j.name).join("|");
+  }
+  // per-second: pulse each dot as its real next fire arrives; update the readout
+  function zenTick() {
+    if (!state.zen.on) return;
+    const now = Date.now();
+    if (!state.radar.items.length || (state.radar.items[0] && state.radar.items[0].t <= now)) computeRadar();
+    if (!reduceMotion()) {
+      const due = {};
+      for (const it of state.radar.items) { const dt = it.t - now; if (dt >= -1500 && dt <= 1000) due[it.name] = true; }
+      $("zenField").querySelectorAll(".zen-dot").forEach((d) => {
+        const on = !!due[d.getAttribute("data-job")];
+        if (on !== d.classList.contains("due")) d.classList.toggle("due", on);
+      });
+    }
+    const enabled = state.jobs.filter((j) => j.enabled).length;
+    const soon = state.radar.items.filter((x) => x.t >= now)[0];
+    $("zenSub").textContent = enabled + " jobs armed · " + utcClock() +
+      (soon ? " · next " + soon.name + " " + fmtCountdown((soon.t - now) / 1000) : "");
+  }
+  // decide whether an idle, healthy wallboard should drift to zen
+  function zenGovernor() {
+    if (!state.wallboard || !prefs.zen) { zenOff(); state.zen.idleSince = 0; return; }
+    // never drift into (or stay in) "ALL SYSTEMS NOMINAL" on stale data: with
+    // the daemon unreachable the all-green frame is unverified, not nominal --
+    // show the NO SIGNAL wallboard instead.
+    if (wallboardStale()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
+    if (state.anyFailing || anyRunning()) { state.zen.idleSince = 0; if (state.zen.on) zenOff(); return; }
+    const nowMs = Date.now();
+    if (!state.zen.idleSince) state.zen.idleSince = nowMs;
+    if (!state.zen.on && nowMs - state.zen.idleSince >= (prefs.zenIdle || ZEN_IDLE)) zenOn();
+    if (state.zen.on) {
+      const sig = state.jobs.filter((j) => j.enabled).map((j) => j.name).join("|");
+      if (sig !== state.zen.sig) renderZenField();
+    }
+  }
+  function zenWake() { if (state.zen.on) { zenOff(); state.zen.idleSince = Date.now(); } }
+
+  // ===================================================================
+  //  BIOS-style boot / POST self-test
+  // ===================================================================
+  function setBoot(v) {
+    prefs.boot = v; savePref("boot");
+    // re-enabling clears the cooldown stamp so the next load always shows it
+    if (v) { try { localStorage.removeItem(BOOT_SEEN_KEY); } catch (_) {} }
+    syncSettings();
+  }
+  // The full POST screen replays only after a cooldown has elapsed since it
+  // last ran; in-between visits get the quick power-on sweep instead.
+  const BOOT_SEEN_KEY = PREF_PREFIX + "bootShownAt";
+  const BOOT_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+  function bootDue() {
+    try { return Date.now() - (+localStorage.getItem(BOOT_SEEN_KEY) || 0) >= BOOT_COOLDOWN_MS; }
+    catch (_) { return true; }
+  }
+  // Compose the CLUSTER readout for every backend/role shape: standalone, gossip
+  // (leader/follower/spread/no-quorum), and the lease backends. Red when election
+  // is on but the node is not quorate (Leader jobs fail closed there).
+  function bootClusterLine(d) {
+    if (!d || !d.enabled) return '<span class="lbl">standalone (no cluster)</span>';
+    const parts = [d.backend || "gossip"];
+    if (d.node_name) parts.push("node=" + d.node_name);
+    if (d.elect_leader) {
+      // a conflict (duplicate nodeName / size / policy) fails the Leader gate
+      // closed regardless of quorum/leader, so it dominates the readout — else
+      // we'd print a healthy "leader" while Leader jobs are actually paused.
+      if (d.conflict) parts.push("conflict (Leader jobs paused)");
+      else if (d.distribution === "spread") parts.push(d.quorate ? "spread/quorate" : "spread/no-quorum");
+      else if (d.is_leader) parts.push("leader");
+      else if (d.quorate && d.leader) parts.push("follower→" + d.leader);
+      else if (d.quorate) parts.push("follower");
+      else parts.push("no-quorum");
+    }
+    const bad = d.elect_leader && (d.conflict || !d.quorate);
+    return '<span class="' + (bad ? "fail" : "val") + '">' + esc(parts.join(" / ")) + "</span>";
+  }
+  // The POST screen: each line resolves as its REAL fetch completes, so it is a
+  // genuine readiness check, not a cosmetic animation. Skippable with any key /
+  // click; on completion (or skip / failure) it tears down and calls `done`
+  // (the normal first-load path). It never blocks startup: a thrown fetch or a
+  // caught error still reaches the finally that runs `done`.
+  async function runBootSequence(done) {
+    state.booting = true;
+    try { localStorage.setItem(BOOT_SEEN_KEY, String(Date.now())); } catch (_) {}
+    const screen = $("bootScreen"), log = $("bootLog");
+    log.innerHTML = "";
+    screen.style.display = "flex";
+    screen.setAttribute("aria-hidden", "false");
+    let finished = false, skipped = false;
+    const finish = () => {
+      if (finished) return; finished = true;
+      state.booting = false;
+      document.removeEventListener("keydown", onSkip, true);
+      screen.removeEventListener("pointerdown", onSkip);
+      screen.classList.add("done");
+      setTimeout(() => {
+        screen.style.display = "none";
+        screen.setAttribute("aria-hidden", "true");
+        screen.classList.remove("done");
+      }, 260);
+      try { done(); } catch (e) { console.warn(e); }
+    };
+    const onSkip = (e) => { if (e) { e.preventDefault(); e.stopPropagation(); } skipped = true; finish(); };
+    document.addEventListener("keydown", onSkip, true);
+    screen.addEventListener("pointerdown", onSkip);
+    const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+    const cur = () => '<span class="boot-cur">█</span>';
+    const line = (label) => {
+      const div = el("div", "boot-line boot-probe");
+      div.innerHTML = '<span class="lbl">' + esc(label) + '</span><span class="lead"></span><span class="res">' + cur() + "</span>";
+      log.appendChild(div);
+      return div;
+    };
+    const res = (div, html) => { const r = div.querySelector(".res"); if (r) r.innerHTML = html; };
+    // one probe; never throws — maps outcomes to {ok, status, r}. Bounded by a
+    // timeout so a half-open socket (daemon accepts but never answers) still
+    // resolves to OFFLINE and lets the sequence finish rather than hanging the
+    // overlay forever.
+    const probe = async (path, opts) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5000);
+      try {
+        const r = await apiFetch(path, Object.assign({ signal: ctrl.signal }, opts));
+        return r.ok ? { ok: true, r: r } : { ok: false, status: "FAIL (HTTP " + r.status + ")" };
+      } catch (e) {
+        return { ok: false, status: e.message === "unauthorized" ? "UNAUTHORIZED" : "OFFLINE" };
+      } finally { clearTimeout(timer); }
+    };
+    // a red halt line + hint; the finally-block finish() then reveals whatever
+    // apiFetch surfaced (the token modal on 401) and starts the app degraded.
+    const halt = async (div, label, note) => {
+      res(div, '<span class="fail">' + esc(label) + "</span>");
+      const h = el("div", "boot-line boot-halt");
+      h.innerHTML = '<span class="fail">■ HALTED</span> <span class="lbl">— ' + esc(note) + "</span>";
+      log.appendChild(h);
+      const hint = el("div", "boot-hint"); hint.textContent = "press any key to continue";
+      log.appendChild(hint);
+      await pause(1200);
+    };
+    try {
+      const banner = el("div", "boot-banner"); banner.textContent = "YACRON2 CONTROL TERMINAL";
+      const sub = el("div", "boot-sub"); sub.textContent = "startup self test";
+      log.appendChild(banner); log.appendChild(sub);
+      await pause(220); if (skipped) return;
+
+      // 1) connectivity + firmware version (/version doubles as the reachability probe)
+      const l1 = line("CONNECTING TO DAEMON");
+      const v = await probe("/version"); if (skipped) return;
+      if (v.status === "UNAUTHORIZED") { await halt(l1, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (!v.ok) { await halt(l1, v.status === "OFFLINE" ? "FAIL — daemon unreachable" : v.status, "continuing in degraded mode"); return; }
+      res(l1, '<span class="ok">OK</span>');
+      const version = (await v.r.text()).trim();
+      await pause(130); if (skipped) return;
+
+      const l2 = line("FIRMWARE VERSION");
+      res(l2, '<span class="val">v' + esc(version) + "</span>");
+      await pause(110); if (skipped) return;
+
+      // 2) job-set id + job count (one JSON call)
+      const l3 = line("JOB SET");
+      const js = await probe("/job-set-id", { headers: { Accept: "application/json" } }); if (skipped) return;
+      if (js.status === "UNAUTHORIZED") { await halt(l3, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (js.ok) {
+        const d = await js.r.json();
+        res(l3, '<span class="val">#' + esc(shortId(d.job_set_id || "")) + '</span> <span class="lbl">[' + esc(d.jobs != null ? d.jobs : "?") + " jobs]</span>");
+      } else res(l3, '<span class="fail">' + esc(js.status) + "</span>");
+      await pause(130); if (skipped) return;
+
+      // 3) cluster role / quorum
+      const l4 = line("CLUSTER");
+      const cl = await probe("/cluster"); if (skipped) return;
+      if (cl.status === "UNAUTHORIZED") { await halt(l4, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (cl.ok) { res(l4, bootClusterLine(await cl.r.json())); }
+      else res(l4, '<span class="fail">' + esc(cl.status) + "</span>");
+      await pause(130); if (skipped) return;
+
+      // 4) scan schedules (a genuine /jobs read)
+      const l5 = line("SCANNING SCHEDULES");
+      const jb = await probe("/jobs"); if (skipped) return;
+      if (jb.status === "UNAUTHORIZED") { await halt(l5, "UNAUTHORIZED", "enter an access token to continue"); return; }
+      if (jb.ok) { const arr = await jb.r.json(); res(l5, '<span class="ok">OK</span> <span class="lbl">[' + (Array.isArray(arr) ? arr.length : "?") + " scheduled]</span>"); }
+      else res(l5, '<span class="fail">' + esc(jb.status) + "</span>");
+      await pause(240); if (skipped) return;
+
+      const ready = el("div", "boot-line boot-ready");
+      ready.innerHTML = '<span class="ok">READY.</span> ' + cur();
+      log.appendChild(ready);
+      await pause(650);
+    } catch (e) {
+      console.warn("boot self-test error:", e);
+    } finally {
+      finish();
+    }
+  }
+
   // ===================================================================
   //  boot
   // ===================================================================
   loadPrefs();
   applyTheme();
+  applyCols();
   document.body.classList.toggle("density-compact", prefs.density);
   $("optFollow").checked = prefs.follow;
   $("optWrap").checked = prefs.wrap;
@@ -2025,16 +4978,50 @@
   fillHelp();
   updateAuthBtn();
   wire();
-  if (!window.matchMedia || !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    document.body.classList.add("booting");
-    setTimeout(() => document.body.classList.remove("booting"), 600);
+  // reflect persisted add-on-panel prefs onto their toggles + initial render
+  $("radarBtn").classList.toggle("on", prefs.radar);
+  $("heatBtn").classList.toggle("on", prefs.heat);
+  $("heatWindow").value = prefs.heatWindow;
+  if (prefs.radar) renderRadar();
+  if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }
+  // opt-in run ledger: hydrate the in-memory mirror from IndexedDB before the
+  // first poll so anomaly baselines + the History note are ready immediately.
+  state.ledger.on = prefs.ledger;
+  if (prefs.ledger) ledgerLoad().then(() => { refreshLedgerStat(); renderRows(); });
+  // if cues were left enabled across a reload, autoplay policy blocks the
+  // AudioContext until a gesture — resume it on the first interaction.
+  const resumeAudio = () => {
+    if (prefs.sound) audio();
+    document.removeEventListener("pointerdown", resumeAudio);
+    document.removeEventListener("keydown", resumeAudio);
+  };
+  document.addEventListener("pointerdown", resumeAudio);
+  document.addEventListener("keydown", resumeAudio);
+  // first-load hydration + steady-state polling; runs after the boot self-test
+  // (or immediately when the POST screen is disabled / motion-suppressed).
+  function startApp() {
+    loadVersion();
+    loadJobSetId();
+    // /cluster rides along on loadJobs' success path (loadCluster there); a
+    // direct call here would just guarantee two overlapping /cluster fetches
+    // at every startup.
+    loadJobs().then(openFromHash);
+    restartPolling();
   }
-  loadVersion();
-  loadJobSetId();
-  loadJobs().then(openFromHash);
-  restartPolling();
   setInterval(tick, 1000);
+  setInterval(alarmTick, 1000);                               // adaptive failure alarm (self-gates its cadence)
+  setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
   tick();
+  const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  if (prefs.boot && !reducedMotion && bootDue()) {
+    runBootSequence(startApp);          // POST screen types out, then starts the app
+  } else {
+    if (!reducedMotion) {               // otherwise keep the quick power-on sweep
+      document.body.classList.add("booting");
+      setTimeout(() => document.body.classList.remove("booting"), 600);
+    }
+    startApp();
+  }
 })();
 </script>
 </body>

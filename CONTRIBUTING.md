@@ -75,10 +75,10 @@ If more than one marker appears across the pushed commits, the most significant
 bump wins (major > minor > patch).
 
 > **Caution:** the match is a plain substring, so writing a literal
-> `[release:patch]` (or `[release]`) anywhere in a commit message — even in prose
-> describing the release process — **will trigger a publish**. Don't quote the
+> `[release:patch]` (or `[release]`) anywhere in a commit message (even in prose
+> describing the release process) **will trigger a publish**. Don't quote the
 > marker verbatim in a commit message unless you mean it. (File contents like
-> this document are never scanned — only commit messages are.)
+> this document are never scanned; only commit messages are.)
 
 You can also release manually without a marker: **Actions → release → Run
 workflow**, then pick the bump level from the dropdown.
@@ -90,17 +90,17 @@ On a release the workflow, in order:
 1. **decides** whether to release and at what level (the strict marker check);
 2. **computes** the next version from the latest `X.Y.Z` tag (refusing if that
    tag already exists);
-3. **gates** on `tox` (py310, py311, py312, py313, py314, lint, mypy) — a red build means no release;
+3. **gates** on `tox` (py310, py311, py312, py313, py314, lint, mypy): a red build means no release;
 4. **builds** the wheel + sdist *and* the self-contained PyInstaller binaries
    for Linux (`amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x`
    and `riscv64`, glibc and musl), macOS (`arm64` + `amd64`) and Windows
    (`amd64` + `arm64`), each on a matching runner (the non-native Linux arches
    inside a container under QEMU; Windows ARM64 on the `windows-11-arm`
-   runner), smoke-tested with `--version` — all at the computed version,
+   runner), smoke-tested with `--version`, all at the computed version,
    *before* publishing, so a broken build fails the run instead of producing a
    half-finished release;
 5. **publishes the wheel + sdist to PyPI** via [Trusted Publishing
-   (OIDC)](https://docs.pypi.org/trusted-publishers/) — there is no API token to
+   (OIDC)](https://docs.pypi.org/trusted-publishers/): there is no API token to
    manage or leak;
 6. **only after a successful publish**, creates and pushes the `X.Y.Z` tag and a
    GitHub Release with the wheel, sdist, and all the binaries
@@ -128,7 +128,7 @@ The official image is built and published by the
   or the workflow, it builds the image *without* pushing, so a broken
   `Dockerfile` fails CI before a release.
 - **Manually** (Actions → docker → Run workflow) you can (re)build any existing
-  release tag — useful to backfill an image for a release cut before this
+  release tag, useful to backfill an image for a release cut before this
   workflow existed, or to retry a failed push.
 
 Build it locally the same way CI does (the version is read from git, or pass

@@ -14,13 +14,14 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A modern, container-friendly cron replacement.
+A modern, optionally-distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
 ## Features
 
-* "Crontab" is in YAML format
+* "Crontab" is in YAML format; classic crontab files are accepted as-is too
+  (see [Classic crontab files](#classic-crontab-files))
 * Builtin sending of Sentry and Mail outputs when cron jobs fail
 * Flexible configuration: you decide how to determine if a cron job fails or not
 * Designed for running in Docker, Kubernetes, or 12 factor environments:
@@ -34,9 +35,17 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * Option to automatically retry failing cron jobs, with exponential backoff
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
+  metrics), covering run outcomes, durations, retries, schedules, and cluster
+  health (see [Metrics](#metrics))
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
+* **Opt-in clustering and leader election**: optionally have instances confirm
+  over mutual TLS that a configured set of peers is running the same job set, and
+  **elect a leader** so several replicas can run from one config without
+  double-running jobs (see
+  [Clustering and leader election](#clustering-and-leader-election))
 * Arbitrary timezone support
 * Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
 
@@ -229,7 +238,7 @@ POSIX. A few platform details differ:
 
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
-  and `unix://` web listeners are skipped with a warning — use an `http://`
+  and `unix://` web listeners are skipped with a warning. Use an `http://`
   listener instead.
 
 ## Production container deployment
@@ -352,6 +361,8 @@ Three built-in themes (amber and green phosphor CRT, or a flat **modern** look),
 
 Run history and live logs are kept **in memory only**, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
 
+**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live.
+
 ## Usage
 
 Configuration is in YAML format.  To start yacron2, give it a configuration file
@@ -364,7 +375,9 @@ yacron2 -c /tmp/my-crontab.yaml
 This starts yacron2 (always in the foreground!), reading
 `/tmp/my-crontab.yaml` as configuration file.  If the path is a directory,
 any `*.yaml` or `*.yml` files inside this directory are taken as
-configuration files.
+configuration files, along with any classic crontabs (`*.crontab`, `*.cron`,
+or a file named `crontab`; see
+[Classic crontab files](#classic-crontab-files)).
 
 ### Configuration basics
 
@@ -426,7 +439,7 @@ jobs:
     captureStdout: true
 ```
 
-Since Yacron2 version 0.11, you can also request that the schedule be
+You can also request that the schedule be
 interpreted in an arbitrary timezone, using the `timezone` attribute:
 
 ```yaml
@@ -465,6 +478,38 @@ jobs:
 The env file must be a list of `KEY=VALUE` pairs. Empty lines and lines starting with `#` will be ignored.
 
 Variables declared in the `environment` option will override those found in the `env_file`.
+
+### Classic crontab files
+
+Already have a crontab?  yacron2 runs it as-is.  A file named `*.crontab`,
+`*.cron`, or just `crontab` (so `-c /etc/crontab` works) is read in the
+classic Vixie format, whether passed directly to `-c`, dropped into a config
+directory next to YAML files, or pulled in with `include:`:
+
+```crontab
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# m h dom mon dow command
+*/15 * * * *  /usr/local/bin/backup --incremental
+30 4 * * mon-fri  /usr/local/bin/report --daily
+@daily  /usr/local/bin/rotate-logs
+0 0 * * *  pg_dump mydb > /backup/mydb-$(date +\%F).sql
+```
+
+Comments, `NAME=value` environment lines (position-sensitive, `SHELL` and
+`CRON_TZ` honored), the `@reboot`/`@daily`/... nicknames, and `\%` escapes
+all work as in `man 5 crontab`.  Each entry becomes an ordinary yacron2 job
+named `<file>:<line>`, configured to yacron2's standard defaults rather than
+an emulation of cron's environment: schedules run in **UTC** unless the
+crontab sets `CRON_TZ`, failure means a non-zero exit or stderr output (no
+`MAILTO` mail), and the `%`-as-stdin feature is a load-time error instead of
+a silent surprise (`\%` still gives a literal `%`).  When an entry needs
+retries, reporting, timeouts, or any other per-job option, move it to YAML.
+The full mapping and every deviation are documented in the
+[Classic Crontabs](https://github.com/ptweezy/yacron2/wiki/Classic-Crontabs)
+wiki page, and a runnable example (a config directory mixing a crontab with
+YAML and the dashboard) lives in [example/crontab](example/crontab).
 
 ### Specifying defaults
 
@@ -513,7 +558,7 @@ email, Sentry and shell command (additional reporting methods might be added in 
           # Alternatively:
           # fromFile: /etc/secrets/my-secret-dsn
           # fromEnvVar: SENTRY_DSN
-        fingerprint:  # optional, since yacron2 0.6
+        fingerprint:  # optional
           - yacron2
           - "{{ environment.HOSTNAME }}"
           - "{{ name }}"
@@ -553,7 +598,7 @@ the same standard output and standard error as yacron2 itself.
 
 Both *stdout* and *stderr* stream lines are by default prefixed with
 `[{job_name} {stream_name}]`, i.e. `[test-01 stdout]`, if for any reason you
-need to change this, provide the option `streamPrefix` (new in version 0.16)
+need to change this, provide the option `streamPrefix`
 with your own custom string.
 
 ```yaml
@@ -594,7 +639,7 @@ It is possible also to report job success, as well as failure, via the
         smtpHost: 127.0.0.1
 ```
 
-Since yacron2 0.5, it is possible to customize the format of the report. For
+It is possible to customize the format of the report. For
 `mail` reporting, the option `subject` indicates what is the subject of the
 email, while `body` formats the email body.  For Sentry reporting, there is
 only `body`.  In all cases, the values of those options are strings that are
@@ -633,7 +678,7 @@ Example:
           (exit code: {{exit_code}})
 ```
 
-The shell reporter (since yacron2 0.13) executes a user given shell command in
+The shell reporter executes a user given shell command in
 the specified shell. It passes all environment variables from the python
 executable and specifies some additional ones to inform about the state of the
 job:
@@ -661,7 +706,7 @@ A simple example configuration:
         command: echo "Error code $YACRON2_RETCODE"
 ```
 
-Since yacron2 0.15, it is possible to send emails formatted as html, by  adding
+It is possible to send emails formatted as html, by adding
 the `html: true` property.  For example, here the standard output of a shell
 command is captured and interpreted as html and placed in the email message:
 
@@ -683,7 +728,24 @@ command is captured and interpreted as html and placed in the email message:
 
 ### Metrics
 
-Yacron2 has builtin support for writing job metrics to [Statsd](https://github.com/etsy/statsd):
+Yacron2 natively exposes Prometheus metrics whenever the
+[HTTP REST API](https://github.com/ptweezy/yacron2/wiki/HTTP-API) is enabled --
+no exporter sidecar needed:
+
+```yaml
+web:
+  listen:
+    - http://127.0.0.1:8080
+```
+
+`GET /metrics` then serves job run outcomes, duration histograms, retries,
+next-run times, config-reload health, and cluster/leader-election state, in
+both the Prometheus text format and OpenMetrics. See
+[Metrics with Prometheus](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Prometheus)
+for the full metric reference, scrape configuration, and example alert rules.
+
+Yacron2 also has builtin support for pushing per-job metrics to
+[Statsd](https://github.com/etsy/statsd):
 
 ```yaml
 jobs:
@@ -813,8 +875,6 @@ Replace
 
 ### Execution timeout
 
-(new in version 0.4)
-
 If you have a cron job that may possibly hang sometimes, you can instruct yacron2
 to terminate the process after N seconds if it's still running by then, via the
 `executionTimeout` option.  For example, the following cron job takes 2
@@ -863,8 +923,6 @@ will send it a SIGKILL after half a second:
 
 ### Change to another user/group
 
-(new in version 0.11)
-
 You can request that Yacron2 change to another user and/or group for a specific
 cron job.  The field `user` indicates the user (uid or userame) under which
 the subprocess must be executed.  The field `group` (gid or group name)
@@ -888,8 +946,6 @@ with `user` or `group` set is rejected with a configuration error; see
 [Running on Windows](#running-on-windows).
 
 ### Remote web/HTTP interface
-
-(new in version 0.10)
 
 If you wish to remotely control yacron2, you can optionally enable an HTTP REST
 interface, with the following configuration (example):
@@ -1118,8 +1174,8 @@ data: {}
 The **job-set id** is an order-independent fingerprint of the set of jobs a
 yacron2 instance is running. Two instances produce the *same* id if and only if
 they hold the same set of jobs, which lets several replicas deployed from the
-same configuration confirm they agree, for example for leader election, or to
-detect that one replica has drifted before letting it run jobs.
+same configuration confirm they are running the same thing, or detect that one
+has drifted from the others.
 
 The id is taken over the *effective* (post-merge) configuration of every job,
 which gives it some useful properties:
@@ -1170,9 +1226,61 @@ It is available three ways:
 * **Logs**: it is logged once at startup, and again whenever a config reload
   changes it.
 
-### Includes
+### Clustering and leader election
 
-(new in version 0.13)
+By default yacron2 runs as a single instance and every replica runs every job.
+An optional `cluster` section lets several replicas coordinate: each node serves
+a small `GET /peer` endpoint over **mutual TLS** and periodically polls its
+configured peers, comparing [job-set ids](#job-set-id) so they can confirm they
+are running the *same* set of jobs (cluster peer attestation). Turning on
+`electLeader` promotes that same attestation into a **quorum-gated leader
+election**, so you can run more than one replica from one config without
+double-running scheduled jobs:
+
+```yaml
+cluster:
+  listen: "0.0.0.0:8443"          # the mTLS listener for this node
+  tls:
+    ca:   /etc/yacron2/cluster-ca.pem   # trust anchor for peer certificates
+    cert: /etc/yacron2/this-node.pem    # this node's certificate
+    key:  /etc/yacron2/this-node.key
+  peers:
+    - host: yacron-b.internal:8443
+    - host: yacron-c.internal:8443
+  nodeName: yacron-a              # optional; defaults to the system hostname
+  interval: 30                    # optional; seconds per round (default 30)
+  connectTimeout: 10              # optional; per-peer connect timeout (default 10)
+  driftAfter: 3                   # optional; rounds before "drifted" (default 3)
+  electLeader: true               # observe-only if false (the default)
+```
+
+Each node independently elects, as leader, the lowest `nodeName` among the
+members it currently sees agreeing on the job-set id, but only if that set is a
+**quorum** (a strict majority) of the cluster, so under a clean partition at
+most one side leads. This is best-effort (the default `gossip` backend keeps no
+shared state); for a fenced, exactly-once guarantee set
+`cluster.backend: kubernetes` or `cluster.backend: etcd`
+to elect through a `coordination.k8s.io/v1` `Lease` or a lease-bound etcd key
+instead.
+
+Each job can override the cluster-wide default with a per-job `clusterPolicy`,
+picking its own point on the liveness-vs-duplication trade-off:
+
+| `clusterPolicy` | healthy (quorate) | partitioned / sub-quorum | use for |
+| --- | --- | --- | --- |
+| `Leader` *(default)* | leader runs once | **nobody** runs (skips) | non-idempotent jobs where a duplicate is harmful and an occasional skip is OK (billing, outbound email) |
+| `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | important **and** idempotent jobs that should never skip |
+| `EveryNode` | every node runs | every reachable node runs | genuinely per-node work (local log rotation), or fully idempotent jobs |
+
+The current view (members, elected leader, quorum, and any conflicts) is
+available at `GET /cluster` and shown as a panel in the dashboard. This is a
+teaser: the full trust model, per-peer status table, quorum math, sizing
+guidance, `distribution: spread` load-balancing, and the fenced lease backends
+are all covered in depth in the
+[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election)
+guide in the wiki. To watch it live, see [Try it](#web-dashboard) below.
+
+### Includes
 
 You may have a use case where it's convenient to have multiple config files,
 and choose at runtime which one to use.  In that case, it might be useful if
@@ -1237,8 +1345,6 @@ logging:
 ### Obscure configuration options
 
 #### enabled: true|false (default true)
-
-(new in yacron2 0.18)
 
 It is possible to disable a specific cron job by adding a `enabled: false` option.  Jobs
 with `enabled: false` will simply be skipped, as if they aren't there, apart from

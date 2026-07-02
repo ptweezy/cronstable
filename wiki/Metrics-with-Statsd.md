@@ -1,6 +1,6 @@
 # Metrics with statsd
 
-yacron2 can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format yacron2 emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop).
+yacron2 can emit per-job lifecycle metrics to a [statsd](https://github.com/statsd/statsd) server over UDP. This page documents the `statsd` config block, the exact wire format yacron2 emits, and the delivery guarantees (best-effort, fire-and-forget, idempotent stop). statsd is the push-side metrics option; for pull-side scraping, yacron2 also serves a native [Prometheus endpoint](Metrics-with-Prometheus) on the web API, and both can be enabled at once.
 
 ## Enabling statsd for a job
 
@@ -55,11 +55,11 @@ When the job stops (normal exit, timeout, or cancellation), yacron2 computes the
 <prefix>.duration:<ms>|ms|@0.1
 ```
 
-- `<prefix>.stop:1|g` — gauge, always `1`.
-- `<prefix>.success:<1|0>|g` — gauge. `1` if the job did **not** fail, `0` if it failed. The value comes from `0 if job.failed else 1`, where `job.failed` is the [failure-detection](Failure-Detection-and-Retries) result (`failsWhen`). A nonzero exit code, output on a watched stream, or `failsWhen: always` therefore reports `success:0`.
-- `<prefix>.duration:<ms>|ms|@0.1` — timer (`|ms`) with a sample rate suffix of `@0.1`. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. The `@0.1` sample-rate flag is sent literally on every datagram; yacron2 does not actually sample (it sends one duration per run) — the flag instructs the statsd server to scale the metric accordingly. Configure your statsd/dashboards to account for this.
+- `<prefix>.stop:1|g`: gauge, always `1`.
+- `<prefix>.success:<1|0>|g`: gauge. `1` if the job did **not** fail, `0` if it failed. The value comes from `0 if job.failed else 1`, where `job.failed` is the [failure-detection](Failure-Detection-and-Retries) result (`failsWhen`). A nonzero exit code, output on a watched stream, or `failsWhen: always` therefore reports `success:0`.
+- `<prefix>.duration:<ms>|ms|@0.1`: timer (`|ms`) with a sample rate suffix of `@0.1`. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. The `@0.1` sample-rate flag is sent literally on every datagram; yacron2 does not actually sample (it sends one duration per run), so the flag instructs the statsd server to scale the metric accordingly. Configure your statsd/dashboards to account for this.
 
-A run whose command never launches (the subprocess could not be spawned; `start_failed` is set) emits neither metric: `wait()` returns early on that path and `_on_stop` — hence `job_stopped` — is never called, and `_on_start` was likewise never reached. Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`), which suppresses a stop metric for a run that was stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
+A run whose command never launches (the subprocess could not be spawned; `start_failed` is set) emits neither metric: `wait()` returns early on that path and `_on_stop` (hence `job_stopped`) is never called, and `_on_start` was likewise never reached. Separately, `job_stopped` itself guards on a recorded start time (`if self.start_time is None: return`), which suppresses a stop metric for a run that was stopped without a corresponding `job_started` (for example, the `cancel()`/`wait()` race under `concurrencyPolicy: Replace`).
 
 ## Best-effort delivery
 
@@ -83,20 +83,21 @@ async def _on_stop(self) -> None:
     ...
 ```
 
-This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a running job (`cancel()`) while its `wait()` task is also completing — both call `_on_stop`, but only the first one emits metrics. This guarantee is intentional and tested; duplicate stop metrics under cancellation were fixed in a prior release. See [Concurrency and Timeouts](Concurrency-and-Timeouts) for the concurrency policies, and [Failure Detection and Retries](Failure-Detection-and-Retries) for how `success` is computed.
+This matters for `concurrencyPolicy: Replace`, where the scheduler may cancel a running job (`cancel()`) while its `wait()` task is also completing. Both call `_on_stop`, but only the first one emits metrics. This guarantee is intentional and tested; duplicate stop metrics under cancellation were fixed in a prior release. See [Concurrency and Timeouts](Concurrency-and-Timeouts) for the concurrency policies, and [Failure Detection and Retries](Failure-Detection-and-Retries) for how `success` is computed.
 
 > The `start_time` guard means a forced cancellation also yields a correct duration: the duration is measured from the recorded `perf_counter` start to the moment `job_stopped` runs, regardless of how the process ended (normal exit, `executionTimeout`, or `Replace` cancellation).
 
 ## Version notes
 
 - Sending job metrics to statsd was added in yacron 0.6.0 (inherited by yacron2; see `HISTORY.md`).
-- statsd reporting is strictly best-effort — a failure to send `job_started`/`job_stopped` (for example, an unresolvable statsd host) is logged as a warning instead of propagating out of job start/stop.
+- statsd reporting is strictly best-effort: a failure to send `job_started`/`job_stopped` (for example, an unresolvable statsd host) is logged as a warning instead of propagating out of job start/stop.
 - Job stop metrics are emitted exactly once per run; an idempotency guard on `_on_stop` prevents duplicate metrics when `cancel` races `wait` (e.g. `concurrencyPolicy=Replace`).
 - statsd UDP errors are logged with their detail (`UDP error received: %s`) rather than being dropped.
 
 ## See also
 
-- [Configuration Reference](Configuration-Reference) — full per-job option list.
-- [Reporting (Mail, Sentry, Shell)](Reporting) — the other outbound notification channels.
-- [Failure Detection and Retries](Failure-Detection-and-Retries) — how `job.failed` (and thus `success:0`/`success:1`) is determined.
-- [Concurrency and Timeouts](Concurrency-and-Timeouts) — `concurrencyPolicy` and `executionTimeout`, which interact with stop metrics.
+- [Metrics with Prometheus](Metrics-with-Prometheus): the pull-side sibling; a scrapeable `/metrics` endpoint on the web API.
+- [Configuration Reference](Configuration-Reference): full per-job option list.
+- [Reporting (Mail, Sentry, Shell)](Reporting): the other outbound notification channels.
+- [Failure Detection and Retries](Failure-Detection-and-Retries): how `job.failed` (and thus `success:0`/`success:1`) is determined.
+- [Concurrency and Timeouts](Concurrency-and-Timeouts): `concurrencyPolicy` and `executionTimeout`, which interact with stop metrics.
