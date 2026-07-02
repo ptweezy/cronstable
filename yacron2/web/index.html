@@ -4894,7 +4894,7 @@
     };
     try {
       const banner = el("div", "boot-banner"); banner.textContent = "YACRON2 CONTROL TERMINAL";
-      const sub = el("div", "boot-sub"); sub.textContent = "power-on self test";
+      const sub = el("div", "boot-sub"); sub.textContent = "startup self test";
       log.appendChild(banner); log.appendChild(sub);
       await pause(220); if (skipped) return;
 
