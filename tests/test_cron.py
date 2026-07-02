@@ -3103,7 +3103,8 @@ jobs:
 async def test_run_reloads_changed_config(tmp_path, monkeypatch):
     # tiny sleep so the reload loop iterates quickly instead of waiting out the
     # real ~60s to the next minute boundary.
-    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda: 0.02)
+    # accept the subminute flag arg the loop now passes to next_sleep_interval
+    monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.02)
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_RELOAD_V1)
 
@@ -3324,3 +3325,124 @@ async def test_fleet_job_summaries_snapshot():
     alpha = cron.fleet_job_summaries()["alpha"]
     assert alpha["running"] is True
     assert alpha["scheduled_in"] is None
+
+
+# =====================================================================
+#  second-level (sub-minute) scheduling
+# =====================================================================
+
+_SECONDS_JOB = """
+jobs:
+  - name: sec
+    command: echo sec
+    schedule: "*/15 * * * * * *"
+  - name: min
+    command: echo min
+    schedule: "* * * * *"
+"""
+
+
+def _set_now(monkeypatch, holder):
+    # a controllable clock: holder["now"] is a naive datetime, localised to the
+    # requested timezone exactly as the real fixed_current_time fixture does.
+    def get_now(timezone):
+        now = holder["now"]
+        if timezone is not None:
+            now = (
+                now.replace(tzinfo=timezone)
+                if now.tzinfo is None
+                else now.astimezone(timezone)
+            )
+        return now
+
+    monkeypatch.setattr("yacron2.cron.get_now", get_now)
+
+
+def test_schedule_slot_resolution(monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 0, 0, 4, 500000)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    sec = cron.cron_jobs["sec"]
+    minute = cron.cron_jobs["min"]
+    # a second-level job truncates to the whole second (microseconds zeroed)
+    assert yacron2.cron.schedule_slot(sec) == DT(
+        2020, 1, 1, 0, 0, 4, tzinfo=UTC
+    )
+    # a minute-level job truncates to the top of the minute, as always
+    assert yacron2.cron.schedule_slot(minute) == DT(
+        2020, 1, 1, 0, 0, 0, tzinfo=UTC
+    )
+
+
+def test_needs_subminute():
+    # an enabled second-level job makes the scheduler tick per-second
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    assert cron._needs_subminute() is True
+    # minute-only config does not
+    cron2 = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    assert cron2._needs_subminute() is False
+    # a DISABLED second-level job must not force per-second ticking
+    disabled = """
+jobs:
+  - name: sec
+    command: echo sec
+    schedule: "*/15 * * * * * *"
+    enabled: false
+"""
+    cron3 = yacron2.cron.Cron(None, config_yaml=disabled)
+    assert cron3._needs_subminute() is False
+
+
+@pytest.mark.parametrize(
+    "second, should_run",
+    [(0, True), (1, False), (14, False), (15, True), (45, True), (46, False)],
+)
+def test_job_should_run_at_seconds(monkeypatch, second, should_run):
+    holder = {"now": DT(2020, 1, 1, 0, 0, second)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+    job = cron.cron_jobs["sec"]  # "*/15 * * * * * *"
+    assert cron.job_should_run(False, job) is should_run
+
+
+def test_next_sleep_interval_modes(monkeypatch):
+    holder = {"now": DT(2020, 1, 1, 12, 30, 30, 500000)}
+    _set_now(monkeypatch, holder)
+    # minute mode snaps to the next minute (preserving the sub-second offset,
+    # exactly as the historical behaviour did): from :30.5 that is 30.0s away.
+    assert yacron2.cron.next_sleep_interval(False) == pytest.approx(30.0)
+    # sub-minute mode snaps to the next whole-second boundary: :30.5 -> :31.0
+    assert yacron2.cron.next_sleep_interval(True) == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_spawn_jobs_subminute_dedup(monkeypatch):
+    # Ticking every second, a minute-level job must still fire exactly once per
+    # minute, and a second-level job exactly once per matching second -- even
+    # if two ticks land in one second. spawn_jobs de-dupes per scheduling slot.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=_SECONDS_JOB)
+
+    launched = []
+
+    async def fake_launch(job):
+        launched.append((holder["now"].second, holder["now"].minute, job.name))
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+
+    async def tick(minute, second):
+        holder["now"] = DT(2020, 1, 1, 0, minute, second)
+        await cron.spawn_jobs(False)
+
+    await tick(0, 0)  # sec + min both due at :00
+    await tick(0, 1)  # nothing (sec off-beat; min already fired this minute)
+    await tick(0, 15)  # sec only
+    await tick(0, 15)  # duplicate tick in the same second: de-duped
+    await tick(0, 30)  # sec only
+    await tick(1, 0)  # new minute: sec + min both fire again
+
+    sec_fires = [(m, s) for (s, m, n) in launched if n == "sec"]
+    min_fires = [(m, s) for (s, m, n) in launched if n == "min"]
+    assert sec_fires == [(0, 0), (0, 15), (0, 30), (1, 0)]
+    assert min_fires == [(0, 0), (1, 0)]  # once per minute despite 6 ticks
