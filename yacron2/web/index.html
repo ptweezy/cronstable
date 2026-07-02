@@ -165,17 +165,20 @@
     background: color-mix(in srgb, var(--bg) 90%, transparent);
     backdrop-filter: blur(3px);
     border-bottom: 1px solid var(--border);
+    user-select: none;
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-  .brand .mark { color: var(--fg); font-weight: 700; cursor: default; user-select: none;
+  .brand .mark { color: var(--fg); font-weight: 700; cursor: default;
     display: inline-block; }
-  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; user-select: none; }
-  .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; user-select: none; }
-  .brand .ver { font-size: 10.5px; color: var(--fg-faint); }
+  .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
+  .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; }
+  /* header text can't be selected, so these copy their value on click instead */
+  .brand .ver { font-size: 10.5px; color: var(--fg-faint); cursor: pointer; }
+  .brand .ver:hover { color: var(--fg-dim); text-decoration: underline dotted; }
   .spacer { flex: 1; }
 
   .clock { font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; }
-  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; cursor: default; user-select: none; }
+  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; cursor: default; }
 
   .summary { display: flex; gap: 7px; align-items: center; }
   .pill {
@@ -3724,6 +3727,9 @@
       markVel += 360;
       if (!markRaf) { markLast = performance.now(); markRaf = requestAnimationFrame(spinMark); }
     });
+    // header text is unselectable; these chips hand out their value on click
+    $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
+    $("jobset").addEventListener("click", () => { const id = $("jobset").dataset.full; if (id) copyText(id, "job set id"); });
     $("refreshBtn").addEventListener("click", loadJobs);
     $("runFailingBtn").addEventListener("click", runAllFailing);
     $("radarBtn").addEventListener("click", () => setRadar(!prefs.radar));
@@ -3910,8 +3916,13 @@
   }
 
   async function loadVersion() {
-    try { const r = await apiFetch("/version"); if (r.ok) $("ver").textContent = "v" + (await r.text()).trim(); }
-    catch (_) {}
+    try {
+      const r = await apiFetch("/version");
+      if (!r.ok) return;
+      const el = $("ver");
+      el.textContent = "v" + (await r.text()).trim();
+      el.title = "version (click to copy)";
+    } catch (_) {}
   }
 
   async function loadJobSetId() {
@@ -3920,9 +3931,10 @@
       if (!r.ok) return;
       const id = (await r.text()).trim();
       const el = $("jobset");
-      // show a short prefix in the header; full id in the tooltip
+      // show a short prefix in the header; full id in the tooltip + copied on click
       el.textContent = "#" + id.replace(/^v\d+:/, "").slice(0, 12);
-      el.title = "job set id: " + id;
+      el.title = "job set id: " + id + " (click to copy)";
+      el.dataset.full = id;
     } catch (_) {}
   }
 
