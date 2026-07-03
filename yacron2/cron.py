@@ -45,6 +45,14 @@ from yacron2.prometheus import (
 
 logger = logging.getLogger("yacron2")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
+# In sub-minute mode, the most whole seconds the scheduler will retroactively
+# service after a slow pass (see Cron._service_slots): a gap up to this bound
+# is tick overhead (a long config reload, many simultaneous launches) whose
+# skipped seconds we replay so a second-level job is not silently dropped; a
+# larger gap is a stall/suspend/clock jump, which we resume past WITHOUT
+# replaying -- matching cron's no-catch-up-after-an-outage behaviour, so a long
+# freeze cannot unleash a burst of backdated launches.
+CATCHUP_LIMIT = datetime.timedelta(seconds=10)
 # How many finished runs to retain per job for the web UI's history/stats view.
 # In-memory only (like the rest of the run record), and bounded so a frequently
 # scheduled job cannot grow memory without limit.
@@ -237,7 +245,9 @@ def next_sleep_interval(subminute: bool = False) -> float:
     return (target - now).total_seconds()
 
 
-def schedule_slot(job: JobConfig) -> datetime.datetime:
+def schedule_slot(
+    job: JobConfig, now: Optional[datetime.datetime] = None
+) -> datetime.datetime:
     """The scheduling instant to test ``job`` against on this tick.
 
     Truncated to the job's own resolution -- the whole second for a
@@ -246,8 +256,25 @@ def schedule_slot(job: JobConfig) -> datetime.datetime:
     decide whether the job is due (:meth:`Cron.job_should_run`) and to
     de-duplicate launches (:meth:`Cron.spawn_jobs`): microseconds are always
     zeroed so two ticks within one slot compare equal and the job fires once.
+
+    ``now`` is the pass instant supplied by :meth:`Cron._service_slots` (a
+    timezone-aware UTC datetime).  Passing it means the whole pass reads the
+    clock ONCE: the same instant decides "due" and is recorded for de-dup, so
+    the two cannot straddle a slot boundary and double-launch a single-slot
+    job -- and a whole-second slot the previous pass overran can be serviced
+    after the fact.  It is rendered into the job's own frame first: an explicit
+    timezone via ``astimezone``, or local time (naive, matching
+    ``get_now(None)``) for a job without one.  ``now`` omitted keeps the old
+    per-job fresh read.
     """
-    now = get_now(job.timezone)
+    if now is None:
+        now = get_now(job.timezone)
+    elif job.timezone is not None:
+        now = now.astimezone(job.timezone)
+    else:
+        # no explicit timezone -> local wall clock, naive, exactly as
+        # get_now(None) (datetime.now(None)) would have returned.
+        now = now.astimezone().replace(tzinfo=None)
     if job.has_seconds:
         return now.replace(microsecond=0)
     return now.replace(second=0, microsecond=0)
@@ -308,6 +335,12 @@ class Cron:
         # cluster/web (re)start, logging). Gates that work to once per minute
         # even while ticking per-second. See run().
         self._last_housekeeping_minute: Optional[datetime.datetime] = None
+        # the last whole-second (UTC) scheduling slot serviced, and whether the
+        # last pass ran in sub-minute mode. Together they let _service_slots
+        # replay whole seconds a slow pass skipped (bounded by CATCHUP_LIMIT),
+        # so a second-level job is never silently dropped by tick overhead.
+        self._last_serviced_slot: Optional[datetime.datetime] = None
+        self._subminute_serviced: bool = False
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -438,9 +471,12 @@ class Cron:
                         # config changes, so a fixed-after-error logging
                         # section is picked up on reload without a restart.
                         applied_logging_config = config.logging_config
-            await self.spawn_jobs(startup)
+            # Service the due slot(s). _service_slots re-reads the clock AFTER
+            # the (possibly slow) housekeeping above, so a whole second the
+            # reload pushed past is still serviced instead of silently dropped.
+            await self._service_slots(startup)
             startup = False
-            # Recompute after spawn_jobs so a reload that just added (or
+            # Recompute after servicing so a reload that just added (or
             # removed) a second-level job switches cadence on this same tick.
             sleep_interval = next_sleep_interval(self._needs_subminute())
             logger.debug("Will sleep for %.1f seconds", sleep_interval)
@@ -1272,12 +1308,98 @@ class Cron:
             job.has_seconds for job in self.cron_jobs.values() if job.enabled
         )
 
-    async def spawn_jobs(self, startup: bool) -> None:
+    async def _service_slots(self, startup: bool) -> None:
+        """Run :meth:`spawn_jobs` for every scheduling slot due since the last
+        pass.
+
+        Normally that is the single current slot.  In sub-minute mode, if the
+        previous pass ran long -- many simultaneous launches, or the once-a-
+        minute config reload -- and pushed the clock past one or more whole-
+        second boundaries, those skipped seconds are serviced here too, so a
+        second-level job due in the gap still fires (once) rather than being
+        silently dropped.  In minute mode the minute-truncated slot already
+        absorbs any sub-minute tick overhead, so a single current slot
+        reproduces the historical behaviour exactly and nothing is ever caught
+        up.  The replay is bounded by :data:`CATCHUP_LIMIT`.
+        """
+        now = get_now(datetime.timezone.utc)
+        subminute = self._needs_subminute()
+        if not subminute:
+            self._last_serviced_slot = now.replace(second=0, microsecond=0)
+            self._subminute_serviced = False
+            await self.spawn_jobs(startup, now)
+            return
+        current = now.replace(microsecond=0)
+        if (
+            startup
+            or self._last_serviced_slot is None
+            or not self._subminute_serviced
+        ):
+            # First sub-minute pass (startup, or the tick that just switched
+            # into sub-minute mode): no established prior second to catch up
+            # from, so service only the current slot.
+            slots = [current]
+        else:
+            start = self._last_serviced_slot + datetime.timedelta(seconds=1)
+            if current - start >= CATCHUP_LIMIT:
+                # Gap too large to be tick overhead (a stall/suspend/clock
+                # jump): resume at the current second without replaying, so a
+                # long freeze cannot unleash a burst of backdated launches.
+                if current > start:
+                    logger.warning(
+                        "scheduler fell behind by %.0fs (a stall, suspend, "
+                        "or clock change); resuming at the current second "
+                        "without replaying the skipped interval",
+                        (current - self._last_serviced_slot).total_seconds(),
+                    )
+                slots = [current]
+            else:
+                slots = []
+                s = start
+                while s <= current:
+                    slots.append(s)
+                    s += datetime.timedelta(seconds=1)
+                # A clock that did not advance a whole second (or moved
+                # backwards) leaves slots empty; service the current slot so a
+                # pass is never a silent no-op.
+                if not slots:
+                    slots = [current]
+        self._last_serviced_slot = current
+        self._subminute_serviced = True
+        for slot in slots:
+            await self.spawn_jobs(startup, slot)
+
+    async def spawn_jobs(
+        self, startup: bool, now: Optional[datetime.datetime] = None
+    ) -> None:
         self._log_cluster_role()
         for job in self.cron_jobs.values():
-            if not self.job_should_run(startup, job):
+            # One clock read per job per pass: the SAME slot decides "due" and
+            # is recorded for de-dup, so the two cannot straddle a boundary and
+            # double-launch a single-slot job. `now` is the pass instant from
+            # _service_slots (None -> a fresh per-job read for direct callers).
+            slot = (
+                schedule_slot(job, now)
+                if isinstance(job.schedule, CronTab)
+                else None
+            )
+            if startup and slot is not None:
+                # Seed the de-dup map with the in-progress slot for every
+                # scheduled job, so the first post-startup tick does not fire a
+                # minute-level job for the minute already under way at startup
+                # (nor a second-level job for the in-progress second). This
+                # restores the historical "snap to the next boundary, skip the
+                # partial period" start behaviour, which per-second ticking
+                # otherwise broke: without it, merely having any second-level
+                # job made every minute-level job fire ~1s after a mid-minute
+                # restart. @reboot jobs (no CronTab slot) are unaffected and
+                # still fire once at startup below.
+                self._last_run_slot[job.name] = slot
+            if not self.job_should_run(startup, job, slot):
                 continue
-            if not startup:
+            if not startup and slot is not None:
+                # (slot is always set here: a non-CronTab job returns False
+                # from job_should_run above and was skipped.)
                 # De-duplicate within a scheduling slot. When a second-level
                 # job makes the scheduler tick every second, a minute-level job
                 # tests "due" on every one of the 60 ticks of its due minute
@@ -1288,7 +1410,6 @@ class Cron:
                 # job is evaluated exactly once per slot -- once per minute as
                 # before. @reboot startup runs are exempt (they fire once by
                 # construction and carry no crontab slot).
-                slot = schedule_slot(job)
                 if self._last_run_slot.get(job.name) == slot:
                     continue
                 self._last_run_slot[job.name] = slot
@@ -1705,7 +1826,11 @@ class Cron:
             self._was_leader = leader
 
     @staticmethod
-    def job_should_run(startup: bool, job: JobConfig) -> bool:
+    def job_should_run(
+        startup: bool,
+        job: JobConfig,
+        slot: Optional[datetime.datetime] = None,
+    ) -> bool:
         if not job.enabled:
             logger.debug(
                 "Job %s (%s) is disabled in the config",
@@ -1728,7 +1853,12 @@ class Cron:
             # schedule_slot truncates to the job's resolution: the top of the
             # minute for a minute-level job (identical to the old
             # replace(second=0)), or the whole second for a second-level one.
-            if crontab.test(schedule_slot(job)):
+            # `slot` is the pass instant precomputed by spawn_jobs so the
+            # due-test and the de-dup key are one and the same read; None means
+            # a direct caller wants a fresh read.
+            if slot is None:
+                slot = schedule_slot(job)
+            if crontab.test(slot):
                 logger.debug(
                     "Job %s (%s) is scheduled for now",
                     job.name,

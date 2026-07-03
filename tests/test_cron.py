@@ -3446,3 +3446,102 @@ async def test_spawn_jobs_subminute_dedup(monkeypatch):
     min_fires = [(m, s) for (s, m, n) in launched if n == "min"]
     assert sec_fires == [(0, 0), (0, 15), (0, 30), (1, 0)]
     assert min_fires == [(0, 0), (1, 0)]  # once per minute despite 6 ticks
+
+
+_EVERY_SECOND_AND_MINUTE = """
+jobs:
+  - name: tick
+    command: echo tick
+    schedule: "* * * * * * *"
+  - name: noon
+    command: echo noon
+    schedule: "0 12 * * *"
+"""
+
+
+def _drive_cron(monkeypatch, holder, config_yaml):
+    """A Cron wired to the controllable clock, recording (name, slot-second)
+    at each launch by reading the de-dup slot spawn_jobs just set."""
+    _set_now(monkeypatch, holder)
+    cron = yacron2.cron.Cron(None, config_yaml=config_yaml)
+    launched = []
+
+    async def fake_launch(job):
+        launched.append((job.name, cron._last_run_slot[job.name].second))
+
+    monkeypatch.setattr(cron, "launch_scheduled_job", fake_launch)
+    return cron, launched
+
+
+@pytest.mark.asyncio
+async def test_service_slots_catches_up_overrun_seconds(monkeypatch):
+    # A pass that overruns by a couple of seconds (the clock jumps forward
+    # between passes) must not silently drop the seconds it skipped: the next
+    # pass services each skipped whole-second slot too.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+
+    await cron._service_slots(startup=True)  # startup at :00 seeds, fires none
+    assert launched == []
+    holder["now"] = DT(2020, 1, 1, 0, 0, 3)  # the :00 pass overran to :03
+    await cron._service_slots(startup=False)
+
+    # every skipped second :01, :02, :03 is serviced (the every-second job
+    # fires once for each), rather than only :03.
+    assert [s for (n, s) in launched if n == "tick"] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_service_slots_bounds_catchup_after_long_gap(monkeypatch):
+    # A gap larger than CATCHUP_LIMIT is a stall/suspend, not tick overhead:
+    # resume at the current second instead of replaying a burst.
+    holder = {"now": DT(2020, 1, 1, 0, 0, 0)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+
+    await cron._service_slots(startup=True)
+    gap = int(yacron2.cron.CATCHUP_LIMIT.total_seconds()) + 5
+    holder["now"] = DT(2020, 1, 1, 0, 0, gap)
+    await cron._service_slots(startup=False)
+
+    # only the current second fires -- no backdated storm of the skipped ones
+    assert [s for (n, s) in launched if n == "tick"] == [gap]
+
+
+@pytest.mark.asyncio
+async def test_startup_seeding_skips_in_progress_minute(monkeypatch):
+    # Restarting partway through a minute must not fire a minute-level job for
+    # the minute already under way, even though a second-level job is present
+    # (which forces per-second ticking). Regression: without startup seeding
+    # the minute job fired ~1s after a mid-minute restart.
+    holder = {"now": DT(2020, 1, 1, 0, 5, 30)}
+    cron, launched = _drive_cron(monkeypatch, holder, _SECONDS_JOB)
+
+    await cron._service_slots(startup=True)  # restart at 00:05:30
+    holder["now"] = DT(2020, 1, 1, 0, 5, 31)
+    await cron._service_slots(startup=False)
+    # the in-progress minute is skipped -- "min" must not have fired
+    assert "min" not in [n for (n, s) in launched]
+
+    holder["now"] = DT(2020, 1, 1, 0, 6, 0)  # next minute boundary
+    await cron._service_slots(startup=False)
+    assert ("min", 0) in launched  # now it fires, once, at the fresh boundary
+
+
+@pytest.mark.asyncio
+async def test_single_slot_job_fires_once_across_boundary(monkeypatch):
+    # A single-slot job (noon) serviced tick-by-tick across the minute boundary
+    # fires exactly once. Regression for the two-clock-read TOCTOU: the due
+    # test and the de-dup key are now one and the same read, so the boundary
+    # cannot double-launch it.
+    holder = {"now": DT(2020, 1, 1, 11, 59, 58)}
+    cron, launched = _drive_cron(monkeypatch, holder, _EVERY_SECOND_AND_MINUTE)
+
+    await cron._service_slots(startup=True)
+    for sec in (59, 0, 1, 2):
+        minute = 59 if sec == 59 else 0
+        hour = 11 if sec == 59 else 12
+        holder["now"] = DT(2020, 1, 1, hour, minute, sec)
+        await cron._service_slots(startup=False)
+
+    noon_fires = [s for (n, s) in launched if n == "noon"]
+    assert noon_fires == [0]  # exactly one launch, at second 0 of 12:00
