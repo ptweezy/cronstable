@@ -11,12 +11,12 @@ name: docker
 #     ------        ----                          ----------   --------------
 #     debian        python:3.14-slim              (none)       3.14   <- latest
 #     alpine        python:3.14-alpine            -alpine      3.14
-#     ubuntu        ubuntu:24.04                  -ubuntu      3.12
-#     rhel          ubi9 (Red Hat UBI)            -rhel        3.12
-#     fedora        fedora:41                     -fedora      3.13
-#     opensuse      opensuse/leap:15.6            -opensuse    3.11
+#     ubuntu        ubuntu:26.04                  -ubuntu      3.14
+#     rhel          ubi10 (Red Hat UBI)           -rhel        3.12
+#     fedora        fedora:44                     -fedora      3.14
+#     opensuse      opensuse/leap:16.0            -opensuse    3.13
 #     amazonlinux   amazonlinux:2023              -amazonlinux 3.11
-#     distroless    gcr.io/distroless/python3     -distroless  3.11
+#     distroless    gcr.io/distroless/python3     -distroless  3.13
 #
 # The Debian image is the default: it gets the bare `latest`/`<version>` tags
 # (no suffix). The variants get `latest-<distro>` and `<version>-<distro>`.
