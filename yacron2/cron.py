@@ -2324,7 +2324,15 @@ class Cron:
         for the ``Forbid`` skip), so a caller accounting for launches --
         the retry metric -- does not count a swallowed one.
         """
-        if self.running_jobs[job.name]:
+        # .get(), not self.running_jobs[job.name]: a bare subscript on this
+        # defaultdict would INSERT an empty-list entry for a not-yet-running
+        # job. Such a jobless key makes `self.running_jobs` truthy while
+        # holding nothing to reap, and the reaper's idle wait
+        # (_wait_for_running_jobs) blocks on _jobs_running without a timeout --
+        # so a phantom key left behind (e.g. if start() below raises before the
+        # append) would spin the reaper hot at shutdown instead of letting it
+        # exit. Reading with .get() never creates the key.
+        if self.running_jobs.get(job.name):
             logger.warning(
                 "Job %s: still running and concurrencyPolicy is %s",
                 job.name,
