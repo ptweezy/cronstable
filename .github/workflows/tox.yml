@@ -5,14 +5,19 @@ on: [push, pull_request]
 permissions:
   contents: read
 
-# Make every pip call (including the ones tox runs inside its venvs) resilient
-# to transient PyPI/network blips: PIP_RETRIES retries failed requests and
-# PIP_TIMEOUT raises the per-request socket timeout. pip reads both from the
-# environment, so this covers the explicit installs below AND tox's internal
-# ones with no third-party action.
+# Make every package install resilient to transient PyPI/network blips.
+# PIP_RETRIES/PIP_TIMEOUT harden the `pip install tox tox-uv` bootstrap; once
+# tox-uv is in, tox provisions its envs and installs deps with uv, so
+# UV_HTTP_TIMEOUT raises uv's per-request socket timeout to match. All are read
+# from the environment, covering both the explicit installs below and tox's
+# internal ones with no third-party action. UV_PYTHON_DOWNLOADS=never keeps uv
+# on the interpreter setup-python provisioned (the matrix Python) rather than
+# silently fetching a managed one.
 env:
   PIP_RETRIES: "5"
   PIP_TIMEOUT: "60"
+  UV_HTTP_TIMEOUT: "60"
+  UV_PYTHON_DOWNLOADS: "never"
 
 jobs:
   tox-lint:
@@ -20,8 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6.2.0
+      # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install --upgrade pip
-      - run: pip install tox
+      - run: pip install tox tox-uv
       - run: tox -e lint
 
   tox-mypy:
@@ -29,8 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6.2.0
+      # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install --upgrade pip
-      - run: pip install tox
+      - run: pip install tox tox-uv
       - run: tox -e mypy
 
   tox:
@@ -64,8 +71,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
+      # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install --upgrade pip
-      - run: pip install tox
+      - run: pip install tox tox-uv
       - run: tox -e py
       # Publish coverage to Codecov. Every matrix cell uploads its own
       # coverage.xml; Codecov merges them by flag into one combined number, so
