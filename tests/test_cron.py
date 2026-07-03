@@ -413,6 +413,17 @@ RETRYING_JOB_THAT_FAILS2 = (
 
 @pytest.mark.asyncio
 async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noqa: C901
+    # This test runs against the REAL wall clock (get_now maps perf_counter
+    # 1:1 onto simulated time from START_TIME), spawning two real subprocesses:
+    # the @reboot job fails, then its single retry fires initialDelay (0.4s)
+    # later. numjobs must reach 2 before the wait_and_quit loop stops at
+    # STOP_TIME. Keep this window WIDE (2s): the retry's launch is anchored to
+    # when the FIRST job's subprocess finishes failing, and Windows/CI process
+    # spawn latency is both large and variable (100-300ms). A tight window
+    # (the retry delay nearly filling it) leaves only tens of ms of slack, so a
+    # slow spawn pushes the retry's launch past STOP_TIME and the second job is
+    # never counted -- a load-sensitive flake seen on the windows-latest CI
+    # runners (assert 1 == 2). Do not shrink it back.
     START_TIME = datetime.datetime(
         year=1999,
         month=12,
@@ -428,8 +439,8 @@ async def test_concurrency_and_backoff(monkeypatch, tracing_running_job):  # noq
         day=31,
         hour=12,
         minute=1,
-        second=00,
-        microsecond=250000,
+        second=1,
+        microsecond=750000,
     )
 
     t0 = time.perf_counter()
@@ -1549,7 +1560,13 @@ async def test_run_survives_config_error(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         raise ConfigError("boom")
 
-    monkeypatch.setattr("yacron2.cron.parse_config", boom)
+    # reload_config now skips the reparse when the file is unchanged on disk,
+    # so touch it (a real "config edited to something invalid on reload"
+    # scenario bumps mtime) to defeat the skip; the failed parse never records
+    # a new fingerprint, so every subsequent tick still sees the change and
+    # retries.
+    cfg.write_text(TWO_JOBS + "\n# edited\n")
+    monkeypatch.setattr("yacron2.cron.parse_config_with_sources", boom)
 
     task = asyncio.create_task(cron.run())
     try:
@@ -3653,6 +3670,7 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     # The once-a-minute reparse is offloaded to a worker thread so a slow disk
     # read + parse cannot freeze the event loop (and stall the scheduling
     # tick). Prove every run-loop reparse executes off the event-loop thread.
+    import itertools
     import threading
 
     cfg = tmp_path / "c.yaml"
@@ -3662,14 +3680,35 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     main_thread = threading.get_ident()
 
     seen = []
-    real_parse = yacron2.cron.parse_config
+    real_parse = yacron2.cron.parse_config_with_sources
 
     def recording_parse(arg):
         seen.append(threading.get_ident())
         return real_parse(arg)
 
-    monkeypatch.setattr("yacron2.cron.parse_config", recording_parse)
+    monkeypatch.setattr(
+        "yacron2.cron.parse_config_with_sources", recording_parse
+    )
     monkeypatch.setattr("yacron2.cron.next_sleep_interval", lambda *a: 0.01)
+    # Force every housekeeping pass to reparse by defeating the
+    # unchanged-config skip cache: an ever-incrementing signature never equals
+    # the stored one, so reload_config always treats the config as changed and
+    # offloads the parse. This test is about WHERE the reparse runs (a worker
+    # thread), not about the skip cache's change detection -- which
+    # test_run_reloads_changed_config already covers via a real on-disk edit.
+    # Driving the reparse this way keeps the test off filesystem timing
+    # entirely: relying on real size/mtime changes to trigger successive
+    # reparses races the parse->record window (reload_config re-stats the file
+    # when recording the parse result, so a second rapid rewrite lands inside
+    # that window and is absorbed into the record -- the next reparse never
+    # fires). That race is benign in production (reloads are ~60s apart) but is
+    # deterministic under this test's 10ms ticks on Windows / Python <= 3.12,
+    # whose coarse ~15.6ms asyncio timer lands every rewrite inside the window
+    # -- which hung this test in CI.
+    _sig_counter = itertools.count()
+    monkeypatch.setattr(
+        cron, "_config_signature", lambda files: next(_sig_counter)
+    )
 
     task = asyncio.create_task(cron.run())
     try:
@@ -3678,7 +3717,7 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
         cron.signal_shutdown()
         await asyncio.wait_for(task, timeout=5)
 
-    assert seen  # the loop reparsed at least once
+    assert len(seen) >= 2  # the loop reparsed on each on-disk change
     assert all(t != main_thread for t in seen)  # ...always off the loop thread
 
 
