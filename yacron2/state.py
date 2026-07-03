@@ -260,9 +260,7 @@ class StateBackend(abc.ABC):
     # --- durable immutable records ---------------------------------------
 
     @abc.abstractmethod
-    async def append_record(
-        self, stream: str, data: Dict[str, Any]
-    ) -> str:
+    async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
         """Append one immutable record to ``stream``; return its record id."""
 
     @abc.abstractmethod
@@ -305,9 +303,7 @@ class StateBackend(abc.ABC):
         """Take (or renew) lease ``name`` for ``ttl``s, else ``None``."""
 
     @abc.abstractmethod
-    async def renew_lease(
-        self, lease: Lease, ttl: float
-    ) -> Optional[Lease]:
+    async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
         """Extend a still-held lease; ``None`` if it was taken over."""
 
     @abc.abstractmethod
@@ -472,9 +468,7 @@ class FilesystemStateBackend(StateBackend):
             os.fsync(fobj.fileno())
         os.replace(tmp, dest)
 
-    async def append_record(
-        self, stream: str, data: Dict[str, Any]
-    ) -> str:
+    async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
         return await asyncio.to_thread(self._append_sync, stream, data)
 
     def _append_sync(self, stream: str, data: Dict[str, Any]) -> str:
@@ -493,9 +487,7 @@ class FilesystemStateBackend(StateBackend):
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        self._atomic_write(
-            os.path.join(stream_dir, rec_id + ".json"), payload
-        )
+        self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
         return rec_id
 
     def _quarantine(self, path: str, name: str, reason: str) -> None:
@@ -665,9 +657,7 @@ class FilesystemStateBackend(StateBackend):
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
     ) -> Optional[Lease]:
-        return await asyncio.to_thread(
-            self._acquire_sync, name, holder, ttl
-        )
+        return await asyncio.to_thread(self._acquire_sync, name, holder, ttl)
 
     def _acquire_sync(
         self, name: str, holder: str, ttl: float
@@ -701,9 +691,7 @@ class FilesystemStateBackend(StateBackend):
             self._write_lease_file(lease_path, lease)
             return lease
 
-    async def renew_lease(
-        self, lease: Lease, ttl: float
-    ) -> Optional[Lease]:
+    async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
         return await asyncio.to_thread(self._renew_sync, lease, ttl)
 
     def _renew_sync(self, lease: Lease, ttl: float) -> Optional[Lease]:

@@ -216,12 +216,26 @@ _REPORT_DEFAULTS = {
 }
 
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "shell": platform.DEFAULT_SHELL,
     "concurrencyPolicy": "Allow",
     # where this job runs under cluster leader election (inert unless
     # cluster.electLeader is set); see yacron2.cron._cluster_allows.
     "clusterPolicy": "Leader",
+    # missed-run catch-up on restart (requires a `state` backend for the
+    # durable last-run watermark; inert without one). skip (default, classic
+    # behaviour: occurrences missed while down are not run) | run-once (fire
+    # once to catch up, coalescing all missed slots) | run-all (replay each
+    # missed occurrence). See yacron2.cron._catch_up.
+    "onMissed": "skip",
+    # only occurrences missed within this many seconds are caught up; None (the
+    # default) means no deadline. Bounds run-all to a recent window so a long
+    # outage cannot stampede. Like Kubernetes CronJob startingDeadlineSeconds.
+    "startingDeadlineSeconds": None,
+    # spread the boot-time catch-up launches of different jobs over [0, N)
+    # seconds (deterministic per job name) so a fleet of jobs does not all fire
+    # at once on restart. 0 (default) fires them together.
+    "catchupJitterSeconds": 0,
     "captureStderr": True,
     "captureStdout": False,
     "saveLimit": 4096,
@@ -327,6 +341,9 @@ _job_defaults_common = {
     Opt("shell"): Str(),
     Opt("concurrencyPolicy"): Enum(["Allow", "Forbid", "Replace"]),
     Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
+    Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
+    Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
+    Opt("catchupJitterSeconds"): Int(),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
     Opt("saveLimit"): Int(),
@@ -665,6 +682,9 @@ class JobConfig:
         "shell",
         "concurrencyPolicy",
         "clusterPolicy",
+        "onMissed",
+        "startingDeadlineSeconds",
+        "catchupJitterSeconds",
         "captureStderr",
         "captureStdout",
         "streamPrefix",
@@ -702,6 +722,14 @@ class JobConfig:
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
         self.clusterPolicy = config.pop("clusterPolicy")
+        # Catch-up config is deliberately NOT part of the job-set fingerprint
+        # (yacron2.fingerprint): it is a restart-time, node-local behaviour
+        # depends on a durable state backend, not a property of "which jobs run
+        # on which schedule", so it does not gate leader-election drift and
+        # needs no SCHEME_VERSION bump.
+        self.onMissed = config.pop("onMissed")
+        self.startingDeadlineSeconds = config.pop("startingDeadlineSeconds")
+        self.catchupJitterSeconds = config.pop("catchupJitterSeconds")
         self.captureStderr = config.pop("captureStderr")
         self.captureStdout = config.pop("captureStdout")
         self.streamPrefix = config.pop("streamPrefix")
@@ -873,6 +901,15 @@ class JobConfig:
         require(self.saveLimit >= 0, "saveLimit must be >= 0")
         require(self.maxLineLength > 0, "maxLineLength must be > 0")
         require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        require(
+            self.catchupJitterSeconds >= 0,
+            "catchupJitterSeconds must be >= 0",
+        )
+        if self.startingDeadlineSeconds is not None:
+            require(
+                self.startingDeadlineSeconds > 0,
+                "startingDeadlineSeconds must be > 0 when set",
+            )
         if self.executionTimeout is not None:
             require(
                 self.executionTimeout > 0,

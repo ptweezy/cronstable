@@ -751,3 +751,235 @@ async def test_durable_last_run_at_watermark(tmp_path):
 async def test_durable_last_run_at_no_backend():
     cron = Cron(None, config_yaml=_ONE_JOB)
     assert await cron.durable_last_run_at("j") is None
+
+
+# --- Phase 2: missed-run catch-up ----------------------------------------
+
+_NOW = datetime.datetime(2026, 7, 1, 10, 10, 30, tzinfo=_UTC)
+
+
+def _catchup_yaml(
+    onmissed="run-all", deadline=None, jitter=0, sched="* * * * *"
+):
+    lines = [
+        "jobs:",
+        "  - name: j",
+        "    command: 'true'",
+        "    schedule: '" + sched + "'",
+        "    onMissed: " + onmissed,
+        "    catchupJitterSeconds: " + str(jitter),
+    ]
+    if deadline is not None:
+        lines.append("    startingDeadlineSeconds: " + str(deadline))
+    return "\n".join(lines) + "\n"
+
+
+async def _cron_with_watermark(tmp_path, watermark_iso, **jobkw):
+    cron = Cron(None, config_yaml=_catchup_yaml(**jobkw))
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    if watermark_iso is not None:
+        await cron.state_backend.append_record(
+            cron._run_stream("j"),
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "started_at": None,
+                "finished_at": watermark_iso,
+                "duration": None,
+                "fail_reason": None,
+            },
+        )
+    return cron
+
+
+def _count_launcher():
+    calls = []
+
+    async def fake(job):
+        calls.append(job.name)
+        return True
+
+    return calls, fake
+
+
+# --- config surface ---
+
+
+def test_onmissed_defaults():
+    cfg = parse_config_string(_ONE_JOB, "")
+    j = cfg.jobs[0]
+    assert j.onMissed == "skip"
+    assert j.startingDeadlineSeconds is None
+    assert j.catchupJitterSeconds == 0
+
+
+def test_onmissed_custom_fields():
+    cfg = parse_config_string(
+        _catchup_yaml(onmissed="run-all", deadline=60, jitter=5), ""
+    )
+    j = cfg.jobs[0]
+    assert j.onMissed == "run-all"
+    assert j.startingDeadlineSeconds == 60
+    assert j.catchupJitterSeconds == 5
+
+
+def test_onmissed_invalid_rejected():
+    with pytest.raises(ConfigError):
+        parse_config_string(_catchup_yaml(onmissed="bogus"), "")
+
+
+def test_starting_deadline_must_be_positive():
+    with pytest.raises(ConfigError, match="startingDeadlineSeconds"):
+        parse_config_string(_catchup_yaml(deadline=0), "")
+
+
+def test_catchup_jitter_must_be_nonnegative():
+    with pytest.raises(ConfigError, match="catchupJitterSeconds"):
+        parse_config_string(_catchup_yaml(jitter=-1), "")
+
+
+# --- _catchup_offset (pure) ---
+
+
+def test_catchup_offset_zero_when_disabled():
+    assert Cron._catchup_offset("j", 0) == 0.0
+
+
+def test_catchup_offset_deterministic_and_in_range():
+    off = Cron._catchup_offset("job-name", 10)
+    assert 0.0 <= off < 10.0
+    assert Cron._catchup_offset("job-name", 10) == off  # stable across calls
+
+
+# --- _missed_occurrences ---
+
+
+async def test_missed_zero_when_never_ran(tmp_path):
+    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
+    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 0
+
+
+async def test_missed_zero_when_current(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:10:00+00:00", onmissed="run-all"
+    )
+    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 0
+
+
+async def test_missed_run_once_coalesces_to_one(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 1
+
+
+async def test_missed_run_all_counts_each(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    # per-minute job, 10:01..10:10 missed by 10:10:30 -> 10 occurrences.
+    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 10
+
+
+async def test_missed_deadline_bounds_window(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all", deadline=180
+    )
+    # only the last 180s (10:08, 10:09, 10:10) count.
+    assert await cron._missed_occurrences(cron.cron_jobs["j"], _NOW) == 3
+
+
+async def test_missed_hard_capped(tmp_path, caplog):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    far = datetime.datetime(2026, 7, 1, 12, 30, 0, tzinfo=_UTC)  # 150 min
+    count = await cron._missed_occurrences(cron.cron_jobs["j"], far)
+    assert count == 100
+    assert any("dropping the rest" in r.getMessage() for r in caplog.records)
+
+
+# --- _catch_up orchestration ---
+
+
+async def test_catch_up_run_once_launches_once(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    await cron._catch_up(_NOW)
+    await asyncio.gather(*list(cron._catchup_tasks))
+    assert calls == ["j"]
+    assert cron._caught_up is True
+
+
+async def test_catch_up_run_all_launches_each(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    now = datetime.datetime(2026, 7, 1, 10, 3, 30, tzinfo=_UTC)  # 3 missed
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    await cron._catch_up(now)
+    await asyncio.gather(*list(cron._catchup_tasks))
+    assert calls == ["j", "j", "j"]
+
+
+async def test_catch_up_runs_only_once(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    await cron._catch_up(_NOW)
+    await asyncio.gather(*list(cron._catchup_tasks))
+    await cron._catch_up(_NOW)  # second call is a no-op
+    assert calls == ["j"]
+
+
+async def test_catch_up_skip_schedules_nothing(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="skip"
+    )
+    await cron._catch_up(_NOW)
+    assert cron._catchup_tasks == set()
+
+
+async def test_catch_up_without_backend_warns(tmp_path, caplog):
+    cron = Cron(None, config_yaml=_catchup_yaml(onmissed="run-all"))
+    await cron._catch_up(_NOW)  # no state backend configured
+    assert cron._catchup_tasks == set()
+    assert any(
+        "needs a" in r.getMessage() and "state" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_catch_up_respects_cluster_gate(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    cron._cluster_allows = lambda job: False  # type: ignore[method-assign]
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    await cron._catch_up(_NOW)
+    await asyncio.gather(*list(cron._catchup_tasks))
+    assert calls == []  # non-owner leaves the backfill to the owner
+
+
+async def test_run_catch_up_bails_when_stopping(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    cron._stop_event.set()
+    await cron._run_catch_up(cron.cron_jobs["j"], 5, 0.0)
+    assert calls == []
+
+
+async def test_run_catch_up_waits_out_jitter(tmp_path):
+    cron = await _cron_with_watermark(
+        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-once"
+    )
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    # a small non-zero offset exercises the interruptible jitter sleep before
+    # the launch (the cross-job stagger path).
+    await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.02)
+    assert calls == ["j"]
