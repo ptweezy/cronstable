@@ -137,6 +137,19 @@ newly created virtualenv.  It is as simple as:
 pipx install yacron2
 ```
 
+### Install using Homebrew
+
+On macOS or Linux, install from the yacron2
+[Homebrew tap](https://github.com/ptweezy/homebrew-tap):
+
+```shell
+brew install ptweezy/tap/yacron2
+```
+
+This installs the self-contained release binary for your platform (signed and
+notarized on macOS; glibc `amd64`/`arm64` on Linux via Homebrew on Linux), so no
+Python is required. Upgrade later with `brew upgrade yacron2`.
+
 ### Install using binary
 
 Alternatively, a self-contained binary can be downloaded
