@@ -404,6 +404,34 @@ async def test_next_run_gate_checks_enabled_and_schedule_independently():
 
 
 @pytest.mark.asyncio
+async def test_next_run_reads_seeded_next_fire_index():
+    # Steady-state path: once the loop has seeded the next-fire index, a scrape
+    # must read the job's next fire straight from cron._next_fire instead of
+    # re-walking the crontab (the fallback the gate test above exercises on a
+    # loop that never ran). Seed a DISTINCTIVE instant that "*/5 * * * *" could
+    # never itself produce (not on a 5-minute boundary, and years out), so a
+    # regression that recomputed via the fallback would render a different
+    # value and fail here rather than silently matching.
+    cron = Cron(None, config_yaml=_NEXT_RUN_GATE)
+    when = datetime.datetime(
+        2099, 1, 1, 0, 2, 3, tzinfo=datetime.timezone.utc
+    )
+    cron._next_fire["cron-on"] = when
+    text = cron.metrics.render(cron)
+    assert (
+        sample_value(
+            text, "yacron2_job_next_run_timestamp_seconds", job_name="cron-on"
+        )
+        == when.timestamp()
+    )
+    # a disabled job never enters the index, so it still gets no sample even
+    # when an enabled sibling is served from it.
+    assert sample_value(
+        text, "yacron2_job_next_run_timestamp_seconds", job_name="cron-off"
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_web_metrics_handler_openmetrics_negotiation():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {}

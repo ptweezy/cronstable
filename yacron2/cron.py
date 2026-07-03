@@ -17,6 +17,7 @@ from typing import (  # noqa
     Awaitable,
     Deque,
     Dict,
+    FrozenSet,
     List,
     Optional,
     Tuple,
@@ -39,8 +40,8 @@ from yacron2.config import (
     WebConfig,
     Yacron2Config,
     cluster_config_warnings,
-    parse_config,
     parse_config_string,
+    parse_config_with_sources,
     schedule_object_to_crontab,
 )
 from yacron2.fingerprint import job_set_id
@@ -333,6 +334,13 @@ class Cron:
         self.metrics = PrometheusMetrics()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
+        # Memoized job-set fingerprint (see job_set_id). The fingerprint is a
+        # pure function of cron_jobs, but it is queried on hot, repeating paths
+        # (every /metrics scrape, every peer poll, each gossip round, several
+        # times per lease renew) while only ever changing on a reload. Computed
+        # lazily, cached here, and invalidated (set None) at every point
+        # cron_jobs is reassigned.
+        self._job_set_id_cache = None  # type: Optional[str]
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
@@ -355,6 +363,17 @@ class Cron:
         # cluster/web (re)start, logging). Gates that work to once per minute
         # even while a second-level job wakes the loop far more often. run().
         self._last_housekeeping_minute: Optional[datetime.datetime] = None
+        # Config-reload skip cache. strictyaml is a slow pure-Python parser,
+        # so rereading and reparsing the whole config on every once-a-minute
+        # housekeeping pass when nothing changed on disk is pure wasted CPU (in
+        # a worker thread, but still real work + thread-pool churn). We
+        # remember the set of files the last successful parse read, a cheap
+        # stat fingerprint of them, and the config it produced; reload_config
+        # skips the reparse whenever the fingerprint is unchanged. See
+        # _config_signature / reload_config.
+        self._config_sources: FrozenSet[str] = frozenset()
+        self._config_sig: Optional[tuple] = None
+        self._last_config: Optional[Yacron2Config] = None
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -364,6 +383,7 @@ class Cron:
             self.cron_jobs = OrderedDict(
                 (job.name, job) for job in config.jobs
             )
+            self._job_set_id_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
         self._stop_event = asyncio.Event()
@@ -545,6 +565,11 @@ class Cron:
     def signal_shutdown(self) -> None:
         logger.debug("Signalling shutdown")
         self._stop_event.set()
+        # Wake the job reaper if it is parked on the idle wait below, so it
+        # re-evaluates the loop condition and exits promptly instead of after
+        # its next poll. Harmless when a job is running (the reaper clears this
+        # each busy iteration); the only other setter is a job launch.
+        self._jobs_running.set()
 
     @staticmethod
     def _empty_config() -> Yacron2Config:
@@ -561,54 +586,113 @@ class Cron:
             logging_config=None,
         )
 
+    def _config_signature(self, files: FrozenSet[str]) -> tuple:
+        """A cheap stat fingerprint of the files a parse read.
+
+        ``(abspath, st_mtime_ns, st_size)`` per file, sorted for determinism; a
+        file that has vanished collapses to a sentinel so a deletion still
+        registers as a change. When the config source is a DIRECTORY its own
+        mtime is folded in as well, so a brand-new entry dropped into the dir
+        (which touches none of the already-tracked files) is still noticed. All
+        of this is a handful of ``os.stat`` calls -- microseconds -- versus a
+        full strictyaml reparse, which is the whole point.
+        """
+        parts: List[tuple] = []
+        for f in sorted(files):
+            try:
+                st = os.stat(f)
+                parts.append((f, st.st_mtime_ns, st.st_size))
+            except OSError:
+                parts.append((f, None, None))
+        if self.config_arg is not None and os.path.isdir(self.config_arg):
+            try:
+                parts.append(("\0dir", os.stat(self.config_arg).st_mtime_ns))
+            except OSError:
+                parts.append(("\0dir", None))
+        return tuple(parts)
+
+    def _record_config(
+        self, config: Yacron2Config, sources: FrozenSet[str]
+    ) -> None:
+        """Cache a successful parse for the unchanged-config skip.
+
+        Fingerprints ``sources`` immediately after the parse, so the next
+        housekeeping pass compares against the on-disk state we actually
+        parsed. (A file edited in the microseconds between the parse's read and
+        this stat would be recorded as already-current and picked up only on a
+        later change -- an acceptable, vanishingly narrow window for a
+        once-a-minute reload.)
+        """
+        self._config_sources = sources
+        self._config_sig = self._config_signature(sources)
+        self._last_config = config
+
     def update_config(self) -> Yacron2Config:
         """Reload the config from disk and apply it, synchronously.
 
         Used at construction (where there is no running event loop to offload
         to) and by tests. The run loop instead calls :meth:`reload_config`,
         which does the same work but runs the disk read + reparse off the event
-        loop; both paths share the pure parse (:func:`parse_config`) and
-        :meth:`_apply_reload`.
+        loop; both paths share the pure parse
+        (:func:`parse_config_with_sources`) and :meth:`_apply_reload`. Always
+        parses (no unchanged-config skip): it runs once at construction to
+        establish the baseline the skip later compares against.
         """
         if self.config_arg is None:
             return self._empty_config()
         try:
-            config = parse_config(self.config_arg)
+            config, sources = parse_config_with_sources(self.config_arg)
         except ConfigError:
             # feeds yacron2_config_last_reload_successful, the standard
             # "config broken on disk" alert signal.
             self.metrics.config_parse(False)
             raise
-        return self._apply_reload(config)
+        result = self._apply_reload(config)
+        self._record_config(config, sources)
+        return result
 
     async def reload_config(self) -> Yacron2Config:
         """Like :meth:`update_config`, but runs the disk read + full reparse
-        OFF the event loop, in a worker thread.
+        OFF the event loop, in a worker thread -- and skips it entirely when
+        nothing the last parse read has changed on disk.
 
-        :func:`parse_config` is a synchronous file read and full reparse; run
-        inline on the scheduling tick it froze the entire event loop -- web
+        The reparse is a synchronous file read plus a full strictyaml parse;
+        run inline on the scheduling tick it froze the entire event loop -- web
         API, cluster gossip, job output pumping -- for its whole duration, once
-        a minute. Offloading just the parse keeps the loop responsive; applying
-        the result (which mutates shared scheduler state) stays on the loop
-        thread via :meth:`_apply_reload`, so there is no cross-thread access to
-        ``self``. The caller applies this BEFORE servicing due slots, so the
-        cluster gate is always current for the tick.
+        a minute. First we compare a cheap stat fingerprint
+        (:meth:`_config_signature`) of the files the last successful parse read
+        against the stored one; if they match, the config on disk is unchanged
+        and we return the already-loaded config without touching strictyaml or
+        the thread pool. The downstream cluster/web/logging (re)starts in
+        :meth:`run` are idempotent, so handing them the same config object is a
+        no-op. Only a real change offloads the parse to a worker thread;
+        applying the result (which mutates shared scheduler state) stays on the
+        loop thread via :meth:`_apply_reload`, so there is no cross-thread
+        access to ``self``. The caller applies this BEFORE servicing due slots,
+        so the cluster gate is always current for the tick.
         """
         if self.config_arg is None:
             return self._empty_config()
+        if self._last_config is not None and (
+            self._config_signature(self._config_sources) == self._config_sig
+        ):
+            logger.debug("config unchanged on disk; skipping reparse")
+            return self._last_config
         loop = asyncio.get_running_loop()
         try:
-            config = await loop.run_in_executor(
-                None, parse_config, self.config_arg
+            config, sources = await loop.run_in_executor(
+                None, parse_config_with_sources, self.config_arg
             )
         except ConfigError:
             # feeds yacron2_config_last_reload_successful, the standard
             # "config broken on disk" alert signal. The parse ran in the worker
-            # thread (parse_config does not touch metrics), so record the
-            # failure here, back on the loop thread.
+            # thread (parse_config_with_sources does not touch metrics), so
+            # record the failure here, back on the loop thread.
             self.metrics.config_parse(False)
             raise
-        return self._apply_reload(config)
+        result = self._apply_reload(config)
+        self._record_config(config, sources)
+        return result
 
     def _apply_reload(self, config: Yacron2Config) -> Yacron2Config:
         """Swap in a freshly parsed config's job set (event-loop thread only).
@@ -621,6 +705,10 @@ class Cron:
         self.metrics.config_parse(True)
         old_jobs = self.cron_jobs
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
+        # The job set changed: drop the memoized fingerprint so the next
+        # job_set_id() recomputes it once. A failed parse raises before this
+        # point, so a bad reload never stales the cache.
+        self._job_set_id_cache = None
         # Drop metric series for jobs removed from the config, so a renamed
         # job does not leave a stale twin behind forever. A removed job with
         # an instance still running keeps its accumulator until the run
@@ -651,8 +739,18 @@ class Cron:
 
         Two yacron2 instances return the same value iff they hold the same set
         of jobs (same effective config, any order); see yacron2.fingerprint.
+
+        Memoized: the fingerprint is a pure function of the loaded job set, so
+        it is computed once per reload and cached (invalidated wherever
+        cron_jobs is reassigned), keeping the per-job deepcopy/JSON/SHA-256
+        work off the scrape / gossip / lease-renew paths that query it each
+        cycle.
         """
-        return job_set_id(self.cron_jobs.values())
+        cached = self._job_set_id_cache
+        if cached is None:
+            cached = job_set_id(self.cron_jobs.values())
+            self._job_set_id_cache = cached
+        return cached
 
     def _log_job_set_id(self) -> None:
         """Log the job-set id at startup and whenever a reload changes it."""
@@ -2226,7 +2324,15 @@ class Cron:
         for the ``Forbid`` skip), so a caller accounting for launches --
         the retry metric -- does not count a swallowed one.
         """
-        if self.running_jobs[job.name]:
+        # .get(), not self.running_jobs[job.name]: a bare subscript on this
+        # defaultdict would INSERT an empty-list entry for a not-yet-running
+        # job. Such a jobless key makes `self.running_jobs` truthy while
+        # holding nothing to reap, and the reaper's idle wait
+        # (_wait_for_running_jobs) blocks on _jobs_running without a timeout --
+        # so a phantom key left behind (e.g. if start() below raises before the
+        # append) would spin the reaper hot at shutdown instead of letting it
+        # exit. Reading with .get() never creates the key.
+        if self.running_jobs.get(job.name):
             logger.warning(
                 "Job %s: still running and concurrencyPolicy is %s",
                 job.name,
@@ -2263,10 +2369,12 @@ class Cron:
                         if job not in wait_tasks:
                             wait_tasks[job] = asyncio.create_task(job.wait())
                 if not wait_tasks:
-                    try:
-                        await asyncio.wait_for(self._jobs_running.wait(), 1)
-                    except asyncio.TimeoutError:
-                        pass
+                    # Nothing running: block until a job launches or shutdown
+                    # is signalled (both set _jobs_running) rather than polling
+                    # once a second. This is the scheduler's most frequent idle
+                    # wakeup, and the loop condition can only change on those
+                    # two events, so a plain wait loses no liveness.
+                    await self._jobs_running.wait()
                     continue
                 self._jobs_running.clear()
                 # wait for at least one task with timeout
