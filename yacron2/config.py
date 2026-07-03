@@ -587,7 +587,14 @@ def schedule_has_seconds(
     string, ``@reboot`` and the ``@daily``/``@hourly``/... nicknames never do.
     """
     if isinstance(schedule_unparsed, dict):
-        return schedule_unparsed.get("second") is not None
+        # Derive from the ACTUAL rendered field count, not mere key presence:
+        # a blank/whitespace ``second:`` value (e.g. a leftover ``second:``
+        # with no value) renders a leading empty column that vanishes under
+        # parse-crontab's whitespace split, leaving a minute-granular 5-/6-
+        # field line. Keying off presence alone would set has_seconds True for
+        # such a line and force the whole scheduler to tick per-second for a
+        # job that only ever fires once a minute.
+        return len(schedule_object_to_crontab(schedule_unparsed).split()) == 7
     if isinstance(schedule_unparsed, str):
         stripped = schedule_unparsed.strip()
         if not stripped or stripped.startswith("@"):

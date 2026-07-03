@@ -1610,18 +1610,29 @@
     // restrict to specific year(s) when a year column is present (6-/7-field)
     if (yr !== "*") clauses.push("in " + listJoin(p.year.values.map(String)));
     let base = [timePart, ...clauses].join(", ");
-    // A leading second column (7-field) fires at second granularity; lead with
-    // it. A literal "0" is the implicit default, so it adds nothing.
+    // A leading second column (7-field) with a non-default seconds value.
     if (p.hasSeconds && sec !== "0") {
       const stepS = sec.match(/^\*\/(\d+)$/), everySec = sec === "*";
       const stepSok = stepS && (60 % +stepS[1] === 0);
-      let secPhrase;
-      if (everySec) secPhrase = "Every second";
-      else if (stepSok) secPhrase = "Every " + stepS[1] + " seconds";
-      else secPhrase = "At second" + (p.second.values.length > 1 ? "s " : " ") + p.second.values.map((x) => pad2(x)).join(", ");
-      // when the rest is just "Every minute", the second phrase says it all
-      if (base === "Every minute") return everySec ? "Every second" : secPhrase;
-      return secPhrase + ", " + base.charAt(0).toLowerCase() + base.slice(1);
+      // A standalone cadence phrase ("Every second" / "Every N seconds") is
+      // only TRUE when nothing above the seconds column is restricted -- the
+      // job really does fire every (Nth) second of every minute. When a
+      // minute/hour/day IS restricted the seconds only sub-select within those
+      // matched minutes, so leading with "Every second" would overstate the
+      // frequency (e.g. "* 30 * * * * *" fires 60x during :30, not 3600x/hr).
+      const topFree = everyMin && everyHr && everyDom && everyMon && everyDow && yr === "*";
+      if (topFree) {
+        if (everySec) return "Every second";
+        if (stepSok) return "Every " + stepS[1] + " seconds";
+        return "At second" + (p.second.values.length > 1 ? "s " : " ") + p.second.values.map((x) => pad2(x)).join(", ");
+      }
+      // Restricted above seconds: append the seconds as a qualifying clause,
+      // enumerated (consistent with the restricted minute/hour phrasing) so the
+      // cadence is not overstated.
+      const secClause = everySec
+        ? "every second"
+        : "at second" + (p.second.values.length > 1 ? "s " : " ") + p.second.values.map((x) => pad2(x)).join(", ");
+      return base + ", " + secClause;
     }
     return base;
   }

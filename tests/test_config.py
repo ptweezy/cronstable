@@ -905,3 +905,15 @@ def test_bad_schedule_string_reports_config_error():
     # a malformed field is a ConfigError (was an anonymous ValueError before)
     with pytest.raises(ConfigError, match="invalid schedule"):
         _one_job('    schedule: "* * * notamonth *"\n')
+
+
+@pytest.mark.parametrize("blank", ['""', '" "'])
+def test_blank_second_is_not_second_granular(blank):
+    # A blank/whitespace `second:` value collapses to a minute-granular line;
+    # has_seconds must be False so it does not force the whole scheduler to
+    # tick per-second for a job that only fires once a minute. has_seconds is
+    # derived from the actual rendered field count, not mere key presence.
+    job = _one_job(
+        "    schedule:\n      second: {}\n      minute: \"5\"\n".format(blank)
+    )
+    assert job.has_seconds is False
