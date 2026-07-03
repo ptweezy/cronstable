@@ -236,6 +236,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # seconds (deterministic per job name) so a fleet of jobs does not all fire
     # at once on restart. 0 (default) fires them together.
     "catchupJitterSeconds": 0,
+    # depends-on-past guard: skip a scheduled fire when the job's previous
+    # durable run did not succeed (Airflow depends_on_past). Requires a `state`
+    # backend for the durable outcome; inert without one. See
+    # yacron2.cron._depends_on_past_ok.
+    "onlyIfLastSucceeded": False,
+    # archive each finished run's captured output to the `state` store (opt-in;
+    # requires a state backend). Encryption-at-rest is the mount's job (EFS/S3
+    # SSE, an encrypted volume); this writes the captured lines, redacted.
+    "archiveOutput": False,
+    # scrub common secrets (tokens, passwords, keys, auth URLs) from archived
+    # output before it is written. On by default; captured stdout/stderr
+    # routinely carries credentials. Only applies when archiveOutput is set.
+    "redactArchivedSecrets": True,
     "captureStderr": True,
     "captureStdout": False,
     "saveLimit": 4096,
@@ -344,6 +357,9 @@ _job_defaults_common = {
     Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
     Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
     Opt("catchupJitterSeconds"): Int(),
+    Opt("onlyIfLastSucceeded"): Bool(),
+    Opt("archiveOutput"): Bool(),
+    Opt("redactArchivedSecrets"): Bool(),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
     Opt("saveLimit"): Int(),
@@ -685,6 +701,9 @@ class JobConfig:
         "onMissed",
         "startingDeadlineSeconds",
         "catchupJitterSeconds",
+        "onlyIfLastSucceeded",
+        "archiveOutput",
+        "redactArchivedSecrets",
         "captureStderr",
         "captureStdout",
         "streamPrefix",
@@ -730,6 +749,9 @@ class JobConfig:
         self.onMissed = config.pop("onMissed")
         self.startingDeadlineSeconds = config.pop("startingDeadlineSeconds")
         self.catchupJitterSeconds = config.pop("catchupJitterSeconds")
+        self.onlyIfLastSucceeded = config.pop("onlyIfLastSucceeded")
+        self.archiveOutput = config.pop("archiveOutput")
+        self.redactArchivedSecrets = config.pop("redactArchivedSecrets")
         self.captureStderr = config.pop("captureStderr")
         self.captureStdout = config.pop("captureStdout")
         self.streamPrefix = config.pop("streamPrefix")
