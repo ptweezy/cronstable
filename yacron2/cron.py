@@ -56,6 +56,7 @@ from yacron2.prometheus import (
     PrometheusMetrics,
     resolve_metrics_config,
 )
+from yacron2.redact import redact_secrets
 from yacron2.state import StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
@@ -88,6 +89,9 @@ JOBS_INLINE_HISTORY = 20
 # config edits) rather than job-set id, so restart-durable history survives an
 # ordinary reload instead of being orphaned every time the config changes.
 RUN_STREAM_PREFIX = "runs/"
+# Prefix for a job's archived captured output (opt-in archiveOutput), one
+# stream per job, pruned to the same maxRunsPerJob bound as the run ledger.
+LOG_STREAM_PREFIX = "logs/"
 # Floor (seconds) for the gate re-check interval of a deferred fail-closed
 # retry: the cluster gate can stay closed for a while, and a job configured
 # with a tiny/zero backoff delay must not hot-loop the scheduler (and spam the
@@ -2587,6 +2591,13 @@ class Cron:
             return False
 
     async def launch_scheduled_job(self, job: JobConfig) -> None:
+        if not await self._depends_on_past_ok(job):
+            logger.info(
+                "Job %s skipped: onlyIfLastSucceeded and its last run did "
+                "not succeed",
+                job.name,
+            )
+            return
         await self.cancel_job_retries(job.name)
         assert job.name not in self.retry_state
 
@@ -2712,15 +2723,21 @@ class Cron:
         """The durable ledger stream name for a job's finished runs."""
         return RUN_STREAM_PREFIX + name
 
+    @staticmethod
+    def _log_stream(name: str) -> str:
+        """The durable stream name for a job's archived captured output."""
+        return LOG_STREAM_PREFIX + name
+
     async def _persist_run_record(self, name: str, info: JobRunInfo) -> None:
-        """Append one finished run to the durable ledger and prune it.
+        """Append one finished run to the durable ledger, prune, and archive.
 
         Runs as a background task (see :meth:`_record_run`).  Errors are logged
         and swallowed: a durability failure must never break job handling, and
         an unhandled exception in a fire-and-forget task would otherwise show
         as a noisy "task exception was never retrieved".  Pruning right after
         the append bounds the stream where it just grew, avoiding a per-minute
-        fleet-wide scan.
+        fleet-wide scan.  When the job opts into ``archiveOutput`` the run's
+        captured output is archived too, in the same task.
         """
         backend = self.state_backend
         if backend is None:  # torn down between scheduling and running
@@ -2730,10 +2747,47 @@ class Cron:
             await backend.append_record(stream, info.to_dict())
             if self._state_max_runs > 0:
                 await backend.prune_records(stream, keep=self._state_max_runs)
+            job = self.cron_jobs.get(name)
+            if job is not None and job.archiveOutput:
+                await self._archive_output(job, info)
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             logger.warning(
                 "state: failed to persist run record for %s: %s", name, ex
             )
+
+    async def _archive_output(self, job: JobConfig, info: JobRunInfo) -> None:
+        """Write a finished run's captured output to the durable log store.
+
+        Opt-in per job (``archiveOutput``).  The output is already bounded by
+        the job's ``saveLimit`` / ``maxLineLength``; each line is scrubbed of
+        recognisable secrets (:func:`yacron2.redact.redact_secrets`) unless the
+        job set ``redactArchivedSecrets: false``, then written as one immutable
+        record linked to the run by its ``finished_at``.  Encryption-at-rest is
+        the mount's job (an encrypted volume, EFS/S3 server-side encryption);
+        this only redacts.  Pruned to the same per-job bound as the ledger.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        redact = job.redactArchivedSecrets
+        lines = [
+            {
+                "stream": stream_name,
+                "line": redact_secrets(line) if redact else line,
+            }
+            for stream_name, line in info.output.lines
+        ]
+        record = {
+            "finished_at": info.finished_at.isoformat(),
+            "outcome": info.outcome,
+            "exit_code": info.exit_code,
+            "redacted": redact,
+            "lines": lines,
+        }
+        stream = self._log_stream(job.name)
+        await backend.append_record(stream, record)
+        if self._state_max_runs > 0:
+            await backend.prune_records(stream, keep=self._state_max_runs)
 
     async def _rehydrate_from_state(self) -> None:
         """Warm the in-memory history from the durable ledger, once, on boot.
@@ -2801,6 +2855,33 @@ class Cron:
             self._run_stream(name), "finished_at"
         )
         return result if isinstance(result, str) else None
+
+    async def _depends_on_past_ok(self, job: JobConfig) -> bool:
+        """Whether ``job``'s depends-on-past gate permits a scheduled fire.
+
+        ``True`` (allow) unless ``onlyIfLastSucceeded`` is set AND the job's
+        most recent durable *run* outcome was a failure.  Consults the ledger,
+        skipping non-run outcomes (``cancelled``/``skipped``) to find the last
+        real ``success``/``failure`` -- so a skipped tick does not itself clear
+        the gate, and only a genuine success re-opens it.  No state backend or
+        no prior run on record -> allow (there is nothing to depend on, and a
+        first-ever run must not be blocked).  Applies to scheduled and @reboot
+        fires (:meth:`launch_scheduled_job`); retries, catch-up backfills, and
+        manual API triggers deliberately bypass it.
+        """
+        if not job.onlyIfLastSucceeded:
+            return True
+        backend = self.state_backend
+        if backend is None:
+            return True
+        recs = await backend.list_records(
+            self._run_stream(job.name), limit=20, newest_first=True
+        )
+        for rec in recs:
+            outcome = rec.get("outcome")
+            if outcome in ("success", "failure"):
+                return bool(outcome == "success")
+        return True
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
         jobs_list = self.running_jobs[job.config.name]

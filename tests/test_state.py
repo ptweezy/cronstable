@@ -9,6 +9,7 @@ drive them deterministically.
 import asyncio
 import datetime
 import json
+import logging
 import os
 
 import pytest
@@ -983,3 +984,164 @@ async def test_run_catch_up_waits_out_jitter(tmp_path):
     # the launch (the cross-job stagger path).
     await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.02)
     assert calls == ["j"]
+
+
+# --- Phase 3: depends_on_past (onlyIfLastSucceeded) -----------------------
+
+_DEP_JOB = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+    "    onlyIfLastSucceeded: true\n"
+)
+
+
+async def _dep_cron(tmp_path):
+    cron = Cron(None, config_yaml=_DEP_JOB)
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    return cron
+
+
+async def _put_outcome(cron, outcome, ts):
+    await cron.state_backend.append_record(
+        cron._run_stream("j"), {"outcome": outcome, "finished_at": ts}
+    )
+
+
+def test_phase3_config_defaults():
+    j = parse_config_string(_ONE_JOB, "").jobs[0]
+    assert j.onlyIfLastSucceeded is False
+    assert j.archiveOutput is False
+    assert j.redactArchivedSecrets is True
+
+
+def test_phase3_config_custom():
+    j = parse_config_string(
+        _archive_yaml(archive=True, redact=False), ""
+    ).jobs[0]
+    assert j.archiveOutput is True
+    assert j.redactArchivedSecrets is False
+    assert parse_config_string(_DEP_JOB, "").jobs[0].onlyIfLastSucceeded
+
+
+async def test_depends_on_past_allows_without_flag(tmp_path):
+    cron = Cron(None, config_yaml=_ONE_JOB)  # flag defaults off
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
+
+
+async def test_depends_on_past_allows_without_backend():
+    cron = Cron(None, config_yaml=_DEP_JOB)  # flag on, no state backend
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
+
+
+async def test_depends_on_past_allows_first_run(tmp_path):
+    cron = await _dep_cron(tmp_path)  # empty ledger
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
+
+
+async def test_depends_on_past_blocks_after_failure(tmp_path):
+    cron = await _dep_cron(tmp_path)
+    await _put_outcome(cron, "failure", "2026-07-01T10:00:00+00:00")
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is False
+
+
+async def test_depends_on_past_allows_after_success(tmp_path):
+    cron = await _dep_cron(tmp_path)
+    await _put_outcome(cron, "failure", "2026-07-01T10:00:00+00:00")
+    await _put_outcome(cron, "success", "2026-07-01T10:05:00+00:00")
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is True
+
+
+async def test_depends_on_past_ignores_cancelled(tmp_path):
+    # a cancelled run after a failure does not itself re-open the gate.
+    cron = await _dep_cron(tmp_path)
+    await _put_outcome(cron, "failure", "2026-07-01T10:00:00+00:00")
+    await _put_outcome(cron, "cancelled", "2026-07-01T10:05:00+00:00")
+    assert await cron._depends_on_past_ok(cron.cron_jobs["j"]) is False
+
+
+async def test_launch_scheduled_job_skips_on_depends_on_past(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="yacron2")
+    cron = await _dep_cron(tmp_path)
+    await _put_outcome(cron, "failure", "2026-07-01T10:00:00+00:00")
+    calls, cron.maybe_launch_job = _count_launcher()  # type: ignore[method-assign]
+    await cron.launch_scheduled_job(cron.cron_jobs["j"])
+    assert calls == []
+    assert any(
+        "skipped: onlyIfLastSucceeded" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+# --- Phase 3: output/log archival with redaction -------------------------
+
+
+def _archive_yaml(archive=True, redact=True):
+    return (
+        "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+        "    archiveOutput: " + ("true" if archive else "false") + "\n"
+        "    redactArchivedSecrets: " + ("true" if redact else "false") + "\n"
+    )
+
+
+def _info_with_output(pairs):
+    out = JobOutputStream()
+    for stream_name, line in pairs:
+        out.publish(stream_name, line)
+    dt = datetime.datetime(2026, 7, 1, 10, 0, 0, tzinfo=_UTC)
+    return JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=dt,
+        finished_at=dt,
+        fail_reason=None,
+        output=out,
+    )
+
+
+async def test_archive_output_writes_redacted(tmp_path):
+    cron = Cron(None, config_yaml=_archive_yaml(archive=True, redact=True))
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    cron._record_run(
+        "j",
+        _info_with_output(
+            [("stdout", "password=hunter2"), ("stderr", "normal line")]
+        ),
+    )
+    await _drain_state_writes(cron)
+    logs = await cron.state_backend.list_records(cron._log_stream("j"))
+    assert len(logs) == 1
+    assert logs[0]["redacted"] is True
+    lines = logs[0]["lines"]
+    assert lines[0]["line"] == "password=***REDACTED***"
+    assert lines[1]["line"] == "normal line"
+
+
+async def test_archive_output_without_redaction(tmp_path):
+    cron = Cron(None, config_yaml=_archive_yaml(archive=True, redact=False))
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    cron._record_run("j", _info_with_output([("stdout", "password=hunter2")]))
+    await _drain_state_writes(cron)
+    logs = await cron.state_backend.list_records(cron._log_stream("j"))
+    assert logs[0]["redacted"] is False
+    assert logs[0]["lines"][0]["line"] == "password=hunter2"
+
+
+async def test_no_archive_without_flag(tmp_path):
+    cron = Cron(None, config_yaml=_ONE_JOB)  # archiveOutput defaults off
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    cron._record_run("j", _info_with_output([("stdout", "x")]))
+    await _drain_state_writes(cron)
+    assert await cron.state_backend.list_records(cron._log_stream("j")) == []
+
+
+async def test_archive_output_pruned_to_max(tmp_path):
+    cron = Cron(None, config_yaml=_archive_yaml(archive=True))
+    cfg = _state_cfg(
+        "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 2\n"
+    )
+    await cron.start_stop_state(cfg)
+    for i in range(4):
+        cron._record_run("j", _info_with_output([("stdout", "run %d" % i)]))
+        await _drain_state_writes(cron)
+    logs = await cron.state_backend.list_records(cron._log_stream("j"))
+    assert len(logs) == 2
