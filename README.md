@@ -1443,9 +1443,3 @@ jobs:
     shell: /bin/bash
     schedule: "* * * * *"
 ```
-
-## Contributing
-
-Development setup, the test/lint/type-check workflow, and the automated release
-process (including the commit-message marker that triggers a PyPI release) are
-documented in [CONTRIBUTING.md](CONTRIBUTING.md).
