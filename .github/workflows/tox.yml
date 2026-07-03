@@ -23,8 +23,8 @@ jobs:
   tox-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install --upgrade pip
       - run: pip install tox tox-uv
@@ -33,8 +33,8 @@ jobs:
   tox-mypy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install --upgrade pip
       - run: pip install tox tox-uv
@@ -66,8 +66,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6.2.0
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-python@v6.3.0
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
@@ -82,7 +82,7 @@ jobs:
       # build, and the experimental rows (continue-on-error) don't gate uploads.
       - name: Upload coverage to Codecov
         if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
