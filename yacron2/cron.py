@@ -9,6 +9,7 @@ import logging
 import logging.config
 import os
 import ssl
+import zlib
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
@@ -68,6 +69,12 @@ WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
 # recent occurrence -- matching cron's no-catch-up-after-an-outage behaviour,
 # so a long freeze cannot unleash a burst of backdated launches.
 CATCHUP_LIMIT = datetime.timedelta(seconds=10)
+# Hard cap on how many missed occurrences a single job replays on restart under
+# onMissed: run-all, so a long outage (or a per-second job) cannot stampede
+# or spin the loop enumerating occurrences. The newest bound-fitting window is
+# preferred via startingDeadlineSeconds; this is the backstop when no deadline
+# is set. Coalescing (run-once) is always exactly one launch regardless.
+MAX_CATCHUP_OCCURRENCES = 100
 # How many finished runs to retain per job for the web UI's history/stats view.
 # In-memory only (like the rest of the run record), and bounded so a frequently
 # scheduled job cannot grow memory without limit.
@@ -461,6 +468,13 @@ class Cron:
         # how many finished runs to retain per job in the durable ledger; set
         # from state.maxRunsPerJob when the backend starts. <= 0 disables.
         self._state_max_runs = 0
+        # whether missed-run catch-up has run; it runs once, on the first
+        # start-up pass, reading the durable last-run watermark. See _catch_up.
+        self._caught_up = False
+        # in-flight catch-up launch tasks (each may sleep its per-job jitter
+        # before launching), tracked so they are not GC'd and can be cancelled
+        # on shutdown.
+        self._catchup_tasks: Set[asyncio.Task] = set()
         # last job-set id we logged, so reloads only log it again on change
         self._logged_job_set_id = None  # type: Optional[str]
         # whether the loaded config asks us to gate jobs on leader election;
@@ -622,6 +636,11 @@ class Cron:
             self.cluster_manager = None
         await self._wait_for_running_jobs_task
 
+        # cancel any pending catch-up backfills (they also self-abort on the
+        # stop event, set above, but cancelling is prompt and tidy at exit).
+        for task in list(self._catchup_tasks):
+            task.cancel()
+
         if self.state_backend is not None:
             # flush the in-flight durable run-record writes so the last few
             # runs are not lost on a clean shutdown; bounded so a stuck store
@@ -631,9 +650,7 @@ class Cron:
                     "Flushing %d pending state write(s)",
                     len(self._pending_state_writes),
                 )
-                await asyncio.wait(
-                    set(self._pending_state_writes), timeout=5
-                )
+                await asyncio.wait(set(self._pending_state_writes), timeout=5)
             logger.info("Stopping state backend")
             await self.state_backend.stop()
             self.state_backend = None
@@ -1844,6 +1861,150 @@ class Cron:
             nxt = self._compute_next_fire(job, nxt)
         return fires, nxt
 
+    @staticmethod
+    def _catchup_offset(name: str, jitter: int) -> float:
+        """Deterministic per-job start offset in ``[0, jitter)`` seconds.
+
+        Derived from the job name (crc32) so the spread is stable across boots
+        and across the fleet, and needs no RNG.  ``0.0`` when jitter is off.
+        """
+        if jitter <= 0:
+            return 0.0
+        return (zlib.crc32(name.encode("utf-8")) % (jitter * 1000)) / 1000.0
+
+    async def _missed_occurrences(
+        self, job: JobConfig, now: datetime.datetime
+    ) -> int:
+        """How many catch-up launches ``job`` is owed for downtime.
+
+        Reads the durable last-run watermark and steps the schedule forward
+        from it (DST-safe, via :meth:`_compute_next_fire`), bounded by
+        ``startingDeadlineSeconds`` and :data:`MAX_CATCHUP_OCCURRENCES`.
+        Returns ``0`` when nothing was missed or the job never ran under this
+        store (no reference point, so -- like anacron/systemd -- a first-ever
+        run just schedules forward); ``1`` for ``run-once`` when at least one
+        slot was missed (every missed slot coalesced into a single launch); or
+        the bounded count of missed slots for ``run-all``.
+        """
+        watermark = await self.durable_last_run_at(job.name)
+        if watermark is None:
+            return 0
+        try:
+            after = datetime.datetime.fromisoformat(watermark)
+        except ValueError:  # pragma: no cover - ledger writes valid ISO
+            return 0
+        deadline = job.startingDeadlineSeconds
+        if deadline:
+            cutoff = now - datetime.timedelta(seconds=deadline)
+            if cutoff > after:
+                after = cutoff  # only the recent window (bounds run-all)
+        nxt = self._compute_next_fire(job, after)
+        if nxt is None or nxt > now:
+            return 0
+        if job.onMissed == "run-once":
+            return 1
+        # run-all: count each missed occurrence, hard-capped.
+        count = 1
+        nxt = self._compute_next_fire(job, nxt)
+        while nxt is not None and nxt <= now:
+            count += 1
+            if count >= MAX_CATCHUP_OCCURRENCES:
+                logger.warning(
+                    "catch-up: %s missed at least %d runs; replaying %d and "
+                    "dropping the rest (set startingDeadlineSeconds to bound "
+                    "the window, or use onMissed: run-once)",
+                    job.name,
+                    MAX_CATCHUP_OCCURRENCES,
+                    MAX_CATCHUP_OCCURRENCES,
+                )
+                break
+            nxt = self._compute_next_fire(job, nxt)
+        return count
+
+    async def _catch_up(self, now: datetime.datetime) -> None:
+        """Replay (or coalesce) runs missed while down, once, on start-up.
+
+        Runs on the first start-up pass, after the state backend and the
+        cluster gate are up.  For each enabled ``onMissed`` job it counts the
+        missed occurrences and, when this node is the job's cluster owner,
+        schedules the catch-up launches spread over ``catchupJitterSeconds`` so
+        a fleet does not all fire at once.  A no-op without a state backend
+        (there is no durable watermark to compare against) -- catch-up is a
+        stateful-only feature.
+        """
+        if self._caught_up:
+            return
+        self._caught_up = True
+        wants = [j for j in self.cron_jobs.values() if j.onMissed != "skip"]
+        if self.state_backend is None:
+            if wants:
+                logger.warning(
+                    "onMissed catch-up is set on %d job(s) but needs a "
+                    "`state` backend for the last-run watermark; skipping",
+                    len(wants),
+                )
+            return
+        for name, job in self.cron_jobs.items():
+            if (
+                job.onMissed == "skip"
+                or not job.enabled
+                or not isinstance(job.schedule, CronTab)
+            ):
+                continue
+            count = await self._missed_occurrences(job, now)
+            if count <= 0:
+                continue
+            if not self._cluster_allows(job):
+                logger.info(
+                    "catch-up: %s missed %d run(s) but this node is not its "
+                    "owner; leaving the backfill to the owner",
+                    name,
+                    count,
+                )
+                continue
+            offset = self._catchup_offset(name, job.catchupJitterSeconds)
+            task = asyncio.create_task(self._run_catch_up(job, count, offset))
+            self._catchup_tasks.add(task)
+            task.add_done_callback(self._catchup_tasks.discard)
+
+    async def _run_catch_up(
+        self, job: JobConfig, count: int, offset: float
+    ) -> None:
+        """Launch a job's catch-up runs, after its jitter offset.
+
+        Sleeps out the per-job jitter (interruptibly, so shutdown wakes it at
+        once) then launches ``count`` times through the concurrency-gated path.
+        Uses :meth:`maybe_launch_job`, not :meth:`launch_scheduled_job`: a
+        backfill is best-effort and does not arm retries (whose single per-job
+        slot ``run-all``'s repeated launches would otherwise tangle).  Failure
+        reporting still applies (the reaper reports every finished run), and
+        each finished run is recorded to the ledger, advancing the watermark so
+        a later restart does not re-backfill the same slots.
+        """
+        try:
+            if offset > 0:
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=offset
+                    )
+                except asyncio.TimeoutError:
+                    pass  # normal: the jitter elapsed without a shutdown
+            if self._stop_event.is_set():
+                return
+            logger.info(
+                "catch-up: replaying %d missed run(s) for %s", count, job.name
+            )
+            for _ in range(count):
+                if self._stop_event.is_set():
+                    break
+                await self.maybe_launch_job(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a backfill must never kill the loop
+            logger.exception(
+                "catch-up: unexpected error backfilling %s", job.name
+            )
+
     async def _service_slots(self, startup: bool) -> None:
         """Service the jobs due on this pass.
 
@@ -1851,12 +2012,15 @@ class Cron:
         pushed past is still serviced instead of dropped) and hands that
         instant to :meth:`spawn_jobs`.  On the start-up pass it also seeds the
         next-fire index for every scheduled job, so their first fire is the
-        boundary strictly after start-up (the skip-the-partial-period start).
+        boundary strictly after start-up (the skip-the-partial-period start),
+        and then runs missed-run catch-up once (:meth:`_catch_up`).
         """
         now = get_now(datetime.timezone.utc)
         if startup:
             self._ensure_seeded(now)
         await self.spawn_jobs(startup, now)
+        if startup:
+            await self._catch_up(now)
 
     async def spawn_jobs(
         self, startup: bool, now: Optional[datetime.datetime] = None
@@ -2548,9 +2712,7 @@ class Cron:
         """The durable ledger stream name for a job's finished runs."""
         return RUN_STREAM_PREFIX + name
 
-    async def _persist_run_record(
-        self, name: str, info: JobRunInfo
-    ) -> None:
+    async def _persist_run_record(self, name: str, info: JobRunInfo) -> None:
         """Append one finished run to the durable ledger and prune it.
 
         Runs as a background task (see :meth:`_record_run`).  Errors are logged
@@ -2567,9 +2729,7 @@ class Cron:
         try:
             await backend.append_record(stream, info.to_dict())
             if self._state_max_runs > 0:
-                await backend.prune_records(
-                    stream, keep=self._state_max_runs
-                )
+                await backend.prune_records(stream, keep=self._state_max_runs)
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             logger.warning(
                 "state: failed to persist run record for %s: %s", name, ex
@@ -2623,9 +2783,7 @@ class Cron:
                 warmed,
             )
 
-    async def durable_last_run_at(
-        self, name: str
-    ) -> Optional[str]:
+    async def durable_last_run_at(self, name: str) -> Optional[str]:
         """The last finished-run timestamp for a job, from the durable ledger.
 
         The restart-surviving "last fired" watermark, derived as the max
