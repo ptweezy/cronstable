@@ -3681,12 +3681,16 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
 
     task = asyncio.create_task(cron.run())
     try:
-        # reload_config now skips the reparse while the file is unchanged on
-        # disk, so edit it (a distinct body each time bumps size/mtime past
-        # the recorded fingerprint) to force each reparse and prove a couple
-        # of them run off the loop thread.
+        # reload_config skips the reparse while the file is unchanged on disk
+        # (stat fingerprint: size + mtime). Force a reparse each iteration by
+        # GROWING the file so its size changes every time. mtime alone is not
+        # enough: Windows stamps file mtimes from the ~15.6ms system timer, so
+        # two rapid writes can land on the same mtime, and equal-length bodies
+        # (e.g. "# edit 0" vs "# edit 1") would then fingerprint identically --
+        # the second reparse would be skipped and this test would hang on
+        # Windows CI. A distinct size sidesteps the mtime resolution entirely.
         for i in range(2):
-            cfg.write_text(TWO_JOBS + f"\n# edit {i}\n")
+            cfg.write_text(TWO_JOBS + "\n# edit\n" * (i + 1))
             before = len(seen)
             await _wait_until(lambda before=before: len(seen) > before)
     finally:
