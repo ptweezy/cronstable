@@ -89,6 +89,25 @@ async def test_token_bucket_burst_then_wait():
     assert waited > 0.0
 
 
+def test_gc_grace_config_floor(tmp_path):
+    from yacron2.config import ConfigError, parse_config_string
+
+    with pytest.raises(ConfigError, match="gcGraceSeconds"):
+        parse_config_string(
+            "state:\n  path: {}\n  gcGraceSeconds: 3600\n".format(tmp_path),
+            "",
+        )
+    # 0/negative (disabled) and >= a day are both fine
+    for value in ("0", "-1", "86400"):
+        cfg = parse_config_string(
+            "state:\n  path: {}\n  gcGraceSeconds: {}\n".format(
+                tmp_path, value
+            ),
+            "",
+        ).state_config
+        assert cfg is not None
+
+
 def test_rate_limit_wiring(tmp_path):
     assert _backend(tmp_path)._rate_limit is None
     assert _backend(tmp_path, maxOpsPerSecond=0)._rate_limit is None
@@ -175,6 +194,8 @@ async def test_collect_garbage_rules(tmp_path, monkeypatch):
     # dry run deleted nothing
     assert len(await backend.list_records("runs/orphan")) == 1
 
+    lease = await backend.acquire_lease("leader", "n1", ttl=30.0)
+    assert lease is not None
     result = await backend.collect_garbage(keep=keep, grace=3600.0)
     assert result["streams_removed"] == 2
     assert result["records_removed"] == 2
@@ -185,6 +206,10 @@ async def test_collect_garbage_rules(tmp_path, monkeypatch):
     assert len(await backend.list_records("runs/fresh-orphan")) == 1
     assert len(await backend.list_records("custom")) == 1
     assert len(await backend.list_records("meta")) == 1
+    # lease files are NEVER touched: a lease file is its fence's only home
+    lease_after = await backend.read_lease("leader")
+    assert lease_after is not None
+    assert lease_after.fence == lease.fence
 
 
 async def test_collect_garbage_sweeps_tmp_and_quarantine(
@@ -414,10 +439,37 @@ def test_cli_migrate(tmp_path, monkeypatch, capsys):
     )
 
 
+def test_cli_gc_defers_on_young_manifest_history(
+    tmp_path, monkeypatch, capsys
+):
+    # a store with no (or young) manifest history cannot prove absence:
+    # the pass must defer rather than collect with zero effective grace.
+    store = tmp_path / "store"
+    config = _write_config(tmp_path, store)
+    _seed_store(store)
+    assert (
+        _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
+    )
+    out = capsys.readouterr().out
+    assert "gc deferred" in out
+
+
 def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)
     _seed_store(store)
+
+    # seed a manifest OLDER than the grace window so the history-depth
+    # guard is satisfied (grace is the default 7 days)
+    async def seed_manifest():
+        backend = _backend(store)
+        old = datetime.datetime.now(_UTC) - datetime.timedelta(days=8)
+        await backend.append_record(
+            "manifests",
+            {"jobSetId": "v1:x", "host": "h", "jobs": [], "at": old.isoformat()},
+        )
+
+    _run(seed_manifest())
     assert (
         _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
     )

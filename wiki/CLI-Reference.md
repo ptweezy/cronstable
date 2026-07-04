@@ -189,7 +189,8 @@ mode `0600`.
 ### `state migrate`
 
 ```
-yacron2 state migrate --dest PATH [--dest-deployment-id ID] [-c FILE-OR-DIR]
+yacron2 state migrate --dest PATH [--dest-deployment-id ID] [--force]
+                      [-c FILE-OR-DIR]
 ```
 
 Copies the store to another path or mount. A local directory and an Amazon
@@ -199,9 +200,12 @@ direction is a faithful file copy. `--dest` (required) is the destination
 destination (default: keep the current one). Each file lands via a temp
 sibling plus atomic rename, so a reader of the *destination* never observes a
 torn record -- important when cutting over to a shared mount that other nodes
-already watch. Migrating a store onto itself is refused (exit `1`). After a
-successful copy, point `state.path` (and `deploymentId`, if you changed it) at
-the new location to cut over.
+already watch. Refused with exit `1`: migrating a store onto (or into) itself,
+and a destination namespace that already holds records or leases unless
+`--force` is given -- overwriting a live destination's lease files would
+regress their fence counters under any daemon already using that store.
+After a successful copy, point `state.path` (and `deploymentId`, if you
+changed it) at the new location to cut over.
 
 ### `state gc`
 
@@ -215,8 +219,11 @@ manifest references and whose newest record is older than
 `state.gcGraceSeconds`, plus counter streams of unmanifested hosts, crashed
 write-temp files, and quarantined records older than the grace. It prints
 what was removed (or, with `--dry-run`, what would be) and the kept-stream
-count. When GC is disabled (`gcGraceSeconds` <= 0) the command reports that
-there is nothing to collect and exits `1`.
+count. Like the automatic pass, it defers (exit `0`, with a message) until
+the store's manifest history spans one full grace window -- a store that
+cannot yet prove absence deletes nothing. When GC is disabled
+(`gcGraceSeconds` <= 0) the command reports that there is nothing to collect
+and exits `1`.
 
 ### `state check`
 

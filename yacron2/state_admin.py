@@ -15,8 +15,10 @@ for it.
 """
 
 import asyncio
+import io
 import os
 import shutil
+import socket
 import tarfile
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -81,12 +83,20 @@ def cmd_backup(config_arg: str, output: str) -> int:
     count = 0
     with tarfile.open(output, "w:gz") as tar:
         for full, arcname in _walk_carried(base):
+            # Read the file fully BEFORE writing its tar header: tar.add
+            # streams header-then-data, so a read failing midway (a prune,
+            # a Windows sharing violation) would truncate the member and
+            # silently corrupt the whole archive. Records are small; a
+            # file that cannot be read is skipped, by design for a backup
+            # taken against a live daemon.
             try:
-                tar.add(full, arcname=arcname, recursive=False)
+                with open(full, "rb") as fobj:
+                    payload = fobj.read()
+                info = tar.gettarinfo(full, arcname=arcname)
             except OSError:
-                # raced away (a prune, a lease rewrite): a backup taken
-                # against a live daemon skips the moved file, by design.
                 continue
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
             count += 1
     print(
         "state: backed up {} file(s) from {} to {}".format(count, base, output)
@@ -103,8 +113,15 @@ def _safe_members(
     for member in tar.getmembers():
         if not member.isfile():
             continue
-        target = os.path.realpath(os.path.join(dest, member.name))
-        if os.path.commonpath([real_dest, target]) != real_dest:
+        try:
+            target = os.path.realpath(os.path.join(dest, member.name))
+            inside = os.path.commonpath([real_dest, target]) == real_dest
+        except ValueError:
+            # commonpath raises on mixed drives/UNC roots (Windows): such a
+            # member cannot be inside dest -- skip it, never abort the
+            # restore mid-extraction.
+            continue
+        if not inside:
             continue
         yield member
 
@@ -142,7 +159,10 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
 
 
 def cmd_migrate(
-    config_arg: str, dest_path: str, dest_deployment: Optional[str]
+    config_arg: str,
+    dest_path: str,
+    dest_deployment: Optional[str],
+    force: bool,
 ) -> int:
     """Copy the store to another path/mount (FS <-> S3 Files migration).
 
@@ -151,7 +171,10 @@ def cmd_migrate(
     the destination namespace.  Each file lands via a temp sibling + atomic
     rename, so a reader of the DESTINATION never observes a torn record --
     important when cutting over to a shared mount that other nodes already
-    watch.
+    watch.  A POPULATED destination is refused without ``--force``: blindly
+    overwriting its lease files would regress their fence counters (a
+    lease file is its fence's only home) under any daemon already using
+    that store.
     """
     backend = _load_state_backend(config_arg)
     src_base = backend.base
@@ -174,6 +197,18 @@ def cmd_migrate(
         # the copy walk would start finding its own output.
         print("state: destination must be a store outside the source")
         return 1
+    populated = any(
+        os.path.isdir(os.path.join(dest_base, sub))
+        and os.listdir(os.path.join(dest_base, sub))
+        for sub in _CARRIED_DIRS
+    )
+    if populated and not force:
+        print(
+            "state: refusing to migrate into the non-empty store at {} "
+            "(pass --force to overwrite; NOT safe while a daemon uses "
+            "it)".format(dest_base)
+        )
+        return 1
     count = 0
     for full, arcname in _walk_carried(src_base):
         target = os.path.join(dest_base, arcname.replace("/", os.sep))
@@ -181,7 +216,9 @@ def cmd_migrate(
         tmp = target + ".migrating"
         try:
             shutil.copyfile(full, tmp)
-            os.replace(tmp, target)
+            # the backend's replace, not a bare os.replace: it rides out
+            # transient Windows sharing violations (AV scans, readers).
+            FilesystemStateBackend._replace(tmp, target)
         except OSError as ex:
             print("state: failed to copy {}: {}".format(arcname, ex))
             try:
@@ -230,8 +267,20 @@ async def _gc_async(
         MANIFEST_STREAM, limit=MANIFEST_STREAM_KEEP, newest_first=True
     )
     now = get_now(datetime.timezone.utc)
+    # same young-history deferral as the daemon's automatic pass: unless
+    # the manifest history spans one full grace window, absence cannot be
+    # proven and nothing may be deleted.
+    oldest = None
+    for rec in manifests:
+        at = _parse_iso_utc(rec.get("at"))
+        if at is not None and (oldest is None or at < oldest):
+            oldest = at
+    if oldest is None or (now - oldest).total_seconds() < grace:
+        return {"deferred": True}
     names = set(keep_names)
-    hosts: Set[str] = set()
+    # keep this machine's own counter snapshots even if no daemon has
+    # manifested from here recently.
+    hosts: Set[str] = {socket.gethostname() or "localhost"}
     for rec in manifests:
         at = _parse_iso_utc(rec.get("at"))
         if at is None or (now - at).total_seconds() > grace:
@@ -260,6 +309,12 @@ def cmd_gc(config_arg: str, dry_run: bool) -> int:
     backend = _load_state_backend(config_arg)
     names = _job_names(config_arg)
     result = asyncio.run(_gc_async(backend, names, dry_run))
+    if result.get("deferred"):
+        print(
+            "state: gc deferred: the manifest history does not yet span "
+            "gcGraceSeconds, so the store cannot prove what is orphaned"
+        )
+        return 0
     verb = "would remove" if dry_run else "removed"
     print(
         "state: gc {} {} stream(s) ({} record(s)), {} temp file(s), "
@@ -357,7 +412,9 @@ def dispatch(args: Any) -> int:
         if action == "restore":
             return cmd_restore(args.config, args.archive, args.force)
         if action == "migrate":
-            return cmd_migrate(args.config, args.dest, args.dest_deployment_id)
+            return cmd_migrate(
+                args.config, args.dest, args.dest_deployment_id, args.force
+            )
         if action == "gc":
             return cmd_gc(args.config, args.dry_run)
         if action == "check":

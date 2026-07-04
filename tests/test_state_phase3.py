@@ -451,6 +451,140 @@ async def test_rearm_reboot_keepalive_continuity(tmp_path, monkeypatch):
         await _stop_state(cron)
 
 
+async def test_rearm_superseded_by_newer_run(tmp_path):
+    # A run that finished AFTER the retry was armed proves the ladder was
+    # resolved somehow (its settle write may have been dropped while the
+    # store was down): settle, never re-run. Pins the double-run repro
+    # where the state section is removed, the ladder resolves statelessly,
+    # and the section is re-added later.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        armed = _now_utc() - datetime.timedelta(seconds=120)
+        job = cron.cron_jobs["j"]
+        await cron.state_backend.append_record(
+            "retries/j",
+            {
+                "kind": "pending",
+                "attempt": 1,
+                "notBefore": armed.isoformat(),
+                "jobDigest": job_digest(job),
+                "at": armed.isoformat(),
+            },
+        )
+        finished = _now_utc() - datetime.timedelta(seconds=30)
+        await cron.state_backend.append_record(
+            "runs/j",
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                "started_at": None,
+                "finished_at": finished.isoformat(),
+                "duration": None,
+                "fail_reason": None,
+            },
+        )
+        cron._state_rehydrated = False
+        await cron._rehydrate_from_state()  # warms last_run, then re-arms
+        assert "j" not in cron.retry_state
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "superseded-by-run"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_rearm_skips_other_hosts_pending(tmp_path):
+    # a pending record written by ANOTHER host (shared store) is that
+    # host's live ladder: neither re-armed nor settled here.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        await cron.state_backend.append_record(
+            "retries/j",
+            {
+                "kind": "pending",
+                "attempt": 1,
+                "notBefore": _now_utc().isoformat(),
+                "jobDigest": job_digest(cron.cron_jobs["j"]),
+                "host": "some-other-node",
+                "at": _now_utc().isoformat(),
+            },
+        )
+        cron._state_rehydrated = False
+        await cron._rehydrate_from_state()
+        assert "j" not in cron.retry_state
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "retries/j")
+        assert rec["kind"] == "pending"  # untouched
+    finally:
+        await _stop_state(cron)
+
+
+async def test_rearm_settles_when_retries_disabled(tmp_path):
+    # maximumRetries edited to 0 since the ladder was armed: the stale
+    # pending must settle now, not lurk until a later config revert.
+    no_retry_yaml = "jobs:\n  - name: j\n    command: ls\n    schedule: '0 0 * * *'\n"
+    cron = await _stateful_cron(tmp_path, no_retry_yaml)
+    try:
+        await cron.state_backend.append_record(
+            "retries/j",
+            {
+                "kind": "pending",
+                "attempt": 1,
+                "notBefore": _now_utc().isoformat(),
+                "jobDigest": "digest-from-the-retrying-definition",
+                "at": _now_utc().isoformat(),
+            },
+        )
+        cron._state_rehydrated = False
+        await cron._rehydrate_from_state()
+        assert "j" not in cron.retry_state
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "retries/j")
+        assert rec["kind"] == "settled"
+        assert rec["reason"] == "config-changed"
+    finally:
+        await _stop_state(cron)
+
+
+async def test_retry_consume_settles_before_launch(tmp_path):
+    # record-before-run: the settled("launched") record must land BEFORE
+    # maybe_launch_job runs, so a crash right after the launch cannot
+    # re-arm the attempt that already ran.
+    cron = await _stateful_cron(tmp_path, _RETRY_JOB)
+    try:
+        events = []
+        backend = cron.state_backend
+        real_append = backend.append_record
+
+        async def spy_append(stream, data):
+            if stream.startswith("retries/"):
+                events.append("append:" + data.get("kind", "?"))
+            return await real_append(stream, data)
+
+        backend.append_record = spy_append  # type: ignore[method-assign]
+
+        async def fake_launch(job, *, with_retries=True):
+            events.append("launch")
+            return True
+
+        cron.maybe_launch_job = fake_launch  # type: ignore[method-assign]
+        state = JobRetryState(1, 2, 60)
+        state.next_delay()
+        cron.retry_state["j"] = state
+        await cron.schedule_retry_job("j", 0, 1)
+        await _drain_state_writes(cron)
+        assert "launch" in events
+        launch_at = events.index("launch")
+        assert "append:settled" in events[:launch_at]
+        # and the pending append was ordered before the settle
+        assert events.index("append:pending") < events.index(
+            "append:settled"
+        )
+    finally:
+        await _stop_state(cron)
+
+
 # --- durable retries: the pre-launch consume marker -----------------------
 
 
@@ -831,7 +965,20 @@ async def test_collect_state_garbage_keeps_manifested_jobs(
         await backend.append_record("runs/manifested", {"finished_at": "x"})
         await backend.append_record("runs/j", {"finished_at": "x"})
         monkeypatch.undo()
-        # a recent manifest from "another node" claims 'manifested'
+        # an OLD manifest satisfying the history-depth guard (the manifest
+        # window must span the grace before anything may be deleted) ...
+        await backend.append_record(
+            "manifests",
+            {
+                "jobSetId": "v1:old",
+                "host": "old-host",
+                "jobs": [],
+                "at": (
+                    _now_utc() - datetime.timedelta(seconds=7200)
+                ).isoformat(),
+            },
+        )
+        # ... and a recent manifest from "another node" claiming 'manifested'
         await backend.append_record(
             "manifests",
             {

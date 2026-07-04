@@ -52,6 +52,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -233,12 +234,17 @@ def _record_epoch(name: str) -> float:
 
     Unknown/foreign filenames map to ``+inf`` so an age-based sweep treats
     them as brand new and keeps their stream -- never delete what cannot be
-    classified.
+    classified.  Guarded against ``float()``'s non-numeric spellings: a file
+    named ``nan-...`` would otherwise parse to NaN, every comparison against
+    it would be False, and the keep-unclassifiable contract would invert.
     """
     try:
-        return float(name.split("-", 1)[0])
+        epoch = float(name.split("-", 1)[0])
     except ValueError:
         return float("inf")
+    if math.isnan(epoch) or math.isinf(epoch):
+        return float("inf")
+    return epoch
 
 
 def _unescape_mount(field: str) -> str:
@@ -907,6 +913,12 @@ class FilesystemStateBackend(StateBackend):
             logger.warning(
                 "state: quarantined corrupt record %s (%s)", name, reason
             )
+            # stamp the QUARANTINE time: rename preserves the original write
+            # mtime, and the GC quarantine sweep ages by mtime -- without
+            # this, an old-written poison record could be swept in the same
+            # pass it was quarantined, losing the forensics window.
+            with contextlib.suppress(OSError):
+                os.utime(dest, None)
         except OSError:
             # already moved/removed by another pass or node, or unwritable:
             # never let cleanup of a poison record raise into a read.
@@ -1332,6 +1344,15 @@ class FilesystemStateBackend(StateBackend):
             newest = max(
                 (_record_epoch(n) for n in records), default=float("-inf")
             )
+            if not records:
+                # an empty managed dir: usually deletable debris, but a
+                # writer may have JUST created it (its first record's temp
+                # file is still being renamed in), so age the DIRECTORY
+                # itself against the grace instead of deleting on sight.
+                try:
+                    newest = os.stat(stream_dir).st_mtime
+                except OSError:
+                    newest = float("inf")
             if newest > cutoff:
                 kept_streams += 1
                 continue

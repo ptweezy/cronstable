@@ -1197,6 +1197,14 @@ def _build_state_config(raw: dict) -> StateConfig:
         raise ConfigError("state.path is required and must be non-empty")
     if float(cfg.get("maxOpsPerSecond") or 0) < 0:
         raise ConfigError("state.maxOpsPerSecond must be >= 0")
+    grace = int(cfg.get("gcGraceSeconds") or 0)
+    if 0 < grace < 86400:
+        # a grace below the manifest cadence would make every live peer's
+        # manifests look stale and hand their state to the collector; a day
+        # is the floor at which the anchoring stays sound.
+        raise ConfigError(
+            "state.gcGraceSeconds must be <= 0 (GC disabled) or >= 86400"
+        )
     return StateConfig(cfg)
 
 

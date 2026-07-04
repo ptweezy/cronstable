@@ -520,6 +520,10 @@ async def test_rehydration_does_not_regress_fresh_run(tmp_path):
     }
 
     async def racing_list(stream, *, limit=None, newest_first=False):
+        # rehydration also reads the counters/retries streams these days;
+        # only the run-history read carries this test's race.
+        if not stream.startswith("runs/"):
+            return []
         for _ in range(3):
             await asyncio.sleep(0)  # the read is "in flight"
         # a run finishes while the read is in flight: _record_run's

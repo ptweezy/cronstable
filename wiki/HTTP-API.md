@@ -506,7 +506,8 @@ $ http get http://127.0.0.1:8080/jobs/test-01/trends
 ```
 
 `source` is `"durable"` when the aggregates were computed over the durable
-ledger (the horizon is then bounded by `state.maxRunsPerJob` retention) and
+ledger (the horizon is then bounded by `state.maxRunsPerJob` retention, and
+by the 5000 newest records per request on an unbounded-retention store) and
 `"memory"` when the endpoint degraded to the in-memory run history -- because
 no `state:` section is configured, or the store could not be read in time.
 The endpoint always answers rather than erroring on store trouble. See
