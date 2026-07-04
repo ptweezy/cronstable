@@ -468,3 +468,81 @@ async def test_renew_loop_survives_store_errors(tmp_path, monkeypatch):
             await task
     finally:
         await _stop(a)
+
+
+async def test_wedged_renew_does_not_re_extend_fence_from_read(
+    tmp_path, monkeypatch
+):
+    # CRITICAL regression: when the locked renew write is wedged (times
+    # out), the round changes nothing and returns -- it must NOT fall
+    # through to the unlocked read and re-extend the leadership fence,
+    # which would keep this node "leader" past the frozen on-disk expiry
+    # while a challenger takes the lease after the skew margin (two
+    # leaders). A transient timeout is survived (the fence from the last
+    # good renew has not lapsed); a persistent one self-demotes purely on
+    # the monotonic deadline, never ratcheted forward off a read.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+        await a._renew_once()
+        assert a.is_leader() is True
+        deadline = a._lease_deadline_mono
+
+        async def _timeout(*_args, **_kw):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(a._store, "renew_lease", _timeout)
+        # transient: still inside the last good renew's window -> leader
+        clock.advance(a.renew_period)
+        await a._renew_once()
+        assert a._lease is not None  # kept for the next locked renew retry
+        assert a._lease_deadline_mono == deadline  # fence untouched
+        assert a.is_leader() is True  # survived the transient timeout
+        # persistent: advance past the monotonic fence deadline
+        clock.advance(a.ttl)
+        await a._renew_once()
+        assert a._lease_deadline_mono == deadline  # STILL not re-extended
+        assert a.is_leader() is False  # self-demoted with no I/O
+    finally:
+        await _stop(a)
+
+
+async def test_confirm_after_denied_acquire_does_not_assert_leadership(
+    tmp_path, monkeypatch
+):
+    # a denied acquire whose confirming (unlocked) read shows our own token
+    # -- an earlier abandoned acquire landed -- adopts the lease but must
+    # not grant leadership from the read; the next locked renew does.
+    clock = _Clock(monkeypatch)
+    a = await _started(_backend(tmp_path, "node-a"))
+    try:
+        # an abandoned acquire already on disk under our token
+        landed = await a._store.acquire_lease(
+            a.election_name, a._holder_token, a.ttl
+        )
+        assert landed is not None
+
+        async def _deny(*_args, **_kw):
+            return None  # every acquire is denied this round
+
+        monkeypatch.setattr(a._store, "acquire_lease", _deny)
+        # force the campaign path: the observe read must not short-circuit
+        # into the own-token adoption branch, so hide the lease from the
+        # first read but reveal it to the confirm read.
+        reads = {"n": 0}
+        real_read = a._store.read_lease
+
+        async def _read(name):
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return None  # observe: looks absent -> campaign
+            return await real_read(name)  # confirm: our token
+
+        monkeypatch.setattr(a._store, "read_lease", _read)
+        clock.advance(1.0)
+        await a._renew_once()
+        assert a._lease is not None  # adopted
+        assert a._lease_deadline_mono is None  # leadership not asserted
+        assert a.is_leader() is False
+    finally:
+        await _stop(a)

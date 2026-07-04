@@ -675,6 +675,15 @@ class Cron:
         # unordered fire-and-forget appends could land newest-first
         # inverted and resurrect a consumed retry on the next boot.
         self._retry_write_tail: Dict[str, asyncio.Task] = {}
+        # same ordering guard for the in-flight run stream: the open and its
+        # paired close are separate fire-and-forget appends whose filename
+        # sort key is the wall clock read on each write's own worker thread,
+        # so for a near-instant run (e.g. a start_failed job) the close
+        # could sort BEFORE the open and leave "open" newest for a finished
+        # run -- which the next restart would reconcile as a spurious
+        # interrupted run. Chaining each job's inflight writes keeps the
+        # close after the open.
+        self._inflight_write_tail: Dict[str, asyncio.Task] = {}
         # latched when a @reboot boot-marker store op times out during the
         # startup pass: the remaining @reboot jobs then apply the policy
         # without more I/O instead of serially stalling the first
@@ -3753,9 +3762,10 @@ class Cron:
         if self.state_backend is not None and first_instance:
             # record the run as in-flight (0 -> 1 instances) so a crash
             # leaves an "open" record for reconciliation; closed again when
-            # the LAST instance finishes (see _handle_finished_job).
-            self._track_state_write(
-                self._persist_inflight_open(job, running_job)
+            # the LAST instance finishes (see _handle_finished_job). Ordered
+            # via the per-job inflight tail so the close cannot sort ahead.
+            self._queue_inflight_write(
+                job.name, self._persist_inflight_open(job, running_job)
             )
         logger.info("Job %s spawned", job.name)
         self._jobs_running.set()
@@ -4191,26 +4201,73 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        try:
-            observed = await asyncio.wait_for(
-                backend.read_lease(self._slot_name(name)),
-                timeout=STATE_OP_TIMEOUT,
-            )
-            if observed is not None and observed.holder == self._slot_holder():
-                await asyncio.wait_for(
-                    backend.release_lease(observed),
+        # Serialized under the per-job slot mutex: the phantom read_lease +
+        # release match ONLY on the per-process holder string (a degraded
+        # launch left our token on disk but no local Lease), so without the
+        # mutex a fresh claim that installs a real lease L (same holder,
+        # since the token is process-wide) between this read and its
+        # release would see L released out from under a live run -- the
+        # slot freed while we believe we hold it, its renewer spinning,
+        # and a peer's Forbid claim then double-running. A fresh claim
+        # installs _slot_leases[name] under this same mutex, so once one is
+        # present this cleanup is a no-op.
+        async with self._slot_mutex(name):
+            if self._slot_leases.get(name) is not None:
+                return  # a live claim owns the slot now; not a phantom
+            try:
+                observed = await asyncio.wait_for(
+                    backend.read_lease(self._slot_name(name)),
                     timeout=STATE_OP_TIMEOUT,
                 )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
+                if (
+                    observed is not None
+                    and observed.holder == self._slot_holder()
+                    and self._slot_leases.get(name) is None
+                ):
+                    await asyncio.wait_for(
+                        backend.release_lease(observed),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
 
     # --- in-flight run records and crash reconciliation -------------------
 
     @staticmethod
     def _inflight_stream(name: str) -> str:
         return INFLIGHT_STREAM_PREFIX + name
+
+    def _queue_inflight_write(
+        self, name: str, coro: Coroutine[Any, Any, None]
+    ) -> asyncio.Task:
+        """Run an inflight-stream write ordered behind the job's previous one.
+
+        The open and its paired close run on separate worker threads whose
+        filename sort key is each thread's own wall-clock read, so an
+        unordered pair could land filename-inverted (close before open) for
+        a near-instant run and leave "open" newest -- a spurious interrupted
+        run on the next restart.  Chaining each job's inflight writes (the
+        same idiom as :meth:`_queue_retry_write`) keeps the stream's order
+        equal to the launch/finish order.
+        """
+        prev = self._inflight_write_tail.get(name)
+
+        async def _ordered() -> None:
+            if prev is not None and not prev.done():
+                await asyncio.wait({prev})
+            await coro
+
+        task = self._track_state_write(_ordered())
+        self._inflight_write_tail[name] = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if self._inflight_write_tail.get(name) is done:
+                del self._inflight_write_tail[name]
+
+        task.add_done_callback(_clear)
+        return task
 
     async def _persist_inflight_open(
         self, job: JobConfig, running_job: RunningJob
@@ -4361,11 +4418,30 @@ class Cron:
         rec = recs[0] if recs else None
         if rec is None or rec.get("kind") != "open":
             return
-        if (
-            rec.get("host") == self._state_host
-            and rec.get("proc") == self._proc_token
-        ):
-            return
+        if rec.get("host") == self._state_host:
+            # a same-host orphan (a previous daemon on this host): our own
+            # live run is never reconciled, and -- exactly as the
+            # rehydration path does -- a recorded pid that is still alive
+            # means the job process outlived its daemon (a crash does not
+            # kill spawned children), so the run is NOT interrupted. Only a
+            # genuinely foreign host's record is judged purely by fence
+            # supersession (its pid names another machine).
+            if rec.get("proc") == self._proc_token:
+                return  # our own live run
+            pid = rec.get("pid")
+            if (
+                isinstance(pid, int)
+                and not isinstance(pid, bool)
+                and platform.pid_alive(pid)
+            ):
+                logger.warning(
+                    "Job %s: a previous daemon's run (pid %d) on this host "
+                    "still appears to be running; leaving its in-flight "
+                    "record open on the slot takeover",
+                    job.name,
+                    pid,
+                )
+                return
         self._reconcile_open_record(job.name, job, rec, "reconciled-takeover")
 
     def _reconcile_open_record(
@@ -4410,7 +4486,9 @@ class Cron:
             data["finished_at"] = started_iso
         else:
             data["interruptedAt"] = started_iso
-        self._track_state_write(self._persist_inflight_closed(name, reason))
+        self._queue_inflight_write(
+            name, self._persist_inflight_closed(name, reason)
+        )
         self._track_state_write(self._persist_reconciled_record(name, data))
         # make it visible on this node's dashboard immediately (bypassing
         # _record_run: no metric emission, no double-persist).
@@ -5085,8 +5163,11 @@ class Cron:
             # record. Fire-and-forget; runs before the replaced/cancelled
             # early-returns below on purpose -- a replaced instance ending
             # the job's last local instance must still close the record.
-            self._track_state_write(
-                self._persist_inflight_closed(job.config.name)
+            # Ordered behind the open so a near-instant run's close cannot
+            # sort ahead of it (see _inflight_write_tail).
+            self._queue_inflight_write(
+                job.config.name,
+                self._persist_inflight_closed(job.config.name),
             )
         if job.config.concurrencyScope == "cluster":
             # every claimed launch pairs with exactly one finish here; the
@@ -5769,6 +5850,29 @@ class Cron:
                 pass
         if not claimed:
             return
+        # Re-apply the top-guard invariant: the awaits above (list/acquire/
+        # claim/release, each up to STATE_OP_TIMEOUT) yield, and in that
+        # window a scheduled fire of this job could have launched, failed,
+        # and armed a LIVE local ladder (its retry_state.task). Overwriting
+        # retry_state[name] here would strand that task as a second,
+        # uncancelled same-node ladder -- and because both write host ==
+        # self._state_host, the foreign-record abort in the consume path
+        # never fires, so the job double-fires on ONE node. That live
+        # ladder outranks (exactly as the top guard at the method start
+        # would have declined the claim); drop the just-made claim. Its
+        # durable pending is host-local and the live ladder settles it on
+        # consume.
+        existing = self.retry_state.get(name)
+        if self.running_jobs.get(name) or (
+            existing is not None
+            and (existing.task is not None or existing.count > 0)
+        ):
+            logger.info(
+                "Job %s: dropping a just-made retry claim; a local retry "
+                "ladder was armed while claiming (it supersedes)",
+                name,
+            )
+            return
         retry = job.onFailure["retry"]
         state = JobRetryState(
             retry["initialDelay"],
@@ -5863,6 +5967,18 @@ class Cron:
                 asyncio.shield(write), timeout=STATE_OP_TIMEOUT
             )
         except asyncio.TimeoutError:
+            # We are abandoning this claim (the caller arms no ladder). The
+            # write is shielded, so without this cancel it would still land
+            # LATER as an own-host pending -- which our own future scans
+            # skip (a host never claims its own pending) and rehydration
+            # never re-arms, while a live original owner reading it aborts
+            # its ladder: an unreclaimable orphan that silently drops the
+            # retry. Cancel it so the foreign record stays newest and the
+            # next scan (here or on a peer) can re-claim cleanly. (If the
+            # append already completed at the instant of the timeout the
+            # cancel is a harmless no-op; the vanishingly small residual is
+            # the same at-least-once window every claim path accepts.)
+            write.cancel()
             return False
         return True
 

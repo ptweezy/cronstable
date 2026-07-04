@@ -868,3 +868,181 @@ async def test_claim_scan_spawned_from_housekeeping(tmp_path):
         await asyncio.wait_for(cron._retry_claim_task, timeout=20)
     finally:
         await _stop_state(cron)
+
+
+# --- review regressions -----------------------------------------------------
+
+
+async def test_phantom_release_no_ops_when_a_live_claim_owns_the_slot(
+    tmp_path,
+):
+    # regression (slot-protocol): a phantom release (a degraded launch left
+    # our per-process holder on disk but no local Lease) must not revoke a
+    # FRESH claim's lease -- the holder string matches (same process), so
+    # without the mutex + live-lease guard it would free a slot a live run
+    # believes it holds, and a peer's Forbid claim would then double-run.
+    cron = await _stateful_cron(tmp_path, _FORBID_JOB)
+    try:
+        backend = cron.state_backend
+        holder = cron._slot_holder()
+        lease = await backend.acquire_lease("slots/j", holder, cron._slot_ttl)
+        cron._slot_leases["j"] = lease
+        cron._slot_refs["j"] = 1
+        await cron._release_phantom_slot("j")
+        assert await backend.read_lease("slots/j") is not None
+    finally:
+        cron._slot_leases.clear()
+        cron._slot_refs.clear()
+        await _stop_state(cron)
+
+
+async def test_phantom_release_cleans_a_true_phantom(tmp_path):
+    # the flip side: with NO local lease, a stale on-disk lease under our
+    # own holder is a genuine phantom and IS released so peers are not
+    # blocked for a whole TTL.
+    cron = await _stateful_cron(tmp_path, _FORBID_JOB)
+    try:
+        backend = cron.state_backend
+        holder = cron._slot_holder()
+        await backend.acquire_lease("slots/j", holder, cron._slot_ttl)
+        assert "j" not in cron._slot_leases
+        await cron._release_phantom_slot("j")
+        assert await backend.read_lease("slots/j") is None
+    finally:
+        await _stop_state(cron)
+
+
+async def test_claim_dropped_when_local_ladder_armed_during_claim(tmp_path):
+    # regression (retry-resume): _maybe_claim_retry's awaits yield, and a
+    # scheduled fire can arm a LIVE local ladder in that window. The claim
+    # must be dropped -- overwriting retry_state would strand that task as a
+    # second same-node ladder, and since both write host==ours the foreign-
+    # record abort never fires: a same-node double-fire.
+    taker = await _resume_cron(tmp_path, _RETRY_JOB, "node-b")
+    try:
+        stale = _now_utc() - datetime.timedelta(seconds=120)
+        await taker.state_backend.append_record(
+            "retries/j",
+            {
+                "kind": "pending",
+                "attempt": 2,
+                "notBefore": _iso(stale),
+                "jobDigest": job_digest(taker.cron_jobs["j"]),
+                "host": "node-a",
+                "at": _iso(stale),
+            },
+        )
+        fresh = JobRetryState(1, 2, 60)
+        fresh.next_delay()
+
+        async def _never():
+            await asyncio.Event().wait()
+
+        fresh.task = asyncio.create_task(_never())
+        orig = taker._claim_retry_under_lease
+
+        async def _claim_and_race(*a, **k):
+            ok = await orig(*a, **k)
+            taker.retry_state["j"] = fresh
+            return ok
+
+        taker._claim_retry_under_lease = _claim_and_race  # type: ignore[method-assign]
+        await taker._maybe_claim_retry("j", taker.cron_jobs["j"])
+        assert taker.retry_state["j"] is fresh
+        assert not fresh.task.done()
+    finally:
+        await _stop_state(taker)
+
+
+async def test_takeover_reconcile_spares_a_live_local_orphan(
+    tmp_path, monkeypatch
+):
+    # regression (reconcile): a slot takeover whose orphaned open record is
+    # from a PREVIOUS daemon on THIS host with a still-alive pid must not be
+    # reconciled -- a daemon crash does not kill the job process it spawned.
+    cron = await _stateful_cron(tmp_path, _FORBID_JOB)
+    try:
+        monkeypatch.setattr(platform_mod, "pid_alive", lambda pid: True)
+        orphan = {
+            "kind": "open",
+            "host": cron._state_host,
+            "proc": "0ldpr0ct0ken",
+            "pid": 4321,
+            "startedAt": _iso(_now_utc() - datetime.timedelta(minutes=3)),
+            "jobDigest": job_digest(cron.cron_jobs["j"]),
+        }
+        await cron.state_backend.append_record("inflight/j", orphan)
+        await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
+        await _drain_state_writes(cron)
+        rec = await _newest(cron, "inflight/j")
+        assert rec["kind"] == "open"
+        assert "j" not in cron.last_run
+    finally:
+        await _stop_state(cron)
+
+
+async def test_inflight_open_sorts_before_close_for_a_fast_run(tmp_path):
+    # regression (reconcile): the per-job inflight tail chains open and its
+    # paired close so the close can never sort ahead of the open.
+    cron = await _stateful_cron(tmp_path, _PLAIN_JOB)
+    try:
+        job = cron.cron_jobs["j"]
+        assert await cron.maybe_launch_job(job) is True
+        rj = cron.running_jobs["j"][0]
+        await rj.wait()
+        await cron._handle_finished_job(rj)
+        await _drain_state_writes(cron)
+        recs = await cron.state_backend.list_records(
+            "inflight/j", newest_first=True
+        )
+        assert recs[0]["kind"] == "closed"
+        assert any(r["kind"] == "open" for r in recs)
+    finally:
+        await _stop_state(cron)
+
+
+async def test_abandoned_claim_write_does_not_orphan_own_host_pending(
+    tmp_path, monkeypatch
+):
+    # regression (retry-resume): a claim-write that times out is shielded,
+    # so it would otherwise land LATER as an own-host pending that this
+    # node's scans skip and rehydration never re-arms -- an unreclaimable
+    # orphan. The timeout cancels the shielded write so the foreign record
+    # stays newest and re-claimable.
+    import yacron2.cron as cron_mod
+
+    taker = await _resume_cron(tmp_path, _RETRY_JOB, "node-b")
+    try:
+        stale = _now_utc() - datetime.timedelta(seconds=120)
+        foreign = {
+            "kind": "pending",
+            "attempt": 1,
+            "notBefore": _iso(stale),
+            "jobDigest": job_digest(taker.cron_jobs["j"]),
+            "host": "node-a",
+            "at": _iso(stale),
+        }
+        await taker.state_backend.append_record("retries/j", foreign)
+        monkeypatch.setattr(cron_mod, "STATE_OP_TIMEOUT", 0.05)
+
+        def _slow_queue(name, record):
+            async def _slow():
+                if record.get("host") == taker._state_host:
+                    await asyncio.sleep(0.5)
+                await taker._append_retry_record(name, record)
+
+            task = taker._track_state_write(_slow())
+            taker._retry_write_tail[name] = task
+            return task
+
+        taker._queue_retry_write = _slow_queue  # type: ignore[method-assign]
+        ok = await taker._claim_retry_under_lease(
+            "j", taker.cron_jobs["j"], foreign, 1, stale
+        )
+        assert ok is False
+        await asyncio.sleep(0.6)
+        await _drain_state_writes(taker)
+        rec = await _newest(taker, "retries/j")
+        assert rec["host"] == "node-a"
+    finally:
+        await _stop_state(taker)
