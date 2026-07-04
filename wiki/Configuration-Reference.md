@@ -41,6 +41,7 @@ jobs:               # optional: list of job definitions
 include: [ ... ]    # optional: list of other config files to merge
 web: { ... }        # optional: HTTP control API
 cluster: { ... }    # optional: mTLS peer attestation / leader election
+state: { ... }      # optional: durable state store (history, catch-up, retries)
 logging: { ... }    # optional: Python logging dictConfig
 ```
 
@@ -51,6 +52,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
+| `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it yacron2 is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
 
 ### `web`
@@ -150,6 +152,42 @@ scheduler. See [Command-Line Reference](CLI-Reference).
 Full behavior, the trust model, quorum math, the lease backends' guarantees,
 and per-job `clusterPolicy` are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election).
+
+### `state`
+
+Optional. Enables the **durable state store**: restart-durable run history,
+missed-run catch-up, restart-surviving retries, once-per-boot `@reboot`
+dedupe, restart-durable Prometheus job counters, and durable output archival.
+yacron2 is stateless by default: absent this section everything stays in
+memory exactly as before. The store is a directory of immutable JSON records
+behind a single filesystem backend -- a local path gives single-node
+durability, while a shared Amazon EFS (NFSv4) / S3 Files mount gives the same
+durability and coordination fleet-wide (the same code either way; the mount
+decides the reach). There must be exactly one `state` block across the whole
+configuration; a duplicate in an included file or a second config-directory
+file raises a `ConfigError`. Defaults come from `DEFAULT_STATE` and are
+applied only when a `state` section is present. (The
+[Web Dashboard](Web-Dashboard)'s browser-side IndexedDB run ledger is a
+separate, client-local feature, unrelated to this store.)
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | `Str` | required | Directory the store lives in. A local path gives single-node durability; a shared Amazon EFS (NFSv4) / S3 Files mount gives the same durability fleet-wide. Must be non-empty: a blank or whitespace-only value is a `ConfigError` at load (`state.path is required and must be non-empty`). |
+| `topology` | `Enum(["auto", "single-node", "shared"])` | `auto` | Whether the store may offer cross-node coordination. `auto` probes `/proc/mounts` for a shared network mount (NFS/EFS/S3 Files) and otherwise assumes `single-node`; Windows and macOS cannot probe, so there `auto` resolves to `single-node` unless overridden with `shared`. |
+| `deploymentId` | `Str` | none (namespace `default`) | Stable namespace prefix so several deployments can share one store/bucket without colliding or cross-reading. Unset means the `default` namespace. |
+| `maxRunsPerJob` | `Int` | `1000` | Durable finished-run retention per job (the durable analogue of the in-memory history ring); the ledger is pruned to this after each append. `<= 0` disables pruning (unbounded; rely on an external lifecycle rule). Durable retention is larger than the in-memory window on purpose. |
+| `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, hung). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `yacron2_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong -- the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
+| `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. |
+| `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). |
+
+`path` is the only required key. Full behavior -- the store layout and
+durability model, restart-surviving retries, missed-run catch-up, `@reboot`
+dedupe, the SLA trends endpoint, garbage collection, the state metrics, and
+the `yacron2 state` CLI subcommands (backup, restore, migrate, gc, check,
+migrate-schema) --
+is documented in [Durable State](Durable-State). The per-job knobs that build
+on this store are under [Durable state and catch-up](#durable-state-and-catch-up)
+below.
 
 ### `logging`
 
@@ -315,6 +353,24 @@ Defaults from `_REPORT_DEFAULTS["webhook"]`:
 | `body` | `Str` | default webhook body template | Request body (jinja2). The default is a Slack-compatible `{"text": ...}` JSON payload of the default subject + body text. |
 | `timeout` | `Float` | `10` | Total request timeout, seconds. |
 
+### Durable state and catch-up
+
+These options build on the top-level [`state`](#state) store and only take
+full effect when a `state` section is configured; without one they parse and
+validate normally but change nothing. The one exception is
+`onlyIfLastSucceeded`, which also works without a `state` section from the
+in-memory history alone (the gate then resets on restart). See
+[Durable State](Durable-State) for the full semantics.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `onMissed` | `Enum(["skip", "run-once", "run-all"])` | `skip` | Missed-run catch-up after downtime, computed from the durable last-run watermark. `skip` (classic behavior): occurrences missed while down are not run. `run-once`: fire once at boot, coalescing all missed slots. `run-all`: replay each missed occurrence. Inert without a `state` section. |
+| `startingDeadlineSeconds` | `Int` or null | none | Only occurrences missed within this many seconds are caught up; unset means no deadline. Bounds `run-all` to a recent window so a long outage cannot stampede (like the Kubernetes CronJob field of the same name). Also invalidates a persisted retry ladder older than the deadline. Must be `> 0` when set. Only meaningful with a `state` section. |
+| `catchupJitterSeconds` | `Int` | `0` | Spread the boot-time catch-up launches of different jobs over `[0, N)` seconds, deterministic per job name, so a fleet of jobs does not all fire at once on restart. `0` fires them together. Must be `>= 0`. Only meaningful with a `state` section. |
+| `onlyIfLastSucceeded` | `Bool` | `false` | Depends-on-past gate: skip a scheduled fire when the job's most recent finished run did not succeed, or when a previous instance is still running (unless `concurrencyPolicy: Replace`). The last real outcome is the newest of the in-memory history and the durable run ledger; cancelled and skipped runs are ignored; retries, catch-up backfills, and manual API triggers deliberately bypass the gate. Works without a `state` section from the in-memory history alone (resetting on restart); with one, the gate's memory survives restarts. |
+| `archiveOutput` | `Bool` | `false` | Persist each finished run's captured output durably to the state store (the job's `logs/` stream). Encryption at rest is the mount's job (EFS/S3 SSE, an encrypted volume). Inert without a `state` section (a startup warning notes it archives nothing). |
+| `redactArchivedSecrets` | `Bool` | `true` | Scrub recognisable secrets (tokens, passwords, keys, auth URLs) from archived output before it is written. Applies only when `archiveOutput` is set, so it too has no effect without a `state` section. |
+
 ### Environment
 
 | Option | Type | Default | Description |
@@ -374,6 +430,8 @@ time, not at run time. New in the yacron2 fork.
 | `maxLineLength > 0` | always |
 | `killTimeout >= 0` | always |
 | `executionTimeout > 0` | only when `executionTimeout` is set |
+| `catchupJitterSeconds >= 0` | always |
+| `startingDeadlineSeconds > 0` | only when `startingDeadlineSeconds` is set |
 | `onFailure.retry.maximumRetries >= -1` | only when a `retry` block is present |
 | `onFailure.retry.initialDelay >= 0` | only when a `retry` block is present |
 | `onFailure.retry.maximumDelay > 0` | only when a `retry` block is present |

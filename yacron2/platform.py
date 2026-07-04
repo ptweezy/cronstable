@@ -24,7 +24,7 @@ import os
 import signal
 import sys
 import time
-from typing import Callable, Iterator, List, Union
+from typing import Callable, Iterator, List, Optional, Union
 
 # Platform-specific file-locking primitive, imported behind a ``sys.platform``
 # guard so each OS pulls in only the module it has (``fcntl`` is Unix-only,
@@ -156,6 +156,55 @@ def install_shutdown_handlers(
             signal.signal(sig, prev)
 
     return restore_signal_handlers
+
+
+# --- OS boot identity ------------------------------------------------------
+def os_boot_id() -> Optional[str]:
+    """A stable, unique identifier of the current OS boot, or ``None``.
+
+    Linux publishes a fresh UUID per boot; where the file is unavailable
+    (Windows, macOS, BSD) callers fall back to :func:`os_boot_time`.  Used by
+    the state-backed standalone ``@reboot`` dedupe: a daemon restart within
+    one OS boot must not re-run a boot one-shot, while a genuine reboot must.
+    """
+    path = "/proc/sys/kernel/random/boot_id"
+    try:
+        with open(path, encoding="ascii") as fobj:
+            value = fobj.read().strip()
+    except (OSError, ValueError):
+        return None
+    return value or None
+
+
+def os_boot_time() -> Optional[float]:
+    """Wall-clock epoch seconds the OS booted at, or ``None`` (cannot tell).
+
+    Derived as ``now - uptime``: on Windows from ``GetTickCount64`` (a 64-bit
+    millisecond tick count that keeps running across sleep/hibernate and is
+    unaffected by wall-clock steps), on POSIX from ``/proc/uptime``.  The
+    derivation rides the *current* wall clock, so an NTP step shifts the
+    result by the step size -- which is why consumers compare boot times with
+    a tolerance rather than exactly.  ``None`` where neither source exists
+    (macOS/BSD): the caller then treats every daemon start as a fresh boot,
+    which is the pre-dedupe behaviour.
+    """
+    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            ticks = kernel32.GetTickCount64
+            ticks.restype = ctypes.c_uint64
+            uptime = float(ticks()) / 1000.0
+        except Exception:  # noqa: BLE001 - any ctypes failure -> cannot tell
+            return None
+        return time.time() - uptime
+    try:
+        with open("/proc/uptime", encoding="ascii") as fobj:
+            uptime = float(fobj.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    return time.time() - uptime
 
 
 # --- Advisory exclusive file locking -------------------------------------

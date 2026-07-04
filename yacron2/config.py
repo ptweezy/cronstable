@@ -134,6 +134,26 @@ DEFAULT_STATE: Dict[str, Any] = {
     # append. <= 0 disables pruning (unbounded; rely on an external lifecycle
     # rule). Durable retention is larger than the in-memory window on purpose.
     "maxRunsPerJob": 1000,
+    # what the STATEFUL features do while the store is configured but
+    # unavailable (down, unreadable, hung). "degrade" (default) falls back to
+    # the in-memory behaviour: durable-truth gates fail open and writes are
+    # dropped with a warning (and counted). "fail-closed" prefers not running
+    # over possibly running wrong: the onlyIfLastSucceeded gate blocks, a
+    # due durable retry defers until the store answers, and an unverifiable
+    # @reboot boot marker skips the boot run. Plain scheduled fires are never
+    # gated on the store under either policy.
+    "onStoreUnavailable": "degrade",
+    # age (seconds) past which durable state belonging to a job that no
+    # recent manifest references (no node's loaded config under this
+    # deploymentId has mentioned it for this long) is garbage collected.
+    # <= 0 disables automatic GC. Defaults to 7 days -- long enough that a
+    # briefly-removed job, or a fleet node down for a long weekend, keeps
+    # its history.
+    "gcGraceSeconds": 604800,
+    # upper bound on store operations per second (a token bucket over every
+    # backend call), for request-rate/cost control on mounts that bill per
+    # request. 0 disables (no throttling).
+    "maxOpsPerSecond": 0,
 }
 
 
@@ -549,6 +569,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("topology"): Enum(["auto", "single-node", "shared"]),
                 Opt("deploymentId"): Str(),
                 Opt("maxRunsPerJob"): Int(),
+                Opt("onStoreUnavailable"): Enum(["degrade", "fail-closed"]),
+                Opt("gcGraceSeconds"): Int(),
+                Opt("maxOpsPerSecond"): Int() | Float(),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -1172,6 +1195,8 @@ def _build_state_config(raw: dict) -> StateConfig:
     cfg.update(raw)
     if not cfg.get("path") or not str(cfg["path"]).strip():
         raise ConfigError("state.path is required and must be non-empty")
+    if float(cfg.get("maxOpsPerSecond") or 0) < 0:
+        raise ConfigError("state.maxOpsPerSecond must be >= 0")
     return StateConfig(cfg)
 
 

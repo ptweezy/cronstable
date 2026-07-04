@@ -283,6 +283,9 @@ class PrometheusMetrics:
         self._last_reload_success_time: Optional[float] = None
         self._leader_transitions = 0
         self._quorum_transitions = 0
+        # durable-state writes that failed and were dropped, by kind
+        # (run-record, checkpoint, retry, reboot-marker, counters, manifest)
+        self._state_dropped: Dict[str, int] = {}
 
     # -- configuration ----------------------------------------------------
 
@@ -353,6 +356,123 @@ class PrometheusMetrics:
     def cluster_quorum_transition(self) -> None:
         self._quorum_transitions += 1
 
+    def state_write_dropped(self, kind: str) -> None:
+        self._state_dropped[kind] = self._state_dropped.get(kind, 0) + 1
+
+    # -- durable counter snapshots (yacron2.cron state backend) -------------
+
+    def counters_snapshot(self) -> Dict[str, Any]:
+        """A JSON-safe snapshot of the per-job counter accumulators.
+
+        Persisted by the scheduler to the durable state store so counters
+        survive a restart (see ``Cron._persist_counter_snapshot``).  Bucket
+        bounds ride along once (they are shared by every job) so a restore
+        can tell whether the histogram state still lines up with the
+        configured buckets.
+        """
+        jobs: Dict[str, Any] = {}
+        for name, job in self._jobs.items():
+            jobs[name] = {
+                "runs": dict(job.runs),
+                "retries": job.retries,
+                "permanent_failures": job.permanent_failures,
+                "start_failures": job.start_failures,
+                "duration_sum": job.duration_sum,
+                "duration_count": job.duration_count,
+                "bucket_counts": list(job.bucket_counts),
+                "last_success_time": job.last_success_time,
+                "last_failure_time": job.last_failure_time,
+            }
+        return {"buckets": list(self._buckets), "jobs": jobs}
+
+    def seed_counters(
+        self, snapshot: Dict[str, Any], keep: Iterable[str]
+    ) -> int:
+        """ADD a persisted snapshot into the accumulators; return jobs seeded.
+
+        Restart rehydration for the counters: called at most once per
+        process (the caller latches), and it *adds* rather than assigns so
+        events recorded before the seed ran (a job finishing during boot)
+        are kept -- pre-restart and post-restart counts are disjoint, so
+        addition is correct in either order.  Only jobs in ``keep`` (the
+        loaded config) are seeded, honouring the reload-prune contract.
+        Histogram state is seeded only when the persisted bucket bounds
+        equal the current ones, mirroring the bucket-change reset rule;
+        the outcome counters are seeded regardless, mirroring
+        :meth:`set_duration_buckets` leaving counters untouched.  Corrupt
+        or foreign-shaped fields are skipped one by one, never fatal.
+        """
+        jobs = snapshot.get("jobs")
+        if not isinstance(jobs, dict):
+            return 0
+        raw_buckets = snapshot.get("buckets")
+        try:
+            buckets_match = isinstance(raw_buckets, list) and (
+                tuple(float(b) for b in raw_buckets) == self._buckets
+            )
+        except (TypeError, ValueError):
+            buckets_match = False
+        keep_set = set(keep)
+        seeded = 0
+        for name, data in jobs.items():
+            if name not in keep_set or not isinstance(data, dict):
+                continue
+            job = self._job(name)
+            runs = data.get("runs")
+            if isinstance(runs, dict):
+                for outcome, count in runs.items():
+                    if (
+                        isinstance(outcome, str)
+                        and isinstance(count, int)
+                        and not isinstance(count, bool)
+                        and count > 0
+                    ):
+                        job.runs[outcome] = job.runs.get(outcome, 0) + count
+            for attr in ("retries", "permanent_failures", "start_failures"):
+                value = data.get(attr)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                ):
+                    setattr(job, attr, getattr(job, attr) + value)
+            if buckets_match:
+                self._seed_histogram(job, data)
+            for attr in ("last_success_time", "last_failure_time"):
+                value = data.get(attr)
+                if isinstance(value, (int, float)) and not isinstance(
+                    value, bool
+                ):
+                    current = getattr(job, attr)
+                    if current is None or float(value) > current:
+                        setattr(job, attr, float(value))
+            seeded += 1
+        return seeded
+
+    def _seed_histogram(self, job: _JobMetrics, data: Dict[str, Any]) -> None:
+        duration_sum = data.get("duration_sum")
+        duration_count = data.get("duration_count")
+        bucket_counts = data.get("bucket_counts")
+        if (
+            isinstance(duration_sum, (int, float))
+            and not isinstance(duration_sum, bool)
+            and isinstance(duration_count, int)
+            and not isinstance(duration_count, bool)
+            and duration_count >= 0
+            and isinstance(bucket_counts, list)
+            and len(bucket_counts) == len(self._buckets)
+            and all(
+                isinstance(c, int) and not isinstance(c, bool) and c >= 0
+                for c in bucket_counts
+            )
+        ):
+            job.duration_sum += float(duration_sum)
+            job.duration_count += duration_count
+            job.bucket_counts = [
+                a + b
+                for a, b in zip(job.bucket_counts, bucket_counts, strict=True)
+            ]
+
     # -- rendering ---------------------------------------------------------
 
     def render(self, cron: "Cron", openmetrics: bool = False) -> str:
@@ -361,7 +481,126 @@ class PrometheusMetrics:
     def _families(self, cron: "Cron") -> List[MetricFamily]:
         families = self._daemon_families(cron)
         families.extend(self._job_families(cron))
+        families.extend(self._state_families(cron))
         families.extend(self._cluster_families(cron))
+        return families
+
+    def _state_families(self, cron: "Cron") -> List[MetricFamily]:
+        """Durable-state self-observability families.
+
+        The dropped-write counter is an accumulator here (the scheduler
+        counts drops as it swallows them) and is emitted whenever nonzero,
+        even after the backend is torn down.  Everything else reads the
+        live backend at scrape time and is omitted without one; a backend
+        read error degrades the scrape (families omitted) instead of
+        500ing, mirroring the cluster block.  Conditional emission: the
+        lock/throttle counters appear only once nonzero -- a store that
+        never leases or throttles should not export frozen zeros forever.
+        """
+        families: List[MetricFamily] = []
+        if self._state_dropped:
+            dropped = MetricFamily(
+                "yacron2_state_dropped_writes",
+                "counter",
+                "Durable state writes that failed and were dropped, by kind.",
+            )
+            for kind in sorted(self._state_dropped):
+                dropped.add({"kind": kind}, self._state_dropped[kind])
+            families.append(dropped)
+        backend = cron.state_backend
+        if backend is None:
+            return families
+        try:
+            view = backend.view_dict()
+            stats = backend.stats()
+        except Exception:
+            # A backend read should never raise; if one does, the scrape
+            # must still serve the job metrics rather than 500. Mirrors
+            # the cluster block's fail-safe.
+            logger.exception(
+                "error reading state-backend stats for /metrics; "
+                "omitting state metrics from this scrape"
+            )
+            return families
+
+        info = MetricFamily(
+            "yacron2_state",
+            "info",
+            "Static durable-state backend facts for this node.",
+        )
+        info.add(
+            {
+                "backend": str(view.get("backend", "")),
+                "topology": str(view.get("topology", "")),
+            },
+            1,
+        )
+        families.append(info)
+
+        ops = stats.get("ops") or {}
+        if ops:
+            op_count = MetricFamily(
+                "yacron2_state_ops",
+                "counter",
+                "Durable state store operations, by operation.",
+            )
+            op_errors = MetricFamily(
+                "yacron2_state_op_errors",
+                "counter",
+                "Durable state store operations that raised, by operation.",
+            )
+            op_seconds = MetricFamily(
+                "yacron2_state_op_seconds",
+                "counter",
+                "Seconds spent inside durable state store operations, by "
+                "operation (rate against yacron2_state_ops_total for mean "
+                "latency).",
+            )
+            for op in sorted(ops):
+                entry = ops[op]
+                labels = {"op": op}
+                op_count.add(labels, entry.get("count", 0))
+                op_errors.add(labels, entry.get("errors", 0))
+                op_seconds.add(labels, entry.get("seconds", 0.0))
+            families.append(op_count)
+            families.append(op_errors)
+            families.append(op_seconds)
+
+        lock = stats.get("lock") or {}
+        if lock.get("acquisitions"):
+            acquisitions = MetricFamily(
+                "yacron2_state_lock_acquisitions",
+                "counter",
+                "Advisory-lock acquisitions by the state backend.",
+            )
+            acquisitions.add({}, lock.get("acquisitions", 0))
+            families.append(acquisitions)
+            lock_wait = MetricFamily(
+                "yacron2_state_lock_wait_seconds",
+                "counter",
+                "Seconds spent waiting to acquire the state backend's "
+                "advisory locks (contention signal).",
+            )
+            lock_wait.add({}, lock.get("wait_seconds", 0.0))
+            families.append(lock_wait)
+
+        throttle = stats.get("throttle") or {}
+        if throttle.get("count"):
+            throttled = MetricFamily(
+                "yacron2_state_throttled_ops",
+                "counter",
+                "Store operations delayed by the maxOpsPerSecond rate limit.",
+            )
+            throttled.add({}, throttle.get("count", 0))
+            families.append(throttled)
+            throttle_wait = MetricFamily(
+                "yacron2_state_throttle_wait_seconds",
+                "counter",
+                "Seconds store operations spent waiting on the "
+                "maxOpsPerSecond rate limit.",
+            )
+            throttle_wait.add({}, throttle.get("wait_seconds", 0.0))
+            families.append(throttle_wait)
         return families
 
     def _daemon_families(self, cron: "Cron") -> List[MetricFamily]:

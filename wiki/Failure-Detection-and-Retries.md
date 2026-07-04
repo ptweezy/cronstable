@@ -59,7 +59,7 @@ jobs:
 
 ## Retries: `onFailure.retry`
 
-Retries are configured under `onFailure.retry`. Retry orchestration lives in `yacron2/cron.py` (`launch_scheduled_job`, `handle_job_failure`, `schedule_retry_job`, `cancel_job_retries`); per-job backoff state is `JobRetryState` in `yacron2/job.py`.
+Retries are configured under `onFailure.retry`. Retry orchestration lives in `yacron2/cron.py` (`launch_scheduled_job`, `handle_job_failure`, `schedule_retry_job`, `cancel_job_retries`); per-job backoff state is `JobRetryState` in `yacron2/job.py`. Retry state is in-memory by default, so a pending retry dies with the process; with a `state:` section configured it also survives daemon restarts (see "Restart-surviving retries" below).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -86,6 +86,8 @@ next delay = min(current delay * backoffMultiplier, maximumDelay)
 
 The first retry waits `initialDelay`; each subsequent retry waits the previous delay times `backoffMultiplier`, capped at `maximumDelay`. With `initialDelay: 1`, `backoffMultiplier: 2`, `maximumDelay: 30`, the delay sequence is 1, 2, 4, 8, 16, 30, 30, ... seconds. The retry counter (`count`) increments on each `next_delay()` call.
 
+The ladder is a pure function of the retry config and the attempt number, which is what lets a durable pending retry be re-armed at its exact position after a daemon restart (see "Restart-surviving retries" below).
+
 ### Retry lifecycle
 
 - A retry state is created only when `maximumRetries` is truthy (non-zero). With `maximumRetries: 0` no state is created and a failed run goes straight to permanent failure.
@@ -94,7 +96,21 @@ The first retry waits `initialDelay`; each subsequent retry waits the previous d
 - A success (`handle_job_success`) calls `cancel_job_retries` and fires `onSuccess`, ending the sequence.
 - If a job is removed from the configuration while a retry is pending, `schedule_retry_job` logs a warning, discards the stale retry state, and skips the run cleanly (no exception).
 - When leader election is enabled (`cluster.electLeader`), `schedule_retry_job` re-checks the cluster gate before relaunching. A transient fail-closed condition (lost quorum, a detected conflict, a rebuilt gossip manager's still-converging view, a backend read error) does *not* end the sequence: the retry state is kept and the gate is re-checked after another delay of the same length (floored at one second; the first deferral of a wait is logged at INFO, repeats at DEBUG), so a keep-alive job survives the blip. Only when another node is *positively* identified as the job's owner is the pending retry **abandoned**: the retry state is cancelled and discarded, a WARNING is logged, and the abandonment is recorded in the run history as `cancelled`. An abandoned sequence ends without firing `onPermanentFailure`, and the failed attempt is not re-run elsewhere: the new owner only picks up the job's *future scheduled firings*, which an `@reboot` one-shot does not have (its boot run is already recorded, so an abandoned `@reboot` keep-alive ends cluster-wide). See [Clustering and Leader Election](Clustering-and-Leader-Election).
-- On shutdown, all pending retries are cancelled before yacron2 exits.
+- On shutdown, all pending retries are cancelled before yacron2 exits. Without a `state:` section that ends the sequence for good; with one, the graceful-shutdown cancellation deliberately does *not* settle the durable pending record, so the next start re-arms it (see below).
+
+### Restart-surviving retries
+
+Everything in this subsection activates only when a `state:` config section is present (the [durable state store](Durable-State)). Without one, the lifecycle above is the whole story and a pending retry dies with the process. (The store is server-side, on `state.path`; it is unrelated to the web dashboard's browser-side IndexedDB run ledger.)
+
+With `state:` configured, every job with a non-zero `maximumRetries` gets a durable retry ladder alongside the in-memory one:
+
+- When a retry is armed, a *pending* record is appended (fire-and-forget) to the job's durable retry stream, carrying the attempt number, the **absolute** `notBefore` deadline, and the job's per-job config digest (`yacron2.fingerprint.job_digest`). A write that never lands loses only the durability: the retry dies with the process, exactly the stateless behaviour. No durable record is written for a ladder that never scheduled a retry, so a retry-armed job that keeps succeeding costs no store writes.
+- Every way a ladder can resolve appends a *settled* record on top, so the next boot finds nothing pending. The settle reasons are `launched` (the settle-before-launch write below), `succeeded` (the run succeeded), `superseded` (a fresh scheduled fire reset the sequence), `cancelled` (e.g. a run cancelled from the dashboard), `exhausted` (`maximumRetries` reached), `owner-moved` (the cluster abandonment described above), and `job-removed` (the job disappeared from a reloaded config while the retry slept), plus the boot-time invalidation reasons below.
+- Just before a retry launches, its pending record is settled with reason `launched` -- record-before-run, so a crash right after the launch cannot re-arm the attempt that already ran. This is the at-most-once bias. The one caveat: under the default `onStoreUnavailable: degrade`, a settle write that cannot land launches anyway (at-least-once -- a crash in that narrow window could replay that one attempt after a restart); under `onStoreUnavailable: fail-closed` the launch is deferred and re-checked instead, exactly like a closed cluster gate.
+- A graceful shutdown does **not** settle: the shutdown drain cancels the in-process retry tasks but leaves the pending record on top of the stream, and that record is exactly what the next boot re-arms.
+- On boot, a job whose newest retry record is pending has its ladder re-armed at the persisted position: the retry counter and the next backoff delay are replayed to the recorded attempt, and the task sleeps only the time remaining until the absolute `notBefore` deadline -- zero if it passed while the daemon was down, in which case the retry is due immediately. The re-armed task is the ordinary `schedule_retry_job`, so the cluster-gate re-check, job-removed cleanup, and shutdown behaviour are identical to a never-restarted ladder. Live activity outranks the ledger: a job already retrying or running when the store comes up is left alone.
+- A pending record is *settled instead of re-armed* (invalidation) when: the job's per-job config digest changed -- the digest is per-job, stricter than the whole-set job-set id, so editing an *unrelated* job does not drop the retry; the job was removed or disabled; the recorded attempt already exhausts `maximumRetries`; the record is older than the job's `startingDeadlineSeconds` (when set); or, for an `@reboot` job, the machine actually rebooted, so the fresh boot run supersedes the stale ladder. Any ambiguous case also settles: the bias is always no-run over double-run.
+- `@reboot` keep-alive continuity: an `@reboot` job with `maximumRetries: -1` whose durable boot marker shows its boot run already happened during *this* OS boot gets its pending retry re-armed rather than a fresh boot run, so a keep-alive "supervisor" (see below) survives daemon restarts.
 
 ### Retry example
 
@@ -133,6 +149,8 @@ jobs:
         maximumDelay: 30
         backoffMultiplier: 2
 ```
+
+By default the keep-alive lasts only as long as the yacron2 process: a daemon restart runs the `@reboot` job afresh and any pending retry is lost. With a `state:` section configured, both halves become durable: the boot run is deduplicated to once per OS boot, and a pending retry is re-armed across daemon restarts, so the supervisor pattern survives them (see "Restart-surviving retries" above).
 
 See [Schedules and Timezones](Schedules-and-Timezones) for `@reboot` semantics.
 

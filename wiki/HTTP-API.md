@@ -80,6 +80,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
+| `GET` | `/jobs/{name}/trends` | `_web_job_trends` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 | `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
 | `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
@@ -433,8 +434,9 @@ $ http get http://127.0.0.1:8080/jobs
 ### `GET /jobs/{name}/runs`
 
 Returns the job's retained run history (oldest first, bounded, and held in
-memory only) together with aggregate statistics. Returns `404 Not Found` for
-an unknown job.
+memory -- though with a [durable state store](Durable-State) configured it is
+rehydrated from the durable run ledger after a restart) together with
+aggregate statistics. Returns `404 Not Found` for an unknown job.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
@@ -473,6 +475,43 @@ $ http get http://127.0.0.1:8080/jobs/test-01/runs
     }
 }
 ```
+
+### `GET /jobs/{name}/trends`
+
+The long-horizon sibling of `GET /jobs/{name}/runs`: the same `stats` object,
+computed per time window over the [durable run ledger](Durable-State), which
+survives restarts and -- on a shared mount -- merges every node's runs.
+Returns `404 Not Found` for an unknown job.
+
+The response carries the job `name`, a `source` field, a `generated_at`
+timestamp, and a `windows` map with keys `1h`, `24h`, `7d`, `30d`, and `all`,
+each holding the stats object documented under
+[`GET /jobs/{name}/runs`](#get-jobsnameruns) for the runs that finished inside
+that window:
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01/trends
+{
+    "name": "test-01",
+    "source": "durable",
+    "generated_at": "2026-07-04T12:00:00+00:00",
+    "windows": {
+        "1h":  { "total": 4, "success": 4, "...": "..." },
+        "24h": { "total": 96, "success": 95, "...": "..." },
+        "7d":  { "total": 672, "success": 668, "...": "..." },
+        "30d": { "...": "..." },
+        "all": { "...": "..." }
+    }
+}
+```
+
+`source` is `"durable"` when the aggregates were computed over the durable
+ledger (the horizon is then bounded by `state.maxRunsPerJob` retention) and
+`"memory"` when the endpoint degraded to the in-memory run history -- because
+no `state:` section is configured, or the store could not be read in time.
+The endpoint always answers rather than erroring on store trouble. See
+[Durable State](Durable-State#sla-trends-over-the-ledger) for the ledger this
+reads.
 
 ### `GET /jobs/{name}/logs`
 

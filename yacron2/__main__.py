@@ -13,6 +13,87 @@ from yacron2.cron import ConfigError, Cron
 CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH
 
 
+def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
+    """Wire the `yacron2 state <action>` administration subcommands.
+
+    Bare `yacron2` (no subcommand) stays the daemon.  Each action accepts
+    its own -c/--config (same dest and default as the daemon flag) so both
+    `yacron2 -c X state gc` and `yacron2 state gc -c X` work.
+    """
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+    state = sub.add_parser(
+        "state",
+        help="administer the durable state store (backup/restore/migrate/"
+        "gc/check/migrate-schema)",
+    )
+    actions = state.add_subparsers(dest="state_command", metavar="ACTION")
+
+    def _with_config(sub_parser):
+        # SUPPRESS, not CONFIG_DEFAULT: a subparser default would otherwise
+        # OVERWRITE a root-level `yacron2 -c X state ...` value (argparse
+        # applies subparser defaults after the root parse). The root parser
+        # already supplies the default.
+        sub_parser.add_argument(
+            "-c",
+            "--config",
+            default=argparse.SUPPRESS,
+            metavar="FILE-OR-DIR",
+            help="configuration with the `state:` section to administer",
+        )
+        return sub_parser
+
+    backup = _with_config(
+        actions.add_parser(
+            "backup", help="write a .tar.gz backup of the store"
+        )
+    )
+    backup.add_argument("-o", "--output", required=True, metavar="FILE.tar.gz")
+    restore = _with_config(
+        actions.add_parser("restore", help="restore a backup into the store")
+    )
+    restore.add_argument("archive", metavar="FILE.tar.gz")
+    restore.add_argument(
+        "--force",
+        default=False,
+        action="store_true",
+        help="merge into a non-empty store",
+    )
+    migrate = _with_config(
+        actions.add_parser(
+            "migrate",
+            help="copy the store to another path or mount "
+            "(local disk <-> S3 Files / EFS)",
+        )
+    )
+    migrate.add_argument("--dest", required=True, metavar="PATH")
+    migrate.add_argument(
+        "--dest-deployment-id",
+        default=None,
+        metavar="ID",
+        help="namespace at the destination (default: keep the current one)",
+    )
+    gc = _with_config(
+        actions.add_parser(
+            "gc", help="garbage-collect state of unreferenced jobs"
+        )
+    )
+    gc.add_argument("--dry-run", default=False, action="store_true")
+    _with_config(
+        actions.add_parser(
+            "check", help="verify the store is usable and print an inventory"
+        )
+    )
+    migrate_schema = _with_config(
+        actions.add_parser(
+            "migrate-schema",
+            help="rewrite records of older known record schemes",
+        )
+    )
+    migrate_schema.add_argument(
+        "--dry-run", default=False, action="store_true"
+    )
+
+
 def main_loop(loop):
     parser = argparse.ArgumentParser(prog="yacron2")
     parser.add_argument(
@@ -35,6 +116,7 @@ def main_loop(loop):
         "running the same set of jobs",
     )
     parser.add_argument("--version", default=False, action="store_true")
+    _add_state_subcommands(parser)
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level))
@@ -44,6 +126,13 @@ def main_loop(loop):
     if args.version:
         print(yacron2.version.version)
         sys.exit(0)
+
+    if getattr(args, "command", None) == "state":
+        # lazy import: the admin module (tarfile etc.) costs the daemon and
+        # the stateless install nothing.
+        from yacron2 import state_admin
+
+        sys.exit(state_admin.dispatch(args))
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
