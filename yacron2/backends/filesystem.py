@@ -482,20 +482,30 @@ class FilesystemBackend(LeaseBackend):
         """
         was_leader = self.is_leader()
         if self._lease is not None:
-            lease_mono: Optional[float] = _monotonic()
+            lease_mono = _monotonic()
             try:
                 renewed = await self._bounded(
                     self._store.renew_lease(self._lease, self.ttl)
                 )
             except asyncio.TimeoutError:
-                # UNKNOWN: the abandoned worker may still land the renew.
-                # Change nothing; the fence self-demotes if this persists.
-                renewed = None
-                lease_mono = None
+                # UNKNOWN: the abandoned (locked) worker may still land the
+                # renew. Change NOTHING and return -- do not fall through to
+                # the unlocked read below, which would re-extend the
+                # leadership fence off a read while the on-disk expiry stays
+                # frozen (a wedged flock with succeeding reads -> two
+                # leaders). Leaving state untouched keeps _lease set (the
+                # next round retries the locked renew) and lets the
+                # monotonic fence from the LAST successful renew lapse on
+                # its own: a healthy leader survives a transient timeout
+                # (is_leader stays True until the real deadline, so
+                # never-skip PreferLeader keeps running), and a persistent
+                # one self-demotes with no I/O exactly when the deadline
+                # passes.
                 logger.debug(
                     "cluster: filesystem lease renew timed out; leaving "
                     "state to its deadlines"
                 )
+                return
             if renewed is not None:
                 self._lease = renewed
                 self._apply_round(
@@ -507,13 +517,14 @@ class FilesystemBackend(LeaseBackend):
                 )
                 await self._maintain_reboot_ran(gained=False)
                 return
-            if lease_mono is not None:
-                # positively refused (taken over / released / unreadable):
-                # fence closed NOW, raw win flag kept for the never-skip
-                # self-demotion window; then fall through and look at the
-                # store like any non-holder.
-                self._lease_lost = True
-                self._lease = None
+            # renewed is None here: positively refused (taken over,
+            # released, or an unreadable-lease blip -- the store fails
+            # closed). Fence closed NOW, raw win flag kept for the
+            # never-skip self-demotion window; then fall through and look
+            # at the store like any non-holder. (A renew TIMEOUT returned
+            # above without reaching here, so this is never a timeout.)
+            self._lease_lost = True
+            self._lease = None
         # not holding (or just lost): observe, then maybe take over.
         try:
             observed = await self._bounded(
@@ -522,16 +533,25 @@ class FilesystemBackend(LeaseBackend):
         except asyncio.TimeoutError:
             return
         if observed is not None and observed.holder == self._holder_token:
-            # our own lease -- an acquire abandoned by an earlier timeout
-            # landed after all (the documented UNKNOWN case). Adopt the
-            # Lease object so the next round renews it under the lock;
-            # leadership itself waits for that locked confirmation.
+            # our own lease -- read UNLOCKED (read_lease takes no flock),
+            # either an acquire abandoned by an earlier timeout that landed
+            # after all, or, when a renew just timed out, our still-valid
+            # on-disk lease. Adopt the Lease object so the NEXT round renews
+            # it under the lock; but NEVER grant or extend the leadership
+            # fence from an unlocked read (is_leader=False): a wedged renew
+            # loop whose blocking flock stalls while unlocked reads still
+            # succeed would otherwise ratchet _lease_deadline_mono forward
+            # off read time while the on-disk expiry stays frozen, and once
+            # that drift exceeds the skew margin a challenger takes the
+            # expired lease -- two leaders. Leadership is re-established
+            # only by the next locked renew, whose fence anchors pre-send.
             # Adopted AFTER the round is applied: the non-leader branch of
             # _apply_round clears the held lease, and this adoption must
-            # survive it.
+            # survive it. (The read still counts as store contact, so
+            # quorum stays fresh.)
             self._apply_round(
                 display_name(observed.holder),
-                self._is_leader and not self._lease_lost,
+                False,
                 observed.expires_at,
                 observed.fence,
             )
@@ -588,13 +608,20 @@ class FilesystemBackend(LeaseBackend):
         except asyncio.TimeoutError:
             return
         if confirm is not None:
+            # confirm is an UNLOCKED read: never assert leadership from it
+            # (same reason as the own-token adoption branch above). If it
+            # shows our token an earlier abandoned acquire landed -- adopt
+            # the lease so the next LOCKED renew re-establishes leadership
+            # with a pre-send fence anchor; the read counts as contact so
+            # quorum stays fresh, but the fence is not granted here.
+            own = confirm.holder == self._holder_token
             self._apply_round(
                 display_name(confirm.holder),
-                confirm.holder == self._holder_token,
+                False,
                 confirm.expires_at,
                 confirm.fence,
             )
-            if confirm.holder == self._holder_token:
+            if own:
                 self._lease = confirm
             await self._maintain_reboot_ran(gained=False)
 
