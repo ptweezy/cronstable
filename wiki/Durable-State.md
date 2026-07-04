@@ -539,12 +539,20 @@ forever. The store cleans up after itself, conservatively, anchored on
   `meta` streams themselves. A store shared by several deployments is safe:
   each namespace GCs only itself, and anything GC does not positively
   recognise as garbage stays.
+* **Deferred until it can prove absence:** nothing is deleted until the
+  retained manifest history spans one full grace window. A fresh store --
+  or the first passes after upgrading a store that predates manifests --
+  therefore collects nothing for the first `gcGraceSeconds`, rather than
+  treating "nobody has manifested yet" as "nobody wants this".
 
 The manifest-plus-grace design means a node that is merely *down* does not
 lose its jobs' history (its last manifest stays recent for the grace period),
 while a job genuinely deleted from every config ages out a week later. Set
 `gcGraceSeconds` to cover your longest plausible full-fleet outage, or `<= 0`
-to disable automatic GC entirely and run `yacron2 state gc` yourself.
+to disable automatic GC entirely and run `yacron2 state gc` yourself. Values
+between `1` and `86399` are rejected at parse time: a grace shorter than the
+manifest cadence would make every live peer's manifests look stale and hand
+their state to the collector.
 
 ## Rate limiting: `maxOpsPerSecond`
 

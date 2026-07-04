@@ -72,6 +72,12 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
         metavar="ID",
         help="namespace at the destination (default: keep the current one)",
     )
+    migrate.add_argument(
+        "--force",
+        default=False,
+        action="store_true",
+        help="overwrite a non-empty destination store",
+    )
     gc = _with_config(
         actions.add_parser(
             "gc", help="garbage-collect state of unreferenced jobs"

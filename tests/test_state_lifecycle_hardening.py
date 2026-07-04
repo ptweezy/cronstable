@@ -252,7 +252,9 @@ async def test_shutdown_flushes_pending_run_record(tmp_path):
         # write task has not run even once yet, so without the shutdown
         # flush it would be abandoned mid-air.
         cron._record_run("j", _info(second=1))
-        assert len(cron._pending_state_writes) == 1
+        # at least the run-record write is pending and un-run (the backend
+        # start may also have queued chore writes, e.g. the manifest)
+        assert len(cron._pending_state_writes) >= 1
     finally:
         cron.signal_shutdown()
         await asyncio.wait_for(task, timeout=30)
