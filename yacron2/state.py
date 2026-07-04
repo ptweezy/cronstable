@@ -63,6 +63,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     TypeVar,
     cast,
@@ -81,6 +82,26 @@ logger = logging.getLogger("yacron2.state")
 #: Bump this when the wrapper (not a caller's ``data``) changes shape, so old
 #: and new records are told apart instead of silently mis-read.
 SCHEME_VERSION = "v1"
+
+# Registry of record-scheme converters for `yacron2 state migrate-schema`:
+# maps an OLD wrapper schemaVersion to a callable converting that version's
+# ``data`` dict to the CURRENT version's shape (return ``None`` to declare
+# the record unconvertible, leaving it to be quarantined on read).  Empty
+# while v1 is the only scheme ever shipped; when a v2 arrives it registers
+# its v1 converter here and `state migrate-schema` rewrites stores in place.
+RECORD_MIGRATIONS: Dict[
+    str, Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+] = {}
+
+# Streams never garbage collected regardless of manifests: the store's
+# version stamp and the manifest anchor stream itself.
+PROTECTED_STREAMS = frozenset({"meta", "manifests"})
+
+# Age (seconds) past which an orphaned write-temp file is swept by garbage
+# collection.  No legitimate in-flight write lives anywhere near this long
+# (each op writes a small file and either renames or unlinks it within
+# seconds); anything older is debris from a crash mid-write.
+TMP_MAX_AGE = 86400.0
 
 # Subdirectories under a namespace root.  Records live under RECORDS_DIR in a
 # per-stream directory; leases under LEASES_DIR; corrupt records are moved into
@@ -184,6 +205,40 @@ def _fs_safe(name: str) -> str:
         digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
         token = token[: _FS_SAFE_MAX - 34] + "%." + digest
     return token
+
+
+def _fs_safe_fragment(fragment: str) -> str:
+    """Per-byte escape of a stream-name PREFIX, for on-disk prefix matching.
+
+    Applies :func:`_fs_safe`'s byte encoding without its whole-token
+    adjustments.  Valid for *prefix* matching because those adjustments only
+    ever rewrite a token's FIRST character (reserved device names, which are
+    whole-token matches a multi-part prefix can never be) or its over-length
+    TAIL (the digest truncation keeps the head intact) -- a managed prefix
+    like ``runs/`` therefore always survives verbatim at the front of the
+    stream's encoded directory name.
+    """
+    out: List[str] = []
+    for byte in fragment.encode("utf-8"):
+        char = chr(byte)
+        if char in _FS_SAFE:
+            out.append(char)
+        else:
+            out.append("%{:02X}".format(byte))
+    return "".join(out)
+
+
+def _record_epoch(name: str) -> float:
+    """The write-epoch a record filename sorts by, or ``+inf`` (unknown).
+
+    Unknown/foreign filenames map to ``+inf`` so an age-based sweep treats
+    them as brand new and keeps their stream -- never delete what cannot be
+    classified.
+    """
+    try:
+        return float(name.split("-", 1)[0])
+    except ValueError:
+        return float("inf")
 
 
 def _unescape_mount(field: str) -> str:
@@ -299,6 +354,46 @@ class Lease:
         }
 
 
+class _TokenBucket:
+    """Async token bucket bounding store operations per second.
+
+    The request-rate/cost control for stores that bill per request (the
+    future native-S3 backend; harmless on a filesystem).  Refilled from the
+    event loop's monotonic clock; burst capacity is one second's worth of
+    tokens (at least 1), so a quiet store still serves a small flurry
+    immediately.  Single-loop use only (no lock): every await point is
+    between full read-modify-write passes.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self.rate = rate
+        self.burst = max(1.0, rate)
+        self._tokens = self.burst
+        self._last: Optional[float] = None
+
+    async def throttle(self) -> float:
+        """Take one token, sleeping until one is available.
+
+        Returns the seconds slept (0.0 when a token was free), so the caller
+        can account throttling separately from store latency.
+        """
+        loop = asyncio.get_running_loop()
+        waited = 0.0
+        while True:
+            now = loop.time()
+            if self._last is not None:
+                self._tokens = min(
+                    self.burst, self._tokens + (now - self._last) * self.rate
+                )
+            self._last = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return waited
+            need = (1.0 - self._tokens) / self.rate
+            waited += need
+            await asyncio.sleep(need)
+
+
 class StateBackend(abc.ABC):
     """The seam every durable-state and coordination call goes through.
 
@@ -387,6 +482,24 @@ class StateBackend(abc.ABC):
     async def read_lease(self, name: str) -> Optional[Lease]:
         """Observe a lease without taking it (best-effort, unlocked read)."""
 
+    # --- maintenance -------------------------------------------------------
+
+    async def collect_garbage(
+        self,
+        *,
+        keep: Dict[str, "Set[str]"],
+        grace: float,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Remove streams no recent manifest references (see the filesystem
+        backend for semantics); the base backend has nothing to collect."""
+        return {}
+
+    async def migrate_schema(self, *, dry_run: bool = False) -> Dict[str, Any]:
+        """Rewrite records of older known schemes to the current one (see
+        :data:`RECORD_MIGRATIONS`); the base backend has nothing to walk."""
+        return {}
+
     # --- introspection ---------------------------------------------------
 
     @property
@@ -397,6 +510,11 @@ class StateBackend(abc.ABC):
     def supports_shared_locking(self) -> bool:
         """Whether a lease here excludes across hosts (HA-capable)."""
         return self.topology == "shared"
+
+    def stats(self) -> Dict[str, Any]:
+        """Self-observability counters (op counts/errors/latency, lock
+        contention, throttling); ``{}`` for a backend with none."""
+        return {}
 
     def view_dict(self) -> Dict[str, Any]:
         """The state view for a future ``GET /state`` / the dashboard."""
@@ -445,6 +563,21 @@ class FilesystemStateBackend(StateBackend):
         # excess calls queue on the semaphore (cheap pending tasks) instead.
         # Created lazily so construction needs no running event loop.
         self._call_slots: Optional[asyncio.Semaphore] = None
+        # Optional request-rate control (state.maxOpsPerSecond): every op
+        # takes a token before its worker thread is spawned, so a billing-
+        # sensitive mount sees a bounded request rate. 0/absent -> off.
+        rate = float(config.get("maxOpsPerSecond") or 0)
+        self._rate_limit = _TokenBucket(rate) if rate > 0 else None
+        # Self-observability accumulators (see stats()).  Updated from the
+        # worker threads, hence the plain lock; read (snapshotted) from the
+        # event loop at scrape time.
+        self._stats_lock = threading.Lock()
+        # op -> [count, errors, seconds-of-store-time]
+        self._op_stats: Dict[str, List[float]] = {}
+        self._lock_acquisitions = 0
+        self._lock_wait_seconds = 0.0
+        self._throttled_ops = 0
+        self._throttle_wait_seconds = 0.0
 
     # --- paths -----------------------------------------------------------
 
@@ -478,7 +611,7 @@ class FilesystemStateBackend(StateBackend):
 
     # --- worker threads ----------------------------------------------------
 
-    async def _call(self, fn: Callable[..., _T], *args: Any) -> _T:
+    async def _call(self, op: str, fn: Callable[..., _T], *args: Any) -> _T:
         """Run blocking ``fn(*args)`` on a *daemon* thread and await it.
 
         Not ``asyncio.to_thread``: the default executor's threads are
@@ -489,8 +622,21 @@ class FilesystemStateBackend(StateBackend):
         a hung store abandonable: callers can time out (``asyncio.wait_for``)
         and exit; the OS reclaims the stuck thread.  State ops are low-rate
         (a handful per finished run), so thread-per-call is cheap.
+
+        ``op`` labels the call in the self-observability stats: count, error
+        count, and seconds of store time (measured around ``fn`` itself on
+        the worker thread, so queueing and throttling are excluded) are
+        accumulated per label and surfaced via :meth:`stats`.
         """
         loop = asyncio.get_running_loop()
+        if self._rate_limit is not None:
+            # take the rate token BEFORE a worker slot, so a throttled op
+            # queues as a cheap pending coroutine, not a held thread slot.
+            waited = await self._rate_limit.throttle()
+            if waited > 0.0:
+                with self._stats_lock:
+                    self._throttled_ops += 1
+                    self._throttle_wait_seconds += waited
         if self._call_slots is None:
             self._call_slots = asyncio.Semaphore(16)
         slots = self._call_slots
@@ -514,10 +660,21 @@ class FilesystemStateBackend(StateBackend):
         def _runner() -> None:
             result: Any = None
             exc: Optional[BaseException] = None
+            began = time.perf_counter()
             try:
                 result = fn(*args)
             except BaseException as ex:  # noqa: BLE001 - relayed to awaiter
                 exc = ex
+            # Stats update on the worker thread (never lost to an abandoned
+            # await): an op stuck in a syscall simply reports when it
+            # finally returns, which is exactly the latency worth seeing.
+            elapsed = time.perf_counter() - began
+            with self._stats_lock:
+                entry = self._op_stats.setdefault(op, [0, 0, 0.0])
+                entry[0] += 1
+                if exc is not None:
+                    entry[1] += 1
+                entry[2] += elapsed
             try:
                 loop.call_soon_threadsafe(_resolve, result, exc)
             except RuntimeError:
@@ -542,7 +699,7 @@ class FilesystemStateBackend(StateBackend):
         return self._topology
 
     async def start(self) -> None:
-        await self._call(self._start_sync)
+        await self._call("start", self._start_sync)
         logger.info(
             "state: filesystem backend ready at %s "
             "(namespace=%s, topology=%s, shared_locking=%s)",
@@ -581,6 +738,48 @@ class FilesystemStateBackend(StateBackend):
             # failed start retry).
             with contextlib.suppress(OSError):
                 os.unlink(probe)
+        self._stamp_meta_sync()
+
+    def _stamp_meta_sync(self) -> None:
+        """Stamp a fresh store with the record-scheme version (once).
+
+        The per-record ``schemaVersion`` already isolates unreadable records
+        (quarantine on read); this stream-level stamp is the *upfront* signal:
+        a store last written by a build with a NEWER scheme logs one pointed
+        warning at start instead of quietly quarantining history record by
+        record.  Read raw (not via ``_read_record``): a newer-versioned stamp
+        is exactly the record whose version mismatch is meaningful, and the
+        normal reader would quarantine it.  Best-effort throughout -- the
+        stamp is advisory, never load-bearing.
+        """
+        stream_dir = self._stream_dir("meta")
+        try:
+            names = sorted(
+                n for n in os.listdir(stream_dir) if n.endswith(".json")
+            )
+        except OSError:
+            names = []
+        for name in reversed(names):
+            try:
+                with open(os.path.join(stream_dir, name), "rb") as fobj:
+                    obj = json.loads(fobj.read())
+            except Exception:  # noqa: BLE001 - unreadable stamp: keep looking
+                continue
+            if isinstance(obj, dict) and "schemaVersion" in obj:
+                version = obj.get("schemaVersion")
+                if version != SCHEME_VERSION:
+                    logger.warning(
+                        "state: the store at %s was last stamped by a build "
+                        "writing record scheme %r (this build writes %r); "
+                        "records this build cannot read are quarantined -- "
+                        "consider `yacron2 state migrate-schema`",
+                        self.base,
+                        version,
+                        SCHEME_VERSION,
+                    )
+                return
+        with contextlib.suppress(OSError):
+            self._append_sync("meta", {"storeVersion": SCHEME_VERSION})
 
     def _resolve_topology(self) -> str:
         configured = self._configured_topology
@@ -677,7 +876,7 @@ class FilesystemStateBackend(StateBackend):
                     os.close(dfd)
 
     async def append_record(self, stream: str, data: Dict[str, Any]) -> str:
-        return await self._call(self._append_sync, stream, data)
+        return await self._call("append", self._append_sync, stream, data)
 
     def _append_sync(self, stream: str, data: Dict[str, Any]) -> str:
         stream_dir = self._stream_dir(stream)
@@ -771,7 +970,9 @@ class FilesystemStateBackend(StateBackend):
         limit: Optional[int] = None,
         newest_first: bool = False,
     ) -> List[Dict[str, Any]]:
-        return await self._call(self._list_sync, stream, limit, newest_first)
+        return await self._call(
+            "list", self._list_sync, stream, limit, newest_first
+        )
 
     def _list_sync(
         self, stream: str, limit: Optional[int], newest_first: bool
@@ -795,7 +996,9 @@ class FilesystemStateBackend(StateBackend):
         return out
 
     async def derive_max(self, stream: str, field: str) -> Optional[Any]:
-        return await self._call(self._derive_max_sync, stream, field)
+        return await self._call(
+            "derive-max", self._derive_max_sync, stream, field
+        )
 
     def _derive_max_sync(self, stream: str, field: str) -> Optional[Any]:
         best: Optional[Any] = None
@@ -816,7 +1019,7 @@ class FilesystemStateBackend(StateBackend):
         return best
 
     async def prune_records(self, stream: str, *, keep: int) -> int:
-        return await self._call(self._prune_sync, stream, keep)
+        return await self._call("prune", self._prune_sync, stream, keep)
 
     def _prune_sync(self, stream: str, keep: int) -> int:
         stream_dir = self._stream_dir(stream)
@@ -856,7 +1059,14 @@ class FilesystemStateBackend(StateBackend):
             # msvcrt.locking needs a byte present to lock; guarantee one.
             if os.fstat(fdesc).st_size == 0:
                 os.write(fdesc, b"\0")
+            began = time.perf_counter()
             with exclusive_file_lock(fdesc):
+                # time-to-acquire is the contention signal: near zero on an
+                # idle store, and the cross-host wait on a fought-over lease.
+                waited = time.perf_counter() - began
+                with self._stats_lock:
+                    self._lock_acquisitions += 1
+                    self._lock_wait_seconds += waited
                 yield
         finally:
             os.close(fdesc)
@@ -907,7 +1117,9 @@ class FilesystemStateBackend(StateBackend):
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
     ) -> Optional[Lease]:
-        return await self._call(self._acquire_sync, name, holder, ttl)
+        return await self._call(
+            "lease-acquire", self._acquire_sync, name, holder, ttl
+        )
 
     def _acquire_sync(
         self, name: str, holder: str, ttl: float
@@ -964,7 +1176,7 @@ class FilesystemStateBackend(StateBackend):
             return lease
 
     async def renew_lease(self, lease: Lease, ttl: float) -> Optional[Lease]:
-        return await self._call(self._renew_sync, lease, ttl)
+        return await self._call("lease-renew", self._renew_sync, lease, ttl)
 
     def _renew_sync(self, lease: Lease, ttl: float) -> Optional[Lease]:
         lock_path, lease_path = self._lease_paths(lease.name)
@@ -1015,7 +1227,7 @@ class FilesystemStateBackend(StateBackend):
             return renewed
 
     async def release_lease(self, lease: Lease) -> None:
-        await self._call(self._release_sync, lease)
+        await self._call("lease-release", self._release_sync, lease)
 
     def _release_sync(self, lease: Lease) -> None:
         lock_path, lease_path = self._lease_paths(lease.name)
@@ -1047,13 +1259,235 @@ class FilesystemStateBackend(StateBackend):
 
     async def read_lease(self, name: str) -> Optional[Lease]:
         _lock_path, lease_path = self._lease_paths(name)
-        lease = await self._call(self._read_lease_file, lease_path)
+        lease = await self._call(
+            "lease-read", self._read_lease_file, lease_path
+        )
         if lease is not None and lease.expires_at <= 0.0:
             # a released lease: observers see "nobody holds it".
             return None
         return lease
 
+    # --- maintenance -------------------------------------------------------
+
+    async def collect_garbage(
+        self,
+        *,
+        keep: Dict[str, Set[str]],
+        grace: float,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Remove durable state nothing references anymore.
+
+        ``keep`` maps a managed stream *prefix* (``"runs/"``, ``"logs/"``,
+        ...) to the set of suffixes (job names, hosts) that must survive --
+        the caller derives it from the recent manifests plus its own loaded
+        config, which is what anchors cross-jobset GC to the deployment
+        rather than to any single node's job set.  A stream is deleted only
+        when it POSITIVELY matches a managed prefix, its suffix is not kept,
+        AND its newest record is older than ``grace`` seconds (belt and
+        braces for a store whose manifests are missing).  Anything that
+        cannot be classified is kept; :data:`PROTECTED_STREAMS` and lease
+        files are never touched (a lease file is its fence counter's only
+        home).  Also sweeps crash debris: write-temp files older than
+        :data:`TMP_MAX_AGE` and quarantined records older than ``grace``.
+        """
+        return await self._call("gc", self._gc_sync, keep, grace, dry_run)
+
+    def _gc_sync(
+        self, keep: Dict[str, Set[str]], grace: float, dry_run: bool
+    ) -> Dict[str, Any]:
+        now = _now()
+        cutoff = now - max(0.0, grace)
+        keep_tokens = {_fs_safe(stream) for stream in PROTECTED_STREAMS}
+        prefix_tokens: List[str] = []
+        for prefix, suffixes in keep.items():
+            prefix_tokens.append(_fs_safe_fragment(prefix))
+            for suffix in suffixes:
+                keep_tokens.add(_fs_safe(prefix + suffix))
+        removed_streams: List[str] = []
+        removed_records = 0
+        kept_streams = 0
+        records_root = os.path.join(self.base, RECORDS_DIR)
+        try:
+            entries = sorted(os.listdir(records_root))
+        except OSError:
+            entries = []
+        for token in entries:
+            stream_dir = os.path.join(records_root, token)
+            if not os.path.isdir(stream_dir):
+                continue
+            if token in keep_tokens or not any(
+                token.startswith(p) for p in prefix_tokens
+            ):
+                # referenced, protected, or unrecognised: never delete what
+                # is still wanted or cannot be classified.
+                kept_streams += 1
+                continue
+            try:
+                names = os.listdir(stream_dir)
+            except OSError:
+                kept_streams += 1
+                continue
+            records = [n for n in names if n.endswith(".json")]
+            newest = max(
+                (_record_epoch(n) for n in records), default=float("-inf")
+            )
+            if newest > cutoff:
+                kept_streams += 1
+                continue
+            removed_streams.append(token)
+            removed_records += len(records)
+            if dry_run:
+                continue
+            for name in names:
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(stream_dir, name))
+            # a straggler unlink (Windows sharing hold) leaves the dir
+            # non-empty; the rmdir then fails and the next pass converges.
+            with contextlib.suppress(OSError):
+                os.rmdir(stream_dir)
+        tmp_removed = self._sweep_dir_sync(
+            os.path.join(self.base, TMP_DIR), now - TMP_MAX_AGE, dry_run
+        )
+        quarantine_removed = self._sweep_dir_sync(
+            os.path.join(self.base, QUARANTINE_DIR), cutoff, dry_run
+        )
+        return {
+            "dry_run": dry_run,
+            "streams_removed": len(removed_streams),
+            "removed": removed_streams,
+            "records_removed": removed_records,
+            "streams_kept": kept_streams,
+            "tmp_removed": tmp_removed,
+            "quarantine_removed": quarantine_removed,
+        }
+
+    @staticmethod
+    def _sweep_dir_sync(path: str, cutoff: float, dry_run: bool) -> int:
+        """Unlink files under ``path`` last modified before ``cutoff``."""
+        removed = 0
+        try:
+            names = os.listdir(path)
+        except OSError:
+            return 0
+        for name in names:
+            full = os.path.join(path, name)
+            try:
+                if not os.path.isfile(full):
+                    continue
+                if os.stat(full).st_mtime >= cutoff:
+                    continue
+                if not dry_run:
+                    os.unlink(full)
+                removed += 1
+            except OSError:
+                continue
+        return removed
+
+    async def migrate_schema(self, *, dry_run: bool = False) -> Dict[str, Any]:
+        """Rewrite records of OLDER known schemes to the current one.
+
+        Walks every record wrapper and, for a ``schemaVersion`` with a
+        registered converter (:data:`RECORD_MIGRATIONS`), rewrites the file
+        in place via the same temp-file + atomic rename as any write, so a
+        concurrent reader never sees a torn record.  This is the one
+        sanctioned exception to "records are never rewritten": an explicit,
+        operator-run admin action (`yacron2 state migrate-schema`) whose
+        rewrite is a pure re-encoding of the same logical record.  Records
+        with no converter are left alone (counted; the normal readers
+        quarantine what they cannot parse), as are unreadable files.
+        """
+        return await self._call("migrate", self._migrate_sync, dry_run)
+
+    def _migrate_sync(self, dry_run: bool) -> Dict[str, Any]:
+        current = converted = unknown = unreadable = failed = 0
+        records_root = os.path.join(self.base, RECORDS_DIR)
+        try:
+            streams = sorted(os.listdir(records_root))
+        except OSError:
+            streams = []
+        for token in streams:
+            stream_dir = os.path.join(records_root, token)
+            if not os.path.isdir(stream_dir):
+                continue
+            try:
+                names = sorted(
+                    n for n in os.listdir(stream_dir) if n.endswith(".json")
+                )
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(stream_dir, name)
+                try:
+                    with open(path, "rb") as fobj:
+                        obj = json.loads(fobj.read())
+                except Exception:  # noqa: BLE001 - quarantined on next read
+                    unreadable += 1
+                    continue
+                version = (
+                    obj.get("schemaVersion") if isinstance(obj, dict) else None
+                )
+                if version == SCHEME_VERSION:
+                    current += 1
+                    continue
+                convert = RECORD_MIGRATIONS.get(str(version))
+                data = obj.get("data") if isinstance(obj, dict) else None
+                if convert is None or not isinstance(data, dict):
+                    unknown += 1
+                    continue
+                try:
+                    new_data = convert(data)
+                except Exception:  # noqa: BLE001 - a converter bug, counted
+                    failed += 1
+                    continue
+                if new_data is None:
+                    unknown += 1
+                    continue
+                converted += 1
+                if dry_run:
+                    continue
+                payload = json.dumps(
+                    {"schemaVersion": SCHEME_VERSION, "data": new_data},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                try:
+                    self._atomic_write(path, payload)
+                except OSError:
+                    converted -= 1
+                    failed += 1
+        return {
+            "dry_run": dry_run,
+            "current": current,
+            "converted": converted,
+            "unknown": unknown,
+            "unreadable": unreadable,
+            "failed": failed,
+        }
+
     # --- introspection ---------------------------------------------------
+
+    def stats(self) -> Dict[str, Any]:
+        with self._stats_lock:
+            ops = {
+                op: {
+                    "count": int(entry[0]),
+                    "errors": int(entry[1]),
+                    "seconds": entry[2],
+                }
+                for op, entry in self._op_stats.items()
+            }
+            return {
+                "ops": ops,
+                "lock": {
+                    "acquisitions": self._lock_acquisitions,
+                    "wait_seconds": self._lock_wait_seconds,
+                },
+                "throttle": {
+                    "count": self._throttled_ops,
+                    "wait_seconds": self._throttle_wait_seconds,
+                },
+            }
 
     def view_dict(self) -> Dict[str, Any]:
         return {

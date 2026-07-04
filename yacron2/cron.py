@@ -8,6 +8,7 @@ import json
 import logging
 import logging.config
 import os
+import socket
 import ssl
 import zlib
 from collections import OrderedDict, defaultdict, deque
@@ -16,6 +17,7 @@ from functools import lru_cache
 from typing import (  # noqa
     Any,
     Awaitable,
+    Coroutine,
     Deque,
     Dict,
     FrozenSet,
@@ -47,7 +49,7 @@ from yacron2.config import (
     parse_config_with_sources,
     schedule_object_to_crontab,
 )
-from yacron2.fingerprint import job_set_id
+from yacron2.fingerprint import job_digest, job_set_id
 from yacron2.job import JobOutputStream, JobRetryState, RunningJob
 from yacron2.leadership import LeadershipBackend, make_backend
 from yacron2.prometheus import (
@@ -123,6 +125,61 @@ CATCHUP_IDLE_WAIT_LIMIT = 30.0
 # with a tiny/zero backoff delay must not hot-loop the scheduler (and spam the
 # log) while it waits. See schedule_retry_job.
 RETRY_GATE_RECHECK_FLOOR = 1.0
+# Prefix for a job's durable retry-ladder stream: a "pending" record (with an
+# ABSOLUTE notBefore deadline and the job's per-job config digest) is written
+# when a retry is armed, and a "settled" record when the ladder resolves
+# (launched / succeeded / superseded / exhausted / ...). Newest record wins:
+# a boot that finds a "pending" on top re-arms the retry with only the
+# remaining delay (see _rehydrate_retries). Job-name scoped like the run
+# ledger; the digest inside the record is what invalidates on config change.
+RETRY_STREAM_PREFIX = "retries/"
+# How many retry-ladder records to retain per job (each ladder writes a
+# handful; only the newest is ever read back).
+RETRY_STREAM_KEEP = 8
+# Prefix for a job's @reboot boot-marker stream (standalone dedupe): a marker
+# records which HOST ran the job during which OS BOOT (boot_id / derived boot
+# time) for which job definition (digest). A daemon restart within the same
+# boot skips the re-run; a genuine reboot, a redefined job, or an unreadable
+# marker runs it (at-least-once, today's behaviour). Host-scoped inside the
+# records so several standalone daemons may share one store.
+REBOOT_STREAM_PREFIX = "reboot/"
+# Markers retained per job: bounds the stream while keeping enough history
+# for a modest number of hosts sharing one store standalone.
+REBOOT_STREAM_KEEP = 32
+# Wall-clock slack when comparing DERIVED boot times (now - uptime): the
+# derivation rides the current wall clock, so an NTP step shifts it. Two real
+# boots are further apart than this in practice; where an exact boot_id
+# exists (Linux) it is used instead and this never applies.
+BOOT_TIME_TOLERANCE = 60.0
+# Stream of per-node job manifests: each node periodically records the job
+# names its loaded config defines. The union of RECENT manifests (any node,
+# any job set, same deploymentId) is what anchors cross-jobset garbage
+# collection: a job stream is garbage only when nobody has claimed its name
+# for state.gcGraceSeconds.
+MANIFEST_STREAM = "manifests"
+# Manifest records retained (shared across every node writing to the store).
+MANIFEST_STREAM_KEEP = 64
+# How often each node re-records its manifest (also written on every backend
+# start), and how often the GC pass runs. Loop-clock gated, per process.
+STATE_MANIFEST_INTERVAL = 21600.0
+STATE_GC_INTERVAL = 86400.0
+# Prefix for the per-HOST durable Prometheus counter snapshots (host-scoped:
+# counters are per-process truth, and the host name is the stable identity a
+# restart can reclaim, unlike the backend's per-process instance id).
+COUNTER_STREAM_PREFIX = "counters/"
+COUNTER_STREAM_KEEP = 4
+# Minimum seconds between durable counter snapshots. Snapshots piggyback on
+# the per-run persist task, so without a floor a per-second job would double
+# every durable write for a low-value gain; the tail is flushed at shutdown.
+COUNTER_SNAPSHOT_INTERVAL = 15.0
+# Aggregation windows served by GET /jobs/{name}/trends over the durable
+# ledger (label, seconds). Bounded by state.maxRunsPerJob retention.
+TREND_WINDOWS: Tuple[Tuple[str, float], ...] = (
+    ("1h", 3600.0),
+    ("24h", 86400.0),
+    ("7d", 604800.0),
+    ("30d", 2592000.0),
+)
 # requests served without bearer-token auth even when authToken is configured.
 # Only the UI page itself (which carries no data and no secrets) is public; the
 # browser then authenticates every data request with the token the user enters.
@@ -544,6 +601,32 @@ class Cron:
         # from state_backend so catch-up can tell "no durability configured"
         # (latch and warn) from "configured but not started yet" (retry).
         self._state_configured = False
+        # effective state.onStoreUnavailable policy while a state section is
+        # configured: "degrade" (default: gates fail open, writes drop with
+        # a warning) or "fail-closed" (durable-truth gates prefer not
+        # running). Reset to "degrade" when the section is removed.
+        self._state_on_unavailable = "degrade"
+        # effective state.gcGraceSeconds; <= 0 disables automatic GC.
+        self._state_gc_grace = 0.0
+        # host tag for the host-scoped durable streams (counter snapshots,
+        # @reboot boot markers): stable across restarts, unlike the state
+        # backend's per-process instance id, so a restarted daemon can
+        # reclaim its own records.
+        self._state_host = socket.gethostname() or "localhost"
+        # loop-clock instant before which the next durable counter snapshot
+        # is skipped (see COUNTER_SNAPSHOT_INTERVAL).
+        self._counter_snapshot_next = 0.0
+        # whether this PROCESS already seeded the Prometheus accumulators
+        # from a durable snapshot. Never reset (unlike _state_rehydrated):
+        # seeding ADDS into live counters, so a second seed -- e.g. after a
+        # state.path change swapped stores -- would double-count.
+        self._counters_seeded = False
+        # loop-clock instants the next manifest write / GC pass are due.
+        self._manifest_next = 0.0
+        self._gc_next = 0.0
+        # the in-flight GC pass, if any (single-flight; a slow store must
+        # not stack passes).
+        self._gc_task: Optional[asyncio.Task] = None
         # in-flight catch-up launch tasks (each may sleep its per-job jitter
         # before launching), tracked so they are not GC'd and can be cancelled
         # on shutdown.
@@ -616,6 +699,9 @@ class Cron:
                     self._log_job_set_id()
                     await self.start_stop_cluster(config.cluster_config)
                     await self.start_stop_state(config.state_config)
+                    # periodic durable-state chores (manifest, GC): cheap
+                    # due-checks that spawn tracked background tasks.
+                    self._state_periodic()
                 except ConfigError as err:
                     logger.error(
                         "Error in configuration file(s), so not updating "
@@ -688,8 +774,13 @@ class Cron:
 
         logger.info("Shutting down (after currently running jobs finish)...")
         while self.retry_state:
+            # settle=None: a graceful stop must NOT settle the durable
+            # ladder records -- surviving the restart (re-arming from the
+            # persisted "pending" on the next boot) is the entire point of
+            # restart-durable retries.
             cancel_all = [
-                self.cancel_job_retries(name) for name in self.retry_state
+                self.cancel_job_retries(name, settle=None)
+                for name in self.retry_state
             ]
             await asyncio.gather(*cancel_all)
         # Release leadership BEFORE waiting out the running-job drain: the
@@ -715,6 +806,10 @@ class Cron:
             task.cancel()
 
         if self.state_backend is not None:
+            # one last counter snapshot (unthrottled), so restart-durable
+            # counters lose at most the throttle window's worth of events;
+            # it joins the pending writes and is flushed (bounded) below.
+            self._track_state_write(self._persist_counter_snapshot())
             # flush the in-flight durable run-record writes so the last few
             # runs are not lost on a clean shutdown; bounded so a stuck store
             # cannot hang the exit (its writes are simply abandoned).
@@ -1298,6 +1393,67 @@ class Cron:
             headers=self.web_config.get("headers", None),
         )
 
+    async def _web_job_trends(self, request: web.Request) -> web.Response:
+        """SLA trend aggregates over the durable run ledger.
+
+        The long-horizon sibling of ``/jobs/{name}/runs``: the same stats
+        shape (:func:`_run_stats`), computed per :data:`TREND_WINDOWS`
+        window (plus ``all``) over the ledger, which survives restarts and
+        -- on a shared mount -- merges every node's runs.  Bounded by the
+        store's ``maxRunsPerJob`` retention.  Degrades to the in-memory
+        history (``source: memory``) without a healthy backend, so the
+        endpoint always answers.
+        """
+        assert self.web_config is not None
+        name = request.match_info["name"]
+        if name not in self.cron_jobs:
+            raise web.HTTPNotFound()
+        infos: List[JobRunInfo] = []
+        source = "memory"
+        backend = self.state_backend
+        if backend is not None:
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(self._run_stream(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - degrade, never 500
+                logger.warning(
+                    "state: cannot read the run ledger for trends on %s "
+                    "(%s); serving the in-memory history",
+                    name,
+                    ex,
+                )
+            else:
+                source = "durable"
+                for rec in recs:  # oldest first, matching _run_stats
+                    restored = _job_run_info_from_dict(rec)
+                    if restored is not None:
+                        infos.append(restored)
+        if source == "memory":
+            infos = list(self.run_history.get(name) or [])
+        now = get_now(datetime.timezone.utc)
+        windows = {}
+        for label, seconds in TREND_WINDOWS:
+            recent = [
+                info
+                for info in infos
+                if (now - info.finished_at).total_seconds() <= seconds
+            ]
+            windows[label] = _run_stats(recent)
+        windows["all"] = _run_stats(infos)
+        return web.json_response(
+            {
+                "name": name,
+                "source": source,
+                "generated_at": now.isoformat(),
+                "windows": windows,
+            },
+            headers=self.web_config.get("headers", None),
+        )
+
     def _job_output(self, name: str) -> Optional[JobOutputStream]:
         # the live output of the most recent running instance, else the last
         # finished run's retained output, else nothing captured yet.
@@ -1396,6 +1552,7 @@ class Cron:
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
+                web.get("/jobs/{name}/trends", self._web_job_trends),
                 web.post("/jobs/{name}/start", self._web_start_job),
                 web.post("/jobs/{name}/cancel", self._web_cancel_job),
                 web.get("/jobs/{name}/logs", self._web_job_logs),
@@ -1608,6 +1765,16 @@ class Cron:
         yacron2 from running jobs in memory.
         """
         self._state_configured = state_config is not None
+        if state_config is not None:
+            self._state_on_unavailable = str(
+                state_config.get("onStoreUnavailable") or "degrade"
+            )
+            self._state_gc_grace = float(
+                state_config.get("gcGraceSeconds") or 0
+            )
+        else:
+            self._state_on_unavailable = "degrade"
+            self._state_gc_grace = 0.0
         backend = self.state_backend
         if backend is not None and (
             state_config is None or state_config != backend.config
@@ -1646,10 +1813,151 @@ class Cron:
                 return
             self.state_backend = backend
             self._state_max_runs = state_config.get("maxRunsPerJob", 0)
+            # a fresh backend generation re-anchors the periodic chores:
+            # record this node's manifest immediately (the GC anchor), and
+            # let the first GC pass run on the next housekeeping tick --
+            # gcGraceSeconds is what protects young state, not a delay here.
+            self._manifest_next = 0.0
+            self._gc_next = 0.0
             # warm the in-memory history from the ledger the first time a
             # backend comes up, so a restart's dashboard/status is populated at
             # once instead of blank until each job next runs.
             await self._rehydrate_from_state()
+
+    def _track_state_write(
+        self, coro: Coroutine[Any, Any, None]
+    ) -> asyncio.Task:
+        """Run a durable-state write as a tracked fire-and-forget task.
+
+        The single scheduling idiom for every durable write: tracked in
+        ``_pending_state_writes`` so it is not GC'd mid-flight and the
+        shutdown flush can bound-wait it; never awaited on a scheduling
+        path.  The coroutine itself is responsible for catching and logging
+        its own failures (they are all best-effort).
+        """
+        task = asyncio.create_task(coro)
+        self._pending_state_writes.add(task)
+        task.add_done_callback(self._pending_state_writes.discard)
+        return task
+
+    def _state_periodic(self) -> None:
+        """Kick off the periodic durable-state chores that are due.
+
+        Called from the housekeeping pass: a pair of loop-clock due-checks
+        (cheap) that spawn tracked background tasks (manifest write, GC
+        pass).  No-op without a running backend.
+        """
+        if self.state_backend is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if now >= self._manifest_next:
+            self._manifest_next = now + STATE_MANIFEST_INTERVAL
+            self._track_state_write(self._persist_manifest())
+        if (
+            self._state_gc_grace > 0
+            and now >= self._gc_next
+            and (self._gc_task is None or self._gc_task.done())
+        ):
+            self._gc_next = now + STATE_GC_INTERVAL
+            self._gc_task = self._track_state_write(
+                self._collect_state_garbage()
+            )
+
+    async def _persist_manifest(self) -> None:
+        """Record this node's loaded job set in the shared manifest stream.
+
+        The anchor for cross-jobset garbage collection: a job's durable
+        streams are garbage only when NO recent manifest -- from any node,
+        running any job set, under this deploymentId -- references its name.
+        Every node sharing the store contributes one, so a fleet whose
+        members run different job sets never collects each other's state.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        record = {
+            "jobSetId": self.job_set_id(),
+            "host": self._state_host,
+            "jobs": sorted(self.cron_jobs),
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        try:
+            await backend.append_record(MANIFEST_STREAM, record)
+            await backend.prune_records(
+                MANIFEST_STREAM, keep=MANIFEST_STREAM_KEEP
+            )
+        except Exception as ex:  # noqa: BLE001 - best-effort; log, survive
+            self.metrics.state_write_dropped("manifest")
+            logger.warning("state: failed to record the job manifest: %s", ex)
+
+    async def _collect_state_garbage(self) -> None:
+        """One automatic garbage-collection pass (see state.gcGraceSeconds).
+
+        Builds the keep-set from the union of recent manifests (bounded
+        read) plus this node's own loaded config -- so GC still cannot eat
+        live jobs even when the manifest stream is unreadable or empty --
+        and hands the deletion to the backend.  Every failure degrades to
+        "collect nothing this pass".
+        """
+        backend = self.state_backend
+        grace = self._state_gc_grace
+        if backend is None or grace <= 0:
+            return
+        try:
+            manifests = await asyncio.wait_for(
+                backend.list_records(
+                    MANIFEST_STREAM,
+                    limit=MANIFEST_STREAM_KEEP,
+                    newest_first=True,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: skipping garbage collection: cannot read the "
+                "manifest stream (%s)",
+                ex,
+            )
+            return
+        now = get_now(datetime.timezone.utc)
+        names = set(self.cron_jobs)
+        hosts = {self._state_host}
+        for rec in manifests:
+            at = _parse_iso_utc(rec.get("at"))
+            if at is None or (now - at).total_seconds() > grace:
+                continue
+            jobs = rec.get("jobs")
+            if isinstance(jobs, list):
+                names.update(str(job) for job in jobs)
+            host = rec.get("host")
+            if isinstance(host, str) and host:
+                hosts.add(host)
+        keep: Dict[str, Set[str]] = {
+            RUN_STREAM_PREFIX: names,
+            LOG_STREAM_PREFIX: names,
+            CATCHUP_STREAM_PREFIX: names,
+            RETRY_STREAM_PREFIX: names,
+            REBOOT_STREAM_PREFIX: names,
+            COUNTER_STREAM_PREFIX: hosts,
+        }
+        try:
+            result = await backend.collect_garbage(keep=keep, grace=grace)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning("state: garbage collection failed: %s", ex)
+            return
+        if result.get("streams_removed") or result.get("tmp_removed"):
+            logger.info(
+                "state: garbage collected %s stream(s) (%s record(s)), "
+                "%s temp file(s), %s quarantined record(s)",
+                result.get("streams_removed", 0),
+                result.get("records_removed", 0),
+                result.get("tmp_removed", 0),
+                result.get("quarantine_removed", 0),
+            )
 
     @staticmethod
     def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
@@ -2024,6 +2332,7 @@ class Cron:
                 timeout=STATE_OP_TIMEOUT,
             )
         except Exception as ex:  # noqa: BLE001 - checkpoint is best-effort
+            self.metrics.state_write_dropped("checkpoint")
             logger.warning(
                 "catch-up: could not checkpoint %r for %s (%s); a restart "
                 "mid-backfill may not resume it",
@@ -2485,6 +2794,16 @@ class Cron:
                 continue
             if self._cluster_allows(job):
                 to_launch.append(job)
+        if to_launch and self._state_configured:
+            # state-backed boot dedupe (standalone / EveryNode): a daemon
+            # restart within one OS boot must not re-run boot one-shots.
+            # Deferred Leader/PreferLeader jobs never reach here; their
+            # dedupe is the cluster's reboot_ran path.
+            gated = []
+            for job in to_launch:
+                if await self._reboot_boot_gate(job):
+                    gated.append(job)
+            to_launch = gated
         await self._launch_concurrently(to_launch)
 
     async def _spawn_due_jobs(self, now: datetime.datetime) -> None:
@@ -2566,6 +2885,153 @@ class Cron:
             and job.schedule == "@reboot"
             and job.clusterPolicy in ("Leader", "PreferLeader")
         )
+
+    def _same_boot(self, rec: Dict[str, Any]) -> bool:
+        """Whether a boot-marker record was written during THIS OS boot.
+
+        Prefers the exact per-boot UUID (Linux); falls back to comparing
+        derived boot times within :data:`BOOT_TIME_TOLERANCE` (the
+        derivation rides the wall clock, so NTP steps shift it slightly).
+        ``False`` when neither side can be identified: an unprovable "same
+        boot" must run the job (today's behaviour) rather than eat it.
+        """
+        boot_id = platform.os_boot_id()
+        rec_id = rec.get("bootId")
+        if boot_id is not None and isinstance(rec_id, str) and rec_id:
+            return rec_id == boot_id
+        boot_time = platform.os_boot_time()
+        rec_time = rec.get("bootTime")
+        if boot_time is not None and isinstance(rec_time, (int, float)):
+            return abs(float(rec_time) - boot_time) <= BOOT_TIME_TOLERANCE
+        return False
+
+    async def _reboot_marker_covers(self, job: JobConfig) -> bool:
+        """Whether the durable marker shows ``job``'s boot run already
+        happened on THIS host during THIS OS boot, for THIS job definition.
+
+        Raises whatever the store read raises (bounded); callers map that
+        to their own policy.  A marker for a different definition (digest)
+        answers ``False``: a redefined @reboot job runs again, mirroring
+        the cluster reboot_ran path's job-set scoping.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return False
+        recs = await asyncio.wait_for(
+            backend.list_records(
+                self._reboot_stream(job.name),
+                limit=REBOOT_STREAM_KEEP,
+                newest_first=True,
+            ),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        for rec in recs:
+            if rec.get("host") != self._state_host:
+                continue
+            # newest marker from this host decides; older ones are moot.
+            if rec.get("jobDigest") != job_digest(job):
+                return False
+            return self._same_boot(rec)
+        return False
+
+    async def _reboot_boot_gate(self, job: JobConfig) -> bool:
+        """Record-then-run boot dedupe for a non-deferred @reboot job.
+
+        ``True`` -> launch (with the marker recorded FIRST, so a crash
+        between record and spawn errs toward not re-running -- the same
+        at-most-once ordering as the cluster's mark_reboot_ran path).
+        ``False`` -> skip: the marker proves this boot's run already
+        happened, or the store is unavailable under ``onStoreUnavailable:
+        fail-closed``.  Under the default ``degrade`` policy an unreadable
+        or unwritable store runs the job (at-least-once, exactly the
+        stateless behaviour).
+        """
+        backend = self.state_backend
+        fail_closed = self._state_on_unavailable == "fail-closed"
+        if backend is None:
+            if fail_closed:
+                logger.warning(
+                    "Job %s (@reboot) skipped: the state store is "
+                    "unavailable and onStoreUnavailable is fail-closed",
+                    job.name,
+                )
+                return False
+            return True
+        try:
+            covered = await self._reboot_marker_covers(job)
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - policy decides below
+            if fail_closed:
+                logger.warning(
+                    "Job %s (@reboot) skipped: cannot read its boot marker "
+                    "(%s) and onStoreUnavailable is fail-closed",
+                    job.name,
+                    ex,
+                )
+                return False
+            logger.warning(
+                "state: cannot read the @reboot marker for %s (%s); "
+                "running it (may repeat a boot run)",
+                job.name,
+                ex,
+            )
+            covered = False
+        if covered:
+            logger.info(
+                "Job %s (@reboot) already ran during this OS boot; "
+                "skipping (state-backed dedupe)",
+                job.name,
+            )
+            return False
+        record = {
+            "host": self._state_host,
+            "bootId": platform.os_boot_id(),
+            "bootTime": platform.os_boot_time(),
+            "jobDigest": job_digest(job),
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        stream = self._reboot_stream(job.name)
+        try:
+            await asyncio.wait_for(
+                backend.append_record(stream, record),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - policy decides below
+            self.metrics.state_write_dropped("reboot-marker")
+            if fail_closed:
+                logger.warning(
+                    "Job %s (@reboot) skipped: cannot record its boot "
+                    "marker (%s) and onStoreUnavailable is fail-closed",
+                    job.name,
+                    ex,
+                )
+                return False
+            logger.warning(
+                "state: cannot record the @reboot marker for %s (%s); "
+                "running it anyway (may re-run after a daemon restart)",
+                job.name,
+                ex,
+            )
+            return True
+        # the marker landed: the boot run is committed to happen, so a
+        # failed prune must only be logged, never re-decide the launch.
+        try:
+            await asyncio.wait_for(
+                backend.prune_records(stream, keep=REBOOT_STREAM_KEEP),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - best-effort bound
+            logger.warning(
+                "state: could not prune the @reboot markers for %s: %s",
+                job.name,
+                ex,
+            )
+        return True
 
     async def _process_pending_reboots(self) -> None:
         """Run each deferred @reboot job once the cluster has elected an owner.
@@ -3133,9 +3599,7 @@ class Cron:
         # background task rather than an await here (this method is sync and on
         # the finished-job path). No-op on the stateless default.
         if self.state_backend is not None:
-            task = asyncio.create_task(self._persist_run_record(name, info))
-            self._pending_state_writes.add(task)
-            task.add_done_callback(self._pending_state_writes.discard)
+            self._track_state_write(self._persist_run_record(name, info))
 
     @staticmethod
     def _run_stream(name: str) -> str:
@@ -3146,6 +3610,20 @@ class Cron:
     def _log_stream(name: str) -> str:
         """The durable stream name for a job's archived captured output."""
         return LOG_STREAM_PREFIX + name
+
+    @staticmethod
+    def _retry_stream(name: str) -> str:
+        """The durable stream name for a job's retry-ladder records."""
+        return RETRY_STREAM_PREFIX + name
+
+    @staticmethod
+    def _reboot_stream(name: str) -> str:
+        """The durable stream name for a job's @reboot boot markers."""
+        return REBOOT_STREAM_PREFIX + name
+
+    def _counters_stream(self) -> str:
+        """The durable stream name for this host's counter snapshots."""
+        return COUNTER_STREAM_PREFIX + self._state_host
 
     async def _persist_run_record(self, name: str, info: JobRunInfo) -> None:
         """Append one finished run to the durable ledger, prune, and archive.
@@ -3170,8 +3648,46 @@ class Cron:
             if job is not None and job.archiveOutput:
                 await self._archive_output(job, info)
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
+            self.metrics.state_write_dropped("run-record")
             logger.warning(
                 "state: failed to persist run record for %s: %s", name, ex
+            )
+        # piggyback the (throttled) durable counter snapshot on the same
+        # background task: one finished run is also the moment the counters
+        # changed. Has its own error handling.
+        await self._persist_counter_snapshot(throttled=True)
+
+    async def _persist_counter_snapshot(
+        self, *, throttled: bool = False
+    ) -> None:
+        """Append a durable snapshot of the Prometheus counter accumulators.
+
+        Host-scoped stream (each node's counters are its own truth); pruned
+        to a handful, newest wins on rehydration.  ``throttled`` skips the
+        write when one landed within COUNTER_SNAPSHOT_INTERVAL, so a busy
+        job cannot double every durable write; the shutdown path writes one
+        final unthrottled snapshot.  Lossy by design: a crash forfeits at
+        most the events since the last snapshot, which Prometheus reads as
+        a small, ordinary counter reset.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        if throttled:
+            now = asyncio.get_running_loop().time()
+            if now < self._counter_snapshot_next:
+                return
+            self._counter_snapshot_next = now + COUNTER_SNAPSHOT_INTERVAL
+        record = self.metrics.counters_snapshot()
+        record["at"] = get_now(datetime.timezone.utc).isoformat()
+        stream = self._counters_stream()
+        try:
+            await backend.append_record(stream, record)
+            await backend.prune_records(stream, keep=COUNTER_STREAM_KEEP)
+        except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
+            self.metrics.state_write_dropped("counters")
+            logger.warning(
+                "state: failed to persist the counter snapshot: %s", ex
             )
 
     async def _archive_output(self, job: JobConfig, info: JobRunInfo) -> None:
@@ -3286,6 +3802,168 @@ class Cron:
                 "state: rehydrated run history for %d job(s) from the ledger",
                 warmed,
             )
+        await self._rehydrate_counters()
+        await self._rehydrate_retries()
+
+    async def _rehydrate_counters(self) -> None:
+        """Seed the Prometheus accumulators from the newest durable snapshot.
+
+        Once per PROCESS (never per backend generation): seeding ADDS into
+        the live accumulators (pre-restart and post-restart events are
+        disjoint), so running it twice against two stores would double-
+        count.  The latch is set only once a read has succeeded, so a
+        store that was briefly unreadable at boot gets another chance on
+        the next backend start.  Lossy-durable on purpose: counters resume
+        from the last snapshot, and anything since reads as a small
+        ordinary counter reset.
+        """
+        backend = self.state_backend
+        if backend is None or self._counters_seeded:
+            return
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._counters_stream(), limit=1, newest_first=True
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: cannot rehydrate the metric counters: %s", ex
+            )
+            return
+        self._counters_seeded = True
+        if not recs:
+            return
+        seeded = self.metrics.seed_counters(recs[0], set(self.cron_jobs))
+        if seeded:
+            logger.info(
+                "state: rehydrated Prometheus counters for %d job(s) from "
+                "the durable snapshot",
+                seeded,
+            )
+
+    async def _rehydrate_retries(self) -> None:
+        """Re-arm pending durable retries after a restart.
+
+        The restart-surviving half of the retry ladder: a ``pending`` record
+        on top of a job's retry stream is a retry the previous process armed
+        but never resolved.  ABSOLUTE-deadline re-arming: the record's
+        ``notBefore`` is an instant, so the re-armed task sleeps only the
+        remaining time -- zero when the deadline passed while the daemon was
+        down.  Invalidation is by PER-JOB config digest
+        (:func:`yacron2.fingerprint.job_digest`): stricter than whole-set
+        job-set-id invalidation, which would drop every pending retry
+        whenever ANY job changed, while a digest mismatch means THIS job's
+        behaviour-affecting config changed and its old ladder must not run
+        the new definition.  Every ambiguous case settles the ladder (no
+        re-arm): with live asyncio ladders, cluster gates, and @reboot
+        keep-alives in play, the wrong move here is a double-run, and
+        no-run-on-ambiguity is the documented bias.  For an ``@reboot`` job
+        the pending retry is re-armed only when the boot marker proves the
+        boot run already happened THIS boot (the keep-alive-continuity
+        case); when the job will fire fresh at this startup pass, the fresh
+        boot run supersedes the stale ladder.  The re-armed task is the
+        ordinary :meth:`schedule_retry_job`, so cluster-gate re-checks,
+        job-vanished cleanup, and shutdown behaviour are identical to a
+        never-restarted ladder.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return
+        for name, job in list(self.cron_jobs.items()):
+            retry = job.onFailure["retry"]
+            if not retry["maximumRetries"]:
+                continue
+            if name in self.retry_state or self.running_jobs.get(name):
+                # live activity always outranks the ledger
+                continue
+            try:
+                recs = await asyncio.wait_for(
+                    backend.list_records(
+                        self._retry_stream(name), limit=1, newest_first=True
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "state: retry re-arm timed out reading %s; skipping "
+                    "the rest (store unhealthy?)",
+                    name,
+                )
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - degrade, never crash
+                logger.warning(
+                    "state: cannot read pending retries for %s: %s", name, ex
+                )
+                continue
+            if not recs or recs[0].get("kind") != "pending":
+                continue
+            rec = recs[0]
+            attempt = rec.get("attempt")
+            not_before = _parse_iso_utc(rec.get("notBefore"))
+            if (
+                isinstance(attempt, bool)
+                or not isinstance(attempt, int)
+                or attempt < 1
+                or not_before is None
+            ):
+                self._persist_retry_settled(name, "invalid-record")
+                continue
+            if rec.get("jobDigest") != job_digest(job):
+                self._persist_retry_settled(name, "config-changed", attempt)
+                continue
+            if not job.enabled:
+                self._persist_retry_settled(name, "disabled", attempt)
+                continue
+            maximum = retry["maximumRetries"]
+            if maximum != -1 and attempt > maximum:
+                self._persist_retry_settled(name, "exhausted", attempt)
+                continue
+            now = get_now(datetime.timezone.utc)
+            deadline = job.startingDeadlineSeconds
+            if deadline and (now - not_before).total_seconds() > deadline:
+                # same bound catch-up honours: a retry stale beyond the
+                # job's own catch-up window is not worth replaying.
+                self._persist_retry_settled(name, "deadline-passed", attempt)
+                continue
+            if isinstance(job.schedule, str) and job.schedule == "@reboot":
+                try:
+                    covered = await self._reboot_marker_covers(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - unknown -> not covered
+                    covered = False
+                if not covered:
+                    self._persist_retry_settled(
+                        name, "superseded-by-reboot", attempt
+                    )
+                    continue
+            state = JobRetryState(
+                retry["initialDelay"],
+                retry["backoffMultiplier"],
+                retry["maximumDelay"],
+            )
+            # replay the ladder to the persisted position: count == attempt,
+            # delay == what the NEXT failure would sleep.
+            for _ in range(attempt):
+                state.next_delay()
+            remaining = max(0.0, (not_before - now).total_seconds())
+            self.retry_state[name] = state
+            state.task = asyncio.create_task(
+                self.schedule_retry_job(name, remaining, attempt)
+            )
+            logger.info(
+                "Job %s: re-armed pending retry #%d from the durable "
+                "ledger (due in %.1f seconds)",
+                name,
+                attempt,
+                remaining,
+            )
 
     async def durable_last_run_at(self, name: str) -> Optional[str]:
         """The last finished-run timestamp for a job, from the durable ledger.
@@ -3357,6 +4035,21 @@ class Cron:
                 latest = (info.finished_at, info.outcome)
                 break
         backend = self.state_backend
+        if (
+            backend is None
+            and self._state_configured
+            and self._state_on_unavailable == "fail-closed"
+        ):
+            # the store holds the durable truth this gate exists for, it is
+            # configured but down, and the operator asked for fail-closed:
+            # prefer not running over deciding from a possibly-stale memory.
+            logger.warning(
+                "Job %s: onlyIfLastSucceeded blocked: the state store is "
+                "configured but unavailable and onStoreUnavailable is "
+                "fail-closed",
+                job.name,
+            )
+            return False
         if backend is not None:
             try:
                 recs = await asyncio.wait_for(
@@ -3369,7 +4062,16 @@ class Cron:
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            except Exception as ex:  # noqa: BLE001 - policy decides below
+                if self._state_on_unavailable == "fail-closed":
+                    logger.warning(
+                        "Job %s: onlyIfLastSucceeded blocked: cannot read "
+                        "the run ledger (%s) and onStoreUnavailable is "
+                        "fail-closed",
+                        job.name,
+                        ex,
+                    )
+                    return False
                 logger.warning(
                     "state: cannot read the run ledger for the "
                     "onlyIfLastSucceeded gate on %s (%s); deciding from the "
@@ -3429,7 +4131,7 @@ class Cron:
                     output=job.output,
                 ),
             )
-            await self.cancel_job_retries(job.config.name)
+            await self.cancel_job_retries(job.config.name, settle="cancelled")
             return
 
         if job.start_failed:
@@ -3499,7 +4201,7 @@ class Cron:
             state.count >= retry["maximumRetries"]
             and retry["maximumRetries"] != -1
         ):
-            await self.cancel_job_retries(job.config.name)
+            await self.cancel_job_retries(job.config.name, settle="exhausted")
             self.metrics.job_permanent_failure(job.config.name)
             await job.report_permanent_failure()
         else:
@@ -3519,7 +4221,32 @@ class Cron:
             retry_num,
             delay,
         )
+        # Persist the pending retry (fire-and-forget) with its ABSOLUTE
+        # deadline, so a restart re-arms it with only the remaining delay
+        # (see _rehydrate_retries). A write that never lands simply loses
+        # the durability (the retry dies with the process, exactly the
+        # pre-durable behaviour).
+        pending_write: Optional[asyncio.Task] = None
+        pending_job = self.cron_jobs.get(job_name)
+        if pending_job is not None:
+            not_before = get_now(datetime.timezone.utc) + datetime.timedelta(
+                seconds=delay
+            )
+            pending_write = self._persist_retry_pending(
+                pending_job, retry_num, not_before
+            )
         await asyncio.sleep(delay)
+        if pending_write is not None and not pending_write.done():
+            # With a tiny/zero delay the pending append can still be in
+            # flight, and the settle-before-launch record written below must
+            # sort AFTER it (newest-record-wins), so bound-wait it out
+            # first. Ordering only: the write task handles its own failure.
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(pending_write), timeout=STATE_OP_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                pass
         deferrals = 0
         while True:
             try:
@@ -3533,6 +4260,7 @@ class Cron:
                 # clear the now-stale retry state and stop; falling through
                 # here would call maybe_launch_job(job) with an unbound 'job'.
                 self.retry_state.pop(job_name, None)
+                self._persist_retry_settled(job_name, "job-removed", retry_num)
                 return
             # Re-check the leadership gate before relaunching: a retry can
             # outlive the leadership it started under (a partition / quorum
@@ -3542,8 +4270,18 @@ class Cron:
             # runs it on its next tick -- the exact double-run the
             # abstraction promises to prevent.
             if self._cluster_allows(job):
-                break
-            if self._cluster_owner_moved(job):
+                # Settle the durable pending record BEFORE launching (the
+                # same record-before-run ordering as the @reboot marker):
+                # a crash right after the launch must find the ladder
+                # settled, not re-arm the attempt that already ran. Under
+                # onStoreUnavailable: fail-closed an unsettleable record
+                # defers the launch like a closed gate; under degrade it
+                # launches anyway (at-least-once, bounded replay).
+                if await self._retry_consume_ok(
+                    job_name, retry_num, quiet=deferrals > 0
+                ):
+                    break
+            elif self._cluster_owner_moved(job):
                 # ownership genuinely moved: end this node's retry sequence
                 # (the new owner picks up the job's future scheduled firings,
                 # not this failed attempt; see _abandon_retry for the
@@ -3583,6 +4321,150 @@ class Cron:
         # abandonments, and a concurrencyPolicy=Forbid skip.
         if await self.maybe_launch_job(job):
             self.metrics.job_retry_launched(job_name)
+
+    def _persist_retry_pending(
+        self,
+        job: JobConfig,
+        attempt: int,
+        not_before: datetime.datetime,
+    ) -> Optional[asyncio.Task]:
+        """Fire-and-forget append of a pending-retry record for ``job``.
+
+        Carries the ABSOLUTE deadline (``notBefore``) and the job's config
+        digest, which is everything a restart needs to re-arm the ladder at
+        the right position (the delay ladder itself is a pure function of
+        the retry config and the attempt number).  Returns the write task so
+        the caller can ORDER later ladder writes after it (never to gate on
+        its success).
+        """
+        if self.state_backend is None:
+            return None
+        record = {
+            "kind": "pending",
+            "attempt": attempt,
+            "notBefore": not_before.isoformat(),
+            "jobDigest": job_digest(job),
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        return self._track_state_write(
+            self._append_retry_record(job.name, record)
+        )
+
+    def _persist_retry_settled(
+        self, name: str, reason: str, attempt: Optional[int] = None
+    ) -> None:
+        """Fire-and-forget append of a settled-ladder record for ``name``.
+
+        Whatever ended the ladder (success, supersession, exhaustion,
+        abandonment, an invalidation at re-arm time) writes one of these on
+        top of the stream so the next boot finds nothing pending.
+        """
+        if self.state_backend is None:
+            return
+        record: Dict[str, Any] = {
+            "kind": "settled",
+            "reason": reason,
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        if attempt is not None:
+            record["attempt"] = attempt
+        self._track_state_write(self._append_retry_record(name, record))
+
+    async def _append_retry_record(
+        self, name: str, record: Dict[str, Any]
+    ) -> None:
+        backend = self.state_backend
+        if backend is None:  # torn down between scheduling and running
+            return
+        stream = self._retry_stream(name)
+        try:
+            await backend.append_record(stream, record)
+            await backend.prune_records(stream, keep=RETRY_STREAM_KEEP)
+        except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
+            self.metrics.state_write_dropped("retry")
+            logger.warning(
+                "state: failed to persist retry state for %s: %s", name, ex
+            )
+
+    async def _retry_consume_ok(
+        self, job_name: str, retry_num: int, *, quiet: bool
+    ) -> bool:
+        """Settle the pending-retry record ahead of the launch; may defer.
+
+        ``True`` -> proceed with the launch.  The bounded settle write is
+        the record-before-run half of restart-durable retries: once it
+        lands, a crash cannot re-arm the attempt that is about to run.
+        When it cannot land: the default ``degrade`` policy launches anyway
+        (at-least-once -- a crash in the narrow window before the record
+        is retried by a later settle could replay this one attempt after a
+        restart), while ``fail-closed`` reports False so the caller defers
+        the launch and re-checks, exactly like a closed cluster gate.
+        Stateless (no ``state`` section) is always ``True`` with no I/O.
+        """
+        backend = self.state_backend
+        fail_closed = (
+            self._state_configured
+            and self._state_on_unavailable == "fail-closed"
+        )
+        if backend is None:
+            if fail_closed:
+                if not quiet:
+                    logger.warning(
+                        "Cron job %s retry (#%i) deferred: the state store "
+                        "is unavailable and onStoreUnavailable is "
+                        "fail-closed",
+                        job_name,
+                        retry_num,
+                    )
+                return False
+            return True
+        record = {
+            "kind": "settled",
+            "reason": "launched",
+            "attempt": retry_num,
+            "at": get_now(datetime.timezone.utc).isoformat(),
+        }
+        stream = self._retry_stream(job_name)
+        try:
+            await asyncio.wait_for(
+                backend.append_record(stream, record),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - policy decides below
+            self.metrics.state_write_dropped("retry")
+            if fail_closed:
+                if not quiet:
+                    logger.warning(
+                        "Cron job %s retry (#%i) deferred: cannot settle "
+                        "its durable record (%s) and onStoreUnavailable "
+                        "is fail-closed",
+                        job_name,
+                        retry_num,
+                        ex,
+                    )
+                return False
+            logger.warning(
+                "state: cannot settle the durable record for %s retry "
+                "(#%i) (%s); launching anyway (a crash could replay this "
+                "attempt after a restart)",
+                job_name,
+                retry_num,
+                ex,
+            )
+            return True
+        # settled: bound the stream, best-effort (the launch is committed).
+        try:
+            await asyncio.wait_for(
+                backend.prune_records(stream, keep=RETRY_STREAM_KEEP),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - prune is bookkeeping only
+            pass
+        return True
 
     def _cluster_owner_moved(self, job: JobConfig) -> bool:
         """Whether another node is *positively* identified as ``job``'s owner.
@@ -3649,6 +4531,10 @@ class Cron:
         if state is not None:
             state.cancelled = True
         self.retry_state.pop(job_name, None)
+        # settle the durable ladder: the new owner runs the job's future
+        # firings, so re-arming this attempt on OUR next boot would be the
+        # exact cross-node double-run the abandonment avoids.
+        self._persist_retry_settled(job_name, "owner-moved", retry_num)
         # Wording note: the new owner picks up future *scheduled* firings; it
         # does NOT re-run this failed attempt, and an @reboot one-shot has no
         # future firing at all (its boot run is already recorded), so the
@@ -3684,15 +4570,26 @@ class Cron:
         )
 
     async def handle_job_success(self, job: RunningJob) -> None:
-        await self.cancel_job_retries(job.config.name)
+        await self.cancel_job_retries(job.config.name, settle="succeeded")
         await job.report_success()
 
-    async def cancel_job_retries(self, name: str) -> None:
+    async def cancel_job_retries(
+        self, name: str, *, settle: Optional[str] = "superseded"
+    ) -> None:
         try:
             state = self.retry_state.pop(name)
         except KeyError:
             return
         state.cancelled = True
+        # Settle the durable ladder record (fire-and-forget) so a pending
+        # retry is not re-armed on the next boot. Skipped when settle is
+        # None -- the graceful-shutdown path, where surviving the restart is
+        # the point -- and when no retry was ever scheduled this ladder
+        # (count == 0: nothing durable was written, and settling here would
+        # add one durable write to every successful run of a retry-armed
+        # job).
+        if settle is not None and state.count > 0:
+            self._persist_retry_settled(name, settle, state.count)
         if state.task is not None:
             if state.task.done():
                 await state.task

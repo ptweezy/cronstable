@@ -16,6 +16,7 @@
 - **Job Behavior**
   - [Concurrency and Timeouts](Concurrency-and-Timeouts)
   - [Failure Detection and Retries](Failure-Detection-and-Retries)
+  - [Durable State](Durable-State)
   - [Clustering and Leader Election](Clustering-and-Leader-Election)
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)

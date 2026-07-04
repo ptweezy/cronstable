@@ -32,6 +32,8 @@ operator-facing walkthrough.
 | `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
 | `yacron2/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
+| `yacron2/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount -- the mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written via temp file + atomic rename (unknown/corrupt records are quarantined on read, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. The backend is only constructed (`start_stop_state`) when a `state:` section is configured; stdlib-only, so the stateless install pays nothing. |
+| `yacron2/state_admin.py` | Offline administration of the durable store behind the `yacron2 state ...` subcommands: `backup`/`restore`, `migrate` (between paths/mounts), manual `gc`, `check` (writability probe + inventory), and `migrate-schema`. Works straight from the `state` config section with no running daemon, and stays safe against a live one. Imported lazily by `__main__.py` only when a `state` subcommand is used. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
@@ -48,6 +50,11 @@ dependency on `cron.py` or `job.py`.
 late-imports `yacron2.cron` helpers at scrape time to break the cycle.
 `platform.py` is a leaf module with no yacron2 dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
+`state.py` depends only on `config` and `platform`; `cron.py` imports it and
+builds the backend via `make_state_backend` inside `start_stop_state` (only
+when a `state:` section is configured). `state_admin.py` (which depends on
+`config` and `state`) is imported lazily by `__main__` for the
+`yacron2 state ...` subcommands, so it never enters the daemon's import graph.
 
 ## The event loop
 
@@ -193,6 +200,26 @@ re-checks the gate before relaunching a scheduled-job retry). See
 As `README.md` puts it, `@reboot` "will only run the job when yacron2 is
 initially executed."
 
+When a `state:` section is configured, a non-cluster-deferred `@reboot` job
+additionally passes through `_reboot_boot_gate` before launching: a durable
+boot marker (stream `reboot/<job>`) turns the one-shot into once per **OS
+boot** per host rather than once per daemon start. The ordering is
+record-before-launch -- the marker is appended (bounded, `STATE_OP_TIMEOUT`)
+*before* the spawn, the same at-most-once bias as the cluster's
+`mark_reboot_ran` path, so a crash between record and spawn errs toward not
+re-running. Boot identity comes from `platform.os_boot_id()` (Linux's
+`/proc/sys/kernel/random/boot_id`, an exact per-boot UUID), falling back to
+`platform.os_boot_time()` (boot time derived from uptime: `GetTickCount64` on
+Windows, `/proc/uptime` on POSIX) compared within `BOOT_TIME_TOLERANCE`
+(60 s); where neither source exists (macOS/BSD) the behavior is unchanged
+(runs every daemon start). The marker also carries the host and the job's
+per-job digest (`fingerprint.job_digest`), so a redefined `@reboot` job runs
+again. An unreadable or unwritable marker runs the job anyway under the
+default `onStoreUnavailable: degrade` (at-least-once, the stateless behavior)
+and skips it under `fail-closed`. Cluster-deferred `Leader`/`PreferLeader`
+`@reboot` jobs never reach this gate; their dedupe remains the leadership
+backend's `reboot_ran` path.
+
 ### Shutdown sequence
 
 When `_stop_event` is set the `while` loop exits and `Cron.run` logs
@@ -200,7 +227,9 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 
 1. Drains pending retries: while `self.retry_state` is non-empty, it
    `cancel_job_retries(name)` for every entry concurrently via
-   `asyncio.gather`.
+   `asyncio.gather` -- passing `settle=None`, so with a `state:` section
+   configured a graceful stop leaves each pending durable ladder record in
+   place for the next boot's re-arm (see "Retry state machine").
 2. If a leadership backend is running, logs `"Stopping cluster manager"` and
    `await self.cluster_manager.stop()` (which releases leadership best-effort
    for fast failover: gossip cancels the poll loop and tears down the mTLS
@@ -616,7 +645,46 @@ Flow:
 - **On success** (`handle_job_success`): `cancel_job_retries(name)` clears any
   pending retry, then `report_success()` runs.
 - **`cancel_job_retries(name)`** pops the state (no-op if absent), sets
-  `cancelled = True`, and awaits or cancels the pending `task`.
+  `cancelled = True`, and awaits or cancels the pending `task`. It takes a
+  `settle` reason (default `"superseded"`) for the durable ladder below; the
+  shutdown drain passes `settle=None` so a graceful stop settles nothing.
+
+With a `state:` section configured, the machine gains a durable half (without
+one, the flow above is complete and retries die with the process):
+
+- **Durable ladder records.** `schedule_retry_job` persists a fire-and-forget
+  `pending` record (stream `retries/<job>`, `_persist_retry_pending`) carrying
+  the attempt number, the **absolute** `notBefore` deadline, and the job's
+  `fingerprint.job_digest`; every resolution appends a `settled` record on top
+  (`_persist_retry_settled`) with a reason: `launched`, `succeeded`,
+  `superseded`, `cancelled`, `exhausted`, `owner-moved`, `job-removed`, or a
+  re-arm-time invalidation reason. Just before the relaunch,
+  `_retry_consume_ok` settles the pending record with reason `launched` --
+  record-before-run, so a crash right after the launch cannot re-arm the
+  attempt that already ran. Under `onStoreUnavailable: degrade` an
+  unsettleable record launches anyway (at-least-once, a bounded one-attempt
+  replay window); under `fail-closed` the launch defers and re-checks, exactly
+  like a closed cluster gate. A graceful shutdown deliberately does *not*
+  settle: the surviving pending record is the restart handoff.
+- **Boot re-arm** (`_rehydrate_retries`). When the backend first comes up,
+  each configured retry-enabled job whose newest ladder record is `pending`
+  (and which has no live retry state or running instance -- live activity
+  outranks the ledger) is re-armed at the persisted position: a fresh
+  `JobRetryState` is replayed to the recorded attempt (`count` and the next
+  delay as if the process never restarted) and the ordinary
+  `schedule_retry_job` is scheduled with only the time remaining until
+  `notBefore` (zero if it passed while down), so the cluster-gate re-check and
+  job-vanished cleanup behave identically to a never-restarted ladder. A
+  record is settled instead of re-armed on: a malformed record, a per-job
+  digest mismatch (`config-changed` -- per-job, stricter than the whole-set
+  job-set id, so unrelated config edits do not drop the retry), a disabled
+  job, an exhausted budget, a record older than the job's
+  `startingDeadlineSeconds`, or an `@reboot` job whose boot marker does not
+  cover the current OS boot (`superseded-by-reboot`: the fresh boot run
+  supersedes the stale ladder). Conversely, a *covered* marker re-arms the
+  pending retry, which is what lets an `@reboot` `maximumRetries: -1`
+  keep-alive survive daemon restarts. Every ambiguous case settles: the bias
+  is no-run over double-run.
 
 See [Failure Detection and Retries](Failure-Detection-and-Retries) for the
 operator-facing options.
