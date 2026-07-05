@@ -1118,7 +1118,7 @@ class FilesystemStateBackend(StateBackend):
             pass
 
     def _read_record(
-        self, stream_dir: str, name: str
+        self, stream_dir: str, name: str, *, strict: bool = False
     ) -> Optional[Dict[str, Any]]:
         path = os.path.join(stream_dir, name)
         try:
@@ -1149,6 +1149,17 @@ class FilesystemStateBackend(StateBackend):
                 ex,
                 hint,
             )
+            if strict:
+                # A derived-watermark/cursor read MUST fail closed on an
+                # environmental error: silently dropping this record would
+                # let derive_max return the max over the surviving subset --
+                # a value strictly BELOW the true max -- and the catch-up
+                # caller would replay an occurrence that already ran.
+                # Propagate so the caller treats the watermark as UNKNOWN
+                # (defer/retry), never as a lower value.  (A content-bad
+                # record is still skipped even here: it is unrecoverable, and
+                # failing closed on it forever would wedge the watermark.)
+                raise
             return None
         except Exception:  # noqa: BLE001 - any content-driven parse failure
             # The CONTENT is bad: invalid/truncated JSON (ValueError), or a
@@ -1180,7 +1191,12 @@ class FilesystemStateBackend(StateBackend):
         )
 
     def _list_sync(
-        self, stream: str, limit: Optional[int], newest_first: bool
+        self,
+        stream: str,
+        limit: Optional[int],
+        newest_first: bool,
+        *,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
         try:
@@ -1195,7 +1211,7 @@ class FilesystemStateBackend(StateBackend):
         for name in names:
             if limit is not None and len(out) >= limit:
                 break
-            data = self._read_record(stream_dir, name)
+            data = self._read_record(stream_dir, name, strict=strict)
             if data is not None:
                 out.append(data)
         return out
@@ -1207,7 +1223,9 @@ class FilesystemStateBackend(StateBackend):
 
     def _derive_max_sync(self, stream: str, field: str) -> Optional[Any]:
         best: Optional[Any] = None
-        for data in self._list_sync(stream, None, False):
+        # strict=True: an environmental read error must PROPAGATE (fail the
+        # whole derive), never silently shrink the max -- see _read_record.
+        for data in self._list_sync(stream, None, False, strict=True):
             if field not in data:
                 continue
             value = data[field]

@@ -858,6 +858,8 @@ def mark_task_finished(
     now: float,
     task: TaskSpec,
     jitter: float = 0.0,
+    expected_proc: Optional[str] = None,
+    expected_attempt: Optional[int] = None,
 ):
     """Transform moving a finished instance to its terminal (or retry) state.
 
@@ -865,6 +867,18 @@ def mark_task_finished(
     rather than failed, until it succeeds or times out.  A failed plain task
     with retries left is parked ``failed`` with ``nextRetryAt`` set; the next
     advance re-claims it.  Otherwise the instance is terminal.
+
+    ``expected_proc`` / ``expected_attempt`` FENCE the completion to the exact
+    claim that produced it -- the same ``proc``-token identity
+    :func:`reconcile_crashed` already fences reconciliation on.  A completion
+    from a *superseded* attempt (a partitioned/evicted former owner whose
+    subprocess outlived its lease and finished only after another node
+    reconciled the task -> bumped its attempt -> re-claimed and re-launched it)
+    carries the old proc token / attempt; applying it would terminalise the
+    LIVE re-claimed instance with a dead attempt's exit code (double-advance /
+    wrong outcome).  When the stamped identity no longer matches the entry, the
+    completion is dropped exactly like a duplicate.  ``None`` (the default)
+    disables the check, so pre-existing callers and tests are unaffected.
     """
 
     def transform(body):
@@ -873,6 +887,16 @@ def mark_task_finished(
         entry = body.get("tasks", {}).get(taskkey)
         if entry is None or entry.get("state") != RUNNING:
             # already reconciled/terminal: a duplicate completion is a no-op.
+            return _DOC_KEEP, False
+        if expected_proc is not None and entry.get("proc") != expected_proc:
+            # superseded attempt: the entry was re-claimed by another node
+            # (proc token bumped) after this instance's owner lost the run.
+            return _DOC_KEEP, False
+        if (
+            expected_attempt is not None
+            and int(entry.get("attempt", 0)) != expected_attempt
+        ):
+            # a newer attempt is the live one; this is a stale completion.
             return _DOC_KEEP, False
         if task.type == SENSOR:
             _finish_sensor(entry, success, now, task, jitter)
