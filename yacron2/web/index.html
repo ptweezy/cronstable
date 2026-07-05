@@ -847,6 +847,127 @@
     50% { box-shadow: 0 0 22px color-mix(in srgb, var(--fail) 65%, transparent); border-color: var(--fail); }
   }
   @media (prefers-reduced-motion: reduce) { .wb-tile.st-fail.escalate { animation: none; } #wbAlarm { transition: none; } }
+
+  /* ==================================================================
+     DAG orchestration  (index card + run drawer + task graph)
+     ================================================================== */
+  /* HA chips on job rows: durable-retry / cluster slot / @reboot pending.
+     Same visual grammar as .slow-chip, one hue per concern. */
+  .ha-chip { display: inline-flex; align-items: center; gap: 4px; margin-left: 7px;
+    font-size: 10px; padding: 0 6px; border-radius: 3px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .ha-chip.retry  { color: var(--pending); background: color-mix(in srgb, var(--pending) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--pending) 35%, var(--border)); }
+  .ha-chip.slot   { color: var(--run); background: color-mix(in srgb, var(--run) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--run) 35%, var(--border)); }
+  .ha-chip.slot.wait { color: var(--fg-dim); background: transparent; border-color: var(--border); }
+  .ha-chip.reboot { color: var(--cancelled); background: color-mix(in srgb, var(--cancelled) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--cancelled) 35%, var(--border)); }
+  .ha-chip.recon  { color: var(--unknown); background: color-mix(in srgb, var(--unknown) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--unknown) 35%, var(--border)); }
+
+  /* the 8 DAG task states get their OWN palette so they never overload the
+     job-outcome colors. dot + glyph + label share the state's hue. */
+  .dst { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+  .dst .g { width: 1.2ch; text-align: center; }
+  .dst-pending        { color: var(--pending); }
+  .dst-running        { color: var(--run); }
+  .dst-up_for_retry   { color: var(--pending); }
+  .dst-success        { color: var(--ok); }
+  .dst-failed         { color: var(--fail); }
+  .dst-skipped        { color: var(--disabled); }
+  .dst-upstream_failed{ color: color-mix(in srgb, var(--fail) 60%, var(--fg-faint)); }
+  .dst-expanded       { color: var(--fg-faint); }
+  .dst-unknown        { color: var(--unknown); }
+  body.fx .dst-running .g { animation: pulse 1.8s infinite; }
+
+  /* run-state pill (a DAG run is running | success | failed) */
+  .rpill { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; padding: 1px 8px;
+    border-radius: 999px; white-space: nowrap; border: 1px solid var(--border); background: var(--bg2); color: var(--fg-dim); }
+  .rpill.running { color: var(--run); border-color: color-mix(in srgb, var(--run) 40%, var(--border)); }
+  .rpill.success { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); }
+  .rpill.failed  { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 40%, var(--border)); }
+
+  /* run "kind" provenance badge (scheduled/catchup/manual/backfill) */
+  .kbadge { font-size: 9.5px; text-transform: uppercase; letter-spacing: .5px; padding: 0 5px; border-radius: 3px;
+    color: var(--fg-faint); background: color-mix(in srgb, var(--fg-faint) 12%, transparent); border: 1px solid var(--border); }
+
+  /* per-run task-state histogram bar */
+  .tsbar { display: inline-flex; height: 8px; width: 120px; min-width: 80px; border-radius: 2px; overflow: hidden;
+    vertical-align: middle; border: 1px solid var(--border); background: var(--bg2); }
+  .tsbar i { display: block; height: 100%; }
+  .tsbar i.success { background: var(--ok); }  .tsbar i.failed { background: var(--fail); }
+  .tsbar i.running { background: var(--run); }  .tsbar i.pending { background: var(--pending); }
+  .tsbar i.skipped { background: var(--disabled); } .tsbar i.up_for_retry { background: var(--pending); }
+  .tsbar i.upstream_failed { background: color-mix(in srgb, var(--fail) 60%, var(--fg-faint)); }
+  .tsbar i.expanded { background: var(--fg-faint); } .tsbar i.unknown { background: var(--unknown); }
+
+  /* DAG index card: reuses .card + a run-table-ish layout */
+  #dagCard .dagname { font-weight: 700; color: var(--fg); }
+  #dagCard .dagmeta { color: var(--fg-faint); margin-top: 1px; font-size: 11px; }
+  #dagCard tr.active { background: var(--selbg); }
+
+  /* second right-side drawer for a DAG run; reuses .drawer styling but its own
+     .dpane/.dtab system so the job drawer's switchTab (which toggles the global
+     .pane) can never hide these panes. */
+  #dagDrawer { width: min(960px, 98vw); }
+  .dtabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+  .dtabs button { background: none; border: 0; border-bottom: 2px solid transparent; color: var(--fg-faint);
+    font: inherit; font-size: 12px; padding: 8px 11px; cursor: pointer; }
+  .dtabs button:hover { color: var(--fg-dim); }
+  .dtabs button.active { color: var(--fg); border-bottom-color: var(--accent); }
+  .dpanes { flex: 1; min-height: 0; display: flex; }
+  .dpane { flex: 1; min-height: 0; display: none; flex-direction: column; overflow: auto; padding: 12px 16px; }
+  .dpane.active { display: flex; }
+  .dpane .empty { color: var(--fg-faint); padding: 18px; text-align: center; }
+
+  /* task detail table (Tasks tab): fan-out groups indent their instances */
+  .tasktbl td.inst { padding-left: 22px; color: var(--fg-dim); }
+  .tasktbl tr.fanhead td:first-child { cursor: pointer; }
+  .tasktbl .exit.zero { color: var(--ok); } .tasktbl .exit.nonzero { color: var(--fail); }
+  .fanmeter { display: inline-flex; height: 7px; width: 90px; border-radius: 2px; overflow: hidden;
+    border: 1px solid var(--border); vertical-align: middle; background: var(--bg2); }
+  .fanmeter i { display: block; height: 100%; }
+  .fanmeter i.success { background: var(--ok); } .fanmeter i.failed { background: var(--fail); }
+  .fanmeter i.running { background: var(--run); }
+  .poke { color: var(--run); font-size: 10.5px; }
+  .approw { display: inline-flex; gap: 6px; align-items: center; }
+  .approw .btn { padding: 1px 8px; }
+  .apprv { color: var(--ok); } .aprej { color: var(--fail); }
+
+  /* inline task-graph (SVG, laid out client-side in the swimlane idiom) */
+  .daggraph { width: 100%; overflow: auto; }
+  .daggraph svg { display: block; }
+  .daggraph text { font-family: var(--mono); font-size: 10px; fill: var(--fg); }
+  .daggraph .edge { stroke: var(--border2); stroke-width: 1.4; fill: none; }
+  .daggraph .node { cursor: pointer; }
+  .daggraph .node rect { stroke-width: 1.5; }
+  .daggraph .node:hover rect { filter: brightness(1.25); }
+
+  /* XCom viewer */
+  .xcomval { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); white-space: pre-wrap;
+    max-height: 160px; overflow: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 3px; padding: 6px 8px; }
+
+  /* ==================================================================
+     durable state inspector card
+     ================================================================== */
+  #stateCard .sthead { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #stateCard .sttabs { display: flex; gap: 4px; margin: 10px 0 8px; flex-wrap: wrap; }
+  #stateCard .sttabs button { background: var(--bg2); border: 1px solid var(--border); color: var(--fg-dim);
+    font: inherit; font-size: 11px; padding: 2px 9px; border-radius: 999px; cursor: pointer; }
+  #stateCard .sttabs button:hover { color: var(--fg-dim); border-color: var(--border2); }
+  #stateCard .sttabs button.active { color: var(--fg); background: var(--selbg); border-color: var(--border2); }
+  #stateCard .sttabs button .n { color: var(--fg-faint); margin-left: 5px; font-variant-numeric: tabular-nums; }
+  #stateCard .statebody { max-height: 46vh; overflow: auto; }
+  .redacted { color: var(--fg-faint); font-style: italic; }
+  .src-chip { font-size: 10px; padding: 0 6px; border-radius: 3px; color: var(--fg-faint);
+    background: color-mix(in srgb, var(--fg-faint) 12%, transparent); border: 1px solid var(--border); }
+  .src-chip.durable { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent);
+    border-color: color-mix(in srgb, var(--ok) 30%, var(--border)); }
+
+  /* cluster lease block (filesystem/kubernetes/etcd backends) */
+  #clusterLease td { padding: 4px 8px; font-size: 11.5px; }
+  #clusterLease td.k { color: var(--fg-faint); width: 130px; }
+  .fleet-leader { color: var(--pending); }
 </style>
 </head>
 <body>
@@ -896,6 +1017,8 @@
     <button class="ghostbtn" id="tailBtn" title="Merged multi-tail console">≋ tail</button>
     <button class="ghostbtn" id="tvBtn" title="Wallboard / TV mode (w)">▣ tv</button>
     <button class="ghostbtn" id="runFailingBtn" title="Run every failing job now">▶ run failing</button>
+    <button class="ghostbtn" id="dagsBtn" title="DAG orchestration" style="display:none">⧉ dags</button>
+    <button class="ghostbtn" id="stateBtn" title="Durable state store" style="display:none">⛁ state</button>
     <select class="mini" id="sortSel" title="Sort">
       <option value="name">sort: name</option>
       <option value="status">sort: status</option>
@@ -971,6 +1094,29 @@
     </div>
   </div>
 
+  <div class="card" id="dagCard" style="display:none">
+    <div class="card-label"><span>┌─ dags</span><span class="grow"></span><span class="faint" id="dagMeta"></span></div>
+    <div class="twrap">
+    <table class="runtable" id="dagsTable">
+      <thead>
+        <tr>
+          <th>Status</th><th>DAG</th><th>Schedule</th><th>Tasks</th>
+          <th>Latest run</th><th>Runs</th><th style="text-align:right">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="dagRows"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card" id="stateCard" style="display:none">
+    <div class="card-label"><span>┌─ durable state</span><span class="grow"></span>
+      <span class="src-chip" id="stateTopo"></span><span class="faint" id="stateMeta"></span></div>
+    <div class="sthead" id="stateHealth"></div>
+    <div class="sttabs" id="stateTabs"></div>
+    <div class="statebody" id="stateBody"></div>
+  </div>
+
   <div class="card" id="clusterCard" style="display:none">
     <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="fleetBtn" title="Fleet view: every node's runs in one pane" style="display:none">⊞ fleet</button><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
     <table id="clusterTable">
@@ -1033,6 +1179,43 @@
     <section class="pane" data-pane="schedule">
       <div class="pane-scroll" id="schedulePane"></div>
     </section>
+  </div>
+</aside>
+
+<!-- DAG run-detail drawer (its own scrim + .dpane system, independent of the job drawer) -->
+<div class="scrim" id="dagScrim"></div>
+<aside class="drawer" id="dagDrawer" role="dialog" aria-modal="true" aria-labelledby="dgName" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="row1">
+      <span class="rpill" id="dgState" style="display:none"></span>
+      <h2 id="dgName">dag</h2>
+      <button class="btn run" id="dgTrigger" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg> Trigger</button>
+      <button class="btn" id="dgBackfillBtn" title="Backfill a date range">▦ Backfill</button>
+      <button class="iconbtn" id="dgClose" title="Close (Esc)">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="meta" id="dgMeta"></div>
+    <div id="dgBackfill" style="display:none; margin-top:8px; gap:6px; align-items:center;" class="approw">
+      <span class="faint">backfill</span>
+      <input type="text" id="dgBfFrom" placeholder="from ISO (2026-07-01T00:00:00)" style="width:220px" autocomplete="off" spellcheck="false">
+      <input type="text" id="dgBfTo" placeholder="to ISO" style="width:220px" autocomplete="off" spellcheck="false">
+      <button class="btn primary" id="dgBfGo">run backfill</button>
+    </div>
+  </div>
+  <div class="dtabs" id="dagTabs">
+    <button data-dtab="runs" class="active">Runs</button>
+    <button data-dtab="graph">Graph</button>
+    <button data-dtab="tasks">Tasks</button>
+    <button data-dtab="xcom">XCom</button>
+    <button data-dtab="logs">Logs</button>
+  </div>
+  <div class="dpanes">
+    <section class="dpane active" data-dpane="runs"><div id="dgRuns" style="width:100%"></div></section>
+    <section class="dpane" data-dpane="graph"><div class="daggraph" id="dgGraph" style="width:100%"></div></section>
+    <section class="dpane" data-dpane="tasks"><div id="dgTasks" style="width:100%"></div></section>
+    <section class="dpane" data-dpane="xcom"><div id="dgXcom" style="width:100%"></div></section>
+    <section class="dpane" data-dpane="logs"><div id="dgLogs" style="width:100%; display:flex; flex-direction:column; min-height:0"></div></section>
   </div>
 </aside>
 
@@ -1253,6 +1436,8 @@
     boot: true,   // BIOS-style boot self-test on load
     // opt-in run ledger (IndexedDB) + wallboard zen screensaver + alarm escalation
     ledger: false, zen: true, escalate: true, zenIdle: 30000,
+    // DAG index card visible by default; durable-state inspector opt-in
+    dags: true, stateInsp: false,
     // jobs-table column visibility overrides, keyed by COLUMNS k. Untouched
     // columns have no entry, so ones added later still get their default.
     cols: {},
@@ -1880,6 +2065,12 @@
         ("clusterOwner" in j ? "o:" + (j.clusterOwner || "") : "") + "|" + (j.clusterPolicy || ""),
         // ledger anomaly marker (only meaningful while the ledger is on)
         state.ledger.on && ledgerFlag(j.name) ? "slow" : "",
+        // HA chips: armed retry (attempt + next-fire), cluster slot, @reboot
+        // pending. The countdowns tick client-side; these change only when the
+        // underlying HA state does, so they re-render the row exactly then.
+        j.retry ? j.retry.attempt + ":" + (j.retry.nextRetryAt || "") : "",
+        j.slot ? (j.slot.held ? "h" : "w") + ":" + j.slot.refs : "",
+        j.rebootPending ? "rb" : "",
       ]),
     });
     if (sig === state.lastRowSig) return;
@@ -1909,7 +2100,7 @@
           '><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>';
       return (
         '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
-          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + "</td>" +
+          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + haChips(job) + "</td>" +
           '<td><div class="jobname">' + esc(job.name) + "</div>" +
               '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
           '<td class="col-owner">' + ownerCell(job) + "</td>" +
@@ -1941,6 +2132,11 @@
   // per-second tick for relative cells (no full rerender)
   function tick() {
     document.querySelectorAll("[data-ago]").forEach((e) => { e.textContent = fmtAgo(e.getAttribute("data-ago")); });
+    // DAG/state relative cells: epoch-second "ago", and live countdowns to an
+    // ISO instant (retry ladder) or an epoch instant (sensor poke / lease).
+    document.querySelectorAll("[data-ago-epoch]").forEach((e) => { e.textContent = agoEpoch(parseFloat(e.getAttribute("data-ago-epoch"))); });
+    document.querySelectorAll("[data-until-epoch]").forEach((e) => { e.textContent = untilEpoch(parseFloat(e.getAttribute("data-until-epoch"))); });
+    document.querySelectorAll("[data-until-iso]").forEach((e) => { e.textContent = fmtIn((new Date(e.getAttribute("data-until-iso")).getTime() - Date.now()) / 1000); });
     // a stale wallboard must not keep counting its tiles down toward runs it
     // cannot verify (they'd tick to "now" and stick) -- freeze those cells at
     // an explicit marker instead. body.tv hides the job table, so while the
@@ -2599,6 +2795,8 @@
       if (state.wallboard) renderWallboard();
       zenGovernor();
       loadCluster();
+      loadDags();
+      loadState();
       if (state.drawerJob) renderDrawerMeta();
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
@@ -2775,6 +2973,9 @@
       stat("runs", s.total) +
       stat("success rate", pct, s.success_rate != null && s.success_rate >= 0.999 ? "ok" : (s.success_rate != null && s.success_rate < 0.5 ? "fail" : "")) +
       stat("ok / fail", (s.success || 0) + " / " + (s.failure || 0)) +
+      // crash-reconciled runs: only surfaced when any occurred, so a healthy
+      // job's stat strip stays uncluttered.
+      (s.unknown ? '<div class="stat"><div class="k">interrupted</div><div class="v" style="color:var(--unknown)" title="crash-reconciled: the daemon crashed or lost the state store mid-run">' + esc(s.unknown) + "</div></div>" : "") +
       stat("avg", fmtDuration(s.avg_duration)) +
       stat("min", fmtDuration(s.min_duration)) +
       stat("max", fmtDuration(s.max_duration)) +
@@ -3404,6 +3605,8 @@
       { ic: "⚙", lbl: "Open settings", run: openSettings },
       { ic: "?", lbl: "Keyboard shortcuts", hint: "?", run: openHelp },
       { ic: "⚿", lbl: "Set access token", run: () => openModal() },
+      { ic: "⧉", lbl: "Toggle DAGs card", run: () => $("dagsBtn").click() },
+      { ic: "⛁", lbl: "Toggle state inspector", run: () => $("stateBtn").click() },
       { ic: "⌕", lbl: "Focus filter", hint: "/", run: () => { closePalette(); $("search").focus(); } },
     ];
   }
@@ -3419,6 +3622,14 @@
     }
     return out;
   }
+  function dagCommands() {
+    const out = [];
+    for (const d of state.dags.list) {
+      out.push({ ic: d.latestRun ? dstGlyph(d.latestRun.state) : "⧉", lbl: "DAG: " + d.name, sub: "open", run: () => openDagDrawer(d.name) });
+      out.push({ ic: "▶", lbl: "Trigger DAG: " + d.name, run: () => dagTrigger(d.name) });
+    }
+    return out;
+  }
   function fuzzy(q, s) {
     q = q.toLowerCase(); s = s.toLowerCase();
     if (!q) return 1;
@@ -3429,7 +3640,7 @@
   }
   function renderPalette() {
     const q = $("paletteInput").value.trim();
-    const all = baseCommands().concat(jobCommands());
+    const all = baseCommands().concat(dagCommands()).concat(jobCommands());
     let items = all.map((c) => ({ c, score: fuzzy(q, c.lbl) })).filter((x) => x.score > 0);
     items.sort((a, b) => b.score - a.score);
     items = items.slice(0, 60).map((x) => x.c);
@@ -3578,7 +3789,15 @@
   function openFromHash() {
     if (location.hash === "#tv") { setWallboard(true); return; }
     const m = location.hash.match(/^#job\/(.+)$/);
-    if (m) { const name = decodeURIComponent(m[1]); if (state.byName[name]) openDrawer(name); }
+    if (m) { const name = decodeURIComponent(m[1]); if (state.byName[name]) openDrawer(name); return; }
+    const dm = location.hash.match(/^#dag\/([^\/]+)(?:\/(.+))?$/);
+    if (dm) {
+      const dn = decodeURIComponent(dm[1]);
+      const rk = dm[2] ? decodeURIComponent(dm[2]) : null;
+      const open = () => { if (state.dags.byName[dn]) openDagDrawer(dn, rk, rk ? "tasks" : "runs"); };
+      // dags may not have loaded yet on first paint; fetch then open.
+      if (state.dags.byName[dn]) open(); else loadDags().then(open);
+    }
   }
 
   // ===================================================================
@@ -3602,6 +3821,7 @@
   }
   function anyOverlayOpen() {
     return state.palette.open || state.timeline.open || state.mitigate.open || state.sandbox.open || state.tail.open ||
+      !!(state.dagDrawer && state.dagDrawer.dag) ||
       ["settingsWrap", "helpWrap", "modalWrap"].some((id) => $(id).classList.contains("open"));
   }
   // ---- focus management (trap + restore) for modal surfaces ----
@@ -3620,6 +3840,7 @@
     if (state.timeline.open) return $("timelineWrap");
     if (state.palette.open) return $("paletteWrap");
     if (state.tail.open) return $("tailWrap");   // DOM-first overlay: everything above outranks it
+    if (state.dagDrawer && state.dagDrawer.dag) return $("dagDrawer");
     if (state.drawerJob) return $("drawer");
     return null;
   }
@@ -3677,6 +3898,7 @@
       if (state.sandbox.open) return closeSandbox();
       if (state.timeline.open) return closeTimeline();
       if (state.tail.open) return closeTail();
+      if (state.dagDrawer && state.dagDrawer.dag) return closeDagDrawer();
       if (state.drawerJob) return closeDrawer();
       if (state.wallboard) return setWallboard(false);
       return;
@@ -3714,6 +3936,782 @@
       case "c": { const j = selectedJob(); if (j) copyText(j.command, "command"); break; }
     }
   });
+
+  // ===================================================================
+  //  DAG orchestration
+  // ===================================================================
+  // extra app state (attached to the shared store)
+  state.dags = { list: [], byName: {}, sig: null };
+  state.dagDrawer = { dag: null, runKey: null, tab: "runs", runs: [], run: null, xcom: null, logTask: null };
+  state.dagStream = null;         // AbortController for a DAG task log SSE
+  state.dagRunPoll = null;        // setTimeout handle for the open-run poll
+  state.stateInsp = { data: null, tab: "overview", detail: null };
+
+  // the 8 DAG task states get their OWN glyphs (never overloads the job set)
+  const DST_GLYPH = {
+    pending: "◌", running: "▶", up_for_retry: "↻", success: "●", failed: "✗",
+    skipped: "⊘", upstream_failed: "⊗", expanded: "⋯", unknown: "◍", scheduled: "◔",
+  };
+  const DST_LABEL = {
+    pending: "pending", running: "running", up_for_retry: "retrying", success: "success",
+    failed: "failed", skipped: "skipped", upstream_failed: "upstream failed",
+    expanded: "expanded", unknown: "unknown",
+  };
+  function dstGlyph(s) { return DST_GLYPH[s] || "•"; }
+  function dstVar(s) {
+    return ({ success: "ok", failed: "fail", running: "run", pending: "pending",
+      up_for_retry: "pending", skipped: "disabled", upstream_failed: "fail",
+      expanded: "fg-faint", unknown: "unknown" })[s] || "fg-faint";
+  }
+  function dstCell(s) {
+    return '<span class="dst dst-' + esc(s || "unknown") + '"><span class="g">' + dstGlyph(s) +
+      "</span>" + esc(DST_LABEL[s] || s || "?") + "</span>";
+  }
+  function truncStr(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+  // epoch-second time helpers (DAG timestamps are float epoch seconds; only
+  // logicalDate is ISO). Reuse the ISO formatters via a conversion.
+  function agoEpoch(sec) { return sec == null ? "never" : fmtAgo(new Date(sec * 1000).toISOString()); }
+  function untilEpoch(sec) { return sec == null ? "—" : fmtIn(sec - Date.now() / 1000); }
+  function clockEpoch(sec) { try { return sec == null ? "—" : new Date(sec * 1000).toLocaleString(); } catch (_) { return "—"; } }
+
+  // ---- HA chips on the jobs table (durable retry / cluster slot / reboot) ----
+  function retryChip(job) {
+    const r = job.retry; if (!r) return "";
+    const cnt = "attempt " + r.attempt + (r.maxAttempts != null ? "/" + r.maxAttempts : "");
+    let nxt = "";
+    if (r.nextRetryAt && !job.running) {
+      const secs = (new Date(r.nextRetryAt).getTime() - Date.now()) / 1000;
+      nxt = ' · <span data-until-iso="' + escAttr(r.nextRetryAt) + '">' + fmtIn(secs) + "</span>";
+    }
+    return '<span class="ha-chip retry" title="durable retry ladder is armed">↻ ' + esc(cnt) + nxt + "</span>";
+  }
+  function slotChip(job) {
+    if (job.concurrencyScope !== "cluster" || !job.slot) return "";
+    const s = job.slot;
+    if (s.held) {
+      return '<span class="ha-chip slot" title="holds the cluster-wide slot' +
+        (s.holder ? " (" + escAttr(s.holder) + ")" : "") + '">⛁ slot' + (s.refs > 1 ? " ×" + s.refs : "") + "</span>";
+    }
+    return '<span class="ha-chip slot wait" title="cluster-scoped; this node does not hold the slot">⛁ slot</span>';
+  }
+  function rebootChip(job) {
+    return job.rebootPending
+      ? '<span class="ha-chip reboot" title="@reboot one-shot: still pending its boot run (awaiting a cluster owner)">⏻ boot pending</span>'
+      : "";
+  }
+  function reconChip(job) {
+    const lr = job.last_run;
+    if (!lr || lr.outcome !== "unknown") return "";
+    return '<span class="ha-chip recon" title="' + escAttr(lr.fail_reason || "run interrupted; no completion was recorded") + '">⚠ interrupted</span>';
+  }
+  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job); }
+
+  // ---- DAG index card ----
+  let dagReqSeq = 0, dagAppliedSeq = 0;
+  async function loadDags() {
+    const seq = ++dagReqSeq;
+    try {
+      const r = await apiFetch("/dags");
+      if (seq < dagAppliedSeq) return;
+      if (!r.ok) { dagAppliedSeq = seq; return; }
+      const list = await r.json();
+      if (seq < dagAppliedSeq) return;
+      dagAppliedSeq = seq;
+      state.dags.list = Array.isArray(list) ? list : [];
+      state.dags.byName = {};
+      state.dags.list.forEach((d) => { state.dags.byName[d.name] = d; });
+      renderDagCard();
+      if (state.dagDrawer.dag) renderDagDrawerHead();
+    } catch (e) { if (e.message !== "unauthorized") console.warn("loadDags failed:", e); }
+  }
+  function renderDagCard() {
+    const dags = state.dags.list;
+    const has = dags.length > 0;
+    $("dagsBtn").style.display = has ? "" : "none";
+    const card = $("dagCard");
+    if (!has || !prefs.dags) { card.style.display = "none"; return; }
+    card.style.display = "";
+    $("dagMeta").textContent = dags.length + (dags.length === 1 ? " dag" : " dags");
+    const sig = JSON.stringify(dags.map((d) => [
+      d.name, d.enabled, d.schedule, (d.tasks || []).length, d.totalRuns,
+      d.latestRun && d.latestRun.state, d.latestRun && d.latestRun.updatedAt,
+      d.runCounts, state.dagDrawer.dag,
+    ]));
+    if (sig === state.dags.sig) return;
+    state.dags.sig = sig;
+    $("dagRows").innerHTML = dags.map((d) => {
+      const lr = d.latestRun;
+      const status = lr
+        ? '<span class="rpill ' + esc(lr.state) + '"><span class="g">' + dstGlyph(lr.state) + "</span>" + esc(lr.state) + "</span>"
+        : '<span class="faint">no runs</span>';
+      const tasks = d.tasks || [];
+      const kinds = tasks.reduce((a, t) => { a[t.type] = (a[t.type] || 0) + 1; return a; }, {});
+      const kindStr = Object.keys(kinds).map((k) => kinds[k] + (k === "task" ? "" : " " + k)).join(" · ");
+      const mapped = tasks.some((t) => t.mapped) ? ' <span class="kbadge">fan-out</span>' : "";
+      const sched = d.schedule
+        ? '<span class="chip" title="' + escAttr(describeCron(d.schedule)) + '">' + esc(d.schedule) + "</span>"
+        : '<span class="faint">manual</span>';
+      const latest = lr
+        ? dagHistBar(d.runCounts, d.totalRuns) + ' <span class="faint" data-ago-epoch="' + escAttr(lr.updatedAt) + '">' + agoEpoch(lr.updatedAt) + "</span>"
+        : "—";
+      const runsCount = d.totalRuns != null ? d.totalRuns + (d.totalRuns === 1 ? " run" : " runs") : "—";
+      const rowCls = (state.dagDrawer.dag === d.name ? "active" : "") + (d.enabled ? "" : " muted");
+      return '<tr data-dag="' + escAttr(d.name) + '" class="' + rowCls + '">' +
+        "<td>" + status + "</td>" +
+        '<td><div class="dagname">' + esc(d.name) + (d.enabled ? "" : " (disabled)") + "</div>" +
+        '<div class="dagmeta">' + esc(tasks.length + " task" + (tasks.length === 1 ? "" : "s") + (kindStr && kindStr !== tasks.length + "" ? " · " + kindStr : "")) + mapped + "</div></td>" +
+        "<td>" + sched + "</td>" +
+        '<td class="muted">' + esc(kindStr || tasks.length) + "</td>" +
+        "<td>" + latest + "</td>" +
+        '<td class="muted nowrap">' + esc(runsCount) + "</td>" +
+        '<td style="text-align:right"><div class="actions" style="justify-content:flex-end">' +
+        '<button class="btn run" data-dagtrigger="' + escAttr(d.name) + '" title="Trigger a manual run"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>' +
+        '<button class="btn" data-dagopen="' + escAttr(d.name) + '">Open</button>' +
+        "</div></td></tr>";
+    }).join("");
+  }
+  // a compact stacked bar of a dag's run outcomes (success/failed/running)
+  function dagHistBar(counts, total) {
+    counts = counts || {}; total = total || 0;
+    if (!total) return "";
+    const order = ["success", "running", "failed", "skipped", "up_for_retry", "pending", "upstream_failed", "unknown"];
+    let bar = '<span class="tsbar" style="width:90px" title="' +
+      escAttr(order.filter((k) => counts[k]).map((k) => counts[k] + " " + k).join(" · ")) + '">';
+    order.forEach((k) => { if (counts[k]) bar += '<span class="' + k + '" style="width:' + (100 * counts[k] / total).toFixed(1) + '%"></span>'; });
+    return bar + "</span>";
+  }
+
+  // ---- DAG run-detail drawer ----
+  function openDagDrawer(dag, runKey, tab) {
+    if (!state.dags.byName[dag]) return;
+    if (state.drawerJob) closeDrawer();
+    const wasOpen = !!state.dagDrawer.dag;
+    if (!wasOpen) pushFocus();
+    state.dagDrawer.dag = dag;
+    state.dagDrawer.runKey = runKey || null;
+    state.dagDrawer.run = null; state.dagDrawer.xcom = null; state.dagDrawer.logTask = null;
+    $("dagDrawer").classList.add("open");
+    $("dagDrawer").setAttribute("aria-hidden", "false");
+    $("dagScrim").classList.add("open");
+    $("dgName").textContent = dag;
+    $("dgBackfill").style.display = "none";
+    renderDagDrawerHead();
+    renderDagCard();
+    switchDagTab(tab || (runKey ? "tasks" : "runs"));
+    loadDagRuns();
+    setDagHash();
+    if (!wasOpen) focusFirst($("dagDrawer"));
+  }
+  function closeDagDrawer() {
+    stopDagTaskLog();
+    if (state.dagRunPoll) { clearTimeout(state.dagRunPoll); state.dagRunPoll = null; }
+    state.dagDrawer.dag = null; state.dagDrawer.runKey = null; state.dagDrawer.run = null;
+    $("dagDrawer").classList.remove("open");
+    $("dagDrawer").setAttribute("aria-hidden", "true");
+    $("dagScrim").classList.remove("open");
+    setDagHash();
+    renderDagCard();
+    popFocus();
+  }
+  function renderDagDrawerHead() {
+    const d = state.dags.byName[state.dagDrawer.dag];
+    if (!d) return;
+    const run = state.dagDrawer.run;
+    const pill = $("dgState");
+    if (run) {
+      pill.style.display = "";
+      pill.className = "rpill " + esc(run.state);
+      pill.innerHTML = '<span class="g">' + dstGlyph(run.state) + "</span>" + esc(run.state);
+    } else { pill.style.display = "none"; }
+    // manual-only dags cannot be backfilled (the schedule anchors the range)
+    $("dgBackfillBtn").disabled = !d.schedule;
+    $("dgBackfillBtn").title = d.schedule ? "Backfill a date range" : "manual-only dag: no schedule to backfill";
+    const bits = [];
+    bits.push("<b>" + esc((d.tasks || []).length) + "</b> tasks");
+    if (d.schedule) bits.push("schedule <b>" + esc(d.schedule) + "</b>"); else bits.push("<b>manual</b>");
+    if (state.dagDrawer.runKey) bits.push("run <b>" + esc(truncStr(state.dagDrawer.runKey, 40)) + "</b>");
+    if (run) {
+      bits.push('<span class="kbadge">' + esc(run.kind || "?") + "</span>");
+      if (run.createdAt) bits.push('started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b>");
+    }
+    $("dgMeta").innerHTML = bits.join("");
+  }
+  function switchDagTab(tab) {
+    state.dagDrawer.tab = tab;
+    document.querySelectorAll("#dagTabs button").forEach((b) => b.classList.toggle("active", b.getAttribute("data-dtab") === tab));
+    document.querySelectorAll("#dagDrawer .dpane").forEach((p) => p.classList.toggle("active", p.getAttribute("data-dpane") === tab));
+    if (tab !== "logs") stopDagTaskLog();
+    if (tab === "runs") renderDagRuns();
+    else if (tab === "tasks") renderDagTasks();
+    else if (tab === "graph") renderDagGraph();
+    else if (tab === "xcom") loadDagXcom();
+    else if (tab === "logs") renderDagLogs();
+  }
+  function setDagHash() {
+    let h = "";
+    if (state.dagDrawer.dag) {
+      h = "#dag/" + encodeURIComponent(state.dagDrawer.dag) +
+        (state.dagDrawer.runKey ? "/" + encodeURIComponent(state.dagDrawer.runKey) : "");
+    }
+    if (location.hash !== h && !state.drawerJob) {
+      history.replaceState(null, "", location.pathname + location.search + h);
+    }
+  }
+
+  // ---- Runs tab ----
+  let dagRunsSeq = 0, dagRunsApplied = 0;
+  async function loadDagRuns() {
+    const dag = state.dagDrawer.dag; if (!dag) return;
+    const seq = ++dagRunsSeq;
+    try {
+      const r = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs?limit=50");
+      if (seq < dagRunsApplied || state.dagDrawer.dag !== dag) return;
+      if (!r.ok) { dagRunsApplied = seq; return; }
+      const body = await r.json();
+      if (seq < dagRunsApplied || state.dagDrawer.dag !== dag) return;
+      dagRunsApplied = seq;
+      state.dagDrawer.runs = body.runs || [];
+      if (!state.dagDrawer.runKey && state.dagDrawer.runs.length) {
+        selectDagRun(state.dagDrawer.runs[0].runKey, false);
+      } else if (state.dagDrawer.runKey) {
+        loadDagRun();
+      }
+      renderDagRuns();
+    } catch (e) { if (e.message !== "unauthorized") console.warn("loadDagRuns failed:", e); }
+  }
+  function renderDagRuns() {
+    const holder = $("dgRuns"); if (!holder) return;
+    const runs = state.dagDrawer.runs || [];
+    if (!runs.length) { holder.innerHTML = '<div class="empty">No runs yet. Trigger one above.</div>'; return; }
+    holder.innerHTML =
+      '<table class="runtable"><thead><tr><th>State</th><th>Kind</th><th>Tasks</th>' +
+      "<th>Logical date</th><th>Started</th><th>Updated</th></tr></thead><tbody>" +
+      runs.map((r) => {
+        const sel = state.dagDrawer.runKey === r.runKey ? " active" : "";
+        const total = Object.values(r.taskStates || {}).reduce((a, b) => a + b, 0);
+        return '<tr class="dagrun' + sel + '" data-runkey="' + escAttr(r.runKey) + '" style="cursor:pointer">' +
+          '<td><span class="rpill ' + esc(r.state) + '"><span class="g">' + dstGlyph(r.state) + "</span>" + esc(r.state) + "</span></td>" +
+          '<td><span class="kbadge">' + esc(r.kind || "?") + "</span></td>" +
+          "<td>" + dagHistBar(r.taskStates, total) + ' <span class="faint">' + esc(total) + "</span></td>" +
+          '<td class="muted">' + esc(r.logicalDate ? r.logicalDate.replace("T", " ").replace(/\+.*/, "") : "—") + "</td>" +
+          '<td class="muted nowrap" data-ago-epoch="' + escAttr(r.createdAt) + '">' + agoEpoch(r.createdAt) + "</td>" +
+          '<td class="muted nowrap" data-ago-epoch="' + escAttr(r.updatedAt) + '">' + agoEpoch(r.updatedAt) + "</td></tr>";
+      }).join("") + "</tbody></table>";
+  }
+  function selectDagRun(runKey, doSwitch) {
+    state.dagDrawer.runKey = runKey;
+    state.dagDrawer.run = null; state.dagDrawer.xcom = null;
+    setDagHash();
+    loadDagRun();
+    renderDagRuns();
+    if (doSwitch) switchDagTab("tasks");
+  }
+
+  // ---- run detail (Tasks / Graph / XCom) + live poll ----
+  let dagRunSeq = 0;
+  async function loadDagRun() {
+    const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
+    if (!dag || !rk) return;
+    const seq = ++dagRunSeq;
+    if (state.dagRunPoll) { clearTimeout(state.dagRunPoll); state.dagRunPoll = null; }
+    try {
+      const r = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs/" + encodeURIComponent(rk));
+      if (seq !== dagRunSeq || state.dagDrawer.runKey !== rk) return;
+      if (r.ok) {
+        state.dagDrawer.run = await r.json();
+        renderDagDrawerHead();
+        renderDagRunActiveTab();
+        renderDagRuns();
+      }
+    } catch (e) { if (e.message !== "unauthorized") console.warn("loadDagRun failed:", e); }
+    finally {
+      const run = state.dagDrawer.run;
+      if (state.dagDrawer.runKey === rk && run && run.state === "running" && seq === dagRunSeq) {
+        state.dagRunPoll = setTimeout(loadDagRun, 3000);
+      }
+    }
+  }
+  function renderDagRunActiveTab() {
+    const t = state.dagDrawer.tab;
+    if (t === "tasks") renderDagTasks();
+    else if (t === "graph") renderDagGraph();
+    else if (t === "xcom") renderDagXcom();
+    else if (t === "logs") renderDagLogs();
+  }
+  // the effective state of a task in a run, deriving a mapped task's fan-in
+  // barrier from its id#i instances (the aggregate is not persisted).
+  function effTaskState(run, id) {
+    const tasks = run.tasks || {};
+    const mapped = (run.mapped || {})[id];
+    if (mapped) {
+      const items = mapped.items || [];
+      if (!items.length) return (tasks[id] || {}).state || "pending";
+      let anyFail = false, anyUpf = false, anySkip = false, allTerm = true;
+      for (let i = 0; i < items.length; i++) {
+        const s = (tasks[id + "#" + i] || {}).state || "pending";
+        if (s === "failed") anyFail = true;
+        else if (s === "upstream_failed") anyUpf = true;
+        else if (s === "skipped") anySkip = true;
+        if (s !== "success" && s !== "failed" && s !== "skipped" && s !== "upstream_failed") allTerm = false;
+      }
+      if (!allTerm) return "running";
+      if (anyFail) return "failed";
+      if (anyUpf) return "upstream_failed";
+      if (anySkip) return "skipped";
+      return "success";
+    }
+    return (tasks[id] || {}).state || "pending";
+  }
+
+  // ---- Tasks tab ----
+  function fanMeter(run, id, n) {
+    const tasks = run.tasks || {};
+    let bar = '<span class="fanmeter">';
+    for (let i = 0; i < n; i++) {
+      const s = (tasks[id + "#" + i] || {}).state || "pending";
+      const cls = s === "success" ? "success" : (s === "failed" || s === "upstream_failed") ? "failed" : (s === "running" || s === "up_for_retry") ? "running" : "";
+      bar += '<span class="' + cls + '" style="width:' + (100 / n).toFixed(2) + '%"></span>';
+    }
+    return bar + "</span>";
+  }
+  function taskDetailCell(spec, e, taskkey, st) {
+    const bits = [];
+    if (spec && spec.type === "approval") {
+      if (e.approval) {
+        const ap = e.approval;
+        bits.push('<span class="' + (ap.decision === "approved" ? "apprv" : "aprej") + '">' + esc(ap.decision) +
+          (ap.by ? " by " + esc(ap.by) : "") + "</span>");
+      } else if (st === "running" && e.awaitingApproval) {
+        bits.push('<span class="approw"><span class="pending">⏸ awaiting</span>' +
+          '<button class="btn run" data-approve="' + escAttr(taskkey) + '">✓ Approve</button>' +
+          '<button class="btn cancel" data-reject="' + escAttr(taskkey) + '">✗ Reject</button></span>');
+      }
+    }
+    if (spec && spec.type === "sensor" && e.pokeCount != null) {
+      let poke = "poke #" + e.pokeCount;
+      if (e.nextPokeAt && st === "running") poke += ', next <span data-until-epoch="' + escAttr(e.nextPokeAt) + '">' + untilEpoch(e.nextPokeAt) + "</span>";
+      bits.push('<span class="poke">⏲ ' + poke + "</span>");
+    }
+    if (st === "up_for_retry" && e.nextRetryAt) {
+      bits.push('<span class="pending">↻ retry <span data-until-epoch="' + escAttr(e.nextRetryAt) + '">' + untilEpoch(e.nextRetryAt) + "</span></span>");
+    }
+    if (e.mapItem !== undefined && e.mapItem !== null) {
+      bits.push('<span class="faint">item: ' + esc(truncStr(JSON.stringify(e.mapItem), 40)) + "</span>");
+    }
+    if (e.failReason) {
+      const recon = e.failReason.indexOf("reconciled-crash") >= 0 || e.failReason.indexOf("reconcile") >= 0;
+      bits.push('<span class="' + (recon ? "recon" : "faint") + '" title="' + escAttr(e.failReason) + '">' +
+        (recon ? "⚠ " : "") + esc(truncStr(e.failReason, 48)) + "</span>");
+    }
+    if (e.host) bits.push('<span class="faint">@' + esc(e.host) + "</span>");
+    return bits.join(" · ") || '<span class="faint">—</span>';
+  }
+  function taskRowHtml(label, spec, e, taskkey, st, extra, opts) {
+    opts = opts || {};
+    const attempt = e.attempt != null && e.attempt > 0
+      ? e.attempt + (spec && spec.retries ? "/" + (spec.retries + 1) : "")
+      : (e.attempt === 0 ? "—" : "—");
+    const exit = e.exitCode != null
+      ? '<span class="exit ' + (e.exitCode === 0 ? "zero" : "nonzero") + '">' + esc(e.exitCode) + "</span>"
+      : "—";
+    let dur = "—";
+    if (e.startedAt && e.finishedAt) dur = fmtDuration(e.finishedAt - e.startedAt);
+    else if (e.startedAt && st === "running") dur = fmtDuration(Date.now() / 1000 - e.startedAt);
+    const detail = opts.isGroup ? extra : taskDetailCell(spec, e, taskkey, st);
+    const tcls = opts.inst ? "inst" : "";
+    const typeBadge = (!opts.inst && spec && spec.type && spec.type !== "task")
+      ? ' <span class="kbadge">' + esc(spec.type) + "</span>" : "";
+    return '<tr class="' + (opts.isGroup ? "fanhead" : "") + '">' +
+      '<td class="' + tcls + '">' + label + typeBadge + "</td>" +
+      "<td>" + dstCell(st) + "</td>" +
+      '<td class="muted">' + esc(attempt) + "</td>" +
+      "<td>" + exit + "</td>" +
+      '<td class="muted nowrap">' + dur + "</td>" +
+      '<td class="reason">' + detail + "</td></tr>";
+  }
+  function renderDagTasks() {
+    const holder = $("dgTasks"); if (!holder) return;
+    const run = state.dagDrawer.run;
+    const d = state.dags.byName[state.dagDrawer.dag];
+    if (!run) { holder.innerHTML = '<div class="empty">Select a run from the Runs tab.</div>'; return; }
+    const specTasks = (d && d.tasks) || [];
+    const tasks = run.tasks || {};
+    const mapped = run.mapped || {};
+    let rows = "";
+    specTasks.forEach((spec) => {
+      const id = spec.id;
+      if (mapped[id]) {
+        const items = mapped[id].items || [];
+        const eff = effTaskState(run, id);
+        let done = 0;
+        items.forEach((_, i) => {
+          const s = (tasks[id + "#" + i] || {}).state;
+          if (s === "success" || s === "failed" || s === "skipped" || s === "upstream_failed") done++;
+        });
+        const extra = fanMeter(run, id, items.length || 1) + ' <span class="faint">' + done + "/" + items.length + " done</span>";
+        rows += taskRowHtml('<b>' + esc(id) + '</b> <span class="kbadge">fan-out ×' + items.length + "</span>",
+          spec, {}, id, eff, extra, { isGroup: true });
+        items.forEach((item, i) => {
+          const e = Object.assign({}, tasks[id + "#" + i] || { state: "pending" });
+          e.mapItem = item;
+          rows += taskRowHtml("#" + i, spec, e, id + "#" + i, e.state || "pending", "", { inst: true });
+        });
+      } else {
+        const e = tasks[id] || { state: "pending" };
+        rows += taskRowHtml("<b>" + esc(id) + "</b>", spec, e, id, e.state || "pending", "", {});
+      }
+    });
+    holder.innerHTML =
+      '<table class="runtable tasktbl"><thead><tr><th>Task</th><th>State</th><th>Attempt</th>' +
+      "<th>Exit</th><th>Duration</th><th>Detail</th></tr></thead><tbody>" + rows + "</tbody></table>";
+  }
+
+  // ---- Graph tab (client-side topological layout -> inline SVG) ----
+  function layoutDag(tasks) {
+    const byId = {}; tasks.forEach((t) => { byId[t.id] = t; });
+    const rank = {};
+    function computeRank(id, seen) {
+      if (rank[id] != null) return rank[id];
+      if (seen.has(id)) return 0;              // cycle guard (validated server-side)
+      seen.add(id);
+      let r = 0;
+      ((byId[id] && byId[id].dependsOn) || []).forEach((dep) => {
+        if (byId[dep]) r = Math.max(r, computeRank(dep, seen) + 1);
+      });
+      seen.delete(id);
+      rank[id] = r; return r;
+    }
+    tasks.forEach((t) => computeRank(t.id, new Set()));
+    const cols = {};
+    tasks.forEach((t) => { (cols[rank[t.id]] = cols[rank[t.id]] || []).push(t.id); });
+    const ranks = Object.keys(cols).map(Number).sort((a, b) => a - b);
+    const NW = 158, NH = 30, GX = 54, GY = 14;
+    const pos = {}; let maxRows = 0;
+    ranks.forEach((r) => { maxRows = Math.max(maxRows, cols[r].length); });
+    ranks.forEach((r, ci) => {
+      cols[r].forEach((id, ri) => { pos[id] = { x: ci * (NW + GX) + 10, y: ri * (NH + GY) + 10 }; });
+    });
+    return { pos, width: ranks.length * (NW + GX) + 20, height: maxRows * (NH + GY) + 20, NW: NW, NH: NH };
+  }
+  function renderDagGraph() {
+    const holder = $("dgGraph");
+    const d = state.dags.byName[state.dagDrawer.dag];
+    if (!d || !d.tasks || !d.tasks.length) { holder.innerHTML = '<div class="empty">No graph.</div>'; return; }
+    const tasks = d.tasks;
+    if (tasks.length > 140) { holder.innerHTML = '<div class="empty">Graph too large (' + tasks.length + ' tasks). Use the Tasks tab.</div>'; return; }
+    const L = layoutDag(tasks);
+    const run = state.dagDrawer.run;
+    let svg = '<svg viewBox="0 0 ' + L.width + " " + L.height + '" width="' + L.width + '" height="' + L.height + '">';
+    tasks.forEach((t) => (t.dependsOn || []).forEach((dep) => {
+      if (!L.pos[dep] || !L.pos[t.id]) return;
+      const a = L.pos[dep], b = L.pos[t.id];
+      const x1 = a.x + L.NW, y1 = a.y + L.NH / 2, x2 = b.x, y2 = b.y + L.NH / 2, mx = (x1 + x2) / 2;
+      svg += '<path class="edge" d="M' + x1 + " " + y1 + " C" + mx + " " + y1 + " " + mx + " " + y2 + " " + x2 + " " + y2 + '"/>';
+    }));
+    tasks.forEach((t) => {
+      const p = L.pos[t.id];
+      const st = run ? effTaskState(run, t.id) : null;
+      const v = st ? dstVar(st) : "fg-faint";
+      const fill = st ? "color-mix(in srgb, var(--" + v + ") 22%, var(--panel))" : "var(--panel)";
+      const stroke = "var(--" + v + ")";
+      const glyph = st ? dstGlyph(st) : (t.type === "approval" ? "?" : t.type === "sensor" ? "⏲" : "·");
+      svg += '<g class="node" data-gtask="' + escAttr(t.id) + '"><title>' + escAttr(t.id + (st ? " · " + st : "") + (t.type !== "task" ? " (" + t.type + ")" : "")) + "</title>";
+      svg += '<rect x="' + p.x + '" y="' + p.y + '" width="' + L.NW + '" height="' + L.NH + '" rx="3" fill="' + fill + '" stroke="' + stroke + '"/>';
+      svg += '<text x="' + (p.x + 8) + '" y="' + (p.y + L.NH / 2 + 3.5) + '">' + esc(glyph + " " + truncStr(t.id, 17)) + "</text>";
+      if (t.type !== "task") svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + 10) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">' + esc(t.type) + "</text>";
+      if (t.mapped) svg += '<text x="' + (p.x + L.NW - 6) + '" y="' + (p.y + L.NH - 4) + '" text-anchor="end" style="fill:var(--fg-faint);font-size:8px">fan-out</text>';
+      svg += "</g>";
+    });
+    holder.innerHTML = svg + "</svg>";
+  }
+
+  // ---- XCom tab ----
+  let dagXcomSeq = 0;
+  async function loadDagXcom() {
+    const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
+    const holder = $("dgXcom");
+    if (!rk) { holder.innerHTML = '<div class="empty">Select a run first.</div>'; return; }
+    if (state.dagDrawer.xcom && state.dagDrawer.xcom._rk === rk) { renderDagXcom(); return; }
+    holder.innerHTML = '<div class="empty">Loading XCom…</div>';
+    const seq = ++dagXcomSeq;
+    try {
+      const r = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs/" + encodeURIComponent(rk) + "/xcom");
+      if (seq !== dagXcomSeq || state.dagDrawer.runKey !== rk) return;
+      if (!r.ok) { holder.innerHTML = '<div class="empty">No XCom.</div>'; return; }
+      const body = await r.json(); body._rk = rk;
+      state.dagDrawer.xcom = body;
+      renderDagXcom();
+    } catch (e) { if (e.message !== "unauthorized") holder.innerHTML = '<div class="empty">XCom unavailable.</div>'; }
+  }
+  function renderDagXcom() {
+    const holder = $("dgXcom");
+    const x = state.dagDrawer.xcom;
+    if (!x) { holder.innerHTML = '<div class="empty">No XCom loaded.</div>'; return; }
+    const entries = x.entries || [];
+    if (!entries.length) { holder.innerHTML = '<div class="empty">This run published no XCom values.</div>'; return; }
+    holder.innerHTML =
+      '<table class="runtable"><thead><tr><th>Task</th><th>Key</th><th>Size</th><th>Value</th></tr></thead><tbody>' +
+      entries.map((e) => {
+        let val;
+        if (e.value !== undefined) val = '<div class="xcomval">' + esc(truncStr(e.value, 2000)) + "</div>";
+        else if (e.binary) val = '<span class="faint">binary (' + esc(e.sha256 ? e.sha256.slice(0, 12) : "") + "…)</span>";
+        else if (e.oversize) val = '<span class="faint">too large to inline</span>';
+        else val = '<span class="faint">—</span>';
+        return "<tr><td><b>" + esc(e.taskkey) + "</b></td><td>" + esc(e.key) + "</td>" +
+          '<td class="muted nowrap">' + (e.size != null ? esc(e.size) + " B" : "—") + "</td><td>" + val + "</td></tr>";
+      }).join("") + "</tbody></table>" + (x.truncated ? '<div class="faint" style="margin-top:6px">…more entries not shown</div>' : "");
+  }
+
+  // ---- Logs tab (live-tail a task instance's stdout/stderr) ----
+  async function readSSE(path, ctrl, hooks) {
+    let gotLine = false;
+    try {
+      const res = await apiFetch(path, { signal: ctrl.signal });
+      if (!res.ok || !res.body) { hooks.err("Could not open stream (HTTP " + res.status + ")."); return; }
+      const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
+      while (true) {
+        const rd = await reader.read();
+        if (rd.done) break;
+        buf += dec.decode(rd.value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          let ev = "message", data = "";
+          block.split("\n").forEach((ln) => {
+            if (ln.startsWith(":")) return;
+            if (ln.startsWith("event:")) ev = ln.slice(6).trim();
+            else if (ln.startsWith("data:")) data += ln.slice(5).trim();
+          });
+          if (ev === "line" && data) { try { const o = JSON.parse(data); gotLine = true; hooks.line(o.stream, o.line); } catch (_) {} }
+          else if (ev === "end") { let reason = null; try { reason = (JSON.parse(data || "{}") || {}).reason || null; } catch (_) {} hooks.end(gotLine, reason); }
+        }
+      }
+    } catch (e) { if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Stream ended: " + e.message); }
+  }
+  function stopDagTaskLog() { if (state.dagStream) { state.dagStream.abort(); state.dagStream = null; } }
+  function startDagTaskLog(taskkey) {
+    stopDagTaskLog();
+    state.dagDrawer.logTask = taskkey;
+    const term = $("dgTerm"); if (term) term.textContent = "";
+    const note = $("dgLogNote"); if (note) note.textContent = "connecting…";
+    const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
+    if (!dag || !rk || !taskkey) return;
+    const path = "/dags/" + encodeURIComponent(dag) + "/runs/" + encodeURIComponent(rk) +
+      "/tasks/" + encodeURIComponent(taskkey) + "/logs";
+    const ctrl = new AbortController();
+    state.dagStream = ctrl;
+    readSSE(path, ctrl, {
+      line: (stream, text) => {
+        const t = $("dgTerm"); if (!t) return;
+        const atBottom = t.scrollTop + t.clientHeight >= t.scrollHeight - 4;
+        t.textContent += text + "\n";
+        if (atBottom) t.scrollTop = t.scrollHeight;
+        const n = $("dgLogNote"); if (n) n.textContent = "";
+      },
+      end: (saw, reason) => { const n = $("dgLogNote"); if (n) n.textContent = saw ? "stream ended" : (reason === "no-output" ? "no live output (task is not running)" : "no output"); },
+      err: (msg) => { const n = $("dgLogNote"); if (msg && n) n.textContent = msg; },
+    });
+  }
+  function renderDagLogs() {
+    const holder = $("dgLogs");
+    const run = state.dagDrawer.run;
+    if (!run) { holder.innerHTML = '<div class="empty">Select a run first.</div>'; return; }
+    const tasks = run.tasks || {};
+    const mapped = run.mapped || {};
+    // instance keys only (skip the bare-id placeholder of a fan-out group)
+    const keys = Object.keys(tasks).filter((k) => !mapped[k]).sort();
+    const opts = keys.map((k) => {
+      const st = (tasks[k] || {}).state;
+      return '<option value="' + escAttr(k) + '"' + (state.dagDrawer.logTask === k ? " selected" : "") + ">" + esc(k + " · " + st) + "</option>";
+    }).join("");
+    holder.innerHTML =
+      '<div class="drawer-tools" style="padding:0 0 8px 0"><span class="faint">task</span> ' +
+      '<select id="dgLogTask" class="mini"><option value="">— pick a task —</option>' + opts + "</select>" +
+      '<span class="grow"></span><span class="faint" id="dgLogNote"></span></div>' +
+      '<pre class="term" id="dgTerm" style="flex:1; min-height:120px; overflow:auto"></pre>';
+    if (state.dagDrawer.logTask && tasks[state.dagDrawer.logTask]) startDagTaskLog(state.dagDrawer.logTask);
+  }
+
+  // ---- DAG control actions ----
+  async function dagDecision(taskkey, decision) {
+    const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
+    if (!dag || !rk) return;
+    try {
+      const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/runs/" + encodeURIComponent(rk) +
+        "/tasks/" + encodeURIComponent(taskkey) + "/decision",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ decision: decision, by: "dashboard" }) });
+      if (res.ok) { toast("ok", (decision === "approve" ? "✓ approved " : "✗ rejected ") + taskkey); loadDagRun(); loadDags(); }
+      else if (res.status === 409) { toast("err", "already decided / not awaiting"); loadDagRun(); }
+      else toast("err", "decision failed (HTTP " + res.status + ")");
+    } catch (e) { if (e.message !== "unauthorized") toast("err", "decision failed"); }
+  }
+  async function dagTrigger(name) {
+    try {
+      const res = await apiFetch("/dags/" + encodeURIComponent(name) + "/trigger", { method: "POST" });
+      if (res.ok) {
+        let rk = null; try { rk = (await res.json()).runKey; } catch (_) {}
+        toast("ok", "▶ triggered " + name);
+        loadDags();
+        if (state.dagDrawer.dag === name) { setTimeout(() => { loadDagRuns(); if (rk) selectDagRun(rk, true); }, 300); }
+      } else if (res.status === 404) toast("err", "no such dag");
+      else toast("err", "trigger failed (HTTP " + res.status + ")");
+    } catch (e) { if (e.message !== "unauthorized") toast("err", "trigger failed"); }
+  }
+  async function dagBackfill() {
+    const dag = state.dagDrawer.dag;
+    const from = $("dgBfFrom").value.trim(), to = $("dgBfTo").value.trim();
+    if (!from || !to) { toast("err", "from and to ISO dates are required"); return; }
+    try {
+      const res = await apiFetch("/dags/" + encodeURIComponent(dag) + "/backfill",
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ from: from, to: to }) });
+      if (res.ok) {
+        let created = null; try { created = (await res.json()).created; } catch (_) {}
+        toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + ")" : ""));
+        $("dgBackfill").style.display = "none";
+        setTimeout(loadDagRuns, 300);
+      } else { const t = await res.text().catch(() => ""); toast("err", "backfill: " + (t || "HTTP " + res.status)); }
+    } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
+  }
+
+  // ===================================================================
+  //  durable state inspector  (metadata-only)
+  // ===================================================================
+  let stateSeq = 0, stateApplied = 0;
+  async function loadState() {
+    // Probe once even while closed so the ⛁ toggle can appear when a state
+    // backend exists; after that, only poll while the inspector is open (the
+    // inventory walk is not free).
+    if (!prefs.stateInsp && state.stateInsp.probed) return;
+    const seq = ++stateSeq;
+    try {
+      const r = await apiFetch("/state");
+      if (seq < stateApplied) return;
+      if (!r.ok) { stateApplied = seq; state.stateInsp.probed = true; return; }
+      const data = await r.json();
+      if (seq < stateApplied) return;
+      stateApplied = seq;
+      state.stateInsp.probed = true;
+      state.stateInsp.data = data;
+      renderStateCard();
+    } catch (e) { if (e.message !== "unauthorized") console.warn("loadState failed:", e); }
+  }
+  function renderStateCard() {
+    const data = state.stateInsp.data;
+    const enabled = !!(data && data.enabled);
+    $("stateBtn").style.display = enabled ? "" : "none";
+    const card = $("stateCard");
+    if (!enabled || !prefs.stateInsp) { card.style.display = "none"; return; }
+    card.style.display = "";
+    const view = data.view || {};
+    $("stateTopo").textContent = (view.backend || "state") + " · " + (view.topology || "?") +
+      (view.shared_locking ? " · shared-lock" : "");
+    $("stateTopo").className = "src-chip" + (view.topology === "shared" ? " durable" : "");
+    const recs = data.records || {}, docs = data.documents || {};
+    const totalRec = Object.keys(recs).reduce((a, k) => a + (recs[k].count || 0), 0);
+    $("stateMeta").textContent = (view.path || "") + "  ·  " + totalRec + " records" +
+      (data.quarantine ? " · " + data.quarantine + " quarantined" : "");
+    // build the sub-tabs from what the inventory holds
+    const tabs = [["overview", "overview", 0]];
+    const node = data.node || {};
+    if ((node.retries || []).length) tabs.push(["retries", "retries", node.retries.length]);
+    if ((node.slots || []).length) tabs.push(["slots", "slots", node.slots.length]);
+    if ((data.leases || []).length) tabs.push(["locks", "locks", data.leases.length]);
+    ["kv", "cursor", "idem"].forEach((p) => { if (docs[p]) tabs.push([p, p, docs[p].streams || (docs[p].scopes || []).length]); });
+    ["artifacts", "runs", "reboot", "counters"].forEach((p) => { if (recs[p]) tabs.push([p, p, recs[p].streams || (recs[p].scopes || []).length]); });
+    if (!tabs.some((t) => t[0] === state.stateInsp.tab)) state.stateInsp.tab = "overview";
+    $("stateTabs").innerHTML = tabs.map((t) =>
+      '<button data-sttab="' + t[0] + '" class="' + (state.stateInsp.tab === t[0] ? "active" : "") + '">' +
+      esc(t[1]) + (t[2] ? '<span class="n">' + t[2] + "</span>" : "") + "</button>").join("");
+    renderStateTab();
+  }
+  function renderStateTab() {
+    const data = state.stateInsp.data; if (!data) return;
+    const tab = state.stateInsp.tab;
+    const body = $("stateBody");
+    if (tab === "overview") {
+      const stats = (data.stats && data.stats.ops) || {};
+      const recs = data.records || {}, docs = data.documents || {};
+      let h = '<dl class="kv">';
+      Object.keys(recs).sort().forEach((p) => { h += "<dt>records/" + esc(p) + "</dt><dd>" + esc(recs[p].count) + " in " + esc(recs[p].streams) + " stream(s)</dd>"; });
+      Object.keys(docs).sort().forEach((p) => { h += "<dt>docs/" + esc(p) + "</dt><dd>" + esc(docs[p].count) + " doc(s)</dd>"; });
+      h += "</dl>";
+      const ops = Object.keys(stats);
+      if (ops.length) {
+        h += '<table class="runtable" style="margin-top:12px"><thead><tr><th>Op</th><th>Count</th><th>Errors</th><th>Seconds</th></tr></thead><tbody>' +
+          ops.sort().map((o) => { const s = stats[o] || {}; return "<tr><td>" + esc(o) + '</td><td class="muted">' + esc(s.count || 0) + '</td><td class="' + (s.errors ? "" : "muted") + '">' + esc(s.errors || 0) + '</td><td class="muted">' + esc((s.seconds || 0).toFixed ? (s.seconds).toFixed(2) : s.seconds) + "</td></tr>"; }).join("") + "</tbody></table>";
+      }
+      body.innerHTML = h;
+    } else if (tab === "retries") {
+      const rows = (data.node.retries || []).map((r) =>
+        "<tr><td><b>" + esc(r.job) + "</b></td><td class='muted'>attempt " + esc(r.attempt) + "</td>" +
+        '<td>' + (r.nextRetryAt ? '<span class="pending" data-until-iso="' + escAttr(r.nextRetryAt) + '">' + fmtIn((new Date(r.nextRetryAt).getTime() - Date.now()) / 1000) + "</span>" : "—") + "</td>" +
+        '<td class="muted">' + (r.delaySeconds != null ? fmtDuration(r.delaySeconds) : "—") + "</td></tr>").join("");
+      body.innerHTML = '<table class="runtable"><thead><tr><th>Job</th><th>Attempt</th><th>Next retry</th><th>Backoff</th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="4" class="faint">no armed retries on this node</td></tr>') + "</tbody></table>";
+    } else if (tab === "slots") {
+      const rows = (data.node.slots || []).map((s) =>
+        "<tr><td><b>" + esc(s.slot) + "</b></td><td class='muted'>" + esc(s.holder || "—") + "</td><td>" + esc(s.refs) + "</td>" +
+        '<td class="muted" data-ago-epoch="' + escAttr(s.expiresAt) + '">' + agoEpoch(s.expiresAt) + "</td></tr>").join("");
+      body.innerHTML = '<table class="runtable"><thead><tr><th>Slot</th><th>Holder</th><th>Refs</th><th>Expires</th></tr></thead><tbody>' + rows + "</tbody></table>";
+    } else if (tab === "locks") {
+      const rows = (data.leases || []).map((l) =>
+        "<tr><td><b>" + esc(l.name) + "</b></td><td class='muted'>" + esc(l.holder || "—") + "</td><td>" + esc(l.fence) + "</td>" +
+        '<td class="' + (l.expired ? "faint" : "") + '" data-ago-epoch="' + escAttr(l.expiresAt) + '">' + (l.expired ? "expired " : "") + agoEpoch(l.expiresAt) + "</td></tr>").join("");
+      body.innerHTML = '<table class="runtable"><thead><tr><th>Lease</th><th>Holder</th><th>Fence</th><th>Expires</th></tr></thead><tbody>' +
+        (rows || '<tr><td colspan="4" class="faint">no active leases</td></tr>') + "</tbody></table>";
+    } else {
+      // a doc/record prefix: list scopes, click to drill in
+      const recs = data.records || {}, docs = data.documents || {};
+      const isDoc = !!docs[tab];
+      const bucket = isDoc ? docs[tab] : recs[tab];
+      const scopes = (bucket && bucket.scopes) || [];
+      const kind = isDoc ? "documents" : "records";
+      let h = '<div class="faint" style="margin-bottom:8px">metadata only — values are never fetched here</div>';
+      h += '<table class="runtable"><thead><tr><th>Scope</th><th>Entries</th><th></th></tr></thead><tbody>' +
+        scopes.map((s) =>
+          "<tr><td><b>" + esc(s.scope || "(default)") + "</b></td><td class='muted'>" + esc(s.count) + "</td>" +
+          '<td style="text-align:right"><button class="btn" data-stscope="' + escAttr(kind + "|" + tab + "/" + s.scope) + '">inspect</button></td></tr>').join("") +
+        "</tbody></table>";
+      h += '<div id="stateDetail" style="margin-top:12px"></div>';
+      body.innerHTML = h;
+      if (state.stateInsp.detail) renderStateDetail();
+    }
+  }
+  async function loadStateDetail(kind, path) {
+    const holder = $("stateDetail"); if (holder) holder.innerHTML = '<div class="faint">Loading…</div>';
+    try {
+      const url = kind === "documents"
+        ? "/state/documents?ns=" + encodeURIComponent(path)
+        : "/state/records?stream=" + encodeURIComponent(path);
+      const r = await apiFetch(url);
+      if (!r.ok) { if (holder) holder.innerHTML = '<div class="faint">HTTP ' + r.status + "</div>"; return; }
+      state.stateInsp.detail = { kind: kind, path: path, body: await r.json() };
+      renderStateDetail();
+    } catch (e) { if (e.message !== "unauthorized" && holder) holder.innerHTML = '<div class="faint">unavailable</div>'; }
+  }
+  function renderStateDetail() {
+    const holder = $("stateDetail"); if (!holder) return;
+    const det = state.stateInsp.detail; if (!det) { holder.innerHTML = ""; return; }
+    if (det.kind === "documents") {
+      const docs = det.body.documents || [];
+      holder.innerHTML = "<div class='faint' style='margin-bottom:6px'>" + esc(det.path) + "</div>" +
+        '<table class="runtable"><thead><tr><th>Key/Name</th><th>Value</th><th>Updated</th></tr></thead><tbody>' +
+        docs.map((d) => {
+          const k = d.key || d.name || "—";
+          let val;
+          if (d.valueType !== undefined) val = '<span class="redacted">' + esc(d.valueType) + (d.valueSize != null ? " · " + d.valueSize + " B" : "") + "</span>";
+          else if (d.value !== undefined) val = '<span class="muted">' + esc(truncStr(JSON.stringify(d.value), 60)) + "</span>";
+          else val = '<span class="faint">—</span>';
+          const upd = d.updatedAt || d.claimedAt;
+          return "<tr><td><b>" + esc(k) + "</b></td><td>" + val + '</td><td class="muted">' + esc(upd ? String(upd).replace("T", " ").replace(/\..*/, "") : "—") + "</td></tr>";
+        }).join("") + "</tbody></table>";
+    } else {
+      const recs = det.body.records || [];
+      holder.innerHTML = "<div class='faint' style='margin-bottom:6px'>" + esc(det.path) + " · newest " + recs.length + "</div>" +
+        '<pre class="xcomval" style="max-height:220px">' + esc(recs.map((r) => JSON.stringify(r)).join("\n")) + "</pre>";
+    }
+  }
 
   // ===================================================================
   //  polling control
@@ -3911,6 +4909,39 @@
     $("dDownload").addEventListener("click", downloadLogs);
     $("dTabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-tab]"); if (b) switchTab(b.getAttribute("data-tab")); });
 
+    // ---- DAG toolbar toggles + index card ----
+    $("dagsBtn").addEventListener("click", () => { prefs.dags = !prefs.dags; savePref("dags"); $("dagsBtn").classList.toggle("on", prefs.dags); state.dags.sig = null; renderDagCard(); if (prefs.dags) $("dagCard").scrollIntoView({ block: "nearest" }); });
+    $("stateBtn").addEventListener("click", () => { prefs.stateInsp = !prefs.stateInsp; savePref("stateInsp"); $("stateBtn").classList.toggle("on", prefs.stateInsp); if (prefs.stateInsp) loadState(); else renderStateCard(); });
+    $("dagRows").addEventListener("click", (e) => {
+      const trg = e.target.closest("[data-dagtrigger]");
+      if (trg) { e.stopPropagation(); dagTrigger(trg.getAttribute("data-dagtrigger")); return; }
+      const op = e.target.closest("[data-dagopen]");
+      if (op) { e.stopPropagation(); openDagDrawer(op.getAttribute("data-dagopen")); return; }
+      const tr = e.target.closest("tr[data-dag]");
+      if (tr) openDagDrawer(tr.getAttribute("data-dag"));
+    });
+
+    // ---- DAG run drawer ----
+    $("dgClose").addEventListener("click", closeDagDrawer);
+    $("dagScrim").addEventListener("click", closeDagDrawer);
+    $("dgTrigger").addEventListener("click", () => { if (state.dagDrawer.dag) dagTrigger(state.dagDrawer.dag); });
+    $("dgBackfillBtn").addEventListener("click", () => { const b = $("dgBackfill"); b.style.display = b.style.display === "none" ? "flex" : "none"; if (b.style.display === "flex") $("dgBfFrom").focus(); });
+    $("dgBfGo").addEventListener("click", dagBackfill);
+    $("dagTabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-dtab]"); if (b) switchDagTab(b.getAttribute("data-dtab")); });
+    $("dgRuns").addEventListener("click", (e) => { const tr = e.target.closest("tr[data-runkey]"); if (tr) selectDagRun(tr.getAttribute("data-runkey"), true); });
+    $("dgTasks").addEventListener("click", (e) => {
+      const ap = e.target.closest("[data-approve]");
+      if (ap) { dagDecision(ap.getAttribute("data-approve"), "approve"); return; }
+      const rj = e.target.closest("[data-reject]");
+      if (rj) { dagDecision(rj.getAttribute("data-reject"), "reject"); return; }
+    });
+    $("dgGraph").addEventListener("click", (e) => { const g = e.target.closest("[data-gtask]"); if (g) { switchDagTab("tasks"); } });
+    $("dgLogs").addEventListener("change", (e) => { if (e.target.id === "dgLogTask") { const v = e.target.value; if (v) startDagTaskLog(v); else stopDagTaskLog(); } });
+
+    // ---- durable state inspector ----
+    $("stateTabs").addEventListener("click", (e) => { const b = e.target.closest("button[data-sttab]"); if (b) { state.stateInsp.tab = b.getAttribute("data-sttab"); state.stateInsp.detail = null; renderStateCard(); } });
+    $("stateBody").addEventListener("click", (e) => { const b = e.target.closest("[data-stscope]"); if (b) { const parts = b.getAttribute("data-stscope").split("|"); loadStateDetail(parts[0], parts[1]); } });
+
     // log tools — debounce search so a big buffer isn't re-rendered per keystroke
     $("logSearch").addEventListener("input", debounce(renderTerm, 130));
     $("optRegex").addEventListener("change", renderTerm);
@@ -4048,10 +5079,21 @@
     $("fleetBtn").style.display = "none";
     $("fleetPanel").style.display = "none";
     const lease = data.lease || {};
-    const rows = Object.keys(lease)
-      .filter((k) => lease[k] !== null && lease[k] !== undefined)
-      .map((k) => "<tr><td>" + esc(k) + "</td><td>" + esc(String(lease[k])) + "</td></tr>")
-      .join("");
+    const labels = { holder: "held by", expiry: "expires", fence: "fence", electionName: "election", identity: "our identity", path: "store path" };
+    const order = ["holder", "expiry", "fence", "electionName", "identity", "path"];
+    const seen = order.filter((k) => lease[k] != null);
+    Object.keys(lease).forEach((k) => { if (lease[k] != null && seen.indexOf(k) < 0) seen.push(k); });
+    const rows = seen.map((k) => {
+      let v = String(lease[k]);
+      let cls = "";
+      if (k === "expiry") {
+        const secs = (new Date(lease.expiry).getTime() - Date.now()) / 1000;
+        v = (secs > 0 ? fmtIn(secs) : "expired") + " · " + String(lease.expiry).replace("T", " ").replace(/\..*/, "");
+      }
+      // this node holds the lease: it is the leader — highlight it
+      if (k === "holder" && lease.holder && lease.holder === lease.identity) cls = ' class="ok"';
+      return '<tr><td class="k">' + esc(labels[k] || k) + "</td><td" + cls + ">" + esc(v) + "</td></tr>";
+    }).join("");
     $("clusterLeaseRows").innerHTML =
       rows || '<tr><td colspan="2">no lease detail yet</td></tr>';
   }
@@ -5062,6 +6104,8 @@
   // reflect persisted add-on-panel prefs onto their toggles + initial render
   $("radarBtn").classList.toggle("on", prefs.radar);
   $("heatBtn").classList.toggle("on", prefs.heat);
+  $("dagsBtn").classList.toggle("on", prefs.dags);
+  $("stateBtn").classList.toggle("on", prefs.stateInsp);
   $("heatWindow").value = prefs.heatWindow;
   if (prefs.radar) renderRadar();
   if (prefs.heat) { renderHeatmap(); loadHeatmap(true); }

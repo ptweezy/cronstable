@@ -505,6 +505,13 @@ class JobRetryState:
         self.count = 0  # number of times retried
         self.task = None  # type: Optional[asyncio.Task]
         self.cancelled = False
+        # the absolute instant the currently-armed retry will fire, and the
+        # delay it is sleeping out. Set by the scheduler when a retry is armed
+        # (Cron.schedule_retry_job) so the dashboard can render a live
+        # "attempt N/M · next retry in Xs" countdown from GET /jobs; None while
+        # no retry is pending.
+        self.next_retry_at = None  # type: Optional[datetime]
+        self.scheduled_delay = None  # type: Optional[float]
 
     def next_delay(self) -> float:
         delay = self.delay

@@ -405,7 +405,7 @@ async def test_trigger_and_introspection(tmp_path):
     try:
         _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
         _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
-        dags = cron._dag.list_dags()
+        dags = await cron._dag.list_dags()
         assert dags[0]["name"] == "lin"
         assert {t["id"] for t in dags[0]["tasks"]} == {"a", "b"}
         run_key = await cron._dag.trigger_run("lin")

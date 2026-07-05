@@ -664,6 +664,24 @@ class StateBackend(abc.ABC):
         """The state view for a future ``GET /state`` / the dashboard."""
         return {"backend": self.backend_name, "topology": self.topology}
 
+    async def inventory(self) -> Dict[str, Any]:
+        """A metadata-only topology snapshot for the dashboard's state
+        inspector: health (:meth:`view_dict` + :meth:`stats`) plus, on
+        backends that can enumerate their store, per-prefix stream/document
+        counts, scope lists, and active leases.  NEVER returns record payloads
+        or document values -- the inspector is a metadata surface only.  The
+        base backend cannot enumerate, so it reports ``enumerable: false`` and
+        the health block alone."""
+        return {
+            "view": self.view_dict(),
+            "stats": self.stats(),
+            "enumerable": False,
+            "records": {},
+            "documents": {},
+            "leases": [],
+            "quarantine": 0,
+        }
+
 
 class FilesystemStateBackend(StateBackend):
     """A durable state backend over any POSIX filesystem.
@@ -1979,6 +1997,101 @@ class FilesystemStateBackend(StateBackend):
             "topology": self._topology,
             "shared_locking": self.supports_shared_locking(),
             "job_set_id": self.get_job_set_id(),
+        }
+
+    async def inventory(self) -> Dict[str, Any]:
+        """Metadata-only topology snapshot (see the base docstring).
+
+        Walks the on-disk tree off the event loop and returns per-prefix
+        stream/document counts, capped scope lists, and active leases -- never
+        a record payload or a document value.
+        """
+        loop = asyncio.get_event_loop()
+        base_dict = await loop.run_in_executor(None, self._inventory_sync)
+        base_dict["view"] = self.view_dict()
+        base_dict["stats"] = self.stats()
+        base_dict["enumerable"] = True
+        return base_dict
+
+    def _inventory_sync(self) -> Dict[str, Any]:
+        from urllib.parse import unquote
+
+        cap = 200
+
+        def decode(token: str) -> str:
+            return unquote(token, errors="replace")
+
+        def walk(root: str, suffix: str) -> Dict[str, Any]:
+            # group per first path segment: {prefix: {count, streams, scopes}}
+            groups: Dict[str, Dict[str, Any]] = {}
+            try:
+                tokens = sorted(os.listdir(root))
+            except OSError:
+                return groups
+            for tok in tokens:
+                node = os.path.join(root, tok)
+                if not os.path.isdir(node):
+                    continue
+                try:
+                    count = sum(
+                        1 for n in os.listdir(node) if n.endswith(suffix)
+                    )
+                except OSError:
+                    continue
+                logical = decode(tok)
+                prefix, _sep, scope = logical.partition("/")
+                bucket = groups.setdefault(
+                    prefix, {"count": 0, "streams": 0, "scopes": []}
+                )
+                bucket["count"] += count
+                bucket["streams"] += 1
+                if len(bucket["scopes"]) < cap:
+                    bucket["scopes"].append({"scope": scope, "count": count})
+            return groups
+
+        records = walk(os.path.join(self.base, RECORDS_DIR), ".json")
+        documents = walk(os.path.join(self.base, DOCS_DIR), ".doc")
+
+        leases: List[Dict[str, Any]] = []
+        lease_root = os.path.join(self.base, LEASES_DIR)
+        now = _now()
+        try:
+            lease_files = sorted(os.listdir(lease_root))
+        except OSError:
+            lease_files = []
+        for fname in lease_files:
+            if not fname.endswith(".lease") or len(leases) >= cap:
+                continue
+            try:
+                lease = self._read_lease_file(
+                    os.path.join(lease_root, fname)
+                )
+            except Exception:  # noqa: BLE001 - best-effort observe
+                lease = None
+            if lease is None or lease.expires_at <= 0.0:
+                continue  # released/absent lease: nobody holds it
+            leases.append(
+                {
+                    "name": decode(fname[: -len(".lease")]),
+                    "holder": lease.holder,
+                    "fence": lease.fence,
+                    "expiresAt": lease.expires_at,
+                    "expired": lease.expires_at <= now,
+                }
+            )
+
+        try:
+            quarantine = len(
+                os.listdir(os.path.join(self.base, QUARANTINE_DIR))
+            )
+        except OSError:
+            quarantine = 0
+
+        return {
+            "records": records,
+            "documents": documents,
+            "leases": leases,
+            "quarantine": quarantine,
         }
 
 

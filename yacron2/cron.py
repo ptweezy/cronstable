@@ -300,12 +300,18 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
     success = sum(1 for r in runs if r.outcome == "success")
     failure = sum(1 for r in runs if r.outcome == "failure")
     cancelled = sum(1 for r in runs if r.outcome == "cancelled")
+    # crash-reconciled runs: the daemon crashed / lost the store mid-run, so
+    # no completion was ever recorded. Bucketed on its own so it neither
+    # vanishes into `total` alone nor is miscounted as a real failure, and
+    # so the dashboard can call out interrupted runs distinctly.
+    unknown = sum(1 for r in runs if r.outcome == "unknown")
     durations = [r.duration for r in runs if r.duration is not None]
     return {
         "total": total,
         "success": success,
         "failure": failure,
         "cancelled": cancelled,
+        "unknown": unknown,
         # success rate over runs that ran to completion (excludes
         # cancellations: user-initiated, not a verdict on the job itself).
         "success_rate": (
@@ -1499,6 +1505,42 @@ class Cron:
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
+        # durable-retry visibility: when a retry ladder is armed for this job,
+        # surface attempt/backoff so the dashboard can render a live
+        # "attempt N/M · next retry in Xs" chip. The key is omitted (not the
+        # common case) when no retry is pending -- keeps the poll payload lean.
+        retry_state = self.retry_state.get(name)
+        if retry_state is not None and not retry_state.cancelled:
+            retry_cfg = job.onFailure.get("retry", {}) if job.onFailure else {}
+            max_retries = retry_cfg.get("maximumRetries")
+            result["retry"] = {
+                "attempt": retry_state.count,
+                # -1 means unlimited; surface as null (no ceiling to render).
+                "maxAttempts": None if max_retries == -1 else max_retries,
+                "nextRetryAt": (
+                    retry_state.next_retry_at.isoformat()
+                    if retry_state.next_retry_at is not None
+                    else None
+                ),
+                "delaySeconds": retry_state.scheduled_delay,
+            }
+        # a deferred @reboot one-shot still awaiting its boot run (the cluster
+        # had not elected an owner at boot): lets the dashboard distinguish
+        # "pending boot run" from "already ran".
+        if name in self._pending_reboot_jobs:
+            result["rebootPending"] = True
+        # cluster-wide concurrency slot (concurrencyScope: cluster): whether
+        # THIS node holds the job's slot lease and how many live instances
+        # reference it. Only emitted for cluster-scoped jobs.
+        if job.concurrencyScope == "cluster":
+            slot_name = self._slot_name(name)
+            lease = self._slot_leases.get(slot_name)
+            result["concurrencyScope"] = "cluster"
+            result["slot"] = {
+                "held": lease is not None,
+                "holder": lease.holder if lease is not None else None,
+                "refs": self._slot_refs.get(slot_name, 0),
+            }
         # only relevant when leader election is on, so omit it otherwise to
         # keep the per-poll payload lean for the common single-instance case.
         if self._elect_leader_configured:
@@ -1536,13 +1578,19 @@ class Cron:
         return self.web_config.get("headers", None)
 
     async def _web_list_dags(self, request: web.Request) -> web.Response:
-        return web.json_response(
-            self._dag.list_dags(), headers=self._web_headers()
-        )
+        dags = await self._dag.list_dags()
+        # graft the human-readable schedule string here (schedule_str lives in
+        # this module; dagrun cannot import it without a cycle).
+        for entry in dags:
+            cfg = self.cron_dags.get(entry["name"])
+            if cfg is not None and cfg.schedule_job is not None:
+                entry["schedule"] = schedule_str(cfg.schedule_job)
+        return web.json_response(dags, headers=self._web_headers())
 
     async def _web_dag_runs(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        runs = await self._dag.list_runs(name)
+        limit = self._web_int_query(request, "limit", default=50, lo=1, hi=500)
+        runs = await self._dag.list_runs(name, limit=limit)
         if runs is None:
             raise web.HTTPNotFound()
         return web.json_response(
@@ -1556,6 +1604,161 @@ class Cron:
         if body is None:
             raise web.HTTPNotFound()
         return web.json_response(body, headers=self._web_headers())
+
+    async def _web_dag_xcom(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        run_key = request.match_info["run_key"]
+        result = await self._dag.xcom_for_run(name, run_key)
+        if result is None:
+            raise web.HTTPNotFound()
+        return web.json_response(result, headers=self._web_headers())
+
+    # --- durable state inspector (metadata-only) --------------------------
+
+    async def _web_state(self, request: web.Request) -> web.Response:
+        """Store health + topology for the dashboard's state inspector.
+
+        Metadata only: per-prefix stream/document counts, capped scope lists,
+        and active leases -- never a record payload or a KV value.  Also
+        carries THIS node's live retry ladder and held concurrency slots
+        (the freshest source, straight from memory).  ``enabled: false`` when
+        no state backend is configured, so the inspector hides itself.
+        """
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        backend = self.state_backend
+        if backend is None:
+            return web.json_response({"enabled": False}, headers=headers)
+        try:
+            inv = await asyncio.wait_for(
+                backend.inventory(), timeout=STATE_OP_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade to health only
+            logger.warning("state: inventory failed (%s)", ex)
+            inv = {
+                "view": backend.view_dict(),
+                "stats": backend.stats(),
+                "enumerable": False,
+                "records": {},
+                "documents": {},
+                "leases": [],
+                "quarantine": 0,
+            }
+        inv["enabled"] = True
+        # this node's freshest HA state, straight from memory (no store read).
+        inv["node"] = {
+            "host": self._state_host,
+            "retries": [
+                {
+                    "job": name,
+                    "attempt": st.count,
+                    "nextRetryAt": (
+                        st.next_retry_at.isoformat()
+                        if st.next_retry_at is not None
+                        else None
+                    ),
+                    "delaySeconds": st.scheduled_delay,
+                }
+                for name, st in self.retry_state.items()
+                if not st.cancelled
+            ],
+            "slots": [
+                {
+                    "slot": slot_name,
+                    "holder": lease.holder,
+                    "fence": lease.fence,
+                    "expiresAt": lease.expires_at,
+                    "refs": self._slot_refs.get(slot_name, 0),
+                }
+                for slot_name, lease in self._slot_leases.items()
+            ],
+        }
+        return web.json_response(inv, headers=headers)
+
+    async def _web_state_documents(
+        self, request: web.Request
+    ) -> web.Response:
+        """The documents of one KV/cursor/idempotency namespace, redacted.
+
+        KV values are stripped to a ``valueSize``/``valueType`` summary
+        (metadata-only stance); cursor watermarks and idempotency claim
+        metadata are returned verbatim (no user secret there).
+        """
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        backend = self.state_backend
+        if backend is None:
+            raise web.HTTPNotFound()
+        ns = request.query.get("ns", "")
+        if not ns.startswith(("kv/", "cursor/", "idem/")):
+            raise web.HTTPBadRequest(
+                text="ns must be a kv/, cursor/ or idem/ namespace"
+            )
+        try:
+            docs = await asyncio.wait_for(
+                backend.list_documents(ns), timeout=STATE_OP_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - degrade to empty
+            docs = []
+        redact_values = ns.startswith("kv/")
+        out = []
+        for doc in docs:
+            if redact_values and "value" in doc:
+                value = doc.get("value")
+                summary = {k: v for k, v in doc.items() if k != "value"}
+                try:
+                    summary["valueSize"] = len(
+                        json.dumps(value).encode("utf-8")
+                    )
+                except (TypeError, ValueError):
+                    summary["valueSize"] = None
+                summary["valueType"] = type(value).__name__
+                out.append(summary)
+            else:
+                out.append(doc)
+        return web.json_response(
+            {"namespace": ns, "documents": out}, headers=headers
+        )
+
+    async def _web_state_records(self, request: web.Request) -> web.Response:
+        """The newest records of one stream, metadata-only.
+
+        Archived-output (``logs/``) streams are refused: they carry raw job
+        output, which the metadata-only stance keeps off this surface.
+        """
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        backend = self.state_backend
+        if backend is None:
+            raise web.HTTPNotFound()
+        stream = request.query.get("stream", "")
+        if not stream:
+            raise web.HTTPBadRequest(text="a stream is required")
+        if stream.startswith("logs/") or stream == "logs":
+            # archived job output: raw content, excluded from the metadata
+            # inspector on purpose.
+            raise web.HTTPForbidden(
+                text="log streams carry raw output and are not inspectable"
+            )
+        limit = self._web_int_query(
+            request, "limit", default=100, lo=1, hi=500
+        )
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(stream, limit=limit, newest_first=True),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - degrade to empty
+            recs = []
+        return web.json_response(
+            {"stream": stream, "records": recs}, headers=headers
+        )
 
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -1597,6 +1800,21 @@ class Cron:
         if not result.get("ok"):
             raise web.HTTPConflict(text=str(result.get("reason")))
         return web.json_response(result, headers=self._web_headers())
+
+    @staticmethod
+    def _web_int_query(
+        request: web.Request, name: str, *, default: int, lo: int, hi: int
+    ) -> int:
+        """A clamped integer query param; falls back to ``default`` on a
+        missing or unparseable value (a bad query is never a 400 here)."""
+        raw = request.query.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(lo, min(hi, value))
 
     @staticmethod
     async def _web_json_body(request: web.Request) -> Dict[str, Any]:
@@ -1705,12 +1923,34 @@ class Cron:
         last = self.last_run.get(name)
         return last.output if last is not None else None
 
-    async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:
-        assert self.web_config is not None
-        name = request.match_info["name"]
-        if name not in self.cron_jobs:
-            raise web.HTTPNotFound()
+    def _dag_task_output(
+        self, dag_name: str, run_key: str, taskkey: str
+    ) -> Optional[JobOutputStream]:
+        """The live output stream of a DAG task instance, or ``None``.
 
+        A DAG task runs as a :class:`RunningJob` under the template name
+        ``<dag>.<task_id>`` (its instances share that key), so locate the one
+        whose ``dag_ref`` matches this run + instance key.  Only a *currently
+        running* instance has a reachable buffer -- a finished DAG task's
+        output is not retained under the template name (its completion routes
+        to the DAG driver, not the per-job last_run), so this returns ``None``
+        once the task is done.
+        """
+        # the base task id: a mapped instance key is ``id#<index>``.
+        task_id = taskkey.split("#", 1)[0]
+        template_name = "{}.{}".format(dag_name, task_id)
+        for running in self.running_jobs.get(template_name, []) or []:
+            dref = getattr(running, "dag_ref", None)
+            if (
+                dref is not None
+                and dref.run_key == run_key
+                and dref.taskkey == taskkey
+            ):
+                return running.output
+        return None
+
+    def _sse_headers(self) -> Dict[str, str]:
+        assert self.web_config is not None
         headers = {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -1720,14 +1960,16 @@ class Cron:
         custom = self.web_config.get("headers", None)
         if custom:
             headers.update(custom)
-        resp = web.StreamResponse(headers=headers)
-        await resp.prepare(request)
+        return headers
 
-        output = self._job_output(name)
-        if output is None:
-            await resp.write(b'event: end\ndata: {"reason": "no-output"}\n\n')
-            return resp
+    async def _pump_output(
+        self, resp: web.StreamResponse, output: JobOutputStream
+    ) -> None:
+        """Replay the retained buffer then live-tail an output stream over SSE.
 
+        Shared by the job- and DAG-task log endpoints.  The response must
+        already be prepared.
+        """
         # Subscribe first, then snapshot the buffer: there is no await between
         # the two, so no line can slip through the gap. The snapshot holds
         # everything captured before now; the queue receives only lines
@@ -1753,6 +1995,47 @@ class Cron:
             pass
         finally:
             output.unsubscribe(queue)
+
+    async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:
+        assert self.web_config is not None
+        name = request.match_info["name"]
+        if name not in self.cron_jobs:
+            raise web.HTTPNotFound()
+
+        resp = web.StreamResponse(headers=self._sse_headers())
+        await resp.prepare(request)
+
+        output = self._job_output(name)
+        if output is None:
+            await resp.write(b'event: end\ndata: {"reason": "no-output"}\n\n')
+            return resp
+        await self._pump_output(resp, output)
+        return resp
+
+    async def _web_dag_task_logs(
+        self, request: web.Request
+    ) -> web.StreamResponse:
+        """Live-tail a DAG task instance's stdout/stderr over SSE.
+
+        Serves the LIVE output of a currently-running task instance (a
+        finished instance's buffer is not retained); the dashboard shows
+        "no live output" otherwise.
+        """
+        assert self.web_config is not None
+        name = request.match_info["name"]
+        run_key = request.match_info["run_key"]
+        taskkey = request.match_info["taskkey"]
+        if name not in self.cron_dags:
+            raise web.HTTPNotFound()
+
+        resp = web.StreamResponse(headers=self._sse_headers())
+        await resp.prepare(request)
+
+        output = self._dag_task_output(name, run_key, taskkey)
+        if output is None:
+            await resp.write(b'event: end\ndata: {"reason": "no-output"}\n\n')
+            return resp
+        await self._pump_output(resp, output)
         return resp
 
     async def start_stop_web_app(self, web_config: Optional[WebConfig]):
@@ -1802,12 +2085,23 @@ class Cron:
                 web.get("/dags", self._web_list_dags),
                 web.get("/dags/{name}/runs", self._web_dag_runs),
                 web.get("/dags/{name}/runs/{run_key}", self._web_dag_run),
+                web.get(
+                    "/dags/{name}/runs/{run_key}/xcom", self._web_dag_xcom
+                ),
+                web.get(
+                    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
+                    self._web_dag_task_logs,
+                ),
                 web.post("/dags/{name}/trigger", self._web_dag_trigger),
                 web.post("/dags/{name}/backfill", self._web_dag_backfill),
                 web.post(
                     "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
                     self._web_dag_decision,
                 ),
+                # durable state inspector (metadata-only)
+                web.get("/state", self._web_state),
+                web.get("/state/documents", self._web_state_documents),
+                web.get("/state/records", self._web_state_records),
             ]
             if metrics_config is not None:
                 # buckets apply from here on; a changed bucket set restarts
@@ -5607,6 +5901,12 @@ class Cron:
                 seconds=delay
             )
             self._persist_retry_pending(pending_job, retry_num, not_before)
+            # record the armed retry's absolute fire time so GET /jobs can
+            # render a live next-retry countdown (see _job_to_dict).
+            armed_state = self.retry_state.get(job_name)
+            if armed_state is not None:
+                armed_state.next_retry_at = not_before
+                armed_state.scheduled_delay = delay
         await asyncio.sleep(delay)
         deferrals = 0
         while True:
