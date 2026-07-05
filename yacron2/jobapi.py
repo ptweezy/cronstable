@@ -39,7 +39,7 @@ from urllib.parse import urlparse
 
 from aiohttp import web
 
-from yacron2 import jobstate
+from yacron2 import _json, jobstate
 from yacron2.jobstate import JobStateError
 from yacron2.state import Lease, StateBackend, _DocumentUnreadable
 
@@ -463,6 +463,12 @@ class JobStateAPI:
                 raise
             except JobStateError as ex:
                 return web.json_response({"error": str(ex)}, status=ex.status)
+            except _json.UnsupportedValue as ex:
+                # defence in depth: the value primitives pre-validate via
+                # _check_size, but any handler that writes a client value
+                # without it would otherwise let a non-portable value surface
+                # as a 500.  It is the caller's bad input -> a clean 400.
+                return web.json_response({"error": str(ex)}, status=400)
             except (
                 asyncio.TimeoutError,
                 OSError,
