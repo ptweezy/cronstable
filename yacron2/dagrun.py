@@ -1044,24 +1044,68 @@ class DagScheduler:
             nxt = self._cron._compute_next_fire(sched, nxt)
         return {"ok": True, "created": created}
 
-    def list_dags(self) -> List[Dict[str, Any]]:
+    async def list_dags(self) -> List[Dict[str, Any]]:
+        """Per-DAG summary for the dashboard index.
+
+        Carries the static graph (nodes + edges + per-task type/triggerRule/
+        retries/fan-out marker) plus, when a backend is present, the latest
+        run's state and a run-state histogram -- enough to render a health
+        card without an N+1 of per-DAG ``/runs`` calls.  The durable read is
+        best-effort: a slow/absent backend simply omits the run rollup rather
+        than failing the whole index (mirrors ``_web_job_trends``).  The
+        human-readable schedule string is grafted on by the web handler, which
+        owns ``schedule_str`` (avoiding a cron<->dagrun import cycle).
+        """
+        backend = self._backend()
         out = []
         for name, dagcfg in self._dags().items():
-            out.append(
-                {
-                    "name": name,
-                    "enabled": dagcfg.enabled,
-                    "scheduled": dagcfg.schedule_job is not None,
-                    "tasks": [
-                        {
-                            "id": t.spec.id,
-                            "type": t.spec.type,
-                            "dependsOn": list(t.spec.depends_on),
-                        }
-                        for t in dagcfg.tasks
-                    ],
-                }
-            )
+            entry: Dict[str, Any] = {
+                "name": name,
+                "enabled": dagcfg.enabled,
+                "scheduled": dagcfg.schedule_job is not None,
+                "retainRuns": dagcfg.retain_runs,
+                "tasks": [
+                    {
+                        "id": t.spec.id,
+                        "type": t.spec.type,
+                        "dependsOn": list(t.spec.depends_on),
+                        "triggerRule": t.spec.trigger_rule,
+                        "retries": max(0, t.spec.max_attempts - 1),
+                        "mapped": t.spec.expand is not None,
+                    }
+                    for t in dagcfg.tasks
+                ],
+            }
+            if backend is not None:
+                try:
+                    docs = await asyncio.wait_for(
+                        backend.list_documents(self._ns(name)),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - degrade, never fail /dags
+                    docs = []
+                if docs:
+                    docs.sort(
+                        key=lambda b: float(b.get("createdAt") or 0),
+                        reverse=True,
+                    )
+                    latest = docs[0]
+                    entry["latestRun"] = {
+                        "runKey": latest.get("runKey"),
+                        "state": latest.get("state"),
+                        "kind": latest.get("kind"),
+                        "createdAt": latest.get("createdAt"),
+                        "updatedAt": latest.get("updatedAt"),
+                    }
+                    counts: Dict[str, int] = {}
+                    for body in docs:
+                        st = str(body.get("state", "running"))
+                        counts[st] = counts.get(st, 0) + 1
+                    entry["runCounts"] = counts
+                    entry["totalRuns"] = len(docs)
+            out.append(entry)
         return out
 
     async def get_run(
@@ -1070,6 +1114,84 @@ class DagScheduler:
         if dag_name not in self._dags():
             return None
         return await self._read(dag_name, run_key)
+
+    async def xcom_for_run(
+        self,
+        dag_name: str,
+        run_key: str,
+        *,
+        max_value_bytes: int = 65536,
+        max_entries: int = 500,
+    ) -> Optional[Dict[str, Any]]:
+        """Every XCom value published by this run's tasks, for the dashboard.
+
+        XCom lives in the artifact store under ``dagxcom/<dag>/<run_id>`` with
+        each hand-off named ``<taskkey>/<key>`` (see :func:`dag.xcom_scope` /
+        :func:`dag.xcom_name`); this reassembles those into a flat list with
+        small values inlined (decoded as text) and larger ones surfaced as
+        metadata only.  ``None`` if the dag or run is unknown; degrades to an
+        empty list on a backend hiccup rather than failing.
+        """
+        from yacron2 import jobstate
+
+        backend = self._backend()
+        if backend is None or dag_name not in self._dags():
+            return None
+        body = await self._read(dag_name, run_key)
+        if body is None:
+            return None
+        run_id = body.get("runId")
+        result: Dict[str, Any] = {
+            "dag": dag_name,
+            "runKey": run_key,
+            "runId": run_id,
+            "entries": [],
+            "truncated": False,
+        }
+        if not run_id:
+            return result
+        scope = dag.xcom_scope(dag_name, str(run_id))
+        try:
+            records = await asyncio.wait_for(
+                jobstate.artifact_list(backend, scope),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - degrade, never 500 the tab
+            return result
+        result["truncated"] = len(records) > max_entries
+        for rec in records[:max_entries]:
+            full = str(rec.get("name") or "")
+            taskkey, _, key = full.partition("/")
+            size = rec.get("size")
+            entry: Dict[str, Any] = {
+                "taskkey": taskkey,
+                "key": key,
+                "sha256": rec.get("sha256"),
+                "size": size,
+                "at": rec.get("at"),
+            }
+            if isinstance(size, int) and 0 <= size <= max_value_bytes:
+                try:
+                    got = await asyncio.wait_for(
+                        jobstate.artifact_get(backend, scope, full),
+                        timeout=STATE_OP_TIMEOUT,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - value unreadable; skip it
+                    got = None
+                if got is not None:
+                    _rec, data = got
+                    try:
+                        entry["value"] = data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        entry["binary"] = True
+            else:
+                entry["oversize"] = True
+            result["entries"].append(entry)
+        return result
 
     async def list_runs(
         self, dag_name: str, *, limit: int = 50
