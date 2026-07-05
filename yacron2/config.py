@@ -1741,7 +1741,7 @@ def _validate_web_config(webconf: WebConfig) -> None:
         previous = bound
 
 
-@dataclass
+@dataclass(slots=True)
 class Yacron2Config:
     jobs: List[JobConfig]
     web_config: Optional[WebConfig]
