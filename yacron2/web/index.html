@@ -2880,6 +2880,9 @@
   //  drawer
   // ===================================================================
   function openDrawer(name, tab) {
+    // the two right-side drawers are mutually exclusive (openDagDrawer closes
+    // this one; mirror it here so they never overlap or fight over the hash).
+    if (state.dagDrawer && state.dagDrawer.dag) closeDagDrawer();
     const wasOpen = !!state.drawerJob;
     if (!wasOpen) pushFocus();
     state.drawerJob = name;
@@ -3942,7 +3945,7 @@
   // ===================================================================
   // extra app state (attached to the shared store)
   state.dags = { list: [], byName: {}, sig: null };
-  state.dagDrawer = { dag: null, runKey: null, tab: "runs", runs: [], run: null, xcom: null, logTask: null };
+  state.dagDrawer = { dag: null, runKey: null, tab: "runs", runs: [], run: null, xcom: null, logTask: null, collapsed: {} };
   state.dagStream = null;         // AbortController for a DAG task log SSE
   state.dagRunPoll = null;        // setTimeout handle for the open-run poll
   state.stateInsp = { data: null, tab: "overview", detail: null };
@@ -4091,6 +4094,8 @@
     state.dagDrawer.dag = dag;
     state.dagDrawer.runKey = runKey || null;
     state.dagDrawer.run = null; state.dagDrawer.xcom = null; state.dagDrawer.logTask = null;
+    state.dagDrawer.runs = [];   // clear the prior dag's runs until fresh ones load
+    state.dagDrawer.collapsed = {};
     $("dagDrawer").classList.add("open");
     $("dagDrawer").setAttribute("aria-hidden", "false");
     $("dagScrim").classList.add("open");
@@ -4237,7 +4242,10 @@
     if (t === "tasks") renderDagTasks();
     else if (t === "graph") renderDagGraph();
     else if (t === "xcom") renderDagXcom();
-    else if (t === "logs") renderDagLogs();
+    // NB: no "logs" branch — the Logs tab is push-driven by its own SSE, so a
+    // run poll must NOT re-render it (that would tear down the live stream and
+    // wipe the terminal every few seconds). renderDagLogs runs only on tab
+    // entry (switchDagTab).
   }
   // the effective state of a task in a run, deriving a mapped task's fan-in
   // barrier from its id#i instances (the aggregate is not persisted).
@@ -4349,14 +4357,18 @@
           const s = (tasks[id + "#" + i] || {}).state;
           if (s === "success" || s === "failed" || s === "skipped" || s === "upstream_failed") done++;
         });
+        const collapsed = !!state.dagDrawer.collapsed[id];
+        const caret = collapsed ? "▸" : "▾";
         const extra = fanMeter(run, id, items.length || 1) + ' <span class="faint">' + done + "/" + items.length + " done</span>";
-        rows += taskRowHtml('<b>' + esc(id) + '</b> <span class="kbadge">fan-out ×' + items.length + "</span>",
+        rows += taskRowHtml('<span data-fangroup="' + escAttr(id) + '">' + caret + " <b>" + esc(id) + '</b> <span class="kbadge">fan-out ×' + items.length + "</span></span>",
           spec, {}, id, eff, extra, { isGroup: true });
-        items.forEach((item, i) => {
-          const e = Object.assign({}, tasks[id + "#" + i] || { state: "pending" });
-          e.mapItem = item;
-          rows += taskRowHtml("#" + i, spec, e, id + "#" + i, e.state || "pending", "", { inst: true });
-        });
+        if (!collapsed) {
+          items.forEach((item, i) => {
+            const e = Object.assign({}, tasks[id + "#" + i] || { state: "pending" });
+            e.mapItem = item;
+            rows += taskRowHtml("#" + i, spec, e, id + "#" + i, e.state || "pending", "", { inst: true });
+          });
+        }
       } else {
         const e = tasks[id] || { state: "pending" };
         rows += taskRowHtml("<b>" + esc(id) + "</b>", spec, e, id, e.state || "pending", "", {});
@@ -4491,6 +4503,9 @@
   }
   function stopDagTaskLog() { if (state.dagStream) { state.dagStream.abort(); state.dagStream = null; } }
   function startDagTaskLog(taskkey) {
+    // idempotent: already tailing this exact task on a live stream -> no-op,
+    // so a re-render can never blank/reconnect an active tail.
+    if (state.dagStream && state.dagDrawer.logTask === taskkey) return;
     stopDagTaskLog();
     state.dagDrawer.logTask = taskkey;
     const term = $("dgTerm"); if (term) term.textContent = "";
@@ -4611,6 +4626,14 @@
     const totalRec = Object.keys(recs).reduce((a, k) => a + (recs[k].count || 0), 0);
     $("stateMeta").textContent = (view.path || "") + "  ·  " + totalRec + " records" +
       (data.quarantine ? " · " + data.quarantine + " quarantined" : "");
+    // skip the tabs+body rebuild when nothing changed since last poll — the
+    // per-second tick keeps countdown cells fresh, and this preserves scroll
+    // position / text selection across idle polls (mirrors renderRows).
+    const sig = JSON.stringify([data.view, recs, docs, data.node, data.leases,
+      data.quarantine, state.stateInsp.tab,
+      state.stateInsp.detail && [state.stateInsp.detail.kind, state.stateInsp.detail.path, state.stateInsp.detail.body]]);
+    if (sig === state.stateInsp.sig) return;
+    state.stateInsp.sig = sig;
     // build the sub-tabs from what the inventory holds
     const tabs = [["overview", "overview", 0]];
     const node = data.node || {};
@@ -4911,7 +4934,7 @@
 
     // ---- DAG toolbar toggles + index card ----
     $("dagsBtn").addEventListener("click", () => { prefs.dags = !prefs.dags; savePref("dags"); $("dagsBtn").classList.toggle("on", prefs.dags); state.dags.sig = null; renderDagCard(); if (prefs.dags) $("dagCard").scrollIntoView({ block: "nearest" }); });
-    $("stateBtn").addEventListener("click", () => { prefs.stateInsp = !prefs.stateInsp; savePref("stateInsp"); $("stateBtn").classList.toggle("on", prefs.stateInsp); if (prefs.stateInsp) loadState(); else renderStateCard(); });
+    $("stateBtn").addEventListener("click", () => { prefs.stateInsp = !prefs.stateInsp; savePref("stateInsp"); $("stateBtn").classList.toggle("on", prefs.stateInsp); state.stateInsp.sig = null; renderStateCard(); if (prefs.stateInsp) loadState(); });
     $("dagRows").addEventListener("click", (e) => {
       const trg = e.target.closest("[data-dagtrigger]");
       if (trg) { e.stopPropagation(); dagTrigger(trg.getAttribute("data-dagtrigger")); return; }
@@ -4934,6 +4957,8 @@
       if (ap) { dagDecision(ap.getAttribute("data-approve"), "approve"); return; }
       const rj = e.target.closest("[data-reject]");
       if (rj) { dagDecision(rj.getAttribute("data-reject"), "reject"); return; }
+      const fg = e.target.closest("[data-fangroup]");
+      if (fg) { const id = fg.getAttribute("data-fangroup"); const c = state.dagDrawer.collapsed; if (c[id]) delete c[id]; else c[id] = true; renderDagTasks(); }
     });
     $("dgGraph").addEventListener("click", (e) => { const g = e.target.closest("[data-gtask]"); if (g) { switchDagTab("tasks"); } });
     $("dgLogs").addEventListener("change", (e) => { if (e.target.id === "dgLogTask") { const v = e.target.value; if (v) startDagTaskLog(v); else stopDagTaskLog(); } });

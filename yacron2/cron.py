@@ -1505,12 +1505,18 @@ class Cron:
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
-        # durable-retry visibility: when a retry ladder is armed for this job,
+        # durable-retry visibility: when a retry ladder is ARMED for this job,
         # surface attempt/backoff so the dashboard can render a live
-        # "attempt N/M · next retry in Xs" chip. The key is omitted (not the
-        # common case) when no retry is pending -- keeps the poll payload lean.
+        # "attempt N/M · next retry in Xs" chip. Gated on count > 0: the ladder
+        # is created eagerly at launch with count 0 even for a run that will
+        # succeed, so presence alone would flag every healthy retry-configured
+        # job with a phantom "attempt 0" chip. Omitted otherwise (lean).
         retry_state = self.retry_state.get(name)
-        if retry_state is not None and not retry_state.cancelled:
+        if (
+            retry_state is not None
+            and not retry_state.cancelled
+            and retry_state.count > 0
+        ):
             retry_cfg = job.onFailure.get("retry", {}) if job.onFailure else {}
             max_retries = retry_cfg.get("maximumRetries")
             result["retry"] = {
@@ -1662,7 +1668,7 @@ class Cron:
                     "delaySeconds": st.scheduled_delay,
                 }
                 for name, st in self.retry_state.items()
-                if not st.cancelled
+                if not st.cancelled and st.count > 0
             ],
             "slots": [
                 {
@@ -1704,6 +1710,12 @@ class Cron:
             raise
         except Exception:  # noqa: BLE001 - degrade to empty
             docs = []
+        # KV values are stripped to a size/type summary (a KV value is
+        # arbitrary job-authored data that may be sensitive). Cursor
+        # watermarks are returned verbatim ON PURPOSE -- they are small
+        # progress markers (a timestamp / offset / id), the operator opted
+        # into seeing them, and hiding them would gut the cursor panel.
+        # Idempotency docs carry only key/claimedAt/expiresAt (no value).
         redact_values = ns.startswith("kv/")
         out = []
         for doc in docs:
