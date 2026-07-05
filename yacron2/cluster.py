@@ -644,7 +644,7 @@ def elect_available_job_owner(
     return _hrw_owner(job_name, [node_name, *agreeing_peer_names])
 
 
-@dataclass
+@dataclass(slots=True)
 class PeerState:
     """This node's last observation of one configured peer."""
 

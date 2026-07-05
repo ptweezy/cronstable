@@ -257,7 +257,7 @@ WEB_SECURITY_HEADERS = {
 }
 
 
-@dataclass
+@dataclass(slots=True)
 class JobRunInfo:
     """In-memory summary of a job's most recent finished run (web UI history).
 
