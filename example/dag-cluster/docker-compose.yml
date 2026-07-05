@@ -1,0 +1,91 @@
+# Three yacron2 nodes sharing one state store, running the same DAG config and
+# electing a leader over the store (backend: filesystem) -- no etcd, no gossip
+# certs, no Kubernetes. Each dag_run is advanced by exactly one node under its
+# advance lease, so a task launches exactly once across the fleet.
+#
+#   docker compose -f example/dag-cluster/docker-compose.yml up --build
+#
+# Then:
+#   * open http://localhost:8080/, :8081/ and :8082/ -- the cluster panel shows
+#     one leader; the `shard-etl` DAG fires every 2 minutes and its tasks all
+#     run on the leader (watch the per-task "on <hostname>" output);
+#   * trigger the human-gated release workflow and approve it over the API:
+#       curl -X POST http://localhost:8080/dags/release/trigger
+#       # -> {"dag":"release","runKey":"manual-...."}; then approve its gate:
+#       curl -X POST \
+#         http://localhost:8080/dags/release/runs/<runKey>/tasks/gate/decision \
+#         -H 'Content-Type: application/json' -d '{"decision":"approve","by":"me"}'
+#   * demonstrate failover / crash-resume -- stop the current leader mid-run and
+#     watch another node adopt its runs within a lease TTL and finish them:
+#       docker compose -f example/dag-cluster/docker-compose.yml stop yacron2-a
+#
+# All coordination is on the single `state` volume below; there is no other
+# shared service.
+#
+# The three nodes build the yacron2 image from this repo (so the example works
+# before the DAG feature ships in a published release). Once it is released you
+# can drop the `build:` blocks and use `image: ghcr.io/ptweezy/yacron2:latest`
+# on each node, exactly like the other cluster examples.
+services:
+  # A Docker named volume is created root-owned, but the yacron2 image runs as
+  # an unprivileged user (uid 65534). This one-shot init makes the shared store
+  # writable by that user before the nodes start; the nodes wait for it.
+  init-state:
+    image: busybox
+    command: ["chown", "-R", "65534:65534", "/state"]
+    volumes:
+      - state:/state
+
+  yacron2-a:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: yacron2:dag-cluster-local
+    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+    hostname: yacron2-a          # becomes cluster.nodeName / the lease identity
+    depends_on:
+      init-state:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
+      - state:/var/lib/yacron2/state
+
+  yacron2-b:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: yacron2:dag-cluster-local
+    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+    hostname: yacron2-b
+    depends_on:
+      init-state:
+        condition: service_completed_successfully
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
+      - state:/var/lib/yacron2/state
+
+  yacron2-c:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: yacron2:dag-cluster-local
+    command: ["-c", "/etc/yacron2/yacron2tab.yaml"]
+    hostname: yacron2-c
+    depends_on:
+      init-state:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./yacron2tab.yaml:/etc/yacron2/yacron2tab.yaml:ro
+      - state:/var/lib/yacron2/state
+
+volumes:
+  # The one shared coordination surface: the durable state store AND the leader
+  # election lease both live here. On a real fleet this is an Amazon S3 Files /
+  # EFS / NFS mount instead of a local volume; the config is identical.
+  state:
