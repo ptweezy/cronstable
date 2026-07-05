@@ -555,6 +555,27 @@ async def test_bounded_schedule_exhausts_without_crash(tmp_path):
         await _teardown(cron)
 
 
+async def test_awaiting_approval_polls_promptly(tmp_path):
+    # a run blocked on an approval gate must be re-advanced soon (so a decision
+    # made on a NON-owning node -- which cannot advance the run itself -- is
+    # picked up by the owner within a few seconds, not a full idle cycle).
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        spec = cron.cron_dags["lin"].spec
+        now = 1000.0
+        body = {
+            "tasks": {
+                "gate": {"state": dag.RUNNING, "awaitingApproval": True},
+                "other": {"state": dag.SUCCESS},
+            }
+        }
+        wake = cron._dag._compute_wake(spec, body, now)
+        assert wake == now + dagrun.APPROVAL_POLL_INTERVAL
+        assert wake < now + 60.0
+    finally:
+        await _teardown(cron)
+
+
 async def test_finish_removed_task_is_noop(tmp_path):
     # regression: a completion routed for a task the reload removed must not
     # crash (its spec is gone).

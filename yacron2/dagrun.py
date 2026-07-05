@@ -57,6 +57,11 @@ SCHEDULE_CHECK_INTERVAL = 20.0
 ADOPT_SCAN_INTERVAL = 30.0
 GC_INTERVAL = 3600.0
 
+# How often the owner re-advances a run that is blocked on an approval gate, so
+# a decision recorded on a peer node (which cannot advance a run it does not
+# own) is acted on within a few seconds rather than a full idle re-advance.
+APPROVAL_POLL_INTERVAL = 5.0
+
 # Hard cap on how many missed occurrences a single catch-up replays, mirroring
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
@@ -701,14 +706,18 @@ class DagScheduler:
     ) -> float:
         """The soonest instant this run wants advancing again.
 
-        The nearest due sensor poke or task retry; a small floor otherwise, so
-        a run that just made progress is re-checked promptly (each task
-        completion also forces an advance).
+        The nearest due sensor poke or task retry; a short poll while a gate is
+        awaiting a decision (so an approval made on a *different* node -- which
+        cannot advance a run it does not own -- is picked up by the owner in a
+        few seconds, not a full idle cycle); a longer floor otherwise (each
+        task completion on the owning node also forces an advance).
         """
         soonest = now + 60.0
         for entry in body.get("tasks", {}).values():
             state = entry.get("state")
-            if state == dag.RUNNING and entry.get("nextPokeAt") is not None:
+            if state == dag.RUNNING and entry.get("awaitingApproval"):
+                soonest = min(soonest, now + APPROVAL_POLL_INTERVAL)
+            elif state == dag.RUNNING and entry.get("nextPokeAt") is not None:
                 soonest = min(soonest, float(entry["nextPokeAt"]))
             elif state == dag.UP_FOR_RETRY and entry.get("nextRetryAt"):
                 soonest = min(soonest, float(entry["nextRetryAt"]))
