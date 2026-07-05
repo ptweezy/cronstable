@@ -52,11 +52,12 @@ RUN set -eux; \
 # Best-effort orjson (the `speedups` extra) to accelerate the durable-state and
 # cluster-gossip JSON paths; yacron2/_json falls back to the stdlib json when it
 # is absent, so this never fails the build -- it just logs, per arch, which way
-# this image went. amd64/arm64 install a manylinux wheel and need no toolchain;
-# the other published arches (386/armv7/ppc64le/s390x/riscv64) have no orjson
-# wheel, so install rustc/cargo and source-build it. A source build (especially
-# under QEMU) can import yet be miscompiled, so orjson_ok() round-trips it and a
-# failure uninstalls it -- a broken orjson is never shipped. rustc/cargo and the
+# this image went. Almost every arch (amd64/arm64/386/armv7/ppc64le/s390x)
+# installs a manylinux wheel and needs no toolchain; only riscv64 has no orjson
+# wheel, so it installs a CURRENT Rust via rustup (Debian's packaged rustc is
+# older than orjson's MSRV) and source-builds. A source build (especially under
+# QEMU) can import yet be miscompiled, so orjson_ok() round-trips it and a
+# failure uninstalls it -- a broken orjson is never shipped. The toolchain and
 # apt lists live only in this builder stage; the runtime image carries just the
 # small compiled orjson .so inside /opt/venv when the build succeeded.
 RUN set -eux; \
@@ -66,8 +67,9 @@ RUN set -eux; \
     if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
         echo "orjson: bundled (wheel)"; \
     elif apt-get -o Acquire::Retries=5 update \
-        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo \
-        && /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
+        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates \
+        && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path \
+        && env PATH="/opt/cargo/bin:$PATH" CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
         echo "orjson: bundled (source build)"; \
     else \
         echo "orjson: unavailable on this arch; using stdlib json"; \

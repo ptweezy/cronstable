@@ -274,10 +274,11 @@ jobs:
               pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
               python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
               # Bundle orjson (the `speedups` extra): a musllinux wheel on amd64/
-              # arm64, else a Rust source build (RUST_SETUP installs the toolchain
-              # only when the wheel is missing). The shared script round-trip-
-              # verifies it and drops a broken QEMU build -> stdlib json fallback.
-              RUST_SETUP="apk add --no-cache rust cargo" sh pyinstaller/install_orjson.sh
+              # arm64, else a Rust source build. RUST_SETUP installs a CURRENT
+              # Rust via rustup (distro rustc is older than orjson's MSRV) only
+              # when the wheel is missing; the shared script round-trip-verifies
+              # it and drops a broken QEMU build -> stdlib json fallback.
+              RUST_SETUP="apk add --no-cache curl && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: a musl binary on a musl host
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}-musl
@@ -362,10 +363,11 @@ jobs:
               pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
               python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
               # Bundle orjson (the `speedups` extra): a manylinux wheel on amd64/
-              # arm64, else a Rust source build (RUST_SETUP installs rustc/cargo
-              # only when the wheel is missing). The shared script round-trip-
-              # verifies it and drops a broken QEMU build -> stdlib json fallback.
-              RUST_SETUP="apt-get update && apt-get install -y --no-install-recommends rustc cargo" sh pyinstaller/install_orjson.sh
+              # arm64, else a Rust source build. RUST_SETUP installs a CURRENT
+              # Rust via rustup (distro rustc is older than orjson's MSRV) only
+              # when the wheel is missing; the shared script round-trip-verifies
+              # it and drops a broken QEMU build -> stdlib json fallback.
+              RUST_SETUP="apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
               pyinstaller pyinstaller/yacron2.spec
               dist/yacron2 --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/yacron2 dist/yacron2-linux-${{ matrix.arch }}
