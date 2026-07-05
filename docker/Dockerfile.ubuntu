@@ -41,8 +41,9 @@ RUN set -eux; \
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
 # paths; yacron2/_json falls back to stdlib json when it is absent, so this never
-# fails the build. amd64/arm64 install a wheel; the other published arches have
-# none, so a Rust toolchain is installed and orjson is source-built. A
+# fails the build. Almost every published arch installs a wheel; only riscv64
+# has none, so a CURRENT Rust is installed via rustup (distro rustc is older
+# than orjson's MSRV) and orjson is source-built. A
 # miscompiled build (e.g. under QEMU) is dropped by orjson_ok so it is never
 # shipped; the toolchain/lists stay in this builder stage, only the small orjson
 # .so rides along in /opt/venv.
@@ -53,8 +54,9 @@ RUN set -eux; \
     if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
         echo "orjson: bundled (wheel)"; \
     elif apt-get -o Acquire::Retries=5 update \
-        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends rustc cargo \
-        && /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
+        && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates \
+        && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path \
+        && env PATH="/opt/cargo/bin:$PATH" CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
         echo "orjson: bundled (source build)"; \
     else \
         echo "orjson: unavailable on this arch; using stdlib json"; \
