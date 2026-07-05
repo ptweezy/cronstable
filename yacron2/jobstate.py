@@ -34,6 +34,7 @@ as the backend's own exception.
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from yacron2 import _json
 from yacron2.state import DOC_KEEP, StateBackend
 
 # Document-namespace prefixes (under the backend's ``docs/`` tree) and the
@@ -85,16 +86,31 @@ def _require_scope(scope: str) -> str:
 
 
 def _check_size(kind: str, value: Any, max_bytes: int) -> None:
-    if max_bytes and max_bytes > 0:
-        import json
+    """Reject a client value that is unportable, then that is over-size.
 
-        size = len(json.dumps(value).encode("utf-8"))
-        if size > max_bytes:
-            raise JobStateError(
-                "{} of {} bytes exceeds the configured limit of {} "
-                "bytes".format(kind, size, max_bytes),
-                status=413,
-            )
+    Portability is checked FIRST and ALWAYS (even with no size limit): a
+    non-finite float or an out-of-64-bit-range int is written differently -- or
+    unreadably -- by a node with orjson than one without, so on a mixed fleet
+    it silently corrupts the value or permanently wedges every reading node.
+    Rejecting it here, with the SAME serializer that will persist it, gives the
+    caller a clean 400 before any store work and on every node identically --
+    instead of a 500, a silent ``null``, or an unreadable document downstream.
+    The size is then measured against the persisted (compact) bytes, not a
+    looser stdlib estimate, so the limit means what it says.
+    """
+    try:
+        encoded = _json.dumps_bytes(value)
+    except _json.UnsupportedValue as ex:
+        raise JobStateError(
+            "{} is not portable across the fleet: {}".format(kind, ex)
+        ) from ex
+    if max_bytes and max_bytes > 0 and len(encoded) > max_bytes:
+        raise JobStateError(
+            "{} of {} bytes exceeds the configured limit of {} bytes".format(
+                kind, len(encoded), max_bytes
+            ),
+            status=413,
+        )
 
 
 # --------------------------------------------------------------------------

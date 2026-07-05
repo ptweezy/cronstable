@@ -388,6 +388,40 @@ async def test_kv_size_limit(tmp_path):
     await backend.stop()
 
 
+async def test_kv_rejects_non_portable_values(tmp_path):
+    # H9/M26: a NaN/Infinity float or a >64-bit int is written differently (or
+    # unreadably) with vs. without orjson, so on a mixed fleet it corrupts the
+    # store.  It must be refused at the boundary with a clean 400, on every
+    # node, BEFORE any write -- not accepted here and unreadable elsewhere.
+    backend = _backend(tmp_path)
+    await backend.start()
+    for bad in (float("inf"), float("nan"), 2**64, {"x": float("-inf")}):
+        with pytest.raises(JobStateError) as ei:
+            await jobstate.kv_set(backend, "job-a", "k", bad)
+        assert ei.value.status == 400
+    # the rejected keys were never written -- no unreadable document remains.
+    assert await jobstate.kv_list(backend, "job-a") == []
+    # a portable value still round-trips.
+    await jobstate.kv_set(backend, "job-a", "k", {"n": 2**63 - 1})
+    got = await jobstate.kv_get(backend, "job-a", "k")
+    assert got["value"] == {"n": 2**63 - 1}
+    await backend.stop()
+
+
+async def test_cursor_rejects_non_portable_value(tmp_path):
+    # the exact reported vector: `cursor advance wm 1e400` (-> inf) on a
+    # non-orjson node would persist `{"value":Infinity}` that orjson nodes
+    # cannot read, wedging the cursor.  Refuse it up front.
+    backend = _backend(tmp_path)
+    await backend.start()
+    with pytest.raises(JobStateError) as ei:
+        await jobstate.cursor_advance(backend, "etl", "wm", float("1e400"))
+    assert ei.value.status == 400
+    # the cursor was never created, so it still reads as unset (not wedged).
+    assert await jobstate.cursor_get(backend, "etl", "wm") is None
+    await backend.stop()
+
+
 async def test_kv_list_sorted(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()
