@@ -213,9 +213,12 @@
   }
 
   /* ---------- layout ---------- */
-  /* --colsw widens the page by the net width of opted-in extra table columns
-     (set by applyCols); the classic column set leaves it at 0. */
-  main { max-width: calc(var(--maxw) + var(--colsw, 0px)); margin: 0 auto; padding: 16px 18px 60px; transition: max-width .15s ease; }
+  /* The page is centered at --maxw for the classic column set. Opting into any
+     extra table column flips the layout fluid (main.wide, toggled by applyCols)
+     so the jobs table can use the full window width instead of squeezing and
+     cutting off content; .twrap still scrolls if the columns need even more. */
+  main { max-width: var(--maxw); margin: 0 auto; padding: 16px 18px 60px; transition: max-width .15s ease; }
+  main.wide { max-width: none; }
   .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
   .search {
     flex: 1; min-width: 200px; max-width: 360px;
@@ -288,6 +291,8 @@
 
   .jobname { font-weight: 700; color: var(--fg); }
   .jobcmd { color: var(--fg-faint); margin-top: 1px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* fluid layout has the room to reveal more of the command before ellipsis */
+  main.wide .jobcmd { max-width: 560px; }
   body.density-compact .jobcmd { display: none; }
   .chip {
     display: inline-block; font-size: 11.5px; padding: 1px 7px; border-radius: var(--radius);
@@ -1891,20 +1896,20 @@
 
   // ---- configurable columns (⊞ cols) ----
   // The toggleable jobs-table columns; `on` is the out-of-the-box visibility
-  // and prefs.cols[k] overrides it. Status, Job and Actions are structural,
-  // and the Owner column stays data-driven (spread mode) — none are listed.
-  // `w` is the column's rough rendered width, used to widen the page so extra
-  // columns get real room instead of squeezing the classic set.
+  // (the "classic" set) and prefs.cols[k] overrides it. Status, Job and Actions
+  // are structural, and the Owner column stays data-driven (spread mode) — none
+  // are listed. Opting in any column without `on` flips the page fluid so the
+  // extras get real room instead of squeezing the classic set (see applyCols).
   const COLUMNS = [
-    { k: "policy", lbl: "Cluster policy",   w: 110 },
-    { k: "sched",  lbl: "Schedule",         w: 130, on: true },
-    { k: "tz",     lbl: "Timezone",         w: 110 },
-    { k: "last",   lbl: "Last run",         w: 140, on: true },
-    { k: "dur",    lbl: "Took",             w: 80,  on: true },
-    { k: "next",   lbl: "Next (countdown)", w: 90,  on: true },
-    { k: "nextat", lbl: "Next (wall clock)", w: 100 },
-    { k: "rate",   lbl: "Success rate",     w: 70 },
-    { k: "trend",  lbl: "Trend",            w: 110, on: true },
+    { k: "policy", lbl: "Cluster policy" },
+    { k: "sched",  lbl: "Schedule",         on: true },
+    { k: "tz",     lbl: "Timezone" },
+    { k: "last",   lbl: "Last run",         on: true },
+    { k: "dur",    lbl: "Took",             on: true },
+    { k: "next",   lbl: "Next (countdown)", on: true },
+    { k: "nextat", lbl: "Next (wall clock)" },
+    { k: "rate",   lbl: "Success rate" },
+    { k: "trend",  lbl: "Trend",            on: true },
   ];
   // Overrides map, hardened against a corrupt stored pref (must be an object).
   function colPrefs() { if (!prefs.cols || typeof prefs.cols !== "object") prefs.cols = {}; return prefs.cols; }
@@ -1918,17 +1923,18 @@
   // column never needs a row rebuild — same mechanism as show-owner.
   function applyCols() {
     const t = $("jobsTable");
-    let extra = 0;
+    let anyExtra = false;
     for (const c of COLUMNS) {
       const on = colOn(c.k);
       t.classList.toggle("show-" + c.k, on);
-      if (on !== !!c.on) extra += (on ? 1 : -1) * c.w;
+      // a non-classic column opted in (c.on is falsy for the extras)
+      if (on && !c.on) anyExtra = true;
     }
-    // Widen the page by the net width of the columns beyond the classic set,
-    // so opting in adds room instead of squeezing (hiding classic columns
-    // buys extras space for free; never shrink below the classic width).
-    // .twrap scroll is the fallback when the viewport can't give more.
-    document.documentElement.style.setProperty("--colsw", Math.max(0, extra) + "px");
+    // Opting into any extra column flips the whole page fluid so the jobs table
+    // can use the full window width instead of squeezing the classic columns;
+    // the classic-only set stays centered at --maxw. .twrap scrolls if even the
+    // full width can't fit every enabled column.
+    document.querySelector("main").classList.toggle("wide", anyExtra);
   }
   function renderColsMenu() {
     $("colsMenu").innerHTML = COLUMNS.map((c) =>
