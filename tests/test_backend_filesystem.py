@@ -463,9 +463,16 @@ async def test_renew_loop_survives_store_errors(tmp_path, monkeypatch):
         await asyncio.sleep(0)  # one loop tick: the round raised inside
         await asyncio.sleep(0)
         assert not task.done()  # survived
+        # Tear the loop down the way production stop() does: set the stop
+        # event FIRST, then cancel. A raw cancel() of a task parked in
+        # asyncio.wait_for(Event.wait(), ...) deadlocks on Python <= 3.11
+        # (whose wait_for predates the 3.12 asyncio.timeout reimplementation);
+        # setting the event unblocks the inner wait so the loop exits cleanly.
+        a._stop.set()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError):
             await task
+        assert task.done()  # cancellable while alive, exits on stop
     finally:
         await _stop(a)
 

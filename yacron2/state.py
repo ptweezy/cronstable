@@ -2006,7 +2006,7 @@ class FilesystemStateBackend(StateBackend):
         stream/document counts, capped scope lists, and active leases -- never
         a record payload or a document value.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         base_dict = await loop.run_in_executor(None, self._inventory_sync)
         base_dict["view"] = self.view_dict()
         base_dict["stats"] = self.stats()
