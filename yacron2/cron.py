@@ -4384,6 +4384,32 @@ class Cron:
                 )
         return self._slot_fidelity or None
 
+    async def _acquire_slot_lease(
+        self, backend: StateBackend, lease_name: str
+    ) -> Optional[Lease]:
+        """``acquire_lease`` for a cluster slot, mapping a timeout OR a raised
+        store error to ``None`` so the caller's read-back-and-policy path
+        decides.  Never raises (bar cancellation): ``_claim_cluster_slot`` runs
+        under the slot service task that ``run()`` awaits OUTSIDE its
+        try/except, so an escaped store error (flock ENOLCK/EIO, ``os.open``
+        EMFILE) would terminate the whole scheduler loop.
+        """
+        try:
+            return await asyncio.wait_for(
+                backend.acquire_lease(
+                    lease_name, self._slot_holder(), self._slot_ttl
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a raised store error is as
+            # ambiguous as a timeout; fail closed via the read-back path
+            # rather than letting it escape and crash the loop.
+            return None
+
     async def _claim_cluster_slot(self, job: JobConfig) -> bool:
         """Claim the cluster-wide concurrency slot for one launch of ``job``.
 
@@ -4446,16 +4472,7 @@ class Cron:
                 self._slot_refs[name] = self._slot_refs.get(name, 0) + 1
                 return True
             lease_name = self._slot_name(name)
-            got: Optional[Lease] = None
-            try:
-                got = await asyncio.wait_for(
-                    backend.acquire_lease(
-                        lease_name, self._slot_holder(), self._slot_ttl
-                    ),
-                    timeout=STATE_OP_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                got = None
+            got = await self._acquire_slot_lease(backend, lease_name)
             if got is None:
                 # denied, sick, or timed out -- a bounded read tells a live
                 # foreign holder apart from a store that cannot answer (the
@@ -4469,6 +4486,13 @@ class Cron:
                     )
                     answered = observed is not None
                 except asyncio.TimeoutError:
+                    pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - a raised store error here
+                    # is as ambiguous as a timeout: leave answered=False so the
+                    # "store did not answer" branch below returns _unavailable
+                    # (fail closed) instead of letting it crash the loop.
                     pass
                 if observed is not None:
                     if observed.holder == self._slot_holder():
@@ -4683,6 +4707,19 @@ class Cron:
                 continue  # unknown; retry next period
             except asyncio.CancelledError:
                 raise
+            except Exception:  # noqa: BLE001 - a RAISED store error (flock
+                # ENOLCK/EIO on NFS, a mount blip) is exactly as ambiguous as
+                # a timeout: it must NOT kill the renewer task, because a dead
+                # renewer stops renewing silently and the slot lease then
+                # expires under a live holder -> a standby takes it over and
+                # double-fires the very job the slot fences.  Retry next
+                # period, like the timeout and the sibling list/read calls.
+                logger.warning(
+                    "Job %s: cluster concurrency slot renewal errored; "
+                    "will retry next period",
+                    name,
+                )
+                continue
             if renewed is not None:
                 self._slot_leases[name] = renewed
                 continue

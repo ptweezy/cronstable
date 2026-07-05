@@ -98,6 +98,11 @@ class _DagRef:
     run_id: str
     task_id: str
     taskkey: str
+    # the claim identity of THIS instance: the proc token that claimed it and
+    # the attempt it is running.  Carried back to mark_task_finished so a
+    # superseded attempt's late completion cannot terminalise a re-claimed one.
+    proc: str
+    attempt: int
 
 
 class DagScheduler:
@@ -613,6 +618,8 @@ class DagScheduler:
                     success=False,
                     exit_code=127,
                     fail_reason="launch error",
+                    proc=proc,
+                    attempt=intent.attempt,
                 )
         # 5. terminal? release the lease; else schedule the next wake.
         final = stored if stored is not None else body
@@ -745,6 +752,8 @@ class DagScheduler:
             run_id=run_id,
             task_id=intent.task_id,
             taskkey=taskkey,
+            proc=self._cron._proc_token,
+            attempt=intent.attempt,
         )
         running = RunningJob(
             template,
@@ -767,6 +776,8 @@ class DagScheduler:
                 success=False,
                 exit_code=127,
                 fail_reason="launch failed",
+                proc=dref.proc,
+                attempt=dref.attempt,
             )
             return
         self._cron.running_jobs[template.name].append(running)
@@ -874,6 +885,8 @@ class DagScheduler:
             success=success,
             exit_code=running.retcode,
             fail_reason=running.fail_reason,
+            proc=dref.proc,
+            attempt=dref.attempt,
         )
 
     async def _finish_task(
@@ -886,6 +899,8 @@ class DagScheduler:
         success: bool,
         exit_code: Optional[int],
         fail_reason: Optional[str],
+        proc: Optional[str] = None,
+        attempt: Optional[int] = None,
     ) -> None:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
@@ -902,6 +917,8 @@ class DagScheduler:
                 now=_now(),
                 task=task,
                 jitter=jitter,
+                expected_proc=proc,
+                expected_attempt=attempt,
             )
         )
         await self._mutate(ref[0], ref[1], transform)

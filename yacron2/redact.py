@@ -64,8 +64,13 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
         lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}",
     ),
     # credentials embedded in a URL: scheme://user:PASSWORD@host (redact pass).
+    # The username is OPTIONAL (``*`` not ``+``): the credential-only form
+    # ``scheme://:PASSWORD@host`` -- how redis/mongodb/amqp connection strings
+    # carry a password with no user -- has an empty username, and requiring a
+    # username here leaked those passwords verbatim.  The ``@`` anchor keeps a
+    # plain ``host:port`` URL (no userinfo) from matching.
     (
-        re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s@]+:)([^@/\s]+)(@)"),
+        re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://[^:/\s@]*:)([^@/\s]+)(@)"),
         lambda m: f"{m.group(1)}{REDACTED}{m.group(3)}",
     ),
     # Authorization: Bearer <token> / Basic <base64 user:pass>.  The Basic
@@ -174,6 +179,30 @@ def _pem_state_after(line: str, in_pem: bool) -> bool:
         pos = match.end()
 
 
+def _starts_mid_pem(lines: List[str]) -> bool:
+    """Whether ``lines`` begins INSIDE a PEM block whose BEGIN was truncated.
+
+    ``True`` iff the first PEM marker in the batch (in position order) is an
+    ``END`` with no ``BEGIN`` before it -- the fingerprint of a private key
+    whose header line was evicted from the bounded live-log ring before
+    archiving, leaving only its base64 body and the ``END``.  Seeding
+    :func:`redact_lines` with this scrubs the leading body instead of leaking
+    it.  In untruncated output a ``BEGIN`` always precedes its ``END``, so this
+    is ``False`` and the output is byte-identical to the unseeded walk.
+    """
+    for line in lines:
+        if "-----" not in line:  # cheap gate, parallel to redact_secrets
+            continue
+        begin = _PEM_BEGIN.search(line)
+        end = _PEM_END.search(line)
+        if begin is None and end is None:
+            continue
+        return end is not None and (
+            begin is None or end.start() < begin.start()
+        )
+    return False
+
+
 def redact_lines(lines: Iterable[str]) -> List[str]:
     """Redact an ordered sequence of output lines, tracking PEM blocks.
 
@@ -183,10 +212,19 @@ def redact_lines(lines: Iterable[str]) -> List[str]:
     key material, and no per-line pattern can recognise them in isolation.  A
     block left unterminated (truncated output) stays redacted to the end --
     erring toward over-redaction, per the module contract.
+
+    The batch may also start MID-block: when a private key is printed early and
+    the run then emits enough further output that the bounded live-log ring
+    evicts the ``BEGIN`` header before archiving, the archived tail opens with
+    the key's base64 body.  :func:`_starts_mid_pem` detects that (a leading
+    ``END`` with no preceding ``BEGIN``) and seeds the walk ``in_pem`` so the
+    orphaned body is redacted rather than passed through -- the symmetric case
+    to a truncated trailing ``END``.
     """
+    materialised = list(lines)
     out: List[str] = []
-    in_pem = False
-    for line in lines:
+    in_pem = _starts_mid_pem(materialised)
+    for line in materialised:
         if in_pem:
             out.append(REDACTED)
         else:
