@@ -65,7 +65,7 @@ from yacron2.prometheus import (
     resolve_metrics_config,
 )
 from yacron2.redact import redact_lines
-from yacron2.resources import ResourceUsage
+from yacron2.resources import NodeResourceSampler, ResourceUsage
 from yacron2.state import Lease, StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
@@ -605,6 +605,11 @@ class Cron:
         # rebuilds; created before update_config so the first parse result is
         # already recorded. See yacron2.prometheus.
         self.metrics = PrometheusMetrics()
+        # whole-node CPU/memory sampler for the live node readout (GET /node
+        # and, in a gossip cluster, the fleet view). One long-lived instance
+        # so its "since last call" CPU% counters stay primed. Cheap and
+        # dependency-safe: a no-op yielding None if psutil is unavailable.
+        self._node_sampler = NodeResourceSampler()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
         # the orchestration DAGs (name -> DagConfig), maintained
@@ -1295,6 +1300,32 @@ class Cron:
             )
         return web.json_response(fleet, headers=headers)
 
+    async def _web_get_node(self, request: web.Request) -> web.Response:
+        """This node's live CPU/memory (the dashboard's node readout).
+
+        Whole-host CPU% and memory plus this daemon's own footprint, sampled
+        fresh per request from :class:`yacron2.resources.NodeResourceSampler`.
+        ``resources`` is ``null`` when sampling is unavailable (psutil could
+        not read the host); the dashboard then hides the node meter.
+        """
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        # the cluster node name when clustered, else the plain hostname the
+        # durable-state layer already uses as this node's identity.
+        mgr = self.cluster_manager
+        node_name = (
+            mgr.node_name
+            if mgr is not None and getattr(mgr, "node_name", None)
+            else self._state_host
+        )
+        return web.json_response(
+            {
+                "node_name": node_name,
+                "resources": self._node_sampler.snapshot(),
+            },
+            headers=headers,
+        )
+
     async def _web_metrics(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         accept = request.headers.get("Accept", "")
@@ -1563,6 +1594,23 @@ class Cron:
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
+        # live CPU/memory of the currently-running instances (monitorResources
+        # jobs only). Summed across instances so a job running N copies shows
+        # its aggregate footprint; omitted entirely when nothing is monitored
+        # or no sample has landed yet, so an unmonitored job's payload is
+        # unchanged.
+        live_snaps = [
+            snap
+            for runjob in running
+            if (snap := runjob.live_resources()) is not None
+        ]
+        if live_snaps:
+            result["running_resources"] = {
+                "cpu_percent": sum(s["cpu_percent"] for s in live_snaps),
+                "cpu_seconds": sum(s["cpu_seconds"] for s in live_snaps),
+                "rss_bytes": sum(s["rss_bytes"] for s in live_snaps),
+                "instances": len(live_snaps),
+            }
         # durable-retry visibility: when a retry ladder is ARMED for this job,
         # surface attempt/backoff so the dashboard can render a live
         # "attempt N/M · next retry in Xs" chip. Gated on count > 0: the ladder
@@ -2142,6 +2190,7 @@ class Cron:
                 web.get("/job-set-id", self._web_job_set_id),
                 web.get("/cluster", self._web_get_cluster),
                 web.get("/fleet", self._web_get_fleet),
+                web.get("/node", self._web_get_node),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
