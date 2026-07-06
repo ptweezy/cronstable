@@ -4094,7 +4094,15 @@
     if (!lr || lr.outcome !== "unknown") return "";
     return '<span class="ha-chip recon" title="' + escAttr(lr.fail_reason || "run interrupted; no completion was recorded") + '">⚠ interrupted</span>';
   }
-  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job); }
+  // live CPU/memory of a currently-running monitored job, shown inline in the
+  // status cell so the list conveys load at a glance (full detail in the drawer).
+  function liveResChip(job) {
+    if (!job.running || !job.running_resources) return "";
+    const rr = job.running_resources;
+    return '<span class="ha-chip live-res" title="live CPU% and resident memory of the running instance(s)">▮ ' +
+      fmtPercent(rr.cpu_percent) + " · " + fmtBytes(rr.rss_bytes) + "</span>";
+  }
+  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job) + liveResChip(job); }
 
   // ---- DAG index card ----
   let dagReqSeq = 0, dagAppliedSeq = 0;
