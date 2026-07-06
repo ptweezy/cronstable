@@ -1644,8 +1644,9 @@ class DagScheduler:
                         or now - float(updated) < grace
                     ):
                         continue  # too recent, or undatable: keep
-                    await self._delete_run(backend, name, run_key,
-                                           body.get("runId"))
+                    await self._delete_run(
+                        backend, name, run_key, body.get("runId")
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - one dag must not stop the pass
