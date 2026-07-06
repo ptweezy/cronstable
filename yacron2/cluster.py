@@ -1356,6 +1356,15 @@ class ClusterManager(LeadershipBackend):
             "job_summaries": job_summaries,
             "job_summaries_truncated": summaries_truncated,
         }
+        # node stats ride along ONLY when node-stats sharing is enabled and the
+        # sampler produced a reading: the key is omitted otherwise so a cluster
+        # not sharing them gossips byte-identical payloads (and keeps the 304
+        # optimisation intact). When present its live values roll the ETag each
+        # round, so a full body ships at the poll cadence -- the intended cost
+        # of fresh fleet-wide load numbers.
+        if node_stats is not None:
+            payload["node_stats"] = node_stats
+        return payload
 
     @staticmethod
     def _peer_etag(payload: Dict[str, Any], now_epoch: float) -> str:
@@ -2080,6 +2089,11 @@ class ClusterManager(LeadershipBackend):
             # unchanged, so fleet_view ages the countdowns from the true
             # receipt time; see PeerState.job_summaries_at).
             "peer_job_summaries_at": now,
+            # the peer's whole-node CPU/memory, re-built field-by-field from
+            # the untrusted payload (see _parse_node_stats). None (absent -- a
+            # peer not sharing node stats, or an older build) keeps any
+            # previously-absorbed reading rather than blanking it.
+            "peer_node_stats": _parse_node_stats(data.get("node_stats")),
         }
         self.view.record_success(
             host,
