@@ -77,6 +77,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/job-set-id` | `_web_job_set_id` | `200` |
 | `GET` | `/cluster` | `_web_get_cluster` | `200` |
 | `GET` | `/fleet` | `_web_get_fleet` | `200` |
+| `GET` | `/node` | `_web_get_node` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
@@ -338,6 +339,39 @@ The summaries are observability data only: they never feed leader election or
 any run/skip decision, and a malformed or hostile peer payload degrades to
 "no data for that node" rather than poisoning the view.
 
+### `GET /node`
+
+The serving node's **live** CPU and memory, sampled fresh per request (this is
+what drives the dashboard header's node meter). Returns the node identity and a
+`resources` object:
+
+```shell
+$ http get http://127.0.0.1:8080/node
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "node_name": "node-a",
+    "resources": {
+        "cpu_percent": 37.2,
+        "cpu_count": 8,
+        "mem_percent": 61.4,
+        "mem_used_bytes": 5284167680,
+        "mem_total_bytes": 8589934592,
+        "proc_rss_bytes": 58720256,
+        "proc_cpu_percent": 1.1
+    }
+}
+```
+
+`node_name` is the cluster node name when clustered, else the hostname.
+`cpu_percent` / `mem_percent` are whole-host utilisation; `proc_rss_bytes` /
+`proc_cpu_percent` are the yacron2 daemon's own footprint (best-effort, may be
+absent if the platform denies the per-process read). `resources` is `null` when
+host sampling is unavailable (psutil could not read the host), and the
+dashboard then hides the meter. CPU percentages are measured since the previous
+sample, so the first request after startup reads a priming `0`.
+
 ### `POST /jobs/{name}/start`
 
 Launches the named job immediately, regardless of its schedule. `{name}` is the
@@ -400,6 +434,7 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `captureStdout`, `captureStderr` | Which output streams the job captures, and therefore which are available from `/jobs/{name}/logs`. |
 | `utc`, `timezone` | The schedule's reference frame: `utc` (default `true`) and the IANA `timezone` name, or `null`. |
 | `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
+| `running_resources` | Present only while a [`monitorResources`](Configuration-Reference#metrics) job has a running instance: the **live** CPU/memory of the running instance(s), summed — `{cpu_percent, cpu_seconds, rss_bytes, instances}`. Omitted otherwise. `cpu_percent` is usage since the last sample and can exceed 100 across cores. |
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
