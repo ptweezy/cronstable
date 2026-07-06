@@ -5,9 +5,12 @@ migration (local disk <-> an Amazon S3 Files / EFS mount -- the same POSIX
 layout either way, so a migration is a faithful file copy), manual garbage
 collection, a health/inventory check, and record-scheme migration.  All of
 it works offline, straight from the ``state`` config section, with no
-running daemon required; against a RUNNING daemon every command stays safe
-(records are immutable, copies/reads never lock), though a backup taken
-mid-write is a point-in-time-ish snapshot rather than an exact one.
+running daemon required.  Against a RUNNING daemon the commands that only
+read the store (or write through the backend's own locked paths) stay safe
+-- records are immutable, copies/reads never lock -- though a backup taken
+mid-write is a point-in-time-ish snapshot rather than an exact one.  The
+exceptions are ``restore --force`` and ``migrate --force``: both write
+straight into a store's namespace and are NOT safe while a daemon uses it.
 
 Imported lazily by ``yacron2.__main__`` only when a ``state`` subcommand is
 used, so the daemon's import graph (and the stateless install) pays nothing
@@ -16,6 +19,7 @@ for it.
 
 import asyncio
 import io
+import json
 import os
 import shutil
 import socket
@@ -88,23 +92,36 @@ def cmd_backup(config_arg: str, output: str) -> int:
         print("state: nothing to back up: {} does not exist".format(base))
         return 1
     count = 0
-    with tarfile.open(output, "w:gz") as tar:
-        for full, arcname in _walk_carried(base):
-            # Read the file fully BEFORE writing its tar header: tar.add
-            # streams header-then-data, so a read failing midway (a prune,
-            # a Windows sharing violation) would truncate the member and
-            # silently corrupt the whole archive. Records are small; a
-            # file that cannot be read is skipped, by design for a backup
-            # taken against a live daemon.
-            try:
-                with open(full, "rb") as fobj:
-                    payload = fobj.read()
-                info = tar.gettarinfo(full, arcname=arcname)
-            except OSError:
-                continue
-            info.size = len(payload)
-            tar.addfile(info, io.BytesIO(payload))
-            count += 1
+    # The archive gets the store's own 0o600, not the default 0o644: it
+    # flattens records/docs/blobs -- captured job output, KV values,
+    # artifact payloads, exactly where secrets live -- into one file, so a
+    # world-readable archive would leak everything the store's 0o700/0o600
+    # tree keeps private.  os.open's mode only applies to a NEW file, so a
+    # pre-existing output is chmod'ed too, before any content is written.
+    # (On Windows the POSIX mode is mostly a no-op; POSIX is where the
+    # leak is.)
+    out_fd = os.open(
+        output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )
+    with os.fdopen(out_fd, "wb") as out_fobj:
+        os.chmod(output, 0o600)
+        with tarfile.open(fileobj=out_fobj, mode="w:gz") as tar:
+            for full, arcname in _walk_carried(base):
+                # Read the file fully BEFORE writing its tar header: tar.add
+                # streams header-then-data, so a read failing midway (a
+                # prune, a Windows sharing violation) would truncate the
+                # member and silently corrupt the whole archive. Records are
+                # small; a file that cannot be read is skipped, by design
+                # for a backup taken against a live daemon.
+                try:
+                    with open(full, "rb") as fobj:
+                        payload = fobj.read()
+                    info = tar.gettarinfo(full, arcname=arcname)
+                except OSError:
+                    continue
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+                count += 1
     print(
         "state: backed up {} file(s) from {} to {}".format(count, base, output)
     )
@@ -133,8 +150,26 @@ def _safe_members(
         yield member
 
 
+def _lease_fence(payload: bytes) -> Optional[int]:
+    """The fence counter in a lease file's JSON; ``None`` if unparseable."""
+    try:
+        return int(json.loads(payload)["fence"])
+    except Exception:  # noqa: BLE001 - unparseable means unprovable
+        return None
+
+
 def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
-    """Extract a backup archive into the configured store namespace."""
+    """Extract a backup archive into the configured store namespace.
+
+    Every member lands via a temp sibling + atomic replace (the same
+    pattern as :func:`cmd_migrate`), never a stream into the final path: a
+    concurrent reader of a half-written ``.json`` would see a torn record,
+    which the store QUARANTINES -- silently losing the restored record.
+    When merging into a populated store, a lease file only replaces the
+    current one if its archived fence is not older (fence-max merge): a
+    lease file is its fence counter's only home, and regressing it would
+    hand out already-issued fence values (double execution in a fleet).
+    """
     backend = _load_state_backend(config_arg)
     base = backend.base
     populated = any(
@@ -145,23 +180,75 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
     if populated and not force:
         print(
             "state: refusing to restore into the non-empty store at {} "
-            "(pass --force to merge into it)".format(base)
+            "(pass --force to merge into it; NOT safe while a daemon "
+            "uses it)".format(base)
         )
         return 1
     os.makedirs(base, mode=0o700, exist_ok=True)
     count = 0
+    skipped_leases = 0
     with tarfile.open(archive, "r:gz") as tar:
         for member in _safe_members(tar, base):
-            # extract with modest permissions; the daemon re-creates its
-            # directory modes, and record files carry job output (0o600).
-            member.mode = 0o600
-            tar.extract(member, path=base)
+            fobj = tar.extractfile(member)
+            if fobj is None:
+                continue
+            payload = fobj.read()
+            target = os.path.join(base, member.name.replace("/", os.sep))
+            if populated and member.name.startswith(LEASES_DIR + "/"):
+                if not member.name.endswith(".lease"):
+                    # a .lock side-file carries no data, and a live daemon
+                    # may hold an OS lock on that very inode: replacing it
+                    # would split the lock across two inodes.
+                    continue
+                current: Optional[int] = None
+                current_exists = os.path.exists(target)
+                if current_exists:
+                    try:
+                        with open(target, "rb") as cur:
+                            current = _lease_fence(cur.read())
+                    except OSError:
+                        current = None
+                archived = _lease_fence(payload)
+                if current_exists and (
+                    archived is None or current is None or archived < current
+                ):
+                    # cannot prove the archived fence is >= the store's:
+                    # keep the current lease file.
+                    skipped_leases += 1
+                    continue
+            os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+            tmp = target + ".restoring"
+            try:
+                # created 0o600 (record files carry job output) and swapped
+                # in via the backend's replace, which rides out transient
+                # Windows sharing violations (AV scans, readers).
+                fdesc = os.open(
+                    tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(fdesc, "wb") as tmp_fobj:
+                    tmp_fobj.write(payload)
+                FilesystemStateBackend._replace(tmp, target)
+            except OSError as ex:
+                print(
+                    "state: failed to restore {}: {}".format(member.name, ex)
+                )
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return 1
             count += 1
     print(
         "state: restored {} file(s) from {} into {}".format(
             count, archive, base
         )
     )
+    if skipped_leases:
+        print(
+            "state: kept {} current lease file(s) whose archived fence "
+            "was older (restoring those would regress fence "
+            "counters)".format(skipped_leases)
+        )
     return 0
 
 
