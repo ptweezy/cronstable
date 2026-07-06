@@ -25,7 +25,8 @@ durable stream of finished-run records per job (distinct from the
 derived "last fired" cursor, computed as the maximum over a stream's immutable
 records, never stored as a mutable file. A **lease** is a TTL claim guarded by
 an advisory `flock`. A **manifest** is a node's periodic record of which job
-names its loaded config defines, the anchor for garbage collection.
+names (plus which shared artifact scopes and dag names) its loaded config
+defines, the anchor for garbage collection.
 
 **On this page:**
 [Quickstart](#quickstart) ·
