@@ -88,6 +88,12 @@ else
     echo "  distribution: ${DISTRIBUTION:-spread}"
     echo "  interval: ${INTERVAL:-10}"
     echo "  driftAfter: ${DRIFT_AFTER:-2}"
+    # Share each node's live CPU/memory across the cluster for the dashboard's
+    # fleet view + cluster panel (backend is gossip, so this is just an opt-in
+    # marker -- the election mesh already carries the data). SHARE_NODE_STATS=
+    # false keeps the fleet job summaries but drops the load numbers.
+    echo "  observability:"
+    echo "    shareNodeStats: ${SHARE_NODE_STATS:-true}"
     echo "  peers:"
     # split CLUSTER_HOSTS on commas/spaces, drop our own entry
     for hp in $(echo "$CLUSTER_HOSTS" | tr ',' ' '); do
