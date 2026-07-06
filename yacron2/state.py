@@ -538,8 +538,17 @@ class StateBackend(abc.ABC):
         *,
         limit: Optional[int] = None,
         newest_first: bool = False,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Read back a stream's records (corrupt ones quarantined)."""
+        """Read back a stream's records (corrupt ones quarantined).
+
+        ``strict=True`` makes an environmentally-unreadable record (an NFS
+        blip) or one written by a NEWER schema PROPAGATE as an exception
+        instead of being silently skipped -- required by any caller for whom
+        a missed record is worse than a failed read (the orphan-blob sweep,
+        which must not mistake "a reference I could not read" for "no
+        reference").  The default stays best-effort.
+        """
 
     @abc.abstractmethod
     async def list_stream_names(self, prefix: str) -> List[str]:
@@ -553,6 +562,22 @@ class StateBackend(abc.ABC):
         first discover which members currently exist.  Best-effort: an
         unreadable store returns ``[]`` rather than raising.
         """
+
+    async def list_stream_names_audit(
+        self, prefix: str
+    ) -> "Tuple[List[str], bool]":
+        """``(names, complete)``: the listing plus whether it is exhaustive.
+
+        ``complete`` is ``False`` when a stream matching ``prefix`` exists
+        but could not be NAMED (a legacy length-truncated directory without
+        its logical-name sidecar, which :meth:`list_stream_names` silently
+        skips).  A caller that will DELETE based on the listing -- the
+        orphan-blob sweep builds its referenced-digest set from it -- must
+        distinguish "no other streams" from "streams I cannot see" and keep
+        on any doubt.  The base backend cannot enumerate at all, so it
+        reports an incomplete empty listing.
+        """
+        return [], False
 
     @abc.abstractmethod
     async def derive_max(self, stream: str, field: str) -> Optional[Any]:
@@ -616,6 +641,22 @@ class StateBackend(abc.ABC):
     @abc.abstractmethod
     async def list_documents(self, namespace: str) -> List[Dict[str, Any]]:
         """Every readable document body in ``namespace``, order-independent."""
+
+    async def list_document_namespaces(
+        self, prefix: str
+    ) -> "Tuple[List[str], bool]":
+        """``(namespaces, complete)``: namespaces starting with ``prefix``.
+
+        The garbage collector uses this to discover the per-dag run-document
+        namespaces (``dagrun/<dag>``) so it can keep every live run's XCom
+        stream and collect the runs of dags removed from config.  ``complete``
+        is ``False`` when a matching namespace exists on disk but its logical
+        name is unrecoverable (a length-truncated directory -- document
+        namespaces have no name sidecar), so a deleting caller keeps instead.
+        The base backend cannot enumerate at all, so it reports an incomplete
+        empty listing.
+        """
+        return [], False
 
     # --- content-addressed blobs (job-facing artifact payloads) ----------
 
@@ -1361,14 +1402,22 @@ class FilesystemStateBackend(StateBackend):
         *,
         limit: Optional[int] = None,
         newest_first: bool = False,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
         return await self._call(
-            "list", self._list_sync, stream, limit, newest_first
+            "list", self._list_sync, stream, limit, newest_first, strict
         )
 
     async def list_stream_names(self, prefix: str) -> List[str]:
         return await self._call(
             "list-stream-names", self._list_stream_names_sync, prefix
+        )
+
+    async def list_stream_names_audit(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
+        return await self._call(
+            "list-stream-names", self._list_stream_names_audit_sync, prefix
         )
 
     def _read_stream_name_sidecar(
@@ -1413,15 +1462,24 @@ class FilesystemStateBackend(StateBackend):
             )
 
     def _list_stream_names_sync(self, prefix: str) -> List[str]:
+        return self._list_stream_names_audit_sync(prefix)[0]
+
+    def _list_stream_names_audit_sync(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
         from urllib.parse import unquote
 
         records_root = os.path.join(self.base, RECORDS_DIR)
         token_prefix = _fs_safe_fragment(prefix)
         try:
             tokens = os.listdir(records_root)
+        except FileNotFoundError:
+            # no store written yet: exhaustively empty, not unreadable.
+            return [], True
         except OSError:
-            return []
+            return [], False
         names: List[str] = []
+        complete = True
         for token in tokens:
             if not token.startswith(token_prefix):
                 continue
@@ -1434,20 +1492,24 @@ class FilesystemStateBackend(StateBackend):
                 # verifiable sidecar is SKIPPED, never returned garbled --
                 # a garbled name re-encodes to a different token, so a GC
                 # keep-set built from it would miss the real stream and its
-                # host's state would be collected as garbage.
+                # host's state would be collected as garbage.  The skip is
+                # reported through ``complete`` so the orphan-blob sweep can
+                # tell this listing hides a stream (whose records may still
+                # reference blobs) and keep instead.
                 name = self._read_stream_name_sidecar(stream_dir, token)
                 if name is not None:
                     names.append(name)
+                else:
+                    complete = False
                 continue
             names.append(unquote(token, errors="replace"))
-        return sorted(names)
+        return sorted(names), complete
 
     def _list_sync(
         self,
         stream: str,
         limit: Optional[int],
         newest_first: bool,
-        *,
         strict: bool = False,
     ) -> List[Dict[str, Any]]:
         stream_dir = self._stream_dir(stream)
@@ -1891,6 +1953,45 @@ class FilesystemStateBackend(StateBackend):
         return await self._call(
             "doc-list", self._list_documents_sync, namespace
         )
+
+    async def list_document_namespaces(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
+        return await self._call(
+            "doc-list", self._list_document_namespaces_sync, prefix
+        )
+
+    def _list_document_namespaces_sync(
+        self, prefix: str
+    ) -> Tuple[List[str], bool]:
+        from urllib.parse import unquote
+
+        docs_root = os.path.join(self.base, DOCS_DIR)
+        token_prefix = _fs_safe_fragment(prefix)
+        try:
+            tokens = os.listdir(docs_root)
+        except FileNotFoundError:
+            # no document ever written: exhaustively empty, not unreadable.
+            return [], True
+        except OSError:
+            return [], False
+        names: List[str] = []
+        complete = True
+        for token in tokens:
+            if not token.startswith(token_prefix):
+                continue
+            if not os.path.isdir(os.path.join(docs_root, token)):
+                continue
+            if _FS_TRUNCATION_MARKER in token:
+                # a truncated namespace token is not decodable and (unlike a
+                # record stream) has no logical-name sidecar to recover it
+                # from: report the listing incomplete rather than hand a
+                # garbled name to the GC, which would then collect the XCom
+                # streams this namespace's run documents still anchor.
+                complete = False
+                continue
+            names.append(unquote(token, errors="replace"))
+        return sorted(names), complete
 
     def _list_documents_sync(self, namespace: str) -> List[Dict[str, Any]]:
         ns_dir = self._doc_dir(namespace)
