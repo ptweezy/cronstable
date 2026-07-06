@@ -2013,8 +2013,14 @@ class FilesystemStateBackend(StateBackend):
         digest = hashlib.sha256(data).hexdigest()
         path = self._blob_path(digest)
         # content-addressed: an existing blob with this digest already holds
-        # exactly this payload, so skip the rewrite (and its fsync cost).
+        # exactly this payload, so skip the rewrite (and its fsync cost) --
+        # but refresh its mtime, which is the orphan-blob sweep's age guard:
+        # this payload was just (re)published and its new record has not
+        # landed yet, so a concurrent sweep whose surviving references are
+        # all mid-deletion must read it as too-young, not as an aged orphan.
         if os.path.exists(path):
+            with contextlib.suppress(OSError):
+                os.utime(path)
             return digest
         self._makedirs_durable(os.path.dirname(path))
         # _atomic_write renames over any existing file; a concurrent writer of
