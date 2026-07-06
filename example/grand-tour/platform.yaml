@@ -366,7 +366,10 @@ jobs:
   - name: catalog-build-inmemory
     command: |
       echo "catalog-build-inmemory allocating ~256MB on $HOSTNAME"
-      blob=$(yes meridian-catalog-row | head -c 268435456); export blob
+      # keep the blob shell-LOCAL (no export): the external `sleep` below would
+      # otherwise inherit a 256MB environment and fail with E2BIG. Unexported,
+      # it still holds ~256MB resident in this shell for the sampler to see.
+      blob=$(yes meridian-catalog-row | head -c 268435456)
       echo "holding ${#blob} bytes resident ~25s on $HOSTNAME"
       sleep 25
     schedule: "* * * * *"
@@ -378,7 +381,9 @@ jobs:
   - name: report-render-buffer
     command: |
       echo "report-render-buffer allocating ~400MB on $HOSTNAME"
-      blob=$(yes meridian-report-cell | head -c 419430400); export blob
+      # shell-local (no export) so the external `sleep` does not inherit a
+      # 400MB environment and fail with E2BIG; still held resident here.
+      blob=$(yes meridian-report-cell | head -c 419430400)
       echo "holding ${#blob} bytes resident ~20s on $HOSTNAME"
       sleep 20
     schedule: "*/2 * * * *"
