@@ -2739,8 +2739,9 @@ class Cron:
             # stream ages out like any other) and collects removed dags' run
             # documents; skipped entirely -- everything kept -- while any
             # recent manifest predates scope advertising.
-            await self._gc_dag_state(backend, keep, art_scopes, live_dags,
-                                     grace)
+            await self._gc_dag_state(
+                backend, keep, art_scopes, live_dags, grace
+            )
         else:
             logger.info(
                 "state: leaving artifact streams and dag-run documents "
@@ -2820,13 +2821,13 @@ class Cron:
             )
             return
         removed_dags = {
-            ns[len(DAG_RUN_NS_PREFIX):] for ns in namespaces
+            ns[len(DAG_RUN_NS_PREFIX) :] for ns in namespaces
         } - live_dags
         if removed_dags:
             await self._dag.gc_removed_dags(backend, removed_dags, grace)
         try:
             for ns in namespaces:
-                dag_name = ns[len(DAG_RUN_NS_PREFIX):]
+                dag_name = ns[len(DAG_RUN_NS_PREFIX) :]
                 docs = await asyncio.wait_for(
                     backend.list_documents(ns),
                     timeout=STATE_OP_TIMEOUT,
@@ -2885,9 +2886,7 @@ class Cron:
                 "references cannot be ruled out"
             )
             return
-        scopes = [
-            name[len(ARTIFACT_STREAM_PREFIX):] for name in stream_names
-        ]
+        scopes = [name[len(ARTIFACT_STREAM_PREFIX) :] for name in stream_names]
         try:
             referenced = await asyncio.wait_for(
                 referenced_blob_digests(backend, scopes, strict=True),
@@ -2908,9 +2907,7 @@ class Cron:
             )
             return
         if removed:
-            logger.info(
-                "state: swept %d orphaned artifact blob(s)", removed
-            )
+            logger.info("state: swept %d orphaned artifact blob(s)", removed)
 
     @staticmethod
     def _resolve_web_token(web_config: WebConfig) -> Optional[str]:

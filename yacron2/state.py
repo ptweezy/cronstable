@@ -248,9 +248,7 @@ def _fs_safe(name: str) -> str:
         token = "%{:02X}".format(ord(token[0])) + token[1:]
     if len(token) > _FS_SAFE_MAX:
         digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
-        token = (
-            token[: _FS_SAFE_MAX - 34] + _FS_TRUNCATION_MARKER + digest
-        )
+        token = token[: _FS_SAFE_MAX - 34] + _FS_TRUNCATION_MARKER + digest
     return token
 
 

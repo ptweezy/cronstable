@@ -117,9 +117,7 @@ def cmd_backup(config_arg: str, output: str) -> int:
     # pre-existing output is chmod'ed too, before any content is written.
     # (On Windows the POSIX mode is mostly a no-op; POSIX is where the
     # leak is.)
-    out_fd = os.open(
-        output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-    )
+    out_fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(out_fd, "wb") as out_fobj:
         os.chmod(output, 0o600)
         with tarfile.open(fileobj=out_fobj, mode="w:gz") as tar:
@@ -452,7 +450,7 @@ async def _gc_async(
         )
         if complete:
             for ns in namespaces:
-                dag_name = ns[len(DAG_RUN_NS_PREFIX):]
+                dag_name = ns[len(DAG_RUN_NS_PREFIX) :]
                 for body in await backend.list_documents(ns):
                     run_id = body.get("runId")
                     if run_id:
@@ -504,7 +502,7 @@ async def _sweep_blobs_async(
             "so its blob references cannot be ruled out"
         )
     scopes = [
-        name[len(ARTIFACT_STREAM_PREFIX):]
+        name[len(ARTIFACT_STREAM_PREFIX) :]
         for name in stream_names
         if _fs_safe(name) not in pruned_tokens
     ]
