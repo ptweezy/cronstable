@@ -4702,6 +4702,54 @@ async def test_mtls_round_trip_job_summaries(tmp_path):
         await b.stop()
 
 
+@pytest.mark.asyncio
+async def test_mtls_round_trip_node_stats(tmp_path):
+    # end-to-end over the real mTLS channel: b advertises its whole-node
+    # CPU/memory, a absorbs it and serves it in the merged fleet view -- the
+    # cluster.observability path that lets a lease cluster (or any gossip mesh)
+    # show every node's live load.
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
+        lambda: "v1:same",
+    )
+    b = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
+        lambda: "v1:same",
+    )
+    b.set_node_stats_provider(
+        lambda: {
+            "cpu_percent": 73.0,
+            "cpu_count": 8,
+            "mem_percent": 41.0,
+            "mem_used_bytes": 4096,
+            "mem_total_bytes": 8192,
+        }
+    )
+    await b.start()
+    await a.start()
+    try:
+        await a._poll_all()
+        peer = a.view.peers[f"localhost:{pb}"]
+        assert peer.status == STATUS_AGREED
+        assert peer.node_stats == {
+            "cpu_percent": 73.0,
+            "cpu_count": 8,
+            "mem_percent": 41.0,
+            "mem_used_bytes": 4096.0,
+            "mem_total_bytes": 8192.0,
+        }
+        fleet = a.fleet_view()
+        by_name = {n["node_name"]: n for n in fleet["nodes"]}
+        assert by_name["node-b"]["node_stats"]["cpu_percent"] == 73.0
+        # a shared none, so its own entry reports null
+        assert by_name["node-a"]["node_stats"] is None
+    finally:
+        await a.stop()
+        await b.stop()
+
+
 # --------------------------------------------------------------------------
 # conditional gossip: /peer ETag + If-None-Match -> 304, gzip, countdown aging
 # --------------------------------------------------------------------------
