@@ -151,9 +151,9 @@ class ResourceMonitor:
         self._max_rss = 0
         self._samples = 0
         # Live (instantaneous) readings for the "currently running" dashboard
-        # view, updated every sample: the tree's current RSS (not the peak) and
-        # its CPU% since the previous sample. _prev_cpu is (cpu_total, monotonic
-        # instant) of the last sample, from which the percentage is derived.
+        # view, updated every sample: the tree's current RSS (not the peak)
+        # and its CPU% since the previous sample. _prev_cpu is (cpu_total,
+        # monotonic instant) of the last sample, deriving the percentage.
         self._live_rss = 0
         self._live_cpu_percent = 0.0
         self._prev_cpu: Optional[tuple] = None
@@ -296,3 +296,63 @@ class ResourceMonitor:
             max_rss_bytes=self._max_rss,
             samples=self._samples,
         )
+
+
+class NodeResourceSampler:
+    """Whole-node (and own-process) CPU/memory for the local host.
+
+    One long-lived instance per daemon (owned by the scheduler); its
+    :meth:`snapshot` is read whenever the dashboard asks for node stats, and --
+    in a gossip cluster -- advertised to peers so the fleet view shows every
+    node's load.  ``psutil.cpu_percent(interval=None)`` reports usage *since
+    the previous call*, so the first snapshot after construction is a priming
+    ``0.0`` and every later one covers the interval since the last read.
+
+    Best-effort like everything else here: any psutil error yields ``None``
+    rather than raising, so a node that cannot read its own stats simply shows
+    none.
+    """
+
+    def __init__(self) -> None:
+        self._proc: Any = None
+        if psutil is not None:
+            try:
+                self._proc = psutil.Process()
+                # prime the "since last call" counters so the first real
+                # snapshot is meaningful rather than always-zero.
+                psutil.cpu_percent(interval=None)
+                self._proc.cpu_percent(interval=None)
+            except Exception:  # noqa: BLE001 - never fatal
+                self._proc = None
+
+    def snapshot(self) -> Optional[Dict[str, Any]]:
+        """Current node CPU%/memory (+ this daemon's own), or ``None``."""
+        if psutil is None:
+            return None
+        try:
+            vm = psutil.virtual_memory()
+            data: Dict[str, Any] = {
+                # system-wide CPU utilisation since the previous snapshot,
+                # 0..100 (already averaged across cores by psutil).
+                "cpu_percent": psutil.cpu_percent(interval=None),
+                "cpu_count": psutil.cpu_count() or 0,
+                "mem_percent": vm.percent,
+                "mem_used_bytes": vm.total - vm.available,
+                "mem_total_bytes": vm.total,
+            }
+        except Exception:  # noqa: BLE001 - never fatal
+            logger.warning(
+                "node resource sampling failed", exc_info=True
+            )
+            return None
+        # the daemon's own footprint, best-effort on top (may be denied on
+        # some platforms even when the system-wide read succeeded).
+        if self._proc is not None:
+            try:
+                data["proc_rss_bytes"] = self._proc.memory_info().rss
+                data["proc_cpu_percent"] = self._proc.cpu_percent(
+                    interval=None
+                )
+            except Exception:  # noqa: BLE001 - never fatal
+                pass
+        return data

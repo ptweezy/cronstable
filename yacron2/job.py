@@ -807,6 +807,17 @@ class RunningJob:
                 on_line=self.output.publish,
             )
 
+    def live_resources(self) -> Optional[Dict[str, Any]]:
+        """Current live CPU/memory of this running instance, or ``None``.
+
+        Read by the scheduler while the job is still running (the dashboard's
+        live per-job readout). ``None`` when the run is not monitored, the
+        monitor could not attach, or no sample has landed yet.
+        """
+        if self._resource_monitor is None:
+            return None
+        return self._resource_monitor.snapshot()
+
     def _demote(self):
         # Runs in the child (preexec_fn) while still privileged. Order matters:
         # set/clear supplementary groups, then the primary gid, then the uid.
