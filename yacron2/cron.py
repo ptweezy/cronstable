@@ -681,10 +681,10 @@ class Cron:
         self.web_config = None  # type: Optional[WebConfig]
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
-        # optional gossip observability overlay: a SECOND, election-inert gossip
-        # manager stood up alongside a lease leadership backend so a
-        # kubernetes/etcd/filesystem cluster can still share fleet data (per-node
-        # CPU/memory + job summaries). None when unused -- including under
+        # optional gossip observability overlay: a SECOND, election-inert
+        # gossip manager stood up alongside a lease leadership backend so a
+        # kubernetes/etcd/filesystem cluster can still share fleet data
+        # (per-node CPU/memory + job summaries). None when unused -- including
         # backend: gossip, where the election mesh (cluster_manager) already
         # carries fleet data and IS the fleet backend. See
         # start_stop_observability and _fleet_backend.
@@ -1311,7 +1311,10 @@ class Cron:
         """
         assert self.web_config is not None
         headers = self.web_config.get("headers", None)
-        mgr = self.cluster_manager
+        # the overlay mesh when a lease cluster opted into observability, else
+        # the leadership backend (gossip provides the view; lease backends
+        # return None -> feature unavailable).
+        mgr = self._fleet_backend()
         fleet = mgr.fleet_view() if mgr is not None else None
         if fleet is None:
             return web.json_response(
@@ -2475,15 +2478,15 @@ class Cron:
         has no node-to-node channel of its own.  It is built from the resolved
         ``observabilityMesh`` config (see
         :func:`yacron2.config._attach_observability`); ``None`` there means no
-        overlay is wanted (the section is absent, or ``backend: gossip`` already
-        carries the data on the election mesh, handled in
+        overlay is wanted (the section is absent, or ``backend: gossip``
+        already carries the data on the election mesh, handled in
         :meth:`start_stop_cluster`).
 
-        Mirrors the rebuild logic of :meth:`start_stop_cluster` but simpler: the
-        overlay never elects, so there is no leadership/quorum transition to
-        log.  Like the election manager it is rebuilt on a config change or an
-        in-place TLS cert rotation, and a start failure is logged and swallowed
-        so a misconfigured overlay never stops jobs from running.
+        Mirrors the rebuild logic of :meth:`start_stop_cluster` but simpler:
+        the overlay never elects, so there is no leadership/quorum transition
+        to log.  Like the election manager it is rebuilt on a config change or
+        an in-place TLS cert rotation, and a start failure is logged and
+        swallowed so a misconfigured overlay never stops jobs from running.
         """
         mesh_config = (
             cluster_config.get("observabilityMesh")

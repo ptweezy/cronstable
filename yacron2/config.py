@@ -766,7 +766,7 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         ),
                     }
                 ),
-                # --- observability overlay: gossip as a secondary data plane ---
+                # --- observability overlay: gossip as a secondary data plane -
                 # Share per-node CPU/memory (and job summaries) across the
                 # cluster for the dashboard's fleet view, independent of which
                 # backend owns election. With backend: gossip the election mesh
@@ -775,8 +775,8 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 # redundant). With a lease backend (kubernetes/etcd/filesystem)
                 # it stands up a dedicated, election-inert gossip mesh, so it
                 # requires listen/tls/peers just like backend: gossip does. See
-                # yacron2.cron.start_stop_observability and the overlay build in
-                # _build_cluster_config.
+                # yacron2.cron.start_stop_observability and the overlay build
+                # in _build_cluster_config.
                 Opt("observability"): Map(
                     {
                         Opt("shareNodeStats"): Bool(),
@@ -1695,7 +1695,7 @@ def _attach_observability(
     if obs is None:
         return
     # explicit opt-out is allowed (configure the overlay mesh for fleet job
-    # summaries but not CPU/memory); defaults to on -- sharing load is the point
+    # summaries but not CPU/memory); defaults on -- sharing load is the point.
     cfg["shareNodeStats"] = obs.get("shareNodeStats", True)
     transport_keys = ("listen", "tls", "peers")
     has_transport = any(obs.get(k) is not None for k in transport_keys)
