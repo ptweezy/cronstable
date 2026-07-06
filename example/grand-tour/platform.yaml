@@ -326,6 +326,65 @@ jobs:
     clusterPolicy: EveryNode
 
   # =====================================================================
+  #  3b. Resource-heavy workloads  (per-job + per-node monitoring)
+  # =====================================================================
+  # Every job here is resource-monitored (monitorResources: true is set once in
+  # _defaults.yaml, so the whole fleet inherits it). Each run's CPU time and
+  # peak memory land in the dashboard run history / stats and at GET /metrics
+  # (yacron2_job_cpu_seconds_total, yacron2_job_peak_rss_bytes); while running,
+  # live CPU%/RSS shows on the job row + drawer. And because the cluster shares
+  # node stats (cluster.observability, see node-entrypoint.sh), each node's
+  # whole-host CPU/memory shows in the cluster panel + fleet view — so these
+  # jobs are what make the load numbers move. Watch alongside `docker stats`.
+
+  # [feature: monitorResources — CPU, EveryNode] Burns one core ~30s on EVERY
+  # node, so all nodes light up in the cluster panel's Load column at once.
+  - name: risk-model-recompute
+    command: |
+      echo "risk-model-recompute burning one core ~30s on $HOSTNAME"
+      timeout 30 sh -c 'while :; do :; done' || true
+      echo "risk-model-recompute done on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+
+  # [feature: monitorResources — CPU, Leader/spread] Hash-crunches one core
+  # ~40s on its OWNER node only (under distribution: spread each Leader job has
+  # a different owner), so you can watch load land on one node and move as
+  # ownership does.
+  - name: fraud-graph-scan
+    command: |
+      echo "fraud-graph-scan hashing ~40s on $HOSTNAME"
+      timeout 40 sh -c 'yes | sha256sum >/dev/null' || true
+      echo "fraud-graph-scan done on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: Leader
+
+  # [feature: monitorResources — MEMORY, EveryNode] Holds ~256 MB resident for
+  # ~25s on every node (a string built from `yes` and kept in the shell), so the
+  # peak-RSS metric and the cluster panel's memory column both jump.
+  - name: catalog-build-inmemory
+    command: |
+      echo "catalog-build-inmemory allocating ~256MB on $HOSTNAME"
+      blob=$(yes meridian-catalog-row | head -c 268435456); export blob
+      echo "holding ${#blob} bytes resident ~25s on $HOSTNAME"
+      sleep 25
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+
+  # [feature: monitorResources — MEMORY, Leader] A heavier ~400 MB buffer held
+  # ~20s on the owner node only — the memory analogue of fraud-graph-scan.
+  - name: report-render-buffer
+    command: |
+      echo "report-render-buffer allocating ~400MB on $HOSTNAME"
+      blob=$(yes meridian-report-cell | head -c 419430400); export blob
+      echo "holding ${#blob} bytes resident ~20s on $HOSTNAME"
+      sleep 20
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+
+  # =====================================================================
   #  4. Billing  (exactly-once; retries — finite AND infinite)
   # =====================================================================
   # [feature: idempotent] Exactly-once side effect, fleet-wide. `idempotent`
