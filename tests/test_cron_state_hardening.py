@@ -655,3 +655,85 @@ async def test_backfill_idle_wait_is_bounded_for_allow_policy(
     cron.running_jobs["j"].append(object())  # ever-running scheduled instance
     await cron._run_catch_up(cron.cron_jobs["j"], 1, 0.0, _NOW)
     assert calls == ["j"]
+
+
+# --- cluster slot: stale release vs fresh same-fence re-claim ----------------
+
+
+_FORBID_CLUSTER_JOB = (
+    "jobs:\n"
+    "  - name: j\n"
+    "    command: 'true'\n"
+    "    schedule: '* * * * *'\n"
+    "    concurrencyPolicy: Forbid\n"
+    "    concurrencyScope: cluster\n"
+)
+
+
+async def _cluster_cron(tmp_path):
+    cron = Cron(None, config_yaml=_FORBID_CLUSTER_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    return cron
+
+
+async def _stop_cluster_cron(cron):
+    for task in list(cron._slot_renewers.values()):
+        task.cancel()
+    cron._slot_renewers.clear()
+    cron._slot_leases.clear()
+    cron._slot_refs.clear()
+    await asyncio.gather(*list(cron._pending_state_writes))
+    if cron.state_backend is not None:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_stale_slot_release_stands_down_for_fresh_reclaim(tmp_path):
+    # regression (slot-protocol): _release_cluster_slot pops the lease under
+    # the per-job mutex but writes the on-disk release fire-and-forget, and
+    # a same-holder re-acquire KEEPS the fence -- so a stale release landing
+    # after a fresh re-claim still matched on disk and revoked the new
+    # claim's lease, letting a peer's Forbid claim double-run. The release
+    # must re-check under the mutex and stand down for a live claim.
+    cron = await _cluster_cron(tmp_path)
+    try:
+        backend = cron.state_backend
+        holder = cron._slot_holder()
+        stale = await backend.acquire_lease("slots/j", holder, cron._slot_ttl)
+        fresh = await backend.acquire_lease("slots/j", holder, cron._slot_ttl)
+        assert stale is not None and fresh is not None
+        assert fresh.fence == stale.fence  # the kept-fence re-acquire
+        cron._slot_leases["j"] = fresh
+        cron._slot_refs["j"] = 1
+        await cron._release_slot_lease("j", stale)
+        assert await backend.read_lease("slots/j") is not None
+        # ...while with no live claim the release still frees the slot
+        cron._slot_leases.pop("j", None)
+        cron._slot_refs.pop("j", None)
+        await cron._release_slot_lease("j", fresh)
+        assert await backend.read_lease("slots/j") is None
+    finally:
+        await _stop_cluster_cron(cron)
+
+
+async def test_slot_release_write_yields_to_racing_reclaim(tmp_path):
+    # the same hazard through the production path: the finish-path release
+    # schedules its write fire-and-forget, the job's next fire re-claims
+    # immediately (same holder, fence kept), and only then does the
+    # scheduled write run. The slot must still be held on disk afterwards,
+    # under the original fence -- the new run's claim survived.
+    cron = await _cluster_cron(tmp_path)
+    try:
+        job = cron.cron_jobs["j"]
+        backend = cron.state_backend
+        assert await cron._claim_cluster_slot(job) is True
+        first = cron._slot_leases["j"]
+        await cron._release_cluster_slot(job)  # schedules the stale write
+        assert await cron._claim_cluster_slot(job) is True  # fresh re-claim
+        await asyncio.gather(*list(cron._pending_state_writes))
+        observed = await backend.read_lease("slots/j")
+        assert observed is not None
+        assert observed.holder == cron._slot_holder()
+        assert observed.fence == first.fence
+    finally:
+        await _stop_cluster_cron(cron)

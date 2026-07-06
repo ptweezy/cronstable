@@ -1555,13 +1555,15 @@ class Cron:
         # THIS node holds the job's slot lease and how many live instances
         # reference it. Only emitted for cluster-scoped jobs.
         if job.concurrencyScope == "cluster":
-            slot_name = self._slot_name(name)
-            lease = self._slot_leases.get(slot_name)
+            # _slot_leases/_slot_refs are keyed by plain JOB name (only the
+            # on-disk lease/stream name carries the "slots/" prefix; see
+            # _slot_name and _claim_cluster_slot).
+            lease = self._slot_leases.get(name)
             result["concurrencyScope"] = "cluster"
             result["slot"] = {
                 "held": lease is not None,
                 "holder": lease.holder if lease is not None else None,
-                "refs": self._slot_refs.get(slot_name, 0),
+                "refs": self._slot_refs.get(name, 0),
             }
         # only relevant when leader election is on, so omit it otherwise to
         # keep the per-poll payload lean for the common single-instance case.
@@ -4845,19 +4847,31 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        try:
-            await asyncio.wait_for(
-                backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as ex:  # noqa: BLE001 - TTL expiry is the fallback
-            logger.warning(
-                "state: failed to release the concurrency slot for %s "
-                "(%s); it frees by TTL",
-                name,
-                ex,
-            )
+        # Serialized under the per-job slot mutex, like _release_phantom_slot:
+        # this write is scheduled fire-and-forget by _release_cluster_slot, so
+        # a fresh same-holder re-claim can land before it -- and a same-holder
+        # re-acquire KEEPS the fence, so this stale release would still match
+        # on disk and revoke the new claim's lease (its renewer spinning, a
+        # peer's Forbid claim then double-running). A fresh claim installs
+        # _slot_leases[name] under this same mutex, so once one is present
+        # this release is stale by definition and stands down; holding the
+        # mutex across the write keeps a claim from interleaving with it.
+        async with self._slot_mutex(name):
+            if self._slot_leases.get(name) is not None:
+                return  # a fresh claim adopted the on-disk lease; keep it
+            try:
+                await asyncio.wait_for(
+                    backend.release_lease(lease), timeout=STATE_OP_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:  # noqa: BLE001 - TTL is the fallback
+                logger.warning(
+                    "state: failed to release the concurrency slot for %s "
+                    "(%s); it frees by TTL",
+                    name,
+                    ex,
+                )
 
     async def _release_phantom_slot(self, name: str) -> None:
         backend = self.state_backend
@@ -5974,7 +5988,7 @@ class Cron:
         )
         if state.task is not None:
             if state.task.done():
-                await state.task
+                self._reap_retry_task(job.config.name, state.task)
             else:
                 state.task.cancel()
         retry = job.config.onFailure["retry"]
@@ -6372,6 +6386,49 @@ class Cron:
     def _retry_claim_lease(name: str) -> str:
         return RETRY_CLAIM_PREFIX + name
 
+    async def _acquire_retry_claim(
+        self,
+        backend: StateBackend,
+        job: JobConfig,
+        retry_num: int,
+        *,
+        quiet: bool,
+    ) -> Optional[Lease]:
+        """``acquire_lease`` for a retry claim, mapping a timeout OR a raised
+        store error to ``None`` so the caller's read-back-and-policy path
+        decides -- the same containment as :meth:`_acquire_slot_lease`.  An
+        escape here kills the ``schedule_retry_job`` task (silently dropping
+        the due retry) AND is re-raised by ``cancel_job_retries``' awaiter on
+        the job's next fire, outside ``run()``'s try/except: the whole
+        daemon crashes.
+        """
+        try:
+            return await asyncio.wait_for(
+                backend.acquire_lease(
+                    self._retry_claim_lease(job.name),
+                    self._slot_holder(),
+                    RETRY_CLAIM_TTL,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - flock ENOLCK/EIO/ESTALE on
+            # a sick shared mount is as ambiguous as a timeout; the policy
+            # fork (defer under fail-closed, unserialized proceed under
+            # degrade) decides, never the exception.
+            if not quiet:
+                logger.warning(
+                    "Cron job %s retry (#%i): the retry-claim store call "
+                    "raised (%s); treating the claim as unanswered",
+                    job.name,
+                    retry_num,
+                    ex,
+                )
+            return None
+
     async def _retry_consume_decision(
         self, job: JobConfig, retry_num: int, *, quiet: bool
     ) -> str:
@@ -6407,18 +6464,9 @@ class Cron:
             ok = await self._retry_consume_ok(job.name, retry_num, quiet=quiet)
             return "launch" if ok else "defer"
         fail_closed = self._state_on_unavailable == "fail-closed"
-        lease: Optional[Lease] = None
-        try:
-            lease = await asyncio.wait_for(
-                backend.acquire_lease(
-                    self._retry_claim_lease(job.name),
-                    self._slot_holder(),
-                    RETRY_CLAIM_TTL,
-                ),
-                timeout=STATE_OP_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            lease = None
+        lease = await self._acquire_retry_claim(
+            backend, job, retry_num, quiet=quiet
+        )
         if lease is None:
             observed: Optional[Lease] = None
             try:
@@ -6427,6 +6475,11 @@ class Cron:
                     timeout=STATE_OP_TIMEOUT,
                 )
             except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - as ambiguous as a timeout;
+                # observed stays None so the policy fork below decides.
                 pass
             if observed is not None and observed.holder != self._slot_holder():
                 # a live claimer is working this very ladder: defer and
@@ -6916,6 +6969,27 @@ class Cron:
         await self.cancel_job_retries(job.config.name, settle="succeeded")
         await job.report_success()
 
+    @staticmethod
+    def _reap_retry_task(name: str, task: "asyncio.Task[None]") -> None:
+        """Retrieve (never re-raise) a finished retry task's outcome.
+
+        Both awaiters (here and in ``handle_job_failure``) run on launch/
+        finish paths outside ``run()``'s try/except, so re-raising an
+        exception stored in a dead retry task would crash the whole
+        scheduler.  ``.exception()`` also marks the exception retrieved,
+        silencing the event loop's "never retrieved" report.
+        """
+        if task.cancelled():
+            return
+        ex = task.exception()
+        if ex is not None:
+            logger.error(
+                "Cron job %s: its retry task died with an unexpected "
+                "error; that pending retry was lost",
+                name,
+                exc_info=ex,
+            )
+
     async def cancel_job_retries(
         self, name: str, *, settle: Optional[str] = "superseded"
     ) -> None:
@@ -6935,6 +7009,6 @@ class Cron:
             self._persist_retry_settled(name, settle, state.count)
         if state.task is not None:
             if state.task.done():
-                await state.task
+                self._reap_retry_task(name, state.task)
             else:
                 state.task.cancel()
