@@ -894,6 +894,10 @@ class Cron:
                     config = await self.reload_config()
                     self._log_job_set_id()
                     await self.start_stop_cluster(config.cluster_config)
+                    # the gossip observability overlay (lease clusters that opt
+                    # into cluster.observability); after start_stop_cluster so
+                    # the election backend exists first. No-op otherwise.
+                    await self.start_stop_observability(config.cluster_config)
                     await self.start_stop_state(config.state_config)
                     # periodic durable-state chores (manifest, GC): cheap
                     # due-checks that spawn tracked background tasks.
@@ -998,6 +1002,13 @@ class Cron:
             logger.info("Stopping cluster manager")
             await self.cluster_manager.stop()
             self.cluster_manager = None
+        # the observability overlay holds no leadership, so its teardown order
+        # relative to the drain does not matter; stop it here alongside the
+        # election manager so its gossip listener/poll loop is released too.
+        if self.observability_mesh is not None:
+            logger.info("Stopping cluster observability overlay")
+            await self.observability_mesh.stop()
+            self.observability_mesh = None
         await self._wait_for_running_jobs_task
         # the drain released every slot (each finish cancels its renewer);
         # belt-and-braces for renewers whose release write raced teardown.
@@ -2429,6 +2440,109 @@ class Cron:
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
+
+    def node_resource_snapshot(self) -> Optional[Dict[str, Any]]:
+        """This node's live CPU/memory for gossip and GET /node.
+
+        The callable installed as the gossip node-stats provider; also used by
+        the /node endpoint. Best-effort: returns None when psutil is
+        unavailable.
+        """
+        return self._node_sampler.snapshot()
+
+    def _fleet_backend(self) -> Optional[LeadershipBackend]:
+        """The backend that answers the fleet view / carries fleet gossip.
+
+        The observability overlay mesh when one is running (a lease cluster
+        that opted into ``cluster.observability``), else the leadership backend
+        itself -- which provides the fleet view directly under ``backend:
+        gossip`` and returns ``None`` for the lease backends (no fleet).
+        """
+        return (
+            self.observability_mesh
+            if self.observability_mesh is not None
+            else self.cluster_manager
+        )
+
+    async def start_stop_observability(
+        self, cluster_config: Optional[ClusterConfig]
+    ) -> None:
+        """(Re)build the gossip observability overlay to match the config.
+
+        The overlay is a SECOND, election-inert gossip manager that a lease
+        cluster (kubernetes/etcd/filesystem) stands up purely to exchange fleet
+        data -- per-node CPU/memory and job summaries -- since a lease backend
+        has no node-to-node channel of its own.  It is built from the resolved
+        ``observabilityMesh`` config (see
+        :func:`yacron2.config._attach_observability`); ``None`` there means no
+        overlay is wanted (the section is absent, or ``backend: gossip`` already
+        carries the data on the election mesh, handled in
+        :meth:`start_stop_cluster`).
+
+        Mirrors the rebuild logic of :meth:`start_stop_cluster` but simpler: the
+        overlay never elects, so there is no leadership/quorum transition to
+        log.  Like the election manager it is rebuilt on a config change or an
+        in-place TLS cert rotation, and a start failure is logged and swallowed
+        so a misconfigured overlay never stops jobs from running.
+        """
+        mesh_config = (
+            cluster_config.get("observabilityMesh")
+            if cluster_config is not None
+            else None
+        )
+        mesh = self.observability_mesh
+        if mesh is not None:
+            if mesh_config is None or mesh_config != mesh.config:
+                reason = "configuration changed"
+            elif mesh.tls_files_changed():
+                reason = "TLS certificate files changed"
+            else:
+                reason = None
+            # make-before-break is infeasible for gossip (same listen port), so
+            # a cert rotation only tears down once the NEW material loads --
+            # otherwise keep the running overlay serving the valid old cert.
+            if reason is not None and mesh_config is not None:
+                from yacron2.cluster import gossip_tls_loadable
+
+                if not gossip_tls_loadable(mesh_config):
+                    logger.warning(
+                        "cluster.observability: new TLS material is not yet "
+                        "loadable (a partial rotation?); keeping the running "
+                        "overlay and retrying next reload"
+                    )
+                    reason = None
+            if reason is not None:
+                logger.info("cluster.observability: %s, stopping", reason)
+                await mesh.stop()
+                self.observability_mesh = None
+        if mesh_config is not None and self.observability_mesh is None:
+            try:
+                mgr = make_backend(mesh_config, self.job_set_id)
+                # fleet providers BEFORE start(): its first poll round may race
+                # peers polling us back, and their first absorbed snapshot
+                # should already carry our jobs + load, not an empty block.
+                mgr.set_job_summaries_provider(self.fleet_job_summaries)
+                if (
+                    cluster_config is not None
+                    and cluster_config.get("shareNodeStats")
+                ):
+                    mgr.set_node_stats_provider(self.node_resource_snapshot)
+                await mgr.start()
+            except (
+                OSError,
+                ssl.SSLError,
+                ValueError,
+                ConfigError,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as ex:
+                # same swallow-and-keep-running contract as the election
+                # backend: a bad overlay cert/listen/peer must not stop jobs.
+                logger.error(
+                    "cluster.observability: failed to start: %s", ex
+                )
+                return
+            self.observability_mesh = mgr
 
     async def start_stop_state(
         self, state_config: Optional[StateConfig]
