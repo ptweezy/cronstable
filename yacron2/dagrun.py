@@ -1565,29 +1565,91 @@ class DagScheduler:
             return
         for body in terminal[:excess]:
             run_key = body.get("runKey")
-            run_id = body.get("runId")
             if not run_key:
                 continue
-            await asyncio.wait_for(
-                backend.delete_document(self._ns(name), run_key),
-                timeout=STATE_OP_TIMEOUT,
-            )
-            if run_id:
-                # drop the run's XCom record stream too (its blobs are
-                # content-addressed and never swept, so no XCom can ever
-                # reference a collected blob).
-                from yacron2.jobstate import ARTIFACT_STREAM_PREFIX
+            await self._delete_run(backend, name, run_key, body.get("runId"))
 
-                scope = dag.xcom_scope(name, str(run_id))
-                try:
-                    await asyncio.wait_for(
-                        backend.prune_records(
-                            ARTIFACT_STREAM_PREFIX + scope, keep=0
-                        ),
-                        timeout=STATE_OP_TIMEOUT,
-                    )
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
+    async def _delete_run(
+        self,
+        backend: StateBackend,
+        name: str,
+        run_key: str,
+        run_id: Any,
+    ) -> None:
+        """Delete one run document and prune its XCom record stream.
+
+        The stream's blobs become unreferenced once the records are gone;
+        the state GC's orphan-blob sweep (cron._collect_state_garbage /
+        `yacron2 state gc`) reclaims them on its next pass.  Record order
+        matters: the document goes FIRST, so a crash between the two leaves
+        a doc-less stream the stream GC ages out, never a live run whose
+        XCom vanished.
+        """
+        await asyncio.wait_for(
+            backend.delete_document(self._ns(name), run_key),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        if run_id:
+            from yacron2.jobstate import ARTIFACT_STREAM_PREFIX
+
+            scope = dag.xcom_scope(name, str(run_id))
+            try:
+                await asyncio.wait_for(
+                    backend.prune_records(
+                        ARTIFACT_STREAM_PREFIX + scope, keep=0
+                    ),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+
+    async def gc_removed_dags(
+        self,
+        backend: StateBackend,
+        dag_names: "set[str]",
+        grace: float,
+    ) -> None:
+        """Collect run documents (and XCom) of dags gone from every config.
+
+        Called from the daemon's state GC pass (cron._collect_state_garbage)
+        with the dag names that exist in the store's ``dagrun/`` namespaces
+        but are in NEITHER this node's config NOR any recent manifest -- the
+        same absence anchor job streams use, so a dag briefly removed during
+        a config edit keeps its whole run history for a full gcGraceSeconds.
+        Belt and braces on top of that anchor: only a TERMINAL run whose
+        last update is itself older than ``grace`` is deleted; an active,
+        owned, or undatable run is never touched, so a re-added dag resumes
+        it exactly where it stopped.
+        """
+        now = _now()
+        for name in sorted(dag_names):
+            if name in self._dags():
+                continue  # re-added since the caller built the live set
+            try:
+                docs = await asyncio.wait_for(
+                    backend.list_documents(self._ns(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+                for body in docs:
+                    if not dag.is_terminal_run(body):
+                        continue
+                    run_key = body.get("runKey")
+                    if not isinstance(run_key, str) or not run_key:
+                        continue
+                    if (name, run_key) in self._owned:
+                        continue
+                    updated = body.get("updatedAt") or body.get("createdAt")
+                    if (
+                        not isinstance(updated, (int, float))
+                        or now - float(updated) < grace
+                    ):
+                        continue  # too recent, or undatable: keep
+                    await self._delete_run(backend, name, run_key,
+                                           body.get("runId"))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one dag must not stop the pass
+                logger.exception("dag %s: removed-dag run GC failed", name)
 
     # =====================================================================
     # Shutdown

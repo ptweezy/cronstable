@@ -70,8 +70,25 @@ def _load_state_backend(config_arg: str) -> FilesystemStateBackend:
     return backend
 
 
-def _job_names(config_arg: str) -> Set[str]:
-    return {job.name for job in parse_config(config_arg).jobs}
+def _config_keep_sets(config_arg: str) -> Tuple[Set[str], Set[str], Set[str]]:
+    """(job names, extra artifact scopes, dag names) the config keeps alive.
+
+    The same three seed sets the daemon derives from its loaded config for a
+    GC pass (see Cron._collect_state_garbage / _artifact_scope_names), so a
+    manual ``yacron2 state gc`` protects exactly what a daemon running this
+    config would.
+    """
+    config = parse_config(config_arg)
+    names = {job.name for job in config.jobs}
+    scopes: Set[str] = set()
+    for job in config.jobs:
+        scopes.update(job.stateAllowedScopes)
+    dag_names: Set[str] = set()
+    for dagcfg in config.dags:
+        dag_names.add(dagcfg.name)
+        for template in dagcfg.task_templates.values():
+            scopes.update(template.stateAllowedScopes)
+    return names, scopes, dag_names
 
 
 def _walk_carried(base: str) -> Iterator[Tuple[str, str]]:
@@ -334,7 +351,11 @@ def cmd_migrate(
 
 
 async def _gc_async(
-    backend: FilesystemStateBackend, keep_names: Set[str], dry_run: bool
+    backend: FilesystemStateBackend,
+    keep_names: Set[str],
+    keep_scopes: Set[str],
+    keep_dags: Set[str],
+    dry_run: bool,
 ) -> Dict[str, Any]:
     import datetime
 
@@ -350,9 +371,13 @@ async def _gc_async(
         RETRY_STREAM_PREFIX,
         RUN_STREAM_PREFIX,
         SLOT_STREAM_PREFIX,
+        _fold_manifest,
+        _manifests_cover_scopes,
         _parse_iso_utc,
         get_now,
     )
+    from yacron2.dag import DAG_RUN_NS_PREFIX, xcom_scope
+    from yacron2.jobstate import ARTIFACT_STREAM_PREFIX, GLOBAL_SCOPE
 
     await backend.start()
     grace = float(backend.config.get("gcGraceSeconds") or 0)
@@ -389,16 +414,17 @@ async def _gc_async(
     # keep this machine's own counter snapshots even if no daemon has
     # manifested from here recently.
     hosts: Set[str] = {socket.gethostname() or "localhost"}
+    art_scopes = set(keep_scopes) | {GLOBAL_SCOPE}
+    live_dags = set(keep_dags)
+    recent: List[Dict[str, Any]] = []
     for rec in manifests:
         at = _parse_iso_utc(rec.get("at"))
         if at is None or (now - at).total_seconds() > grace:
             continue
-        jobs = rec.get("jobs")
-        if isinstance(jobs, list):
-            names.update(str(job) for job in jobs)
-        host = rec.get("host")
-        if isinstance(host, str) and host:
-            hosts.add(host)
+        recent.append(rec)
+        _fold_manifest(rec, names, hosts, art_scopes, live_dags)
+    # job names keep their default artifact scope too.
+    art_scopes |= names
     keep: Dict[str, Set[str]] = {
         RUN_STREAM_PREFIX: names,
         LOG_STREAM_PREFIX: names,
@@ -413,16 +439,95 @@ async def _gc_async(
         SLOT_STREAM_PREFIX: names,
         MANIFEST_STREAM_PREFIX: hosts,
     }
-    return await backend.collect_garbage(
+    # artifact streams are managed only when (a) every recent manifest
+    # advertises its scopes/dags (an older node's silence proves nothing --
+    # mirrors the daemon's pass) and (b) every dagrun/<dag> namespace could
+    # be enumerated by name, so every live run's XCom scope is protectable.
+    # Run DOCUMENTS of removed dags are left to the daemon's DagScheduler,
+    # which alone knows what it owns; once it deletes them, this pass
+    # collects their aged streams too.
+    if _manifests_cover_scopes(recent):
+        namespaces, complete = await backend.list_document_namespaces(
+            DAG_RUN_NS_PREFIX
+        )
+        if complete:
+            for ns in namespaces:
+                dag_name = ns[len(DAG_RUN_NS_PREFIX):]
+                for body in await backend.list_documents(ns):
+                    run_id = body.get("runId")
+                    if run_id:
+                        art_scopes.add(xcom_scope(dag_name, str(run_id)))
+            keep[ARTIFACT_STREAM_PREFIX] = art_scopes
+    result = await backend.collect_garbage(
         keep=keep, grace=grace, dry_run=dry_run
+    )
+    removed, skip_reason = await _sweep_blobs_async(
+        backend,
+        grace,
+        dry_run,
+        # dry run: collect_garbage only REPORTED these stream tokens, so
+        # their records still exist; exclude them from the reference walk
+        # so the count matches what a real pass would free.
+        set(result.get("removed") or []) if dry_run else set(),
+    )
+    result["blobs_removed"] = removed
+    if skip_reason:
+        result["blob_sweep_skipped"] = skip_reason
+    return result
+
+
+async def _sweep_blobs_async(
+    backend: FilesystemStateBackend,
+    grace: float,
+    dry_run: bool,
+    pruned_tokens: Set[str],
+) -> Tuple[int, Optional[str]]:
+    """One orphan-blob sweep; ``(count, why-skipped-or-None)``.
+
+    Biased to KEEP on every doubt, exactly like the daemon's pass
+    (Cron._sweep_orphan_artifact_blobs): skipped outright when any artifact
+    stream is unenumerable or any record unreadable, and the backend's age
+    guard keeps blobs younger than the grace.
+    """
+    from yacron2.jobstate import (
+        ARTIFACT_STREAM_PREFIX,
+        referenced_blob_digests,
+    )
+    from yacron2.state import _fs_safe
+
+    stream_names, complete = await backend.list_stream_names_audit(
+        ARTIFACT_STREAM_PREFIX
+    )
+    if not complete:
+        return 0, (
+            "an artifact stream exists whose records cannot be enumerated, "
+            "so its blob references cannot be ruled out"
+        )
+    scopes = [
+        name[len(ARTIFACT_STREAM_PREFIX):]
+        for name in stream_names
+        if _fs_safe(name) not in pruned_tokens
+    ]
+    try:
+        referenced = await referenced_blob_digests(
+            backend, scopes, strict=True
+        )
+    except Exception as ex:  # noqa: BLE001 - a missed reference must KEEP
+        return 0, (
+            "an artifact record could not be read, so its blob reference "
+            "cannot be ruled out ({})".format(ex)
+        )
+    return (
+        await backend.sweep_orphan_blobs(referenced, grace, dry_run=dry_run),
+        None,
     )
 
 
 def cmd_gc(config_arg: str, dry_run: bool) -> int:
     """Run one manual garbage-collection pass (respects gcGraceSeconds)."""
     backend = _load_state_backend(config_arg)
-    names = _job_names(config_arg)
-    result = asyncio.run(_gc_async(backend, names, dry_run))
+    names, scopes, dag_names = _config_keep_sets(config_arg)
+    result = asyncio.run(_gc_async(backend, names, scopes, dag_names, dry_run))
     if result.get("deferred"):
         print(
             "state: gc deferred: the manifest history does not yet span "
@@ -441,6 +546,18 @@ def cmd_gc(config_arg: str, dry_run: bool) -> int:
             result.get("streams_kept", 0),
         )
     )
+    if result.get("blob_sweep_skipped"):
+        print(
+            "state: orphan-blob sweep skipped: {}".format(
+                result["blob_sweep_skipped"]
+            )
+        )
+    else:
+        print(
+            "state: gc {} {} orphaned artifact blob(s)".format(
+                verb, result.get("blobs_removed", 0)
+            )
+        )
     for token in result.get("removed") or []:
         print("  - {}".format(token))
     return 0

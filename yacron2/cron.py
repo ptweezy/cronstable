@@ -364,6 +364,49 @@ def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
     return parsed
 
 
+def _fold_manifest(
+    rec: Dict[str, Any],
+    names: Set[str],
+    hosts: Set[str],
+    art_scopes: Set[str],
+    live_dags: Set[str],
+) -> None:
+    """Accumulate one recent manifest record into the GC keep sets.
+
+    Shared by the daemon pass and `yacron2 state gc` so both read a
+    manifest identically; a missing/mis-typed key contributes nothing (an
+    older node's record simply advertises less -- see
+    :func:`_manifests_cover_scopes` for why that also gates artifact GC).
+    """
+    jobs = rec.get("jobs")
+    if isinstance(jobs, list):
+        names.update(str(job) for job in jobs)
+    host = rec.get("host")
+    if isinstance(host, str) and host:
+        hosts.add(host)
+    if isinstance(rec.get("scopes"), list):
+        art_scopes.update(str(s) for s in rec["scopes"])
+    if isinstance(rec.get("dags"), list):
+        live_dags.update(str(d) for d in rec["dags"])
+
+
+def _manifests_cover_scopes(recent: List[Dict[str, Any]]) -> bool:
+    """Whether artifact streams / dag-run documents may be managed at all.
+
+    Only once EVERY recent manifest advertises its scopes and dags: a
+    pre-scopes node's manifest proves nothing about the shared artifact
+    scopes its jobs may write or the dags it runs, so treating its silence
+    as absence would collect a live peer's artifacts mid-rolling-upgrade.
+    An empty ``recent`` also fails: with no manifest to anchor absence,
+    nothing artifact-related may be collected.
+    """
+    return bool(recent) and all(
+        isinstance(rec.get("scopes"), list)
+        and isinstance(rec.get("dags"), list)
+        for rec in recent
+    )
+
+
 def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
     """Rebuild a :class:`JobRunInfo` from a durable ledger record.
 
@@ -2517,6 +2560,26 @@ class Cron:
     def _manifest_stream(self) -> str:
         return MANIFEST_STREAM_PREFIX + self._state_host
 
+    def _artifact_scope_names(self) -> Set[str]:
+        """Every artifact scope this config can write beyond its job names.
+
+        The shared scope plus each job's / dag task template's
+        stateAllowedScopes: with jobs writing artifacts under their own name
+        by default, this is exactly the set of scopes a keep-set cannot
+        derive from the job names alone.  Advertised in the manifest and
+        folded into the GC keep map so a scope stays alive while any node's
+        config still names it.
+        """
+        from yacron2.jobstate import GLOBAL_SCOPE
+
+        scopes: Set[str] = {GLOBAL_SCOPE}
+        for job in self.cron_jobs.values():
+            scopes.update(job.stateAllowedScopes)
+        for dagcfg in self.cron_dags.values():
+            for template in dagcfg.task_templates.values():
+                scopes.update(template.stateAllowedScopes)
+        return scopes
+
     async def _persist_manifest(self) -> None:
         """Record this node's loaded job set to its OWN manifest stream.
 
@@ -2537,6 +2600,15 @@ class Cron:
             "jobSetId": self.job_set_id(),
             "host": self._state_host,
             "jobs": sorted(self.cron_jobs),
+            # what this node's config can WRITE beyond its job names: the
+            # shared artifact scopes its jobs/dag tasks may publish under and
+            # the dags it runs.  Load-bearing for GC: a keep-set built while
+            # any recent manifest lacks these keys cannot prove a peer's
+            # artifact scopes or dags absent, so artifact streams (and
+            # removed dags' runs) stay unmanaged until the whole fleet
+            # advertises them (see _collect_state_garbage).
+            "scopes": sorted(self._artifact_scope_names()),
+            "dags": sorted(self.cron_dags),
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
         stream = self._manifest_stream()
@@ -2554,8 +2626,11 @@ class Cron:
         every host's own ``manifests/<host>`` stream, bounded per host -- plus
         this node's own loaded config, so GC still cannot eat live jobs even
         when a manifest stream is unreadable or empty, and hands the deletion
-        to the backend.  Every failure degrades to "collect nothing this
-        pass".
+        to the backend.  The same pass manages the ``artifacts/`` streams and
+        removed dags' run documents (see :meth:`_gc_dag_state`) and finishes
+        by sweeping payload blobs no surviving artifact record references
+        (see :meth:`_sweep_orphan_artifact_blobs`).  Every failure degrades
+        to "collect nothing this pass".
         """
         backend = self.state_backend
         grace = self._state_gc_grace
@@ -2631,16 +2706,18 @@ class Cron:
             return
         names = set(self.cron_jobs)
         hosts = {self._state_host}
+        live_dags = set(self.cron_dags)
+        art_scopes = self._artifact_scope_names()
+        recent: List[Dict[str, Any]] = []
         for rec in manifests:
             at = _parse_iso_utc(rec.get("at"))
             if at is None or (now - at).total_seconds() > grace:
                 continue
-            jobs = rec.get("jobs")
-            if isinstance(jobs, list):
-                names.update(str(job) for job in jobs)
-            host = rec.get("host")
-            if isinstance(host, str) and host:
-                hosts.add(host)
+            recent.append(rec)
+            _fold_manifest(rec, names, hosts, art_scopes, live_dags)
+        # job names keep their default artifact scope too.
+        art_scopes |= names
+        scopes_covered = _manifests_cover_scopes(recent)
         keep: Dict[str, Set[str]] = {
             RUN_STREAM_PREFIX: names,
             LOG_STREAM_PREFIX: names,
@@ -2657,6 +2734,20 @@ class Cron:
             # is collected above.
             MANIFEST_STREAM_PREFIX: hosts,
         }
+        if scopes_covered:
+            # folds artifacts/<scope> into ``keep`` (so a removed scope's
+            # stream ages out like any other) and collects removed dags' run
+            # documents; skipped entirely -- everything kept -- while any
+            # recent manifest predates scope advertising.
+            await self._gc_dag_state(backend, keep, art_scopes, live_dags,
+                                     grace)
+        else:
+            logger.info(
+                "state: leaving artifact streams and dag-run documents "
+                "unmanaged this GC pass: a recent manifest does not "
+                "advertise its scopes/dags (a node predating them, or the "
+                "first grace window after upgrading)"
+            )
         try:
             # bounded: a worker thread wedged in a dead-mount syscall must
             # not leave _gc_task pending forever -- the single-flight check
@@ -2678,6 +2769,147 @@ class Cron:
                 result.get("records_removed", 0),
                 result.get("tmp_removed", 0),
                 result.get("quarantine_removed", 0),
+            )
+        # only after a successful collect pass: the records deleted above
+        # (and the XCom streams dagrun's retention pruned since the last
+        # pass) are what release their blobs for the sweep.
+        await self._sweep_orphan_artifact_blobs(backend, grace)
+
+    async def _gc_dag_state(
+        self,
+        backend: StateBackend,
+        keep: Dict[str, Set[str]],
+        art_scopes: Set[str],
+        live_dags: Set[str],
+        grace: float,
+    ) -> None:
+        """Extend one GC pass over artifact streams and dag run documents.
+
+        Enumerates the store's ``dagrun/<dag>`` namespaces, hands the dags
+        that are in neither any live config nor any recent manifest to
+        :meth:`DagScheduler.gc_removed_dags` (terminal runs older than the
+        grace only), then adds ``artifacts/`` to the keep map keyed by the
+        live scopes: job names, configured/manifested shared scopes, and the
+        XCom scope of every run document still on disk.  Any doubt --
+        namespaces or documents unreadable, a namespace whose name is
+        unrecoverable -- leaves artifact streams unmanaged (all kept) this
+        pass instead of collecting on a partial view.
+        """
+        from yacron2.dag import DAG_RUN_NS_PREFIX, xcom_scope
+        from yacron2.jobstate import ARTIFACT_STREAM_PREFIX
+
+        try:
+            namespaces, complete = await asyncio.wait_for(
+                backend.list_document_namespaces(DAG_RUN_NS_PREFIX),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: leaving artifact streams unmanaged this GC pass: "
+                "cannot enumerate the dag-run namespaces (%s)",
+                ex,
+            )
+            return
+        if not complete:
+            logger.warning(
+                "state: leaving artifact streams unmanaged this GC pass: a "
+                "dag-run namespace exists whose name cannot be recovered, "
+                "so its runs' XCom scopes cannot be protected"
+            )
+            return
+        removed_dags = {
+            ns[len(DAG_RUN_NS_PREFIX):] for ns in namespaces
+        } - live_dags
+        if removed_dags:
+            await self._dag.gc_removed_dags(backend, removed_dags, grace)
+        try:
+            for ns in namespaces:
+                dag_name = ns[len(DAG_RUN_NS_PREFIX):]
+                docs = await asyncio.wait_for(
+                    backend.list_documents(ns),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+                for body in docs:
+                    run_id = body.get("runId")
+                    if run_id:
+                        art_scopes.add(xcom_scope(dag_name, str(run_id)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: leaving artifact streams unmanaged this GC pass: "
+                "cannot read the dag-run documents (%s)",
+                ex,
+            )
+            return
+        keep[ARTIFACT_STREAM_PREFIX] = art_scopes
+
+    async def _sweep_orphan_artifact_blobs(
+        self, backend: StateBackend, grace: float
+    ) -> None:
+        """Reclaim artifact/XCom payload blobs no surviving record names.
+
+        The reference set spans every enumerable ``artifacts/`` stream
+        (blobs dedupe across scopes), read strictly.  Deletion is biased to
+        KEEP on every doubt: the sweep is skipped outright when any artifact
+        stream is unenumerable (a legacy truncated directory without its
+        name sidecar) or any record unreadable, and the backend's own age
+        guard keeps blobs younger than the grace (a just-landed payload
+        whose record has not been appended yet).
+        """
+        from yacron2.jobstate import (
+            ARTIFACT_STREAM_PREFIX,
+            referenced_blob_digests,
+        )
+
+        try:
+            stream_names, complete = await asyncio.wait_for(
+                backend.list_stream_names_audit(ARTIFACT_STREAM_PREFIX),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: skipping the orphan-blob sweep: cannot enumerate "
+                "the artifact streams (%s)",
+                ex,
+            )
+            return
+        if not complete:
+            logger.warning(
+                "state: skipping the orphan-blob sweep: an artifact stream "
+                "exists whose records cannot be enumerated, so its blob "
+                "references cannot be ruled out"
+            )
+            return
+        scopes = [
+            name[len(ARTIFACT_STREAM_PREFIX):] for name in stream_names
+        ]
+        try:
+            referenced = await asyncio.wait_for(
+                referenced_blob_digests(backend, scopes, strict=True),
+                timeout=STATE_GC_TIMEOUT,
+            )
+            removed = await asyncio.wait_for(
+                backend.sweep_orphan_blobs(referenced, grace),
+                timeout=STATE_GC_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: skipping the orphan-blob sweep: an artifact record "
+                "could not be read, so its blob reference cannot be ruled "
+                "out (%s)",
+                ex,
+            )
+            return
+        if removed:
+            logger.info(
+                "state: swept %d orphaned artifact blob(s)", removed
             )
 
     @staticmethod

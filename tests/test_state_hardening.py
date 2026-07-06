@@ -466,6 +466,85 @@ async def test_gc_keeps_legacy_truncated_stream_and_skips_its_name(
     assert not os.path.isdir(stream_dir)
 
 
+async def test_list_stream_names_audit_reports_hidden_streams(tmp_path):
+    # The orphan-blob sweep builds its referenced-digest set from the stream
+    # listing, so it must be able to tell "these are ALL the artifact
+    # streams" from "a legacy truncated dir is hiding one": a hidden
+    # stream's records still reference blobs, and a sweep that could not
+    # see them would delete live payloads.
+    backend = _backend(tmp_path)
+    await backend.start()
+    long_scope = "artifacts/" + "S" * 200
+    await backend.append_record("artifacts/plain", {"sha256": "a" * 64})
+    await backend.append_record(long_scope, {"sha256": "b" * 64})
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is True
+    assert set(names) == {"artifacts/plain", long_scope}
+    # a legacy dir (pre-sidecar store): the stream becomes unnameable and
+    # the audit must say so instead of silently shrinking the listing.
+    stream_dir = backend._stream_dir(long_scope)
+    os.unlink(os.path.join(stream_dir, state._STREAM_NAME_SIDECAR))
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is False
+    assert names == ["artifacts/plain"]
+    # the plain (non-audit) listing keeps its established best-effort shape.
+    assert await backend.list_stream_names("artifacts/") == [
+        "artifacts/plain"
+    ]
+    # a prefix with nothing hidden under it stays complete.
+    names, complete = await backend.list_stream_names_audit("manifests/")
+    assert (names, complete) == ([], True)
+
+
+async def test_list_document_namespaces_skips_truncated_namespace(tmp_path):
+    # The GC discovers dag-run namespaces (dagrun/<dag>) through this
+    # listing; a length-truncated namespace has no name sidecar to recover
+    # its logical name from, so it must be reported as an INCOMPLETE
+    # listing -- never returned garbled (a garbled name would be treated as
+    # a removed dag and its runs' XCom scopes left unprotected).
+    backend = _backend(tmp_path)
+    await backend.start()
+
+    def put(body):
+        return lambda _cur: (body, None)
+
+    await backend.mutate_document("dagrun/a", "r1", put({"runId": "1"}))
+    await backend.mutate_document("dagrun/b", "r1", put({"runId": "2"}))
+    await backend.mutate_document("kv/x", "k", put({"value": 1}))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert (names, complete) == (["dagrun/a", "dagrun/b"], True)
+    await backend.mutate_document(
+        "dagrun/" + "D" * 200, "r1", put({"runId": "3"})
+    )
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert names == ["dagrun/a", "dagrun/b"]
+    assert complete is False
+    # unrelated prefixes are unaffected by the truncated dagrun namespace.
+    assert await backend.list_document_namespaces("kv/") == (["kv/x"], True)
+
+
+async def test_sweep_orphan_blobs_keeps_young_unreferenced_blobs(tmp_path):
+    # The put-blob-then-append-record window: a payload that has just
+    # landed has no record yet, so an unreferenced-but-young blob must
+    # survive the sweep (the grace is the age guard) and only a blob both
+    # unreferenced AND older than the grace may go.
+    backend = _backend(tmp_path)
+    await backend.start()
+    digest = await backend.put_blob(b"just-landed")
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) is not None
+    old = time.time() - 7200.0
+    os.utime(backend._blob_path(digest), (old, old))
+    # dry run counts it but must not delete...
+    assert (
+        await backend.sweep_orphan_blobs(set(), 3600.0, dry_run=True) == 1
+    )
+    assert await backend.get_blob(digest) is not None
+    # ...the real pass reclaims it.
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 1
+    assert await backend.get_blob(digest) is None
+
+
 # --- 12: GC reclaims lease files only once dead past the whole grace --------
 
 
