@@ -341,9 +341,7 @@ class NodeResourceSampler:
                 "mem_total_bytes": vm.total,
             }
         except Exception:  # noqa: BLE001 - never fatal
-            logger.warning(
-                "node resource sampling failed", exc_info=True
-            )
+            logger.warning("node resource sampling failed", exc_info=True)
             return None
         # the daemon's own footprint, best-effort on top (may be denied on
         # some platforms even when the system-wide read succeeded).
