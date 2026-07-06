@@ -1230,6 +1230,12 @@ class ClusterManager(LeadershipBackend):
         self._job_summaries_provider: Optional[
             Callable[[], Dict[str, Any]]
         ] = None
+        # our own whole-node CPU/memory provider (the scheduler's
+        # NodeResourceSampler.snapshot), installed the same way when node-stats
+        # sharing is enabled; None leaves node_stats out of the /peer payload.
+        self._node_stats_provider: Optional[
+            Callable[[], Optional[Dict[str, Any]]]
+        ] = None
 
     def set_job_summaries_provider(
         self, provider: Callable[[], Dict[str, Any]]
@@ -1290,7 +1296,8 @@ class ClusterManager(LeadershipBackend):
     def _peer_payload(self) -> Dict[str, Any]:
         """The full /peer response body (see :meth:`_handle_peer`)."""
         job_summaries, summaries_truncated = self._advertised_job_summaries()
-        return {
+        node_stats = self._advertised_node_stats()
+        payload: Dict[str, Any] = {
             "node_name": self.node_name,
             "job_set_id": self.get_job_set_id(),
             "scheme_version": SCHEME_VERSION,
