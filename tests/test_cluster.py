@@ -4599,6 +4599,42 @@ def test_fleet_view_merges_self_and_peers(no_tls):
     assert by_host["c:1"]["status"] == "unknown"
 
 
+def test_fleet_view_includes_node_stats(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 20.0, "mem_percent": 30.0}
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    peer_b = mgr.view.peers["b:1"]
+    peer_b.last_seen = NOW
+    peer_b.node_stats = {"cpu_percent": 88.0, "mem_percent": 50.0}
+    fleet = mgr.fleet_view()
+    # self carries its own freshly-sampled load
+    assert fleet["nodes"][0]["node_stats"] == {
+        "cpu_percent": 20.0,
+        "mem_percent": 30.0,
+    }
+    by_host = {n["host"]: n for n in fleet["nodes"][1:]}
+    assert by_host["b:1"]["node_stats"] == {
+        "cpu_percent": 88.0,
+        "mem_percent": 50.0,
+    }
+    # a node that shared none reports null (not missing) so the UI shows "—"
+    assert by_host["c:1"]["node_stats"] is None
+
+
+def test_fleet_view_node_stats_none_when_not_sharing(no_tls):
+    # no provider installed: self node_stats is null, unchanged fleet otherwise
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    fleet = mgr.fleet_view()
+    assert fleet["nodes"][0]["node_stats"] is None
+
+
 def test_fleet_view_skips_self_listing_and_dedupes_instances(no_tls):
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1", "b2:1"], "node-a"),
