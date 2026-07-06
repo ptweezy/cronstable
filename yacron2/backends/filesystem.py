@@ -724,8 +724,7 @@ class FilesystemBackend(LeaseBackend):
             except (OSError, asyncio.TimeoutError) as ex:
                 if self._reboot_ran_synced:
                     logger.debug(
-                        "cluster: could not refresh the @reboot-ran set: "
-                        "%s",
+                        "cluster: could not refresh the @reboot-ran set: %s",
                         ex,
                     )
                 else:
