@@ -4281,6 +4281,60 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
     }
 
 
+def test_parse_node_stats_absent_and_garbage():
+    from yacron2.cluster import _parse_node_stats
+
+    assert _parse_node_stats(None) is None
+    assert _parse_node_stats("junk") is None
+    assert _parse_node_stats(["not", "a", "dict"]) is None
+    assert _parse_node_stats({}) is None  # no usable field -> None
+    assert _parse_node_stats({"unknown_key": 1}) is None  # not whitelisted
+
+
+def test_parse_node_stats_rebuilds_whitelisted_finite_only():
+    from yacron2.cluster import _parse_node_stats
+
+    parsed = _parse_node_stats(
+        {
+            "cpu_percent": 42.5,
+            "cpu_count": 8.0,  # coerced to int
+            "mem_percent": 60.0,
+            "mem_used_bytes": 1000,
+            "mem_total_bytes": 2000,
+            "proc_rss_bytes": 500,
+            "proc_cpu_percent": 1.5,
+            # hostile / junk: dropped, never poisoning the /fleet JSON
+            "evil": "rm -rf",
+            "nan_field": float("nan"),
+            "cpu_percent_bool": True,
+        }
+    )
+    assert parsed == {
+        "cpu_percent": 42.5,
+        "cpu_count": 8,
+        "mem_percent": 60.0,
+        "mem_used_bytes": 1000.0,
+        "mem_total_bytes": 2000.0,
+        "proc_rss_bytes": 500.0,
+        "proc_cpu_percent": 1.5,
+    }
+    assert isinstance(parsed["cpu_count"], int)
+
+
+def test_parse_node_stats_drops_nonfinite_and_bools():
+    from yacron2.cluster import _parse_node_stats
+
+    # Inf/NaN would make /fleet unparseable to browsers; bools are not numbers
+    parsed = _parse_node_stats(
+        {
+            "cpu_percent": float("inf"),  # dropped
+            "mem_percent": True,  # bool -> dropped
+            "mem_used_bytes": 1234,  # kept
+        }
+    )
+    assert parsed == {"mem_used_bytes": 1234.0}
+
+
 def test_parse_job_summaries_caps_cardinality():
     from yacron2.cluster import (
         MAX_ADVERTISED_JOB_SUMMARIES,
@@ -4326,6 +4380,63 @@ async def test_handle_peer_advertises_job_summaries(no_tls):
     assert set(payload["job_summaries"]) == {"alpha", "beta"}
     assert payload["job_summaries"]["alpha"]["running"] is True
     assert payload["job_summaries_truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_advertises_node_stats_only_when_provided(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    # no node-stats provider: the key is omitted entirely, so a cluster not
+    # sharing node stats gossips byte-identical payloads (and keeps 304s).
+    payload = json.loads((await mgr._handle_peer(_Req())).text)
+    assert "node_stats" not in payload
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 12.0, "mem_percent": 34.0}
+    )
+    payload = json.loads((await mgr._handle_peer(_Req())).text)
+    assert payload["node_stats"] == {"cpu_percent": 12.0, "mem_percent": 34.0}
+    # a provider that returns None (psutil unavailable) also omits the key
+    mgr.set_node_stats_provider(lambda: None)
+    payload = json.loads((await mgr._handle_peer(_Req())).text)
+    assert "node_stats" not in payload
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_absorbs_node_stats(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "inst-b",
+                    "members": [
+                        {
+                            "node_name": "node-a",
+                            "instance_id": mgr.instance_id,
+                            "agreed": True,
+                        }
+                    ],
+                    "node_stats": {
+                        "cpu_percent": 55.5,
+                        "mem_percent": 40.0,
+                        "cpu_count": 4,
+                    },
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].node_stats == {
+        "cpu_percent": 55.5,
+        "mem_percent": 40.0,
+        "cpu_count": 4,
+    }
 
 
 def test_advertised_job_summaries_caps_deterministically(no_tls):
