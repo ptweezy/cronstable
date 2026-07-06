@@ -199,6 +199,53 @@ Full behavior, the trust model, quorum math, the lease backends' guarantees,
 and per-job `clusterPolicy` are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election).
 
+#### Observability overlay
+
+`cluster.observability` shares fleet data — each node's live CPU/memory (see
+[`GET /node`](HTTP-API#get-node)) and per-job run summaries — across the cluster
+for the dashboard's [fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane),
+**independent of which backend owns election**. It exists because the fleet view
+rides node-to-node gossip, which the lease backends do not have: it lets a
+`kubernetes`/`etcd`/`filesystem` cluster stand up a *second*, election-inert
+gossip mesh purely to carry that data.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `shareNodeStats` | `Bool` | `true` | Gossip this node's whole-node CPU/memory for the fleet view. Set `false` to run the overlay mesh for job summaries only. |
+| `listen`, `tls`, `peers` | as `backend: gossip` | — | The overlay gossip transport. **Required with a lease backend** (the overlay is its own mesh); **rejected with `backend: gossip`** (redundant — the election mesh already carries fleet data). |
+| `nodeName`, `interval`, `driftAfter`, `connectTimeout` | as `backend: gossip` | gossip defaults | Optional overlay mesh tuning. |
+
+Two shapes:
+
+- **`backend: gossip`** — the election mesh already exchanges `/peer` bodies, so
+  `observability` is just an opt-in marker: `observability: { shareNodeStats: true }`
+  adds node CPU/memory to what that mesh already gossips. `listen`/`tls`/`peers`
+  here are a `ConfigError` (redundant). Note this makes each `/peer` body ship
+  every gossip round (the live load values roll the response ETag), trading away
+  the idle `304` optimisation — the intended cost of fresh fleet-wide load.
+- **A lease backend** (`kubernetes`/`etcd`/`filesystem`) — election stays with the
+  lease store; `observability` stands up a dedicated gossip mesh (its own
+  `listen`/`tls`/`peers`, all required) that **never elects** (it holds no
+  leadership and gates no jobs), purely to carry fleet data.
+
+```yaml
+cluster:
+  backend: kubernetes            # election via a coordination.k8s.io Lease
+  kubernetes:
+    leaseName: yacron2-leader
+  observability:                 # a gossip mesh JUST for the fleet view
+    listen: "0.0.0.0:8140"
+    tls: { ca: /tls/ca.pem, cert: /tls/node.pem, key: /tls/node.key }
+    peers:
+      - host: node-b:8140
+      - host: node-c:8140
+```
+
+Requires [`psutil`](https://github.com/giampaolo/psutil) (a core dependency) for
+the CPU/memory numbers; a node that cannot read its own load simply shares none.
+Node stats are best-effort observability: a malformed or hostile peer payload
+degrades to "no data for that node", never poisoning the view.
+
 ### `state`
 
 Optional. Enables the **durable state store**: restart-durable run history,
