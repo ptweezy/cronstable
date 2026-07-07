@@ -206,8 +206,7 @@ docker run --rm \
 ```
 
 yacron2 is a pure-Python app that supports any Python >= 3.10, so behavior is
-identical across variants. Pick the base, not the interpreter version. The
-Debian default covers the most architectures; each variant covers the arches
+identical across variants. The Debian default covers the most architectures; each variant covers the arches
 its base image publishes (Alpine matches Debian's full set; RHEL, Fedora,
 openSUSE and distroless cover `amd64`, `arm64`, `ppc64le` and `s390x`; Amazon
 Linux covers `amd64` and `arm64`). All variants share the same non-root,
