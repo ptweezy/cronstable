@@ -1232,6 +1232,10 @@ memory**. The numbers surface everywhere the run does:
 * **live** on the dashboard job row and drawer while it runs (`cpu 61% · 288 MiB`);
 * per run and aggregated (avg/max CPU, peak memory) in the dashboard
   **History** tab and `GET /jobs/{name}/runs`;
+* as **CPU/memory charts** in the dashboard's **Resources** tab — a live
+  view of the running instance, the recorded profile of any recent run, and
+  per-run trend strips — plus a node-wide history chart behind the header
+  meter (`GET /jobs/{name}/resources`, `GET /node/history`);
 * as Prometheus families on `GET /metrics`
   (`yacron2_job_cpu_seconds_total`, `yacron2_job_last_run_max_rss_bytes`, ...)
   and over [statsd](#metrics) when the job has a sink;
@@ -1245,7 +1249,10 @@ memory**. The numbers surface everywhere the run does:
 It is observability only (it never changes a run's verdict), it is off by
 default with zero overhead when off, and the numbers are sampled, so
 short-lived runs are approximate while the long, heavy runs that matter are
-sampled many times. DAG tasks accept the same flag; their usage lands in the
+sampled many times. The map form tunes the sampling cadence and how many
+chart points each run keeps (`monitorResources: { interval: 0.5, history:
+240 }`); series are downsampled in place so even a days-long run stays a few
+KB. DAG tasks accept the same flag; their usage lands in the
 task record of the `dag_run` document. On a cluster,
 `cluster.observability` additionally shares each node's **whole-host**
 CPU/memory so the dashboard's cluster panel and fleet view show where the
