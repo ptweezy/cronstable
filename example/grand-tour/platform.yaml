@@ -1,0 +1,1088 @@
+# =====================================================================
+#  Meridian — the yacron2 GRAND TOUR.
+#
+#  One config that exercises EVERYTHING yacron2 can do, wired into a single
+#  coherent story: "Meridian", a fictional global commerce platform, whose
+#  entire scheduled back-office runs on a NINE-node, mutual-TLS, leader-electing
+#  yacron2 cluster that shares one durable state store.
+#
+#  This one file is mounted IDENTICALLY into all nine nodes (its fingerprint is
+#  the job-set id, so it must match for the peers to agree). Each node's
+#  `cluster:` section is generated at start by node-entrypoint.sh; the durable
+#  `state:` store below is a shared volume, so cursors/locks/idempotency and
+#  every dag_run coordinate across the whole fleet.
+#
+#  Brought up by  ../../docker-compose-grand-tour.yml.
+#
+#  Every job/task is preceded by a one-line `[feature: ...]` tag naming what it
+#  demonstrates and a short note on why. The commands are deliberately SMALL:
+#  each one shows its one feature and nothing else (no fake-data arithmetic),
+#  so you can read a job top-to-bottom and know exactly what it proves.
+#
+#  ---------------------------------------------------------------------
+#  FEATURE MAP (see the per-job/-task [feature: ...] tags below):
+#
+#   Scheduling      cron strings, object form (named fields + `second`),
+#                   @reboot, @daily, SECOND-level (7-field), the trailing YEAR
+#                   field, timezones (NY/London/Tokyo), utc:false
+#   Execution       string vs argv-list commands, environment + env_file,
+#                   captureStdout/Stderr toggles, streamPrefix templating +
+#                   empty prefix, maxLineLength, executionTimeout + killTimeout,
+#                   user/group privilege drop, enabled:false, saveLimit
+#   Failure/report  failsWhen (stderr / stdout / always), onFailure /
+#                   onPermanentFailure / onSuccess, retry with backoff (finite
+#                   AND retry-forever), and ALL FOUR reporters: mail (-> Mailpit,
+#                   with SMTP auth + HTML), webhook (-> the echo sink, custom
+#                   method/headers/contentType), shell (pager), sentry
+#                   (fromEnvVar + extra/body; no-ops until a DSN is set)
+#   Concurrency     Allow / Forbid / Replace, concurrencyScope: cluster
+#                   (fleet-wide single-flight), plus a fleet SEMAPHORE (lock
+#                   --permits N) and a fleet MUTEX (lock --permits 1)
+#   Clustering      mTLS peer attestation + quorum election (gossip backend),
+#                   OR a shared-mount lease (filesystem backend, no service) —
+#                   see node-entrypoint.sh / BACKEND; distribution spread vs
+#                   single-leader; clusterPolicy Leader/PreferLeader/EveryNode
+#   Durable state   cursor (ETL watermark, default + explicit --scope),
+#                   idempotent (exactly-once), lock (mutex + semaphore),
+#                   artifact (put/get/list), secret (fromEnvVar + fromFile),
+#                   KV (string + --json), durable retries, missed-run catch-up
+#                   (onMissed run-once AND run-all + startingDeadlineSeconds +
+#                   catchupJitterSeconds), onlyIfLastSucceeded, archiveOutput +
+#                   redactArchivedSecrets, deploymentId namespacing
+#   Orchestration   FIVE DAGs, one per pattern: a dynamic fan-out ETL (XCom,
+#                   expand/map, retries, fan-in, catch-up + backfill), a linear
+#                   pipeline (timezone), a static diamond (parallel fan-out/
+#                   fan-in + triggerRule all_success), and two human-gated
+#                   releases (approval + sensor; onReject skip vs fail cascade)
+#   Metrics/API     statsd push metrics, native Prometheus /metrics (map form:
+#                   public scrape + custom buckets), custom web.headers, the
+#                   HTTP control API + dashboard, opt-in bearer authToken
+#   Config          include: (this file pulls in _defaults.yaml), a classic
+#                   Vixie crontab in the same dir (legacy.crontab)
+#
+#  ---------------------------------------------------------------------
+#  SELF-DRIVING DASHBOARD DEMO (deterministic, UTC wall-clock, no clicks):
+#    :05 & :35   slow-report-generator is killed by its executionTimeout
+#    :15-:19     the four db-health-* checks fail together (exit 69): the
+#                incident cockpit correlates them; db-health-orders posts a
+#                webhook AND pages via shell
+#    :25-:29     config-lint "fails" only because it wrote to stderr
+#    :45-:47     cert-expiry-check fails alone and MAILS on-call (-> Mailpit)
+#    every 5th   webhook-dispatch fails, retries with backoff, then on
+#                permanent failure mails on-call
+#    every :00   four hourly-* reports collide (thundering-herd warning)
+#    continuous  warehouse-sync overruns (node Forbid); inventory-sync is
+#                fleet-wide Forbid; search-reindex is Replaced -> Cancelled;
+#                render-thumbnails holds a 2-permit fleet semaphore
+#    every 3 min the orders-etl DAG runs end to end (discover -> fan-out -> verify)
+#    every few s the pulse-* second-level probes tick the countdown in SECONDS
+# =====================================================================
+
+include:
+  - _defaults.yaml          # [feature: include] -> defaults + logging
+
+# ---- Durable state: the shared coordination surface --------------------
+# A `state:` section turns on durability. Because the path below is a shared
+# volume (topology: shared), the cursors/locks/idempotency keys and every
+# dag_run coordinate across ALL nine nodes. `jobApi` runs a loopback endpoint
+# and injects its address + a per-run token into every job, so a job command
+# can reach the store through `yacron2 state|cursor|lock|artifact|idempotent|
+# secret` (and DAG tasks through `yacron2 xcom`).  [feature: state, jobApi]
+state:
+  path: /var/lib/yacron2/state
+  topology: shared           # this mount is shared fleet-wide -> leases exclude
+                             # across nodes, cursors converge to the furthest point
+  # [feature: deploymentId] a stable namespace prefix inside the store, so an
+  # independent stack (say a "meridian-staging" deployment) could share this
+  # very mount with ZERO key collisions. Match cluster.filesystem.deploymentId
+  # when you elect over the same mount (see node-entrypoint.sh, BACKEND).
+  deploymentId: meridian-prod
+  maxRunsPerJob: 200         # durable per-job run history retention
+  # [feature: onStoreUnavailable] what to do if the store goes unreachable:
+  # `degrade` (run stateless, the safe-to-demo default) vs `fail-closed` (refuse
+  # to run state-dependent jobs — the correct choice for exactly-once billing).
+  onStoreUnavailable: degrade
+  # [feature: gcGraceSeconds] retention floor (seconds) for unreferenced state
+  # beyond maxRunsPerJob; the offline `yacron2 state gc` pass honors this window.
+  gcGraceSeconds: 86400
+  # [feature: maxOpsPerSecond / slotTtlSeconds] a token-bucket rate limit on
+  # store operations (0 = unlimited) and the lease TTL of the cluster
+  # concurrency slots that back concurrencyScope: cluster.
+  maxOpsPerSecond: 200
+  slotTtlSeconds: 30
+  jobApi:
+    enabled: true
+    lockTtlSeconds: 30       # mutex/semaphore lease TTL (renewed by the daemon)
+    maxArtifactBytes: 16777216   # 16 MiB cap on one artifact payload
+    maxValueBytes: 1048576       # [feature: jobApi.maxValueBytes] 1 MiB KV cap -> HTTP 413 over-cap
+
+# ---- HTTP: dashboard + REST control API + Prometheus metrics ------------
+# 0.0.0.0 so the dashboard is reachable through the published Docker port; the
+# second-level probes below reach the same server over 127.0.0.1.
+web:
+  listen:
+    - http://0.0.0.0:8080
+  # [feature: web.headers] extra response headers merged onto every response
+  # (routing tags, defense-in-depth). Visible in `curl -i http://localhost:8080/`.
+  headers:
+    X-Meridian-Platform: grand-tour
+  # [feature: web.metrics map form] native Prometheus exposition at GET /metrics.
+  # The MAP form (vs a bare `metrics: true`) adds two knobs: `public` exempts
+  # /metrics from authToken (so Prometheus scrapes without a bearer token), and
+  # `durationBuckets` overrides the run-duration histogram buckets (seconds).
+  metrics:
+    enabled: true
+    public: true
+    durationBuckets:
+      - 0.05
+      - 0.1
+      - 0.25
+      - 0.5
+      - 1
+      - 2.5
+      - 5
+      - 10
+      - 30
+      - 60
+  # [feature: web.authToken] OPT-IN bearer-token auth for the dashboard + REST
+  # API. Left commented so the tour boots OPEN by default (yacron2 refuses to
+  # start if authToken is set but resolves to an empty token). To turn it on,
+  # uncomment and run:
+  #   WEB_TOKEN=some-secret docker compose -f docker-compose-grand-tour.yml up
+  # /metrics stays public (above); the pulse-* probes and the release DAG's
+  # canary already present this same token, so they keep working.
+  # authToken:
+  #   fromEnvVar: YACRON2_WEB_TOKEN
+
+jobs:
+  # =====================================================================
+  #  0. Bootstrap  (EveryNode: runs on every node)
+  # =====================================================================
+  - name: welcome
+    command: echo "👋 Meridian online on $HOSTNAME"
+    schedule: "@reboot"                    # [feature: @reboot]
+    clusterPolicy: EveryNode
+
+  - name: heartbeat
+    command: echo "♥ $HOSTNAME at $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # =====================================================================
+  #  1. Ingest  (Leader/PreferLeader work; durable cursor)
+  # =====================================================================
+  # [feature: environment + streamPrefix templating] inline env vars layered
+  # onto the process, and a custom streamPrefix. The {job_name}/{stream_name}
+  # placeholders are substituted, so each captured line is labelled in the log.
+  - name: orders-ingest
+    command: echo "pulled orders from $DB_HOST (region $REGION)"
+    schedule: "*/2 * * * *"
+    clusterPolicy: Leader
+    streamPrefix: "[meridian:{job_name}/{stream_name}] "
+    environment:
+      - key: DB_HOST
+        value: orders-db.meridian.internal
+      - key: REGION
+        value: us-east-1
+
+  - name: clickstream-collect
+    command: echo "flushed clickstream events on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: PreferLeader
+
+  # [feature: cursor] Incremental export driven by a DURABLE, monotonic
+  # watermark stored under an EXPLICIT shared scope ("orders-domain") rather
+  # than this job's own name — so a DIFFERENTLY-named job can read the same
+  # watermark (see dedup-orders). `advance` only ever moves forward, so a
+  # replayed run can never walk it backwards.
+  - name: incremental-orders-export
+    command: |
+      set -eu
+      last=$(yacron2 cursor get high_water --scope orders-domain 2>/dev/null || echo 0)
+      next=$(( last + 100 ))
+      echo "exporting orders $last..$next"
+      yacron2 cursor advance high_water "$next" --scope orders-domain
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+
+  # [feature: concurrencyScope: cluster] FLEET-WIDE single-flight. Fires on
+  # every node every 2 min but takes ~90s; the cluster-scoped Forbid means at
+  # most ONE instance runs across the WHOLE fleet at a time (contrast
+  # warehouse-sync below, which is node-scoped). Needs the shared state store.
+  - name: inventory-sync
+    command: |
+      echo "inventory-sync holds the fleet-wide slot on $HOSTNAME"
+      sleep 90
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+    concurrencyScope: cluster
+
+  # =====================================================================
+  #  2. Transform / ETL  (statsd metrics; output-based failure)
+  # =====================================================================
+  # [feature: statsd] runs ~4s, but every 6th minute it takes ~20s and pushes
+  # that timing to the statsd sink. Turn on the Run Ledger (dashboard Settings)
+  # to see the every-6th-minute spike flagged as a "slow" anomaly.
+  - name: etl-build-facts
+    command: |
+      if [ $(( $(date -u +%-M) % 6 )) -eq 0 ]; then secs=20; else secs=4; fi
+      echo "build-facts pass on $HOSTNAME (${secs}s)"
+      sleep "$secs"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    statsd:
+      prefix: meridian.etl.build_facts
+      host: statsd
+      port: 9125
+
+  # [feature: cursor --scope read] reads the SAME watermark
+  # incremental-orders-export advances, proving an explicit `--scope` is a
+  # shared namespace independent of either job's own name.
+  - name: dedup-orders
+    command: |
+      hw=$(yacron2 cursor get high_water --scope orders-domain 2>/dev/null || echo 0)
+      echo "dedup up to watermark $hw on $HOSTNAME"
+    schedule: "*/4 * * * *"
+    clusterPolicy: Leader
+
+  # [feature: failsWhen producesStderr] Exits 0, but yacron2 marks it FAILED at
+  # :25-:29 because it wrote to stderr — failure by OUTPUT, not by exit code.
+  - name: config-lint
+    command: |
+      m=$(date -u +%-M)
+      echo "validating pipeline configs on $HOSTNAME"
+      if [ "$m" -ge 25 ] && [ "$m" -le 29 ]; then
+        echo "lint: 3 style violations in orders.yaml" >&2
+      fi
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+    failsWhen:
+      producesStdout: false
+      producesStderr: true
+      nonzeroReturn: true
+
+  # [feature: failsWhen producesStdout] the INVERSE predicate: this check is
+  # meant to be silent (a clean formatter prints nothing). Any stdout at all
+  # means it found something to fix, so ANY output marks the run FAILED — even
+  # though it exits 0. Deterministic: it prints a diff only at :35-:39.
+  - name: format-check
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 35 ] && [ "$m" -le 39 ]; then
+        echo "would reformat: pipelines/orders.sql (+3 -1)"
+      fi
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+    failsWhen:
+      producesStdout: true
+
+  # =====================================================================
+  #  3. Load / warehouse  (concurrency policies; mutex + semaphore)
+  # =====================================================================
+  # [feature: concurrencyPolicy: Forbid] NODE-scoped. Fires every minute but
+  # takes ~75s; Forbid skips the tick it cannot start on the SAME node (each
+  # node still runs its own — contrast inventory-sync's cluster scope).
+  - name: warehouse-sync
+    command: |
+      echo "warehouse-sync streaming batch on $HOSTNAME"
+      sleep 75
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+
+  # [feature: concurrencyPolicy: Replace -> Cancelled] Fires every minute,
+  # takes ~80s; Replace cancels the still-running prior instance, which the
+  # dashboard records as Cancelled (not a failure; not reported).
+  - name: search-reindex
+    command: |
+      echo "search-reindex rebuilding index on $HOSTNAME"
+      sleep 80
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Replace
+
+  # [feature: lock — fleet MUTEX] `lock run` holds a named lock (global scope)
+  # for the duration of the wrapped command and releases it after — and the
+  # daemon releases it anyway if the run ends abruptly. --permits defaults to 1,
+  # so this is a mutex: exactly ONE node compacts at a time. --wait/--timeout
+  # bound how long a contending node waits for the slot.
+  - name: compact-warehouse
+    command: >
+      yacron2 lock run --global --wait --timeout 30 warehouse-maintenance
+      -- sh -c 'echo "compacting under the fleet mutex on $HOSTNAME"; sleep 5'
+    schedule: "*/10 * * * *"
+    clusterPolicy: EveryNode
+
+  # [feature: lock — fleet SEMAPHORE] the same `lock run`, but --permits 2 turns
+  # the mutex into a semaphore: up to TWO nodes may render at once, fleet-wide.
+  # All nodes fire on the same minute, so watch the dashboard cap concurrency at
+  # two while the rest wait for a permit.
+  - name: render-thumbnails
+    command: >
+      yacron2 lock run --global --permits 2 --wait --timeout 20 thumbnail-pool
+      -- sh -c 'echo "rendering thumbnails (1 of <=2 fleet permits) on $HOSTNAME"; sleep 8'
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+
+  # =====================================================================
+  #  4. Billing  (exactly-once; retries — finite AND infinite)
+  # =====================================================================
+  # [feature: idempotent] Exactly-once side effect, fleet-wide. `idempotent`
+  # claims a per-hour key once across the whole cluster: exit 0 for the node
+  # that wins the claim (do the charge), exit 1 for everyone else (skip). Even
+  # a duplicate fire or a retry cannot double-charge.
+  - name: charge-subscriptions
+    command: |
+      key="charge-$(date -u +%Y-%m-%dT%H)"
+      if yacron2 idempotent "$key"; then
+        echo "charging this hour's subscriptions on $HOSTNAME (won $key)"
+      else
+        echo "already charged this hour; skipping on $HOSTNAME"
+      fi
+    schedule: "0 * * * *"
+    clusterPolicy: EveryNode
+
+  # [feature: retry (finite) + onPermanentFailure] Fails every 5th minute
+  # (exit 7), retries with exponential backoff (durable: an armed retry survives
+  # a daemon restart because state is on), and if it exhausts them, mails
+  # on-call AND shell-pages. Contrast outbox-flush below (retries FOREVER).
+  - name: webhook-dispatch
+    command: |
+      if [ $(( $(date -u +%-M) % 5 )) -eq 0 ]; then
+        echo "upstream 503 from hooks.meridian.io — will retry" >&2
+        exit 7
+      fi
+      echo "dispatched webhooks from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 2
+        maximumDelay: 10
+        backoffMultiplier: 2
+    onPermanentFailure:
+      report:
+        mail:
+          from: yacron2@meridian.example
+          to: oncall@meridian.example
+          smtpHost: mailpit
+          smtpPort: 1025
+        shell:
+          command: echo "[page] webhook-dispatch exhausted its retries on $HOSTNAME"
+
+  # [feature: retry maximumRetries: -1 (retry FOREVER)] Drains a delivery outbox
+  # that is "down" for the first few attempts of each run, then self-heals. With
+  # maximumRetries: -1 yacron2 retries indefinitely (bounded by maximumDelay),
+  # so it NEVER reaches onPermanentFailure — the pattern for a must-eventually-
+  # succeed side effect. A durable KV counter makes the self-heal deterministic.
+  - name: outbox-flush
+    command: |
+      set -eu
+      n=$(yacron2 state get outbox-attempt --global 2>/dev/null || echo 0)
+      n=$(( n + 1 ))
+      if [ "$n" -lt 3 ]; then
+        yacron2 state set outbox-attempt "$n" --global
+        echo "outbox still draining (attempt $n) — will retry" >&2
+        exit 1
+      fi
+      yacron2 state set outbox-attempt 0 --global   # reset for the next run
+      echo "outbox flushed on $HOSTNAME after $n attempts"
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+    onFailure:
+      retry:
+        maximumRetries: -1          # retry forever; never a permanent failure
+        initialDelay: 2
+        maximumDelay: 30
+        backoffMultiplier: 2
+
+  # =====================================================================
+  #  5. Reporting  (timezones, macros, year field, artifact + secret, herd,
+  #                 timeout, sentry, onSuccess)
+  # =====================================================================
+  # [feature: thundering-herd] these four all fire at :00 — the Schedule tab
+  # warns about the collision.
+  - name: hourly-rollup
+    command: echo "hourly-rollup aggregated the last hour on $HOSTNAME"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+  - name: hourly-kpi-refresh
+    command: echo "hourly-kpi-refresh recomputed KPIs on $HOSTNAME"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+  - name: hourly-exec-dashboard
+    command: echo "hourly-exec-dashboard published on $HOSTNAME"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+  - name: hourly-cache-warm
+    command: echo "hourly-cache-warm primed report caches on $HOSTNAME"
+    schedule: "0 * * * *"
+    clusterPolicy: PreferLeader
+
+  # [feature: onMissed: run-all + catchupJitterSeconds] a per-slot invoice job.
+  # onMissed: run-all REPLAYS every hour missed while the fleet was down (each as
+  # its own run — contrast daily-reconcile's run-once, which COALESCES a gap to a
+  # single run). startingDeadlineSeconds caps how old a miss it will replay, and
+  # catchupJitterSeconds spreads the replay launches (seeded by job name) so a
+  # restart does not stampede.
+  - name: hourly-invoice-emit
+    command: echo "emitted the hourly invoice batch on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "0 * * * *"
+    clusterPolicy: Leader
+    onMissed: run-all
+    startingDeadlineSeconds: 21600      # replay misses up to 6h old
+    catchupJitterSeconds: 30
+
+  # [feature: artifact put/get/list + secret + KV string & --json] Builds the
+  # daily report: fetches RUN-SCOPED secrets over the loopback endpoint (never in
+  # the job's own environment, so they never show in `ps -E`), publishes the CSV
+  # as a named ARTIFACT, reads it straight back with `artifact get`, lists the
+  # artifacts in the store, and stamps both a plain and a --json KV value.
+  # archiveOutput persists the captured output durably; redactArchivedSecrets
+  # scrubs any staged secret value out of that archived copy.
+  - name: build-daily-report
+    command: |
+      set -eu
+      token=$(yacron2 secret get REPORT_TOKEN)
+      signer=$(yacron2 secret get SIGNING_KEY)
+      echo "building daily report on $HOSTNAME (token ${token%%-*}…, signer ${signer%%-*}…)"
+      printf 'date,orders\n%s,1234\n' "$(date -u +%F)" > /tmp/daily-report.csv
+      yacron2 artifact put daily-report /tmp/daily-report.csv
+      echo "read back $(yacron2 artifact get daily-report | wc -l) lines; store holds: $(yacron2 artifact list)"
+      yacron2 state set last-report-at "$(date -u +%FT%TZ)" --global
+      yacron2 state set report-meta '{"rows":1234,"ok":true}' --json --global
+      echo "keys now: $(yacron2 state keys --global)"
+    schedule: "0 6 * * *"
+    clusterPolicy: Leader
+    archiveOutput: true
+    redactArchivedSecrets: true
+    secrets:                                 # [feature: secrets]
+      - name: REPORT_TOKEN
+        fromEnvVar: REPORT_API_TOKEN         # from the container environment
+      - name: SIGNING_KEY
+        fromFile: /config/secrets/signing.key   # from a mounted file
+
+  # [feature: onSuccess reporter] the ONLY reporter event that fires on a
+  # SUCCESSFUL run (onFailure/onPermanentFailure fire on failure). This job
+  # always succeeds, so every few minutes it posts a green webhook to the sink
+  # AND mails a success note to Mailpit — exercising the `success` branch of the
+  # report templates. (An empty rendered mail body would suppress the mail; this
+  # one always renders, so the mail always lands.)
+  - name: ops-heartbeat-report
+    command: echo "pipeline healthy on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+    onSuccess:
+      report:
+        webhook:
+          url:
+            value: http://webhook-sink:8080/heartbeat
+          body: |
+            {"text": "✅ {{ name }} OK on {{ environment.HOSTNAME }} (success={{ success }})"}
+        mail:
+          from: yacron2@meridian.example
+          to: ops@meridian.example
+          smtpHost: mailpit
+          smtpPort: 1025
+          subject: "[Meridian] {{ name }} {% if success %}OK{% else %}FAILED{% endif %}"
+          body: |
+            {{ name }} completed OK on {{ environment.HOSTNAME }}.
+
+  # [feature: timezone + DST advisory] 02:30 America/New_York does not exist on
+  # the spring-forward day; the Schedule tab names the next DST transition.
+  - name: finance-eod-close
+    command: echo "finance-eod-close booked end-of-day on $HOSTNAME"
+    schedule: "30 2 * * *"
+    timezone: America/New_York
+    clusterPolicy: Leader
+
+  # [feature: object-form schedule — named fields] the readable alternative to a
+  # positional "0 6 * * mon-fri" cron string: every field is named. London
+  # markets open on weekdays only.
+  - name: eu-open-report
+    schedule:
+      minute: "0"
+      hour: "6"
+      dayOfWeek: "mon-fri"
+    timezone: Europe/London
+    clusterPolicy: Leader
+    command: echo "eu-open-report sent the London morning digest on $HOSTNAME"
+
+  - name: apac-open-report
+    command: echo "apac-open-report sent the Tokyo morning digest on $HOSTNAME"
+    schedule: "0 9 * * *"
+    timezone: Asia/Tokyo
+    clusterPolicy: Leader
+
+  # [feature: @daily macro + utc:false] the nightly batch, in LOCAL time.
+  - name: nightly-billing-export
+    command: echo "nightly-billing-export wrote the invoice feed on $HOSTNAME at $(date +%H:%M) local"
+    schedule: "@daily"
+    utc: false
+    clusterPolicy: Leader
+
+  # [feature: object-form schedule — YEAR field] the trailing YEAR field (only
+  # settable via the object form, or a 6-field string) pins a job to specific
+  # years: 2026/2 means 2026 and every 2nd year after (2026, 2028, …). Fires
+  # 00:00 on Jan 1 in those years — proof it parses and schedules.
+  - name: fiscal-year-open
+    schedule:
+      minute: "0"
+      hour: "0"
+      dayOfMonth: "1"
+      month: "1"
+      year: "2026/2"
+    clusterPolicy: Leader
+    command: echo "fiscal-year-open opened the new fiscal year on $HOSTNAME"
+
+  # [feature: executionTimeout + killTimeout] Sleeps 30s but is capped at 10s,
+  # so yacron2 terminates it (SIGTERM, then SIGKILL after killTimeout) and
+  # records a timeout failure — the classic exit≈137/143 the dashboard explains.
+  # Reports the timeout via the shell reporter (a stand-in pager on stdout).
+  - name: slow-report-generator
+    command: |
+      echo "slow-report-generator crunching a heavy report on $HOSTNAME"
+      sleep 30
+      echo "you should never see this line"
+    schedule: "5,35 * * * *"
+    clusterPolicy: EveryNode
+    executionTimeout: 10
+    killTimeout: 5
+    onFailure:
+      report:
+        shell:
+          command: echo "[timeout] slow-report-generator exceeded its executionTimeout on $HOSTNAME"
+
+  # [feature: sentry reporter (extra + body) + mail] Fails on the 50th minute and
+  # reports to Sentry AND mail. The Sentry DSN comes from $SENTRY_DSN; while that
+  # is unset (the default) the Sentry reporter logs one line and no-ops, so
+  # nothing breaks. `extra` attaches custom scope tags and `body` sets a custom
+  # event message; set SENTRY_DSN to a real DSN to light it up.
+  - name: fraud-model-refresh
+    command: |
+      if [ "$(date -u +%-M)" -eq 50 ]; then
+        echo "fraud-model: training diverged (NaN loss)" >&2
+        exit 1
+      fi
+      echo "fraud-model-refresh scored the latest batch on $HOSTNAME"
+    schedule: "*/10 * * * *"
+    clusterPolicy: Leader
+    onFailure:
+      report:
+        sentry:
+          dsn:
+            fromEnvVar: SENTRY_DSN
+          level: warning
+          environment: production
+          body: "fraud model refresh failed on {{ environment.HOSTNAME }}"
+          fingerprint:
+            - yacron2
+            - "{{ name }}"
+          extra:
+            service: fraud
+            pipeline: ml
+        mail:
+          from: yacron2@meridian.example
+          to: ml-oncall@meridian.example
+          smtpHost: mailpit
+          smtpPort: 1025
+          subject: "[Meridian] {{ name }} {% if success %}ok{% else %}FAILED{% endif %}"
+          body: |
+            {{ stderr }}
+            (exit code: {{ exit_code }})
+
+  # =====================================================================
+  #  6. Monitoring / health  (EveryNode incident cockpit; all reporters)
+  # =====================================================================
+  # [feature: incident correlation + webhook (method/headers/contentType) +
+  # shell] the four db-health checks share one simulated "orders-db" outage from
+  # :15-:19 and exit 69, so they fail together with the same signature.
+  # db-health-orders additionally POSTs a Slack-shaped webhook to the echo sink
+  # with a custom method, content type and headers, and pages via a shell command.
+  - name: db-health-orders
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "orders-db: connection refused — pool exhausted (simulated outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "orders-db reachable from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    onFailure:
+      report:
+        webhook:
+          url:
+            value: http://webhook-sink:8080/incidents
+          method: POST
+          contentType: application/json
+          headers:
+            X-Meridian-Service: orders
+            X-Meridian-Severity: critical
+          body: |
+            {"text": "🚨 orders-db unreachable from {{ environment.HOSTNAME }} (exit {{ exit_code }})"}
+        shell:
+          command: echo "[page] on-call paged for orders-db unreachable from $HOSTNAME"
+
+  - name: db-health-inventory
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "inventory-db: connection refused — same pool as orders-db (outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "inventory-db reachable from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  - name: db-health-payments
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "payments-db: connection refused — same pool as orders-db (outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "payments-db reachable from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  - name: db-health-warehouse
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 15 ] && [ "$m" -le 19 ]; then
+        echo "warehouse-db: connection refused — same pool as orders-db (outage :15-:19)" >&2
+        exit 69
+      fi
+      echo "warehouse-db reachable from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # [feature: mail reporter — SMTP auth + HTML] Fails alone from :45-:47 (exit 1),
+  # a different signature from the db outage, and MAILS on-call. This mail
+  # authenticates to the SMTP server (username + password.fromEnvVar) and sends
+  # an HTML body (html: true). Lands in the Mailpit inbox. starttls/tls +
+  # validate_certs are shown commented (Mailpit here accepts auth without TLS).
+  - name: cert-expiry-check
+    command: |
+      m=$(date -u +%-M)
+      if [ "$m" -ge 45 ] && [ "$m" -le 47 ]; then
+        echo "api.meridian.internal TLS certificate expires in 3 days" >&2
+        exit 1
+      fi
+      echo "api.meridian.internal certificate OK on $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    onFailure:
+      report:
+        mail:
+          from: yacron2@meridian.example
+          to: oncall@meridian.example
+          smtpHost: mailpit
+          smtpPort: 1025
+          username: meridian
+          password:
+            fromEnvVar: SMTP_PASSWORD
+          # starttls: true            # encrypt submission (needs an SMTP TLS endpoint)
+          # validate_certs: false     # accept a self-signed SMTP cert
+          html: true
+          subject: "[Meridian] cert-expiry-check failed on {{ environment.HOSTNAME }}"
+          body: |
+            <h3>Certificate expiring</h3>
+            <pre>{{ stderr }}</pre>
+
+  # [feature: failsWhen always] an alerting SELF-TEST: it exits 0 and its stdout
+  # is ignored (producesStdout:false), yet failsWhen.always forces every run to
+  # count as FAILED, so it exercises the alert path end-to-end on a fixed cadence
+  # (proving the webhook route is live). Runs twice an hour to keep the noise low.
+  - name: alert-selftest
+    command: echo "alert self-test firing from $HOSTNAME"
+    schedule: "20,40 * * * *"
+    clusterPolicy: Leader
+    failsWhen:
+      producesStdout: false
+      always: true
+    onFailure:
+      report:
+        webhook:
+          url:
+            value: http://webhook-sink:8080/alert-selftest
+          body: |
+            {"text": "🔔 alert self-test from {{ environment.HOSTNAME }} — alerting path is live"}
+
+  - name: api-canary
+    command: echo "api /healthz 200 OK from $HOSTNAME"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+
+  # [feature: statsd] emits work-queue depth as a metric to the statsd sink.
+  - name: queue-depth-probe
+    command: echo "work-queue depth probe on $HOSTNAME"
+    schedule: "*/2 * * * *"
+    clusterPolicy: EveryNode
+    statsd:
+      prefix: meridian.queue.depth
+      host: statsd
+      port: 9125
+
+  # =====================================================================
+  #  7. Second-level SLA probes  (the scheduler ticks every second)
+  # =====================================================================
+  # [feature: second-level object form] liveness probe every 5s. An argv LIST
+  # (no shell) running python3 (which ships in the image). Forbid +
+  # executionTimeout keep a hung probe from stacking up. It presents the
+  # web.authToken bearer if one is set (so it keeps working when auth is on).
+  - name: pulse-liveness
+    schedule:
+      second: "*/5"
+    clusterPolicy: EveryNode
+    concurrencyPolicy: Forbid
+    executionTimeout: 4
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys, time, urllib.request
+        req = urllib.request.Request("http://127.0.0.1:8080/status")
+        tok = os.environ.get("YACRON2_WEB_TOKEN", "")
+        if tok:
+            req.add_header("Authorization", "Bearer " + tok)
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                resp.read(); code = resp.status
+        except Exception as exc:
+            print(f"DOWN: {exc}", file=sys.stderr); sys.exit(1)
+        print(f"UP  HTTP {code}  {(time.perf_counter() - t0) * 1000:6.1f} ms")
+        sys.exit(0 if code == 200 else 1)
+
+  # [feature: second-level 7-field string + failsWhen] latency SLO probe every
+  # 2s (leading field = seconds). A slow response writes to stderr, and
+  # failsWhen turns that into a failed run.
+  - name: pulse-latency
+    schedule: "*/2 * * * * * *"
+    clusterPolicy: EveryNode
+    executionTimeout: 4
+    failsWhen:
+      producesStdout: false
+      producesStderr: true
+      nonzeroReturn: true
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys, time, urllib.request
+        budget = 250.0
+        req = urllib.request.Request("http://127.0.0.1:8080/status")
+        tok = os.environ.get("YACRON2_WEB_TOKEN", "")
+        if tok:
+            req.add_header("Authorization", "Bearer " + tok)
+        t0 = time.perf_counter()
+        try:
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception as exc:
+            print(f"unreachable: {exc}", file=sys.stderr); sys.exit(1)
+        rtt = (time.perf_counter() - t0) * 1000
+        if rtt > budget:
+            print(f"SLO BREACH: {rtt:.1f} ms > {budget:.0f} ms", file=sys.stderr)
+        else:
+            print(f"within SLO: {rtt:6.1f} ms")
+
+  # [feature: streamPrefix ""] a plain per-minute rollup that coexists with the
+  # second-level probes (it still fires exactly ONCE per minute). Empty
+  # streamPrefix so the line is emitted verbatim — handy for JSON log lines.
+  - name: sla-rollup
+    command: echo "{\"kind\":\"sla-rollup\",\"minute\":\"$(date -u +%H:%M)\",\"node\":\"$HOSTNAME\"}"
+    schedule: "* * * * *"
+    clusterPolicy: EveryNode
+    streamPrefix: ""
+
+  # =====================================================================
+  #  8. Housekeeping  (env_file, saveLimit, maxLineLength, capture off,
+  #                    catch-up, counter, privilege drop)
+  # =====================================================================
+  # [feature: maxLineLength] caps each captured line; the long banner below is
+  # truncated in the dashboard log view to keep a chatty job from flooding it.
+  - name: log-rotate
+    command: |
+      echo "log-rotate rotated + gzipped logs on $HOSTNAME"
+      echo "detail: ---------------------------------------------------------------- this very long line is truncated at maxLineLength ----------------------------------------------------------------"
+    schedule: "*/15 * * * *"
+    clusterPolicy: Leader
+    maxLineLength: 80
+
+  - name: cache-evict
+    command: echo "cache-evict expired stale keys on $HOSTNAME"
+    schedule: "*/6 * * * *"
+    clusterPolicy: PreferLeader
+
+  # [feature: env_file] pulls BACKUP_BUCKET etc. from /config/platform.env,
+  # layered under the inline `environment` from _defaults.yaml.
+  - name: backup-warehouse
+    command: |
+      echo "backup-warehouse -> ${BACKUP_BUCKET:-<unset>} (retain ${BACKUP_RETENTION_DAYS:-?}d) on $HOSTNAME"
+      sleep 4
+    schedule: "0 3 * * *"
+    clusterPolicy: Leader
+    env_file: /config/platform.env
+
+  # [feature: captureStdout/Stderr off] its Logs tab shows "no output captured".
+  - name: silent-cleanup
+    command: echo "silent-cleanup ran, but its output is not captured on $HOSTNAME"
+    schedule: "*/8 * * * *"
+    clusterPolicy: Leader
+    captureStdout: false
+    captureStderr: false
+
+  # [feature: saveLimit] keeps only a short in-memory history for this job.
+  - name: audit-log-ship
+    command: echo "audit-log-ship shipped the audit trail on $HOSTNAME"
+    schedule: "*/12 * * * *"
+    clusterPolicy: Leader
+    saveLimit: 8
+
+  # [feature: user / group privilege drop] run a job as a specific uid/gid,
+  # dropping privileges. This is POSIX-only and requires the DAEMON to run as
+  # root; it is also rejected outright on Windows. The grand tour runs as the
+  # unprivileged uid 65534, so it is shown here as CONFIG ONLY (uncomment on a
+  # node whose daemon runs as root):
+  #
+  #   - name: drop-privileges
+  #     command: id            # prints uid=65534 gid=65534 when it runs
+  #     schedule: "*/30 * * * *"
+  #     clusterPolicy: Leader
+  #     user: 65534
+  #     group: 65534
+
+  # [feature: missed-run catch-up (run-once) + onlyIfLastSucceeded +
+  # archiveOutput + catchupJitterSeconds] onMissed: run-once makes yacron2 run
+  # this ONCE on startup if the daily slot was missed while the fleet was down
+  # (bounded to a 12h-old miss). It COALESCES a multi-day gap to a single run —
+  # contrast hourly-invoice-emit's run-all. onlyIfLastSucceeded skips it if the
+  # previous run failed; archiveOutput persists its output to the durable store.
+  - name: daily-reconcile
+    command: |
+      echo "daily-reconcile squared the ledgers on $HOSTNAME at $(date -u +%FT%TZ)"
+      sleep 2
+    schedule: "0 4 * * *"
+    clusterPolicy: Leader
+    onMissed: run-once
+    startingDeadlineSeconds: 43200
+    catchupJitterSeconds: 30
+    onlyIfLastSucceeded: true
+    archiveOutput: true
+
+  # [feature: state KV counter] a DURABLE, fleet-wide run counter. Reads the KV
+  # value, increments it, writes it back — the count survives daemon restarts
+  # and is shared across nodes (global scope).
+  - name: platform-pulse-counter
+    command: |
+      set -eu
+      n=$(yacron2 state get pulse-count --global 2>/dev/null || echo 0)
+      n=$(( n + 1 ))
+      yacron2 state set pulse-count "$n" --global
+      echo "platform pulse #$n (durable, fleet-wide) on $HOSTNAME"
+    schedule: "*/3 * * * *"
+    clusterPolicy: Leader
+
+  # =====================================================================
+  #  9. Manual / on-demand  (scheduled ~never; run from the UI or API)
+  # =====================================================================
+  # These sit Pending until launched via the dashboard or
+  # `POST /jobs/<name>/start`; a manual trigger is never leader-gated.
+  - name: run-schema-migration
+    command: |
+      echo "run-schema-migration applying pending migrations on $HOSTNAME"
+      sleep 4
+    schedule: "0 0 1 1 *"
+    clusterPolicy: Leader
+
+  - name: restore-from-backup
+    command: |
+      echo "restore-from-backup RESTORING latest snapshot on $HOSTNAME"
+      sleep 5
+    schedule: "0 0 1 1 *"
+    clusterPolicy: Leader
+
+  # =====================================================================
+  #  10. Disabled  (present in config, never scheduled)
+  # =====================================================================
+  # [feature: enabled:false]
+  - name: legacy-nightly-sync
+    enabled: false
+    command: echo "legacy-nightly-sync is retired; flip enabled to true to schedule it."
+    schedule: "0 1 * * *"
+    clusterPolicy: Leader
+
+# =====================================================================
+#  ORCHESTRATION: durable DAGs
+# =====================================================================
+dags:
+  # [feature: DAG XCom + expand/map fan-out + retries + fan-in + catch-up]
+  # A scheduled fan-out ETL: discover a set of shards, process them in PARALLEL
+  # (one mapped task instance per shard, each with its own retries + XCom), then
+  # verify. Runs every 3 minutes and completes on its own. Across the fleet a
+  # single dag_run is advanced under ONE lease, so a task never double-launches.
+  # onMissed: run-all + catchupJitterSeconds replay missed cycles after downtime;
+  # you can also deliberately replay a window with a backfill (see the README).
+  - name: orders-etl
+    schedule: "*/3 * * * *"
+    retainRuns: 20
+    onMissed: run-all
+    startingDeadlineSeconds: 1800
+    catchupJitterSeconds: 20
+    tasks:
+      - id: discover
+        command: |
+          echo '["eu", "us", "apac"]' | yacron2 xcom push --key shards
+      - id: load
+        dependsOn:
+          - discover
+        expand:                      # fan out: one `load` per shard
+          fromTask: discover
+          key: shards
+        retries: 2                   # per-task retries (2 -> 3 attempts)
+        retryDelaySeconds: 5
+        command: |
+          echo "load shard=$YACRON2_DAG_MAP_ITEM (index $YACRON2_DAG_MAP_INDEX)"
+          sleep 2
+      - id: verify
+        dependsOn:
+          - load                     # fan-in: waits for every mapped `load`
+        command: |
+          shards=$(yacron2 xcom pull --task discover --key shards)
+          echo "verify on $(hostname); loaded shards were: $shards"
+
+  # [feature: DAG approval gate + sensor + triggerRule + manual trigger] A
+  # human-gated release. It has NO schedule, so it only runs when you trigger it
+  # (POST /dags/release-train/trigger). It builds an artifact, BLOCKS on a human
+  # approval gate, waits on a sensor (polls the platform's own /status until it
+  # is healthy), then publishes. triggerRule all_done makes `publish` run
+  # regardless of upstream skips; onReject: skip cascades a SKIP (not a failure)
+  # if the gate is rejected — the default onReject: fail would instead FAIL
+  # downstream.
+  #
+  #   curl -X POST http://localhost:8080/dags/release-train/trigger
+  #   # note the returned runKey, then approve the gate from ANY node:
+  #   curl -X POST \
+  #     http://localhost:8080/dags/release-train/runs/<runKey>/tasks/approve/decision \
+  #     -H 'Content-Type: application/json' -d '{"decision":"approve","by":"you"}'
+  - name: release-train
+    tasks:
+      - id: build
+        command: |
+          echo "release-$(date -u +%Y%m%d-%H%M%S)" | yacron2 xcom push --key tag
+      - id: approve
+        type: approval
+        dependsOn:
+          - build
+        onReject: skip
+      - id: canary
+        type: sensor
+        dependsOn:
+          - approve
+        pokeIntervalSeconds: 10
+        pokeTimeoutSeconds: 300
+        pokeJitterSeconds: 3
+        command:
+          - python3
+          - -c
+          - |
+            import os, sys, urllib.request
+            req = urllib.request.Request("http://127.0.0.1:8080/status")
+            tok = os.environ.get("YACRON2_WEB_TOKEN", "")
+            if tok:
+                req.add_header("Authorization", "Bearer " + tok)
+            sys.exit(0 if urllib.request.urlopen(req, timeout=3).status == 200 else 1)
+      - id: publish
+        dependsOn:
+          - approve
+          - canary
+        triggerRule: all_done
+        command: |
+          tag=$(yacron2 xcom pull --task build --key tag)
+          echo "published $tag on $(hostname)"
+
+  # [feature: DAG linear pipeline + timezone] the simplest DAG shape: a straight
+  # A -> B -> C chain, scheduled nightly in a named timezone. No fan-out, no
+  # XCom — just ordered, dependency-gated steps, one after the next.
+  - name: nightly-close
+    schedule: "0 1 * * *"
+    timezone: America/New_York
+    clusterPolicy: Leader
+    retainRuns: 10
+    tasks:
+      - id: freeze-ledgers
+        command: echo "froze the day's ledgers on $(hostname)"
+      - id: post-journals
+        dependsOn:
+          - freeze-ledgers
+        command: echo "posted journal entries on $(hostname)"
+      - id: close-books
+        dependsOn:
+          - post-journals
+        command: echo "closed the books on $(hostname)"
+
+  # [feature: DAG static diamond + explicit parallel fan-out/fan-in +
+  # triggerRule all_success] a STATIC diamond: `snapshot` fans out to three
+  # named checks that run in PARALLEL (contrast orders-etl's DYNAMIC expand),
+  # then `certify` fans them back in. `certify` uses the DEFAULT triggerRule
+  # all_success, so if ANY check fails, certify is skipped (upstream_failed).
+  # check-volume fails on odd UTC hours, so the cascade self-drives: certify runs
+  # green on even hours and is skipped on odd hours.
+  - name: data-quality-gate
+    schedule: "*/15 * * * *"
+    clusterPolicy: Leader
+    retainRuns: 20
+    tasks:
+      - id: snapshot
+        command: echo "snapshotted the warehouse on $(hostname)"
+      - id: check-nulls
+        dependsOn:
+          - snapshot
+        command: echo "null check passed"
+      - id: check-freshness
+        dependsOn:
+          - snapshot
+        command: echo "freshness check passed"
+      - id: check-volume
+        dependsOn:
+          - snapshot
+        command: |
+          if [ $(( $(date -u +%-H) % 2 )) -eq 1 ]; then
+            echo "row volume below threshold on odd hour" >&2
+            exit 1
+          fi
+          echo "volume check passed"
+      - id: certify
+        dependsOn:
+          - check-nulls
+          - check-freshness
+          - check-volume
+        command: echo "certified the dataset on $(hostname)"
+
+  # [feature: DAG approval onReject: fail (failure cascade)] a manual hotfix
+  # pipeline. Unlike release-train (onReject: skip, which SKIPS downstream), this
+  # gate uses the DEFAULT onReject: fail: rejecting it FAILS the gate, and
+  # `deploy` (default triggerRule all_success) becomes upstream_failed — the
+  # failure propagates instead of skipping. No schedule, so trigger it by hand:
+  #
+  #   curl -X POST http://localhost:8080/dags/hotfix-release/trigger
+  #   # then REJECT the gate to watch the failure cascade (or approve to deploy):
+  #   curl -X POST \
+  #     http://localhost:8080/dags/hotfix-release/runs/<runKey>/tasks/approve/decision \
+  #     -H 'Content-Type: application/json' -d '{"decision":"reject","by":"you"}'
+  - name: hotfix-release
+    tasks:
+      - id: build-hotfix
+        command: echo "built the hotfix on $(hostname)"
+      - id: approve
+        type: approval
+        dependsOn:
+          - build-hotfix
+        onReject: fail
+      - id: deploy
+        dependsOn:
+          - approve
+        command: echo "deployed the hotfix on $(hostname)"
