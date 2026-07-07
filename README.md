@@ -14,7 +14,7 @@
 [![Checked with mypy](https://img.shields.io/badge/mypy-checked-2a6db2)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A modern, optionally-distributed, fault-tolerant, highly available, leader-electing, container-friendly, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
+A modern, container-friendly, optionally-distributed, fault-tolerant, highly available, leader-electing, highly configurable, precompiled, multi-architecture, portable, security-hardened, production-ready cron replacement.
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
@@ -34,6 +34,24 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
     dropped, so no writable paths or elevated privileges are required (see
     [Production container deployment](#production-container-deployment))
 * Option to automatically retry failing cron jobs, with exponential backoff
+* **Opt-in durable state**: point a single `state:` config block at a local
+  directory (or an Amazon S3 Files / EFS mount to share it fleet-wide) and jobs
+  gain durability across restarts -- missed-run catch-up after downtime and
+  retries that survive a daemon restart. The same store is handed to the jobs
+  themselves over a loopback endpoint, so a job command can reach for durable
+  key/value, an ETL cursor/watermark, a fleet-wide mutex or semaphore,
+  idempotency keys, a shared artifact store and run-scoped secrets with
+  `yacron2 state|cursor|lock|artifact|idempotent|secret` (see the
+  [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State) wiki
+  page); without it, yacron2 stays stateless as before
+* **Opt-in orchestration DAGs**: a `dags:` block turns the scheduler into a
+  small, durable workflow engine -- tasks with `dependsOn` edges, cross-task
+  data hand-off (XCom), dynamic fan-out/mapping, sensors, human approval gates,
+  whole-DAG backfill, and crash-resume of a partial graph, all on the same
+  state store and coordinated across a fleet under a single lease so a task
+  never double-launches (see the
+  [Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs)
+  wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
@@ -373,9 +391,9 @@ Three built-in themes (amber and green phosphor CRT, or a flat **modern** look),
 | :---: | :---: |
 | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
 
-Run history and live logs are kept **in memory only**, and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
+Run history and live logs are kept **in memory only** (unless you opt into the durable state store), and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
 
-**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live.
+**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)).
 
 ## Usage
 
@@ -917,6 +935,11 @@ maximumRetries will mean yacron2 will keep retrying forever, this is mostly
 useful with a schedule of "@reboot" to restart a long running process when it
 has failed.
 
+Retries are in-memory by default: a daemon restart forgets an armed retry. With
+a `state:` section configured, armed retries survive restarts and resume where
+they left off; see [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State)
+in the wiki.
+
 If the cron job is expected to fail sometimes, you may wish to report only in
 the case the cron job ultimately fails after all retries and we give up on it.
 For that situation, you can use the `onPermanentFailure` option:
@@ -1443,9 +1466,3 @@ jobs:
     shell: /bin/bash
     schedule: "* * * * *"
 ```
-
-## Contributing
-
-Development setup, the test/lint/type-check workflow, and the automated release
-process (including the commit-message marker that triggers a PyPI release) are
-documented in [CONTRIBUTING.md](CONTRIBUTING.md).

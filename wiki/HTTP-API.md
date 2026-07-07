@@ -80,11 +80,27 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
+| `GET` | `/jobs/{name}/trends` | `_web_job_trends` | `200` |
 | `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
 | `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
 | `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
+| `GET` | `/dags` | `_web_list_dags` | `200` |
+| `GET` | `/dags/{name}/runs` | `_web_dag_runs` | `200` |
+| `GET` | `/dags/{name}/runs/{run_key}` | `_web_dag_run` | `200` |
+| `GET` | `/dags/{name}/runs/{run_key}/xcom` | `_web_dag_xcom` | `200` |
+| `GET` | `/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs` | `_web_dag_task_logs` | `200` (SSE stream) |
+| `POST` | `/dags/{name}/trigger` | `_web_dag_trigger` | `200` |
+| `POST` | `/dags/{name}/backfill` | `_web_dag_backfill` | `200` |
+| `POST` | `/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision` | `_web_dag_decision` | `200` |
+| `GET` | `/state` | `_web_state` | `200` |
+| `GET` | `/state/documents` | `_web_state_documents` | `200` |
+| `GET` | `/state/records` | `_web_state_records` | `200` |
 | `GET` | `/metrics` | `_web_metrics` | `200` (Prometheus exposition; omitted when `metrics: false`) |
 | `GET` | `/` | `_web_index` | `200` (dashboard page; omitted when `ui: false`) |
+
+The `/dags/...` routes are documented under [DAG endpoints](#dag-endpoints)
+and the `/state...` routes under
+[State inspector endpoints](#state-inspector-endpoints).
 
 The configured `headers` map is applied to every `200` success response across
 all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
@@ -166,7 +182,7 @@ Returns this node's [cluster](Clustering-and-Leader-Election) view as JSON.
 When no `cluster` section is configured, it returns
 `{"enabled": false, "peers": []}`. When a cluster section is present it returns
 `enabled: true` plus a `backend` field naming the active leadership backend
-(`gossip`, `kubernetes`, or `etcd`) and the node's view: its
+(`gossip`, `kubernetes`, `etcd`, or `filesystem`) and the node's view: its
 `node_name` and `job_set_id`, the computed `cluster_size` and `quorum`, whether
 `elect_leader` is on, the `distribution` mode (`single-leader` or `spread`),
 whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
@@ -185,23 +201,28 @@ and a quorate peer advertising a different `distribution` or `elect_leader`
 setting, a coordination-policy conflict surfaced as `policy_conflict: true` with
 the differing descriptors in `conflicting_policies`.
 
-The **lease backends** (`kubernetes` / `etcd`) have no static peer set, so their
-view is lease-shaped: `backend` names the backend, `peers` is empty,
-`cluster_size`/`quorum` are `1`, `elect_leader` is `true`, `distribution` is
+The **lease backends** (`kubernetes` / `etcd` / `filesystem`) have no static
+peer set, so their view is lease-shaped: `backend` names the backend, `peers`
+is empty, `cluster_size`/`quorum` are `1`, `elect_leader` is `true`,
+`distribution` is
 `single-leader`, all three conflict flags (`conflict`, `size_conflict`,
 `policy_conflict`) are always `false`, and an extra `lease` block carries the
 backend-specific detail. This is an endpoint-reference view; the field
 semantics (what `quorate` means for a lease backend, the `lease` block contents,
 and the `expiry` rules below) are documented once in
 [Clustering and Leader Election](Clustering-and-Leader-Election#observing-the-cluster).
-For `kubernetes` the block is `{name, namespace, identity, holder, expiry}` and
-for `etcd` `{electionName, identity, holder, leaseId, expiry}`. The `expiry` is
-populated only while **this** node holds the lease: a follower reports
-`expiry: null`. (For `kubernetes` it is the local lease deadline while this node
-leads; for `etcd` it is the current lease deadline, or `null` when this node is
-not the holder.) `quorate` is whether the node has a fresh successful read of the
-lease store (stale → `Leader` fails closed; the never-skip `PreferLeader` default
-then runs the job anyway).
+For `kubernetes` the block is `{name, namespace, identity, holder, expiry}`,
+for `etcd` `{electionName, identity, holder, leaseId, expiry}`, and for
+`filesystem` `{path, electionName, identity, holder, fence, expiry}`. `fence`
+is the store's monotonic takeover counter: it bumps every time the lease
+changes hands (a renew by the same holder keeps it). For `kubernetes` and
+`etcd` the `expiry` is populated only while **this** node holds the lease: a
+follower reports `expiry: null` (for `kubernetes` it is the local lease
+deadline while this node leads; for `etcd` the current lease deadline). For
+`filesystem` it is the written expiry of the last lease this node observed,
+follower included. `quorate` is whether the node has a fresh successful read
+of the lease store (stale → `Leader` fails closed; the never-skip
+`PreferLeader` default then runs the job anyway).
 
 ```shell
 $ http get http://127.0.0.1:8080/cluster Accept:application/json
@@ -279,8 +300,9 @@ peer traffic. Any node can therefore serve the whole fleet's picture, at most
 one gossip `interval` stale per peer.
 
 When no `cluster` section is configured, or the backend is a lease backend
-(`kubernetes` / `etcd`, which carry only a lease and know nothing about what
-other nodes run), it returns `{"enabled": false, "nodes": []}`.
+(`kubernetes` / `etcd` / `filesystem`, which carry only a lease and know
+nothing about what other nodes run), it returns
+`{"enabled": false, "nodes": []}`.
 
 For the gossip backend it returns `enabled: true`, the serving node's
 `node_name`, the `distribution` and `elect_leader` policy, the gossip
@@ -433,12 +455,18 @@ $ http get http://127.0.0.1:8080/jobs
 ### `GET /jobs/{name}/runs`
 
 Returns the job's retained run history (oldest first, bounded, and held in
-memory only) together with aggregate statistics. Returns `404 Not Found` for
-an unknown job.
+memory -- though with a [durable state store](Durable-State) configured it is
+rehydrated from the durable run ledger after a restart) together with
+aggregate statistics. Returns `404 Not Found` for an unknown job.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
-`fail_reason`). `stats` summarizes them:
+`fail_reason`). Besides `success`, `failure`, and `cancelled`, `outcome` can
+be `unknown`: a crash-reconciled run, recorded when the daemon exited or lost
+the [state store](Durable-State) mid-run so no completion was ever written.
+It is a non-verdict: excluded from `success_rate`, counted only in `total`,
+with no `started_at` or `duration` (`fail_reason` explains the interruption).
+`stats` summarizes them:
 
 | `stats` field | Meaning |
 | --- | --- |
@@ -474,6 +502,44 @@ $ http get http://127.0.0.1:8080/jobs/test-01/runs
 }
 ```
 
+### `GET /jobs/{name}/trends`
+
+The long-horizon sibling of `GET /jobs/{name}/runs`: the same `stats` object,
+computed per time window over the [durable run ledger](Durable-State), which
+survives restarts and -- on a shared mount -- merges every node's runs.
+Returns `404 Not Found` for an unknown job.
+
+The response carries the job `name`, a `source` field, a `generated_at`
+timestamp, and a `windows` map with keys `1h`, `24h`, `7d`, `30d`, and `all`,
+each holding the stats object documented under
+[`GET /jobs/{name}/runs`](#get-jobsnameruns) for the runs that finished inside
+that window:
+
+```shell
+$ http get http://127.0.0.1:8080/jobs/test-01/trends
+{
+    "name": "test-01",
+    "source": "durable",
+    "generated_at": "2026-07-04T12:00:00+00:00",
+    "windows": {
+        "1h":  { "total": 4, "success": 4, "...": "..." },
+        "24h": { "total": 96, "success": 95, "...": "..." },
+        "7d":  { "total": 672, "success": 668, "...": "..." },
+        "30d": { "...": "..." },
+        "all": { "...": "..." }
+    }
+}
+```
+
+`source` is `"durable"` when the aggregates were computed over the durable
+ledger (the horizon is then bounded by `state.maxRunsPerJob` retention, and
+by the 5000 newest records per request on an unbounded-retention store) and
+`"memory"` when the endpoint degraded to the in-memory run history -- because
+no `state:` section is configured, or the store could not be read in time.
+The endpoint always answers rather than erroring on store trouble. See
+[Durable State](Durable-State#sla-trends-over-the-ledger) for the ledger this
+reads.
+
 ### `GET /jobs/{name}/logs`
 
 A [Server-Sent Events](https://developer.mozilla.org/docs/Web/API/Server-sent_events)
@@ -503,6 +569,100 @@ data: {"stream": "stdout", "line": "foobar"}
 event: end
 data: {}
 ```
+
+### DAG endpoints
+
+The orchestration DAGs (the [`dags:`](Orchestration-and-DAGs) section) are
+introspected and controlled here. All are token-gated like the job endpoints.
+
+#### `GET /dags`
+
+The configured DAGs and their tasks:
+
+```json
+[{"name": "nightly-etl", "enabled": true, "scheduled": true,
+  "tasks": [{"id": "extract", "type": "task", "dependsOn": []},
+            {"id": "load", "type": "task", "dependsOn": ["extract"]}]}]
+```
+
+#### `GET /dags/{name}/runs`
+
+Recent dag_runs (newest first), each with its state and a per-state task count:
+
+```json
+{"dag": "nightly-etl", "runs": [
+  {"runKey": "2026-07-04T02:00:00_00:00", "runId": "…", "state": "success",
+   "kind": "scheduled", "logicalDate": "2026-07-04T02:00:00+00:00",
+   "taskStates": {"success": 3}}]}
+```
+
+`404` if the DAG is not configured.
+
+#### `GET /dags/{name}/runs/{run_key}`
+
+One run's full durable document -- every task's state, attempt, timing, XCom
+expansion (`mapped`), and approval decisions. `404` if the run is unknown.
+
+#### `POST /dags/{name}/trigger`
+
+Create and start a manual run now; returns `{"dag": …, "runKey": …}`. `404`
+if the DAG is not configured; a run that could not be durably recorded (the
+state backend is unavailable) surfaces as a `500` error rather than a
+`runKey` for a run that does not exist.
+
+#### `POST /dags/{name}/backfill`
+
+Replay a scheduled DAG across a historical range. Body:
+`{"from": "<ISO>", "to": "<ISO>"}`. Idempotent (create-if-absent per date) and
+bounded. Returns `{"ok": true, "created": <N>}`; `400` on a bad range.
+
+#### `POST /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision`
+
+Approve or reject an [approval gate](Orchestration-and-DAGs#approval-gates).
+Body: `{"decision": "approve"|"reject", "by": "<who>"}`. `200` on success,
+`400` on a bad decision value, `409` if the task is not awaiting a decision.
+
+#### `GET /dags/{name}/runs/{run_key}/xcom`
+
+The XCom outputs the run's tasks published, as a flat list of entries (task,
+key, sha256, size, timestamp) with small text values inlined and larger ones
+metadata-only; `truncated` flags a run with more entries than the cap. `404`
+if the DAG or run is unknown.
+
+#### `GET /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs`
+
+An SSE stream of a *running* task instance's live captured output, in the
+same event shape as [`GET /jobs/{name}/logs`](#get-jobsnamelogs). A finished
+instance's buffer is not retained, so the stream then ends immediately with
+`event: end` and `{"reason": "no-output"}`. `404` if the DAG is not
+configured.
+
+### State inspector endpoints
+
+The dashboard's [durable state](Durable-State) inspector is fed by three
+**metadata-only** routes: record payloads, KV values, and archived output
+never cross this surface. All are token-gated like the job endpoints.
+
+#### `GET /state`
+
+Store health and topology plus an inventory: per-prefix stream and document
+counts, capped scope lists, active leases, the quarantine count, and this
+node's live retry ladders and held concurrency slots. Returns
+`{"enabled": false}` when no `state:` section is configured; an unreadable
+store degrades to health-only rather than erroring.
+
+#### `GET /state/documents?ns=<namespace>`
+
+The documents of one `kv/`, `cursor/`, or `idem/` namespace (`400` for any
+other namespace). KV values are redacted to a `valueSize` / `valueType`
+summary; cursor watermarks and idempotency claim metadata are returned
+verbatim.
+
+#### `GET /state/records?stream=<stream>&limit=<n>`
+
+The newest records of one stream, newest first (default 100, max 500).
+Archived-output `logs/` streams are refused with `403`: they carry raw job
+output, which the metadata-only stance keeps off this surface.
 
 ### `GET /job-set-id`
 
@@ -720,6 +880,144 @@ the web app starts under its own error handling, after the cluster manager, so a
 web misconfiguration cannot skip the cluster gate (which would otherwise fail
 open and run every `Leader` job on every node).
 
+## Job-facing state endpoints (loopback)
+
+Separate from the `web` control API above, yacron2 can run a second,
+**loopback-only** HTTP server that hands its [durable state store](Durable-State)
+to the *jobs it runs*. It binds `127.0.0.1` on an OS-assigned ephemeral port (or
+the address in `state.jobApi.listen`), and the daemon injects its base URL and a
+per-run bearer token into every job's environment, so a job's command line can
+read and write durable state, coordinate through a fleet-wide lock, or fetch a
+run-scoped secret. The `yacron2 state|cursor|lock|artifact|idempotent|secret`
+[CLI commands](CLI-Reference#job-facing-state-commands) are thin clients of this
+endpoint; the same primitives are also reachable offline against the store
+directly, so this server is a front-end, not a second source of truth. The
+surface is served by `yacron2/jobapi.py`; the primitives themselves live in
+`yacron2/jobstate.py`.
+
+### Enabling the endpoint
+
+The endpoint is stood up only when the configuration has a `state:` section with
+`jobApi.enabled` (default `true`). A stateless install, or one with a `state:`
+section but `jobApi.enabled: false`, never starts it and injects nothing.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `true` | Serve the loopback endpoint and inject the `YACRON2_*` environment into every job. |
+| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `0`-`65535` (`0` = OS-assigned), and a non-loopback host needs `allowNonLoopbackBind`. |
+| `maxValueBytes` | int | `1048576` (1 MiB) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` means no limit. |
+| `maxArtifactBytes` | int | `67108864` (64 MiB) | Reject an artifact payload larger than this many bytes with `413`. `0` means no limit. |
+| `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (floored at `5`); the daemon renews it at a third of the TTL while the job holds it. |
+| `allowNonLoopbackBind` | bool | `false` | Explicit opt-in for a non-loopback `listen` host; without it such a host is a `ConfigError` (the endpoint serves per-run tokens and staged secrets over plaintext HTTP). |
+
+The server's own transport-level body cap is derived from these limits (the
+larger of the two, plus envelope headroom), so an oversized request body is
+refused with `413` rather than silently truncated; setting either limit to
+`0` lifts the transport cap too -- genuinely unlimited.
+
+### Injected environment
+
+On launch the daemon injects these variables into every job's process. All are
+strings; an unknown scheduled time is the empty string rather than absent, so a
+job can test the variable instead of guessing whether it was set.
+
+| Variable | Meaning |
+| --- | --- |
+| `YACRON2_STATE_URL` | The loopback base URL, e.g. `http://127.0.0.1:54321`. |
+| `YACRON2_STATE_TOKEN` | A per-run bearer token, revoked the instant the run ends. |
+| `YACRON2_RUN_ID` | A unique id for this run. |
+| `YACRON2_JOB_NAME` | The job's name (also its default scope). |
+| `YACRON2_ATTEMPT` | The retry attempt number (`0` on the first fire). |
+| `YACRON2_SCHEDULED_AT` | The scheduled fire time (ISO-8601), or empty. |
+| `YACRON2_HOST` | The host name. |
+
+### Authentication and errors
+
+Every request must carry `Authorization: Bearer $YACRON2_STATE_TOKEN`. The token
+is matched in constant time against the live run set, so a missing, malformed,
+forged, or stale token returns `401 Unauthorized` before any state is touched.
+Other outcomes:
+
+| Status | When | Body |
+| --- | --- | --- |
+| `400` | A caller error: a missing required field, or a body that is not a JSON object. | `{"error": "..."}` |
+| `409` | A cursor advanced with a value not comparable to its stored one (a type clash). | `{"error": "..."}` |
+| `410` | An artifact record survives but its payload blob was garbage collected. | `{"error": "..."}` |
+| `413` | A value or artifact larger than the configured `maxValueBytes` / `maxArtifactBytes`. | `{"error": "..."}` |
+| `404` | A `get` for a key, cursor, artifact, or secret that is not set. | (empty) |
+| `503` | The state store is unavailable or a backend call timed out. | `{"error": "..."}` |
+
+### Scopes
+
+Every KV, cursor, idempotency, and artifact call acts in a *scope*: a namespace
+that defaults to the calling job's own name (`defaultScope` in `GET /v1/run`), so
+one job cannot read another's state by accident. Omit `scope` for that private
+namespace, or pass `scope=global` (any shared name works) for deliberate
+cross-job coordination.
+
+### Routes
+
+All routes are under `/v1/` and registered in `JobStateAPI._routes`:
+
+| Method | Path | Body / query | Success response |
+| --- | --- | --- | --- |
+| `GET` | `/v1/run` | -- | `{runId, job, attempt, scheduledAt, host, defaultScope}` |
+| `GET` | `/v1/kv/get` | `?scope=&key=` | `{value, updatedAt}`, or `404` |
+| `POST` | `/v1/kv/set` | `{scope?, key, value}` | `{ok, updatedAt}` |
+| `POST` | `/v1/kv/delete` | `{scope?, key}` | `{existed}` |
+| `GET` | `/v1/kv/list` | `?scope=` | `{scope, keys: [{key, value, updatedAt}]}` |
+| `GET` | `/v1/cursor/get` | `?scope=&name=` | `{value, updatedAt}`, or `404` |
+| `POST` | `/v1/cursor/advance` | `{scope?, name, value, force?}` | `{value, advanced}` |
+| `POST` | `/v1/idempotency/claim` | `{scope?, key, ttl?}` | `{fresh, claimedAt}` |
+| `POST` | `/v1/idempotency/release` | `{scope?, key}` | `{released}` |
+| `POST` | `/v1/artifact/put` | `?scope=&name=`, raw body | `{sha256, size}` |
+| `GET` | `/v1/artifact/get` | `?scope=&name=` | raw bytes plus `X-Yacron2-Sha256` / `X-Yacron2-Size`, or `404` |
+| `GET` | `/v1/artifact/list` | `?scope=` | `{scope, artifacts: [{name, sha256, size, at}]}` |
+| `POST` | `/v1/lock/acquire` | `{scope?, name, permits?, ttl?, wait?, blockSeconds?}` | `{acquired, token?, slot?, fence?, ttl?}` |
+| `POST` | `/v1/lock/release` | `{token}` | `{released}` |
+| `GET` | `/v1/secret/get` | `?name=` | `{value}`, or `404` |
+| `GET` | `/v1/secret/list` | -- | `{names: [...]}` |
+
+`cursor/advance` is monotonic by default: the stored value only ever moves to
+`max(current, value)`, so a replayed or out-of-order batch cannot walk a
+watermark backwards, and two nodes racing to advance the same cursor converge on
+the larger value. `advanced` is `false` when the given value was not greater than
+the current one (a no-op that is not even a write), and `force: true` sets the
+value unconditionally (a deliberate rewind). `idempotency/claim` is a fleet-wide
+create-if-absent: the first caller gets `fresh: true`, every later caller
+`fresh: false`, so a retried run can tell "already did this" from "first time"; a
+positive `ttl` bounds the dedupe window (`0` is a permanent claim).
+
+The lock is a fleet-wide mutex (or a semaphore, with `permits > 1`) held as a TTL
+lease that the daemon renews for as long as the job holds it and releases the
+instant the job releases it or the run ends -- so a job that crashes or forgets
+to unlock never leaks a lock. `wait: true` retries for up to `blockSeconds`
+before giving up; without it the call makes a single pass over the permits and
+returns `{acquired: false}` when they are all taken. Like every yacron2
+coordination primitive the lock is at-least-once, not exactly-once (the `fence`
+token in the reply is there for a job that needs true fencing). Run-scoped
+**secrets** are staged in memory by the daemon per run and vanish when the run
+ends; they never touch the store, so only the daemon holds them, and there is no
+scope on the secret routes -- a run sees only its own.
+
+```shell
+# Inside a job, using the injected env directly.
+$ curl -s -H "Authorization: Bearer $YACRON2_STATE_TOKEN" \
+    "$YACRON2_STATE_URL/v1/run"
+{"runId": "…", "job": "nightly-etl", "attempt": 0, "scheduledAt": "2026-07-04T02:00:00+00:00", "host": "node-a", "defaultScope": "nightly-etl"}
+
+# Advance the job's private ETL cursor to the last row processed.
+$ curl -s -H "Authorization: Bearer $YACRON2_STATE_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d '{"name": "rows", "value": 20482}' \
+    "$YACRON2_STATE_URL/v1/cursor/advance"
+{"value": 20482, "advanced": true}
+```
+
+In practice a job reaches for the
+[job-facing CLI](CLI-Reference#job-facing-state-commands) rather than raw `curl`;
+those commands read the injected environment for you.
+
 ## See also
 
 - [Web Dashboard](Web-Dashboard): the built-in browser UI served by this interface.
@@ -727,6 +1025,7 @@ open and run every `Leader` job on every node).
 - [Clustering and Leader Election](Clustering-and-Leader-Election): the `GET /cluster` view and the separate mTLS `/peer` endpoint.
 - [Running on Windows](Running-on-Windows): `unix://` listeners and `socketMode`
   behave differently on Windows.
+- [Durable State](Durable-State): the store the [job-facing state endpoints](#job-facing-state-endpoints-loopback) expose to the jobs the daemon runs.
 - [Configuration Reference](Configuration-Reference)
 - [CLI Reference](CLI-Reference)
 - [Concurrency and Timeouts](Concurrency-and-Timeouts)

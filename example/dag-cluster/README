@@ -1,0 +1,84 @@
+yacron2 clustered DAGs (orchestration on a shared store)
+========================================================
+
+This example runs three yacron2 nodes that share one durable state store and
+elect a leader over it, running the same DAG config. It shows the orchestration
+tier coordinating across a fleet with no coordination service beyond the shared
+mount itself:
+
+  * a dag_run is a single document on the shared store; each run is advanced
+    only by the node holding that run's advance lease, so a task is launched
+    exactly once across the fleet (never double-fired);
+  * `cluster.backend: filesystem` elects a leader using that same shared mount
+    (a flock-guarded TTL lease), so only the leader creates the scheduled runs;
+  * cross-task data (XCom) and per-task state ride the durable store on
+    the same store, so any node can inspect or act on any run;
+  * kill the leader mid-run and another node adopts its in-flight runs within a
+    lease TTL and resumes them from durable per-task state (crash-resume).
+
+On a real fleet the shared mount is an Amazon S3 Files / EFS / NFS volume; here
+it is a local Docker volume shared by the three containers. The config is
+identical either way.
+
+Files
+-----
+
+  yacron2tab.yaml      the shared config: a `state` store (topology: shared),
+                       `cluster.backend: filesystem` election over it, and two
+                       DAGs -- a scheduled fan-out ETL and a human-gated release
+  docker-compose.yml   three yacron2 nodes + one shared state volume (plus a
+                       one-shot init that makes the volume writable by the
+                       image's unprivileged user)
+
+The DAGs
+--------
+
+  shard-etl (every 2 min)   discover -> load (fans out: one mapped instance per
+                            shard, over `discover`'s XCom list) -> verify
+                            (fan-in). Every task prints its node, so you can see
+                            a whole run execute on one leader.
+
+  release (manual only)     build -> gate (an approval node) -> publish.
+                            Trigger it and approve/reject the gate over the API.
+
+Try it
+------
+
+  docker compose -f docker-compose.yml up --build
+
+  # one leader; the shard-etl DAG fires every 2 minutes. Watch the dashboards:
+  #   http://localhost:8080/   http://localhost:8081/   http://localhost:8082/
+
+  # inspect the DAGs and recent runs over the control API (any node):
+  curl -s http://localhost:8080/dags | jq
+  curl -s http://localhost:8080/dags/shard-etl/runs | jq
+
+  # run the human-gated release workflow: trigger it, then approve its gate
+  # (the decision is a compare-and-set on the shared run document, so it
+  # coordinates fleet-wide -- approve from any node):
+  RUN=$(curl -s -X POST http://localhost:8080/dags/release/trigger | jq -r .runKey)
+  curl -s http://localhost:8080/dags/release/runs/$RUN | jq '.tasks.gate'
+  curl -s -X POST \
+    http://localhost:8080/dags/release/runs/$RUN/tasks/gate/decision \
+    -H 'Content-Type: application/json' -d '{"decision":"approve","by":"me"}'
+
+  # backfill the scheduled DAG over a past range (idempotent, bounded):
+  curl -s -X POST http://localhost:8080/dags/shard-etl/backfill \
+    -H 'Content-Type: application/json' \
+    -d '{"from":"2026-01-01T00:00:00+00:00","to":"2026-01-01T00:10:00+00:00"}'
+
+  # failover / crash-resume: stop the current leader mid-run; another node
+  # adopts its runs within a lease TTL and finishes them from durable state:
+  docker compose -f docker-compose.yml stop yacron2-a
+
+Notes
+-----
+
+  * DAGs require a `state` section with `jobApi` enabled (the tasks reach the
+    store -- and their XCom -- through the injected loopback endpoint via
+    `yacron2 xcom | artifact | state`).
+  * The filesystem election backend trusts the wall clock (two ~1s skew
+    margins); the three containers share the host clock, so election is clean.
+    Across real hosts, keep them NTP-synced (see the Clustering wiki page).
+  * See the "Orchestration and DAGs" and "Durable State" wiki pages for the
+    full model.

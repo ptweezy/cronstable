@@ -162,8 +162,17 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
     Includes every behavior-affecting field of the effective config.  The
     resolved uid/gid (host-specific) are deliberately excluded in favor of the
     configured ``user``/``group``; inline secret values are redacted.
+
+    Fields added AFTER the v1 scheme shipped are included only when they
+    differ from their default (see ``out`` below): serialization is
+    ``sort_keys`` over the whole dict, so an unconditional new key would
+    change every existing job's digest on upgrade -- mass-invalidating the
+    persisted retry ladders and ``@reboot`` markers keyed by
+    :func:`job_digest`.  Omit-when-default keeps every pre-existing config's
+    digest byte-identical without a scheme bump; a job that actually sets
+    the new field gets (correctly) a new identity.
     """
-    return {
+    out = {
         "name": job.name,
         "command": _command_repr(job.command),
         "schedule": _schedule_repr(job),
@@ -186,6 +195,12 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         # timezone).
         "timezone": (str(job.timezone) if job.timezone is not None else None),
         "enabled": job.enabled,
+        # gates every scheduled fire (like `enabled`), so replicas that
+        # disagree on it must show as drift.  The catch-up trio
+        # (onMissed/startingDeadlineSeconds/catchupJitterSeconds) and the
+        # archival pair stay excluded: restart-time / observability-only,
+        # node-local behaviour (see yacron2.config.JobConfig.__init__).
+        "onlyIfLastSucceeded": job.onlyIfLastSucceeded,
         "failsWhen": job.failsWhen,
         "onFailure": _redact_action(job.onFailure),
         "onPermanentFailure": _redact_action(job.onPermanentFailure),
@@ -206,6 +221,12 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         "user": job.user,
         "group": job.group,
     }
+    if job.concurrencyScope != "node":
+        # cluster-wide concurrency gates every fire fleet-wide (replicas
+        # disagreeing on it must show as drift), so it is identity -- but
+        # only when set, per the omit-when-default rule above.
+        out["concurrencyScope"] = job.concurrencyScope
+    return out
 
 
 def _normalize_numbers(obj: Any) -> Any:
