@@ -1,0 +1,54 @@
+# Regenerating the dashboard screenshots
+
+The images in `docs/img/dashboard-*.png` are captured off a **real running
+fleet** (no mocked data) at a 1680x1050 viewport with `deviceScaleFactor: 2`
+(3360x2100 PNGs). The width matters: under `distribution: spread` the board
+grows an Owner column and flips the page into its fluid (wide) layout, and
+1680 is enough for that plus the 9-node fleet matrix to render without
+clipping. To refresh them after a UI change:
+
+1. **Boot the grand tour** (builds the image from the working tree, so your
+   local `yacron2/web/index.html` is what gets photographed), then give it
+   10-15 minutes of uptime so sparklines and history fill in:
+
+   ```shell
+   docker compose -f docker-compose-grand-tour.yml up --build -d
+   ```
+
+2. **Run the capture script** (needs `playwright` + its Chromium in the
+   environment; shots land in a `shots/` directory next to the script):
+
+   ```shell
+   python docs/screenshots/capture_dashboard.py                    # everything
+   python docs/screenshots/capture_dashboard.py dashboard-overview # one shot
+   ```
+
+   The script stages the board deliberately: it starts a CPU-burner and a
+   deliberate failure for the hero shot, triggers DAG runs (including parking
+   `release-train` on its approval gate), and saves the staged incident
+   (the four `db-health-*` failures) for last so earlier frames stay clean.
+
+3. **The log-tail closeup** uses a separate one-job daemon whose job actually
+   produces a colorful multi-line stream (the grand-tour jobs are terse
+   one-liners). Run it locally, then capture:
+
+   ```shell
+   yacron2 -c docs/screenshots/logs-demo.yaml &
+   python docs/screenshots/capture_logs_closeup.py
+   ```
+
+4. Review the PNGs, then copy the keepers over `docs/img/` (re-saving with
+   Pillow's `optimize=True` shaves a few percent).
+
+Notes:
+
+* The scripts intercept `GET /version` and substitute the next release number
+  so the header doesn't show a long `setuptools-scm` dev string.
+* Prefer capturing at a "quiet minute" of the grand tour's deterministic
+  failure calendar (see `example/grand-tour/README.md`) unless you *want* the
+  incident chrome in frame.
+* Screenshot prefs are seeded through `localStorage` (`yacron2.boot`,
+  `yacron2.zen`, `yacron2.theme`, ...); the context needs `bypass_csp: true`
+  (the page CSP has no `unsafe-eval`) and `reduced_motion: "no-preference"`
+  (headless Chromium otherwise suppresses the boot POST screen and CRT
+  animation).
