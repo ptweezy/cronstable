@@ -1051,6 +1051,54 @@ def _mk_run(outcome, exit_code=0, dur=1.0):
     )
 
 
+def test_job_run_info_resources_round_trip():
+    from yacron2.resources import ResourceUsage
+
+    run = _mk_run("success")
+    run.resource_usage = ResourceUsage(1.0, 0.5, 9000, 4)
+    d = run.to_dict()
+    assert d["resources"]["cpu_total_seconds"] == 1.5
+    assert d["resources"]["max_rss_bytes"] == 9000
+    # rehydrate from the ledger record
+    restored = yacron2.cron._job_run_info_from_dict(d)
+    assert restored is not None
+    assert restored.resource_usage == run.resource_usage
+
+
+def test_job_run_info_round_trip_without_resources():
+    d = _mk_run("success").to_dict()
+    assert d["resources"] is None
+    restored = yacron2.cron._job_run_info_from_dict(d)
+    assert restored is not None
+    assert restored.resource_usage is None
+
+
+def test_run_stats_cpu_and_memory_aggregates():
+    from yacron2.resources import ResourceUsage
+
+    runs = []
+    for cpu, rss in ((1.0, 1000), (3.0, 5000)):
+        r = _mk_run("success")
+        r.resource_usage = ResourceUsage(cpu, 0.0, rss, 1)
+        runs.append(r)
+    # one unmonitored run in the window: it must not skew the averages
+    runs.append(_mk_run("success"))
+    stats = yacron2.cron._run_stats(runs)
+    assert stats["avg_cpu_seconds"] == 2.0
+    assert stats["max_cpu_seconds"] == 3.0
+    assert stats["max_rss_bytes"] == 5000
+    # the last run was unmonitored -> last_* are None
+    assert stats["last_cpu_seconds"] is None
+    assert stats["last_rss_bytes"] is None
+
+
+def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
+    stats = yacron2.cron._run_stats([_mk_run("success"), _mk_run("failure")])
+    assert stats["avg_cpu_seconds"] is None
+    assert stats["max_rss_bytes"] is None
+    assert stats["last_cpu_seconds"] is None
+
+
 def test_record_run_caps_history():
     cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
     limit = yacron2.cron.RUN_HISTORY_LIMIT
@@ -1063,6 +1111,216 @@ def test_record_run_caps_history():
     assert hist[-1].exit_code == limit + 9
     # last_run mirrors the most recent recorded run
     assert cron.last_run["alpha"].exit_code == limit + 9
+
+
+class _FakeMesh:
+    """A stand-in leadership backend capturing provider installs/lifecycle."""
+
+    def __init__(self, config):
+        self.config = config
+        self.job_summaries_provider = None
+        self.node_stats_provider = None
+        self.started = False
+        self.stopped = False
+
+    def set_job_summaries_provider(self, p):
+        self.job_summaries_provider = p
+
+    def set_node_stats_provider(self, p, share=True):
+        self.node_stats_provider = p
+        self.node_stats_share = share
+
+    def tls_files_changed(self):
+        return False
+
+    async def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+
+def test_fleet_backend_prefers_observability_mesh():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.cluster_manager = object()
+    assert cron._fleet_backend() is cron.cluster_manager
+    mesh = object()
+    cron.observability_mesh = mesh
+    assert cron._fleet_backend() is mesh
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_builds_mesh_and_installs_providers(
+    monkeypatch,
+):
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    built = []
+    monkeypatch.setattr(
+        yacron2.cron,
+        "make_backend",
+        lambda cfg, jsid: built.append(_FakeMesh(cfg)) or built[-1],
+    )
+    cluster_config = {
+        "observabilityMesh": {"backend": "gossip", "marker": 1},
+        "shareNodeStats": True,
+    }
+    await cron.start_stop_observability(cluster_config)
+    assert cron.observability_mesh is built[0]
+    assert built[0].started is True
+    # both fleet providers installed on the overlay mesh, node stats SHARED
+    assert built[0].job_summaries_provider == cron.fleet_job_summaries
+    assert built[0].node_stats_provider == cron.node_resource_snapshot
+    assert built[0].node_stats_share is True
+    # a reload dropping the observability section tears the mesh down
+    await cron.start_stop_observability({"observabilityMesh": None})
+    assert cron.observability_mesh is None
+    assert built[0].stopped is True
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_respects_share_opt_out(monkeypatch):
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    made = []
+    monkeypatch.setattr(
+        yacron2.cron,
+        "make_backend",
+        lambda cfg, jsid: made.append(_FakeMesh(cfg)) or made[-1],
+    )
+    # mesh configured (for job summaries) but shareNodeStats off
+    await cron.start_stop_observability(
+        {"observabilityMesh": {"backend": "gossip"}, "shareNodeStats": False}
+    )
+    assert made[0].job_summaries_provider == cron.fleet_job_summaries
+    # the provider is still installed (for the overlay's own self readout) but
+    # NOT gossiped to peers
+    assert made[0].node_stats_provider == cron.node_resource_snapshot
+    assert made[0].node_stats_share is False
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_reconciles_share_on_kept_mesh(
+    monkeypatch,
+):
+    # shareNodeStats lives on the CLUSTER config, not on the resolved mesh
+    # config the keep/rebuild comparison sees, so a toggle keeps the running
+    # mesh: the latched share flag must be re-reconciled every reload, or
+    # toggling off would keep gossiping CPU/memory until an unrelated restart
+    # and toggling on would never start.
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    made = []
+    monkeypatch.setattr(
+        yacron2.cron,
+        "make_backend",
+        lambda cfg, jsid: made.append(_FakeMesh(cfg)) or made[-1],
+    )
+    mesh_cfg = {"backend": "gossip", "marker": 1}
+    await cron.start_stop_observability(
+        {"observabilityMesh": mesh_cfg, "shareNodeStats": True}
+    )
+    assert made[0].node_stats_share is True
+    # toggle OFF: the mesh config is unchanged, so the mesh is KEPT...
+    await cron.start_stop_observability(
+        {"observabilityMesh": mesh_cfg, "shareNodeStats": False}
+    )
+    assert cron.observability_mesh is made[0]
+    assert made[0].stopped is False
+    # ...and the running mesh sees the new share value
+    assert made[0].node_stats_share is False
+    # toggling back ON reaches the kept mesh too
+    await cron.start_stop_observability(
+        {"observabilityMesh": mesh_cfg, "shareNodeStats": True}
+    )
+    assert cron.observability_mesh is made[0]
+    assert made[0].node_stats_share is True
+
+
+@pytest.mark.asyncio
+async def test_start_stop_observability_none_is_noop():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    await cron.start_stop_observability(None)
+    assert cron.observability_mesh is None
+    await cron.start_stop_observability({"observabilityMesh": None})
+    assert cron.observability_mesh is None
+
+
+@pytest.mark.asyncio
+async def test_web_get_cluster_injects_local_node_stats():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class FakeMgr:
+        def view_dict(self):
+            return {"backend": "gossip", "peers": []}
+
+    cron.cluster_manager = FakeMgr()
+
+    class Req:
+        pass
+
+    resp = await cron._web_get_cluster(Req())
+    data = json.loads(resp.text)
+    # this node's own live load is always injected (local, free)
+    assert data["node_stats"] is not None
+    assert "cpu_percent" in data["node_stats"]
+
+
+@pytest.mark.asyncio
+async def test_web_get_node_returns_resources():
+    import json
+
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class Req:
+        pass
+
+    resp = await cron._web_get_node(Req())
+    data = json.loads(resp.text)
+    assert data["node_name"]
+    # psutil is a core dep, so the node snapshot is populated in tests
+    assert data["resources"] is not None
+    assert "cpu_percent" in data["resources"]
+    assert "mem_percent" in data["resources"]
+
+
+@pytest.mark.asyncio
+async def test_job_to_dict_includes_live_running_resources():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    job = cron.cron_jobs["alpha"]
+
+    class FakeRunning:
+        proc = None
+
+        def live_resources(self):
+            return {"cpu_percent": 40.0, "cpu_seconds": 2.0, "rss_bytes": 1000}
+
+    cron.running_jobs["alpha"] = [FakeRunning(), FakeRunning()]
+    d = cron._job_to_dict("alpha", job)
+    # summed across the two running instances
+    assert d["running_resources"] == {
+        "cpu_percent": 80.0,
+        "cpu_seconds": 4.0,
+        "rss_bytes": 2000,
+        "instances": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_job_to_dict_omits_running_resources_when_unmonitored():
+    cron = yacron2.cron.Cron(None, config_yaml=TWO_JOBS)
+    job = cron.cron_jobs["alpha"]
+
+    class FakeRunning:
+        proc = None
+
+        def live_resources(self):
+            return None  # unmonitored / no sample yet
+
+    cron.running_jobs["alpha"] = [FakeRunning()]
+    d = cron._job_to_dict("alpha", job)
+    assert "running_resources" not in d
 
 
 @pytest.mark.asyncio
@@ -2874,6 +3132,10 @@ async def test_cluster_cert_rotation_keeps_manager_when_unloadable(caplog):
         def tls_files_loadable(self):
             return False  # half-written rotation: cannot load yet
 
+        def set_node_stats_provider(self, provider, share=True):
+            # the kept-manager path re-reconciles the share flag every reload
+            self.node_stats_share = share
+
         async def stop(self):
             self.stopped = True
 
@@ -2922,6 +3184,10 @@ class _ConfigChangeFakeMgr:
     def tls_files_loadable(self):  # pragma: no cover - not reached
         return False
 
+    def set_node_stats_provider(self, provider, share=True):
+        # the kept-manager path re-reconciles the share flag every reload
+        self.node_stats_share = share
+
     async def stop(self):
         self.stopped = True
 
@@ -2968,6 +3234,54 @@ async def test_cluster_config_change_tears_down_when_new_tls_loadable(
     await cron.start_stop_cluster(cfg_b)
     assert fake.stopped is True  # config change tears down
     assert cron.cluster_manager is None  # reconstruction fails closed
+
+
+def _observability_toggle_yamls():
+    yaml_off = (
+        "jobs:\n  - name: a\n    command: echo a\n"
+        '    schedule: "* * * * *"\n'
+        "cluster:\n"
+        '  listen: "127.0.0.1:18443"\n'
+        "  tls:\n"
+        "    ca: /nonexistent/ca.pem\n"
+        "    cert: /nonexistent/cert.pem\n"
+        "    key: /nonexistent/key.pem\n"
+        "  peers:\n"
+        "    - host: b:8443\n"
+        "    - host: c:8443\n"
+        "  electLeader: true\n"
+    )
+    yaml_on = yaml_off + "  observability:\n    shareNodeStats: true\n"
+    return (
+        parse_config_string(yaml_off, "").cluster_config,
+        parse_config_string(yaml_on, "").cluster_config,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cluster_observability_only_change_keeps_manager_reconciles():
+    # An observability-only edit (shareNodeStats toggled; the election
+    # section untouched) must NOT restart the election manager -- on a lease
+    # backend that would drop the leadership lease and pause Leader jobs
+    # fleet-wide for an election-inert change. Instead the kept manager's
+    # LATCHED share flag is re-reconciled to the new config every reload, so
+    # the toggle actually reaches the running gossip mesh.
+    cfg_off, cfg_on = _observability_toggle_yamls()
+    cron = yacron2.cron.Cron(None)
+    fake = _ConfigChangeFakeMgr(cfg_off)
+    cron.cluster_manager = fake
+    # toggle ON: manager kept, share flag reconciled to True
+    await cron.start_stop_cluster(cfg_on)
+    assert fake.stopped is False
+    assert cron.cluster_manager is fake
+    assert fake.node_stats_share is True
+    # toggle back OFF: still kept, flag reconciled to False
+    await cron.start_stop_cluster(cfg_off)
+    assert fake.stopped is False
+    assert cron.cluster_manager is fake
+    assert fake.node_stats_share is False
+    # (a genuine election-relevant change still restarting is covered by
+    # test_cluster_config_change_tears_down_when_new_tls_loadable)
 
 
 # ---------------------------------------------------------------------------

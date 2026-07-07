@@ -1,0 +1,56 @@
+# Throwaway config for the README "live log tail" screenshot: one chatty,
+# resource-monitored job plus a few quiet background jobs so the dimmed
+# overview behind the drawer looks inhabited.
+web:
+  listen:
+    - http://127.0.0.1:8899
+
+defaults:
+  captureStdout: true
+  captureStderr: true
+
+jobs:
+  - name: orders-ingest
+    monitorResources: true
+    schedule: "*/5 * * * *"
+    command:
+      - python
+      - -u
+      - -c
+      - |
+        import sys, time
+        G, Y, C, B, R0 = "\033[32m", "\033[33m", "\033[36m", "\033[1m", "\033[0m"
+        def say(tag, color, msg):
+            print(f"{color}{tag:<5}{R0} {msg}", flush=True)
+            time.sleep(0.55)
+        say("INFO", G, f"orders-ingest starting {C}region=us-east-1{R0} source=orders-db.meridian.internal")
+        say("INFO", G, "cursor: resuming from watermark " + C + "48,200" + R0 + " (scope orders-domain)")
+        total = 0
+        for page in range(1, 7):
+            rows = 500 if page < 6 else 491
+            total += rows
+            if page == 4:
+                say("WARN", Y, f"page {page}/6 throttled by upstream, retrying once (backoff 800ms)")
+                time.sleep(0.4)
+            say("INFO", G, f"pulled page {page}/6 ({rows} rows, {38+page*3}ms)")
+        say("INFO", G, f"dedup pass: {B}2,983{R0} unique / {total:,} pulled (18 replays dropped)")
+        say("INFO", G, "enriching with fx rates for 14:00Z window")
+        say("INFO", G, f"wrote batch {C}2026-07-07T14:00Z{R0} to warehouse ({B}2,983{R0} rows, 1.8 MiB)")
+        say("INFO", G, "cursor: advanced watermark to " + C + "51,183" + R0)
+        say("INFO", G, "done: 6 pages, 2,983 rows, 0 errors")
+
+  - name: heartbeat
+    command: echo ok
+    schedule: "* * * * *"
+  - name: api-canary
+    command: echo canary 200 OK
+    schedule: "*/2 * * * *"
+  - name: cache-warm
+    command: echo warmed 500 keys
+    schedule: "*/5 * * * *"
+  - name: db-backup
+    command: echo snapshot uploaded
+    schedule: "0 3 * * *"
+  - name: report-nightly
+    command: echo report sent
+    schedule: "30 6 * * *"
