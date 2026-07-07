@@ -11,25 +11,44 @@ from email.message import EmailMessage
 from email.utils import format_datetime
 from functools import lru_cache
 from socket import gethostname
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 import aiohttp
-import aiosmtplib
-import jinja2
-import sentry_sdk
-import sentry_sdk.utils
 
 from yacron2 import platform
 from yacron2.config import JobConfig
 from yacron2.statsd import StatsdJobMetricWriter
 
+if TYPE_CHECKING:
+    # jinja2/sentry_sdk/aiosmtplib are imported lazily inside the reporters
+    # that use them (_compiled_template / SentryReporter / MailReporter): they
+    # cost ~40-170ms to import and pull a lot into RSS, and a job that never
+    # reports through those channels should pay for none of it. This block
+    # runs only under the type checker (to resolve the jinja2.Template
+    # annotation); at runtime TYPE_CHECKING is False and it is skipped.
+    import jinja2
+
 logger = logging.getLogger("yacron2")
 
 
 @lru_cache(maxsize=None)
-def _compiled_template(source: str) -> jinja2.Template:
+def _compiled_template(source: str) -> "jinja2.Template":
     # Template source strings come from config and are constant for the life
-    # of the process; compile each distinct one once and reuse it.
+    # of the process; compile each distinct one once and reuse it. jinja2 is
+    # imported here (not at module top) so a daemon whose jobs never render a
+    # report template never pays its import cost; the lru_cache means the
+    # import statement is only reached on the first distinct template anyway.
+    import jinja2
+
     return jinja2.Template(source)
 
 
@@ -71,9 +90,15 @@ class JobOutputStream:
         self.lines: Deque[Tuple[str, str]] = deque(maxlen=limit)
         self._subscribers: List["asyncio.Queue"] = []
         self.closed = False
+        # total lines ever published: `published - len(lines)` is how many
+        # the ring evicted, so a consumer archiving the buffer (see
+        # Cron._archive_output) can record the truncation instead of
+        # presenting the tail as the whole output.
+        self.published = 0
 
     def publish(self, stream_name: str, line: str) -> None:
         item = (stream_name, line)
+        self.published += 1
         self.lines.append(item)
         for queue in self._subscribers:
             queue.put_nowait(item)
@@ -230,6 +255,12 @@ class SentryReporter(Reporter):
         else:
             return  # sentry disabled: early return
 
+        # Imported here, past the disabled/no-DSN early returns, so the ~130ms
+        # sentry_sdk import (and its RSS) is paid only when a job actually
+        # reports to Sentry, not by every daemon at startup.
+        import sentry_sdk
+        import sentry_sdk.utils
+
         template = _compiled_template(config["body"])
         body = template.render(job.template_vars)
 
@@ -327,6 +358,10 @@ class MailReporter(Reporter):
             message.set_content(body, subtype="html")
         else:
             message.set_content(body)
+        # Imported here, past the reporting-disabled early returns, so a daemon
+        # that never sends a mail report never pays the aiosmtplib import cost.
+        import aiosmtplib
+
         smtp = aiosmtplib.SMTP(
             hostname=smtp_host,
             port=smtp_port,
@@ -499,6 +534,20 @@ class JobRetryState:
         self.count = 0  # number of times retried
         self.task = None  # type: Optional[asyncio.Task]
         self.cancelled = False
+        # the absolute instant the currently-armed retry will fire, and the
+        # delay it is sleeping out. Set by the scheduler when a retry is armed
+        # (Cron.schedule_retry_job) so the dashboard can render a live
+        # "attempt N/M · next retry in Xs" countdown from GET /jobs; None while
+        # no retry is pending.
+        self.next_retry_at = None  # type: Optional[datetime]
+        self.scheduled_delay = None  # type: Optional[float]
+        # the instant this ladder's current attempt was ARMED (its pending
+        # first written). Copied into a cross-node HANDOFF record's
+        # ``armedAt`` so the new owner's superseded-by-run guard anchors on
+        # the original arm time, not the hand-off instant -- otherwise a run
+        # the new owner already completed BETWEEN arming and hand-off would
+        # look "older" than the record and be re-run (a double-fire).
+        self.armed_at = None  # type: Optional[datetime]
 
     def next_delay(self) -> float:
         delay = self.delay
@@ -516,9 +565,33 @@ class RunningJob:
     ]  # type: List[Reporter]
 
     def __init__(
-        self, config: JobConfig, retry_state: Optional[JobRetryState]
+        self,
+        config: JobConfig,
+        retry_state: Optional[JobRetryState],
+        *,
+        extra_env: Optional[Dict[str, str]] = None,
+        state_token: Optional[str] = None,
+        run_id: Optional[str] = None,
+        dag_ref: Optional[Any] = None,
     ) -> None:
         self.config = config
+        # when set, this RunningJob is one DAG task instance rather
+        # than a scheduled job; the reaper routes its completion to the DAG
+        # scheduler (yacron2.dagrun) instead of the normal record/retry path.
+        # An opaque marker carrying (dag, run_key, taskkey, ...) the scheduler
+        # needs to move the graph forward.
+        self.dag_ref = dag_ref
+        # environment the daemon injects on top of the job's own
+        # (the loopback state-API URL + a per-run bearer token + run context).
+        # Applied unconditionally in start(), after config.environment, so the
+        # control-channel vars are present on every job and win over a same-
+        # named user override. state_token is the loopback token the daemon
+        # revokes when this run finishes (see Cron._handle_finished_job); it is
+        # also carried in extra_env, but kept here for a direct, unambiguous
+        # cleanup handle. run_id identifies this run in the durable ledger.
+        self.extra_env = extra_env or {}
+        self.state_token = state_token
+        self.run_id = run_id
         self.proc = None  # type: Optional[asyncio.subprocess.Process]
         self.retcode = None  # type: Optional[int]
         # wall-clock instant this run started, for the web UI's run history;
@@ -608,11 +681,15 @@ class RunningJob:
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [self.config.command]
-        if self.config.environment:
+        if self.config.environment or self.extra_env:
             env = dict(os.environ)
             fixup_pyinstaller_env(env)
             for envvar in self.config.environment:
                 env[envvar["key"]] = envvar["value"]
+            # The daemon-injected control-channel vars go last, so a job's own
+            # environment cannot shadow the loopback URL/token it needs to
+            # reach the state API (YACRON2_* is reserved for yacron2's use).
+            env.update(self.extra_env)
             self.env = env
             kwargs["env"] = env
         if self.config.uid is not None or self.config.gid is not None:

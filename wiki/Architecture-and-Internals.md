@@ -25,29 +25,39 @@ operator-facing walkthrough.
 | `yacron2/cron.py` | `Cron` class: scheduler main loop (`Cron.run`), hot reload (`update_config`), the aiohttp web app (`start_stop_web_app` and handlers), due-job spawning (`spawn_jobs` / `job_should_run` / `launch_scheduled_job` / `maybe_launch_job`), the job reaper (`_wait_for_running_jobs`), and retry orchestration (`handle_job_failure` / `schedule_retry_job` / `cancel_job_retries`). |
 | `yacron2/job.py` | `RunningJob` lifecycle (subprocess launch, privilege drop, wait, stream capture), `StreamReader`, the `Reporter` implementations (`SentryReporter`, `MailReporter`, `ShellReporter`, `WebhookReporter`), and `JobRetryState`. |
 | `yacron2/fingerprint.py` | The order-independent **job-set id**: `canonical_job` (the host-independent, effective per-job representation) and the versioned hashing (`SCHEME_VERSION`). Consumed by `cron.py` (the `/job-set-id` endpoint and startup/reload logging) and by `cluster.py` (peer comparison). |
-| `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`) via deferred imports. |
+| `yacron2/leadership.py` | The pluggable-backend seam: the `LeadershipBackend` ABC every leader-gating call in `cron.py` goes through (`start`/`stop`/`is_leader`/`leader_name`/`is_quorate`/`view_dict` plus the defaulted per-job, conflict, `@reboot`, and never-skip `available_*` families), the `LeaseBackend` shared base for the single-holder lease backends, and the `make_backend` factory that builds the one named by `cluster.backend` (`gossip` -> `cluster.ClusterManager`, `kubernetes` -> `backends.kubernetes.KubernetesBackend`, `etcd` -> `backends.etcd.EtcdBackend`, `filesystem` -> `backends.filesystem.FilesystemBackend`) via deferred imports. |
 | `yacron2/backends/kubernetes.py` | `KubernetesBackend` (a `LeaseBackend`): a `coordination.k8s.io/v1` `Lease` driven over either the official `kubernetes` client or a hand-rolled apiserver REST transport (`cluster.kubernetes.clientLibrary` chooses `auto`/`library`/`http`). |
 | `yacron2/backends/etcd.py` | `EtcdBackend` (a `LeaseBackend`): a lease-backed key/election against etcd's v3 gRPC-gateway JSON/HTTP API, a single fully-portable transport with no optional client library. |
+| `yacron2/backends/filesystem.py` | `FilesystemBackend` (a `LeaseBackend`): leader election through the flock-guarded, fence-counted TTL lease of `state.FilesystemStateBackend` over a shared POSIX mount (Amazon S3 Files / EFS / NFSv4) -- no coordination service, the mount is the store; stdlib-only. |
 | `yacron2/backends/__init__.py` | Shared backend helpers, notably the pure `select_transport(client_library, native_available, backend)` used by the kubernetes backend to pick its transport (`auto` prefers the native client, `library` requires it, `http` forces the hand-rolled path). |
 | `yacron2/cluster.py` | The `gossip` backend: `ClusterManager` (the mTLS `/peer` listener and periodic peer-poll loop) is one concrete `LeadershipBackend`, plus the pure `ClusterView` state machine (per-peer status + drift debounce), the pure `quorum_size`/`elect_leader`/`elect_available_leader` functions, and (for `distribution: spread`) the pure rendezvous-hashing `elect_job_owner`/`elect_available_job_owner`. Imports `config` and `fingerprint`; no dependency on `cron.py`. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `yacron2/statsd.py` | `StatsdJobMetricWriter` and the UDP `StatsdClientProtocol` used to emit best-effort statsd metrics. |
 | `yacron2/prometheus.py` | `PrometheusMetrics` accumulators plus the hand-rolled text/OpenMetrics exposition renderer behind `GET /metrics`. |
+| `yacron2/state.py` | The opt-in durable state store: the `StateBackend` ABC and the single `FilesystemStateBackend` concrete serving both a local directory and an Amazon S3 Files / EFS (NFSv4) mount -- the mount, not the code, decides the reach (`detect_topology` probes it). Immutable schema-versioned JSON records written via temp file + atomic rename (unknown/corrupt records are quarantined on read, never fatal), derived-maximum cursors, advisory-`flock` TTL leases with a monotonic fence, and the `make_state_backend` factory. The backend is only constructed (`start_stop_state`) when a `state:` section is configured; stdlib-only, so the stateless install pays nothing. |
+| `yacron2/state_admin.py` | Offline administration of the durable store behind the `yacron2 state ...` subcommands: `backup`/`restore`, `migrate` (between paths/mounts), manual `gc`, `check` (writability probe + inventory), and `migrate-schema`. Works straight from the `state` config section with no running daemon, and stays safe against a live one. Imported lazily by `__main__.py` only when a `state` subcommand is used. |
 | `yacron2/version.py` | Generated version string (`version`), served by the web `/version` endpoint and printed by `--version`. |
 
 The dependency direction is `__main__` -> `cron` -> (`config`, `job`,
 `fingerprint`, `leadership`) -> (`statsd`, `config`). `cron.py` imports
 `make_backend` from `leadership`, so the leadership seam fans out as
 `cron` -> `leadership` -> {`cluster` (gossip), `backends.kubernetes`,
-`backends.etcd`}; those backend modules are imported lazily by `make_backend`,
-so `backends/` never enters the import graph unless `cluster.backend` selects a
-lease backend. `cluster.py` depends on `config` and `fingerprint` only; both
-lease backends depend on `config` and `leadership`; `config.py` has no
+`backends.etcd`, `backends.filesystem`}; those backend modules are imported
+lazily by `make_backend`, so `backends/` never enters the import graph unless
+`cluster.backend` selects a lease backend. `cluster.py` depends on `config` and
+`fingerprint` only; the lease backends depend on `config` and `leadership`
+(`backends.filesystem` also on `state` and `platform`, since it embeds a
+private `FilesystemStateBackend` as its lease store); `config.py` has no
 dependency on `cron.py` or `job.py`.
 `prometheus.py` is a leaf module like `statsd.py`: it imports only
 `yacron2.version` at module scope, `cron.py` imports it, and its renderer
 late-imports `yacron2.cron` helpers at scrape time to break the cycle.
 `platform.py` is a leaf module with no yacron2 dependencies, imported by
 `__main__`, `config`, `cron`, and `job` wherever per-OS behavior is needed.
+`state.py` depends only on `config` and `platform`; `cron.py` imports it and
+builds the backend via `make_state_backend` inside `start_stop_state` (only
+when a `state:` section is configured). `state_admin.py` (which depends on
+`config` and `state`) is imported lazily by `__main__` for the
+`yacron2 state ...` subcommands, so it never enters the daemon's import graph.
 
 ## The event loop
 
@@ -193,6 +203,26 @@ re-checks the gate before relaunching a scheduled-job retry). See
 As `README.md` puts it, `@reboot` "will only run the job when yacron2 is
 initially executed."
 
+When a `state:` section is configured, a non-cluster-deferred `@reboot` job
+additionally passes through `_reboot_boot_gate` before launching: a durable
+boot marker (stream `reboot/<job>`) turns the one-shot into once per **OS
+boot** per host rather than once per daemon start. The ordering is
+record-before-launch -- the marker is appended (bounded, `STATE_OP_TIMEOUT`)
+*before* the spawn, the same at-most-once bias as the cluster's
+`mark_reboot_ran` path, so a crash between record and spawn errs toward not
+re-running. Boot identity comes from `platform.os_boot_id()` (Linux's
+`/proc/sys/kernel/random/boot_id`, an exact per-boot UUID), falling back to
+`platform.os_boot_time()` (boot time derived from uptime: `GetTickCount64` on
+Windows, `/proc/uptime` on POSIX) compared within `BOOT_TIME_TOLERANCE`
+(60 s); where neither source exists (macOS/BSD) the behavior is unchanged
+(runs every daemon start). The marker also carries the host and the job's
+per-job digest (`fingerprint.job_digest`), so a redefined `@reboot` job runs
+again. An unreadable or unwritable marker runs the job anyway under the
+default `onStoreUnavailable: degrade` (at-least-once, the stateless behavior)
+and skips it under `fail-closed`. Cluster-deferred `Leader`/`PreferLeader`
+`@reboot` jobs never reach this gate; their dedupe remains the leadership
+backend's `reboot_ran` path.
+
 ### Shutdown sequence
 
 When `_stop_event` is set the `while` loop exits and `Cron.run` logs
@@ -200,7 +230,9 @@ When `_stop_event` is set the `while` loop exits and `Cron.run` logs
 
 1. Drains pending retries: while `self.retry_state` is non-empty, it
    `cancel_job_retries(name)` for every entry concurrently via
-   `asyncio.gather`.
+   `asyncio.gather` -- passing `settle=None`, so with a `state:` section
+   configured a graceful stop leaves each pending durable ladder record in
+   place for the next boot's re-arm (see "Retry state machine").
 2. If a leadership backend is running, logs `"Stopping cluster manager"` and
    `await self.cluster_manager.stop()` (which releases leadership best-effort
    for fast failover: gossip cancels the poll loop and tears down the mTLS
@@ -283,6 +315,12 @@ never enters the import graph for the common gossip case):
   reachable.
 - **`etcd`** -> `backends.etcd.EtcdBackend`, a lease-backed key/election against
   an etcd cluster, same fenced guarantee.
+- **`filesystem`** -> `backends.filesystem.FilesystemBackend`, a flock-guarded,
+  fence-counted TTL lease on a shared POSIX mount, embedding the durable
+  store's lease machinery (`state.FilesystemStateBackend`) as its store.
+  Fenced, but lease expiry is judged across the participating hosts' wall
+  clocks, so unlike the kubernetes/etcd backends it requires NTP-bounded skew
+  on every node. Stdlib-only.
 
 The `LeadershipBackend` surface is split three ways so a new lease backend stays
 tiny: the *core abstract* methods every backend implements (`start`, `stop`,
@@ -616,7 +654,52 @@ Flow:
 - **On success** (`handle_job_success`): `cancel_job_retries(name)` clears any
   pending retry, then `report_success()` runs.
 - **`cancel_job_retries(name)`** pops the state (no-op if absent), sets
-  `cancelled = True`, and awaits or cancels the pending `task`.
+  `cancelled = True`, and awaits or cancels the pending `task`. It takes a
+  `settle` reason (default `"superseded"`) for the durable ladder below; the
+  shutdown drain passes `settle=None` so a graceful stop settles nothing.
+
+With a `state:` section configured, the machine gains a durable half (without
+one, the flow above is complete and retries die with the process):
+
+- **Durable ladder records.** `schedule_retry_job` persists a fire-and-forget
+  `pending` record (stream `retries/<job>`, `_persist_retry_pending`) carrying
+  the attempt number, the **absolute** `notBefore` deadline, and the job's
+  `fingerprint.job_digest`; every resolution appends a `settled` record on top
+  (`_persist_retry_settled`) with a reason: `launched`, `succeeded`,
+  `superseded`, `cancelled`, `exhausted`, `owner-moved`, `job-removed`, or a
+  re-arm-time invalidation reason. When cross-node retry resume is active (a
+  shared-topology store plus leader election) the stream carries a third
+  kind: an ownership move writes a `handoff` record (`_abandon_retry`)
+  instead of settling the ladder dead, and the claiming node's fresh
+  `pending` carries a `claimedFrom` field naming the host it took the ladder
+  from; on a single-node store `owner-moved` remains the settle. Just before
+  the relaunch,
+  `_retry_consume_ok` settles the pending record with reason `launched` --
+  record-before-run, so a crash right after the launch cannot re-arm the
+  attempt that already ran. Under `onStoreUnavailable: degrade` an
+  unsettleable record launches anyway (at-least-once, a bounded one-attempt
+  replay window); under `fail-closed` the launch defers and re-checks, exactly
+  like a closed cluster gate. A graceful shutdown deliberately does *not*
+  settle: the surviving pending record is the restart handoff.
+- **Boot re-arm** (`_rehydrate_retries`). When the backend first comes up,
+  each configured retry-enabled job whose newest ladder record is `pending`
+  (and which has no live retry state or running instance -- live activity
+  outranks the ledger) is re-armed at the persisted position: a fresh
+  `JobRetryState` is replayed to the recorded attempt (`count` and the next
+  delay as if the process never restarted) and the ordinary
+  `schedule_retry_job` is scheduled with only the time remaining until
+  `notBefore` (zero if it passed while down), so the cluster-gate re-check and
+  job-vanished cleanup behave identically to a never-restarted ladder. A
+  record is settled instead of re-armed on: a malformed record, a per-job
+  digest mismatch (`config-changed` -- per-job, stricter than the whole-set
+  job-set id, so unrelated config edits do not drop the retry), a disabled
+  job, an exhausted budget, a record older than the job's
+  `startingDeadlineSeconds`, or an `@reboot` job whose boot marker does not
+  cover the current OS boot (`superseded-by-reboot`: the fresh boot run
+  supersedes the stale ladder). Conversely, a *covered* marker re-arms the
+  pending retry, which is what lets an `@reboot` `maximumRetries: -1`
+  keep-alive survive daemon restarts. Every ambiguous case settles: the bias
+  is no-run over double-run.
 
 See [Failure Detection and Retries](Failure-Detection-and-Retries) for the
 operator-facing options.
@@ -635,6 +718,24 @@ instance is already running:
   reaper recognizes the forced termination as a replacement rather than a
   failure (`_handle_finished_job` skips reporting/retries for replaced runs),
   then a fresh instance is launched.
+
+With `concurrencyScope: cluster`, one more gate sits between this local check
+and the spawn: `_claim_cluster_slot` takes a TTL slot lease (`slots/<job
+name>`, `state.slotTtlSeconds`) in the shared state store, so `Forbid` and
+`Replace` also exclude instances on other nodes. `maybe_launch_job` is the
+single choke point, so every launch flavor (scheduled, retry, catch-up
+backfill, deferred `@reboot`, manual API start) is gated. Against a live
+foreign holder, `Forbid` skips the launch (a warning names the holder) and
+`Replace` appends a fence-targeted cancel record to the `slots/<name>` stream
+and hands the relaunch to a background pursuit task -- never waited out on
+the scheduler path, bounded at twice the slot TTL, then it gives up with a
+warning (no-run over double-run). A store that cannot answer follows
+`onStoreUnavailable`: `degrade` (the default) launches with node-local
+enforcement only for that run, `fail-closed` skips. The contract is
+at-least-once, not exactly-once: a holder that loses its lease to a store
+outage keeps running, so a peer that then wins the slot overlaps it. The slot
+releases when the job's last local instance finishes; a crashed holder's slot
+frees by TTL expiry.
 
 The `replaced` flag is the single mechanism distinguishing an
 operator/scheduler-initiated replacement from an actual job failure. See

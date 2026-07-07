@@ -135,7 +135,7 @@ def display_holder(raw: Optional[str]) -> Optional[str]:
     return raw.rpartition("#")[0] or raw
 
 
-@dataclass
+@dataclass(slots=True)
 class LeaseState:
     """The fields of an observed ``Lease`` the election cares about."""
 

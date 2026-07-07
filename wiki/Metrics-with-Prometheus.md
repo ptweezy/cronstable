@@ -72,7 +72,7 @@ Two response details differ from the other endpoints:
 
 ## Metric reference
 
-All metrics are prefixed `yacron2_`. Per-job metrics carry the job name in a `job_name` label (not `job`, which would collide with Prometheus's own target label). Counters are cumulative since process start; they reset when the daemon restarts, which Prometheus's `rate()`/`increase()` handle natively.
+All metrics are prefixed `yacron2_`. Per-job metrics carry the job name in a `job_name` label (not `job`, which would collide with Prometheus's own target label). Counters are cumulative since process start; they reset when the daemon restarts, which Prometheus's `rate()`/`increase()` handle natively (with a [durable state store](Durable-State) configured, the per-job counters are re-seeded across restarts; see [Semantics and guarantees](#semantics-and-guarantees)).
 
 ### Daemon
 
@@ -105,6 +105,24 @@ All metrics are prefixed `yacron2_`. Per-job metrics carry the job name in a `jo
 | `yacron2_job_last_run_exit_code{job_name}` | gauge | Exit code of the most recent finished run. |
 | `yacron2_job_last_run_success{job_name}` | gauge | `1` if the most recent finished run succeeded, else `0` (a cancelled run counts as `0`). |
 
+### State backend
+
+Emitted when a [durable state store](Durable-State) is configured (a `state:` section); without one yacron2 is stateless and these families are absent. They observe the store itself -- the job families above are unchanged, except that the store makes the per-job counters restart-durable (see [Semantics and guarantees](#semantics-and-guarantees)). Families and label values appear as they first become relevant, so a store that never contends a lock or is never throttled does not export frozen zero series forever.
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `yacron2_state_info{backend, topology}` | gauge (info) | Static store facts: the backend implementation (`filesystem`) and the effective topology (`single-node` / `shared`, after `topology: auto` resolves); always `1`. |
+| `yacron2_state_ops_total{op}` | counter | Store operations by kind: `op="append"` / `"list"` / `"derive-max"` / `"prune"` / `"lease-acquire"` / `"lease-renew"` / `"lease-release"` / `"lease-read"` / `"start"` / `"gc"`. Each `op` value appears once that operation has first run. |
+| `yacron2_state_op_errors_total{op}` | counter | Store operations that raised, same `op` label. |
+| `yacron2_state_op_seconds_total{op}` | counter | Seconds spent inside store operations; divide by `yacron2_state_ops_total` (e.g. `rate()` over `rate()`) for mean in-store latency per operation. |
+| `yacron2_state_lock_acquisitions_total` | counter | Advisory-lock acquisitions by the store. Emitted once nonzero. |
+| `yacron2_state_lock_wait_seconds_total` | counter | Seconds spent waiting to acquire the store's advisory locks -- the lock-contention signal. Emitted alongside `yacron2_state_lock_acquisitions_total`. |
+| `yacron2_state_throttled_ops_total` | counter | Store operations delayed by the `state.maxOpsPerSecond` token bucket. Emitted once nonzero. |
+| `yacron2_state_throttle_wait_seconds_total` | counter | Seconds those operations spent queued behind the rate limit. Emitted alongside `yacron2_state_throttled_ops_total`. |
+| `yacron2_state_dropped_writes_total{kind}` | counter | Durable writes that failed and were dropped (with a logged warning) -- writes are fire-and-forget under either `onStoreUnavailable` policy -- by `kind="run-record"` / `"checkpoint"` / `"retry"` / `"reboot-marker"` / `"counters"` / `"manifest"`. Emitted once nonzero -- the single most alertable state signal. |
+
+If reading the store's stats fails during a scrape, the state families are omitted from that scrape (with the error logged) rather than failing it -- the same degradation contract as the cluster block below. `yacron2_state_dropped_writes_total` is the exception: it is accumulated by the scheduler as it drops writes, not read from the store, so it keeps being served even when the store itself cannot be read.
+
 ### Cluster
 
 Emitted when a [cluster](Clustering-and-Leader-Election) is configured; the values mirror the pre-derived fields of [`GET /cluster`](HTTP-API#get-cluster), so the same alert rules documented there apply.
@@ -128,7 +146,7 @@ If a backend read fails during a scrape, the cluster block degrades to `yacron2_
 
 - **Metrics never affect scheduling.** Every hook is a synchronous in-memory increment on the scheduler's event loop; there is nothing to time out, retry, or crash on. This is the same contract the statsd writer has, without the UDP.
 - **Counters agree with the API.** `yacron2_job_runs_total` increments at the exact point a run enters the run history (`GET /jobs/{name}/runs`), so the two surfaces can never disagree on outcomes.
-- **Counters survive reloads, not restarts.** The accumulators live on the daemon (not the web app), so a config reload -- even one that restarts the web server or the cluster manager -- keeps them. A process restart resets them, which is normal for Prometheus counters.
+- **Counters survive reloads -- and, with durable state, restarts.** The accumulators live on the daemon (not the web app), so a config reload -- even one that restarts the web server or the cluster manager -- keeps them. Without a `state:` section a process restart resets them, which is normal for Prometheus counters. With a [durable state store](Durable-State) configured, the per-job counters (runs by outcome, retries, permanent and start failures, the duration histogram, and the last success/failure timestamps) are snapshotted durably -- at most one write per 15 seconds while running, plus a final snapshot on clean shutdown -- and seeded back on boot for the jobs still in the config (histogram state only if the `durationBuckets` bounds are unchanged). A restart then reads as, at worst, a small ordinary counter reset covering the events since the last snapshot; a crash forfeits at most those last few seconds. `yacron2_start_time_seconds` still resets per process by design -- that is how you see the restart itself.
 - **Removed jobs disappear.** On every successful reload, series for jobs no longer in the config are dropped; a renamed job starts over at zero.
 - **`@reboot` keep-alives look "always running".** A long-running `@reboot` job shows `yacron2_job_running 1` with zero finished runs -- that is the correct reading, not missing data.
 

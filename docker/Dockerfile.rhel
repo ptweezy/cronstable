@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# yacron2 — RHEL variant, built on Red Hat's Universal Base Image (UBI 9) with
+# yacron2 — RHEL variant, built on Red Hat's Universal Base Image (UBI 10) with
 # its native Python 3.12. UBI is freely redistributable and is the right base
 # for RHEL/OpenShift shops and image-provenance policies that require a Red Hat
 # base. The runtime is the slimmer ubi-minimal.
@@ -10,7 +10,7 @@
 # CI passes the released version via --build-arg VERSION=X.Y.Z; a plain build
 # reads it from .git (kept in the context by .dockerignore).
 
-ARG UBI_VERSION=9
+ARG UBI_VERSION=10
 
 # ---- build stage --------------------------------------------------------
 FROM registry.access.redhat.com/ubi${UBI_VERSION}/ubi AS builder
@@ -20,7 +20,7 @@ ARG VERSION=""
 WORKDIR /src
 COPY . .
 
-# Install Python 3.12 from the UBI AppStream plus a toolchain so pip can
+# Install Python 3.12 (UBI 10's default python3) plus a toolchain so pip can
 # source-compile any dep lacking a manylinux wheel for the target arch. The
 # toolchain stays in this builder stage. git is pulled in only for a plain local
 # build (empty VERSION), where setuptools_scm reads the version from .git.
@@ -28,20 +28,42 @@ COPY . .
 # with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    pkgs="python3.12 python3.12-pip python3.12-devel gcc"; \
+    pkgs="python3 python3-pip python3-devel gcc"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
     retry dnf --setopt=retries=10 install -y $pkgs; \
     dnf clean all; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
-    python3.12 -m venv /opt/venv; \
+    python3 -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
+
+# Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
+# paths; yacron2/_json falls back to stdlib json when it is absent, so this never
+# fails the build. amd64/arm64 install a wheel; the other published arches
+# (ppc64le/s390x) have none, so a Rust toolchain is installed and orjson is
+# source-built (UBI may not package rust, in which case this cleanly falls back).
+# A miscompiled build is dropped by orjson_ok so it is never shipped; the
+# toolchain/cache stays in this builder stage, only the orjson .so rides along.
+RUN set -eux; \
+    orjson_ok() { \
+        /opt/venv/bin/python -c 'import orjson,sys; s={"v":1,"a":[1,2.5,True,None],"z":"x"}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'; \
+    }; \
+    if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (wheel)"; \
+    elif dnf --setopt=retries=10 install -y rust cargo \
+        && /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (source build)"; \
+    else \
+        echo "orjson: unavailable on this arch; using stdlib json"; \
+        /opt/venv/bin/pip uninstall -y orjson || true; \
+    fi; \
+    dnf clean all
 
 # ---- runtime stage ------------------------------------------------------
 FROM registry.access.redhat.com/ubi${UBI_VERSION}/ubi-minimal
 
 LABEL org.opencontainers.image.title="yacron2" \
-      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (RHEL/UBI 9)." \
+      org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement (RHEL/UBI 10)." \
       org.opencontainers.image.source="https://github.com/ptweezy/yacron2" \
       org.opencontainers.image.licenses="MIT"
 
@@ -49,12 +71,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
-# The venv references /usr/bin/python3.12, so the ubi-minimal runtime needs that
-# interpreter installed. microdnf is ubi-minimal's package manager; the same
-# Python 3.12 RPM the builder used is available here.
+# The venv references /usr/bin/python3.12 (UBI 10's default python3), so the
+# ubi-minimal runtime needs that interpreter installed. microdnf is
+# ubi-minimal's package manager; the same python3 RPM the builder used is here.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    retry microdnf install -y python3.12; \
+    retry microdnf install -y python3; \
     microdnf clean all
 
 COPY --from=builder /opt/venv /opt/venv

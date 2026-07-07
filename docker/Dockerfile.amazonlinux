@@ -37,6 +37,21 @@ RUN set -eux; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
+# Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
+# paths. This image publishes only amd64/arm64, which have orjson wheels, so no
+# Rust toolchain is needed. yacron2/_json falls back to stdlib json if the wheel
+# is unavailable, and orjson_ok drops a broken install so it is never shipped.
+RUN set -eux; \
+    orjson_ok() { \
+        /opt/venv/bin/python -c 'import orjson,sys; s={"v":1,"a":[1,2.5,True,None],"z":"x"}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'; \
+    }; \
+    if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (wheel)"; \
+    else \
+        echo "orjson: unavailable; using stdlib json"; \
+        /opt/venv/bin/pip uninstall -y orjson || true; \
+    fi
+
 # ---- runtime stage ------------------------------------------------------
 FROM amazonlinux:${AL_VERSION}
 
