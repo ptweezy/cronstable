@@ -65,6 +65,7 @@ from yacron2.prometheus import (
     resolve_metrics_config,
 )
 from yacron2.redact import redact_lines
+from yacron2.resources import NodeResourceSampler, ResourceUsage
 from yacron2.state import Lease, StateBackend, make_state_backend
 
 logger = logging.getLogger("yacron2")
@@ -287,6 +288,11 @@ class JobRunInfo:
     finished_at: datetime.datetime
     fail_reason: Optional[str]
     output: JobOutputStream
+    # sampled CPU time + peak RSS for the run, when the job opted into
+    # monitorResources; None otherwise (the common case). Defaulted so every
+    # existing JobRunInfo construction site stays valid; the reaper fills it
+    # from the finished RunningJob.
+    resource_usage: Optional[ResourceUsage] = None
 
     @property
     def duration(self) -> Optional[float]:
@@ -307,6 +313,14 @@ class JobRunInfo:
             "finished_at": self.finished_at.isoformat(),
             "duration": self.duration,
             "fail_reason": self.fail_reason,
+            # omitted (null) for unmonitored runs so the record shape is
+            # unchanged for the default config; a monitored run carries the
+            # cpu/rss sub-object (see ResourceUsage.to_dict).
+            "resources": (
+                self.resource_usage.to_dict()
+                if self.resource_usage is not None
+                else None
+            ),
         }
 
 
@@ -322,6 +336,14 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
     # so the dashboard can call out interrupted runs distinctly.
     unknown = sum(1 for r in runs if r.outcome == "unknown")
     durations = [r.duration for r in runs if r.duration is not None]
+    # resource-monitored runs only (monitorResources); an unmonitored history
+    # leaves these all None/absent so the dashboard hides the section.
+    monitored = [
+        r.resource_usage for r in runs if r.resource_usage is not None
+    ]
+    cpu_totals = [u.cpu_total_seconds for u in monitored]
+    rss_values = [u.max_rss_bytes for u in monitored]
+    last_usage = runs[-1].resource_usage if runs else None
     return {
         "total": total,
         "success": success,
@@ -339,6 +361,22 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
         "min_duration": min(durations) if durations else None,
         "max_duration": max(durations) if durations else None,
         "last_duration": runs[-1].duration if runs else None,
+        # CPU time (seconds) and peak resident memory (bytes) over the
+        # monitored runs; None when no run in the window was monitored.
+        "avg_cpu_seconds": (
+            (sum(cpu_totals) / len(cpu_totals)) if cpu_totals else None
+        ),
+        "max_cpu_seconds": max(cpu_totals) if cpu_totals else None,
+        "last_cpu_seconds": (
+            last_usage.cpu_total_seconds if last_usage is not None else None
+        ),
+        "avg_rss_bytes": (
+            (sum(rss_values) / len(rss_values)) if rss_values else None
+        ),
+        "max_rss_bytes": max(rss_values) if rss_values else None,
+        "last_rss_bytes": (
+            last_usage.max_rss_bytes if last_usage is not None else None
+        ),
     }
 
 
@@ -446,6 +484,10 @@ def _job_run_info_from_dict(rec: Dict[str, Any]) -> Optional["JobRunInfo"]:
         finished_at=finished,
         fail_reason=fail_reason if isinstance(fail_reason, str) else None,
         output=empty,
+        # ResourceUsage.from_dict tolerates absent/foreign "resources" fields
+        # (returns None), so a pre-monitoring or hand-edited record rehydrates
+        # cleanly with no resource stats.
+        resource_usage=ResourceUsage.from_dict(rec.get("resources")),
     )
 
 
@@ -606,6 +648,11 @@ class Cron:
         # rebuilds; created before update_config so the first parse result is
         # already recorded. See yacron2.prometheus.
         self.metrics = PrometheusMetrics()
+        # whole-node CPU/memory sampler for the live node readout (GET /node
+        # and, in a gossip cluster, the fleet view). One long-lived instance
+        # so its "since last call" CPU% counters stay primed. Cheap and
+        # dependency-safe: a no-op yielding None if psutil is unavailable.
+        self._node_sampler = NodeResourceSampler()
         # list of cron jobs we /want/ to run
         self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
         # the orchestration DAGs (name -> DagConfig), maintained
@@ -677,6 +724,14 @@ class Cron:
         self.web_config = None  # type: Optional[WebConfig]
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
+        # optional gossip observability overlay: a SECOND, election-inert
+        # gossip manager stood up alongside a lease leadership backend so a
+        # kubernetes/etcd/filesystem cluster can still share fleet data
+        # (per-node CPU/memory + job summaries). None when unused -- including
+        # backend: gossip, where the election mesh (cluster_manager) already
+        # carries fleet data and IS the fleet backend. See
+        # start_stop_observability and _fleet_backend.
+        self.observability_mesh: Optional[LeadershipBackend] = None
         # the durable state backend, when a `state` section is configured; None
         # keeps yacron2's classic stateless, in-memory behaviour. See
         # start_stop_state and yacron2.state.
@@ -882,6 +937,10 @@ class Cron:
                     config = await self.reload_config()
                     self._log_job_set_id()
                     await self.start_stop_cluster(config.cluster_config)
+                    # the gossip observability overlay (lease clusters that opt
+                    # into cluster.observability); after start_stop_cluster so
+                    # the election backend exists first. No-op otherwise.
+                    await self.start_stop_observability(config.cluster_config)
                     await self.start_stop_state(config.state_config)
                     # periodic durable-state chores (manifest, GC): cheap
                     # due-checks that spawn tracked background tasks.
@@ -986,6 +1045,13 @@ class Cron:
             logger.info("Stopping cluster manager")
             await self.cluster_manager.stop()
             self.cluster_manager = None
+        # the observability overlay holds no leadership, so its teardown order
+        # relative to the drain does not matter; stop it here alongside the
+        # election manager so its gossip listener/poll loop is released too.
+        if self.observability_mesh is not None:
+            logger.info("Stopping cluster observability overlay")
+            await self.observability_mesh.stop()
+            self.observability_mesh = None
         await self._wait_for_running_jobs_task
         # the drain released every slot (each finish cancels its renewer);
         # belt-and-braces for renewers whose release write raced teardown.
@@ -1272,6 +1338,18 @@ class Cron:
             )
         payload = dict(self.cluster_manager.view_dict())
         payload["enabled"] = True
+        # lease backends (kubernetes/etcd/filesystem) have no fleet view of
+        # their own, but the observability overlay mesh serves one when
+        # installed (see _fleet_backend) -- tell the dashboard whether its
+        # fleet view has data behind it. The gossip payload stays unchanged:
+        # its UI path always shows the fleet view.
+        if payload.get("backend") != "gossip":
+            payload["fleet"] = self.observability_mesh is not None
+        # this node's own live CPU/memory, sampled fresh: always shown in the
+        # cluster panel (it is local and free), independent of whether peers
+        # share theirs. Peer load rides view_dict's per-peer node_stats (only
+        # populated when the cluster shares node stats -- observability).
+        payload["node_stats"] = self.node_resource_snapshot()
         return web.json_response(payload, headers=headers)
 
     async def _web_get_fleet(self, request: web.Request) -> web.Response:
@@ -1283,18 +1361,47 @@ class Cron:
         :meth:`yacron2.cluster.ClusterManager.fleet_view`) -- serving this
         endpoint triggers no peer traffic.  ``enabled: false`` when there is
         no cluster, or the backend has no node-to-node channel to have
-        carried summaries (the lease backends); the dashboard then hides its
-        fleet view.
+        carried summaries (a lease backend without the observability
+        overlay); the dashboard then hides its fleet view.
         """
         assert self.web_config is not None
         headers = self.web_config.get("headers", None)
-        mgr = self.cluster_manager
+        # the overlay mesh when a lease cluster opted into observability, else
+        # the leadership backend (gossip provides the view; lease backends
+        # return None -> feature unavailable).
+        mgr = self._fleet_backend()
         fleet = mgr.fleet_view() if mgr is not None else None
         if fleet is None:
             return web.json_response(
                 {"enabled": False, "nodes": []}, headers=headers
             )
         return web.json_response(fleet, headers=headers)
+
+    async def _web_get_node(self, request: web.Request) -> web.Response:
+        """This node's live CPU/memory (the dashboard's node readout).
+
+        Whole-host CPU% and memory plus this daemon's own footprint, sampled
+        fresh per request from :class:`yacron2.resources.NodeResourceSampler`.
+        ``resources`` is ``null`` when sampling is unavailable (psutil could
+        not read the host); the dashboard then hides the node meter.
+        """
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        # the cluster node name when clustered, else the plain hostname the
+        # durable-state layer already uses as this node's identity.
+        mgr = self.cluster_manager
+        node_name = (
+            mgr.node_name
+            if mgr is not None and getattr(mgr, "node_name", None)
+            else self._state_host
+        )
+        return web.json_response(
+            {
+                "node_name": node_name,
+                "resources": self._node_sampler.snapshot(),
+            },
+            headers=headers,
+        )
 
     async def _web_metrics(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -1564,6 +1671,23 @@ class Cron:
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
+        # live CPU/memory of the currently-running instances (monitorResources
+        # jobs only). Summed across instances so a job running N copies shows
+        # its aggregate footprint; omitted entirely when nothing is monitored
+        # or no sample has landed yet, so an unmonitored job's payload is
+        # unchanged.
+        live_snaps = [
+            snap
+            for runjob in running
+            if (snap := runjob.live_resources()) is not None
+        ]
+        if live_snaps:
+            result["running_resources"] = {
+                "cpu_percent": sum(s["cpu_percent"] for s in live_snaps),
+                "cpu_seconds": sum(s["cpu_seconds"] for s in live_snaps),
+                "rss_bytes": sum(s["rss_bytes"] for s in live_snaps),
+                "instances": len(live_snaps),
+            }
         # durable-retry visibility: when a retry ladder is ARMED for this job,
         # surface attempt/backoff so the dashboard can render a live
         # "attempt N/M · next retry in Xs" chip. Gated on count > 0: the ladder
@@ -2145,6 +2269,7 @@ class Cron:
                 web.get("/job-set-id", self._web_job_set_id),
                 web.get("/cluster", self._web_get_cluster),
                 web.get("/fleet", self._web_get_fleet),
+                web.get("/node", self._web_get_node),
                 web.get("/status", self._web_get_status),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
@@ -2202,6 +2327,26 @@ class Cron:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
 
+    @staticmethod
+    def _election_relevant(cluster_config: ClusterConfig) -> Dict[str, Any]:
+        """The cluster config minus its observability-only keys.
+
+        ``shareNodeStats`` and ``observabilityMesh`` are resolved onto the
+        same ClusterConfig dict (see
+        :func:`yacron2.config._attach_observability`) but are election-inert:
+        they feed the overlay lifecycle (:meth:`start_stop_observability`) and
+        the share-flag reconciliation in :meth:`start_stop_cluster`, never the
+        election manager's behavior. Restarting the manager on a difference in
+        them would, on a lease backend, drop the leadership lease and pause
+        Leader jobs fleet-wide for an edit that changes nothing about
+        election -- so the restart comparison strips them from both sides.
+        """
+        return {
+            key: value
+            for key, value in cluster_config.items()
+            if key not in ("shareNodeStats", "observabilityMesh")
+        }
+
     async def start_stop_cluster(
         self, cluster_config: Optional[ClusterConfig]
     ) -> None:
@@ -2220,7 +2365,13 @@ class Cron:
         # the old cert until it expires and then loses quorum fleet-wide.
         mgr = self.cluster_manager
         if mgr is not None:
-            if cluster_config is None or cluster_config != mgr.config:
+            # observability-only edits (shareNodeStats / observabilityMesh)
+            # are stripped from the comparison: they never require an election
+            # restart (see _election_relevant); the overlay lifecycle and the
+            # share-flag reconciliation below pick them up instead.
+            if cluster_config is None or self._election_relevant(
+                cluster_config
+            ) != self._election_relevant(mgr.config):
                 reason = "configuration changed"
             elif mgr.tls_files_changed():
                 reason = "TLS certificate files changed"
@@ -2322,6 +2473,23 @@ class Cron:
                 self._was_conflict = False
                 self._was_size_conflict = False
                 self._was_policy_conflict = False
+        if cluster_config is not None and self.cluster_manager is not None:
+            # The manager was KEPT across this reload (only observability
+            # keys -- or nothing -- changed), but it latched the node-stats
+            # share flag once, at whichever set_node_stats_provider call it
+            # last saw. Re-reconcile it to the NEW config unconditionally, or
+            # a shareNodeStats toggle would never reach a running gossip
+            # election mesh: off would keep gossiping CPU/memory until some
+            # unrelated restart, on would never start. Safe on a running
+            # manager -- the call only reassigns the provider and flag, picked
+            # up on the next /peer round -- and a no-op on the lease backends
+            # (their seam default ignores it). Same share expression as the
+            # build path below.
+            self.cluster_manager.set_node_stats_provider(
+                self.node_resource_snapshot,
+                share=bool(cluster_config.get("shareNodeStats"))
+                and cluster_config.get("observabilityMesh") is None,
+            )
         if cluster_config is not None and self.cluster_manager is None:
             # Emit non-fatal advisories here (only when a manager is actually
             # (re)started) rather than at parse time, which runs every reload
@@ -2346,6 +2514,18 @@ class Cron:
                 # absorbed snapshot should carry our jobs rather than an
                 # empty block. No-op for the lease backends.
                 manager.set_job_summaries_provider(self.fleet_job_summaries)
+                # Always install the node-stats provider so a gossip cluster
+                # shows THIS node's own load in its /cluster + /fleet self
+                # readouts (local, free); `share` gates whether we ALSO gossip
+                # it to peers -- on only when observability is enabled with
+                # backend: gossip (no separate overlay mesh; the lease+overlay
+                # case installs on the overlay in start_stop_observability). A
+                # no-op on the lease backends (their seam default ignores it).
+                manager.set_node_stats_provider(
+                    self.node_resource_snapshot,
+                    share=bool(cluster_config.get("shareNodeStats"))
+                    and cluster_config.get("observabilityMesh") is None,
+                )
                 await manager.start()
             except (
                 OSError,
@@ -2366,6 +2546,129 @@ class Cron:
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
+
+    def node_resource_snapshot(self) -> Optional[Dict[str, Any]]:
+        """This node's live CPU/memory for gossip and GET /node.
+
+        The callable installed as the gossip node-stats provider; also used by
+        the /node endpoint. Best-effort: returns None when psutil is
+        unavailable.
+        """
+        return self._node_sampler.snapshot()
+
+    def _fleet_backend(self) -> Optional[LeadershipBackend]:
+        """The backend that answers the fleet view / carries fleet gossip.
+
+        The observability overlay mesh when one is running (a lease cluster
+        that opted into ``cluster.observability``), else the leadership backend
+        itself -- which provides the fleet view directly under ``backend:
+        gossip`` and returns ``None`` for the lease backends (no fleet).
+        """
+        return (
+            self.observability_mesh
+            if self.observability_mesh is not None
+            else self.cluster_manager
+        )
+
+    async def start_stop_observability(
+        self, cluster_config: Optional[ClusterConfig]
+    ) -> None:
+        """(Re)build the gossip observability overlay to match the config.
+
+        The overlay is a SECOND, election-inert gossip manager that a lease
+        cluster (kubernetes/etcd/filesystem) stands up purely to exchange fleet
+        data -- per-node CPU/memory and job summaries -- since a lease backend
+        has no node-to-node channel of its own.  It is built from the resolved
+        ``observabilityMesh`` config (see
+        :func:`yacron2.config._attach_observability`); ``None`` there means no
+        overlay is wanted (the section is absent, or ``backend: gossip``
+        already carries the data on the election mesh, handled in
+        :meth:`start_stop_cluster`).
+
+        Mirrors the rebuild logic of :meth:`start_stop_cluster` but simpler:
+        the overlay never elects, so there is no leadership/quorum transition
+        to log.  Like the election manager it is rebuilt on a config change or
+        an in-place TLS cert rotation, and a start failure is logged and
+        swallowed so a misconfigured overlay never stops jobs from running.
+        """
+        mesh_config = (
+            cluster_config.get("observabilityMesh")
+            if cluster_config is not None
+            else None
+        )
+        mesh = self.observability_mesh
+        if mesh is not None:
+            if mesh_config is None or mesh_config != mesh.config:
+                reason = "configuration changed"
+            elif mesh.tls_files_changed():
+                reason = "TLS certificate files changed"
+            else:
+                reason = None
+            # make-before-break is infeasible for gossip (same listen port), so
+            # a cert rotation only tears down once the NEW material loads --
+            # otherwise keep the running overlay serving the valid old cert.
+            if reason is not None and mesh_config is not None:
+                from yacron2.cluster import gossip_tls_loadable
+
+                if not gossip_tls_loadable(mesh_config):
+                    logger.warning(
+                        "cluster.observability: new TLS material is not yet "
+                        "loadable (a partial rotation?); keeping the running "
+                        "overlay and retrying next reload"
+                    )
+                    reason = None
+            if reason is not None:
+                logger.info("cluster.observability: %s, stopping", reason)
+                await mesh.stop()
+                self.observability_mesh = None
+        if mesh_config is not None and self.observability_mesh is not None:
+            # The overlay was KEPT across this reload -- and shareNodeStats
+            # lives on the CLUSTER config, not on the resolved mesh config the
+            # keep/rebuild comparison above sees, so a toggle always lands
+            # here. The mesh latched the flag at its last
+            # set_node_stats_provider call, so re-reconcile it to the new
+            # config unconditionally or a toggle off keeps gossiping
+            # CPU/memory until an unrelated restart and a toggle on never
+            # starts. Safe on a running mesh: the call only reassigns the
+            # provider and flag, picked up on the next /peer round. Same share
+            # expression as the build path below.
+            self.observability_mesh.set_node_stats_provider(
+                self.node_resource_snapshot,
+                share=bool(
+                    cluster_config is not None
+                    and cluster_config.get("shareNodeStats")
+                ),
+            )
+        if mesh_config is not None and self.observability_mesh is None:
+            try:
+                mgr = make_backend(mesh_config, self.job_set_id)
+                # fleet providers BEFORE start(): its first poll round may race
+                # peers polling us back, and their first absorbed snapshot
+                # should already carry our jobs + load, not an empty block.
+                mgr.set_job_summaries_provider(self.fleet_job_summaries)
+                # always install (so the overlay's own /fleet self readout
+                # shows this node's load); share gates gossiping it to peers.
+                mgr.set_node_stats_provider(
+                    self.node_resource_snapshot,
+                    share=bool(
+                        cluster_config is not None
+                        and cluster_config.get("shareNodeStats")
+                    ),
+                )
+                await mgr.start()
+            except (
+                OSError,
+                ssl.SSLError,
+                ValueError,
+                ConfigError,
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+            ) as ex:
+                # same swallow-and-keep-running contract as the election
+                # backend: a bad overlay cert/listen/peer must not stop jobs.
+                logger.error("cluster.observability: failed to start: %s", ex)
+                return
+            self.observability_mesh = mgr
 
     async def start_stop_state(
         self, state_config: Optional[StateConfig]
@@ -5502,7 +5805,9 @@ class Cron:
         self.run_history[name].append(info)
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
-        self.metrics.job_run_recorded(name, info.outcome, info.duration)
+        self.metrics.job_run_recorded(
+            name, info.outcome, info.duration, info.resource_usage
+        )
         # and, when a durable state backend is configured, persist the run to
         # the ledger so history/last-run survive a restart. Fire-and-forget: a
         # slow store must never stall run handling, so the write is a tracked
@@ -6139,6 +6444,7 @@ class Cron:
                     finished_at=get_now(datetime.timezone.utc),
                     fail_reason="cancelled via web UI",
                     output=job.output,
+                    resource_usage=getattr(job, "resource_usage", None),
                 ),
             )
             await self.cancel_job_retries(job.config.name, settle="cancelled")
@@ -6171,6 +6477,7 @@ class Cron:
                 finished_at=get_now(datetime.timezone.utc),
                 fail_reason=fail_reason,
                 output=job.output,
+                resource_usage=getattr(job, "resource_usage", None),
             ),
         )
         if fail_reason is not None:

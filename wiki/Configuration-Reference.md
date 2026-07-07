@@ -199,6 +199,56 @@ Full behavior, the trust model, quorum math, the lease backends' guarantees,
 and per-job `clusterPolicy` are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election).
 
+#### Observability overlay
+
+`cluster.observability` shares fleet data — each node's live CPU/memory (see
+[`GET /node`](HTTP-API#get-node)) and per-job run summaries — across the cluster
+for the dashboard's [fleet view](Web-Dashboard#fleet-view-every-nodes-runs-in-one-pane),
+**independent of which backend owns election**. It exists because the fleet view
+rides node-to-node gossip, which the lease backends do not have: it lets a
+`kubernetes`/`etcd`/`filesystem` cluster stand up a *second*, election-inert
+gossip mesh purely to carry that data.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `shareNodeStats` | `Bool` | `true` | Gossip this node's whole-node CPU/memory for the fleet view. Set `false` to run the overlay mesh for job summaries only. |
+| `listen`, `tls`, `peers` | as `backend: gossip` | — | The overlay gossip transport. **Required with a lease backend** (the overlay is its own mesh); **rejected with `backend: gossip`** (redundant — the election mesh already carries fleet data). |
+| `nodeName`, `interval`, `driftAfter`, `connectTimeout` | as `backend: gossip` | gossip defaults | Optional overlay mesh tuning. **Lease backends only** (they tune the dedicated overlay mesh); **rejected with `backend: gossip`**, where node stats ride the election mesh and the cluster-level keys of the same names already apply. |
+
+Two shapes:
+
+- **`backend: gossip`** — the election mesh already exchanges `/peer` bodies, so
+  `observability` is just an opt-in marker: `observability: { shareNodeStats: true }`
+  adds node CPU/memory to what that mesh already gossips. `listen`/`tls`/`peers`
+  here are a `ConfigError` (redundant), and so are the overlay tuning keys
+  `nodeName`/`interval`/`driftAfter`/`connectTimeout` (there is no overlay mesh
+  to tune; the stats gossip at `cluster.interval`, so set the cluster-level keys
+  instead). The stats ride each `/peer` response as an `X-Yacron2-Node-Stats`
+  header, never in the body, so sharing live load keeps the mesh's idle `304`
+  optimisation intact.
+- **A lease backend** (`kubernetes`/`etcd`/`filesystem`) — election stays with the
+  lease store; `observability` stands up a dedicated gossip mesh (its own
+  `listen`/`tls`/`peers`, all required) that **never elects** (it holds no
+  leadership and gates no jobs), purely to carry fleet data.
+
+```yaml
+cluster:
+  backend: kubernetes            # election via a coordination.k8s.io Lease
+  kubernetes:
+    leaseName: yacron2-leader
+  observability:                 # a gossip mesh JUST for the fleet view
+    listen: "0.0.0.0:8140"
+    tls: { ca: /tls/ca.pem, cert: /tls/node.pem, key: /tls/node.key }
+    peers:
+      - host: node-b:8140
+      - host: node-c:8140
+```
+
+Requires [`psutil`](https://github.com/giampaolo/psutil) (a core dependency) for
+the CPU/memory numbers; a node that cannot read its own load simply shares none.
+Node stats are best-effort observability: a malformed or hostile peer payload
+degrades to "no data for that node", never poisoning the view.
+
 ### `state`
 
 Optional. Enables the **durable state store**: restart-durable run history,
@@ -519,11 +569,36 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `statsd` | `Map({"prefix": Str, "host": Str, "port": Int})` | none | When set, emit start/stop/success/duration metrics over UDP. All three keys are required. |
+| `monitorResources` | `Bool` | `false` | Sample each run's CPU time and peak resident memory (RSS) by polling the job's process tree while it runs. Observability only: the numbers ride the run record into the dashboard, `GET /metrics` and statsd, but never change a run's success/failure verdict. Off by default; a per-instance sampling task is spawned only when it is on. Set it under `defaults:` to enable it fleet-wide. |
 
 See [Metrics with statsd](Metrics-with-Statsd). Prometheus metrics are not
 configured per job: the `GET /metrics` endpoint is global, tuned under
 `web.metrics` in the `web` section above. See
 [Metrics with Prometheus](Metrics-with-Prometheus).
+
+**Resource accounting (`monitorResources`).** With it on, a run is sampled by
+[psutil](https://github.com/giampaolo/psutil) (a core dependency) over its
+whole process tree, so a job that shells out to child processes is accounted
+too. The result (total user/system CPU seconds and the peak RSS observed)
+appears in the dashboard run history and stats, in the durable run record's
+`resources` object (so it survives a restart), and as the metrics listed in
+[Metrics with Prometheus](Metrics-with-Prometheus). Report templates and the
+shell reporter also receive `cpu_seconds` / `max_rss_bytes`
+(`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`).
+
+DAG tasks accept `monitorResources` too, but surface the result differently:
+a finished task instance's usage is recorded in the `resources` object of its
+task record inside the durable `dag_run` document (returned by
+`GET /dags/<name>/runs/<run_key>`), and sent to the task's statsd sink when
+one is configured. DAG task instances are ephemeral and do not appear in the
+per-job Prometheus families on `GET /metrics`.
+
+The numbers are **sampled**,
+so a run that finishes between two samples is measured approximately; the long,
+heavy runs whose resource use actually matters are sampled many times. It is
+best-effort: if psutil cannot read a process (already exited, permission
+denied) the run simply carries no resource stats, and monitoring never fails a
+job.
 
 ## Load-time numeric validation
 
