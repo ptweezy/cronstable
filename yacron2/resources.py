@@ -30,10 +30,11 @@ Two properties of the design matter:
 import asyncio
 import logging
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     import psutil
@@ -370,6 +371,204 @@ class ResourceMonitor:
         )
 
 
+# Where the cgroup v2 unified hierarchy is mounted on every mainstream Linux
+# distribution.  Overridable in the reader's constructor purely for tests.
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+class _CgroupV2Reader:
+    """Best-effort reader of this process's cgroup v2 slice.
+
+    psutil's node-wide counters come from ``/proc``, which is *not* virtualised
+    by cgroups: inside a container (or a systemd slice with limits) they
+    describe the whole host, so a daemon confined to 512 MiB would happily
+    report the host's 64 GiB as its memory.  This reader recovers the
+    container's own slice by reading the unified-hierarchy files directly --
+    the same sources ``docker stats`` and kubelet use:
+
+    * ``memory.max`` -- the memory limit (``max`` means unlimited).
+    * ``memory.current`` minus ``memory.stat``'s ``inactive_file`` -- usage
+      with the easily-reclaimable page cache excluded, matching how the docker
+      CLI and Kubernetes' working-set metric count "used" (raw
+      ``memory.current`` includes file cache and reads misleadingly high).
+    * ``cpu.max`` -- ``<quota> <period>`` in microseconds; quota/period is the
+      number of CPUs the slice may burn (``max`` quota means unlimited).
+    * ``cpu.stat``'s ``usage_usec`` -- cumulative CPU time, whose delta over
+      wall-clock time yields utilisation.
+
+    Limits are hierarchical, so both lookups walk from our own cgroup up to
+    the mount root and take the *lowest* limit on the path (as the JVM's
+    container-awareness does).  The reader stays inert -- every method returns
+    ``None`` -- on cgroup v1 / hybrid hosts, on non-Linux platforms, and when
+    no limit is set anywhere on the path, in which case the caller keeps its
+    host-wide numbers.  ``cpuset`` pinning is deliberately not considered:
+    ``--cpus``-style quotas are how container platforms hand out CPU.
+
+    Like everything in this module it is best-effort and never fatal: any
+    unreadable or malformed file simply yields ``None``.
+    """
+
+    def __init__(
+        self,
+        root: str = CGROUP_ROOT,
+        proc_cgroup: str = "/proc/self/cgroup",
+    ) -> None:
+        self._root = os.path.normpath(root)
+        self._dir: Optional[str] = None
+        try:
+            self._dir = self._resolve_own_dir(self._root, proc_cgroup)
+        except Exception:  # noqa: BLE001 - never fatal
+            self._dir = None
+
+    @staticmethod
+    def _resolve_own_dir(root: str, proc_cgroup: str) -> Optional[str]:
+        """Locate this process's cgroup directory, or ``None``.
+
+        Only the unified (v2) hierarchy is supported, marked by the
+        ``cgroup.controllers`` file at the mount root.  The process's own
+        position comes from the ``0::<path>`` line of ``/proc/self/cgroup``;
+        with cgroup namespaces (the container default) that path is ``/`` and
+        the mount root *is* our slice.  Without namespaces the host-side path
+        may not exist under our mount, in which case the reader stays inert.
+        """
+        if not os.path.isfile(os.path.join(root, "cgroup.controllers")):
+            return None
+        rel: Optional[str] = None
+        with open(proc_cgroup, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                # the v2 entry is "0::<path>"; v1 lines carry controller
+                # names in the middle field and never match this prefix.
+                if line.startswith("0::"):
+                    rel = line[3:].strip().lstrip("/")
+                    break
+        if rel is None:
+            return None
+        if ".." in rel.split("/"):
+            return None  # never escape the mount root
+        path = os.path.normpath(os.path.join(root, rel)) if rel else root
+        if not os.path.isdir(path):
+            return None
+        return path
+
+    @property
+    def available(self) -> bool:
+        """Whether a v2 hierarchy was found and our cgroup dir resolved."""
+        return self._dir is not None
+
+    def _ancestry(self) -> Iterator[str]:
+        """Our cgroup dir, then each ancestor up to the mount root."""
+        d = self._dir
+        if d is None:  # callers check available first; belt and braces
+            return
+        while True:
+            yield d
+            if d == self._root:
+                return
+            parent = os.path.dirname(d)
+            if parent == d:  # filesystem root; never walked above the mount
+                return
+            d = parent
+
+    @staticmethod
+    def _read_first_line(path: str) -> Optional[str]:
+        try:
+            with open(path, encoding="ascii", errors="replace") as fh:
+                return fh.readline().strip()
+        except OSError:
+            return None
+
+    @staticmethod
+    def _read_stat_field(path: str, field: str) -> Optional[int]:
+        """A ``<field> <value>`` line from a flat keyed file, or ``None``."""
+        try:
+            with open(path, encoding="ascii", errors="replace") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] == field:
+                        return int(parts[1])
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def memory_limit(self) -> Optional[int]:
+        """Lowest ``memory.max`` on the path to the root, or ``None``."""
+        if self._dir is None:
+            return None
+        limit: Optional[int] = None
+        for d in self._ancestry():
+            raw = self._read_first_line(os.path.join(d, "memory.max"))
+            if raw is None or raw == "max":
+                continue
+            try:
+                value = int(raw)
+            except ValueError:
+                continue
+            if value > 0 and (limit is None or value < limit):
+                limit = value
+        return limit
+
+    def memory_used(self) -> Optional[int]:
+        """``memory.current`` less reclaimable file cache, or ``None``."""
+        if self._dir is None:
+            return None
+        raw = self._read_first_line(
+            os.path.join(self._dir, "memory.current")
+        )
+        if raw is None:
+            return None
+        try:
+            current = int(raw)
+        except ValueError:
+            return None
+        # inactive_file is page cache the kernel can drop without swapping,
+        # so it does not count against "how close to the limit am I" (docker
+        # stats and the k8s working-set subtract it too).  A missing/broken
+        # memory.stat just leaves the raw figure.
+        inactive = self._read_stat_field(
+            os.path.join(self._dir, "memory.stat"), "inactive_file"
+        )
+        if inactive is not None:
+            current -= inactive
+        return max(0, current)
+
+    def cpu_limit(self) -> Optional[float]:
+        """Lowest ``cpu.max`` quota on the path, in CPUs, or ``None``."""
+        if self._dir is None:
+            return None
+        limit: Optional[float] = None
+        for d in self._ancestry():
+            raw = self._read_first_line(os.path.join(d, "cpu.max"))
+            if raw is None:
+                continue
+            parts = raw.split()
+            if not parts or parts[0] == "max":
+                continue
+            try:
+                quota = int(parts[0])
+                # the period defaults to 100ms when the file (abnormally)
+                # carries only the quota.
+                period = int(parts[1]) if len(parts) > 1 else 100_000
+            except ValueError:
+                continue
+            if quota <= 0 or period <= 0:
+                continue
+            value = quota / period
+            if limit is None or value < limit:
+                limit = value
+        return limit
+
+    def cpu_usage_seconds(self) -> Optional[float]:
+        """Cumulative CPU seconds consumed by our slice, or ``None``."""
+        if self._dir is None:
+            return None
+        usage = self._read_stat_field(
+            os.path.join(self._dir, "cpu.stat"), "usage_usec"
+        )
+        if usage is None or usage < 0:
+            return None
+        return usage / 1_000_000.0
+
+
 class NodeResourceSampler:
     """Whole-node (and own-process) CPU/memory for the local host.
 
@@ -382,6 +581,14 @@ class NodeResourceSampler:
     (snapshots are memoised for :data:`NODE_SNAPSHOT_TTL`, so near-simultaneous
     readers share one measurement window instead of shrinking it for each
     other).
+
+    Container-aware: when this process runs under a cgroup v2 limit (a
+    container, or a systemd slice with ``MemoryMax``/``CPUQuota``), the
+    CPU/memory fields describe *our slice* -- limit as the total, usage and
+    percentage measured against it -- instead of the host-wide numbers psutil
+    reports from ``/proc`` (see :class:`_CgroupV2Reader`).  Each resource
+    falls back to host-wide independently when it has no cgroup limit, and
+    the snapshot's shape never changes either way.
 
     Best-effort like everything else here: any psutil error yields ``None``
     rather than raising, so a node that cannot read its own stats simply shows
@@ -402,6 +609,15 @@ class NodeResourceSampler:
                 self._proc.cpu_percent(interval=None)
             except Exception:  # noqa: BLE001 - never fatal
                 self._proc = None
+        # cgroup-slice overlay (inert off Linux / without v2 / unlimited).
+        # The CPU reading is a delta between snapshots, so prime it here the
+        # same way the psutil counters are primed above.
+        self._cgroup = _CgroupV2Reader()
+        self._cgroup_prev_cpu: Optional[Tuple[float, float]] = None
+        if self._cgroup.available:
+            usage = self._cgroup.cpu_usage_seconds()
+            if usage is not None:
+                self._cgroup_prev_cpu = (usage, time.monotonic())
 
     def snapshot(self) -> Optional[Dict[str, Any]]:
         """Current node CPU%/memory (+ this daemon's own), or ``None``."""
@@ -431,6 +647,11 @@ class NodeResourceSampler:
         except Exception:  # noqa: BLE001 - never fatal
             logger.warning("node resource sampling failed", exc_info=True)
             return None
+        # inside a cgroup limit, replace the host-wide numbers with our
+        # slice's (same keys, so every consumer -- dashboard, gossip peers,
+        # the /node endpoint -- is agnostic to the source).
+        if self._cgroup.available:
+            self._overlay_cgroup(data)
         # the daemon's own footprint, best-effort on top (may be denied on
         # some platforms even when the system-wide read succeeded).
         if self._proc is not None:
@@ -444,3 +665,43 @@ class NodeResourceSampler:
         self._cache = data
         self._cache_time = now
         return dict(data)
+
+    def _overlay_cgroup(self, data: Dict[str, Any]) -> None:
+        """Swap host-wide fields for our cgroup slice's, where limited.
+
+        Memory and CPU are overlaid independently -- a container run with
+        ``-m 512m`` but no ``--cpus`` keeps the host-wide CPU reading, which
+        is what it can genuinely use.  ``cpu_percent`` is measured against
+        the quota (0..100 of *our allowance*, mirroring ``mem_percent``
+        against the limit) and ``cpu_count`` becomes the quota rounded up,
+        as the JVM's ``availableProcessors`` does.  Any hiccup leaves the
+        already-populated host-wide values in place.
+        """
+        try:
+            limit = self._cgroup.memory_limit()
+            if limit:
+                used = self._cgroup.memory_used()
+                if used is not None:
+                    data["mem_total_bytes"] = limit
+                    data["mem_used_bytes"] = used
+                    data["mem_percent"] = round(
+                        min(100.0, used * 100.0 / limit), 1
+                    )
+            quota = self._cgroup.cpu_limit()
+            if quota:
+                usage = self._cgroup.cpu_usage_seconds()
+                if usage is not None:
+                    now = time.monotonic()
+                    prev = self._cgroup_prev_cpu
+                    self._cgroup_prev_cpu = (usage, now)
+                    if prev is not None:
+                        delta, dt = usage - prev[0], now - prev[1]
+                        # micro-bursts can nudge usage past the quota within
+                        # a window; clamp like mem_percent above.
+                        if dt > 0 and delta >= 0:
+                            data["cpu_percent"] = round(
+                                min(100.0, delta * 100.0 / dt / quota), 1
+                            )
+                data["cpu_count"] = max(1, math.ceil(quota))
+        except Exception:  # noqa: BLE001 - never fatal
+            pass
