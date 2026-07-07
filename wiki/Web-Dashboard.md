@@ -151,6 +151,8 @@ section is configured, the dashboard shows a **cluster panel** below the job
 table (it stays hidden otherwise). The panel polls `GET /cluster` alongside the
 job list and renders:
 
+[![The cluster panel: nine peers all agreed, quorum met, per-node load meters, per-node job ownership, and the DAG card above it](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-cluster.png)
+
 > **Try it:** the bundled Compose demos bring the dashboard up with one command.
 > [`docker-compose-cluster.yml`](https://github.com/ptweezy/yacron2/blob/develop/docker-compose-cluster.yml)
 > starts the three-node gossip cluster (`yacron-a` / `yacron-b` / `yacron-c`) so
@@ -201,6 +203,8 @@ flapping peer as a stripe rather than a single instant). It charts the gossip
 peer set only, so it is hidden entirely for the lease backends.
 
 ### Fleet view: every node's runs in one pane
+
+[![The fleet view: a jobs-by-nodes matrix, each cell a node's last outcome for the job, with per-node health and load in the column headers](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-fleet.png)
 
 The dashboard normally shows one node's truth: `/jobs` reports the runs *this*
 node made, so under
@@ -259,6 +263,8 @@ for the full `GET /cluster` field semantics.
 
 ## Merged multi-tail
 
+[![The multi-tail console: four jobs' live logs merged into one pane with identity-colored prefixes and end-of-run markers](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-multitail.png)
+
 The **`≋ tail`** toolbar button opens the **multi-tail console**: several jobs'
 log streams merged into one live pane, each line prefixed with its job name in
 a stable identity colour, like tailing a set of pods. It is built for
@@ -301,6 +307,8 @@ the bar to the red **CLUSTER ALERT** severity described
 [above](#cluster-panel). The bar carries `▤ timeline`, `▸ mitigate`, and
 `≋ tail` buttons scoped to the incident set.
 
+[![The incident timeline overlay: every job's most recent finished run, newest first, with failure reasons, exit codes, and durations](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-incident-timeline.png)
+
 The **incident timeline** (press `i`, or *Incident timeline* in the command
 palette) lists every job's most recent finished run, newest first, each with
 its relative time, outcome glyph, failure reason, exit code, and duration. A
@@ -319,6 +327,8 @@ incident summary** (timestamp, host, version, cluster state, and a per-job
 table) for your incident channel or ticket.
 
 ## Wallboard / TV mode
+
+[![The wallboard: worst-first job tiles with an INCIDENT stamp, next-fire countdowns, sparklines, and a footer tally](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-wallboard.png)
 
 Press `w` (or *Wallboard / TV mode* in the palette, or open the page with a
 `#tv` hash) for a full-screen kiosk view built for a wall monitor: every job as
@@ -343,6 +353,8 @@ SIGNAL`, not nominal) and respects `prefers-reduced-motion`. The
 `docker-compose-zen.yml` demo boots a single calm node to show it off.
 
 ## Activity heatmap
+
+[![The activity heatmap punchcard: one row per job, cells colored by worst outcome in the bucket and shaded by run volume](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-heatmap.png)
 
 The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
 adds a punchcard card: one row per job, 24 time buckets across a **6h / 24h /
@@ -416,7 +428,7 @@ The dashboard is keyboard-first. Press `?` at any time for this overlay.
 
 The settings panel (and the command palette) expose:
 
-- **Ten themes**: amber, green, and carolina **phosphor CRT** plus flat **modern** and **standard** looks, each in a dark (phosphor) and a light (paper) variant — the light ones trade the glass-black glow for dark ink on tinted paper, and **standard** is the plain white-and-saturated-color default. Cycle hues with `t`; flip light/dark with `T`.
+- **Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor), amber and green **phosphor CRT**, plus flat **modern** and **standard** looks, each in a dark (phosphor) and a light (paper) variant — the light ones trade the glass-black glow for dark ink on tinted paper, and **standard** is the plain white-and-saturated-color look. Cycle hues with `t`; flip light/dark with `T`.
 - **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes (much softer on the paper variants) and automatically respect `prefers-reduced-motion`.
 - **Compact density** for tighter rows.
 - **Desktop notifications** that fire when a job fails (after you grant the browser permission).
@@ -427,9 +439,13 @@ The settings panel (and the command palette) expose:
 All preferences are remembered in the browser's `localStorage`, so the dashboard
 comes back the way you left it.
 
-| Green phosphor CRT | Flat modern theme |
+| Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
-| [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
+| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) |
+
+| Flat modern theme | Carolina, on paper (light) |
+| :---: | :---: |
+| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-carolina-light.png) |
 
 ## Authentication
 

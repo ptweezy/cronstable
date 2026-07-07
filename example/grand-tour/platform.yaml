@@ -209,6 +209,9 @@ jobs:
       yacron2 cursor advance high_water "$next" --scope orders-domain
     schedule: "*/5 * * * *"
     clusterPolicy: Leader
+    # naming a scope other than the job's own requires an explicit allow-list
+    stateAllowedScopes:
+      - orders-domain
 
   # [feature: concurrencyScope: cluster] FLEET-WIDE single-flight. Fires on
   # every node every 2 min but takes ~90s; the cluster-scoped Forbid means at
@@ -250,6 +253,8 @@ jobs:
       echo "dedup up to watermark $hw on $HOSTNAME"
     schedule: "*/4 * * * *"
     clusterPolicy: Leader
+    stateAllowedScopes:
+      - orders-domain
 
   # [feature: failsWhen producesStderr] Exits 0, but yacron2 marks it FAILED at
   # :25-:29 because it wrote to stderr — failure by OUTPUT, not by exit code.

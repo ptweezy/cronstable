@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="amber">
+<html lang="en" data-theme="carolina">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -533,7 +533,9 @@
   .spark i.fail { background: var(--fail); }
   .spark i.cancelled { background: var(--cancelled); }
   .spark i.unknown { background: var(--unknown); }
-  .spark.empty { color: var(--fg-faint); font-size: 11px; }
+  /* padding: 0 shields it from the generic .empty empty-state card rule
+     below, which would otherwise balloon every no-history row */
+  .spark.empty { color: var(--fg-faint); font-size: 11px; padding: 0; }
 
   .actions { display: flex; gap: 5px; justify-content: flex-end; }
   .btn {
@@ -1477,17 +1479,17 @@
         <span class="lab">Theme<small>phosphor (dark) or paper (light)</small></span>
         <select class="mini" id="setTheme">
           <optgroup label="phosphor">
+            <option value="carolina">carolina</option>
             <option value="amber">amber</option>
             <option value="green">green</option>
             <option value="modern">modern (no CRT)</option>
-            <option value="carolina">carolina</option>
             <option value="standard">standard (no CRT)</option>
           </optgroup>
           <optgroup label="paper">
+            <option value="carolina-light">carolina</option>
             <option value="amber-light">amber</option>
             <option value="green-light">green</option>
             <option value="modern-light">modern (no CRT)</option>
-            <option value="carolina-light">carolina</option>
             <option value="standard-light">standard (no CRT)</option>
           </optgroup>
         </select>
@@ -1651,7 +1653,7 @@
 
   // ---- preferences ----
   const prefs = {
-    theme: "amber", fx: true, scan: true, density: false, notify: false,
+    theme: "carolina", fx: true, scan: true, density: false, notify: false,
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
@@ -2164,9 +2166,13 @@
     }
     // Opting into any extra column flips the whole page fluid so the jobs table
     // can use the full window width instead of squeezing the classic columns;
-    // the classic-only set stays centered at --maxw. .twrap scrolls if even the
-    // full width can't fit every enabled column.
-    document.querySelector("main").classList.toggle("wide", anyExtra);
+    // the classic-only set stays centered at --maxw. The data-driven Owner
+    // column (spread mode) widens the table the same way an opted-in extra
+    // does, so it counts too — without it a spread cluster overflows the
+    // centered layout at any window size. .twrap scrolls if even the full
+    // width can't fit every enabled column.
+    const ownerShown = t.classList.contains("show-owner");
+    document.querySelector("main").classList.toggle("wide", anyExtra || ownerShown);
   }
   function renderColsMenu() {
     $("colsMenu").innerHTML = COLUMNS.map((c) =>
@@ -2268,6 +2274,7 @@
     // signature early-return so the column tracks the data on any poll.
     const showOwner = !!state.clusterSpread || jobs.some((j) => "clusterOwner" in j);
     $("jobsTable").classList.toggle("show-owner", showOwner);
+    applyCols();  // wide-layout depends on show-owner; cheap no-op when unchanged
     $("emptyState").style.display = jobs.length ? "none" : "block";
     $("emptyMsg").textContent = state.jobs.length ? "No jobs match your filter." : "No jobs configured.";
     $("countLabel").textContent = jobs.length + (jobs.length === 1 ? " job" : " jobs") +
@@ -4017,13 +4024,13 @@
   //  settings / theme / prefs application
   // ===================================================================
   // every theme is a hue x variant pair: "green" (phosphor) / "green-light" (paper)
-  const THEME_HUES = ["amber", "green", "modern", "carolina", "standard"];
+  const THEME_HUES = ["carolina", "amber", "green", "modern", "standard"];
   const FLAT_HUES = ["modern", "standard"];   // no CRT physics on these
   function themeParts(t) {
     const light = /-light$/.test(t);
     const hue = light ? t.slice(0, -6) : t;
     // self-heal a garbage stored pref (old builds, hand-edited localStorage)
-    return { hue: THEME_HUES.includes(hue) ? hue : "amber", light };
+    return { hue: THEME_HUES.includes(hue) ? hue : "carolina", light };
   }
   function applyTheme() {
     const p = themeParts(prefs.theme);
@@ -4493,13 +4500,15 @@
     // manual-only dags cannot be backfilled (the schedule anchors the range)
     $("dgBackfillBtn").disabled = !d.schedule;
     $("dgBackfillBtn").title = d.schedule ? "Backfill a date range" : "manual-only dag: no schedule to backfill";
+    // each bit is its own <span>: .drawer-head .meta is a flex container and
+    // separates flex items with its gap; bare text nodes would run together
     const bits = [];
-    bits.push("<b>" + esc((d.tasks || []).length) + "</b> tasks");
-    if (d.schedule) bits.push("schedule <b>" + esc(d.schedule) + "</b>"); else bits.push("<b>manual</b>");
-    if (state.dagDrawer.runKey) bits.push("run <b>" + esc(truncStr(state.dagDrawer.runKey, 40)) + "</b>");
+    bits.push("<span><b>" + esc((d.tasks || []).length) + "</b> tasks</span>");
+    if (d.schedule) bits.push("<span>schedule <b>" + esc(d.schedule) + "</b></span>"); else bits.push("<span><b>manual</b></span>");
+    if (state.dagDrawer.runKey) bits.push("<span>run <b>" + esc(truncStr(state.dagDrawer.runKey, 40)) + "</b></span>");
     if (run) {
       bits.push('<span class="kbadge">' + esc(run.kind || "?") + "</span>");
-      if (run.createdAt) bits.push('started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b>");
+      if (run.createdAt) bits.push('<span>started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b></span>");
     }
     $("dgMeta").innerHTML = bits.join("");
   }

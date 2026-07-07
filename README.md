@@ -18,6 +18,24 @@ A modern, container-friendly, optionally-distributed, fault-tolerant, highly ava
 
 yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
 
+## Why yacron2?
+
+* **Built for locked-down containers.** Runs unmodified under restricted
+  Kubernetes PodSecurity: non-root, read-only root filesystem,
+  `RuntimeDefault` seccomp, every Linux capability dropped (see
+  [Production container deployment](#production-container-deployment)).
+* **Prebuilt for practically everything.** Multi-architecture images on GHCR
+  and Docker Hub plus self-contained binaries for Linux (glibc and musl),
+  macOS (signed and notarized) and Windows, so Python on the host is optional
+  (see [Installation](#installation)).
+* **Observability and durability** A live
+  [web dashboard](#web-dashboard), native [Prometheus metrics](#metrics),
+  per-job [resource monitoring](#resource-monitoring), and opt-in
+  [durable state](https://github.com/ptweezy/yacron2/wiki/Durable-State),
+  [orchestration DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs)
+  and [leader-elected clustering](#clustering-and-leader-election), all in one
+  daemon.
+
 ## Features
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
@@ -57,6 +75,10 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
   metrics), covering run outcomes, durations, retries, schedules, and cluster
   health (see [Metrics](#metrics))
+* Opt-in **per-job resource monitoring**: one `monitorResources: true` samples
+  each run's CPU time and peak memory across its whole process tree, live and
+  per run, in the dashboard, the metrics, and the failure reports (see
+  [Resource monitoring](#resource-monitoring))
 * A **job-set id**: an order-independent fingerprint of every job's effective
   configuration, so replicas deployed from the same config can confirm they
   hold an identical set of jobs (see [Job-set id](#job-set-id))
@@ -66,9 +88,63 @@ yacron2 is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo 
   double-running jobs (see
   [Clustering and leader election](#clustering-and-leader-election))
 * Arbitrary timezone support
-* Optional **[live control panel](#web-dashboard)** to watch every job's status, tail its logs in real time, run or cancel jobs on demand, and review run history, success rates, and schedules
+* Optional **[live control panel](#web-dashboard)**: watch every job's status,
+  tail its logs in real time, run or cancel jobs on demand, review run history
+  and success rates, drive DAG runs and approvals, and keep an eye on the whole
+  cluster, from one self-contained page with ten themes and a shortcut for
+  everything
 
-[![yacron2 web dashboard: a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](#web-dashboard)
+[![yacron2 web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](#web-dashboard)
+
+## Quick start
+
+Sixty seconds to a running scheduler with a live dashboard. Install it (see
+[Installation](#installation) for Docker, Homebrew, and no-Python binary
+options):
+
+```shell
+pip install yacron2
+```
+
+Describe your first job in a `yacron2tab.yaml`:
+
+```yaml
+jobs:
+  - name: hello
+    command: echo "hello from yacron2 on $(hostname)"
+    schedule: "* * * * *"        # every minute
+    captureStdout: true
+
+web:
+  listen:
+    - http://127.0.0.1:8080      # optional: the REST API + dashboard
+```
+
+Run it (always in the foreground, in true 12-factor spirit):
+
+```shell
+yacron2 -c yacron2tab.yaml
+```
+
+That's it. Open <http://127.0.0.1:8080/> and watch `hello` fire once a minute,
+with its output tailing live in the [dashboard](#web-dashboard). From here,
+each of these is a few lines away:
+
+* **Never miss a silent failure**: retries with backoff and a Slack/mail/Sentry
+  report when a job ultimately fails ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
+* **Survive restarts**: a one-line `state:` block makes history, retries and
+  missed-run catch-up durable ([tutorial](#tutorial-2-survive-restarts-catch-up-what-was-missed)).
+* **Chain jobs into a pipeline**: a durable DAG with data hand-off and an
+  approval gate ([tutorial](#tutorial-3-your-first-dag-a-durable-pipeline)).
+* **Run replicas safely**: leader election so two copies never double-fire
+  ([tutorial](#tutorial-4-two-replicas-zero-double-runs)).
+* **See it all at once**: `docker compose -f docker-compose-grand-tour.yml up
+  --build` boots a nine-node cluster running every feature together
+  ([example gallery](#example-gallery)).
+
+Already have a crontab? You don't have to translate it:
+`yacron2 -c /etc/crontab` runs the classic format as-is (see
+[Classic crontab files](#classic-crontab-files)).
 
 ## Installation
 
@@ -368,32 +444,296 @@ spec:
 
 ## Web dashboard
 
-yacron2 ships with a **built-in web dashboard**. Point your browser at the HTTP listener and you have a keyboard-driven control room for every job.
+yacron2 ships with a **built-in web dashboard**: one self-contained page (no
+build step, no external assets, no database) served straight from the daemon.
+Point a browser at the HTTP listener and you have a keyboard-driven control
+room for every job, and, when you use them, for the cluster, the DAGs, and the
+durable state store too.
 
-[![yacron2 web dashboard: a live overview of every job, showing status, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
+[![yacron2 web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-overview.png)
 
-The overview shows every job with its **live status**, a **countdown to its next run**, how long the last run took, an exit-code badge, and a **sparkline of recent runs**, all sortable, filterable, and searchable. Click any job (or press `Enter`) to open its detail drawer:
+The overview shows every job with its **live status**, a **countdown to its
+next run**, the last run's duration and exit-code badge, and a **sparkline of
+recent runs**; jobs with [resource monitoring](#resource-monitoring) add live
+**CPU and memory** chips while they run, and a cluster adds each job's
+**owner node**. Everything is sortable, filterable, and searchable, and when
+something is failing a **verdict bar** correlates the failures into one
+headline ("4 share exit=69, likely one cause"). Click any job (or press
+`Enter`) to open its detail drawer:
 
 | Live log tail | Run history | Schedule, explained |
 | :---: | :---: | :---: |
-| [![Live log tailing with ANSI color and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate and a per-run duration chart](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
-| Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run duration chart and the full run log. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
+| [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-schedule.png) |
+| Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run chart; with [resource monitoring](#resource-monitoring) on, **CPU time and peak memory** per run and in the stats. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
-**Everything is one keypress away**: a fuzzy command palette (`Ctrl-K` / `⌘K`) runs any action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can **run a single job, or every failing job at once, on demand**, with a click.
+**Everything is one keypress away**: a fuzzy command palette (`Ctrl-K` / `⌘K`)
+runs any action or jumps to any job, `?` lists every shortcut, `/` filters,
+`j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can
+**run a single job, or every failing job at once, on demand**, with a click.
 
 | Fuzzy command palette | Keyboard-first, with a shortcut for everything |
 | :---: | :---: |
 | [![A fuzzy command palette listing run and log actions for each job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-palette.png) | [![The keyboard shortcut reference overlay](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-shortcuts.png) |
 
-Three built-in themes (amber and green phosphor CRT, or a flat **modern** look), plus configurable CRT glow, scanlines, compact density, desktop failure notifications, and polling interval, all remembered in your browser (and the CRT effects honor `prefers-reduced-motion`):
+### Orchestration, live
 
-| Green phosphor CRT | Flat modern theme |
+[DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs) get
+their own card and drawer: trigger or backfill a run, watch the **task graph**
+advance node by node, inspect per-task attempts, XCom values and logs, and
+decide **approval gates** with a click, from any node in the fleet.
+
+| The task graph | A human approval gate |
 | :---: | :---: |
-| [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) |
+| [![The DAG drawer's graph tab: a diamond of tasks, every node green](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-graph.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-graph.png) | [![The DAG drawer's task list with an approval gate awaiting a decision, Approve and Reject buttons armed](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-approval.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-dag-approval.png) |
+| A `data-quality-gate` diamond: fan-out checks that reconverge on a `certify` task, colored by state as the run advances. | A release train **parked on a human**: the build succeeded, the approval gate is `awaiting`, and the sensor and publish tasks queue behind your decision. |
 
-Run history and live logs are kept **in memory only** (unless you opt into the durable state store), and the page is served with a strict Content-Security-Policy. Turn it on with a one-line `web:` block: the [**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) in the wiki is the full walkthrough, and [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to enable it.
+### The whole fleet on one page
 
-**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)).
+With [clustering](#clustering-and-leader-election) on, a **cluster panel**
+shows the quorum math, this node's role, per-peer attestation status, and,
+with `cluster.observability`, every node's **whole-host CPU and memory**. The
+**fleet view** goes further: a jobs × nodes matrix of the entire fleet's runs,
+assembled from data that piggybacks on the gossip the nodes already exchange,
+so any node can serve the single pane of glass.
+
+| Cluster panel | Fleet view |
+| :---: | :---: |
+| [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-fleet.png) |
+| Nine nodes, `8/8 agreed`, quorum met, per-node **load meters** and per-node **owns** counts under `distribution: spread`. | Every node's state for every job, one glance: ok / failing / running cells with ages, per-column node health, and a **failing only** filter. |
+
+### Built for the 3 a.m. incident
+
+When things break, the dashboard leans in: the verdict bar's **incident
+timeline** lays out every job's most recent finish, newest first, with the
+correlated blast-radius set highlighted; the **mitigate console** start/cancels
+the failing set in bulk and copies a Markdown incident summary for your ticket;
+and the **multi-tail console** merges up to four jobs' live logs into one
+pane, like tailing a set of pods.
+
+| Incident timeline | Merged multi-tail |
+| :---: | :---: |
+| [![The incident timeline overlay: every job's most recent run, newest first, with failure reasons and exit codes](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-incident-timeline.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-incident-timeline.png) | [![The multi-tail console merging four jobs' live logs with identity colors and end-of-run markers](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-multitail.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-multitail.png) |
+| "What happened, in what order": relative times, outcome glyphs, failure reasons, exit codes, durations, and a **failing only** filter. | Four streams, one pane: identity-colored prefixes, `end of run output` markers, auto re-attach on each job's next run. |
+
+### Wallboards, heatmaps, and the state store
+
+Press `w` for a full-screen **wallboard** built for a TV: worst-first tiles,
+an incident stamp when something is failing, a `NO SIGNAL` banner when the
+data goes stale (never a stale all-green), and a zen **screensaver** that
+takes over when everything is healthy. The **activity heatmap** turns run
+history into a punchcard (worst outcome per bucket, shaded by volume), and the
+opt-in **state inspector** shows the [durable state store](https://github.com/ptweezy/yacron2/wiki/Durable-State)'s
+health: record counts by kind, op latencies and errors, locks, cursors,
+counters, artifacts, and quarantine.
+
+| Wallboard / TV mode | Activity heatmap | Durable-state inspector |
+| :---: | :---: | :---: |
+| [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-state.png) |
+
+### Make it yours
+
+**Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor),
+amber and green phosphor, and flat **modern** and **standard** looks, each in
+a dark (phosphor) and a light (paper) variant. Cycle hues with `t`, flip
+light/dark with `T`. CRT glow, scanlines, compact density, desktop failure
+notifications, audible cues, and the polling interval are all toggles,
+remembered per browser, and the CRT effects honor `prefers-reduced-motion`:
+
+| Amber phosphor CRT | Green phosphor CRT |
+| :---: | :---: |
+| [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-green.png) |
+
+| Flat modern theme | Carolina, on paper (light) |
+| :---: | :---: |
+| [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-theme-carolina-light.png) |
+
+And because a control room deserves a proper power-on: an optional (on by
+default, once per 12 hours) **BIOS-style boot self-test** that checks the
+daemon, job set, cluster, and schedules for real while it types:
+
+| Settings | Startup self-test |
+| :---: | :---: |
+| [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/dashboard-boot.png) |
+
+Run history and live logs are kept **in memory only** (unless you opt into the
+durable state store), and the page is served with a strict
+Content-Security-Policy. Turn it on with a one-line `web:` block: the
+[**web dashboard tour**](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard)
+in the wiki is the full walkthrough, and
+[Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
+enable it.
+
+**Try it:** `docker compose -f docker-compose-zen.yml up` boots a single node with a demo job set, and `docker compose -f docker-compose-cluster.yml up` boots a 3-node cluster (`yacron-a`/`yacron-b`/`yacron-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** — a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all four failure reporters wired to live sinks — run `docker compose -f docker-compose-grand-tour.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+
+## Tutorials
+
+Four short, copy-paste-runnable walkthroughs, each built on the
+[quick start](#quick-start) config and each ending where the wiki goes deeper.
+
+### Tutorial 1: Alert when a job fails, then retry it
+
+Classic cron mails root and hopes. Instead: retry with exponential backoff,
+and page a Slack channel only if the job *ultimately* fails.
+
+```yaml
+jobs:
+  - name: nightly-backup
+    command: /usr/local/bin/backup --incremental
+    schedule: "0 3 * * *"
+    captureStderr: true            # include stderr in the report
+    onFailure:
+      retry:
+        maximumRetries: 5
+        initialDelay: 5            # 5s, 10s, 20s, 40s, ... capped at 300s
+        maximumDelay: 300
+        backoffMultiplier: 2
+    onPermanentFailure:            # fires once, after the last retry is spent
+      report:
+        webhook:
+          url:
+            fromEnvVar: SLACK_WEBHOOK_URL
+```
+
+By default a job *fails* when it exits non-zero **or** writes to a captured
+stderr; tune that per job with [`failsWhen`](#handling-failure). The webhook's
+default body is Slack-compatible (Mattermost and Teams work as-is), and mail,
+Sentry, and a shell command are equally one block away, with jinja2 templating
+over the run's name, output, and exit code. Deeper:
+[Failure Detection and Retries](https://github.com/ptweezy/yacron2/wiki/Failure-Detection-and-Retries)
+and [Reporting](https://github.com/ptweezy/yacron2/wiki/Reporting) in the wiki.
+
+### Tutorial 2: Survive restarts, catch up what was missed
+
+Stateless is the default, and a feature. But when a deploy or a reboot lands
+mid-schedule, one `state:` block gives jobs a memory:
+
+```yaml
+state:
+  path: /var/lib/yacron2           # a local dir, or a shared mount for a fleet
+
+jobs:
+  - name: hourly-invoice-emit
+    command: python -m billing.emit_hourly
+    schedule: "0 * * * *"
+    onMissed: run-all              # replay each hour missed while we were down
+    startingDeadlineSeconds: 21600 # ...unless the slot is older than 6h
+    onFailure:
+      retry:
+        maximumRetries: 10
+        initialDelay: 30
+        maximumDelay: 600
+        backoffMultiplier: 2
+```
+
+With just the `state.path` line, run history survives restarts (the dashboard
+rehydrates it), armed retries re-arm at their absolute deadlines, `@reboot`
+means once per *boot* rather than once per daemon start, and Prometheus
+counters stop resetting to zero. `onMissed` adds catch-up on top: `run-once`
+coalesces any number of missed slots into one launch, `run-all` replays each
+one, bounded by `startingDeadlineSeconds`. The same store also hands your job
+*commands* durable primitives (key/value, cursors, fleet-wide locks,
+idempotency keys, artifacts, run-scoped secrets) over a loopback endpoint:
+`yacron2 state|cursor|lock|idempotent|artifact|secret`. Deeper:
+[Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State).
+
+### Tutorial 3: Your first DAG, a durable pipeline
+
+A `dags:` block turns the scheduler into a small, durable workflow engine.
+This one builds, waits for a human, then publishes:
+
+```yaml
+state:
+  path: /var/lib/yacron2           # DAGs live on the state store
+
+dags:
+  - name: release-train            # no schedule: manual-only
+    tasks:
+      - id: build
+        command: make dist
+      - id: approve
+        type: approval             # parks the graph on a human decision
+        dependsOn: [build]
+      - id: publish
+        dependsOn: [approve]
+        command: make publish
+        retries: 2                 # task-level retries, DAG-owned
+        retryDelaySeconds: 60
+```
+
+Trigger it and approve the gate (or click **Approve** in the dashboard's DAG
+drawer):
+
+```shell
+curl -X POST http://127.0.0.1:8080/dags/release-train/trigger
+# -> {"dag": "release-train", "runKey": "manual-..."}
+curl -X POST http://127.0.0.1:8080/dags/release-train/runs/<runKey>/tasks/approve/decision \
+     -H 'Content-Type: application/json' -d '{"decision": "approve", "by": "alice"}'
+```
+
+Every transition is durable: restart the daemon mid-run and the run resumes
+exactly where it was, and across a fleet the run advances under a lease so a
+task never launches twice. Scheduled DAGs add catch-up and `backfill` over a
+date range; tasks can pass data with `yacron2 xcom push/pull`, fan out
+dynamically over a list an upstream task produced, and poll for conditions
+with `type: sensor`. Deeper:
+[Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs).
+
+### Tutorial 4: Two replicas, zero double-runs
+
+Run the same config on two (or nine) hosts that share a POSIX mount, and let
+them elect a leader through a fenced lease file, with no certificates and no
+coordination service:
+
+```yaml
+state:
+  path: /mnt/shared/yacron2/state  # shared durable state (optional but natural here)
+
+cluster:
+  backend: filesystem
+  filesystem:
+    path: /mnt/shared/yacron2      # the mount is the election store
+  nodeName: node-a                 # unique and stable per replica!
+  electLeader: true
+
+jobs:
+  - name: charge-subscriptions
+    command: python -m billing.charge
+    schedule: "0 6 * * *"
+    clusterPolicy: Leader          # the default: exactly the leader runs it
+```
+
+Only the elected leader fires `Leader` jobs; stop it and a follower adopts the
+lease within its TTL. Per job, `clusterPolicy` picks the trade-off:
+`Leader` (never double-runs, may skip when quorum is lost), `PreferLeader`
+(never skips, may double-run under a partition), or `EveryNode` (genuinely
+per-node work). No shared mount? The `gossip` backend elects over mutual TLS
+with no shared store at all, `kubernetes` uses a `coordination.k8s.io` Lease,
+and `etcd` a lease-bound key; `distribution: spread` load-balances job
+ownership across the fleet instead of concentrating it on one leader. Deeper:
+[Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election).
+
+## Example gallery
+
+Every example in [`example/`](example) is a self-contained, annotated,
+runnable project; the compose files live in the repo root. Highlights:
+
+| Example | One command | Shows off |
+| --- | --- | --- |
+| [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-runner, an on-demand job. |
+| [`grand-tour`](example/grand-tour) | `docker compose -f docker-compose-grand-tour.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all four reporters wired to live sinks. |
+| [`cluster`](example/cluster) | `docker compose -f docker-compose-cluster.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
+| [`cluster-large`](example/cluster-large) | `docker compose -f docker-compose-cluster-large.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
+| [`dag`](example/dag) | `yacron2 -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
+| [`dag-cluster`](example/dag-cluster) | `docker compose -f example/dag-cluster/docker-compose.yml up` | DAGs coordinating across three nodes on one shared store: crash-resume, exactly-once tasks. |
+| [`job-state`](example/job-state) | `yacron2 -c example/job-state` | The job-facing state primitives: KV, cursors, locks, idempotency keys, artifacts, secrets. |
+| [`pulse-monitor`](example/pulse-monitor) | `docker compose -f docker-compose-pulse.yml up` | Second-level scheduling as a real-time uptime / SLA monitor. |
+| [`pulse-cluster`](example/pulse-cluster) | `docker compose -f docker-compose-pulse-cluster.yml up` | The same probes fanned across a 3-node leader-electing cluster. |
+| [`acme-platform`](example/acme-platform) | `docker compose -f docker-compose-acme.yml up` | A realistic 5-node "data platform back-office" showcase. |
+| [`zen-demo`](example/zen-demo) | `docker compose -f docker-compose-zen.yml up` | A deliberately calm board, for the wallboard's zen screensaver. |
+| [`crontab`](example/crontab) | `yacron2 -c example/crontab` | Classic Vixie crontabs running as-is next to YAML jobs. |
+| [`kubernetes`](example/kubernetes) | `kubectl apply -f example/kubernetes/deployment.yaml` | Leader election through a `coordination.k8s.io/v1` Lease. |
+| [`etcd`](example/etcd) | `docker compose -f example/etcd/docker-compose.yml up` | Leader election through an etcd lease, over plain HTTP. |
+| [`docker`](example/docker) | `docker build` | The minimal "add yacron2 to your own image" recipe. |
 
 ## Usage
 
@@ -869,6 +1209,47 @@ my.cron.jobs.prefix.test01.stop:1|g   # the rest are sent when the job stops
 my.cron.jobs.prefix.test01.success:1|g
 my.cron.jobs.prefix.test01.duration:3|ms|@0.1
 ```
+
+### Resource monitoring
+
+Ever wondered which cron job is eating the box?! Turn on per-job resource
+accounting with a single flag (or once under `defaults:` for every job):
+
+```yaml
+jobs:
+  - name: nightly-model-refresh
+    command: python -m models.refresh
+    schedule: "0 4 * * *"
+    monitorResources: true
+```
+
+While the job runs, yacron2 samples its **whole process tree** (children and
+shell-outs included) with [psutil](https://github.com/giampaolo/psutil), and
+the run ends with its **total CPU time (user + system)** and **peak resident
+memory**. The numbers surface everywhere the run does:
+
+* **live** on the dashboard job row and drawer while it runs (`cpu 61% · 288 MiB`);
+* per run and aggregated (avg/max CPU, peak memory) in the dashboard
+  **History** tab and `GET /jobs/{name}/runs`;
+* as Prometheus families on `GET /metrics`
+  (`yacron2_job_cpu_seconds_total`, `yacron2_job_last_run_max_rss_bytes`, ...)
+  and over [statsd](#metrics) when the job has a sink;
+* in the durable run record's `resources` object when a
+  [state store](https://github.com/ptweezy/yacron2/wiki/Durable-State) is
+  configured, so it survives restarts;
+* in report templates (`cpu_seconds` / `max_rss_bytes`) and the shell
+  reporter's environment (`YACRON2_CPU_SECONDS` / `YACRON2_MAX_RSS_BYTES`),
+  so a failure page can say how big the run was when it died.
+
+It is observability only (it never changes a run's verdict), it is off by
+default with zero overhead when off, and the numbers are sampled, so
+short-lived runs are approximate while the long, heavy runs that matter are
+sampled many times. DAG tasks accept the same flag; their usage lands in the
+task record of the `dag_run` document. On a cluster,
+`cluster.observability` additionally shares each node's **whole-host**
+CPU/memory so the dashboard's cluster panel and fleet view show where the
+load actually is. The full semantics live in the
+[Configuration Reference](https://github.com/ptweezy/yacron2/wiki/Configuration-Reference).
 
 ### Handling failure
 
@@ -1466,3 +1847,44 @@ jobs:
     shell: /bin/bash
     schedule: "* * * * *"
 ```
+
+## Documentation map
+
+The [wiki](https://github.com/ptweezy/yacron2/wiki):
+
+* **Run it**:
+  [Installation](https://github.com/ptweezy/yacron2/wiki/Installation) ·
+  [Production and Container Deployment](https://github.com/ptweezy/yacron2/wiki/Production-Deployment) ·
+  [Running on Windows](https://github.com/ptweezy/yacron2/wiki/Running-on-Windows) ·
+  [Migration from yacron](https://github.com/ptweezy/yacron2/wiki/Migration-from-yacron)
+* **Configure it**:
+  [Configuration Reference](https://github.com/ptweezy/yacron2/wiki/Configuration-Reference) ·
+  [Schedules and Timezones](https://github.com/ptweezy/yacron2/wiki/Schedules-and-Timezones) ·
+  [Classic Crontabs](https://github.com/ptweezy/yacron2/wiki/Classic-Crontabs) ·
+  [Includes and Defaults](https://github.com/ptweezy/yacron2/wiki/Includes-and-Defaults) ·
+  [Commands and Environment](https://github.com/ptweezy/yacron2/wiki/Commands-and-Environment) ·
+  [Output Capturing](https://github.com/ptweezy/yacron2/wiki/Output-Capturing) ·
+  [Logging](https://github.com/ptweezy/yacron2/wiki/Logging-Configuration)
+* **Trust it**:
+  [Failure Detection and Retries](https://github.com/ptweezy/yacron2/wiki/Failure-Detection-and-Retries) ·
+  [Reporting](https://github.com/ptweezy/yacron2/wiki/Reporting) ·
+  [Concurrency and Timeouts](https://github.com/ptweezy/yacron2/wiki/Concurrency-and-Timeouts) ·
+  [Troubleshooting](https://github.com/ptweezy/yacron2/wiki/Troubleshooting)
+* **Watch it**:
+  [Web Dashboard](https://github.com/ptweezy/yacron2/wiki/Web-Dashboard) ·
+  [HTTP API](https://github.com/ptweezy/yacron2/wiki/HTTP-API) ·
+  [Metrics with Prometheus](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Prometheus) ·
+  [Metrics with Statsd](https://github.com/ptweezy/yacron2/wiki/Metrics-with-Statsd) ·
+  [CLI Reference](https://github.com/ptweezy/yacron2/wiki/CLI-Reference)
+* **Scale it**:
+  [Durable State](https://github.com/ptweezy/yacron2/wiki/Durable-State) ·
+  [Orchestration and DAGs](https://github.com/ptweezy/yacron2/wiki/Orchestration-and-DAGs) ·
+  [Clustering and Leader Election](https://github.com/ptweezy/yacron2/wiki/Clustering-and-Leader-Election) ·
+  [Architecture and Internals](https://github.com/ptweezy/yacron2/wiki/Architecture-and-Internals)
+
+## Contributing and license
+
+Bug reports, feature ideas, and pull requests are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and
+[Contributing and Releasing](https://github.com/ptweezy/yacron2/wiki/Contributing-and-Releasing)
+for how releases work. yacron2 is [MIT-licensed](LICENSE).
