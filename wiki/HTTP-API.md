@@ -957,7 +957,7 @@ section but `jobApi.enabled: false`, never starts it and injects nothing.
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | Serve the loopback endpoint and inject the `YACRON2_*` environment into every job. |
-| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `1`-`65535`, and a non-loopback host needs `allowNonLoopbackBind`. |
+| `listen` | string | (ephemeral) | Address to bind, as `host:port` or `http://host:port`. When omitted it binds `127.0.0.1` on an OS-assigned port; an explicit port must be in `0`-`65535` (`0` = OS-assigned), and a non-loopback host needs `allowNonLoopbackBind`. |
 | `maxValueBytes` | int | `1048576` (1 MiB) | Reject a KV or cursor value larger than this many bytes (JSON-encoded) with `413`. `0` means no limit. |
 | `maxArtifactBytes` | int | `67108864` (64 MiB) | Reject an artifact payload larger than this many bytes with `413`. `0` means no limit. |
 | `lockTtlSeconds` | float | `30` | Default lease TTL for a job lock (floored at `5`); the daemon renews it at a third of the TTL while the job holds it. |
