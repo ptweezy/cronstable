@@ -1,9 +1,4 @@
-<p>
-  <picture>
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/logo-spin-light.gif">
-    <img src="https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/logo-spin.gif" alt="The yacron2 mark, spinning the way it does in the live dashboard">
-  </picture>
-</p>
+# ![The yacron2 mark, spinning the way it does in the live dashboard](https://raw.githubusercontent.com/ptweezy/yacron2/develop/docs/img/logo-spin.gif)
 
 [![PyPI version](https://img.shields.io/pypi/v/yacron2.svg?logo=pypi&logoColor=white&color=0073b7)](https://pypi.org/project/yacron2/)
 [![Python versions](https://img.shields.io/pypi/pyversions/yacron2.svg?logo=python&logoColor=ffd343&color=306998)](https://pypi.org/project/yacron2/)
