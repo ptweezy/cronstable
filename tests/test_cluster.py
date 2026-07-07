@@ -7,6 +7,7 @@ import aiohttp
 import pytest
 
 from yacron2.cluster import (
+    NODE_STATS_HEADER,
     STATUS_AGREED,
     STATUS_CONFLICT,
     STATUS_DRIFTED,
@@ -374,6 +375,7 @@ def test_to_dict_shape():
         "last_seen",
         "last_error",
         "mismatch_streak",
+        "node_stats",
     }
     # instance_id is an internal liveness token, deliberately not surfaced
     assert "instance_id" not in d
@@ -855,6 +857,49 @@ async def test_web_cluster_endpoint_enabled():
     assert data["enabled"] is True
     assert data["node_name"] == "n"
     assert data["peers"][0]["status"] == "agreed"
+
+
+@pytest.mark.asyncio
+async def test_web_cluster_lease_payload_carries_fleet_hint():
+    # a lease backend's /cluster payload tells the dashboard whether /fleet
+    # has data behind it: true exactly while the observability overlay mesh
+    # is installed (the same condition under which _fleet_backend() serves
+    # the overlay's fleet_view()), false without it.
+    import json
+
+    import yacron2.cron
+
+    class StubLease:
+        def view_dict(self):
+            return {"backend": "kubernetes", "node_name": "n", "peers": []}
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubLease()
+    resp = await cron._web_get_cluster(_Req())
+    assert json.loads(resp.text)["fleet"] is False
+    cron.observability_mesh = object()  # overlay installed
+    resp = await cron._web_get_cluster(_Req())
+    assert json.loads(resp.text)["fleet"] is True
+
+
+@pytest.mark.asyncio
+async def test_web_cluster_gossip_payload_has_no_fleet_hint():
+    # gossip serves the fleet view natively; its payload stays unchanged and
+    # the dashboard's gossip branch shows the fleet button unconditionally.
+    import json
+
+    import yacron2.cron
+
+    class StubGossip:
+        def view_dict(self):
+            return {"backend": "gossip", "node_name": "n", "peers": []}
+
+    cron = yacron2.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubGossip()
+    resp = await cron._web_get_cluster(_Req())
+    assert "fleet" not in json.loads(resp.text)
 
 
 @pytest.mark.asyncio
@@ -4281,6 +4326,60 @@ def test_parse_job_summaries_hostile_fields_degrade_not_poison():
     }
 
 
+def test_parse_node_stats_absent_and_garbage():
+    from yacron2.cluster import _parse_node_stats
+
+    assert _parse_node_stats(None) is None
+    assert _parse_node_stats("junk") is None
+    assert _parse_node_stats(["not", "a", "dict"]) is None
+    assert _parse_node_stats({}) is None  # no usable field -> None
+    assert _parse_node_stats({"unknown_key": 1}) is None  # not whitelisted
+
+
+def test_parse_node_stats_rebuilds_whitelisted_finite_only():
+    from yacron2.cluster import _parse_node_stats
+
+    parsed = _parse_node_stats(
+        {
+            "cpu_percent": 42.5,
+            "cpu_count": 8.0,  # coerced to int
+            "mem_percent": 60.0,
+            "mem_used_bytes": 1000,
+            "mem_total_bytes": 2000,
+            "proc_rss_bytes": 500,
+            "proc_cpu_percent": 1.5,
+            # hostile / junk: dropped, never poisoning the /fleet JSON
+            "evil": "rm -rf",
+            "nan_field": float("nan"),
+            "cpu_percent_bool": True,
+        }
+    )
+    assert parsed == {
+        "cpu_percent": 42.5,
+        "cpu_count": 8,
+        "mem_percent": 60.0,
+        "mem_used_bytes": 1000.0,
+        "mem_total_bytes": 2000.0,
+        "proc_rss_bytes": 500.0,
+        "proc_cpu_percent": 1.5,
+    }
+    assert isinstance(parsed["cpu_count"], int)
+
+
+def test_parse_node_stats_drops_nonfinite_and_bools():
+    from yacron2.cluster import _parse_node_stats
+
+    # Inf/NaN would make /fleet unparseable to browsers; bools are not numbers
+    parsed = _parse_node_stats(
+        {
+            "cpu_percent": float("inf"),  # dropped
+            "mem_percent": True,  # bool -> dropped
+            "mem_used_bytes": 1234,  # kept
+        }
+    )
+    assert parsed == {"mem_used_bytes": 1234.0}
+
+
 def test_parse_job_summaries_caps_cardinality():
     from yacron2.cluster import (
         MAX_ADVERTISED_JOB_SUMMARIES,
@@ -4326,6 +4425,192 @@ async def test_handle_peer_advertises_job_summaries(no_tls):
     assert set(payload["job_summaries"]) == {"alpha", "beta"}
     assert payload["job_summaries"]["alpha"]["running"] is True
     assert payload["job_summaries_truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_advertises_node_stats_header_only_when_shared(
+    no_tls,
+):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    # no node-stats provider: no header (absence is the signal)
+    resp = await mgr._handle_peer(_Req())
+    assert NODE_STATS_HEADER not in resp.headers
+    assert "node_stats" not in json.loads(resp.text)
+    # provider installed WITHOUT sharing: still no header (the provider is
+    # for this node's own local readout only).
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 12.0, "mem_percent": 34.0}, share=False
+    )
+    resp = await mgr._handle_peer(_Req())
+    assert NODE_STATS_HEADER not in resp.headers
+    # sharing on: the reading rides the response HEADER as compact JSON --
+    # never the body, whose bytes (and so whose ETag) stay identical to the
+    # not-sharing case.
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 12.0, "mem_percent": 34.0}, share=True
+    )
+    resp = await mgr._handle_peer(_Req())
+    assert json.loads(resp.headers[NODE_STATS_HEADER]) == {
+        "cpu_percent": 12.0,
+        "mem_percent": 34.0,
+    }
+    assert "node_stats" not in json.loads(resp.text)
+    # a provider that returns None (psutil unavailable) also sends no header
+    mgr.set_node_stats_provider(lambda: None, share=True)
+    resp = await mgr._handle_peer(_Req())
+    assert NODE_STATS_HEADER not in resp.headers
+
+
+def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
+    # the /cluster peer panel: per-peer node_stats (populated when shared) and
+    # the local readout independent of sharing.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # a provider installed WITHOUT sharing still drives the LOCAL readout
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 5.0, "mem_percent": 6.0}, share=False
+    )
+    assert mgr._local_node_stats() == {"cpu_percent": 5.0, "mem_percent": 6.0}
+    peer = mgr.view.peers["b:1"]
+    peer.node_stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
+    # record_success stamps this alongside the stats; a reading with no stamp
+    # (or one past the staleness window) renders None -- see the expiry test.
+    peer.node_stats_at = datetime.datetime.now(datetime.timezone.utc)
+    view = mgr.view_dict()
+    by_host = {p["host"]: p for p in view["peers"]}
+    assert by_host["b:1"]["node_stats"] == {
+        "cpu_percent": 70.0,
+        "mem_percent": 20.0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_absorbs_node_stats_header(no_tls):
+    # the reading arrives via the response HEADER (never the body -- see
+    # _handle_peer), hardened through _parse_node_stats like any peer input
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "inst-b",
+                    "members": [
+                        {
+                            "node_name": "node-a",
+                            "instance_id": mgr.instance_id,
+                            "agreed": True,
+                        }
+                    ],
+                },
+                headers={
+                    NODE_STATS_HEADER: json.dumps(
+                        {
+                            "cpu_percent": 55.5,
+                            "mem_percent": 40.0,
+                            "cpu_count": 4,
+                        },
+                        separators=(",", ":"),
+                    )
+                },
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].node_stats == {
+        "cpu_percent": 55.5,
+        "mem_percent": 40.0,
+        "cpu_count": 4,
+    }
+    # the reading is stamped so it can expire once no fresh one arrives
+    assert mgr.view.peers["b:1"].node_stats_at is not None
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_ignores_malformed_node_stats_header(no_tls):
+    # the header is CA-vouched-but-untrusted input: bad JSON, a non-dict, or
+    # an oversized value must read as "no reading this round" -- the poll
+    # itself (agreement, last_seen, every gate) still succeeds
+    from yacron2.cluster import MAX_NODE_STATS_HEADER_LEN
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # valid JSON padded past the cap: rejected on length, not parsed
+    oversized = json.dumps({"cpu_percent": 1.0}) + " " * (
+        MAX_NODE_STATS_HEADER_LEN + 1
+    )
+    for bad in ("{not json", '["not", "a", "dict"]', oversized):
+        session = _FakeSession(
+            _FakeGet(
+                resp=_FakeResp(_PEER_B_BODY, headers={NODE_STATS_HEADER: bad})
+            )
+        )
+        await mgr._poll_peer(session, "b:1", "v1:mine")
+        peer = mgr.view.peers["b:1"]
+        assert peer.status == STATUS_AGREED  # the poll never fails on junk
+        assert peer.node_stats is None  # the junk reading is dropped
+
+
+def test_view_expires_node_stats_without_fresh_reading(no_tls):
+    # A peer that STOPS sending the node-stats header (shareNodeStats toggled
+    # off, psutil broken, a downgraded build) still polls successfully every
+    # round, so last_seen stays fresh while the absorbed reading ages
+    # silently: past the staleness window every consumer must render None
+    # rather than present hours-old load as current -- and a poll whose
+    # header DOES carry stats refreshes. peer_node_stats here is exactly what
+    # _observe_peer passes per response after parsing the header (None =
+    # header absent that round).
+    from yacron2.cluster import NODE_STATS_STALE_ROUNDS
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    window = NODE_STATS_STALE_ROUNDS * mgr.config["interval"]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
+
+    def poll(at, with_stats):
+        mgr.view.record_success(
+            "b:1",
+            "node-b",
+            "v1:mine",
+            SCHEME_VERSION,
+            "v1:mine",
+            at,
+            "node-a",
+            peer_instance="inst-b",
+            peer_node_stats=stats if with_stats else None,
+        )
+
+    def rendered():
+        view_peer = {p["host"]: p for p in mgr.view_dict()["peers"]}["b:1"]
+        fleet = {n["host"]: n for n in mgr.fleet_view()["nodes"]}
+        return view_peer["node_stats"], fleet["b:1"]["node_stats"]
+
+    # absorb one reading, then several successful polls carrying none, the
+    # last of them past the window
+    poll(now - datetime.timedelta(seconds=window + 5), with_stats=True)
+    for offset in (2, 1, 0):
+        poll(now - datetime.timedelta(seconds=offset), with_stats=False)
+    peer = mgr.view.peers["b:1"]
+    assert peer.last_seen == now  # the peer itself polls fresh...
+    assert peer.node_stats == stats  # ...and the raw reading is kept...
+    assert rendered() == (None, None)  # ...but every consumer expires it
+    # a poll WITH stats refreshes the reading
+    poll(now, with_stats=True)
+    assert rendered() == (stats, stats)
+    # and within the window, polls carrying none keep it rendered (the
+    # briefly-absent case: last-known beats blanking)
+    poll(now, with_stats=False)
+    assert rendered() == (stats, stats)
 
 
 def test_advertised_job_summaries_caps_deterministically(no_tls):
@@ -4488,6 +4773,44 @@ def test_fleet_view_merges_self_and_peers(no_tls):
     assert by_host["c:1"]["status"] == "unknown"
 
 
+def test_fleet_view_includes_node_stats(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
+        lambda: "v1:mine",
+    )
+    mgr.set_node_stats_provider(
+        lambda: {"cpu_percent": 20.0, "mem_percent": 30.0}
+    )
+    _seed_agree(mgr, "b:1", "node-b")
+    peer_b = mgr.view.peers["b:1"]
+    peer_b.last_seen = NOW
+    peer_b.node_stats = {"cpu_percent": 88.0, "mem_percent": 50.0}
+    # freshly stamped, as record_success would; expiry is covered separately
+    peer_b.node_stats_at = datetime.datetime.now(datetime.timezone.utc)
+    fleet = mgr.fleet_view()
+    # self carries its own freshly-sampled load
+    assert fleet["nodes"][0]["node_stats"] == {
+        "cpu_percent": 20.0,
+        "mem_percent": 30.0,
+    }
+    by_host = {n["host"]: n for n in fleet["nodes"][1:]}
+    assert by_host["b:1"]["node_stats"] == {
+        "cpu_percent": 88.0,
+        "mem_percent": 50.0,
+    }
+    # a node that shared none reports null (not missing) so the UI shows "—"
+    assert by_host["c:1"]["node_stats"] is None
+
+
+def test_fleet_view_node_stats_none_when_not_sharing(no_tls):
+    # no provider installed: self node_stats is null, unchanged fleet otherwise
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    fleet = mgr.fleet_view()
+    assert fleet["nodes"][0]["node_stats"] is None
+
+
 def test_fleet_view_skips_self_listing_and_dedupes_instances(no_tls):
     mgr = ClusterManager(
         _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1", "b2:1"], "node-a"),
@@ -4550,6 +4873,54 @@ async def test_mtls_round_trip_job_summaries(tmp_path):
         fleet = a.fleet_view()
         by_name = {n["node_name"]: n for n in fleet["nodes"]}
         assert by_name["node-b"]["jobs"]["beta"]["last"]["exit_code"] == 1
+    finally:
+        await a.stop()
+        await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_mtls_round_trip_node_stats(tmp_path):
+    # end-to-end over the real mTLS channel: b advertises its whole-node
+    # CPU/memory, a absorbs it and serves it in the merged fleet view -- the
+    # cluster.observability path that lets a lease cluster (or any gossip mesh)
+    # show every node's live load.
+    tls = _write_tls(tmp_path)
+    pa, pb = _free_port(), _free_port()
+    a = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
+        lambda: "v1:same",
+    )
+    b = ClusterManager(
+        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
+        lambda: "v1:same",
+    )
+    b.set_node_stats_provider(
+        lambda: {
+            "cpu_percent": 73.0,
+            "cpu_count": 8,
+            "mem_percent": 41.0,
+            "mem_used_bytes": 4096,
+            "mem_total_bytes": 8192,
+        }
+    )
+    await b.start()
+    await a.start()
+    try:
+        await a._poll_all()
+        peer = a.view.peers[f"localhost:{pb}"]
+        assert peer.status == STATUS_AGREED
+        assert peer.node_stats == {
+            "cpu_percent": 73.0,
+            "cpu_count": 8,
+            "mem_percent": 41.0,
+            "mem_used_bytes": 4096.0,
+            "mem_total_bytes": 8192.0,
+        }
+        fleet = a.fleet_view()
+        by_name = {n["node_name"]: n for n in fleet["nodes"]}
+        assert by_name["node-b"]["node_stats"]["cpu_percent"] == 73.0
+        # a shared none, so its own entry reports null
+        assert by_name["node-a"]["node_stats"] is None
     finally:
         await a.stop()
         await b.stop()
@@ -4731,6 +5102,81 @@ async def test_observe_peer_conditional_replay_on_304(no_tls):
     # the summaries receipt time rides through the replay unchanged, so the
     # fleet view keeps ageing the countdown from the original snapshot
     assert peer.job_summaries_at == taken_at
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_etag_stable_while_node_stats_change(no_tls):
+    # THE point of the header sidecar: live load values never touch the
+    # body's ETag, so a sharing cluster keeps the idle-304 optimisation --
+    # and the 304 itself carries the FRESH reading.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
+    )
+    stats = {"cpu_percent": 10.0, "mem_percent": 30.0}
+    mgr.set_node_stats_provider(lambda: dict(stats), share=True)
+    resp = await mgr._handle_peer(_Req())
+    assert resp.status == 200
+    etag = resp.headers["ETag"]
+    assert json.loads(resp.headers[NODE_STATS_HEADER])["cpu_percent"] == 10.0
+    assert "node_stats" not in json.loads(resp.text)
+    # the load changes; nothing else does. The tag must hold, so the same
+    # conditional request gets a bodyless 304 -- carrying the new reading.
+    stats["cpu_percent"] = 90.0
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    resp2 = await mgr._handle_peer(req)
+    assert resp2.status == 304
+    assert resp2.body is None
+    assert resp2.headers["ETag"] == etag
+    assert json.loads(resp2.headers[NODE_STATS_HEADER])["cpu_percent"] == 90.0
+
+
+@pytest.mark.asyncio
+async def test_observe_peer_absorbs_fresh_node_stats_on_304(no_tls):
+    # the poller half of the sidecar: a conditional 304 round replays the
+    # cached body observation but absorbs THIS response's header reading --
+    # never a stale one from the cache
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    session = _FakeSeqSession(
+        _FakeGet(
+            resp=_FakeResp(
+                _PEER_B_BODY,
+                headers={
+                    "ETag": '"tag-1"',
+                    NODE_STATS_HEADER: json.dumps({"cpu_percent": 10.0}),
+                },
+            )
+        ),
+        _FakeGet(
+            resp=_FakeResp(
+                body=b"",
+                status=304,
+                headers={NODE_STATS_HEADER: json.dumps({"cpu_percent": 90.0})},
+            )
+        ),
+        _FakeGet(resp=_FakeResp(body=b"", status=304)),
+    )
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    peer = mgr.view.peers["b:1"]
+    assert peer.node_stats == {"cpu_percent": 10.0}
+    first_at = peer.node_stats_at
+    assert first_at is not None
+    # round 2: a 304 whose header carries a NEWER reading -- absorbed live
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    assert session.request_headers[1] == {"If-None-Match": '"tag-1"'}
+    assert peer.status == STATUS_AGREED
+    assert peer.node_stats == {"cpu_percent": 90.0}
+    assert peer.node_stats_at is not None and peer.node_stats_at >= first_at
+    stamped_at = peer.node_stats_at
+    # round 3: a 304 with NO header (the peer stopped sharing): the last
+    # reading is kept (None keeps-last-known) but its stamp does not advance,
+    # so it ages toward the NODE_STATS_STALE_ROUNDS expiry
+    await mgr._observe_peer(session, "b:1", "v1:mine")
+    assert peer.status == STATUS_AGREED
+    assert peer.node_stats == {"cpu_percent": 90.0}
+    assert peer.node_stats_at == stamped_at
 
 
 @pytest.mark.asyncio

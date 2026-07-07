@@ -77,6 +77,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/job-set-id` | `_web_job_set_id` | `200` |
 | `GET` | `/cluster` | `_web_get_cluster` | `200` |
 | `GET` | `/fleet` | `_web_get_fleet` | `200` |
+| `GET` | `/node` | `_web_get_node` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
@@ -189,9 +190,18 @@ whether any conflict is pausing `Leader` jobs (`conflict`, the umbrella flag),
 whether this node is `quorate`, the elected `leader`
 (`null` when this node is not quorate, and always `null` in `spread` mode) and
 `is_leader` (always `false` in `spread` mode), and a `peers` array (each with
-`host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`, and
-`mismatch_streak`). Under `distribution: spread`, per-job owners instead appear
-as a `clusterOwner` field on each leader-gated job in `GET /jobs`.
+`host`, `status`, `node_name`, `job_set_id`, `last_seen`, `last_error`,
+`mismatch_streak`, and `node_stats`). Under `distribution: spread`, per-job
+owners instead appear as a `clusterOwner` field on each leader-gated job in
+`GET /jobs`.
+
+A top-level `node_stats` object carries **this** node's own live CPU/memory
+(the same shape as [`GET /node`](#get-node)'s `resources`), always present (it
+is local and free). Each peer's `node_stats` is its last-shared load — `null`
+unless the cluster shares node stats via
+[`cluster.observability`](Configuration-Reference#observability-overlay). The
+dashboard's cluster panel renders this node's load in the summary and a per-peer
+**Load** column when peers share.
 
 The umbrella `conflict` flag is set by any of three triggers, each with its own
 detail list, and all three stand `Leader` jobs down: a duplicate `nodeName` (the
@@ -284,7 +294,11 @@ The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
 
 > The separate `GET /peer` attestation endpoint is **not** part of this web API.
 > It is served only on the cluster's own mutual-TLS `listen` address (default
-> port `8443`), never on the public `web` listeners. See
+> port `8443`), never on the public `web` listeners. When node stats are
+> shared, each `/peer` response carries the node's live load as an
+> `X-Yacron2-Node-Stats` response header (on `200` and `304` responses alike,
+> never in the body), so sharing preserves that exchange's conditional `304`
+> optimisation. See
 > [Clustering and Leader Election](Clustering-and-Leader-Election).
 
 ### `GET /fleet`
@@ -318,7 +332,11 @@ Per node: `jobs` maps each job name to
 `{outcome, finished_at, duration, exit_code}` or `null` for a job that has not
 run since that node started. `jobs: null` (as opposed to `{}`) means no
 snapshot is held for that node at all: it was never reached, or it runs an
-older build that does not gossip summaries. `truncated: true` flags a node
+older build that does not gossip summaries. Each node also carries `node_stats`
+— its whole-node CPU/memory (the same shape as [`GET /node`](#get-node)'s
+`resources`) — when the cluster shares node load via
+[`cluster.observability`](Configuration-Reference#observability-overlay);
+`null` when that node shares none. `truncated: true` flags a node
 with more jobs than the per-payload cap (512), whose advertised set is the
 sorted-name prefix. A briefly unreachable peer keeps its last-known summaries
 with the old `as_of` rather than being blanked, so stale data is visibly stale
@@ -352,6 +370,50 @@ Content-Type: application/json; charset=utf-8
 The summaries are observability data only: they never feed leader election or
 any run/skip decision, and a malformed or hostile peer payload degrades to
 "no data for that node" rather than poisoning the view.
+
+### `GET /node`
+
+The serving node's **live** CPU and memory, sampled fresh per request (this is
+what drives the dashboard header's node meter). Returns the node identity and a
+`resources` object:
+
+```shell
+$ http get http://127.0.0.1:8080/node
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=utf-8
+
+{
+    "node_name": "node-a",
+    "resources": {
+        "cpu_percent": 37.2,
+        "cpu_count": 8,
+        "mem_percent": 61.4,
+        "mem_used_bytes": 5284167680,
+        "mem_total_bytes": 8589934592,
+        "proc_rss_bytes": 58720256,
+        "proc_cpu_percent": 1.1
+    }
+}
+```
+
+`node_name` is the cluster node name when clustered, else the hostname.
+`cpu_percent` / `mem_percent` are whole-host utilisation; `proc_rss_bytes` /
+`proc_cpu_percent` are the yacron2 daemon's own footprint (best-effort, may be
+absent if the platform denies the per-process read). `resources` is `null` when
+host sampling is unavailable (psutil could not read the host), and the
+dashboard then hides the meter. CPU percentages are measured since the previous
+sample, so the first request after startup reads a priming `0`.
+
+**Containers.** When the daemon runs under a cgroup v2 limit (Docker/Kubernetes
+memory or CPU limits, or a systemd slice with `MemoryMax`/`CPUQuota`), these
+numbers describe **its own slice** rather than the whole host: `mem_total_bytes`
+is the effective memory limit, `mem_used_bytes` is the slice's usage with
+reclaimable page cache excluded (the same accounting `docker stats` shows),
+`cpu_count` is the CPU quota rounded up, and `cpu_percent` is utilisation of
+that quota. Memory and CPU switch over independently — a container with only a
+memory limit still reports host-wide CPU. Unlimited cgroups, cgroup v1 hosts,
+and non-Linux platforms report whole-host numbers as before; the response shape
+never changes.
 
 ### `POST /jobs/{name}/start`
 
@@ -415,6 +477,7 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `captureStdout`, `captureStderr` | Which output streams the job captures, and therefore which are available from `/jobs/{name}/logs`. |
 | `utc`, `timezone` | The schedule's reference frame: `utc` (default `true`) and the IANA `timezone` name, or `null`. |
 | `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
+| `running_resources` | Present only while a [`monitorResources`](Configuration-Reference#metrics) job has a running instance: the **live** CPU/memory of the running instance(s), summed — `{cpu_percent, cpu_seconds, rss_bytes, instances}`. Omitted otherwise. `cpu_percent` is usage since the last sample and can exceed 100 across cores. |
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
@@ -461,7 +524,10 @@ aggregate statistics. Returns `404 Not Found` for an unknown job.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
-`fail_reason`). Besides `success`, `failure`, and `cancelled`, `outcome` can
+`fail_reason`, and `resources`). `resources` is `null` unless the job opted
+into [`monitorResources`](Configuration-Reference#metrics), in which case it is
+`{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
+samples}` for that run. Besides `success`, `failure`, and `cancelled`, `outcome` can
 be `unknown`: a crash-reconciled run, recorded when the daemon exited or lost
 the [state store](Durable-State) mid-run so no completion was ever written.
 It is a non-verdict: excluded from `success_rate`, counted only in `total`,
@@ -473,6 +539,8 @@ with no `started_at` or `duration` (`fail_reason` explains the interruption).
 | `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
 | `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
 | `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. |
+| `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Configuration-Reference#metrics) runs in the window; `null` when none were monitored. |
+| `avg_rss_bytes`, `max_rss_bytes`, `last_rss_bytes` | Peak-RSS aggregates (bytes) over the monitored runs; `null` when none were monitored. |
 
 ```shell
 $ http get http://127.0.0.1:8080/jobs/test-01/runs

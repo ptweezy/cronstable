@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="amber">
+<html lang="en" data-theme="carolina">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -12,6 +12,7 @@
 
   /* ---------- phosphor palettes ---------- */
   :root {
+    color-scheme: dark;
     --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
             Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
 
@@ -23,6 +24,21 @@
     --disabled: #7d8590;
     --cancelled: #c98bff;
     --unknown: #9aa5b1;   /* crash-reconciled runs: neutral, never green */
+
+    /* cluster peer states (cdots + swimlane segments) */
+    --peer-agreed: #3fb950;
+    --peer-syncing: #d29922;
+    --peer-bad: #f85149;      /* drifted / untrusted / conflict */
+    --peer-unreachable: #8b949e;
+    --peer-self: #58a6ff;
+    --peer-unknown: #7d8590;
+
+    /* ANSI log palette — phosphor-bright; the paper themes re-ink these */
+    --ansi-30: #555;    --ansi-31: #ff5f56; --ansi-32: #3fd271; --ansi-33: #ffbf47;
+    --ansi-34: #4aa8ff; --ansi-35: #c98bff; --ansi-36: #56d4dd; --ansi-37: #cfd6e0;
+    --ansi-90: #7d8590; --ansi-91: #ff8783; --ansi-92: #7ee2a0; --ansi-93: #ffd47a;
+    --ansi-94: #83c0ff; --ansi-95: #dcaaff; --ansi-96: #8be4ea; --ansi-97: #fff;
+    --ansi-pink: #f0a1c2;   /* 12th multi-tail label color (no SGR twin) */
 
     --radius: 3px;
     --shadow-lg: 0 10px 40px rgba(0, 0, 0, .7);
@@ -90,6 +106,150 @@
     --glow:     rgba(92, 171, 222, .5);
     --selbg:    rgba(75, 156, 211, .12);
   }
+  /* "standard" — the family's plain member: neutral charcoal, saturated
+     inks, no phosphor physics (flat like modern) */
+  html[data-theme="standard"] {
+    --bg:       #0f1114;
+    --bg2:      #14161a;
+    --panel:    #171b20;
+    --panel2:   #1c2126;
+    --hover:    #1f232a;
+    --border:   #31383f;
+    --border2:  #48505a;
+    --fg:       #e6e9ed;
+    --fg-dim:   #a6aeb9;
+    --fg-faint: #8f98a3;
+    --accent:   #4c8dff;
+    --glow:     rgba(76, 141, 255, 0);
+    --selbg:    rgba(76, 141, 255, .14);
+  }
+
+  /* ---------- paper (light) palettes ---------- */
+  /* Light twins of the themes above in the idiom of the paper-white
+     terminals: dark ink on a tinted screen, same hue family as the phosphor
+     original. Every ink/surface pairing holds >=4.2:1 (body text >=7:1). */
+  html[data-theme="amber-light"] {
+    --bg:       #f3e9d2;
+    --bg2:      #eadcbc;
+    --panel:    #faf3e3;
+    --panel2:   #f0e5c9;
+    --hover:    #e7d8b4;
+    --border:   #cdb582;
+    --border2:  #a98f52;
+    --fg:       #3f2d00;
+    --fg-dim:   #6d500b;
+    --fg-faint: #755c20;
+    --accent:   #855700;
+    --glow:     rgba(138, 90, 0, .28);
+    --selbg:    rgba(179, 125, 0, .16);
+  }
+  html[data-theme="green-light"] {
+    --bg:       #e4f2e6;
+    --bg2:      #d4e8d8;
+    --panel:    #f2faf2;
+    --panel2:   #ddefe0;
+    --hover:    #cfe6d4;
+    --border:   #a9cdb2;
+    --border2:  #7fb28c;
+    --fg:       #0b3a1e;
+    --fg-dim:   #1a6238;
+    --fg-faint: #3a7050;
+    --accent:   #0d7034;
+    --glow:     rgba(18, 105, 55, .25);
+    --selbg:    rgba(24, 128, 68, .15);
+  }
+  html[data-theme="modern-light"] {
+    --bg:       #f6f8fa;
+    --bg2:      #eaeef2;
+    --panel:    #ffffff;
+    --panel2:   #f6f8fa;
+    --hover:    #eff2f5;
+    --border:   #d0d7de;
+    --border2:  #a8b3bd;
+    --fg:       #1f2328;
+    --fg-dim:   #57606a;
+    --fg-faint: #656e79;
+    --accent:   #0969da;
+    --glow:     rgba(9, 105, 218, 0);
+    --selbg:    rgba(9, 105, 218, .12);
+  }
+  /* #4B9CD3 is too pale to be ink on paper — the hero moves to --border2 */
+  html[data-theme="carolina-light"] {
+    --bg:       #e7f0f8;
+    --bg2:      #d7e6f3;
+    --panel:    #f3f8fc;
+    --panel2:   #dfecf6;
+    --hover:    #d0e2f0;
+    --border:   #a8c9e2;
+    --border2:  #4b9cd3;
+    --fg:       #0e3a5c;
+    --fg-dim:   #175e91;
+    --fg-faint: #3b688c;
+    --accent:   #0d67ac;
+    --glow:     rgba(23, 94, 145, .25);
+    --selbg:    rgba(75, 156, 211, .18);
+  }
+  /* "standard" light — true white, no paper tint: the neutral default */
+  html[data-theme="standard-light"] {
+    --bg:       #ffffff;
+    --bg2:      #f2f4f7;
+    --panel:    #ffffff;
+    --panel2:   #f7f8fa;
+    --hover:    #eceff3;
+    --border:   #d9dee5;
+    --border2:  #aab3bf;
+    --fg:       #14181d;
+    --fg-dim:   #4b5563;
+    --fg-faint: #5d6675;
+    --accent:   #0b5ed7;
+    --glow:     rgba(11, 94, 215, 0);
+    --selbg:    rgba(11, 94, 215, .12);
+  }
+  /* what the dark themes take for granted about the surface: native control
+     scheme, shadow weight, and the status inks (the :root set is tuned for
+     dark phosphor and washes out on paper) */
+  html[data-theme$="-light"] {
+    color-scheme: light;
+    --shadow-lg: 0 10px 40px rgba(0, 0, 0, .18);
+    /* status inks sit on every surface down to --hover; the palest paper's
+       hover is the binding constraint, so these run darker than "light mode
+       green/red" usually would */
+    --ok: #12692b;
+    --fail: #b32d23;
+    --run: #0757b8;
+    --pending: #7d5300;
+    --disabled: #565e68;
+    --cancelled: #7a3fd6;
+    --unknown: #57606a;
+
+    --peer-agreed: #12692b;
+    --peer-syncing: #7d5300;
+    --peer-bad: #b32d23;
+    --peer-unreachable: #6e7781;
+    --peer-self: #0757b8;
+    --peer-unknown: #57606a;
+
+    /* ANSI re-inked for paper (>=4:1 on the palest term tint) */
+    --ansi-30: #24292f; --ansi-31: #cf222e; --ansi-32: #116329; --ansi-33: #8a5c00;
+    --ansi-34: #0969da; --ansi-35: #8250df; --ansi-36: #12626b; --ansi-37: #57606a;
+    --ansi-90: #6e7781; --ansi-91: #a40e26; --ansi-92: #1a7f37; --ansi-93: #7d4e00;
+    --ansi-94: #0550ae; --ansi-95: #6639ba; --ansi-96: #1b7c83; --ansi-97: #1f2328;
+    --ansi-pink: #bf3989;
+  }
+  /* standard-light re-saturates the shared paper inks: its surfaces are pale
+     enough to hold 4.2:1 with far more chroma than the tinted papers allow.
+     (Must follow the block above — equal specificity, source order wins.) */
+  html[data-theme="standard-light"] {
+    --ok: #107a33;
+    --fail: #d31f1f;
+    --run: #0b5ed7;
+    --pending: #b45309;
+    --cancelled: #7c3aed;
+    --peer-agreed: #107a33;
+    --peer-syncing: #b45309;
+    --peer-bad: #d31f1f;
+    --peer-self: #0b5ed7;
+  }
 
   * { box-sizing: border-box; }
   html, body { height: 100%; }
@@ -135,6 +295,19 @@
     background: radial-gradient(ellipse at center,
       rgba(0,0,0,0) 55%, rgba(0,0,0,.45) 100%);
   }
+  /* on paper the dark-strength scanlines/vignette read as grime — cut way down */
+  html[data-theme$="-light"] body.scan #crt::before {
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(0,0,0,0) 0px,
+      rgba(0,0,0,0) 1px,
+      rgba(0,0,0,.05) 1px,
+      rgba(0,0,0,.05) 3px);
+  }
+  html[data-theme$="-light"] body.fx #crt::after {
+    background: radial-gradient(ellipse at center,
+      rgba(0,0,0,0) 55%, rgba(0,0,0,.12) 100%);
+  }
   body.fx.flicker #crt { animation: flicker 3.2s infinite steps(60); }
   @keyframes flicker {
     0%,100% { opacity: 1; } 97% { opacity: 1; }
@@ -170,6 +343,16 @@
   .clock { font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; }
   .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; cursor: default; }
 
+  /* live node CPU/memory meter in the header (from GET /node); hidden until
+     a first reading arrives (empty span collapses with no padding/border). */
+  .nodemeter { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; color: var(--fg-dim); white-space: nowrap; cursor: default; }
+  .nodemeter:empty { display: none; }
+  .nodemeter .m { display: inline-flex; align-items: center; gap: 5px; }
+  .nodemeter .bar { width: 42px; height: 6px; border-radius: 3px; background: var(--panel); border: 1px solid var(--border); overflow: hidden; }
+  .nodemeter .bar > i { display: block; height: 100%; background: var(--run); }
+  .nodemeter .bar.warn > i { background: var(--fail); }
+  .nodemeter b { color: var(--fg); font-weight: 700; }
+
   .summary { display: flex; gap: 7px; align-items: center; }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
@@ -187,6 +370,7 @@
   .dot.cancelled { background: var(--cancelled); }
   .dot.unknown { background: var(--unknown); }
   .dot.live { background: #5cff97; filter: drop-shadow(0 0 4px rgba(92, 255, 151, .9)); }
+  html[data-theme$="-light"] .dot.live { background: var(--ok); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--ok) 60%, transparent)); }
   .dot.dead { background: var(--fail); }
   .dot.run, .dot.live { box-shadow: 0 0 0 0 currentColor; animation: pulse 1.8s infinite; color: var(--run); }
   .dot.live { color: var(--ok); }
@@ -329,6 +513,11 @@
   /* per-node ownership tally in the cluster panel (spread only) */
   .col-owns { display: none; text-align: right; }
   #clusterTable.show-owns .col-owns { display: table-cell; }
+  /* per-peer CPU/mem load column, shown only when peers share node stats */
+  .col-load { display: none; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #clusterTable.show-load .col-load { display: table-cell; }
+  #clusterTable .col-load b { color: var(--fg); font-weight: 700; }
+  #clusterTable .col-load.warn b { color: var(--fail); }
   .exit { font-size: 10.5px; padding: 0 5px; border-radius: 3px; margin-left: 6px; }
   .exit.zero { color: var(--ok); background: color-mix(in srgb, var(--ok) 16%, transparent); }
   .exit.nonzero { color: var(--fail); background: color-mix(in srgb, var(--fail) 16%, transparent); }
@@ -344,7 +533,9 @@
   .spark i.fail { background: var(--fail); }
   .spark i.cancelled { background: var(--cancelled); }
   .spark i.unknown { background: var(--unknown); }
-  .spark.empty { color: var(--fg-faint); font-size: 11px; }
+  /* padding: 0 shields it from the generic .empty empty-state card rule
+     below, which would otherwise balloon every no-history row */
+  .spark.empty { color: var(--fg-faint); font-size: 11px; padding: 0; }
 
   .actions { display: flex; gap: 5px; justify-content: flex-end; }
   .btn {
@@ -365,6 +556,7 @@
 
   /* ---------- drawer ---------- */
   .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.55); opacity: 0; pointer-events: none; transition: opacity .18s ease; z-index: 40; }
+  html[data-theme$="-light"] .scrim { background: rgba(0,0,0,.35); }
   .scrim.open { opacity: 1; pointer-events: auto; }
   .drawer {
     position: fixed; top: 0; right: 0; height: 100%; width: min(820px, 96vw);
@@ -407,6 +599,11 @@
   html[data-theme="amber"] .term { background: #070502; color: #e8c98a; }
   html[data-theme="green"] .term { background: #030806; color: #b6ffce; }
   html[data-theme="carolina"] .term { background: #030609; color: #9fd0ee; }
+  /* paper terms: ink on paper, no glass-black well */
+  html[data-theme$="-light"] .term { background: #f6f8fa; color: #1f2328; }
+  html[data-theme="amber-light"] .term { background: #fbf4e0; color: #4a3606; }
+  html[data-theme="green-light"] .term { background: #eef7ef; color: #114022; }
+  html[data-theme="carolina-light"] .term { background: #edf5fb; color: #123c5c; }
   .term.nowrap { white-space: pre; word-break: normal; }
   .term .ln { display: block; }
   .term .ln.stderr { color: var(--fail); }
@@ -415,6 +612,9 @@
   .term .ln .ts { color: var(--fg-faint); user-select: none; margin-right: 8px; opacity: .7; }
   .term mark { background: var(--accent); color: #000; border-radius: 2px; }
   .term mark.cur { outline: 1px solid #fff; }
+  /* paper accents are dark inks — flip the highlight text/outline */
+  html[data-theme$="-light"] .term mark { color: #fff; }
+  html[data-theme$="-light"] .term mark.cur { outline-color: #000; }
   .term-empty { color: var(--fg-faint); padding: 18px 4px; font-style: italic; }
 
   /* history pane */
@@ -445,6 +645,7 @@
 
   /* ---------- overlay panels (palette / help / settings) ---------- */
   .overlay { position: fixed; inset: 0; display: grid; z-index: 60; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .12s ease; }
+  html[data-theme$="-light"] .overlay { background: rgba(0,0,0,.35); }
   .overlay.open { opacity: 1; pointer-events: auto; }
   .palette { place-self: start center; margin-top: 12vh; width: min(640px, 94vw); background: var(--panel); border: 1px solid var(--border2); border-radius: var(--radius); box-shadow: var(--shadow-lg); overflow: hidden; }
   .palette .pin { display: flex; align-items: center; gap: 8px; padding: 11px 14px; border-bottom: 1px solid var(--border); }
@@ -511,13 +712,13 @@
   }
   /* cluster panel */
   .cdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: middle; background: var(--fg-faint); }
-  .cdot.agreed { background: #3fb950; }
-  .cdot.syncing { background: #d29922; }
-  .cdot.drifted { background: #f85149; }
-  .cdot.untrusted { background: #f85149; }
-  .cdot.conflict { background: #f85149; }
-  .cdot.unreachable { background: #8b949e; }
-  .cdot.self { background: #58a6ff; }
+  .cdot.agreed { background: var(--peer-agreed); }
+  .cdot.syncing { background: var(--peer-syncing); }
+  .cdot.drifted { background: var(--peer-bad); }
+  .cdot.untrusted { background: var(--peer-bad); }
+  .cdot.conflict { background: var(--peer-bad); }
+  .cdot.unreachable { background: var(--peer-unreachable); }
+  .cdot.self { background: var(--peer-self); }
 
   /* ============================================================= *
    *  add-on panels: next-fire radar · wallboard · heatmap ·        *
@@ -637,7 +838,7 @@
   #swimPanel .lane-bg { fill: var(--bg2); }
   #swimPanel .seg { shape-rendering: crispEdges; }
   #swimPanel .qlost { fill: color-mix(in srgb, var(--fail) 15%, transparent); }
-  #swimPanel .lead { stroke: #ffbf47; stroke-width: 1.5; }
+  #swimPanel .lead { stroke: var(--pending); stroke-width: 1.5; }
   #swimPanel .lbl { fill: var(--fg-dim); font-size: 10px; }
   #swimPanel .axl { fill: var(--fg-faint); font-size: 9px; }
 
@@ -658,6 +859,11 @@
   #fleetPanel .nname2.selfcol { color: var(--accent); }
   #fleetPanel .nsub { display: block; font-weight: 400; font-size: 10px; color: var(--fg-faint); }
   #fleetPanel .nsub .cdot { margin-right: 4px; }
+  /* per-node CPU/memory readout in a fleet column header (cluster.observability) */
+  #fleetPanel .nload { display: block; font-weight: 400; font-size: 10px; color: var(--fg-dim); font-variant-numeric: tabular-nums; margin-top: 1px; }
+  #fleetPanel .nload b { color: var(--fg); font-weight: 700; }
+  #fleetPanel .nload.warn b { color: var(--fail); }
+  #fleetPanel .nload.none { color: var(--fg-faint); }
   #fleetPanel .cell .age { color: var(--fg-faint); font-size: 10.5px; margin-left: 5px; }
   #fleetPanel .cell.ok { color: var(--ok); }
   #fleetPanel .cell.fail { color: var(--fail); font-weight: 700; }
@@ -869,6 +1075,8 @@
     border: 1px solid color-mix(in srgb, var(--cancelled) 35%, var(--border)); }
   .ha-chip.recon  { color: var(--unknown); background: color-mix(in srgb, var(--unknown) 15%, transparent);
     border: 1px solid color-mix(in srgb, var(--unknown) 35%, var(--border)); }
+  .ha-chip.live-res { color: var(--run); background: color-mix(in srgb, var(--run) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--run) 30%, var(--border)); font-variant-numeric: tabular-nums; }
 
   /* the 8 DAG task states get their OWN palette so they never overload the
      job-outcome colors. dot + glyph + label share the state's hue. */
@@ -988,6 +1196,7 @@
   </div>
   <div class="spacer"></div>
   <span class="clock" id="clock">--:--:-- UTC</span>
+  <span class="nodemeter" id="nodeMeter" title="This node's live CPU and memory"></span>
   <span class="conn" id="conn"><span class="dot live"></span><span id="connTxt">live</span></span>
   <div class="summary" id="summary"></div>
   <button class="ghostbtn" id="paletteBtn" title="Command palette"><span>⌘K</span></button>
@@ -1125,7 +1334,7 @@
   <div class="card" id="clusterCard" style="display:none">
     <div class="card-label"><span>┌─ cluster</span><span class="grow"></span><button class="ghostbtn mini" id="fleetBtn" title="Fleet view: every node's runs in one pane" style="display:none">⊞ fleet</button><button class="ghostbtn mini" id="swimBtn" title="Peer status timeline" style="display:none">▚ timeline</button><span id="clusterSummary"></span></div>
     <table id="clusterTable">
-      <thead><tr><th>Peer</th><th>Node</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
+      <thead><tr><th>Peer</th><th>Node</th><th class="col-load">Load</th><th class="col-owns">Owns</th><th>Status</th><th>Job set</th></tr></thead>
       <tbody id="clusterRows"></tbody>
     </table>
     <table id="clusterLease" style="display:none">
@@ -1267,12 +1476,22 @@
     <h3>settings</h3>
     <div class="body">
       <div class="setrow">
-        <span class="lab">Phosphor theme<small>screen color</small></span>
+        <span class="lab">Theme<small>phosphor (dark) or paper (light)</small></span>
         <select class="mini" id="setTheme">
-          <option value="amber">amber</option>
-          <option value="green">green</option>
-          <option value="modern">modern (no CRT)</option>
-          <option value="carolina">carolina</option>
+          <optgroup label="phosphor">
+            <option value="carolina">carolina</option>
+            <option value="amber">amber</option>
+            <option value="green">green</option>
+            <option value="modern">modern (no CRT)</option>
+            <option value="standard">standard (no CRT)</option>
+          </optgroup>
+          <optgroup label="paper">
+            <option value="carolina-light">carolina</option>
+            <option value="amber-light">amber</option>
+            <option value="green-light">green</option>
+            <option value="modern-light">modern (no CRT)</option>
+            <option value="standard-light">standard (no CRT)</option>
+          </optgroup>
         </select>
       </div>
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
@@ -1434,7 +1653,7 @@
 
   // ---- preferences ----
   const prefs = {
-    theme: "amber", fx: true, scan: true, density: false, notify: false,
+    theme: "carolina", fx: true, scan: true, density: false, notify: false,
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
@@ -1548,6 +1767,21 @@
     if (m < 60) return m + "m " + s + "s";
     const h = Math.floor(m / 60);
     return h + "h " + (m % 60) + "m";
+  }
+  // human-readable byte size for peak-RSS readouts (1 KiB = 1024 B). Mirrors
+  // fmtDuration's null -> "—" contract so callers need no guard.
+  function fmtBytes(n) {
+    if (n == null) return "—";
+    if (n < 1024) return n + " B";
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let v = n / 1024, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v < 10 ? v.toFixed(1) : Math.round(v)) + " " + units[i];
+  }
+  // CPU percentages can exceed 100 (multiple cores); show whole percent.
+  function fmtPercent(p) {
+    if (p == null) return "—";
+    return (p < 10 ? p.toFixed(1) : Math.round(p)) + "%";
   }
   function fmtIn(sec) {
     if (sec == null) return "—";
@@ -1932,9 +2166,13 @@
     }
     // Opting into any extra column flips the whole page fluid so the jobs table
     // can use the full window width instead of squeezing the classic columns;
-    // the classic-only set stays centered at --maxw. .twrap scrolls if even the
-    // full width can't fit every enabled column.
-    document.querySelector("main").classList.toggle("wide", anyExtra);
+    // the classic-only set stays centered at --maxw. The data-driven Owner
+    // column (spread mode) widens the table the same way an opted-in extra
+    // does, so it counts too — without it a spread cluster overflows the
+    // centered layout at any window size. .twrap scrolls if even the full
+    // width can't fit every enabled column.
+    const ownerShown = t.classList.contains("show-owner");
+    document.querySelector("main").classList.toggle("wide", anyExtra || ownerShown);
   }
   function renderColsMenu() {
     $("colsMenu").innerHTML = COLUMNS.map((c) =>
@@ -2036,6 +2274,7 @@
     // signature early-return so the column tracks the data on any poll.
     const showOwner = !!state.clusterSpread || jobs.some((j) => "clusterOwner" in j);
     $("jobsTable").classList.toggle("show-owner", showOwner);
+    applyCols();  // wide-layout depends on show-owner; cheap no-op when unchanged
     $("emptyState").style.display = jobs.length ? "none" : "block";
     $("emptyMsg").textContent = state.jobs.length ? "No jobs match your filter." : "No jobs configured.";
     $("countLabel").textContent = jobs.length + (jobs.length === 1 ? " job" : " jobs") +
@@ -2531,9 +2770,12 @@
   // ===================================================================
   //  cluster peer status swimlane  (client-accumulated timeline)
   // ===================================================================
+  // --peer-* custom properties (see the palette CSS); applied via style="fill:"
+  // because var() never resolves inside an SVG fill= presentation attribute
   const PEER_COLOR = {
-    agreed: "#3fb950", syncing: "#d29922", drifted: "#f85149", untrusted: "#f85149",
-    conflict: "#f85149", unreachable: "#8b949e", self: "#58a6ff", unknown: "#7d8590",
+    agreed: "var(--peer-agreed)", syncing: "var(--peer-syncing)", drifted: "var(--peer-bad)",
+    untrusted: "var(--peer-bad)", conflict: "var(--peer-bad)",
+    unreachable: "var(--peer-unreachable)", self: "var(--peer-self)", unknown: "var(--peer-unknown)",
   };
   const SWIM_KEY = "yacron2.swim", SWIM_MAX = 400, SWIM_WINDOW = 20 * 60 * 1000;
   function loadSwimBuf(jsid) {
@@ -2607,7 +2849,7 @@
         const x = X(segStart), w = Math.max(0.5, X(end) - x);
         const tip = segStatus + (segErr ? " · " + segErr : "") + " · since " + fmtClock(segStart);
         svg += '<rect class="seg" x="' + x.toFixed(1) + '" y="' + (y + 1) + '" width="' + w.toFixed(1) + '" height="' +
-          (laneH - 3) + '" fill="' + (PEER_COLOR[segStatus] || PEER_COLOR.unknown) + '"><title>' + escAttr(tip) + "</title></rect>";
+          (laneH - 3) + '" style="fill:' + (PEER_COLOR[segStatus] || PEER_COLOR.unknown) + '"><title>' + escAttr(tip) + "</title></rect>";
       };
       for (let i = 0; i < buf.length; i++) {
         const p = buf[i].peers.find((x) => x.h === host);
@@ -2682,6 +2924,35 @@
       }
     }
   }
+  // percent past which a node CPU/memory readout is warn-tinted (either axis)
+  const LOAD_WARN_PCT = 85;
+  // shared warn flag + tooltip text for a node_stats payload; nodeLoad and
+  // loadCell wrap the result in their own markup. tipPrefix distinguishes
+  // "node CPU …" (fleet header) from plain "CPU …" (cluster table).
+  function describeLoad(ns, tipPrefix) {
+    const cpu = ns.cpu_percent, mem = ns.mem_percent;
+    const warn = (cpu != null && cpu > LOAD_WARN_PCT) || (mem != null && mem > LOAD_WARN_PCT);
+    const tip = tipPrefix + "CPU " + fmtPercent(cpu) + (ns.cpu_count ? " across " + ns.cpu_count + " cores" : "") +
+      " · memory " + fmtPercent(mem) +
+      (ns.mem_used_bytes != null && ns.mem_total_bytes != null ? " (" + fmtBytes(ns.mem_used_bytes) + " / " + fmtBytes(ns.mem_total_bytes) + ")" : "");
+    return { warn: warn, tip: tip, cpu: cpu, mem: mem };
+  }
+  // compact per-node CPU/mem line for a fleet column header (from node_stats,
+  // shared via cluster.observability). Empty string when this node shares none.
+  function nodeLoad(ns) {
+    if (!ns) return '<span class="nload none" title="this node is not sharing CPU/memory">cpu — · mem —</span>';
+    const d = describeLoad(ns, "node ");
+    return '<span class="nload' + (d.warn ? " warn" : "") + '" title="' + escAttr(d.tip) + '">cpu <b>' +
+      fmtPercent(d.cpu) + "</b> · mem <b>" + fmtPercent(d.mem) + "</b></span>";
+  }
+  // a cluster-table "Load" cell for a peer's node_stats (or "—" when the peer
+  // shares none). Warn-tinted past LOAD_WARN_PCT on either axis.
+  function loadCell(ns) {
+    if (!ns) return '<td class="col-load muted" title="this peer is not sharing node stats (enable cluster.observability)">—</td>';
+    const d = describeLoad(ns, "");
+    return '<td class="col-load' + (d.warn ? " warn" : "") + '" title="' + escAttr(d.tip) + '"><b>' +
+      fmtPercent(d.cpu) + "</b> / <b>" + fmtPercent(d.mem) + "</b></td>";
+  }
   function renderFleet() {
     const box = $("fleetPanel");
     $("fleetBtn").classList.toggle("on", prefs.fleet);
@@ -2715,12 +2986,16 @@
       '<span class="grow"></span>' +
       "<span>peer data rides gossip" + (data.interval ? " (every " + esc(String(data.interval)) + "s)" : "") + "</span>" +
       "</div>";
+    const anyLoad = nodes.some((n) => n.node_stats);
     const th = nodes.map((n) => {
       const st = n.self ? "self" : (n.status || "unknown");
       const age = n.self ? "live" : (n.as_of ? agoShort(n.as_of) + " ago" : "never reached");
       return '<th><span class="nname2' + (n.self ? " selfcol" : "") + '">' + esc(n.node_name || n.host || "?") + "</span>" +
         '<span class="nsub"><span class="cdot ' + esc(st) + '"></span>' + esc(n.self ? "this node" : st) + " · " + esc(age) +
-        (n.truncated ? " · partial" : "") + "</span></th>";
+        (n.truncated ? " · partial" : "") + "</span>" +
+        // per-node live CPU/memory when the cluster shares node stats
+        // (cluster.observability); the whole row is omitted when no node does.
+        (anyLoad ? nodeLoad(n.node_stats) : "") + "</th>";
     }).join("");
     html += '<div class="fleetwrap"><table><thead><tr><th class="jobcol">job</th>' + th + "</tr></thead><tbody>";
     for (const j of rows) {
@@ -2801,6 +3076,7 @@
       if (state.wallboard) renderWallboard();
       zenGovernor();
       loadCluster();
+      loadNode();
       loadDags();
       loadState();
       if (state.drawerJob) renderDrawerMeta();
@@ -2810,6 +3086,35 @@
       refreshing = false;
       $("refreshBtn").classList.remove("spin");
     }
+  }
+  // Live node CPU/memory meter in the header (GET /node). Best-effort: a
+  // failed fetch or a node without psutil just leaves the meter empty (hidden).
+  async function loadNode() {
+    try {
+      const res = await apiFetch("/node");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      renderNodeMeter(data.resources);
+    } catch (e) {
+      if (e.message !== "unauthorized") $("nodeMeter").innerHTML = "";
+    }
+  }
+  function renderNodeMeter(r) {
+    const el = $("nodeMeter");
+    if (!r) { el.innerHTML = ""; return; }  // no psutil / unavailable
+    const cpu = r.cpu_percent, mem = r.mem_percent;
+    // CPU bar is scaled to a single core's worth (0..100); memory is a true
+    // 0..100 fraction. Turn the bar red past LOAD_WARN_PCT.
+    const cpuBar = cpu == null ? 0 : Math.max(0, Math.min(100, cpu));
+    const memBar = mem == null ? 0 : Math.max(0, Math.min(100, mem));
+    const cpuTip = r.cpu_count ? "node CPU across " + r.cpu_count + " cores" : "node CPU";
+    const memTip = (r.mem_used_bytes != null && r.mem_total_bytes != null)
+      ? "node memory " + fmtBytes(r.mem_used_bytes) + " / " + fmtBytes(r.mem_total_bytes) : "node memory";
+    el.innerHTML =
+      '<span class="m" title="' + escAttr(cpuTip) + '">cpu <b>' + fmtPercent(cpu) +
+        '</b><span class="bar' + (cpuBar > LOAD_WARN_PCT ? " warn" : "") + '"><i style="width:' + cpuBar + '%"></i></span></span>' +
+      '<span class="m" title="' + escAttr(memTip) + '">mem <b>' + fmtPercent(mem) +
+        '</b><span class="bar' + (memBar > LOAD_WARN_PCT ? " warn" : "") + '"><i style="width:' + memBar + '%"></i></span></span>';
   }
   function setConnected(ok) {
     if (state.connected !== ok) {
@@ -2943,9 +3248,20 @@
       "<span class='faint'>" + esc(describeCron(job.schedule)) + "</span>",
     ];
     if (job.running && job.pids && job.pids.length) parts.push("<span>pid <b>" + esc(job.pids.join(", ")) + "</b></span>");
+    // live resource usage of the currently-running instance(s), monitorResources jobs only
+    if (job.running && job.running_resources) {
+      const rr = job.running_resources;
+      parts.push("<span>live cpu <b>" + fmtPercent(rr.cpu_percent) + "</b></span>");
+      parts.push("<span>live mem <b>" + fmtBytes(rr.rss_bytes) + "</b></span>");
+    }
     if (lr) {
       parts.push("<span>last " + fmtAgo(lr.finished_at) + (lr.exit_code == null ? "" : " · exit " + esc(lr.exit_code)) + "</span>");
       if (lr.duration != null) parts.push("<span>took " + fmtDuration(lr.duration) + "</span>");
+      // resource usage present only when the run had monitorResources on
+      if (lr.resources) {
+        parts.push("<span>cpu <b>" + fmtDuration(lr.resources.cpu_total_seconds) + "</b></span>");
+        parts.push("<span>peak mem <b>" + fmtBytes(lr.resources.max_rss_bytes) + "</b></span>");
+      }
     }
     if (caps.length) parts.push('<span class="faint">capture: ' + esc(caps.join(", ")) + "</span>");
     // clusterPolicy is only present in the payload when leader election is on
@@ -2988,6 +3304,12 @@
       stat("avg", fmtDuration(s.avg_duration)) +
       stat("min", fmtDuration(s.min_duration)) +
       stat("max", fmtDuration(s.max_duration)) +
+      // CPU/memory stats appear only when at least one run in the window was
+      // resource-monitored (monitorResources); otherwise these are all null
+      // and the strip stays duration-only.
+      (s.avg_cpu_seconds != null ? stat("avg cpu", fmtDuration(s.avg_cpu_seconds)) : "") +
+      (s.max_cpu_seconds != null ? stat("max cpu", fmtDuration(s.max_cpu_seconds)) : "") +
+      (s.max_rss_bytes != null ? stat("peak mem", fmtBytes(s.max_rss_bytes)) : "") +
       "</div>";
     const durs = runs.map((r) => r.duration).filter((d) => d != null);
     const max = durs.length ? Math.max.apply(null, durs) : 0;
@@ -2998,6 +3320,9 @@
       bars += '<i class="' + cls + '" style="height:' + ht + 'px" title="' + escAttr((r.outcome) + " · " + fmtDuration(r.duration)) + '"></i>';
     }
     bars += "</div>";
+    // show the CPU/mem columns only when the window has monitored runs, so an
+    // unmonitored job's run table keeps its original five columns.
+    const hasRes = runs.some((r) => r.resources);
     let rows = "";
     for (let i = runs.length - 1; i >= 0; i--) {
       const r = runs[i];
@@ -3007,10 +3332,14 @@
         "<td>" + (r.exit_code == null ? "—" : esc(r.exit_code)) + "</td>" +
         '<td class="nowrap" title="' + escAttr(r.finished_at) + '">' + fmtAgo(r.finished_at) + "</td>" +
         "<td>" + fmtDuration(r.duration) + "</td>" +
+        (hasRes ? "<td>" + (r.resources ? fmtDuration(r.resources.cpu_total_seconds) : "—") + "</td>" +
+                  "<td>" + (r.resources ? fmtBytes(r.resources.max_rss_bytes) : "—") + "</td>" : "") +
         '<td class="reason">' + esc(r.fail_reason || "") + "</td>" +
       "</tr>";
     }
-    const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th><th>Reason</th></tr></thead><tbody>' + rows + "</tbody></table>";
+    const table = '<table class="runtable"><thead><tr><th>Outcome</th><th>Exit</th><th>Finished</th><th>Took</th>' +
+      (hasRes ? "<th>CPU</th><th>Peak mem</th>" : "") +
+      '<th>Reason</th></tr></thead><tbody>' + rows + "</tbody></table>";
     // opt-in run ledger: long-horizon totals this browser has accumulated,
     // beyond the server's in-memory 50-run window shown above.
     let ledgerNote = "";
@@ -3108,8 +3437,10 @@
     if (!segs.length) push("");
     return segs;
   }
-  const ANSI_FG = { 30: "#555", 31: "#ff5f56", 32: "#3fd271", 33: "#ffbf47", 34: "#4aa8ff", 35: "#c98bff", 36: "#56d4dd", 37: "#cfd6e0",
-                    90: "#7d8590", 91: "#ff8783", 92: "#7ee2a0", 93: "#ffd47a", 94: "#83c0ff", 95: "#dcaaff", 96: "#8be4ea", 97: "#fff" };
+  // values are --ansi-* custom properties (see the palette CSS) so already-
+  // rendered log lines re-ink live when the theme flips phosphor <-> paper
+  const ANSI_FG = {};
+  for (const c of [30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97]) ANSI_FG[c] = "var(--ansi-" + c + ")";
   function applySgr(style, code) {
     if (code === 0) { for (const k in style) delete style[k]; }
     else if (code === 1) style.bold = true;
@@ -3337,8 +3668,9 @@
   //  and the action POSTs, or the whole dashboard starves behind the tails.
   const TAIL_MAX = 4;
   const TAIL_RETRY_MS = 5000;              // throttle reconnects after a stream error
-  const TAIL_COLORS = ["#4aa8ff", "#3fd271", "#ffbf47", "#c98bff", "#56d4dd", "#ff8783",
-                       "#ffd47a", "#7ee2a0", "#83c0ff", "#dcaaff", "#8be4ea", "#f0a1c2"];
+  // label colors ride the --ansi-* vars so tail labels re-ink with the theme
+  const TAIL_COLORS = [34, 32, 33, 35, 36, 91, 93, 92, 94, 95, 96, "pink"]
+    .map((c) => "var(--ansi-" + c + ")");
   function tailTermEl() { return $("tailTerm"); }
   function tailQuery() {
     const q = $("tailSearch").value;
@@ -3589,6 +3921,7 @@
       { ic: "↻", lbl: "Refresh now", hint: "g", run: loadJobs },
       { ic: "▶", lbl: "Run all failing jobs", run: runAllFailing },
       { ic: "◐", lbl: "Cycle theme", hint: "t", run: cycleTheme },
+      { ic: "◑", lbl: "Toggle light / dark", sub: "phosphor ↔ paper", hint: "T", run: toggleLightDark },
       { ic: "▤", lbl: "Toggle CRT effects", run: () => setFx(!prefs.fx) },
       { ic: "≡", lbl: "Toggle scanlines", run: () => setScan(!prefs.scan) },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
@@ -3690,16 +4023,36 @@
   // ===================================================================
   //  settings / theme / prefs application
   // ===================================================================
+  // every theme is a hue x variant pair: "green" (phosphor) / "green-light" (paper)
+  const THEME_HUES = ["carolina", "amber", "green", "modern", "standard"];
+  const FLAT_HUES = ["modern", "standard"];   // no CRT physics on these
+  function themeParts(t) {
+    const light = /-light$/.test(t);
+    const hue = light ? t.slice(0, -6) : t;
+    // self-heal a garbage stored pref (old builds, hand-edited localStorage)
+    return { hue: THEME_HUES.includes(hue) ? hue : "carolina", light };
+  }
   function applyTheme() {
-    document.documentElement.setAttribute("data-theme", prefs.theme);
-    // CRT effects are meaningless on the "modern" theme
-    const fxAllowed = prefs.theme !== "modern";
+    const p = themeParts(prefs.theme);
+    document.documentElement.setAttribute("data-theme", p.hue + (p.light ? "-light" : ""));
+    // CRT effects are meaningless on the flat themes (modern, standard)
+    const fxAllowed = !FLAT_HUES.includes(p.hue);
     document.body.classList.toggle("fx", prefs.fx && fxAllowed);
     document.body.classList.toggle("flicker", prefs.fx && fxAllowed);
     document.body.classList.toggle("scan", prefs.scan && fxAllowed);
   }
   function setTheme(v) { prefs.theme = v; savePref("theme"); applyTheme(); syncSettings(); }
-  function cycleTheme() { const order = ["amber", "green", "modern", "carolina"]; setTheme(order[(order.indexOf(prefs.theme) + 1) % order.length]); toast("info", "theme: " + prefs.theme); }
+  function cycleTheme() {
+    const p = themeParts(prefs.theme);
+    const hue = THEME_HUES[(THEME_HUES.indexOf(p.hue) + 1) % THEME_HUES.length];
+    setTheme(hue + (p.light ? "-light" : ""));
+    toast("info", "theme: " + prefs.theme);
+  }
+  function toggleLightDark() {
+    const p = themeParts(prefs.theme);
+    setTheme(p.light ? p.hue : p.hue + "-light");
+    toast("info", "theme: " + prefs.theme);
+  }
   function setFx(v) { prefs.fx = v; savePref("fx"); applyTheme(); syncSettings(); }
   function setScan(v) { prefs.scan = v; savePref("scan"); applyTheme(); syncSettings(); }
   function setDensity(v) { prefs.density = v; savePref("density"); document.body.classList.toggle("density-compact", v); syncSettings(); }
@@ -3729,9 +4082,9 @@
     $("setZenIdle").value = String(prefs.zenIdle);
     $("setEscalate").checked = prefs.escalate;
     refreshLedgerStat();
-    // CRT effects / scanlines do nothing on the flat "modern" theme — disable
-    // those toggles there so they aren't inoperative-yet-interactive.
-    const crt = prefs.theme !== "modern";
+    // CRT effects / scanlines do nothing on the flat themes (modern, standard)
+    // — disable those toggles there so they aren't inoperative-yet-interactive.
+    const crt = !FLAT_HUES.includes(themeParts(prefs.theme).hue);
     $("setFx").disabled = !crt;
     $("setScan").disabled = !crt;
   }
@@ -3938,6 +4291,7 @@
       case "k": case "ArrowUp": e.preventDefault(); moveSelection(-1); break;
       case "g": e.preventDefault(); loadJobs(); break;
       case "t": e.preventDefault(); cycleTheme(); break;
+      case "T": e.preventDefault(); toggleLightDark(); break;
       case "i": e.preventDefault(); openTimeline(); break;
       case "Enter": { const j = selectedJob(); if (j) openDrawer(j.name); break; }
       case "r": { const j = selectedJob(); if (j && j.enabled && !j.running) runJob(j.name); break; }
@@ -4014,7 +4368,15 @@
     if (!lr || lr.outcome !== "unknown") return "";
     return '<span class="ha-chip recon" title="' + escAttr(lr.fail_reason || "run interrupted; no completion was recorded") + '">⚠ interrupted</span>';
   }
-  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job); }
+  // live CPU/memory of a currently-running monitored job, shown inline in the
+  // status cell so the list conveys load at a glance (full detail in the drawer).
+  function liveResChip(job) {
+    if (!job.running || !job.running_resources) return "";
+    const rr = job.running_resources;
+    return '<span class="ha-chip live-res" title="live CPU% and resident memory of the running instance(s)">▮ ' +
+      fmtPercent(rr.cpu_percent) + " · " + fmtBytes(rr.rss_bytes) + "</span>";
+  }
+  function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job) + liveResChip(job); }
 
   // ---- DAG index card ----
   let dagReqSeq = 0, dagAppliedSeq = 0;
@@ -4138,13 +4500,15 @@
     // manual-only dags cannot be backfilled (the schedule anchors the range)
     $("dgBackfillBtn").disabled = !d.schedule;
     $("dgBackfillBtn").title = d.schedule ? "Backfill a date range" : "manual-only dag: no schedule to backfill";
+    // each bit is its own <span>: .drawer-head .meta is a flex container and
+    // separates flex items with its gap; bare text nodes would run together
     const bits = [];
-    bits.push("<b>" + esc((d.tasks || []).length) + "</b> tasks");
-    if (d.schedule) bits.push("schedule <b>" + esc(d.schedule) + "</b>"); else bits.push("<b>manual</b>");
-    if (state.dagDrawer.runKey) bits.push("run <b>" + esc(truncStr(state.dagDrawer.runKey, 40)) + "</b>");
+    bits.push("<span><b>" + esc((d.tasks || []).length) + "</b> tasks</span>");
+    if (d.schedule) bits.push("<span>schedule <b>" + esc(d.schedule) + "</b></span>"); else bits.push("<span><b>manual</b></span>");
+    if (state.dagDrawer.runKey) bits.push("<span>run <b>" + esc(truncStr(state.dagDrawer.runKey, 40)) + "</b></span>");
     if (run) {
       bits.push('<span class="kbadge">' + esc(run.kind || "?") + "</span>");
-      if (run.createdAt) bits.push('started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b>");
+      if (run.createdAt) bits.push('<span>started <b data-ago-epoch="' + escAttr(run.createdAt) + '">' + agoEpoch(run.createdAt) + "</b></span>");
     }
     $("dgMeta").innerHTML = bits.join("");
   }
@@ -4317,6 +4681,14 @@
       const recon = e.failReason.indexOf("reconciled-crash") >= 0 || e.failReason.indexOf("reconcile") >= 0;
       bits.push('<span class="' + (recon ? "recon" : "faint") + '" title="' + escAttr(e.failReason) + '">' +
         (recon ? "⚠ " : "") + esc(truncStr(e.failReason, 48)) + "</span>");
+    }
+    // sampled CPU/peak-RSS, present only when the task ran with monitorResources
+    if (e.resources) {
+      bits.push('<span class="faint nowrap" title="' +
+        escAttr("user " + fmtDuration(e.resources.cpu_user_seconds) +
+          " · sys " + fmtDuration(e.resources.cpu_system_seconds)) +
+        '">cpu <b>' + fmtDuration(e.resources.cpu_total_seconds) +
+        "</b> · peak mem <b>" + fmtBytes(e.resources.max_rss_bytes) + "</b></span>");
     }
     if (e.host) bits.push('<span class="faint">@' + esc(e.host) + "</span>");
     return bits.join(" · ") || '<span class="faint">—</span>';
@@ -5031,7 +5403,7 @@
       ["Enter", "Open selected job"],
       ["r", "Run selected job"], ["x", "Cancel selected (running) job"],
       ["c", "Copy selected command"],
-      ["g", "Refresh now"], ["t", "Cycle theme"],
+      ["g", "Refresh now"], ["t", "Cycle theme"], ["T", "Light / dark theme"],
       ["i", "Incident timeline"],
       ["w", "Wallboard (TV) mode"], ["a", "Acknowledge failure alarm"],
       ["?", "This help"], ["Esc", "Close panel / drawer"],
@@ -5101,16 +5473,32 @@
     else if (data.quorate && data.leader) role = "follower (leader: " + data.leader + ")";
     else if (data.quorate) role = "follower";
     else role = "no quorum (store unreachable)";
-    const line = (data.node_name || "?") + " · " + data.backend + " · " + role;
+    let line = (data.node_name || "?") + " · " + data.backend + " · " + role;
+    // this node's own live load (local, always available even on a lease
+    // backend that shares nothing node-to-node)
+    if (data.node_stats) {
+      line += " · this node " + fmtPercent(data.node_stats.cpu_percent) +
+        " cpu / " + fmtPercent(data.node_stats.mem_percent) + " mem";
+    }
     $("clusterSummary").textContent = line;
     state.clusterLine = line;
-    // the swimlane and fleet view both chart the gossip peer set; lease
-    // backends have none (and gossip no summaries).
+    // the swimlane charts gossip peer-agreement history; a lease backend has
+    // no peer set to chart, overlay or not.
     $("swimBtn").style.display = "none";
     $("swimPanel").style.display = "none";
-    state.fleet.data = null;
-    $("fleetBtn").style.display = "none";
-    $("fleetPanel").style.display = "none";
+    // the fleet view IS available on a lease backend when the observability
+    // overlay mesh is running -- /cluster says so via data.fleet -- so mirror
+    // the gossip branch: show the button and, while the panel is open, chain
+    // loadFleet() on this same poll so the view keeps refreshing. Without the
+    // overlay there are no per-job summaries; hide and clear as before.
+    if (data.fleet) {
+      $("fleetBtn").style.display = "";
+      if (prefs.fleet) loadFleet(); else renderFleet();
+    } else {
+      state.fleet.data = null;
+      $("fleetBtn").style.display = "none";
+      $("fleetPanel").style.display = "none";
+    }
     const lease = data.lease || {};
     const labels = { holder: "held by", expiry: "expires", fence: "fence", electionName: "election", identity: "our identity", path: "store path" };
     const order = ["holder", "expiry", "fence", "electionName", "identity", "path"];
@@ -5262,13 +5650,23 @@
           (policies ? " (" + policies + ")" : "") +
           " — Leader jobs paused";
       }
+      // this node's own live load in the summary (always available, local)
+      if (data.node_stats) {
+        summary += " · this node " + fmtPercent(data.node_stats.cpu_percent) +
+          " cpu / " + fmtPercent(data.node_stats.mem_percent) + " mem";
+      }
       $("clusterSummary").textContent = summary;
       state.clusterLine = summary;
       // the Owns column lists each peer's job count; reveal it only under spread
       $("clusterTable").classList.toggle("show-owns", spread);
+      // the Load column appears only when peers actually share node stats
+      // (cluster.observability); otherwise those cells would be a wall of "—"
+      const anyPeerLoad = peers.some((p) => p.node_stats);
+      $("clusterTable").classList.toggle("show-load", anyPeerLoad);
       $("clusterRows").innerHTML = peers.map((p) =>
         '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
         "<td>" + esc(p.node_name || "—") + "</td>" +
+        loadCell(p.node_stats) +
         '<td class="col-owns">' + (ownsCounts && p.node_name ? esc(ownsCounts[p.node_name] || 0) : "—") + "</td>" +
         "<td>" + esc(p.status) + "</td>" +
         '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
@@ -5439,11 +5837,6 @@
     if (!f || job.running) return "";
     const r = f.ratio ? "×" + f.ratio.toFixed(1) : "";
     return '<span class="slow-chip" title="latest successful run ran unusually slow vs its ledger baseline">◱ slow ' + esc(r) + "</span>";
-  }
-  function fmtBytes(b) {
-    if (b < 1024) return b + " B";
-    if (b < 1048576) return (b / 1024).toFixed(1) + " KB";
-    return (b / 1048576).toFixed(1) + " MB";
   }
   function refreshLedgerStat() {
     const row = $("ledgerStatRow"), out = $("ledgerStat");

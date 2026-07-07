@@ -787,6 +787,25 @@ run/skip decision ignore them, and a malformed summary from a peer degrades to
 "no data for that node". The lease backends exchange nothing node-to-node, so
 `/fleet` reports `enabled: false` there.
 
+**Gossip as a secondary data plane (`cluster.observability`).** The same gossip
+mechanism can carry more than election. Opt in and each node also gossips its
+**whole-node CPU/memory** (the [`GET /node`](HTTP-API#get-node) numbers), so the
+fleet view shows every node's live load beside its runs — invaluable in `spread`
+mode for watching work distribute. The reading rides each `/peer` response as a
+small `X-Yacron2-Node-Stats` header rather than in the body, on full responses
+and bodyless `304`s alike, so live load values never defeat the exchange's
+conditional `304` optimisation: a sharing cluster's steady-state round still
+costs headers only, and each absorbed reading is as fresh as the last
+successful poll. Crucially this is **available to any
+backend**: a `kubernetes`/`etcd`/`filesystem` cluster (which has no node-to-node
+channel of its own) can stand up a *second, election-inert* gossip mesh purely
+for this observability data, leaving election with the lease store. See
+[`cluster.observability`](Configuration-Reference#observability-overlay) for the
+config and the two shapes (an opt-in marker under `backend: gossip`; a dedicated
+mesh for the lease backends). Like the run summaries, node stats are best-effort
+display data: a hostile or malformed peer payload degrades to "no data", never
+poisoning the view or any decision.
+
 ### Monitoring and alerting
 
 **`quorate` is the field to alert on for every backend** (on gossip it means "this

@@ -73,6 +73,26 @@ if [ "$BACKEND" = "filesystem" ]; then
     echo "    ttl: 15"
     echo "    deploymentId: meridian-prod"
     echo "    topology: shared"
+    # Observability overlay: election is the lease above, but a lease backend
+    # has no node-to-node channel, so we stand up a SECOND, election-inert
+    # gossip mesh JUST to share fleet data (per-node CPU/memory + job summaries)
+    # for the dashboard's fleet view + cluster panel. It reuses the same
+    # per-node certs and peer list the gossip backend would. This is the "gossip
+    # as a secondary data plane" path -- see cluster.observability in the docs.
+    # Set SHARE_NODE_STATS=false to keep only job summaries (no load numbers).
+    echo "  observability:"
+    echo "    shareNodeStats: ${SHARE_NODE_STATS:-true}"
+    echo "    listen: \"0.0.0.0:8443\""
+    echo "    tls:"
+    echo "      ca: /certs/ca.pem"
+    echo "      cert: \"/certs/${NODE_NAME}.pem\""
+    echo "      key: \"/certs/${NODE_NAME}.key\""
+    echo "    peers:"
+    for hp in $(echo "$CLUSTER_HOSTS" | tr ',' ' '); do
+      [ -z "$hp" ] && continue
+      [ "${hp%%:*}" = "$NODE_NAME" ] && continue
+      _valid "$hp" && echo "      - host: \"${hp}\""
+    done
   } > "$DIR/cluster.yaml"
 else
   # Gossip mesh: mutual-TLS /peer endpoint + quorum election, optionally spread.
@@ -88,6 +108,12 @@ else
     echo "  distribution: ${DISTRIBUTION:-spread}"
     echo "  interval: ${INTERVAL:-10}"
     echo "  driftAfter: ${DRIFT_AFTER:-2}"
+    # Share each node's live CPU/memory across the cluster for the dashboard's
+    # fleet view + cluster panel (backend is gossip, so this is just an opt-in
+    # marker -- the election mesh already carries the data). SHARE_NODE_STATS=
+    # false keeps the fleet job summaries but drops the load numbers.
+    echo "  observability:"
+    echo "    shareNodeStats: ${SHARE_NODE_STATS:-true}"
     echo "  peers:"
     # split CLUSTER_HOSTS on commas/spaces, drop our own entry
     for hp in $(echo "$CLUSTER_HOSTS" | tr ',' ' '); do
