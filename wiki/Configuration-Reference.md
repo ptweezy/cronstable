@@ -38,9 +38,13 @@ jobs:               # optional: list of job definitions
   - name: ...
     command: ...
     schedule: ...
+dags:               # optional: durable orchestration DAGs (needs state)
+  - name: ...
+    tasks: [ ... ]
 include: [ ... ]    # optional: list of other config files to merge
 web: { ... }        # optional: HTTP control API
 cluster: { ... }    # optional: mTLS peer attestation / leader election
+state: { ... }      # optional: durable state store (history, catch-up, retries)
 logging: { ... }    # optional: Python logging dictConfig
 ```
 
@@ -48,9 +52,11 @@ logging: { ... }    # optional: Python logging dictConfig
 | --- | --- | --- | --- |
 | `defaults` | `Map` of the per-job common options | No | Default values inherited by every job in the same file. May contain any per-job option except `name`, `command`, and `schedule`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `jobs` | `Seq(Map)` of job definitions | No | The list of cron jobs. Each entry is validated against the per-job schema below. |
+| `dags` | `Seq(Map)` of DAG definitions | No | Durable orchestration workflows: each DAG is a graph of tasks with `dependsOn` edges, run on a schedule. Requires a `state` section with `jobApi` enabled. See [Orchestration and DAGs](Orchestration-and-DAGs). |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
+| `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it yacron2 is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
 
 ### `web`
@@ -73,15 +79,19 @@ can run from one config without double-running jobs. `cluster.backend` chooses
 how: the default **`gossip`** backend attests, over mutual TLS, that a static
 list of peers is running the same job set and runs a best-effort quorum
 election; the **`kubernetes`** and **`etcd`** backends use a coordination store
-(a `Lease` / a lease-bound key) for a fenced, exactly-once election. There must
-be exactly one `cluster` block across the whole configuration; a duplicate in an
-included file or a second config-directory file raises a `ConfigError`. Defaults
-come from `DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` for the lease
-backends) and are applied only when a `cluster` section is present.
+(a `Lease` / a lease-bound key) for a fenced, exactly-once election; the
+**`filesystem`** backend elects through a fenced TTL lease on a shared POSIX
+mount, with no coordination service at all (its safety additionally rests on
+synchronized clocks; see its table below). There must be exactly one `cluster`
+block across the whole configuration; a duplicate in an included file or a
+second config-directory file raises a `ConfigError`. Defaults come from
+`DEFAULT_CLUSTER` (plus `DEFAULT_K8S` / `DEFAULT_ETCD` / `DEFAULT_FILESYSTEM`
+for the lease backends) and are applied only when a `cluster` section is
+present.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `backend` | `Enum(["gossip", "kubernetes", "etcd"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd` are fenced lease backends. The lease backends talk to their store over plain HTTP via the core `aiohttp` dependency, so they add no runtime dependency. |
+| `backend` | `Enum(["gossip", "kubernetes", "etcd", "filesystem"])` | `gossip` | Which leadership backend gates jobs. `gossip` (default) is the embedded mTLS best-effort election; `kubernetes`/`etcd`/`filesystem` are fenced lease backends. `kubernetes`/`etcd` talk to their store over plain HTTP via the core `aiohttp` dependency, and `filesystem` needs only a shared POSIX mount, so none of them adds a runtime dependency. |
 
 **Gossip backend** (`backend: gossip`). `listen`, `tls`, and `peers` are
 required **only for this backend**:
@@ -98,7 +108,7 @@ required **only for this backend**:
 | `driftAfter` | `Int` | `3` | Consecutive reachable-but-mismatched rounds before a peer is reported `drifted` (debounce). Must be `>= 1`. |
 | `connectTimeout` | `Int` | `10` | Seconds per request (also the HTTP timeout for the lease backends). Must be `> 0`. |
 | `electLeader` | `Bool` | `false` | When true, only the quorum-gated elected leader runs *scheduled* jobs (manual API triggers and retries are unaffected). Off by default, so a gossip `cluster` section is observe-only until opted in. The lease backends imply `electLeader: true` (configuring one is opting into leadership). |
-| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With `backend: kubernetes`/`etcd` a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
+| `distribution` | `Enum(["single-leader", "spread"])` | `single-leader` | How leader-gated jobs spread across the quorate cluster. `single-leader`: one elected leader runs every `Leader` job. `spread`: per-job ownership via rendezvous hashing, so the work fans out across the quorate nodes (same quorum gate, same guarantee). Inert without `electLeader` (warns if set anyway). With a lease backend (`kubernetes`/`etcd`/`filesystem`) a non-default `distribution` is a **hard `ConfigError` at load** (a single lease holder cannot be a per-job owner), not a silent fallback. See [Clustering and Leader Election](Clustering-and-Leader-Election#distribution-one-leader-or-spread-the-load). |
 
 Gossip load-time validation (in addition to the numeric ranges above): with
 `electLeader: true`, a **2-node** cluster (one peer) is rejected outright with a
@@ -141,15 +151,148 @@ traffic sent in cleartext, a `ConfigError`). Likewise a `username` or resolved
 bearer token are never POSTed in cleartext; a `username` without a resolvable
 `password` is also rejected.
 
+**Filesystem backend** (`backend: filesystem`), under `cluster.filesystem`. The
+flock-guarded, fence-counted TTL lease of the durable state store's filesystem
+backend is the fence, taken over a shared POSIX mount (Amazon EFS (NFSv4) / S3
+Files) -- no coordination service; the mount is the store. Defaults from
+`DEFAULT_FILESYSTEM`:
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | `Str` | required | Directory the election lease lives in -- normally a shared mount. Must be present and non-empty: a missing, blank, or whitespace-only value is a `ConfigError` at load (`cluster.filesystem.path is required and must be non-empty`). Sharing the [`state`](#state) store's directory (same mount, same `deploymentId`) is legal and recommended when both are configured: the namespaces are disjoint, and one mount stays the whole coordination surface. |
+| `electionName` | `Str` | `cluster/leader` | Name of the lease the replicas contend for. Must be non-empty: a blank or whitespace-only value is a `ConfigError` at load (`cluster.filesystem.electionName must be non-empty`). |
+| `ttl` | `Int` or `Float` | `15` | Lease time-to-live, seconds. Must be `>= 3`, for the same reason as etcd's floor: the leader holds the lease only until `ttl` minus a clock-skew margin and renews every `max(1s, ttl/3)`, so a smaller `ttl` would make a node that wins the election immediately treat its own lease as expired (no `Leader` job would ever run). |
+| `deploymentId` | `Str` or null | null → namespace `default` | Stable namespace prefix inside the store, same semantics as `state.deploymentId`. Use the **same** value as `state.deploymentId` when sharing a mount with the state store. |
+| `topology` | `Enum(["auto", "single-node", "shared"])` | `auto` | Whether the mount's locks may be trusted across hosts; same semantics and probe as `state.topology`. `auto` probes `/proc/mounts` for a shared network mount; Windows and macOS cannot probe, so there `auto` resolves to `single-node` (the election then only excludes processes on this host, with a startup warning) unless overridden with an explicit `shared`. |
+
+The lease-backend family rules apply exactly as for `kubernetes`/`etcd`:
+`electLeader` is forced on (configuring the backend is opting into
+leadership), `distribution: spread` is a hard `ConfigError`, a store block
+belonging to a different backend (say an `etcd:` block under
+`backend: filesystem`) is a `ConfigError` rather than silently ignored, and
+gossip-only keys (`listen`, `tls`, `peers`, `interval`, `driftAfter`) draw an
+emit-once startup advisory.
+
+One filesystem-backend guard is deferred to startup, because it needs the
+live mount: `start()` probes lock fidelity (two descriptors of one file must
+actually contend on a non-blocking exclusive lock; on Linux an NFS mount
+carrying `nolock` or `local_lock=flock`/`local_lock=all` is additionally
+refused, since those honour locks host-locally) and **hard-refuses** a store
+whose locks are no-ops, verbatim
+`cluster.backend filesystem: refusing to elect over <path>: <reason>`. A
+refused start leaves the cluster manager unbuilt, so `Leader` jobs fail
+closed -- the safe direction. Both checks run on one host, so on platforms
+without `/proc/mounts` (Windows, macOS) the residual risk rests on the
+operator's `topology: shared` assertion. Unlike the `kubernetes`/`etcd`
+fences, election safety here also rests on wall clocks (two leaders need
+inter-host clock skew above roughly 2 seconds): run NTP on every node, the
+same requirement [Durable State](Durable-State) documents for shared mounts.
+
 Because the cluster schema has many load-time rejections (the ordering rules,
-the RFC1123 and https guards, the credential-over-plaintext refusals above),
-check a cluster config before deploying with `yacron2 --validate-config`, which
-runs the full load path and prints the first `ConfigError` without starting the
-scheduler. See [Command-Line Reference](CLI-Reference).
+the RFC1123 and https guards, the credential-over-plaintext refusals, and the
+lease-family rules above), check a cluster config before deploying with
+`yacron2 --validate-config`, which runs the full load path and prints the
+first `ConfigError` without starting the scheduler. See
+[Command-Line Reference](CLI-Reference).
 
 Full behavior, the trust model, quorum math, the lease backends' guarantees,
 and per-job `clusterPolicy` are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election).
+
+### `state`
+
+Optional. Enables the **durable state store**: restart-durable run history,
+missed-run catch-up, restart-surviving retries, once-per-boot `@reboot`
+dedupe, restart-durable Prometheus job counters, and durable output archival.
+yacron2 is stateless by default: absent this section everything stays in
+memory exactly as before. The store is a directory of immutable JSON records
+behind a single filesystem backend -- a local path gives single-node
+durability, while a shared Amazon EFS (NFSv4) / S3 Files mount gives the same
+durability and coordination fleet-wide (the same code either way; the mount
+decides the reach). There must be exactly one `state` block across the whole
+configuration; a duplicate in an included file or a second config-directory
+file raises a `ConfigError`. Defaults come from `DEFAULT_STATE` and are
+applied only when a `state` section is present. (The
+[Web Dashboard](Web-Dashboard)'s browser-side IndexedDB run ledger is a
+separate, client-local feature, unrelated to this store.)
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `path` | `Str` | required | Directory the store lives in. A local path gives single-node durability; a shared Amazon EFS (NFSv4) / S3 Files mount gives the same durability fleet-wide. Must be non-empty: a blank or whitespace-only value is a `ConfigError` at load (`state.path is required and must be non-empty`). |
+| `topology` | `Enum(["auto", "single-node", "shared"])` | `auto` | Whether the store may offer cross-node coordination. `auto` probes `/proc/mounts` for a shared network mount (NFS/EFS/S3 Files) and otherwise assumes `single-node`; Windows and macOS cannot probe, so there `auto` resolves to `single-node` unless overridden with `shared`. |
+| `deploymentId` | `Str` | none (namespace `default`) | Stable namespace prefix so several deployments can share one store/bucket without colliding or cross-reading. Unset means the `default` namespace. |
+| `maxRunsPerJob` | `Int` | `1000` | Durable finished-run retention per job (the durable analogue of the in-memory history ring); the ledger is pruned to this after each append. `<= 0` disables pruning (unbounded; rely on an external lifecycle rule). Durable retention is larger than the in-memory window on purpose. |
+| `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, hung). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `yacron2_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong -- the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
+| `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. Values between `1` and `86399` are a `ConfigError` at load: a grace below the manifest cadence would make live peers' manifests look stale and collect their state. |
+| `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). Lease (coordination) operations bypass the bucket: a lease renew queued behind bulk writes could overshoot its TTL and double-run the very job the lease exists to fence. |
+| `slotTtlSeconds` | `Int` or `Float` | `30` | TTL, in seconds, of the per-job concurrency slot lease taken for `concurrencyScope: cluster` jobs; the running holder renews it at a third of this, and a crashed holder's slot frees itself after at most this long. Must be `>= 5` (a `ConfigError` at load, `state.slotTtlSeconds must be >= 5`): the renew cadence needs headroom, and below ~5s one slow renew on a network mount expires a healthy holder's slot and invites the cross-node double-run the lease exists to fence. |
+| `jobApi` | `Map` | *(see below)* | The [job-facing state endpoint](Durable-State#job-facing-state): a loopback HTTP server the daemon injects into every job's environment, backing the `yacron2 state\|cursor\|lock\|artifact\|idempotent\|secret` commands. A nested block (merged over its defaults, so a partial block keeps the rest). |
+
+The `state.jobApi` sub-keys:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `enabled` | `Bool` | `true` | Run the loopback endpoint and inject its address/token into every job. `false` keeps the durable scheduler features but exposes nothing to jobs. |
+| `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` URL (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. An explicit port must be an integer in `0`-`65535` (a `ConfigError` otherwise; `0` or omitting the port keeps the ephemeral bind), and a non-loopback host is a `ConfigError` unless `allowNonLoopbackBind` is also `true`. |
+| `maxValueBytes` | `Int` | `1048576` | Cap (bytes) on one KV / cursor value; a larger set is refused (HTTP 413). Must be `>= 0`. |
+| `maxArtifactBytes` | `Int` | `67108864` | Cap (bytes) on one artifact payload; a larger put is refused (HTTP 413). Must be `>= 0`. |
+| `lockTtlSeconds` | `Int` or `Float` | `30` | TTL of a job mutex/semaphore lease, renewed by the daemon at a third of this. Must be `>= 5` (a `ConfigError`, `state.jobApi.lockTtlSeconds must be >= 5`), for the same reason as `slotTtlSeconds`. |
+| `allowNonLoopbackBind` | `Bool` | `false` | Explicit opt-in for a non-loopback `listen` host. Without it, a non-loopback host is a `ConfigError`: the endpoint serves per-run bearer tokens and staged job secrets over plaintext HTTP, so exposing it beyond this host needs a deliberate choice (and should be paired with a reverse proxy adding TLS/auth). |
+
+`path` is the only required key. Full behavior -- the store layout and
+durability model, restart-surviving retries, missed-run catch-up, `@reboot`
+dedupe, the SLA trends endpoint, garbage collection, the state metrics, and
+the `yacron2 state` CLI subcommands (backup, restore, migrate, gc, check,
+migrate-schema) --
+is documented in [Durable State](Durable-State). The per-job knobs that build
+on this store are under [Durable state and catch-up](#durable-state-and-catch-up)
+below.
+
+### `dags`
+
+A list of durable orchestration DAGs. Requires a `state` section with
+`jobApi.enabled` (the default). Full guide: [Orchestration and DAGs](Orchestration-and-DAGs).
+
+Per-DAG keys:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | `Str` | required | Unique DAG name. |
+| `tasks` | `Seq(Map)` | required | The task nodes (at least one). |
+| `schedule` | `Str` or `Map` | none | Same grammar as a job's `schedule`, except it must parse to a cron expression: `@reboot` is a `ConfigError` (`DAG schedules must be cron expressions; @reboot is not supported for dags`), while `@daily`/`@hourly`-style aliases still work. Omit for a manual-only DAG. |
+| `timezone` / `utc` | `Str` / `Bool` | as jobs | Schedule time base, as jobs. |
+| `onMissed` | `skip` / `run-once` / `run-all` | `skip` | Missed-run catch-up on restart, as jobs. |
+| `startingDeadlineSeconds` | `Int` | none | Bound how old a missed run may be to replay. |
+| `catchupJitterSeconds` | `Int` | `0` | Spread boot-time catch-up. |
+| `clusterPolicy` | `Leader` / `PreferLeader` / `EveryNode` | `Leader` | Which node schedules the DAG under leader election. |
+| `enabled` | `Bool` | `true` | Disable without deleting. |
+| `retainRuns` | `Int` | `50` | Keep the newest N terminal runs (must be ≥ 1). |
+
+Per-task keys:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `id` | `Str` | required | Unique task id within the DAG. |
+| `command` | `Str` or `Seq(Str)` | required (not for `approval`) | The command to run. |
+| `type` | `task` / `sensor` / `approval` | `task` | Node kind. |
+| `dependsOn` | `Seq(Str)` | `[]` | Upstream task ids. |
+| `triggerRule` | `all_success` / `all_done` | `all_success` | When the task becomes ready. |
+| `retries` | `Int` | `0` | Per-task retry attempts (DAG-owned). Must be `>= 0`: the job-level `-1` retry-forever sentinel is a `ConfigError` here. |
+| `retryDelaySeconds` | `Int`/`Float` | `0` | Delay between attempts. |
+| `expand` | `Map{fromTask, key}` | none | Dynamic mapping: fan out over an upstream's XCom list (a direct, non-mapped dependency). |
+| `pokeIntervalSeconds` | `Int`/`Float` | `30` | Sensor: seconds between pokes. |
+| `pokeTimeoutSeconds` | `Int`/`Float` | `3600` | Sensor: give up after this long. |
+| `pokeJitterSeconds` | `Int`/`Float` | `0` | Sensor: jitter added to each poke. |
+| `onReject` | `fail` / `skip` | `fail` | Approval gate: what a rejection does. |
+
+Plus the shared launch fields a job takes: `shell`, `environment`,
+`captureStdout` / `captureStderr`, `saveLimit`, `maxLineLength`, `streamPrefix`,
+`failsWhen`, `executionTimeout`, `killTimeout`, `user` / `group`, `env_file`,
+`secrets`, `stateAllowedScopes`.
+
+The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or
+an `expand.fromTask` that is not a direct non-mapped dependency are config
+errors.
 
 ### `logging`
 
@@ -203,6 +346,7 @@ See [Schedules and Timezones](Schedules-and-Timezones).
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `concurrencyPolicy` | `Enum(["Allow", "Forbid", "Replace"])` | `Allow` | Behavior when a scheduled run overlaps a still-running instance. `Allow`: run concurrently. `Forbid`: skip the new run. `Replace`: cancel the running instance and start the new one. |
+| `concurrencyScope` | `Enum(["node", "cluster"])` | `node` | How far `concurrencyPolicy` reaches. `node` (default): an overlap is another instance in this yacron2 process, exactly as before. `cluster`: `Forbid`/`Replace` also exclude instances of the job on other nodes sharing the [`state`](#state) store, via a per-job TTL slot lease (`slots/<job name>`) in the state store -- it works with or without a `cluster` section. Requires a `state` section somewhere in the assembled config: without one, load fails with a `ConfigError` naming the offending job(s). `cluster` with `concurrencyPolicy: Allow` is likewise a `ConfigError` at load (Allow places no bound on concurrent instances, so widening its scope gates nothing). Enforcement is best-effort at-least-once, not exactly-once; `state.slotTtlSeconds` and `state.onStoreUnavailable` govern the edges. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation) **only when set to `cluster`** (existing configs keep their digests; replicas disagreeing on it show as drift). See [Concurrency and Timeouts](Concurrency-and-Timeouts#concurrency-across-a-cluster). |
 | `clusterPolicy` | `Enum(["Leader", "PreferLeader", "EveryNode"])` | `Leader` | Where this job runs under cluster leader election. **Inert unless `cluster.electLeader` is set** (without election every job runs on every instance). `Leader`: only the quorum-gated leader runs it (at-most-once; may skip). `PreferLeader`: the lowest reachable agreeing node runs it, ignoring quorum (never skips; may double-run across a partition). `EveryNode`: every node runs it, independent of cluster health. Part of the [job-set id](Clustering-and-Leader-Election#the-job-set-id-foundation). See [Clustering and Leader Election](Clustering-and-Leader-Election#per-job-policy). |
 | `executionTimeout` | `Float` | none | Seconds after which a still-running process is terminated. Unset means no timeout. Must be `> 0` when set. The "terminated" action differs by platform (graceful SIGTERM->SIGKILL escalation on POSIX vs an immediate `TerminateProcess` on Windows); see `killTimeout` below and [Running on Windows](Running-on-Windows). |
 | `killTimeout` | `Float` | `30` | Seconds to wait after SIGTERM before sending SIGKILL when terminating a job. Must be `>= 0`. The SIGTERM-then-SIGKILL escalation is POSIX-specific: there `terminate()` sends SIGTERM (graceful, trappable) and `kill()` sends SIGKILL, a real escalation. On Windows there are no POSIX signals, so both `terminate()` and `kill()` call `TerminateProcess` (an immediate, ungraceful stop that does not notify the child), so the escalation is effectively moot; `killTimeout` still bounds the wait but the outcome is the same hard kill. See [Running on Windows](Running-on-Windows). |
@@ -315,12 +459,32 @@ Defaults from `_REPORT_DEFAULTS["webhook"]`:
 | `body` | `Str` | default webhook body template | Request body (jinja2). The default is a Slack-compatible `{"text": ...}` JSON payload of the default subject + body text. |
 | `timeout` | `Float` | `10` | Total request timeout, seconds. |
 
+### Durable state and catch-up
+
+These options build on the top-level [`state`](#state) store and only take
+full effect when a `state` section is configured; without one they parse and
+validate normally but change nothing. The one exception is
+`onlyIfLastSucceeded`, which also works without a `state` section from the
+in-memory history alone (the gate then resets on restart). See
+[Durable State](Durable-State) for the full semantics.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `onMissed` | `Enum(["skip", "run-once", "run-all"])` | `skip` | Missed-run catch-up after downtime, computed from the durable last-run watermark. `skip` (classic behavior): occurrences missed while down are not run. `run-once`: fire once at boot, coalescing all missed slots. `run-all`: replay each missed occurrence. Inert without a `state` section. |
+| `startingDeadlineSeconds` | `Int` or null | none | Only occurrences missed within this many seconds are caught up; unset means no deadline. Bounds `run-all` to a recent window so a long outage cannot stampede (like the Kubernetes CronJob field of the same name). Also invalidates a persisted retry ladder older than the deadline. Must be `> 0` when set. Only meaningful with a `state` section. |
+| `catchupJitterSeconds` | `Int` | `0` | Spread the boot-time catch-up launches of different jobs over `[0, N)` seconds, deterministic per job name, so a fleet of jobs does not all fire at once on restart. `0` fires them together. Must be `>= 0`. Only meaningful with a `state` section. |
+| `onlyIfLastSucceeded` | `Bool` | `false` | Depends-on-past gate: skip a scheduled fire when the job's most recent finished run did not succeed, or when a previous instance is still running (unless `concurrencyPolicy: Replace`). The last real outcome is the newest of the in-memory history and the durable run ledger; cancelled and skipped runs are ignored; retries, catch-up backfills, and manual API triggers deliberately bypass the gate. Works without a `state` section from the in-memory history alone (resetting on restart); with one, the gate's memory survives restarts. |
+| `archiveOutput` | `Bool` | `false` | Persist each finished run's captured output durably to the state store (the job's `logs/` stream). Encryption at rest is the mount's job (EFS/S3 SSE, an encrypted volume). Inert without a `state` section (a startup warning notes it archives nothing). |
+| `redactArchivedSecrets` | `Bool` | `true` | Scrub recognisable secrets (tokens, passwords, keys, auth URLs) from archived output before it is written. Applies only when `archiveOutput` is set, so it too has no effect without a `state` section. |
+
 ### Environment
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
+| `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `yacron2 secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
+| `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `yacron2 state\|cursor\|lock\|artifact` calls may explicitly name via `--scope`. Naming any other scope -- most dangerously another job's own name, which IS that job's private scope -- is refused (`403`). See [Scopes](Durable-State#scopes). |
 
 ```yaml
 jobs:
@@ -364,16 +528,20 @@ configured per job: the `GET /metrics` endpoint is global, tuned under
 ## Load-time numeric validation
 
 strictyaml enforces only the type (`Int`/`Float`). After type validation,
-`JobConfig._validate_numeric_ranges` enforces value ranges and raises a
-`ConfigError` (prefixed `Job <name>:`) on violation. These checks run at load
-time, not at run time. New in the yacron2 fork.
+`JobConfig._validate_numeric_ranges` enforces value ranges (plus one
+cross-field rule) and raises a `ConfigError` (prefixed `Job <name>:`) on
+violation. These checks run at load time, not at run time. New in the yacron2
+fork.
 
 | Rule | Condition |
 | --- | --- |
 | `saveLimit >= 0` | always |
 | `maxLineLength > 0` | always |
 | `killTimeout >= 0` | always |
+| `concurrencyPolicy` is `Forbid` or `Replace` | only when `concurrencyScope: cluster` (widening `Allow` gates nothing, so it is rejected rather than ignored) |
 | `executionTimeout > 0` | only when `executionTimeout` is set |
+| `catchupJitterSeconds >= 0` | always |
+| `startingDeadlineSeconds > 0` | only when `startingDeadlineSeconds` is set |
 | `onFailure.retry.maximumRetries >= -1` | only when a `retry` block is present |
 | `onFailure.retry.initialDelay >= 0` | only when a `retry` block is present |
 | `onFailure.retry.maximumDelay > 0` | only when a `retry` block is present |

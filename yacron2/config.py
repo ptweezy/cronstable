@@ -7,7 +7,7 @@ import os
 import re
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Dict,
@@ -39,11 +39,12 @@ from strictyaml import (
 from strictyaml import Optional as Opt
 from strictyaml.ruamel.error import YAMLError
 
-from yacron2 import crontabs, platform
+from yacron2 import crontabs, dag, platform
 
 logger = logging.getLogger("yacron2.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
 ClusterConfig = NewType("ClusterConfig", Dict[str, Any])
+StateConfig = NewType("StateConfig", Dict[str, Any])
 JobDefaults = NewType("JobDefaults", Dict[str, Any])
 LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
 
@@ -54,9 +55,12 @@ DEFAULT_CLUSTER = {
     #   "gossip" (default) - the embedded mTLS, no-shared-state, best-effort
     #                        quorum election (listen/tls/peers below);
     #   "kubernetes"       - a coordination.k8s.io/v1 Lease (fenced);
-    #   "etcd"             - a lease-backed etcd key/election (fenced).
-    # The two lease backends talk to their store over plain HTTP (the core
-    # aiohttp dependency), so neither adds a runtime dependency.
+    #   "etcd"             - a lease-backed etcd key/election (fenced);
+    #   "filesystem"       - a flock-guarded TTL lease on a shared POSIX
+    #                        mount (fenced under NTP-bounded clock skew).
+    # The kubernetes/etcd backends talk to their store over plain HTTP (the
+    # core aiohttp dependency) and the filesystem backend needs only a
+    # mount, so none of them adds a runtime dependency.
     "backend": "gossip",
     "interval": 30,  # seconds between peer-attestation rounds
     "driftAfter": 3,  # reachable-but-mismatched rounds before "drifted"
@@ -109,6 +113,116 @@ DEFAULT_ETCD: Dict[str, Any] = {
     "password": {"value": None, "fromFile": None, "fromEnvVar": None},
     # optional client TLS to the etcd endpoints
     "tls": {"ca": None, "cert": None, "key": None},
+}
+
+# Defaults merged over a `cluster.filesystem` block (backend: filesystem):
+# leader election over a shared POSIX mount (Amazon S3 Files / EFS / NFS),
+# using the same flock-guarded TTL lease the durable state store uses -- no
+# coordination service at all. See yacron2.backends.filesystem.
+DEFAULT_FILESYSTEM: Dict[str, Any] = {
+    # required: the directory the election lease lives in. Point it at the
+    # same mount (and deploymentId) as the `state` section to keep one
+    # coordination surface per deployment.
+    "path": None,
+    "electionName": "cluster/leader",
+    "ttl": 15,  # lease time-to-live, seconds (floor 3, like etcd)
+    # namespace prefix inside the store; None -> "default". Use the SAME
+    # value as state.deploymentId when sharing a mount with the state store.
+    "deploymentId": None,
+    # auto (probe the mount) | single-node | shared -- same semantics as
+    # state.topology. Windows/macOS cannot probe; assert `shared` explicitly
+    # there.
+    "topology": "auto",
+}
+
+
+# Defaults for an (optional) state block. Only applied when a `state` section
+# is present; see _build_state_config. yacron2 is stateless by default, so the
+# whole section is absent unless the user opts in.
+DEFAULT_STATE: Dict[str, Any] = {
+    # required: the directory the durable store lives in. A local path gives
+    # single-node durability; an Amazon S3 Files / EFS mount gives durability
+    # plus fleet-wide coordination -- the same POSIX backend either way, the
+    # mount decides the reach. Enforced non-empty in _build_state_config.
+    "path": None,
+    # auto (probe the mount) | single-node | shared. Gates whether cross-node
+    # coordination may be offered; auto detects a shared network mount
+    # (NFS/EFS/S3 Files) and otherwise assumes single-node. See yacron2.state.
+    "topology": "auto",
+    # optional stable prefix so several deployments can share one store/bucket
+    # without colliding or cross-reading; None -> the "default" namespace.
+    "deploymentId": None,
+    # how many finished runs to retain durably per job (the durable analogue of
+    # the in-memory history ring); the ledger is pruned to this after each
+    # append. <= 0 disables pruning (unbounded; rely on an external lifecycle
+    # rule). Durable retention is larger than the in-memory window on purpose.
+    "maxRunsPerJob": 1000,
+    # what the STATEFUL features do while the store is configured but
+    # unavailable (down, unreadable, hung). "degrade" (default) falls back to
+    # the in-memory behaviour: durable-truth gates fail open and writes are
+    # dropped with a warning (and counted). "fail-closed" prefers not running
+    # over possibly running wrong: the onlyIfLastSucceeded gate blocks, a
+    # due durable retry defers until the store answers, and an unverifiable
+    # @reboot boot marker skips the boot run. Plain scheduled fires are never
+    # gated on the store under either policy.
+    "onStoreUnavailable": "degrade",
+    # age (seconds) past which durable state belonging to a job that no
+    # recent manifest references (no node's loaded config under this
+    # deploymentId has mentioned it for this long) is garbage collected.
+    # <= 0 disables automatic GC. Defaults to 7 days -- long enough that a
+    # briefly-removed job, or a fleet node down for a long weekend, keeps
+    # its history.
+    "gcGraceSeconds": 604800,
+    # upper bound on store operations per second (a token bucket over every
+    # backend call), for request-rate/cost control on mounts that bill per
+    # request. 0 disables (no throttling). Lease operations (coordination)
+    # bypass the bucket: a renew queued behind bulk writes could overshoot
+    # its TTL and double-run the job the lease fences.
+    "maxOpsPerSecond": 0,
+    # TTL (seconds) of the per-job concurrency slot lease taken for
+    # concurrencyScope: cluster jobs. Renewed at a third of this while the
+    # job runs; on a crash the slot frees itself after at most this long.
+    # Floor 5 (enforced): a tiny TTL leaves no room for renew latency on a
+    # network mount and would expire live holders.
+    "slotTtlSeconds": 30,
+    # the job-facing state API: the loopback HTTP endpoint + the
+    # `yacron2 state|cursor|lock|artifact|idempotent|secret` job commands.
+    # Merged (not replaced) over DEFAULT_JOB_API in _build_state_config, so a
+    # partial `jobApi:` block keeps the untouched defaults. See the defaults.
+    "jobApi": None,
+}
+
+# Defaults for the state.jobApi sub-section. Present only when a `state`
+# section is (the loopback endpoint has no store to talk to otherwise). See
+# yacron2.jobapi / yacron2.jobstate.
+DEFAULT_JOB_API: Dict[str, Any] = {
+    # run the loopback endpoint and inject its address/token into every job's
+    # environment. On by default when `state` is configured; set false to keep
+    # the durable store's scheduler features but expose nothing to jobs.
+    "enabled": True,
+    # override the loopback bind, as an `http://host:port` URL. None (default)
+    # binds an OS-assigned ephemeral port on 127.0.0.1 -- reachable only from
+    # this host's job processes, which is what the per-run token then scopes.
+    # A unix:// path is not accepted here: the job CLI reaches the endpoint
+    # over stdlib urllib, which speaks TCP only.
+    "listen": None,
+    # upper bound (bytes) on a single KV / cursor value; a larger set is
+    # refused (HTTP 413). Keeps a runaway job from filling the store one
+    # oversized document at a time.
+    "maxValueBytes": 1024 * 1024,
+    # upper bound (bytes) on a single artifact payload; a larger put is
+    # refused (HTTP 413).
+    "maxArtifactBytes": 64 * 1024 * 1024,
+    # TTL (seconds) of a job mutex/semaphore lease. The daemon holds the lease
+    # on the run's behalf and renews it at a third of this; if the job (or the
+    # daemon) dies the lock frees itself after at most this long. Floor 5, like
+    # slotTtlSeconds, for the same renew-latency reason.
+    "lockTtlSeconds": 30,
+    # explicit opt-in required for a `listen` host that is not loopback. The
+    # endpoint serves per-run bearer tokens and staged job secrets in
+    # plaintext HTTP, so binding it to a routable interface without this set
+    # would serve them to anything that can reach the port.
+    "allowNonLoopbackBind": False,
 }
 
 
@@ -191,12 +305,46 @@ _REPORT_DEFAULTS = {
 }
 
 
-DEFAULT_CONFIG = {
+DEFAULT_CONFIG: Dict[str, Any] = {
     "shell": platform.DEFAULT_SHELL,
     "concurrencyPolicy": "Allow",
+    # how far concurrencyPolicy reaches: "node" (default, classic behaviour:
+    # only this process's running instances are considered) or "cluster"
+    # (Forbid/Replace also exclude instances on OTHER nodes sharing the
+    # `state` store, via a TTL slot lease on the shared mount). Requires a
+    # `state` section; Allow+cluster is refused as inert. See
+    # yacron2.cron.maybe_launch_job.
+    "concurrencyScope": "node",
     # where this job runs under cluster leader election (inert unless
     # cluster.electLeader is set); see yacron2.cron._cluster_allows.
     "clusterPolicy": "Leader",
+    # missed-run catch-up on restart (requires a `state` backend for the
+    # durable last-run watermark; inert without one). skip (default, classic
+    # behaviour: occurrences missed while down are not run) | run-once (fire
+    # once to catch up, coalescing all missed slots) | run-all (replay each
+    # missed occurrence). See yacron2.cron._catch_up.
+    "onMissed": "skip",
+    # only occurrences missed within this many seconds are caught up; None (the
+    # default) means no deadline. Bounds run-all to a recent window so a long
+    # outage cannot stampede. Like Kubernetes CronJob startingDeadlineSeconds.
+    "startingDeadlineSeconds": None,
+    # spread the boot-time catch-up launches of different jobs over [0, N)
+    # seconds (deterministic per job name) so a fleet of jobs does not all fire
+    # at once on restart. 0 (default) fires them together.
+    "catchupJitterSeconds": 0,
+    # depends-on-past guard: skip a scheduled fire when the job's previous
+    # durable run did not succeed (Airflow depends_on_past). Requires a `state`
+    # backend for the durable outcome; inert without one. See
+    # yacron2.cron._depends_on_past_ok.
+    "onlyIfLastSucceeded": False,
+    # archive each finished run's captured output to the `state` store (opt-in;
+    # requires a state backend). Encryption-at-rest is the mount's job (EFS/S3
+    # SSE, an encrypted volume); this writes the captured lines, redacted.
+    "archiveOutput": False,
+    # scrub common secrets (tokens, passwords, keys, auth URLs) from archived
+    # output before it is written. On by default; captured stdout/stderr
+    # routinely carries credentials. Only applies when archiveOutput is set.
+    "redactArchivedSecrets": True,
     "captureStderr": True,
     "captureStdout": False,
     "saveLimit": 4096,
@@ -223,6 +371,16 @@ DEFAULT_CONFIG = {
     "onPermanentFailure": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "onSuccess": {"report": copy.deepcopy(_REPORT_DEFAULTS)},
     "environment": [],
+    # run-scoped secrets staged for the job over the loopback endpoint; each is
+    # {name, value|fromFile|fromEnvVar}. Resolved fresh per run, never durably
+    # stored. Inert without a `state` section with jobApi enabled.
+    "secrets": [],
+    # extra scope names (besides this job's own name and the conventional
+    # `global` namespace) this job's loopback state calls may explicitly
+    # name. Without an entry here, a `--scope OTHER` naming any other job's
+    # own name is refused (403) rather than reaching that job's private
+    # state. See yacron2.jobapi.JobStateAPI._scope.
+    "stateAllowedScopes": [],
     "env_file": None,
     "executionTimeout": None,
     "killTimeout": 30,
@@ -301,7 +459,14 @@ _report_schema = Map(
 _job_defaults_common = {
     Opt("shell"): Str(),
     Opt("concurrencyPolicy"): Enum(["Allow", "Forbid", "Replace"]),
+    Opt("concurrencyScope"): Enum(["node", "cluster"]),
     Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
+    Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
+    Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
+    Opt("catchupJitterSeconds"): Int(),
+    Opt("onlyIfLastSucceeded"): Bool(),
+    Opt("archiveOutput"): Bool(),
+    Opt("redactArchivedSecrets"): Bool(),
     Opt("captureStderr"): Bool(),
     Opt("captureStdout"): Bool(),
     Opt("saveLimit"): Int(),
@@ -332,6 +497,24 @@ _job_defaults_common = {
     Opt("onPermanentFailure"): Map({Opt("report"): _report_schema}),
     Opt("onSuccess"): Map({Opt("report"): _report_schema}),
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
+    # run-scoped secrets: each is resolved fresh per run and served
+    # to the job over the loopback endpoint (`yacron2 secret get NAME`) rather
+    # than placed in the environment, so it never shows in /proc/<pid>/environ
+    # or a `ps -E`. The same value/fromFile/fromEnvVar source triple every
+    # other secret uses. Needs a `state` section with jobApi enabled.
+    Opt("secrets"): Seq(
+        Map(
+            {
+                "name": Str(),
+                Opt("value"): EmptyNone() | Str(),
+                Opt("fromFile"): EmptyNone() | Str(),
+                Opt("fromEnvVar"): EmptyNone() | Str(),
+            }
+        )
+    ),
+    # allowlist of extra scope names this job may explicitly name in its
+    # loopback state calls; see yacron2.jobapi.JobStateAPI._scope.
+    Opt("stateAllowedScopes"): Seq(Str()),
     Opt("env_file"): Str(),
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
@@ -371,10 +554,94 @@ _job_schema_dict.update(
     }
 )
 
+# Orchestration: a task is a job invocation, so it reuses the shared
+# launch fields (shell/environment/capture/timeouts/user/secrets/...) and adds
+# the DAG-node fields (id, dependsOn edges, node type, per-task retries,
+# dynamic mapping, sensor poke schedule, approval reject policy).  ``command``
+# is optional only for an approval gate (which runs no subprocess).
+_dag_task_launch_fields = {
+    Opt("shell"): Str(),
+    Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
+    Opt("captureStderr"): Bool(),
+    Opt("captureStdout"): Bool(),
+    Opt("saveLimit"): Int(),
+    Opt("maxLineLength"): Int(),
+    Opt("streamPrefix"): Str(),
+    Opt("failsWhen"): Map(
+        {
+            "producesStdout": Bool(),
+            Opt("producesStderr"): Bool(),
+            Opt("nonzeroReturn"): Bool(),
+            Opt("always"): Bool(),
+        }
+    ),
+    Opt("executionTimeout"): Float(),
+    Opt("killTimeout"): Float(),
+    Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
+    Opt("user"): Int() | Str(),
+    Opt("group"): Int() | Str(),
+    Opt("env_file"): Str(),
+    Opt("secrets"): Seq(
+        Map(
+            {
+                "name": Str(),
+                Opt("value"): EmptyNone() | Str(),
+                Opt("fromFile"): EmptyNone() | Str(),
+                Opt("fromEnvVar"): EmptyNone() | Str(),
+            }
+        )
+    ),
+    Opt("stateAllowedScopes"): Seq(Str()),
+}
+
+_dag_task_schema_dict = dict(_dag_task_launch_fields)
+_dag_task_schema_dict.update(
+    {
+        "id": Str(),
+        Opt("command"): Str() | Seq(Str()),
+        Opt("type"): Enum(["task", "sensor", "approval"]),
+        Opt("dependsOn"): Seq(Str()),
+        Opt("triggerRule"): Enum(["all_success", "all_done"]),
+        Opt("retries"): Int(),
+        Opt("retryDelaySeconds"): Int() | Float(),
+        Opt("expand"): Map({"fromTask": Str(), "key": Str()}),
+        Opt("pokeIntervalSeconds"): Int() | Float(),
+        Opt("pokeTimeoutSeconds"): Int() | Float(),
+        Opt("pokeJitterSeconds"): Int() | Float(),
+        Opt("onReject"): Enum(["fail", "skip"]),
+    }
+)
+
+_dag_schema_dict = {
+    "name": Str(),
+    Opt("schedule"): Str()
+    | Map(
+        {
+            Opt("second"): Str(),
+            Opt("minute"): Str(),
+            Opt("hour"): Str(),
+            Opt("dayOfMonth"): Str(),
+            Opt("month"): Str(),
+            Opt("year"): Str(),
+            Opt("dayOfWeek"): Str(),
+        }
+    ),
+    Opt("timezone"): Str(),
+    Opt("utc"): Bool(),
+    Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
+    Opt("startingDeadlineSeconds"): EmptyNone() | Int(),
+    Opt("catchupJitterSeconds"): Int(),
+    Opt("clusterPolicy"): Enum(["Leader", "PreferLeader", "EveryNode"]),
+    Opt("enabled"): Bool(),
+    Opt("retainRuns"): Int(),
+    "tasks": Seq(Map(_dag_task_schema_dict)),
+}
+
 CONFIG_SCHEMA = EmptyDict() | Map(
     {
         Opt("defaults"): Map(_job_defaults_common),
         Opt("jobs"): Seq(Map(_job_schema_dict)),
+        Opt("dags"): Seq(Map(_dag_schema_dict)),
         Opt("web"): Map(
             {
                 "listen": Seq(Str()),
@@ -415,8 +682,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
         # carry them.
         Opt("cluster"): Map(
             {
-                # gossip (default) | kubernetes | etcd
-                Opt("backend"): Enum(["gossip", "kubernetes", "etcd"]),
+                # gossip (default) | kubernetes | etcd | filesystem
+                Opt("backend"): Enum(
+                    ["gossip", "kubernetes", "etcd", "filesystem"]
+                ),
                 # --- gossip transport (required for backend: gossip) ---
                 # host:port the mTLS cluster listener binds to
                 Opt("listen"): Str(),
@@ -477,6 +746,49 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         ),
                     }
                 ),
+                # --- shared-mount election backend (backend: filesystem) ---
+                Opt("filesystem"): Map(
+                    {
+                        Opt("path"): Str(),
+                        Opt("electionName"): Str(),
+                        Opt("ttl"): Int() | Float(),
+                        Opt("deploymentId"): EmptyNone() | Str(),
+                        Opt("topology"): Enum(
+                            ["auto", "single-node", "shared"]
+                        ),
+                    }
+                ),
+            }
+        ),
+        # Optional state section: an opt-in durable store (a local filesystem
+        # path or an Amazon S3 Files / EFS mount -- the same POSIX backend
+        # either way) enabling restart-durable history, missed-run catch-up
+        # and, on a shared mount, HA coordination. Stateless by default: absent
+        # this section yacron2 keeps everything in memory exactly as before.
+        # See yacron2.state.
+        Opt("state"): Map(
+            {
+                "path": Str(),
+                Opt("topology"): Enum(["auto", "single-node", "shared"]),
+                Opt("deploymentId"): Str(),
+                Opt("maxRunsPerJob"): Int(),
+                Opt("onStoreUnavailable"): Enum(["degrade", "fail-closed"]),
+                Opt("gcGraceSeconds"): Int(),
+                Opt("maxOpsPerSecond"): Int() | Float(),
+                Opt("slotTtlSeconds"): Int() | Float(),
+                # the job-facing state API: the loopback endpoint
+                # and the `yacron2 state|cursor|lock|artifact|...` commands.
+                # See yacron2.jobapi. Defaults filled from DEFAULT_JOB_API.
+                Opt("jobApi"): Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("listen"): Str(),
+                        Opt("maxValueBytes"): Int(),
+                        Opt("maxArtifactBytes"): Int(),
+                        Opt("lockTtlSeconds"): Int() | Float(),
+                        Opt("allowNonLoopbackBind"): Bool(),
+                    }
+                ),
             }
         ),
         Opt("include"): Seq(Str()),
@@ -521,6 +833,14 @@ def mergedicts(dict1, dict2):
                             for kk, vv in merged.items()
                         ],
                     )
+                elif k == "secrets":
+                    # secrets is a list of {name, ...}; merge by name so a
+                    # job's secret overrides a same-named default rather than
+                    # staging two secrets under one name (mirrors environment).
+                    merged_secrets = {e["name"]: e for e in v1}
+                    for e in v2:
+                        merged_secrets[e["name"]] = e
+                    yield (k, list(merged_secrets.values()))
                 elif k == "fingerprint":
                     # sentry "fingerprint" is a replace-not-append setting: a
                     # job (or a defaults block) that supplies its own
@@ -625,7 +945,14 @@ class JobConfig:
         "has_seconds",
         "shell",
         "concurrencyPolicy",
+        "concurrencyScope",
         "clusterPolicy",
+        "onMissed",
+        "startingDeadlineSeconds",
+        "catchupJitterSeconds",
+        "onlyIfLastSucceeded",
+        "archiveOutput",
+        "redactArchivedSecrets",
         "captureStderr",
         "captureStdout",
         "streamPrefix",
@@ -640,6 +967,8 @@ class JobConfig:
         "onSuccess",
         "env_file",
         "environment",
+        "secrets",
+        "stateAllowedScopes",
         "executionTimeout",
         "killTimeout",
         "statsd",
@@ -662,7 +991,25 @@ class JobConfig:
         self.has_seconds: bool = schedule_has_seconds(self.schedule_unparsed)
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
+        # cluster scope reaches across nodes, so it IS fingerprinted (like
+        # clusterPolicy) -- but only when set, so pre-existing configs keep
+        # their digests (see yacron2.fingerprint.canonical_job).
+        self.concurrencyScope = config.pop("concurrencyScope")
         self.clusterPolicy = config.pop("clusterPolicy")
+        # Catch-up config is deliberately NOT part of the job-set fingerprint
+        # (yacron2.fingerprint): it is a restart-time, node-local behaviour
+        # depends on a durable state backend, not a property of "which jobs run
+        # on which schedule", so it does not gate leader-election drift and
+        # needs no SCHEME_VERSION bump.  The same goes for the archival pair
+        # (observability, not behaviour).  onlyIfLastSucceeded is different:
+        # it gates EVERY scheduled fire, so it IS fingerprinted, like
+        # `enabled` -- replicas disagreeing on it must show as drift.
+        self.onMissed = config.pop("onMissed")
+        self.startingDeadlineSeconds = config.pop("startingDeadlineSeconds")
+        self.catchupJitterSeconds = config.pop("catchupJitterSeconds")
+        self.onlyIfLastSucceeded = config.pop("onlyIfLastSucceeded")
+        self.archiveOutput = config.pop("archiveOutput")
+        self.redactArchivedSecrets = config.pop("redactArchivedSecrets")
         self.captureStderr = config.pop("captureStderr")
         self.captureStdout = config.pop("captureStdout")
         self.streamPrefix = config.pop("streamPrefix")
@@ -682,6 +1029,9 @@ class JobConfig:
 
         self.env_file = config.pop("env_file")
         self.environment = config.pop("environment")
+        self.secrets = config.pop("secrets")
+        self._validate_secrets()
+        self.stateAllowedScopes = config.pop("stateAllowedScopes")
         if self.env_file is not None:
             self._merge_env_file()
 
@@ -736,6 +1086,28 @@ class JobConfig:
         if self.utc:
             return datetime.timezone.utc
         return None
+
+    def _validate_secrets(self) -> None:
+        """Reject secret blocks that name no source.
+
+        A secret with no source (value/fromFile/fromEnvVar) could only ever
+        stage empty, which is a config mistake worth catching at load rather
+        than at run time.  (The ``name`` is schema-required, and same-named
+        secrets merge to last-wins exactly as ``environment`` variables do.)
+        Whether a *configured* source resolves non-empty is checked when the
+        run stages it (yacron2.jobapi), the same fail-closed contract every
+        other secret uses.
+        """
+        for entry in self.secrets:
+            if not (
+                entry.get("value")
+                or entry.get("fromFile")
+                or entry.get("fromEnvVar")
+            ):
+                raise ConfigError(
+                    "job {!r}: secret {!r} needs a value, fromFile or "
+                    "fromEnvVar source".format(self.name, entry.get("name"))
+                )
 
     def _merge_env_file(self) -> None:
         try:
@@ -834,6 +1206,28 @@ class JobConfig:
         require(self.saveLimit >= 0, "saveLimit must be >= 0")
         require(self.maxLineLength > 0, "maxLineLength must be > 0")
         require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        # Allow places no bound on concurrent instances, so widening its
+        # scope to the cluster gates nothing -- a safety option that
+        # silently does nothing is worse than an error the operator sees
+        # once at load time.
+        require(
+            not (
+                self.concurrencyScope == "cluster"
+                and self.concurrencyPolicy == "Allow"
+            ),
+            "concurrencyScope: cluster has no effect with "
+            "concurrencyPolicy: Allow (the default); set Forbid or "
+            "Replace, or drop concurrencyScope",
+        )
+        require(
+            self.catchupJitterSeconds >= 0,
+            "catchupJitterSeconds must be >= 0",
+        )
+        if self.startingDeadlineSeconds is not None:
+            require(
+                self.startingDeadlineSeconds > 0,
+                "startingDeadlineSeconds must be > 0 when set",
+            )
         if self.executionTimeout is not None:
             require(
                 self.executionTimeout > 0,
@@ -858,6 +1252,204 @@ class JobConfig:
                 retry["backoffMultiplier"] > 0,
                 "onFailure.retry.backoffMultiplier must be > 0",
             )
+
+
+# Defaults for the DAG-node fields strictyaml leaves absent (unlike jobs, a
+# task dict is not pre-merged over a full defaults dict, so absent optionals
+# stay absent).  The launch fields are filled from DEFAULT_CONFIG when the
+# per-task JobConfig template is built.
+_DAG_TASK_DEFAULTS: Dict[str, Any] = {
+    "type": "task",
+    "dependsOn": [],
+    "triggerRule": "all_success",
+    "retries": 0,
+    "retryDelaySeconds": 0.0,
+    "pokeIntervalSeconds": 30.0,
+    "pokeTimeoutSeconds": 3600.0,
+    "pokeJitterSeconds": 0.0,
+    "onReject": "fail",
+}
+
+# the DAG-node keys consumed here; everything else in a task dict is a launch
+# field forwarded to the per-task JobConfig template.
+_DAG_TASK_NODE_KEYS = frozenset(
+    {
+        "id",
+        "type",
+        "dependsOn",
+        "triggerRule",
+        "retries",
+        "retryDelaySeconds",
+        "expand",
+        "pokeIntervalSeconds",
+        "pokeTimeoutSeconds",
+        "pokeJitterSeconds",
+        "onReject",
+    }
+)
+
+
+class DagTaskConfig:
+    """One DAG node: its state-machine :class:`yacron2.dag.TaskSpec` plus the
+    :class:`JobConfig` launch template the scheduler runs it from.
+
+    A task *is* a job invocation (the mandate), so the launch fields reuse the
+    exact job machinery -- the template carries the command, shell, env,
+    capture, timeouts and run-scoped secrets, and the daemon launches it
+    through the same :class:`~yacron2.job.RunningJob` path a scheduled job
+    uses.  The DAG-node fields (deps, type, retries, mapping) drive the pure
+    state machine.
+    """
+
+    __slots__ = ("id", "type", "job_template", "spec")
+
+    def __init__(self, dag_name: str, raw_task: dict) -> None:
+        merged = dict(mergedicts(_DAG_TASK_DEFAULTS, raw_task))
+        self.id: str = merged["id"]
+        self.type: str = merged["type"]
+        node = {
+            k: merged.pop(k) for k in list(merged) if k in _DAG_TASK_NODE_KEYS
+        }
+        expand = node.get("expand")
+        command = merged.get("command")
+        if self.type == "approval":
+            # an approval gate runs no subprocess; a harmless placeholder keeps
+            # the JobConfig template valid without demanding a command.
+            merged["command"] = command or "true"
+        elif not command:
+            raise ConfigError(
+                "dag {!r}: task {!r} needs a command".format(dag_name, self.id)
+            )
+        retries = int(node["retries"])
+        if retries < 0:
+            # the job-level onFailure.retry.maximumRetries documents -1 as
+            # the "retry forever" sentinel; a dag task has no such sentinel,
+            # and a negative value here would silently mean ZERO retries
+            # (max_attempts = retries + 1), the opposite of that intent.
+            raise ConfigError(
+                "dag {!r}: task {!r}: retries must be >= 0 (the job-level "
+                "-1 retry-forever sentinel is not supported for dag "
+                "tasks)".format(dag_name, self.id)
+            )
+        job_dict = dict(mergedicts(DEFAULT_CONFIG, merged))
+        job_dict["name"] = "{}.{}".format(dag_name, self.id)
+        # never auto-fires: task templates are not in the scheduler's job set,
+        # so this placeholder schedule is only there to satisfy JobConfig.
+        job_dict["schedule"] = "@reboot"
+        try:
+            self.job_template = JobConfig(job_dict)
+        except ConfigError as ex:
+            raise ConfigError(
+                "dag {!r}: task {!r}: {}".format(dag_name, self.id, ex)
+            ) from ex
+        self.spec = dag.TaskSpec(
+            id=self.id,
+            type=self.type,
+            depends_on=tuple(node["dependsOn"]),
+            trigger_rule=node["triggerRule"],
+            max_attempts=retries + 1,
+            retry_delay=float(node["retryDelaySeconds"]),
+            expand=(
+                dag.ExpandSpec(from_task=expand["fromTask"], key=expand["key"])
+                if expand
+                else None
+            ),
+            poke_interval=float(node["pokeIntervalSeconds"]),
+            poke_timeout=float(node["pokeTimeoutSeconds"]),
+            poke_jitter=float(node["pokeJitterSeconds"]),
+            on_reject=dag.SKIPPED
+            if node["onReject"] == "skip"
+            else dag.FAILED,
+        )
+
+
+class DagConfig:
+    """A whole DAG: its scheduling frame, its tasks, and the validated graph.
+
+    ``schedule_job`` is a synthetic :class:`JobConfig` carrying only the DAG's
+    schedule/timezone/onMissed frame, so the scheduler reuses
+    ``_compute_next_fire`` / the catch-up discipline verbatim; it is ``None``
+    for a manual-only DAG (triggered by API or backfill).  The graph is
+    validated at construction, so a cycle or dangling dependency is a
+    :class:`ConfigError` at load.
+    """
+
+    __slots__ = (
+        "name",
+        "enabled",
+        "retain_runs",
+        "schedule_job",
+        "tasks",
+        "spec",
+        "task_templates",
+    )
+
+    def __init__(self, raw_dag: dict) -> None:
+        raw = dict(raw_dag)
+        self.name: str = raw.pop("name")
+        self.enabled: bool = bool(raw.pop("enabled", True))
+        self.retain_runs: int = int(raw.pop("retainRuns", 50))
+        if self.retain_runs < 1:
+            raise ConfigError(
+                "dag {!r}: retainRuns must be >= 1".format(self.name)
+            )
+        tasks_raw = raw.pop("tasks")
+        if not tasks_raw:
+            raise ConfigError(
+                "dag {!r}: needs at least one task".format(self.name)
+            )
+        self.tasks = [DagTaskConfig(self.name, t) for t in tasks_raw]
+        self.task_templates: Dict[str, JobConfig] = {
+            t.id: t.job_template for t in self.tasks
+        }
+        self.spec = dag.DagSpec.build(self.name, [t.spec for t in self.tasks])
+        try:
+            dag.validate_graph(self.spec)
+        except dag.DagValidationError as ex:
+            raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
+        schedule = raw.pop("schedule", None)
+        self.schedule_job: Optional[JobConfig] = (
+            self._build_schedule_job(raw, schedule)
+            if schedule is not None
+            else None
+        )
+
+    def _build_schedule_job(self, raw: dict, schedule: Any) -> JobConfig:
+        overrides: Dict[str, Any] = {
+            "name": "dag:" + self.name,
+            "command": "true",
+            "schedule": schedule,
+            "enabled": self.enabled,
+        }
+        for key in (
+            "onMissed",
+            "startingDeadlineSeconds",
+            "catchupJitterSeconds",
+            "timezone",
+            "utc",
+            "clusterPolicy",
+        ):
+            if key in raw:
+                overrides[key] = raw[key]
+        job_dict = dict(mergedicts(DEFAULT_CONFIG, overrides))
+        try:
+            job = JobConfig(job_dict)
+        except ConfigError as ex:
+            raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
+        # every DAG scheduling path (seeding, catch-up, backfill) computes
+        # next-fire instants from a CronTab; a schedule _parse_schedule leaves
+        # as a plain string ("@reboot", the boot marker) has none and would
+        # crash the scheduler at runtime instead of failing the load here.
+        # Structural on purpose: whatever parses into a CronTab (including
+        # the @daily/@hourly-style aliases the crontab library expands) is
+        # fine, anything that stays a string is not.
+        if not isinstance(job.schedule, CronTab):
+            raise ConfigError(
+                "dag {!r}: schedule {!r} is not a cron expression; DAG "
+                "schedules must be cron expressions (@reboot is not "
+                "supported for dags)".format(self.name, schedule)
+            )
+        return job
 
 
 def parse_environment_file(path: str) -> Dict[str, str]:
@@ -1056,7 +1648,108 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
         return _build_kubernetes_cluster_config(raw)
     if backend == "etcd":
         return _build_etcd_cluster_config(raw)
+    if backend == "filesystem":
+        return _build_filesystem_cluster_config(raw)
     return _build_gossip_cluster_config(raw)
+
+
+def _build_state_config(raw: dict) -> StateConfig:
+    """Fill the state defaults over a raw (schema-validated) block, validate.
+
+    ``path`` is the one required key (the schema enforces its presence and
+    string type; this guards against an empty/whitespace value that would
+    otherwise resolve to a surprising directory).  ``topology`` is already
+    constrained to the enum by the schema, and ``deploymentId`` is free-form.
+    """
+    cfg: Dict[str, Any] = dict(DEFAULT_STATE)
+    cfg.update(raw)
+    if not cfg.get("path") or not str(cfg["path"]).strip():
+        raise ConfigError("state.path is required and must be non-empty")
+    # The float checks below are written NaN-rejecting on purpose: strictyaml's
+    # Float() accepts 'nan' and overflow literals like '1e309' (== inf), and a
+    # plain 'x < floor' comparison is False for NaN, so a non-finite value
+    # would sail through into the lease/TTL arithmetic it silently breaks
+    # (expires_at = now + nan is never "validly held"; + inf never expires).
+    ops = float(cfg.get("maxOpsPerSecond") or 0)
+    if not math.isfinite(ops) or ops < 0:
+        raise ConfigError("state.maxOpsPerSecond must be >= 0 and finite")
+    grace = int(cfg.get("gcGraceSeconds") or 0)
+    if 0 < grace < 86400:
+        # a grace below the manifest cadence would make every live peer's
+        # manifests look stale and hand their state to the collector; a day
+        # is the floor at which the anchoring stays sound.
+        raise ConfigError(
+            "state.gcGraceSeconds must be <= 0 (GC disabled) or >= 86400"
+        )
+    slot_ttl = float(cfg.get("slotTtlSeconds") or 0)
+    if not math.isfinite(slot_ttl) or slot_ttl < 5:
+        # the slot lease is renewed at ttl/3 by a live holder; below ~5s
+        # one slow renew on a network mount expires a healthy holder's
+        # slot and invites the cross-node double-run the lease fences.
+        raise ConfigError("state.slotTtlSeconds must be >= 5 and finite")
+    # jobApi is a nested block: merge its raw keys over the defaults explicitly
+    # (cfg.update above is a shallow merge that would drop the untouched
+    # DEFAULT_JOB_API keys of a partially-specified `jobApi:` block).
+    job_api = dict(DEFAULT_JOB_API)
+    job_api.update(cfg.get("jobApi") or {})
+    cfg["jobApi"] = job_api
+    lock_ttl = float(job_api.get("lockTtlSeconds") or 0)
+    if not math.isfinite(lock_ttl) or lock_ttl < 5:
+        raise ConfigError(
+            "state.jobApi.lockTtlSeconds must be >= 5 and finite"
+        )
+    if int(job_api.get("maxValueBytes") or 0) < 0:
+        raise ConfigError("state.jobApi.maxValueBytes must be >= 0")
+    if int(job_api.get("maxArtifactBytes") or 0) < 0:
+        raise ConfigError("state.jobApi.maxArtifactBytes must be >= 0")
+    listen = job_api.get("listen")
+    if (
+        listen is not None
+        and "://" in str(listen)
+        and not str(listen).startswith("http://")
+    ):
+        raise ConfigError(
+            "state.jobApi.listen must be an http:// URL or a bare host:port "
+            "(the job CLI reaches the loopback endpoint over TCP only)"
+        )
+    if listen:
+        # validate the port the same way the runtime bind parses it
+        # (urlparse().port raises on a non-numeric or out-of-range port);
+        # left unchecked, the ValueError would escape the API startup and
+        # permanently disable the loopback endpoint instead of failing the
+        # config load. An explicit :0 is fine -- jobapi._bind_target maps
+        # a missing port to 0 anyway, and the bind treats both as the
+        # OS-assigned ephemeral default -- but anything else must be usable.
+        text = str(listen)
+        parsed = urlparse(text if "://" in text else "http://" + text)
+        try:
+            port = parsed.port
+        except ValueError as err:
+            raise ConfigError(
+                "state.jobApi.listen has an invalid port in {!r}: the port "
+                "must be an integer in 0-65535 (0 or omitted binds an "
+                "OS-assigned ephemeral port)".format(text)
+            ) from err
+        if port is not None and not 0 <= port <= 65535:
+            raise ConfigError(
+                "state.jobApi.listen has an invalid port in {!r}: the port "
+                "must be an integer in 0-65535 (0 or omitted binds an "
+                "OS-assigned ephemeral port)".format(text)
+            )
+    if listen and not job_api.get("allowNonLoopbackBind"):
+        text = str(listen)
+        parsed = urlparse(text if "://" in text else "http://" + text)
+        host = parsed.hostname or ""
+        if host != "localhost" and _loopback_ip_version(host) is None:
+            msg = (
+                "state.jobApi.listen host {!r} is not loopback; this "
+                "endpoint serves per-run bearer tokens and staged job "
+                "secrets over plaintext HTTP, so binding it beyond this "
+                "host needs state.jobApi.allowNonLoopbackBind: true (and "
+                "should be paired with a reverse proxy adding TLS/auth)"
+            )
+            raise ConfigError(msg.format(host))
+    return StateConfig(cfg)
 
 
 def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
@@ -1178,7 +1871,7 @@ def _reject_lease_spread(cfg: dict, backend: str) -> None:
 # Lease store sub-blocks. Each lease builder reads ONLY its own; a block under
 # the wrong backend is rejected so the operator's intended endpoints/TLS/creds
 # are never silently discarded (see _reject_foreign_store_blocks).
-_LEASE_STORE_KEYS = ("etcd", "kubernetes")
+_LEASE_STORE_KEYS = ("etcd", "kubernetes", "filesystem")
 
 # Kubernetes object-name charsets, used to keep leaseName/leaseNamespace clear
 # of URL path metacharacters ('/', '?', '#', whitespace) that could retarget
@@ -1618,6 +2311,49 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     return ClusterConfig(cfg)
 
 
+def _build_filesystem_cluster_config(raw: dict) -> ClusterConfig:
+    """Build the cluster config for the shared-mount (filesystem) backend.
+
+    The store is a directory, so validation is far smaller than etcd's: a
+    non-empty path, a ttl floor (same rationale as etcd's -- below 3s the
+    leader window collapses under the renew cadence and the clock-skew
+    margin), and the shared lease-backend rules (no spread, no foreign store
+    blocks, electLeader implied).
+    """
+    cfg = _cluster_base(raw)
+    _reject_lease_spread(cfg, "filesystem")
+    _reject_foreign_store_blocks(cfg, "filesystem")
+    raw_fs = cfg.get("filesystem") or {}
+    fsb = dict(DEFAULT_FILESYSTEM)
+    fsb.update(raw_fs)
+    cfg["filesystem"] = fsb
+    if not fsb.get("path") or not str(fsb["path"]).strip():
+        raise ConfigError(
+            "cluster.filesystem.path is required and must be non-empty "
+            "(the directory -- normally a shared mount -- the election "
+            "lease lives in)"
+        )
+    if not str(fsb.get("electionName") or "").strip():
+        raise ConfigError("cluster.filesystem.electionName must be non-empty")
+    # NaN-rejecting on purpose, like the state TTL floors: 'nan < 3' is False
+    # and '1e309' parses as inf, and either silently breaks the lease expiry
+    # arithmetic (multiple leaders / a crashed leader's lease never expiring).
+    if not math.isfinite(float(fsb["ttl"])) or fsb["ttl"] < 3:
+        raise ConfigError(
+            "cluster.filesystem.ttl must be >= 3 seconds and finite (the "
+            "leader holds the lease only until ttl minus a clock-skew "
+            "margin and "
+            "renews every max(1s, ttl/3); a smaller ttl makes a node that "
+            "wins the election immediately treat its own lease as "
+            "expired, so no Leader job ever runs); got {}".format(fsb["ttl"])
+        )
+    cfg["electLeader"] = True
+    advisories = _lease_advisories(raw, "filesystem")
+    if advisories:
+        cfg["_advisories"] = advisories
+    return ClusterConfig(cfg)
+
+
 def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
     """Non-fatal advisories for a cluster config, returned as messages.
 
@@ -1741,7 +2477,7 @@ def _validate_web_config(webconf: WebConfig) -> None:
         previous = bound
 
 
-@dataclass
+@dataclass(slots=True)
 class Yacron2Config:
     jobs: List[JobConfig]
     web_config: Optional[WebConfig]
@@ -1750,6 +2486,12 @@ class Yacron2Config:
     # Optional; None default so existing constructors (e.g. the empty config in
     # Cron.update_config) need no change.
     cluster_config: Optional[ClusterConfig] = None
+    # Optional durable state backend (yacron2.state); None keeps the classic
+    # stateless, in-memory behaviour. Defaulted for the same reason as above.
+    state_config: Optional[StateConfig] = None
+    # Orchestration DAGs; empty keeps the classic no-DAG behaviour.
+    # A mutable default needs field(default_factory), never a shared [].
+    dags: List["DagConfig"] = field(default_factory=list)
 
 
 def parse_config_string(
@@ -1798,6 +2540,7 @@ def _config_from_doc(
     """
     inc_defaults_merged: dict = {}
     jobs = []
+    dags: List[DagConfig] = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
     if webconf is not None:
         # (an included file's web section was already validated when that
@@ -1806,6 +2549,7 @@ def _config_from_doc(
     clusterconf = (
         _build_cluster_config(doc["cluster"]) if "cluster" in doc else None
     )
+    stateconf = _build_state_config(doc["state"]) if "state" in doc else None
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
@@ -1818,6 +2562,7 @@ def _config_from_doc(
             mergedicts(inc_defaults_merged, inc_config.job_defaults)
         )
         jobs.extend(inc_config.jobs)
+        dags.extend(inc_config.dags)
         if inc_config.web_config:
             if webconf:
                 raise ConfigError("multiple web configs")
@@ -1826,6 +2571,10 @@ def _config_from_doc(
             if clusterconf:
                 raise ConfigError("multiple cluster configs")
             clusterconf = inc_config.cluster_config
+        if inc_config.state_config:
+            if stateconf:
+                raise ConfigError("multiple state configs")
+            stateconf = inc_config.state_config
         if inc_config.logging_config:
             if logging_conf:
                 raise ConfigError("multiple logging configs")
@@ -1835,12 +2584,19 @@ def _config_from_doc(
     for config_job in doc.get("jobs", []):
         job_dict = dict(mergedicts(defaults, config_job))
         jobs.append(JobConfig(job_dict))
+    # DAGs are self-contained (tasks carry their own launch fields), so a
+    # top-level `defaults:` block is not applied to them; each DAG builds its
+    # per-task templates over DEFAULT_CONFIG in DagConfig.
+    for config_dag in doc.get("dags", []):
+        dags.append(DagConfig(config_dag))
     return Yacron2Config(
         jobs=jobs,
         web_config=webconf,
         job_defaults=JobDefaults(defaults),
         logging_config=logging_conf,
         cluster_config=clusterconf,
+        state_config=stateconf,
+        dags=dags,
     )
 
 
@@ -1897,17 +2653,132 @@ def parse_config_file(
     return parse_config_string(data, path, _seen, _sources)
 
 
+def _validate_cross_sections(config: Yacron2Config) -> None:
+    """Validate constraints spanning jobs and the optional sections.
+
+    Runs only at the top-level parse entry point (:func:`parse_config`),
+    on the fully-assembled config -- never inside :func:`_config_from_doc`,
+    where an included or config-dir sibling file is parsed standalone and
+    the section a job depends on may legitimately live in another file.
+    """
+    if config.state_config is None:
+        offenders = sorted(
+            job.name
+            for job in config.jobs
+            if job.concurrencyScope == "cluster"
+        )
+        if offenders:
+            raise ConfigError(
+                "concurrencyScope: cluster requires a `state` section "
+                "(the shared store is what coordinates the nodes), but "
+                "none is configured; offending job(s): {}".format(
+                    ", ".join(offenders)
+                )
+            )
+        secret_offenders = sorted(
+            job.name for job in config.jobs if job.secrets
+        )
+        if secret_offenders:
+            raise ConfigError(
+                "job `secrets` are staged over the state loopback endpoint, "
+                "which requires a `state` section; none is configured, "
+                "offending job(s): {}".format(", ".join(secret_offenders))
+            )
+    elif config.jobs:
+        job_api = config.state_config.get("jobApi") or {}
+        if not job_api.get("enabled", True):
+            secret_offenders = sorted(
+                job.name for job in config.jobs if job.secrets
+            )
+            if secret_offenders:
+                raise ConfigError(
+                    "job `secrets` need the state loopback endpoint, but "
+                    "state.jobApi.enabled is false; offending job(s): "
+                    "{}".format(", ".join(secret_offenders))
+                )
+    _validate_dags(config)
+
+
+def _validate_dags(config: Yacron2Config) -> None:
+    """Cross-section invariants for the orchestration DAGs.
+
+    DAGs live entirely on the durable store (each ``dag_run`` is a document,
+    per-task state and XCom ride the durable store), and their tasks reach
+    the store through the loopback endpoint, so a DAG needs a ``state`` section
+    with ``jobApi`` enabled.  DAG names must be unique across the whole config.
+    The per-DAG graph (acyclic, resolvable deps, valid expand targets) is
+    already validated when each :class:`DagConfig` is built.
+    """
+    if not config.dags:
+        return
+    names = [d.name for d in config.dags]
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        raise ConfigError("duplicate dag name(s): {}".format(", ".join(dups)))
+    # Each task's launch template is named '<dag>.<taskId>' and shares the
+    # scheduler's per-name bookkeeping (running_jobs, concurrencyPolicy, the
+    # durable in-flight record) with regular jobs, so a name collision
+    # entangles unrelated runs: a Replace job would cancel an in-flight DAG
+    # task mid-run, a Forbid job silently skips fires while it runs. Task ids
+    # may themselves contain '.', so two dags can also mint the same template
+    # name (dag 'a' task 'b.c' vs dag 'a.b' task 'c'). Reject both at load.
+    # A job named after a bare dag is fine: the dag's synthetic schedule job
+    # carries a 'dag:' prefix and is never launched, and dag run/XCom state
+    # lives under its own 'dagrun/'/'dagxcom/' scopes.
+    job_names = {job.name for job in config.jobs}
+    template_owner: Dict[str, Tuple[str, str]] = {}
+    for d in config.dags:
+        for task in d.tasks:
+            template = task.job_template.name
+            if template in job_names:
+                raise ConfigError(
+                    "job {!r} collides with dag {!r} task {!r}: dag tasks "
+                    "launch under the template name '<dag>.<taskId>' and "
+                    "would share that job's concurrency bookkeeping; "
+                    "rename the job or the task".format(
+                        template, d.name, task.id
+                    )
+                )
+            owner = template_owner.get(template)
+            if owner is not None:
+                raise ConfigError(
+                    "dag {!r} task {!r} and dag {!r} task {!r} both launch "
+                    "under the template name {!r} (task ids may contain "
+                    "'.', so distinct dag/task pairs can collide); rename "
+                    "one so their runs are not entangled".format(
+                        owner[0], owner[1], d.name, task.id, template
+                    )
+                )
+            template_owner[template] = (d.name, task.id)
+    if config.state_config is None:
+        raise ConfigError(
+            "dags require a `state` section (each dag_run and its per-task "
+            "state live on the durable store); none is configured, "
+            "offending dag(s): {}".format(", ".join(sorted(names)))
+        )
+    job_api = config.state_config.get("jobApi") or {}
+    if not job_api.get("enabled", True):
+        raise ConfigError(
+            "dags need the state loopback endpoint for XCom and task state, "
+            "but state.jobApi.enabled is false; offending dag(s): "
+            "{}".format(", ".join(sorted(names)))
+        )
+
+
 def parse_config(
     config_arg: str, _sources: Optional[set] = None
 ) -> Yacron2Config:
     if os.path.isdir(config_arg):
-        return _parse_config_dir(config_arg, _sources)
-    try:
-        return parse_config_file(config_arg, _sources=_sources)
-    except OSError as ex:
-        # surface a clean ConfigError (e.g. file not found) rather than a bare
-        # OSError, so callers (__main__) handle it uniformly.
-        raise ConfigError(str(ex)) from ex
+        config = _parse_config_dir(config_arg, _sources)
+    else:
+        try:
+            config = parse_config_file(config_arg, _sources=_sources)
+        except OSError as ex:
+            # surface a clean ConfigError (e.g. file not found) rather than a
+            # bare OSError, so callers (__main__) handle it uniformly.
+            raise ConfigError(str(ex)) from ex
+    _validate_cross_sections(config)
+    return config
 
 
 def parse_config_with_sources(
@@ -1917,7 +2788,8 @@ def parse_config_with_sources(
 
     Returns ``(config, sources)`` where ``sources`` is the absolute path of
     every YAML/crontab file consulted (the top-level file or directory entries,
-    plus anything they ``include`` transitively) and every job's ``env_file``.
+    plus anything they ``include`` transitively) and every job's and DAG
+    task's ``env_file``.
     The scheduler stats this exact set to detect that nothing changed on disk
     and skip the (strictyaml-heavy) reparse on an unchanged config; because it
     covers includes and env_files, an edit to any file that actually feeds the
@@ -1930,6 +2802,12 @@ def parse_config_with_sources(
     for job in config.jobs:
         if job.env_file is not None:
             sources.add(os.path.abspath(job.env_file))
+    # DAG task templates read their env_file at parse time exactly like jobs
+    # do, so an edit to one must bust the reparse-skip signature the same way.
+    for dag_cfg in config.dags:
+        for template in dag_cfg.task_templates.values():
+            if template.env_file is not None:
+                sources.add(os.path.abspath(template.env_file))
     return config, frozenset(sources)
 
 
@@ -1937,11 +2815,14 @@ def _parse_config_dir(
     config_arg: str, _sources: Optional[set] = None
 ) -> Yacron2Config:
     jobs: List[JobConfig] = []
+    dags: List[DagConfig] = []
     config_errors: Dict[str, str] = {}
     web_config: Optional[WebConfig] = None
     web_config_source_fname: Optional[str] = None
     cluster_config: Optional[ClusterConfig] = None
     cluster_config_source_fname: Optional[str] = None
+    state_config: Optional[StateConfig] = None
+    state_config_source_fname: Optional[str] = None
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
@@ -1967,6 +2848,7 @@ def _parse_config_dir(
             config_errors[config_arg] = str(ex)
             continue
         jobs.extend(config.jobs)
+        dags.extend(config.dags)
         if config.web_config is not None:
             if web_config is None:
                 web_config = config.web_config
@@ -1987,6 +2869,17 @@ def _parse_config_dir(
                     "Multiple 'cluster' configurations found: "
                     "first in {}, now in {}".format(
                         cluster_config_source_fname, direntry.path
+                    )
+                )
+        if config.state_config is not None:
+            if state_config is None:
+                state_config = config.state_config
+                state_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'state' configurations found: "
+                    "first in {}, now in {}".format(
+                        state_config_source_fname, direntry.path
                     )
                 )
         if config.logging_config is not None:
@@ -2014,4 +2907,6 @@ def _parse_config_dir(
         job_defaults=job_defaults,
         logging_config=logging_config,
         cluster_config=cluster_config,
+        state_config=state_config,
+        dags=dags,
     )

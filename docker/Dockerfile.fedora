@@ -36,6 +36,28 @@ RUN set -eux; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
 
+# Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
+# paths; yacron2/_json falls back to stdlib json when it is absent, so this never
+# fails the build. amd64/arm64 install a wheel; the other published arches
+# (ppc64le/s390x) have none, so a Rust toolchain is installed and orjson is
+# source-built. A miscompiled build (e.g. under QEMU) is dropped by orjson_ok so
+# it is never shipped; the toolchain/cache stays in this builder stage, only the
+# small orjson .so rides along in /opt/venv.
+RUN set -eux; \
+    orjson_ok() { \
+        /opt/venv/bin/python -c 'import orjson,sys; s={"v":1,"a":[1,2.5,True,None],"z":"x"}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'; \
+    }; \
+    if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (wheel)"; \
+    elif dnf --setopt=retries=10 install -y rust cargo \
+        && /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
+        echo "orjson: bundled (source build)"; \
+    else \
+        echo "orjson: unavailable on this arch; using stdlib json"; \
+        /opt/venv/bin/pip uninstall -y orjson || true; \
+    fi; \
+    dnf clean all
+
 # ---- runtime stage ------------------------------------------------------
 FROM fedora:${FEDORA_VERSION}
 

@@ -50,8 +50,8 @@ def tracing_running_job(monkeypatch):
 class TracingRunningJob(RunningJob):
     _TRACE = asyncio.Queue()
 
-    def __init__(self, config: JobConfig, retry_state) -> None:
-        super().__init__(config, retry_state)
+    def __init__(self, config: JobConfig, retry_state, **kwargs) -> None:
+        super().__init__(config, retry_state, **kwargs)
         self._TRACE.put_nowait((time.perf_counter(), "create", self))
 
     async def start(self) -> None:
@@ -333,7 +333,7 @@ async def test_handle_finished_job_skips_replaced(monkeypatch):
     monkeypatch.setattr(cron, "handle_job_success", fake_success)
 
     job = SimpleNamespace(
-        config=SimpleNamespace(name="test"),
+        config=SimpleNamespace(name="test", concurrencyScope="node"),
         replaced=True,
         cancelled=False,
         fail_reason="failsWhen=nonzeroReturn and retcode=-15",
@@ -369,7 +369,7 @@ async def test_handle_finished_job_reports_normal_failure(monkeypatch):
     monkeypatch.setattr(cron, "handle_job_success", fake_success)
 
     job = SimpleNamespace(
-        config=SimpleNamespace(name="test"),
+        config=SimpleNamespace(name="test", concurrencyScope="node"),
         replaced=False,
         cancelled=False,
         start_failed=False,
@@ -1210,7 +1210,7 @@ async def test_handle_finished_job_records_cancelled(monkeypatch):
     monkeypatch.setattr(cron, "handle_job_success", fake_success)
 
     job = SimpleNamespace(
-        config=SimpleNamespace(name="test"),
+        config=SimpleNamespace(name="test", concurrencyScope="node"),
         replaced=False,
         cancelled=True,
         fail_reason=None,
