@@ -319,3 +319,199 @@ async def test_monitor_without_psutil_is_noop(monkeypatch):
     monitor.start()
     assert not monitor.available
     assert await monitor.stop() is None
+
+
+# ---- cgroup v2 container awareness ----------------------------------------
+#
+# All hermetic: the reader takes its mount root and /proc/self/cgroup paths as
+# constructor arguments, so these build a fake cgroup v2 tree under tmp_path
+# and run identically on every platform (including Windows).
+
+MIB = 1024 * 1024
+
+
+def _fake_cgroup(tmp_path, rel="box", proc_line=None):
+    """A fake unified-hierarchy mount; returns (root, own-dir, proc-file)."""
+    root = tmp_path / "cgroup"
+    root.mkdir(exist_ok=True)
+    (root / "cgroup.controllers").write_text("cpu memory\n")
+    d = root
+    for part in rel.split("/"):
+        if part:
+            d = d / part
+            d.mkdir(exist_ok=True)
+    proc = tmp_path / "proc_self_cgroup"
+    proc.write_text(proc_line if proc_line is not None else f"0::/{rel}\n")
+    return root, d, proc
+
+
+def _reader(root, proc):
+    return resources._CgroupV2Reader(str(root), str(proc))
+
+
+def test_cgroup_reader_needs_v2_marker(tmp_path):
+    # no cgroup.controllers at the root -> v1/hybrid host -> inert.
+    root, d, proc = _fake_cgroup(tmp_path)
+    (root / "cgroup.controllers").unlink()
+    reader = _reader(root, proc)
+    assert not reader.available
+    assert reader.memory_limit() is None
+    assert reader.memory_used() is None
+    assert reader.cpu_limit() is None
+    assert reader.cpu_usage_seconds() is None
+
+
+def test_cgroup_reader_inert_when_own_dir_missing(tmp_path):
+    # a host-side path that is not mounted here (container without cgroupns).
+    root, d, proc = _fake_cgroup(
+        tmp_path, proc_line="0::/system.slice/docker-beef.scope\n"
+    )
+    assert not _reader(root, proc).available
+
+
+def test_cgroup_reader_inert_without_v2_entry(tmp_path):
+    # a pure v1 /proc/self/cgroup has controller names, no "0::" line.
+    root, d, proc = _fake_cgroup(
+        tmp_path, proc_line="12:memory:/foo\n3:cpu,cpuacct:/foo\n"
+    )
+    assert not _reader(root, proc).available
+
+
+def test_cgroup_reader_rejects_escaping_path(tmp_path):
+    root, d, proc = _fake_cgroup(tmp_path, proc_line="0::/../../etc\n")
+    assert not _reader(root, proc).available
+
+
+def test_cgroup_reader_namespaced_root(tmp_path):
+    # with cgroup namespaces (the container default) the entry is "0::/" and
+    # the mount root IS our slice; limits written there must be found.
+    root, d, proc = _fake_cgroup(tmp_path, rel="", proc_line="0::/\n")
+    (root / "memory.max").write_text(f"{512 * MIB}\n")
+    (root / "memory.current").write_text(f"{200 * MIB}\n")
+    reader = _reader(root, proc)
+    assert reader.available
+    assert reader.memory_limit() == 512 * MIB
+    assert reader.memory_used() == 200 * MIB  # no memory.stat -> raw figure
+
+
+def test_cgroup_memory_limit_is_lowest_on_path(tmp_path):
+    # limits are hierarchical: an unlimited leaf under a limited parent is
+    # still limited, and the lowest limit on the path wins.
+    root, d, proc = _fake_cgroup(tmp_path, rel="parent/leaf")
+    (d / "memory.max").write_text("max\n")
+    (root / "parent" / "memory.max").write_text(f"{512 * MIB}\n")
+    (root / "memory.max").write_text(f"{1024 * MIB}\n")
+    assert _reader(root, proc).memory_limit() == 512 * MIB
+
+
+def test_cgroup_memory_unlimited_and_malformed(tmp_path):
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "memory.max").write_text("max\n")
+    reader = _reader(root, proc)
+    assert reader.memory_limit() is None
+    (d / "memory.max").write_text("banana\n")
+    assert reader.memory_limit() is None
+    (d / "memory.current").write_text("banana\n")
+    assert reader.memory_used() is None
+
+
+def test_cgroup_memory_used_subtracts_inactive_file(tmp_path):
+    # "used" excludes reclaimable page cache, matching docker stats and the
+    # k8s working-set metric; a used figure can never go negative.
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "memory.current").write_text(f"{200 * MIB}\n")
+    (d / "memory.stat").write_text(
+        f"anon {100 * MIB}\nfile {90 * MIB}\ninactive_file {50 * MIB}\n"
+    )
+    reader = _reader(root, proc)
+    assert reader.memory_used() == 150 * MIB
+    (d / "memory.stat").write_text(f"inactive_file {900 * MIB}\n")
+    assert reader.memory_used() == 0
+
+
+def test_cgroup_cpu_limit_parsing(tmp_path):
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "cpu.max").write_text("150000 100000\n")
+    reader = _reader(root, proc)
+    assert reader.cpu_limit() == pytest.approx(1.5)
+    (d / "cpu.max").write_text("max 100000\n")
+    assert reader.cpu_limit() is None
+    (d / "cpu.max").write_text("0 0\n")  # malformed: never a zero quota
+    assert reader.cpu_limit() is None
+
+
+def test_cgroup_cpu_limit_is_lowest_on_path(tmp_path):
+    root, d, proc = _fake_cgroup(tmp_path, rel="parent/leaf")
+    (d / "cpu.max").write_text("max 100000\n")
+    (root / "parent" / "cpu.max").write_text("200000 100000\n")
+    assert _reader(root, proc).cpu_limit() == pytest.approx(2.0)
+
+
+def test_cgroup_cpu_usage_seconds(tmp_path):
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "cpu.stat").write_text(
+        "usage_usec 30000000\nuser_usec 20000000\nsystem_usec 10000000\n"
+    )
+    assert _reader(root, proc).cpu_usage_seconds() == pytest.approx(30.0)
+    (d / "cpu.stat").unlink()
+    assert _reader(root, proc).cpu_usage_seconds() is None
+
+
+def test_node_sampler_cgroup_overlay(tmp_path, monkeypatch):
+    # inside a limited slice the snapshot reports the slice: the limit as the
+    # total, docker-stats-style used bytes, and CPU% of the quota -- same keys
+    # as the host-wide readout, so consumers never see a shape change.
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "memory.max").write_text(f"{512 * MIB}\n")
+    (d / "memory.current").write_text(f"{200 * MIB}\n")
+    (d / "memory.stat").write_text(f"inactive_file {72 * MIB}\n")
+    (d / "cpu.max").write_text("200000 100000\n")  # 2 CPUs
+    (d / "cpu.stat").write_text("usage_usec 35000000\n")
+
+    sampler = NodeResourceSampler()
+    sampler._cgroup = _reader(root, proc)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(resources.time, "monotonic", lambda: clock["now"])
+    # previous reading: 30 cpu-seconds at t=990 -> 5s over a 10s window on a
+    # 2-CPU quota = 25% of the allowance.
+    sampler._cgroup_prev_cpu = (30.0, 990.0)
+
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert snap["mem_total_bytes"] == 512 * MIB
+    assert snap["mem_used_bytes"] == 128 * MIB
+    assert snap["mem_percent"] == pytest.approx(25.0)
+    assert snap["cpu_count"] == 2
+    assert snap["cpu_percent"] == pytest.approx(25.0)
+    # the delta base advanced to this reading for the next window.
+    assert sampler._cgroup_prev_cpu == (35.0, 1000.0)
+
+
+def test_node_sampler_cgroup_overlay_is_per_resource(tmp_path, monkeypatch):
+    # -m without --cpus: memory reports the slice, CPU stays host-wide (the
+    # slice really can use every host core).
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "memory.max").write_text(f"{512 * MIB}\n")
+    (d / "memory.current").write_text(f"{100 * MIB}\n")
+    (d / "cpu.max").write_text("max 100000\n")
+
+    sampler = NodeResourceSampler()
+    sampler._cgroup = _reader(root, proc)
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert snap["mem_total_bytes"] == 512 * MIB
+    assert snap["cpu_count"] == resources.psutil.cpu_count()
+
+
+def test_node_sampler_unlimited_cgroup_keeps_host_numbers(tmp_path):
+    # a v2 host with no limit anywhere on the path is the common bare-metal
+    # case: the snapshot must be the plain host-wide psutil readout.
+    root, d, proc = _fake_cgroup(tmp_path)
+    (d / "memory.max").write_text("max\n")
+    (d / "cpu.max").write_text("max 100000\n")
+
+    sampler = NodeResourceSampler()
+    sampler._cgroup = _reader(root, proc)
+    snap = sampler.snapshot()
+    assert snap is not None
+    assert snap["mem_total_bytes"] == resources.psutil.virtual_memory().total

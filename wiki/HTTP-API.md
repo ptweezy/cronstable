@@ -404,6 +404,17 @@ host sampling is unavailable (psutil could not read the host), and the
 dashboard then hides the meter. CPU percentages are measured since the previous
 sample, so the first request after startup reads a priming `0`.
 
+**Containers.** When the daemon runs under a cgroup v2 limit (Docker/Kubernetes
+memory or CPU limits, or a systemd slice with `MemoryMax`/`CPUQuota`), these
+numbers describe **its own slice** rather than the whole host: `mem_total_bytes`
+is the effective memory limit, `mem_used_bytes` is the slice's usage with
+reclaimable page cache excluded (the same accounting `docker stats` shows),
+`cpu_count` is the CPU quota rounded up, and `cpu_percent` is utilisation of
+that quota. Memory and CPU switch over independently — a container with only a
+memory limit still reports host-wide CPU. Unlimited cgroups, cgroup v1 hosts,
+and non-Linux platforms report whole-host numbers as before; the response shape
+never changes.
+
 ### `POST /jobs/{name}/start`
 
 Launches the named job immediately, regardless of its schedule. `{name}` is the
