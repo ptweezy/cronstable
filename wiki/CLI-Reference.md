@@ -238,9 +238,10 @@ Runs one manual garbage-collection pass with the same rules as the daemon's
 automatic periodic pass: it removes the streams of jobs (and artifact
 scopes) that no recent manifest references and whose newest record is older
 than `state.gcGraceSeconds`, plus counter and manifest streams of
-unmanifested hosts, provably dead lease files, crashed write-temp files, and
-quarantined records older than the grace, then sweeps artifact payload
-blobs no surviving record references. It prints what was removed (or, with
+unmanifested hosts, provably dead per-run DAG advance leases (the only
+lease class ever deleted), orphaned lock side-files idle past the grace,
+crashed write-temp files, and quarantined records older than the grace,
+then sweeps artifact payload blobs no surviving record references. It prints what was removed (or, with
 `--dry-run`, what would be), the kept-stream count, and the reclaimed
 orphan-blob count -- or the reason the blob sweep stood down (an
 unenumerable artifact stream or an unreadable record keeps every blob). Run
