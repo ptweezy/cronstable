@@ -280,7 +280,7 @@ The `state.jobApi` sub-keys:
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `enabled` | `Bool` | `true` | Run the loopback endpoint and inject its address/token into every job. `false` keeps the durable scheduler features but exposes nothing to jobs. |
-| `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` URL (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. An explicit port must be an integer in `1`-`65535` (a `ConfigError` otherwise; omitting the port keeps the ephemeral bind), and a non-loopback host is a `ConfigError` unless `allowNonLoopbackBind` is also `true`. |
+| `listen` | `Str` | *(ephemeral)* | Override the bind, as an `http://host:port` URL (a `unix://` URL is a `ConfigError`: the job CLI speaks TCP only). Unset binds an OS-assigned ephemeral port on `127.0.0.1`. An explicit port must be an integer in `0`-`65535` (a `ConfigError` otherwise; `0` or omitting the port keeps the ephemeral bind), and a non-loopback host is a `ConfigError` unless `allowNonLoopbackBind` is also `true`. |
 | `maxValueBytes` | `Int` | `1048576` | Cap (bytes) on one KV / cursor value; a larger set is refused (HTTP 413). Must be `>= 0`. |
 | `maxArtifactBytes` | `Int` | `67108864` | Cap (bytes) on one artifact payload; a larger put is refused (HTTP 413). Must be `>= 0`. |
 | `lockTtlSeconds` | `Int` or `Float` | `30` | TTL of a job mutex/semaphore lease, renewed by the daemon at a third of this. Must be `>= 5` (a `ConfigError`, `state.jobApi.lockTtlSeconds must be >= 5`), for the same reason as `slotTtlSeconds`. |

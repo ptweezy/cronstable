@@ -208,14 +208,15 @@ with no native rename:
   [`concurrencyScope: cluster`](Clustering-and-Leader-Election)) and the
   cross-node retry claim (`retry-claim/<job>`; see
   [Restart-surviving retries](#restart-surviving-retries)). A lease file is
-  its fence counter's only home, so within the GC grace window lease files
-  are never touched: removing one would hand the next taker a reset fence a
-  stale holder could not be told apart from. A lease *provably* dead for a
-  whole grace window -- both its recorded expiry and its last write older
-  than `gcGraceSeconds` -- is reclaimed by
-  [GC](#garbage-collection-and-manifests) together with its `.lock`
-  side-file; every fence it ever issued expired at least a grace ago, so
-  the reset is unobservable. Locked read-modify-writes run in a worker
+  its fence counter's only home, so these named, long-lived lease families
+  are **never deleted at any age**: fence values persist in durable records
+  (a `slots/<job>` replace-cancel names the fence it targets), so no grace
+  window makes a fence reset safe. Only the per-run DAG advance leases
+  (`dagadvance/<dag>/<runKey>`, one uniquely-named lease per run, nothing
+  persisting their fences beyond the run document itself) are reclaimed by
+  [GC](#garbage-collection-and-manifests), and only once *provably* dead
+  for a whole grace window -- both the recorded expiry and the last write
+  older than `gcGraceSeconds`. Locked read-modify-writes run in a worker
   thread so a blocking lock can never freeze the event loop.
 * **Writes never stall scheduling.** Durable writes are fire-and-forget
   background tasks; a failed write is dropped with a warning and counted
@@ -243,8 +244,8 @@ The layout under `<path>/<deploymentId>/`:
 ├── docs/                 # mutable job-facing documents (KV, cursors,
 │                         #   idempotency claims) and dag_run documents
 ├── blobs/                # content-addressed artifact payloads (sha256)
-├── leases/               # lock + lease files (GC'd only when provably dead
-│                         #   for a whole grace window; see the GC section)
+├── leases/               # lock + lease files (only per-run DAG advance
+│                         #   leases are ever GC'd; see the GC section)
 ├── quarantine/           # records quarantined on read
 └── tmp/                  # write-temps, atomically renamed into records/
 ```
@@ -709,10 +710,15 @@ forever. The store cleans up after itself, conservatively, anchored on
   starts one grace window after an upgrade); the blob sweep stands down
   with a logged reason when any artifact stream cannot be enumerated or any
   record read; and a just-written or re-published blob is age-guarded.
-* **Dead leases are reclaimed.** Within the grace window lease files are
-  never touched (a lease file is its fence counter's only home, so fences
-  stay monotonic); a lease whose recorded expiry *and* last write are both
-  older than the grace is deleted along with its `.lock` side-file.
+* **Only per-run DAG advance leases are reclaimed.** A `dagadvance/` lease
+  whose recorded expiry *and* last write are both older than the grace is
+  deleted along with its `.lock` side-file; run keys are unique, so nothing
+  persists such a lease's fence beyond its own run document. Every other
+  lease file (slot, retry claim, election, job lock) is never deleted at
+  any age: their fences persist in durable records, and a reset fence
+  could re-collide with a persisted replace-cancel. Orphaned lock
+  side-files (a document's `.lock` whose document is gone, a bare lease
+  `.lock` without its lease) are swept once idle for a full grace window.
 * The pass also sweeps crashed write-temp files older than a day and
   quarantined records older than the grace.
 * **Never touched:** unrecognised streams and the `meta` stream. A store
