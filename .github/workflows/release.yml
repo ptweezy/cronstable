@@ -698,17 +698,42 @@ jobs:
 
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@v1.14.0
+        with:
+          # Idempotent re-runs: the publish precedes the tag/Release below, so if
+          # a later step fails (e.g. the tag push) the version is already on PyPI.
+          # skip-existing makes re-running the workflow a no-op on the upload
+          # instead of a hard "file already exists" failure, so the tag + Release
+          # can be completed on a retry without burning the version.
+          skip-existing: true
 
       # Everything below runs only after PyPI has accepted the upload.
       - name: Tag the release
         env:
           NEW: ${{ needs.version.outputs.new }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "$NEW" -m "Release $NEW"
-          git push origin "refs/tags/$NEW"
+          # The default GITHUB_TOKEN is the GitHub Actions *App*, and GitHub
+          # forbids an App from pushing a ref that creates/updates any file under
+          # .github/workflows/ unless the token carries the `workflows` scope --
+          # which is NOT grantable to GITHUB_TOKEN. This release tag points at a
+          # commit that may itself modify this workflow, so pushing it with
+          # GITHUB_TOKEN is rejected ("refusing to allow a GitHub App to create or
+          # update workflow ... without workflows permission"). Push instead with
+          # RELEASE_TOKEN -- a PAT or GitHub App token with `workflow` scope
+          # (fine-grained: Contents + Workflows: write) -- exactly like the
+          # cross-repo Homebrew push uses HOMEBREW_TAP_TOKEN. If it is unset we
+          # fall back to GITHUB_TOKEN with a warning (works only when the tagged
+          # commit doesn't touch .github/workflows/).
+          if [ -n "${RELEASE_TOKEN:-}" ]; then
+            git push "https://x-access-token:${RELEASE_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$NEW"
+          else
+            echo "::warning::RELEASE_TOKEN not set; pushing the tag with the default GITHUB_TOKEN. This FAILS if the tagged commit modifies .github/workflows/ -- set RELEASE_TOKEN (Contents + Workflows: write) to fix."
+            git push origin "refs/tags/$NEW"
+          fi
 
       # This job attaches only the fast native binaries (Linux glibc amd64/arm64,
       # macOS, Windows); the musl/i686/emulated arches are attached later by
