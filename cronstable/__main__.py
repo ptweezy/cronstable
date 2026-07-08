@@ -110,6 +110,13 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     jobcli.add_state_job_actions(actions)
     jobcli.add_job_commands(sub)
 
+    # `cronstable mcp`: the MCP stdio bridge. Like the job-facing commands it
+    # is a thin stdlib client of the running daemon (imported lazily so it
+    # never pulls the daemon graph into the CLI import cost).
+    from cronstable import mcpcli
+
+    mcpcli.add_mcp_command(sub)
+
 
 def main_loop(loop):
     parser = argparse.ArgumentParser(prog="cronstable")
@@ -190,6 +197,13 @@ def main_loop(loop):
         from cronstable import jobcli
 
         sys.exit(jobcli.dispatch(args))
+
+    if command == "mcp":
+        # the MCP stdio bridge: a thin stdlib client of the running daemon,
+        # like the job-facing subcommands, so it never imports Cron/aiohttp.
+        from cronstable import mcpcli
+
+        sys.exit(mcpcli.dispatch(args))
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
