@@ -192,8 +192,8 @@ def main_loop(loop):
 
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
-            "cronstable error: configuration file not found, please provide one "
-            "with the --config option",
+            "cronstable error: configuration file not found, please provide "
+            "one with the --config option",
             file=sys.stderr,
         )
         parser.print_help(sys.stderr)
