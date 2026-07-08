@@ -6,7 +6,7 @@ summary, the DAG XCom read, and the metadata-only state inspector
 (``/state``, ``/state/documents``, ``/state/records``) with its redaction and
 guards.  Handlers are called directly with a small mock request, the same
 style as the existing ``test_cron.py`` web tests; the state/dag cases spin a
-real :class:`~yacron2.state.FilesystemStateBackend` in a temp dir like
+real :class:`~cronstable.state.FilesystemStateBackend` in a temp dir like
 ``test_state_dag_run.py``.
 """
 
@@ -17,10 +17,15 @@ import json
 import pytest
 from aiohttp import web
 
-from yacron2.cron import Cron, JobRunInfo, _job_run_info_from_dict, _run_stats
-from yacron2.job import JobOutputStream, JobRetryState
-from yacron2.resources import ResourceUsage
-from yacron2.state import Lease
+from cronstable.cron import (
+    Cron,
+    JobRunInfo,
+    _job_run_info_from_dict,
+    _run_stats,
+)
+from cronstable.job import JobOutputStream, JobRetryState
+from cronstable.resources import ResourceUsage
+from cronstable.state import Lease
 
 _UTC = datetime.timezone.utc
 
@@ -196,17 +201,14 @@ dags:
 
 
 def _state_cfg(yaml):
-    from yacron2.config import parse_config_string
+    from cronstable.config import parse_config_string
 
     return parse_config_string(yaml, "").state_config
 
 
 async def _make_cron(tmp_path, dags_yaml):
     cfg = (
-        "state:\n"
-        "  path: {}\n"
-        "  jobApi:\n"
-        "    enabled: true\n".format(tmp_path)
+        "state:\n  path: {}\n  jobApi:\n    enabled: true\n".format(tmp_path)
     ) + dags_yaml
     cron = Cron(None, config_yaml=cfg)
     cron.web_config = {}
@@ -248,15 +250,13 @@ async def test_web_state_inventory_and_node(tmp_path):
 
 
 async def test_web_state_documents_redacts_kv(tmp_path):
-    from yacron2 import jobstate
+    from cronstable import jobstate
 
     cron = await _make_cron(tmp_path, _STATE_DAG)
     try:
         be = cron.state_backend
         await jobstate.kv_set(be, "myscope", "secret", {"pw": "hunter2"})
-        resp = await cron._web_state_documents(
-            Req(query={"ns": "kv/myscope"})
-        )
+        resp = await cron._web_state_documents(Req(query={"ns": "kv/myscope"}))
         docs = json.loads(resp.text)["documents"]
         assert docs and "value" not in docs[0]
         assert docs[0]["valueType"] == "dict"
@@ -272,9 +272,7 @@ async def test_web_state_records_forbids_logs(tmp_path):
     cron = await _make_cron(tmp_path, _STATE_DAG)
     try:
         with pytest.raises(web.HTTPForbidden):
-            await cron._web_state_records(
-                Req(query={"stream": "logs/etl.a"})
-            )
+            await cron._web_state_records(Req(query={"stream": "logs/etl.a"}))
         # a normal stream is allowed (empty result is fine)
         resp = await cron._web_state_records(
             Req(query={"stream": "runs/nobody"})
@@ -290,7 +288,7 @@ async def test_web_list_dags_enriched(tmp_path):
         resp = await cron._web_list_dags(Req())
         dags = json.loads(resp.text)
         etl = next(d for d in dags if d["name"] == "etl")
-        assert etl["schedule"] == "0 2 * * *"      # grafted by the handler
+        assert etl["schedule"] == "0 2 * * *"  # grafted by the handler
         assert etl["scheduled"] is True
         ids = {t["id"]: t for t in etl["tasks"]}
         assert ids["b"]["dependsOn"] == ["a"]
