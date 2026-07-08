@@ -1,6 +1,6 @@
-"""The durable DAG state machine (pure logic in yacron2.dag).
+"""The durable DAG state machine (pure logic in cronstable.dag).
 
-These tests drive :mod:`yacron2.dag` directly: the transforms are pure
+These tests drive :mod:`cronstable.dag` directly: the transforms are pure
 ``transform(body) -> (new_body, result)`` callables, so a tiny in-test executor
 stands in for the cron driver (apply the claim transform, "launch" each intent,
 mark it finished with a scripted outcome, repeat).  No backend, no clock, no
@@ -17,14 +17,14 @@ import sys
 
 import pytest
 
-import yacron2.__main__
-from yacron2 import dag, jobcli
-from yacron2.config import (
+import cronstable.__main__
+from cronstable import dag, jobcli
+from cronstable.config import (
     ConfigError,
     _validate_cross_sections,
     parse_config_string,
 )
-from yacron2.dag import DagSpec, ExpandSpec, TaskSpec
+from cronstable.dag import DagSpec, ExpandSpec, TaskSpec
 
 _STATE = "state:\n  path: /tmp/x\n"
 
@@ -266,7 +266,7 @@ def test_diamond_fan_in():
     )
     ex = _Executor(
         spec,
-        outcomes={k: True for k in ("root", "left", "right", "join")},
+        outcomes=dict.fromkeys(("root", "left", "right", "join"), True),
     )
     body = ex.run(_body(spec))
     assert body["state"] == dag.SUCCESS
@@ -801,7 +801,8 @@ def test_reconcile_claimed_but_never_launched():
 
 
 def test_reconcile_leaves_sensor_between_pokes(monkeypatch):
-    # a sensor idling between pokes has proc cleared; reconciliation (which runs
+    # a sensor idling between pokes has proc cleared;
+    # reconciliation (which runs
     # at the top of every advance) must NOT touch it, or it would re-poke every
     # pass and defeat the poke schedule.
     spec = _spec(
@@ -877,7 +878,8 @@ def test_run_key_sanitised():
 
 
 # --------------------------------------------------------------------------
-# `yacron2 xcom` CLI (the HTTP seam monkeypatched, like the phase-5 CLI tests)
+# `cronstable xcom` CLI (the HTTP seam monkeypatched, like the phase-5 CLI
+# tests)
 # --------------------------------------------------------------------------
 
 
@@ -895,15 +897,17 @@ class _FakeHTTP:
             {"method": method, "path": path, "query": query, "data": data}
         )
         status, body = self.responses.get(path, (200, {}))
-        payload = body if isinstance(body, bytes) else json.dumps(body).encode()
+        payload = (
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
         return status, {}, payload
 
 
 def _xcom_cli(monkeypatch, argv, http=None, stdin=b""):
-    monkeypatch.setenv("YACRON2_STATE_URL", "http://127.0.0.1:1")
-    monkeypatch.setenv("YACRON2_STATE_TOKEN", "tok")
-    monkeypatch.setenv("YACRON2_DAG_XCOM_SCOPE", "dagxcom/d/rid")
-    monkeypatch.setenv("YACRON2_DAG_TASKKEY", "gen")
+    monkeypatch.setenv("CRONSTABLE_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
+    monkeypatch.setenv("CRONSTABLE_DAG_XCOM_SCOPE", "dagxcom/d/rid")
+    monkeypatch.setenv("CRONSTABLE_DAG_TASKKEY", "gen")
     if http is not None:
         monkeypatch.setattr(jobcli, "_http", http)
 
@@ -917,12 +921,12 @@ def _xcom_cli(monkeypatch, argv, http=None, stdin=b""):
     monkeypatch.setattr(sys, "stdin", _Buf())
     loop = asyncio.new_event_loop()
     try:
-        monkeypatch.setattr(sys, "argv", ["yacron2"] + argv)
+        monkeypatch.setattr(sys, "argv", ["cronstable"] + argv)
         monkeypatch.setattr(
             sys, "exit", lambda code=0: (_ for _ in ()).throw(_ExitError(code))
         )
         with pytest.raises(_ExitError) as ex:
-            yacron2.__main__.main_loop(loop)
+            cronstable.__main__.main_loop(loop)
         return ex.value.args[0]
     finally:
         loop.close()
@@ -973,18 +977,18 @@ def test_xcom_pull_missing_is_exit_4(monkeypatch):
 
 
 def test_xcom_outside_dag_errors(monkeypatch):
-    # no YACRON2_DAG_XCOM_SCOPE -> a clean error, not a traceback
-    monkeypatch.delenv("YACRON2_DAG_XCOM_SCOPE", raising=False)
-    monkeypatch.setenv("YACRON2_STATE_URL", "http://127.0.0.1:1")
-    monkeypatch.setenv("YACRON2_STATE_TOKEN", "tok")
-    monkeypatch.setattr(sys, "argv", ["yacron2", "xcom", "list"])
+    # no CRONSTABLE_DAG_XCOM_SCOPE -> a clean error, not a traceback
+    monkeypatch.delenv("CRONSTABLE_DAG_XCOM_SCOPE", raising=False)
+    monkeypatch.setenv("CRONSTABLE_STATE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
+    monkeypatch.setattr(sys, "argv", ["cronstable", "xcom", "list"])
     monkeypatch.setattr(
         sys, "exit", lambda code=0: (_ for _ in ()).throw(_ExitError(code))
     )
     loop = asyncio.new_event_loop()
     try:
         with pytest.raises(_ExitError) as ex:
-            yacron2.__main__.main_loop(loop)
+            cronstable.__main__.main_loop(loop)
         assert ex.value.args[0] == jobcli.EXIT_ERROR
     finally:
         loop.close()
@@ -1087,9 +1091,7 @@ def test_dag_unknown_dep_is_config_error():
 
 def test_dag_task_needs_command():
     with pytest.raises(ConfigError, match="needs a command"):
-        _dagcfg(
-            "dags:\n  - name: d\n    tasks:\n      - id: a\n"
-        )
+        _dagcfg("dags:\n  - name: d\n    tasks:\n      - id: a\n")
 
 
 def test_dag_approval_needs_no_command():
@@ -1208,8 +1210,12 @@ def test_sensor_repoke_clears_stale_due_instant():
     body, _ = _apply(dag.plan_and_claim(spec, 100.0, "p", "h", {}), body)
     body, _ = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=100.0, task=task,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=100.0,
+            task=task,
         ),
         body,
     )
@@ -1222,8 +1228,12 @@ def test_sensor_repoke_clears_stale_due_instant():
     # its completion re-sets the schedule
     body, _ = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=112.0, task=task,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=112.0,
+            task=task,
         ),
         body,
     )
@@ -1246,9 +1256,15 @@ def test_sensor_completion_poke_fence():
     assert [i.poke_number for i in res.launches] == [0]
     body, applied = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=100.0, task=task,
-            expected_proc="p", expected_attempt=0, expected_poke=0,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=100.0,
+            task=task,
+            expected_proc="p",
+            expected_attempt=0,
+            expected_poke=0,
         ),
         body,
     )
@@ -1261,9 +1277,15 @@ def test_sensor_completion_poke_fence():
     # a stale re-apply of poke 0's completion must NOT touch the live poke
     body, applied = _apply(
         dag.mark_task_finished(
-            "s", success=False, exit_code=1, fail_reason=None,
-            now=112.0, task=task,
-            expected_proc="p", expected_attempt=0, expected_poke=0,
+            "s",
+            success=False,
+            exit_code=1,
+            fail_reason=None,
+            now=112.0,
+            task=task,
+            expected_proc="p",
+            expected_attempt=0,
+            expected_poke=0,
         ),
         body,
     )
@@ -1275,9 +1297,15 @@ def test_sensor_completion_poke_fence():
     # the live poke's own completion (matching poke fence) applies
     body, applied = _apply(
         dag.mark_task_finished(
-            "s", success=True, exit_code=0, fail_reason=None,
-            now=113.0, task=task,
-            expected_proc="p", expected_attempt=0, expected_poke=1,
+            "s",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
+            now=113.0,
+            task=task,
+            expected_proc="p",
+            expected_attempt=0,
+            expected_poke=1,
         ),
         body,
     )
@@ -1292,7 +1320,8 @@ def test_mapped_fanout_item_cap_fails_task_cleanly():
     spec = _spec(
         TaskSpec("gen"),
         TaskSpec(
-            "work", depends_on=("gen",),
+            "work",
+            depends_on=("gen",),
             expand=ExpandSpec(from_task="gen", key="items"),
         ),
         TaskSpec("collect", depends_on=("work",)),
@@ -1324,9 +1353,7 @@ def test_claims_are_batched_per_pass(monkeypatch):
     body, res = _apply(dag.plan_and_claim(spec, 3.0, "p", "h", {}), body)
     assert len(res.launches) == 1
     assert res.deferred is False
-    assert all(
-        _state(body, "t{}".format(i)) == dag.RUNNING for i in range(5)
-    )
+    assert all(_state(body, "t{}".format(i)) == dag.RUNNING for i in range(5))
 
 
 def test_reload_added_dependency_does_not_wedge_run():
@@ -1361,7 +1388,7 @@ def test_reload_added_dependency_does_not_wedge_run():
 def test_finished_task_records_resources():
     # a monitored instance's sampled usage rides mark_task_finished into the
     # task record, and a later attempt's completion overwrites it.
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     spec = _spec(TaskSpec("a", max_attempts=2, retry_delay=0.0))
     body = _body(spec)
@@ -1372,8 +1399,13 @@ def test_finished_task_records_resources():
     assert res.launches[0].task_id == "a"
     body, _ = _apply(
         dag.mark_task_finished(
-            "a", success=False, exit_code=1, fail_reason="x",
-            now=now, task=task, resources=usage1,
+            "a",
+            success=False,
+            exit_code=1,
+            fail_reason="x",
+            now=now,
+            task=task,
+            resources=usage1,
         ),
         body,
     )
@@ -1383,8 +1415,13 @@ def test_finished_task_records_resources():
     usage2 = ResourceUsage(9.0, 1.0, 4096, 8).to_dict()
     body, _ = _apply(
         dag.mark_task_finished(
-            "a", success=True, exit_code=0, fail_reason=None,
-            now=now + 2, task=task, resources=usage2,
+            "a",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
+            now=now + 2,
+            task=task,
+            resources=usage2,
         ),
         body,
     )
@@ -1398,7 +1435,7 @@ def test_finished_task_records_resources():
 def test_unmonitored_task_keeps_resources_none():
     # monitoring off (or nothing captured) -> resources stays None, and a
     # sensor's succeeding poke records its usage.
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     spec = _spec(TaskSpec("a"))
     ex = _Executor(spec, outcomes={"a": True})
@@ -1410,8 +1447,13 @@ def test_unmonitored_task_keeps_resources_none():
     usage = ResourceUsage(0.2, 0.1, 512, 1).to_dict()
     body, _ = _apply(
         dag.mark_task_finished(
-            "s", success=True, exit_code=0, fail_reason=None,
-            now=2.0, task=spec.by_id["s"], resources=usage,
+            "s",
+            success=True,
+            exit_code=0,
+            fail_reason=None,
+            now=2.0,
+            task=spec.by_id["s"],
+            resources=usage,
         ),
         body,
     )
@@ -1422,7 +1464,7 @@ def test_unmonitored_task_keeps_resources_none():
 def test_task_record_without_resources_field_still_parses():
     # backward compat: a pre-feature dag_run document has no "resources" key
     # on its task entries; completing and reading it must not care.
-    from yacron2.resources import ResourceUsage
+    from cronstable.resources import ResourceUsage
 
     spec = _spec(TaskSpec("a"))
     body = _body(spec)
