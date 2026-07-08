@@ -73,6 +73,13 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
+  AI agents (Claude, Cursor, VS Code Copilot). An agent can **observe**
+  cronstable, and **control** it when you opt in. It is read-only by default and
+  exposes tools, resources, and triage prompts covering jobs, DAGs, the
+  cluster/fleet, metrics, and durable state. It is served at `POST /mcp` on the
+  web listeners and through a `cronstable mcp` stdio bridge, and is hand-rolled
+  in pure Python with no new dependencies
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
   metrics), covering run outcomes, durations, retries, schedules, and cluster
   health (see [Metrics](#metrics))
@@ -95,7 +102,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   cluster, from one self-contained page with ten themes and a shortcut for
   everything
 
-[![cronstable web dashboard: a live overview of every job, showing status, live resource usage, owner node, schedule, last run, next-run countdown, and a run-trend sparkline](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-overview.png)](#web-dashboard)
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, and the accessibility options — a colour-vision-safe palette and larger UI scale](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
+
+> The tour above is a single animated image ([WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp); [GIF fallback](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.gif)). Every frame is a real running fleet — see the [web dashboard](#web-dashboard) section for the annotated stills.
 
 ## Quick start
 
@@ -539,6 +548,10 @@ light/dark with `T`. CRT glow, scanlines, compact density, desktop failure
 notifications, audible cues, and the polling interval are all toggles,
 remembered per browser, and the CRT effects honor `prefers-reduced-motion`:
 
+[![The same cronstable board cycling through all ten themes — carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant — and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)
+
+*(One board, ten themes, two interface fonts, animated — [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
+
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
 | [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png) |
@@ -546,6 +559,22 @@ remembered per browser, and the CRT effects honor `prefers-reduced-motion`:
 | Flat modern theme | Carolina, on paper (light) |
 | :---: | :---: |
 | [![The dashboard in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-modern.png) | [![The dashboard in the carolina light (paper) theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-carolina-light.png) |
+
+**Readability and accessibility.** Beyond the themes, the dashboard is built to
+be read comfortably by everyone (all remembered per browser):
+
+* **Interface font** — swap the terminal monospace for a **proportional
+  sans-serif** for easier reading (both shown, per theme, in the animation
+  above); log output and cron strings stay monospace where alignment matters
+  (in Settings, or "Toggle readable font" in the command palette).
+* **UI scale** — zoom the whole interface to **100 / 110 / 125 / 140 %** for
+  larger text without touching your browser zoom.
+* **Colour-vision modes** — **deuteranopia-** and **tritanopia-safe** palettes
+  re-ink the success/failure/pending status colours (and the paper themes get
+  their own tuned variants) so state never rides on red-vs-green alone.
+* **Reduced motion** — the CRT glow, scanlines, flicker and logo spin all honor
+  `prefers-reduced-motion` (and a manual toggle), and status is always carried
+  by glyphs and text, not colour or animation alone.
 
 And because a control room deserves a proper power-on: an optional (on by
 default, once per 12 hours) **BIOS-style boot self-test** that checks the
