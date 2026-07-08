@@ -73,6 +73,13 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   wiki page)
 * Optional HTTP REST API, to fetch status, start jobs, cancel running jobs, and
   read per-job run history on demand
+* Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
+  AI agents (Claude, Cursor, VS Code Copilot). An agent can **observe**
+  cronstable, and **control** it when you opt in. It is read-only by default and
+  exposes tools, resources, and triage prompts covering jobs, DAGs, the
+  cluster/fleet, metrics, and durable state. It is served at `POST /mcp` on the
+  web listeners and through a `cronstable mcp` stdio bridge, and is hand-rolled
+  in pure Python with no new dependencies
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
   metrics), covering run outcomes, durations, retries, schedules, and cluster
   health (see [Metrics](#metrics))

@@ -46,6 +46,7 @@ from cronstable.config import (
     JobConfig,
     JobDefaults,
     LoggingConfig,
+    MCPConfig,
     StateConfig,
     WebConfig,
     cluster_config_warnings,
@@ -249,6 +250,45 @@ TREND_SCAN_LIMIT = 5000
 # Only the UI page itself (which carries no data and no secrets) is public; the
 # browser then authenticates every data request with the token the user enters.
 WEB_PUBLIC_PATHS = frozenset({"/"})
+
+
+class ApiActionError(Exception):
+    """A read/control action that failed with a client-facing reason.
+
+    Carries an HTTP-style ``status`` so the shared payload/action helpers can
+    raise one place and each surface translate it: the aiohttp handlers into
+    the matching ``web.HTTP*`` response, and the MCP layer into an ``isError``
+    tool result the model can read and correct.
+    """
+
+    def __init__(self, message: str, *, status: int = 400) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def _http_for_action_error(
+    ex: "ApiActionError", headers: Optional[Any] = None
+) -> web.HTTPException:
+    """Map an :class:`ApiActionError` to the matching aiohttp response.
+
+    ``headers`` (the operator's ``web.headers``) is applied where the pre-MCP
+    handlers applied it -- the ``409`` conflict bodies of the job start/cancel
+    routes -- and omitted elsewhere, preserving the documented behavior.
+    """
+    status_map = {
+        400: web.HTTPBadRequest,
+        403: web.HTTPForbidden,
+        404: web.HTTPNotFound,
+        409: web.HTTPConflict,
+    }
+    factory = status_map.get(ex.status, web.HTTPBadRequest)
+    # HTTPNotFound rejects a text argument in some aiohttp versions only when
+    # the body would conflict; passing the reason as text is supported by all
+    # of these 4xx exceptions and gives the caller the actual cause.
+    if headers is not None:
+        return factory(text=ex.message, headers=headers)
+    return factory(text=ex.message)
 
 # Defense-in-depth security headers for the dashboard HTML document. The
 # page is fully self-contained (one inline <script>, inline styles, no
@@ -733,6 +773,11 @@ class Cron:
         self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
+        # the optional MCP server config and its handler. Both track the web
+        # app's lifecycle: the handler is (re)built inside start_stop_web_app
+        # so it always reflects the current config after a reload.
+        self.mcp_config = None  # type: Optional[MCPConfig]
+        self._mcp = None  # type: Optional[Any]
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
         # optional gossip observability overlay: a SECOND, election-inert
@@ -975,7 +1020,9 @@ class Cron:
                     # every reload iteration. The cluster gate must engage
                     # regardless of the web app's fate.
                     try:
-                        await self.start_stop_web_app(config.web_config)
+                        await self.start_stop_web_app(
+                            config.web_config, config.mcp_config
+                        )
                     except ConfigError as err:
                         logger.error(
                             "Error in the web configuration, so not starting "
@@ -1342,13 +1389,14 @@ class Cron:
             )
         return web.Response(text=job_set, headers=headers)
 
-    async def _web_get_cluster(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+    def cluster_payload(self) -> Dict[str, Any]:
+        """This node's cluster/leadership view.
+
+        Behind ``GET /cluster`` and MCP ``cron_get_cluster``.
+        ``enabled: false`` when no cluster section is configured.
+        """
         if self.cluster_manager is None:
-            return web.json_response(
-                {"enabled": False, "peers": []}, headers=headers
-            )
+            return {"enabled": False, "peers": []}
         payload = dict(self.cluster_manager.view_dict())
         payload["enabled"] = True
         # lease backends (kubernetes/etcd/filesystem) have no fleet view of
@@ -1363,7 +1411,14 @@ class Cron:
         # share theirs. Peer load rides view_dict's per-peer node_stats (only
         # populated when the cluster shares node stats -- observability).
         payload["node_stats"] = self.node_resource_snapshot()
-        return web.json_response(payload, headers=headers)
+        return payload
+
+    async def _web_get_cluster(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        return web.json_response(
+            self.cluster_payload(),
+            headers=self.web_config.get("headers", None),
+        )
 
     async def _web_get_fleet(self, request: web.Request) -> web.Response:
         """The cluster-wide per-job run view (the dashboard's fleet view).
@@ -1378,17 +1433,25 @@ class Cron:
         overlay); the dashboard then hides its fleet view.
         """
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        return web.json_response(
+            self.fleet_payload(), headers=self.web_config.get("headers", None)
+        )
+
+    def fleet_payload(self) -> Dict[str, Any]:
+        """The cluster-wide per-job run view.
+
+        Behind ``GET /fleet`` and MCP ``cron_get_fleet``.
+        ``enabled: false`` when there is no cluster, or the backend has no
+        node-to-node channel to have carried summaries.
+        """
         # the overlay mesh when a lease cluster opted into observability, else
         # the leadership backend (gossip provides the view; lease backends
         # return None -> feature unavailable).
         mgr = self._fleet_backend()
         fleet = mgr.fleet_view() if mgr is not None else None
         if fleet is None:
-            return web.json_response(
-                {"enabled": False, "nodes": []}, headers=headers
-            )
-        return web.json_response(fleet, headers=headers)
+            return {"enabled": False, "nodes": []}
+        return fleet
 
     async def _web_get_node(self, request: web.Request) -> web.Response:
         """This node's live CPU/memory (the dashboard's node readout).
@@ -1400,7 +1463,17 @@ class Cron:
         not read the host); the dashboard then hides the node meter.
         """
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        return web.json_response(
+            self.node_payload(), headers=self.web_config.get("headers", None)
+        )
+
+    def node_payload(self, history: bool = False) -> Dict[str, Any]:
+        """This node's live CPU/memory (`GET /node`, MCP `cron_get_node`).
+
+        ``resources`` is ``None`` when sampling is unavailable.  With
+        ``history=True`` a ``history`` block (the retained ring the dashboard
+        chart uses) rides along.
+        """
         # the cluster node name when clustered, else the plain hostname the
         # durable-state layer already uses as this node's identity.
         mgr = self.cluster_manager
@@ -1409,13 +1482,18 @@ class Cron:
             if mgr is not None and getattr(mgr, "node_name", None)
             else self._state_host
         )
-        return web.json_response(
-            {
-                "node_name": node_name,
-                "resources": self._node_sampler.snapshot(),
-            },
-            headers=headers,
-        )
+        payload: Dict[str, Any] = {
+            "node_name": node_name,
+            "resources": self._node_sampler.snapshot(),
+        }
+        if history:
+            hist = self._node_sampler.history()
+            payload["history"] = {
+                "enabled": hist is not None,
+                "interval": hist["interval"] if hist is not None else None,
+                "points": hist["points"] if hist is not None else [],
+            }
+        return payload
 
     async def _web_node_history(self, request: web.Request) -> web.Response:
         """The node's retained CPU/memory history (the dashboard node chart).
@@ -1469,8 +1547,11 @@ class Cron:
         )
         return web.Response(body=body.encode("utf-8"), headers=headers)
 
-    async def _web_get_status(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
+    def status_payload(self) -> List[Dict[str, Any]]:
+        """Per-job status rows (running / disabled / scheduled).
+
+        The data behind ``GET /status`` and the MCP ``cron_get_status`` tool.
+        """
         # the old cron library's untyped next() left this list's value type
         # as Any; the in-house engine types it Optional[float], so spell out
         # the mixed-shape rows explicitly.
@@ -1507,6 +1588,11 @@ class Cron:
                         ),
                     }
                 )
+        return out
+
+    async def _web_get_status(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        out = self.status_payload()
         if request.headers.get("Accept") == "application/json":
             return web.json_response(
                 out, headers=self.web_config.get("headers", None)
@@ -1538,19 +1624,24 @@ class Cron:
                 headers=self.web_config.get("headers", None),
             )
 
-    async def _web_start_job(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
-        name = request.match_info["name"]
+    async def start_job_by_name(self, name: str) -> None:
+        """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
+
+        Raises :class:`ApiActionError` for an unknown (404) or disabled (409)
+        job; otherwise honours the job's concurrencyPolicy exactly as the
+        scheduler would.
+        """
         try:
             job = self.cron_jobs[name]
         except KeyError as ex:
-            raise web.HTTPNotFound() from ex
+            raise ApiActionError(
+                "job {!r} not found".format(name), status=404
+            ) from ex
         if not job.enabled:
             # a disabled job behaves "as if it isn't there"; refuse to launch
             # it manually rather than silently overriding the config.
-            raise web.HTTPConflict(
-                text="job {!r} is disabled".format(name),
-                headers=self.web_config.get("headers", None),
+            raise ApiActionError(
+                "job {!r} is disabled".format(name), status=409
             )
         # A manual start of a job still pending as a deferred @reboot one-shot
         # IS its boot run: retire the pending entry and record the run with
@@ -1576,20 +1667,24 @@ class Cron:
                     name,
                 )
         await self.maybe_launch_job(job)
-        return web.Response(headers=self.web_config.get("headers", None))
 
-    async def _web_cancel_job(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
-        name = request.match_info["name"]
+    async def cancel_job_by_name(self, name: str) -> int:
+        """Cancel a job's running instances; return how many were signalled.
+
+        Behind ``POST /jobs/{name}/cancel`` and MCP ``cron_cancel_job``.
+        Raises :class:`ApiActionError` for an unknown (404) or not-running
+        (409) job.
+        """
         if name not in self.cron_jobs:
-            raise web.HTTPNotFound()
+            raise ApiActionError(
+                "job {!r} not found".format(name), status=404
+            )
         running = list(self.running_jobs.get(name) or [])
         if not running:
             # nothing to cancel: report a conflict rather than a silent no-op
-            # so the dashboard can tell the user the job was not running.
-            raise web.HTTPConflict(
-                text="job {!r} is not running".format(name),
-                headers=self.web_config.get("headers", None),
+            # so the caller can tell the user the job was not running.
+            raise ApiActionError(
+                "job {!r} is not running".format(name), status=409
             )
         for runjob in running:
             # mark before cancelling so the reaper records this as a deliberate
@@ -1600,7 +1695,34 @@ class Cron:
         await asyncio.gather(
             *(rj.cancel() for rj in running if rj.proc is not None)
         )
+        return len(running)
+
+    async def _web_start_job(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        try:
+            await self.start_job_by_name(request.match_info["name"])
+        except ApiActionError as ex:
+            raise self._action_http_error(ex) from ex
         return web.Response(headers=self.web_config.get("headers", None))
+
+    async def _web_cancel_job(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        try:
+            await self.cancel_job_by_name(request.match_info["name"])
+        except ApiActionError as ex:
+            raise self._action_http_error(ex) from ex
+        return web.Response(headers=self.web_config.get("headers", None))
+
+    def _action_http_error(
+        self, ex: "ApiActionError"
+    ) -> web.HTTPException:
+        # historical parity: web.headers ride the 409 conflict bodies of the
+        # start/cancel routes, but NOT their 404 (unknown job).
+        assert self.web_config is not None
+        headers = (
+            self.web_config.get("headers", None) if ex.status == 409 else None
+        )
+        return _http_for_action_error(ex, headers)
 
     def _security_headers(self) -> Dict[str, str]:
         """Security headers for the dashboard HTML page.
@@ -1799,14 +1921,24 @@ class Cron:
                 )
         return result
 
-    async def _web_list_jobs(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
-        out = [
+    def jobs_payload(self) -> List[Dict[str, Any]]:
+        """Full per-job dicts for ``GET /jobs`` and MCP ``cron_list_jobs``."""
+        return [
             self._job_to_dict(name, job)
             for name, job in self.cron_jobs.items()
         ]
+
+    def job_detail_payload(self, name: str) -> Optional[Dict[str, Any]]:
+        """One job's full dict, or ``None`` when there is no such job."""
+        job = self.cron_jobs.get(name)
+        if job is None:
+            return None
+        return self._job_to_dict(name, job)
+
+    async def _web_list_jobs(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
         return web.json_response(
-            out, headers=self.web_config.get("headers", None)
+            self.jobs_payload(), headers=self.web_config.get("headers", None)
         )
 
     # --- DAG introspection + control --------------------------------------
@@ -1815,7 +1947,8 @@ class Cron:
         assert self.web_config is not None
         return self.web_config.get("headers", None)
 
-    async def _web_list_dags(self, request: web.Request) -> web.Response:
+    async def dags_payload(self) -> List[Dict[str, Any]]:
+        """Configured DAGs + tasks (`GET /dags`, MCP `cron_list_dags`)."""
         dags = await self._dag.list_dags()
         # graft the human-readable schedule string here (schedule_str lives in
         # this module; dagrun cannot import it without a cycle).
@@ -1823,7 +1956,12 @@ class Cron:
             cfg = self.cron_dags.get(entry["name"])
             if cfg is not None and cfg.schedule_job is not None:
                 entry["schedule"] = schedule_str(cfg.schedule_job)
-        return web.json_response(dags, headers=self._web_headers())
+        return dags
+
+    async def _web_list_dags(self, request: web.Request) -> web.Response:
+        return web.json_response(
+            await self.dags_payload(), headers=self._web_headers()
+        )
 
     async def _web_dag_runs(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -1854,19 +1992,24 @@ class Cron:
     # --- durable state inspector (metadata-only) --------------------------
 
     async def _web_state(self, request: web.Request) -> web.Response:
-        """Store health + topology for the dashboard's state inspector.
-
-        Metadata only: per-prefix stream/document counts, capped scope lists,
-        and active leases -- never a record payload or a KV value.  Also
-        carries THIS node's live retry ladder and held concurrency slots
-        (the freshest source, straight from memory).  ``enabled: false`` when
-        no state backend is configured, so the inspector hides itself.
-        """
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        return web.json_response(
+            await self.state_payload(),
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def state_payload(self) -> Dict[str, Any]:
+        """Store health + topology for the state inspector, metadata only.
+
+        Per-prefix stream/document counts, capped scope lists, and active
+        leases -- never a record payload or a KV value.  Also carries THIS
+        node's live retry ladder and held concurrency slots (straight from
+        memory).  ``enabled: false`` when no state backend is configured.
+        Behind ``GET /state`` and MCP ``cron_inspect_state``.
+        """
         backend = self.state_backend
         if backend is None:
-            return web.json_response({"enabled": False}, headers=headers)
+            return {"enabled": False}
         try:
             inv = await asyncio.wait_for(
                 backend.inventory(), timeout=STATE_OP_TIMEOUT
@@ -1913,24 +2056,24 @@ class Cron:
                 for slot_name, lease in self._slot_leases.items()
             ],
         }
-        return web.json_response(inv, headers=headers)
+        return inv
 
-    async def _web_state_documents(self, request: web.Request) -> web.Response:
-        """The documents of one KV/cursor/idempotency namespace, redacted.
+    async def state_documents_payload(self, ns: str) -> Dict[str, Any]:
+        """Documents of one KV/cursor/idempotency namespace, redacted.
 
         KV values are stripped to a ``valueSize``/``valueType`` summary
         (metadata-only stance); cursor watermarks and idempotency claim
-        metadata are returned verbatim (no user secret there).
+        metadata are returned verbatim (no user secret there).  Behind
+        ``GET /state/documents`` and MCP ``cron_inspect_state``.  Raises
+        :class:`ApiActionError` when there is no store or ``ns`` is not an
+        inspectable namespace.
         """
-        assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
         backend = self.state_backend
         if backend is None:
-            raise web.HTTPNotFound()
-        ns = request.query.get("ns", "")
+            raise ApiActionError("state store is not configured", status=404)
         if not ns.startswith(("kv/", "cursor/", "idem/")):
-            raise web.HTTPBadRequest(
-                text="ns must be a kv/, cursor/ or idem/ namespace"
+            raise ApiActionError(
+                "ns must be a kv/, cursor/ or idem/ namespace", status=400
             )
         try:
             docs = await asyncio.wait_for(
@@ -1962,33 +2105,43 @@ class Cron:
                 out.append(summary)
             else:
                 out.append(doc)
+        return {"namespace": ns, "documents": out}
+
+    async def _web_state_documents(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        try:
+            payload = await self.state_documents_payload(
+                request.query.get("ns", "")
+            )
+        except ApiActionError as ex:
+            raise _http_for_action_error(ex) from ex
         return web.json_response(
-            {"namespace": ns, "documents": out}, headers=headers
+            payload, headers=self.web_config.get("headers", None)
         )
 
-    async def _web_state_records(self, request: web.Request) -> web.Response:
-        """The newest records of one stream, metadata-only.
+    async def state_records_payload(
+        self, stream: str, limit: int = 100
+    ) -> Dict[str, Any]:
+        """Newest records of one stream, metadata-only.
 
         Archived-output (``logs/``) streams are refused: they carry raw job
-        output, which the metadata-only stance keeps off this surface.
+        output, which the metadata-only stance keeps off this surface.  Behind
+        ``GET /state/records`` and MCP ``cron_inspect_state``.  Raises
+        :class:`ApiActionError` for a missing store, empty stream, or a log
+        stream.
         """
-        assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
         backend = self.state_backend
         if backend is None:
-            raise web.HTTPNotFound()
-        stream = request.query.get("stream", "")
+            raise ApiActionError("state store is not configured", status=404)
         if not stream:
-            raise web.HTTPBadRequest(text="a stream is required")
+            raise ApiActionError("a stream is required", status=400)
         if stream.startswith("logs/") or stream == "logs":
             # archived job output: raw content, excluded from the metadata
             # inspector on purpose.
-            raise web.HTTPForbidden(
-                text="log streams carry raw output and are not inspectable"
+            raise ApiActionError(
+                "log streams carry raw output and are not inspectable",
+                status=403,
             )
-        limit = self._web_int_query(
-            request, "limit", default=100, lo=1, hi=500
-        )
         try:
             recs = await asyncio.wait_for(
                 backend.list_records(stream, limit=limit, newest_first=True),
@@ -1998,8 +2151,21 @@ class Cron:
             raise
         except Exception:  # noqa: BLE001 - degrade to empty
             recs = []
+        return {"stream": stream, "records": recs}
+
+    async def _web_state_records(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        limit = self._web_int_query(
+            request, "limit", default=100, lo=1, hi=500
+        )
+        try:
+            payload = await self.state_records_payload(
+                request.query.get("stream", ""), limit=limit
+            )
+        except ApiActionError as ex:
+            raise _http_for_action_error(ex) from ex
         return web.json_response(
-            {"stream": stream, "records": recs}, headers=headers
+            payload, headers=self.web_config.get("headers", None)
         )
 
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
@@ -2072,19 +2238,28 @@ class Cron:
             raise web.HTTPBadRequest(text="request body must be a JSON object")
         return body
 
+    def job_runs_payload(self, name: str) -> Optional[Dict[str, Any]]:
+        """Retained run history + stats for one job, or ``None`` if unknown.
+
+        Behind ``GET /jobs/{name}/runs`` and MCP ``cron_list_runs``.
+        """
+        if name not in self.cron_jobs:
+            return None
+        runs = list(self.run_history.get(name) or [])
+        return {
+            "name": name,
+            "runs": [r.to_dict() for r in runs],  # oldest first
+            "stats": _run_stats(runs),
+        }
+
     async def _web_job_runs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         name = request.match_info["name"]
-        if name not in self.cron_jobs:
+        payload = self.job_runs_payload(name)
+        if payload is None:
             raise web.HTTPNotFound()
-        runs = list(self.run_history.get(name) or [])
         return web.json_response(
-            {
-                "name": name,
-                "runs": [r.to_dict() for r in runs],  # oldest first
-                "stats": _run_stats(runs),
-            },
-            headers=self.web_config.get("headers", None),
+            payload, headers=self.web_config.get("headers", None)
         )
 
     async def _web_job_resources(self, request: web.Request) -> web.Response:
@@ -2102,12 +2277,27 @@ class Cron:
         """
         assert self.web_config is not None
         name = request.match_info["name"]
-        job = self.cron_jobs.get(name)
-        if job is None:
-            raise web.HTTPNotFound()
         max_runs = self._web_int_query(
             request, "runs", default=20, lo=0, hi=RUN_HISTORY_LIMIT
         )
+        payload = self.job_resources_payload(name, max_runs)
+        if payload is None:
+            raise web.HTTPNotFound()
+        return web.json_response(
+            payload, headers=self.web_config.get("headers", None)
+        )
+
+    def job_resources_payload(
+        self, name: str, max_runs: int
+    ) -> Optional[Dict[str, Any]]:
+        """CPU/RSS series for a job's live + recent runs, or ``None``.
+
+        Behind ``GET /jobs/{name}/resources`` and MCP
+        ``cron_get_job_resources``.  ``max_runs`` caps the recorded-run tail.
+        """
+        job = self.cron_jobs.get(name)
+        if job is None:
+            return None
         live = []
         for runjob in self.running_jobs.get(name) or []:
             series = runjob.live_resource_series()
@@ -2134,16 +2324,13 @@ class Cron:
             r.to_dict(include_series=True)
             for r in monitored[len(monitored) - max_runs :]
         ]
-        return web.json_response(
-            {
-                "name": name,
-                "monitored": bool(job.monitorResources),
-                "interval": job.monitorResourcesInterval,
-                "live": live,
-                "runs": runs,
-            },
-            headers=self.web_config.get("headers", None),
-        )
+        return {
+            "name": name,
+            "monitored": bool(job.monitorResources),
+            "interval": job.monitorResourcesInterval,
+            "live": live,
+            "runs": runs,
+        }
 
     async def _web_job_trends(self, request: web.Request) -> web.Response:
         """SLA trend aggregates over the durable run ledger.
@@ -2158,8 +2345,22 @@ class Cron:
         """
         assert self.web_config is not None
         name = request.match_info["name"]
-        if name not in self.cron_jobs:
+        payload = await self.job_trends_payload(name)
+        if payload is None:
             raise web.HTTPNotFound()
+        return web.json_response(
+            payload, headers=self.web_config.get("headers", None)
+        )
+
+    async def job_trends_payload(
+        self, name: str
+    ) -> Optional[Dict[str, Any]]:
+        """SLA trend aggregates over the durable run ledger, or ``None``.
+
+        Behind ``GET /jobs/{name}/trends`` and MCP ``cron_get_job_trends``.
+        """
+        if name not in self.cron_jobs:
+            return None
         infos: List[JobRunInfo] = []
         source = "memory"
         backend = self.state_backend
@@ -2204,15 +2405,12 @@ class Cron:
             ]
             windows[label] = _run_stats(recent)
         windows["all"] = _run_stats(infos)
-        return web.json_response(
-            {
-                "name": name,
-                "source": source,
-                "generated_at": now.isoformat(),
-                "windows": windows,
-            },
-            headers=self.web_config.get("headers", None),
-        )
+        return {
+            "name": name,
+            "source": source,
+            "generated_at": now.isoformat(),
+            "windows": windows,
+        }
 
     def _job_output(self, name: str) -> Optional[JobOutputStream]:
         # the live output of the most recent running instance, else the last
@@ -2296,6 +2494,77 @@ class Cron:
         finally:
             output.unsubscribe(queue)
 
+    @staticmethod
+    def _tail_payload(
+        output: Optional[JobOutputStream],
+        tail: int,
+        cursor: Optional[int],
+    ) -> Dict[str, Any]:
+        """Poll-friendly snapshot of a retained output buffer.
+
+        The non-streaming counterpart of :meth:`_pump_output`, backing the MCP
+        log-tail tools (a client polls with the returned ``cursor`` to fetch
+        only newly appended lines).  Without a ``cursor`` returns the last
+        ``tail`` lines; with one, the lines after that offset (capped at
+        ``tail``).  ``cursor`` is a line offset into the bounded in-memory
+        buffer, so after the buffer rotates it can only ever skip forward,
+        never resurrect dropped lines.
+        """
+        lines = list(output.lines) if output is not None else []
+        total = len(lines)
+        if cursor is None:
+            start = max(0, total - tail)
+        else:
+            start = min(max(cursor, 0), total)
+        selected = lines[start : start + tail]
+        return {
+            "lines": [
+                {"stream": stream, "line": line} for stream, line in selected
+            ],
+            "cursor": start + len(selected),
+            # older retained lines exist above what we returned (only
+            # meaningful on a cursor-less "give me the tail" call).
+            "truncated": cursor is None and start > 0,
+        }
+
+    def job_logs_tail_payload(
+        self, name: str, tail: int = 100, cursor: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Last retained log lines of a job, or ``None`` if unknown.
+
+        Behind MCP ``cron_tail_job_logs`` -- the poll/cursor projection of the
+        SSE stream at ``GET /jobs/{name}/logs``.
+        """
+        if name not in self.cron_jobs:
+            return None
+        payload = self._tail_payload(self._job_output(name), tail, cursor)
+        payload["name"] = name
+        payload["running"] = bool(self.running_jobs.get(name))
+        return payload
+
+    def dag_task_logs_tail_payload(
+        self,
+        dag: str,
+        run_key: str,
+        taskkey: str,
+        tail: int = 100,
+        cursor: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Last retained log lines of a running DAG task instance, or ``None``.
+
+        Behind MCP ``cron_tail_dag_task_logs``.  Only a currently-running
+        instance has a reachable buffer (a finished task's output is not
+        retained under the template name), so ``lines`` is empty once it ends.
+        """
+        if dag not in self.cron_dags:
+            return None
+        output = self._dag_task_output(dag, run_key, taskkey)
+        payload = self._tail_payload(output, tail, cursor)
+        payload["dag"] = dag
+        payload["run_key"] = run_key
+        payload["taskkey"] = taskkey
+        return payload
+
     async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:
         assert self.web_config is not None
         name = request.match_info["name"]
@@ -2338,9 +2607,18 @@ class Cron:
         await self._pump_output(resp, output)
         return resp
 
-    async def start_stop_web_app(self, web_config: Optional[WebConfig]):
+    async def start_stop_web_app(
+        self,
+        web_config: Optional[WebConfig],
+        mcp_config: Optional[MCPConfig] = None,
+    ):
         if self.web_runner is not None and (
-            web_config is None or web_config != self.web_config
+            web_config is None
+            or web_config != self.web_config
+            # an mcp-only change (e.g. readOnly flipped, a toolset added) must
+            # also restart the app: the /mcp route set is fixed at build time,
+            # so it only picks up config through a fresh routes list.
+            or mcp_config != self.mcp_config
         ):
             # assert self.web_runner is not None
             logger.info("Stopping http server")
@@ -2406,6 +2684,21 @@ class Cron:
                 web.get("/state/documents", self._web_state_documents),
                 web.get("/state/records", self._web_state_records),
             ]
+            # The MCP server (POST /mcp) rides these same listeners and the
+            # auth middleware above -- /mcp is NEVER added to `public`, so it
+            # inherits the bearer-token gate. Built here (not in __init__) so a
+            # reload rebuilds it against the current config. The fail-closed
+            # no-token-on-a-routable-listener check ran at parse time
+            # (config._validate_mcp_config); this only wires it up.
+            self._mcp = None
+            if mcp_config is not None and mcp_config.get("enabled"):
+                from cronstable.mcp import MCPHandler
+
+                self._mcp = MCPHandler(self, mcp_config)
+                routes.append(web.post("/mcp", self._mcp.handle_http))
+                routes.append(web.get("/mcp", self._mcp.handle_http_get))
+                routes.append(web.options("/mcp", self._mcp.handle_options))
+                logger.info("mcp: serving the MCP endpoint at POST /mcp")
             if metrics_config is not None:
                 # buckets apply from here on; a changed bucket set restarts
                 # the histograms (an ordinary counter reset to Prometheus).
@@ -2433,6 +2726,7 @@ class Cron:
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
             self.web_config = web_config
+            self.mcp_config = mcp_config
 
         # Node history sampling follows the web API's lifecycle: the ring
         # only feeds the dashboard's node chart, so it runs whenever the web
