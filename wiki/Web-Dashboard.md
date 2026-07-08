@@ -431,6 +431,9 @@ The settings panel (and the command palette) expose:
 - **Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor), amber and green **phosphor CRT**, plus flat **modern** and **standard** looks, each in a dark (phosphor) and a light (paper) variant — the light ones trade the glass-black glow for dark ink on tinted paper, and **standard** is the plain white-and-saturated-color look. Cycle hues with `t`; flip light/dark with `T`.
 - **CRT effects** (phosphor glow, vignette, and a subtle flicker) and **scanlines**, each toggleable. They apply only to the CRT themes (much softer on the paper variants) and automatically respect `prefers-reduced-motion`.
 - **Compact density** for tighter rows.
+- An **interface font** choice: the terminal monospace (default) or a proportional sans-serif that is easier on the eyes for long reading. Log output, cron expressions, and keycaps stay monospace either way, and numerals stay tabular so the clocks don't jitter.
+- A **UI scale** of 100% / 110% / 125% / 140% that enlarges the whole dashboard — handy for wallboard TVs viewed from across the room, too.
+- A **reduce motion** switch that stops the spinners, pulsing status dots, flicker, and the boot self-test without touching your OS preference (`prefers-reduced-motion` is always honored regardless).
 - **Desktop notifications** that fire when a job fails (after you grant the browser permission).
 - A **refresh interval** of 1s / 2s / 3s / 5s / 10s, or paused.
 - The **zen screensaver** toggle and its idle delay, for the [wallboard](#wallboard--tv-mode).
