@@ -46,6 +46,7 @@ logger = logging.getLogger("cronstable.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
 ClusterConfig = NewType("ClusterConfig", Dict[str, Any])
 StateConfig = NewType("StateConfig", Dict[str, Any])
+MCPConfig = NewType("MCPConfig", Dict[str, Any])
 JobDefaults = NewType("JobDefaults", Dict[str, Any])
 LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
 
@@ -226,6 +227,57 @@ DEFAULT_JOB_API: Dict[str, Any] = {
     # plaintext HTTP, so binding it to a routable interface without this set
     # would serve them to anything that can reach the port.
     "allowNonLoopbackBind": False,
+}
+
+# The toolsets the MCP server groups its tools into (see cronstable.mcp). The
+# read-only `observe` set is the default; `act` (mutating job/DAG control),
+# `dags` (DAG introspection) and `state` (durable-state inspection) are opt-in.
+MCP_TOOLSETS = ("observe", "act", "dags", "state")
+
+# Defaults for the optional `mcp:` section. The server is served on the `web:`
+# listeners (it reuses their auth + lifecycle), so it is inert without a `web`
+# section; `enabled` defaults false so a plain install pays nothing. See
+# cronstable.mcp.
+DEFAULT_MCP: Dict[str, Any] = {
+    # serve the Model Context Protocol endpoint (POST /mcp) on the web
+    # listeners, and expose the `cronstable mcp` stdio bridge. Off by default.
+    "enabled": False,
+    # strip every mutating tool (run/cancel a job, trigger/backfill a DAG,
+    # decide an approval gate). On by default: an agent gets read-only access
+    # unless the operator deliberately opts into control. Takes precedence over
+    # `toolsets` -- `act` is suppressed while this is true.
+    "readOnly": True,
+    # which tool groups to expose. `observe` (read-only job/cluster/metrics
+    # views) is the safe default; add `dags`, `state`, and -- with
+    # readOnly:false -- `act`.
+    "toolsets": ["observe"],
+    # exact-match browser Origins allowed to call /mcp. Empty (default) serves
+    # non-browser clients only: a present Origin not on this list is refused
+    # (403, a DNS-rebinding defense); a non-empty list additionally answers
+    # CORS preflight with a scoped Access-Control-Allow-Origin.
+    "allowedOrigins": [],
+    # serve /mcp on a routable listener even when no web.authToken is set.
+    # Fail-closed default (false): with no token the app has no auth middleware
+    # at all, so an enabled /mcp on a non-loopback address would be wide open.
+    # Set true only when the endpoint is protected by other means (an
+    # mTLS-terminating reverse proxy, a network policy).
+    "allowUnauthenticated": False,
+    # expose MCP resources (URI-addressable read-only context, e.g.
+    # cronstable://status) and prompts (canned triage playbooks). Both are
+    # read-only and safe; turn either off for a tools-only profile or a client
+    # that mishandles them. Their scope follows `toolsets` (a dag resource is
+    # served only when the `dags` toolset is on, etc).
+    "resources": True,
+    "prompts": True,
+    # optional free-text `instructions` surfaced to the client at initialize
+    # (a short operator note on how to use this server). None omits it.
+    "instructions": None,
+    # ceiling on any list tool's `limit`; a larger request is capped (never an
+    # error) and an opaque cursor is offered for the rest.
+    "maxRows": 200,
+    # cap (bytes) on a single /mcp request body. Tool arguments arrive from an
+    # LLM, so an oversized POST is refused (413) rather than buffered.
+    "maxBodyBytes": 1024 * 1024,
 }
 
 
@@ -716,6 +768,26 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("points"): Int(),
                     }
                 ),
+            }
+        ),
+        # Optional MCP (Model Context Protocol) server: expose jobs, DAGs,
+        # cluster/fleet, metrics and durable state to AI agents as MCP tools,
+        # served on the web listeners (POST /mcp) and over a stdio bridge.
+        # Every field is optional; defaults live in DEFAULT_MCP. Off unless
+        # `enabled: true`. See cronstable.mcp.
+        Opt("mcp"): EmptyDict()
+        | Map(
+            {
+                Opt("enabled"): Bool(),
+                Opt("readOnly"): Bool(),
+                Opt("toolsets"): Seq(Enum(list(MCP_TOOLSETS))),
+                Opt("allowedOrigins"): Seq(Str()),
+                Opt("allowUnauthenticated"): Bool(),
+                Opt("resources"): Bool(),
+                Opt("prompts"): Bool(),
+                Opt("instructions"): EmptyNone() | Str(),
+                Opt("maxRows"): Int(),
+                Opt("maxBodyBytes"): Int(),
             }
         ),
         # Optional cluster section: gate scheduled jobs on a leadership
@@ -2701,6 +2773,92 @@ def _validate_web_config(webconf: WebConfig) -> None:
         previous = bound
 
 
+def _build_mcp_config(raw: Optional[dict]) -> MCPConfig:
+    """Fill the optional ``mcp:`` section over :data:`DEFAULT_MCP`.
+
+    An absent or empty block yields the defaults (the server disabled), so a
+    bare ``mcp: {}`` is inert.  Cross-section constraints that also need the
+    web section (the fail-closed no-auth check) live in
+    :func:`_validate_mcp_config`, run once on the fully assembled config.
+    """
+    merged: Dict[str, Any] = {**DEFAULT_MCP, **(raw or {})}
+    # dedupe toolsets while preserving order, so `[observe, observe]` is one.
+    seen: set = set()
+    toolsets: List[str] = []
+    for name in merged["toolsets"]:
+        if name not in seen:
+            seen.add(name)
+            toolsets.append(name)
+    merged["toolsets"] = toolsets
+    if merged["maxRows"] < 1:
+        raise ConfigError("mcp.maxRows must be >= 1")
+    if merged["maxBodyBytes"] < 1:
+        raise ConfigError("mcp.maxBodyBytes must be >= 1")
+    return MCPConfig(merged)
+
+
+def _is_local_listener(addr: str) -> bool:
+    """True if a web ``listen`` address is loopback-only or a unix socket.
+
+    These are the addresses on which an unauthenticated ``/mcp`` is
+    acceptable -- nothing off-host can reach them; every other address is
+    routable and must carry authentication (see :func:`_validate_mcp_config`).
+    """
+    text = addr if "://" in addr else "http://" + addr
+    parsed = urlparse(text)
+    if parsed.scheme == "unix":
+        return True
+    host = (parsed.hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_mcp_config(config: "CronstableConfig") -> None:
+    """Fail-closed checks for the MCP server that also need the web section.
+
+    Runs at the top-level parse (from :func:`_validate_cross_sections`), where
+    the web and mcp sections are both fully merged -- an ``mcp`` block and the
+    ``web`` listeners it rides on may legitimately live in different
+    config-directory files.
+    """
+    mcp = config.mcp_config
+    if mcp is None or not mcp.get("enabled"):
+        return
+    web = config.web_config
+    if web is None or not web.get("listen"):
+        raise ConfigError(
+            "mcp.enabled requires a `web` section with at least one `listen` "
+            "address: the MCP endpoint (POST /mcp) is served on the web "
+            "listeners"
+        )
+    # An mcp block that names `act` but leaves readOnly on gets read-only tools
+    # only; warn rather than fail so a "prepare to enable writes" config is
+    # still loadable.
+    if "act" in mcp.get("toolsets", ()) and mcp.get("readOnly"):
+        logger.warning(
+            "mcp.toolsets includes 'act' but mcp.readOnly is true; mutating "
+            "tools stay suppressed until readOnly is set false"
+        )
+    if mcp.get("allowUnauthenticated") or web.get("authToken"):
+        return
+    routable = [a for a in web["listen"] if not _is_local_listener(a)]
+    if routable:
+        raise ConfigError(
+            "mcp.enabled is set but web.authToken is not, and the web API "
+            "listens on non-loopback address(es) {}: /mcp would be served "
+            "without authentication (with no token the web app installs no "
+            "auth middleware at all). Set web.authToken, restrict web.listen "
+            "to loopback/unix-socket addresses, or set "
+            "mcp.allowUnauthenticated: true when the endpoint is protected by "
+            "other means (an mTLS-terminating proxy, a network policy)."
+            .format(", ".join(routable))
+        )
+
+
 @dataclass(slots=True)
 class CronstableConfig:
     jobs: List[JobConfig]
@@ -2716,6 +2874,9 @@ class CronstableConfig:
     # Orchestration DAGs; empty keeps the classic no-DAG behaviour.
     # A mutable default needs field(default_factory), never a shared [].
     dags: List["DagConfig"] = field(default_factory=list)
+    # Optional MCP server section; None keeps the server off. Defaulted so the
+    # empty config in Cron.update_config and other constructors need no change.
+    mcp_config: Optional[MCPConfig] = None
 
 
 def parse_config_string(
@@ -2774,6 +2935,7 @@ def _config_from_doc(
         _build_cluster_config(doc["cluster"]) if "cluster" in doc else None
     )
     stateconf = _build_state_config(doc["state"]) if "state" in doc else None
+    mcpconf = _build_mcp_config(doc["mcp"]) if "mcp" in doc else None
     logging_conf = LoggingConfig(doc["logging"]) if "logging" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
@@ -2799,6 +2961,10 @@ def _config_from_doc(
             if stateconf:
                 raise ConfigError("multiple state configs")
             stateconf = inc_config.state_config
+        if inc_config.mcp_config:
+            if mcpconf:
+                raise ConfigError("multiple mcp configs")
+            mcpconf = inc_config.mcp_config
         if inc_config.logging_config:
             if logging_conf:
                 raise ConfigError("multiple logging configs")
@@ -2821,6 +2987,7 @@ def _config_from_doc(
         cluster_config=clusterconf,
         state_config=stateconf,
         dags=dags,
+        mcp_config=mcpconf,
     )
 
 
@@ -2921,6 +3088,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
                     "{}".format(", ".join(secret_offenders))
                 )
     _validate_dags(config)
+    _validate_mcp_config(config)
 
 
 def _validate_dags(config: CronstableConfig) -> None:
@@ -3047,6 +3215,8 @@ def _parse_config_dir(
     cluster_config_source_fname: Optional[str] = None
     state_config: Optional[StateConfig] = None
     state_config_source_fname: Optional[str] = None
+    mcp_config: Optional[MCPConfig] = None
+    mcp_config_source_fname: Optional[str] = None
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
@@ -3106,6 +3276,17 @@ def _parse_config_dir(
                         state_config_source_fname, direntry.path
                     )
                 )
+        if config.mcp_config is not None:
+            if mcp_config is None:
+                mcp_config = config.mcp_config
+                mcp_config_source_fname = direntry.path
+            else:
+                raise ConfigError(
+                    "Multiple 'mcp' configurations found: "
+                    "first in {}, now in {}".format(
+                        mcp_config_source_fname, direntry.path
+                    )
+                )
         if config.logging_config is not None:
             if logging_config is None:
                 logging_config = config.logging_config
@@ -3133,4 +3314,5 @@ def _parse_config_dir(
         cluster_config=cluster_config,
         state_config=state_config,
         dags=dags,
+        mcp_config=mcp_config,
     )

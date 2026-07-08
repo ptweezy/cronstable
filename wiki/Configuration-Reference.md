@@ -43,6 +43,7 @@ dags:               # optional: durable orchestration DAGs (needs state)
     tasks: [ ... ]
 include: [ ... ]    # optional: list of other config files to merge
 web: { ... }        # optional: HTTP control API
+mcp: { ... }        # optional: Model Context Protocol server for AI agents
 cluster: { ... }    # optional: mTLS peer attestation / leader election
 state: { ... }      # optional: durable state store (history, catch-up, retries)
 logging: { ... }    # optional: Python logging dictConfig
@@ -55,6 +56,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `dags` | `Seq(Map)` of DAG definitions | No | Durable orchestration workflows: each DAG is a graph of tasks with `dependsOn` edges, run on a schedule. Requires a `state` section with `jobApi` enabled. See [Orchestration and DAGs](Orchestration-and-DAGs). |
 | `include` | `Seq(Str)` | No | Paths (relative to the including file) of other config files to parse and merge. Include cycles raise a `ConfigError`. See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults). |
 | `web` | `Map` | No | Enables the HTTP control API. See [HTTP Control API](HTTP-API). |
+| `mcp` | `Map` | No | Enables the Model Context Protocol server (`POST /mcp` on the web listeners, plus the `cronstable mcp` stdio bridge) so AI agents can observe and, opt-in, control jobs/DAGs. Requires a `web` section. Off by default. See [`mcp`](#mcp) below. |
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it cronstable is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
@@ -72,6 +74,51 @@ logging: { ... }    # optional: Python logging dictConfig
 
 `listen` is the only required key. Full behavior, authentication, and endpoint
 semantics are documented in [HTTP Control API](HTTP-API).
+
+### `mcp`
+
+Opt-in [Model Context Protocol](https://modelcontextprotocol.io) server, so an
+AI agent (Claude Desktop/Code, Cursor, VS Code Copilot, …) can drive cronstable
+the way an operator drives the dashboard. It is served as a stateless
+Streamable-HTTP endpoint at **`POST /mcp`** on the existing `web.listen`
+addresses (inheriting the same `authToken` / unix-socket auth) and over the
+featherweight **`cronstable mcp`** stdio bridge for desktop clients. Every field
+is optional; the server is **off unless `enabled: true`**, and requires a `web`
+section (there is nowhere to serve it otherwise). Tools operate on the same data
+as the REST API, so there is one source of truth.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | `Bool` | `false` | Serve `POST /mcp` and expose the `cronstable mcp` stdio bridge. |
+| `readOnly` | `Bool` | `true` | Strip every mutating tool (run/cancel a job, trigger/backfill a DAG, decide a gate). On by default: agents get read-only access unless the operator opts into control. Takes precedence over `toolsets` (`act` stays suppressed while true). |
+| `toolsets` | `Seq(Enum)` of `observe` / `act` / `dags` / `state` | `[observe]` | Which tool groups to expose. `observe` = read-only job/cluster/metrics views; `dags` = DAG introspection (+ control when `readOnly:false`); `state` = durable-state inspector (redacted); `act` = mutating job control (only when `readOnly:false`). |
+| `allowedOrigins` | `Seq(Str)` | `[]` | Exact-match browser `Origin`s allowed to call `/mcp`. Empty serves non-browser clients only, so a present `Origin` not on the list is refused `403` (a DNS-rebinding defense). A non-empty list additionally answers CORS preflight with a scoped `Access-Control-Allow-Origin`. |
+| `allowUnauthenticated` | `Bool` | `false` | Serve `/mcp` on a routable (non-loopback, non-socket) listener even with no `web.authToken`. Fail-closed default: with no token the web app has no auth middleware at all, so an enabled `/mcp` on a routable address raises a `ConfigError` at load. Set true only when the endpoint is protected by other means (an mTLS-terminating proxy, a network policy). |
+| `resources` | `Bool` | `true` | Expose MCP **resources**: URI-addressable read-only context like `cronstable://status` and `cronstable://jobs/{name}` that mirrors the read tools for clients that consume resources. Their scope follows `toolsets` (a `cronstable://dags/{name}` resource is served only when the `dags` toolset is on). |
+| `prompts` | `Bool` | `true` | Expose MCP **prompts**: canned triage playbooks (`triage_job_failure`, `why_did_dag_run_fail`, `blast_radius`, `fleet_health_summary`, `backfill_plan`) that chain the read tools into repeatable workflows. |
+| `instructions` | `EmptyNone() \| Str` | none | Optional free-text server `instructions` surfaced to the client at `initialize`. |
+| `maxRows` | `Int` | `200` | Ceiling on any list tool's `limit`; a larger request is capped (never an error) and an opaque `nextOffset` is offered for the rest. |
+| `maxBodyBytes` | `Int` | `1048576` | Cap on a single `/mcp` request body (tool arguments arrive from an LLM); an oversized POST is refused `413`. |
+
+```yaml
+web:
+  listen:
+    - http://127.0.0.1:8080
+  authToken:
+    fromEnvVar: CRONSTABLE_WEB_TOKEN   # also gates /mcp
+
+mcp:
+  enabled: true
+  readOnly: false        # allow mutating tools
+  toolsets:              # jobs + DAG reads/control
+    - observe
+    - dags
+    - act
+```
+
+Wire a client to it with, e.g., `claude mcp add --transport http cronstable
+https://host/mcp --header "Authorization: Bearer $TOKEN"`, or over stdio with
+`claude mcp add cronstable -- cronstable mcp --url http://127.0.0.1:8080`.
 
 ### `cluster`
 

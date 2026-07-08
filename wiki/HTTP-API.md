@@ -904,6 +904,24 @@ the page itself loads without a token (it holds no data); it prompts for the
 token in the browser and authenticates every data request with it (see
 [Authentication](#authentication)).
 
+### `POST /mcp` (the MCP server)
+
+When a [`mcp`](Configuration-Reference#mcp) section sets `enabled: true`, an
+opt-in [Model Context Protocol](https://modelcontextprotocol.io) server is
+served at `POST /mcp` on the same listeners, letting an AI agent observe (and,
+when `readOnly: false`, control) jobs, DAGs, the cluster/fleet, metrics and the
+durable state store. It is a **stateless Streamable-HTTP** JSON-RPC 2.0
+endpoint (no `Mcp-Session-Id`; `GET /mcp` returns `405`), pinned to MCP
+revision `2025-11-25`. It inherits `web.authToken` exactly like the data
+routes (it is **never** in the public set, so it always requires the bearer
+token when one is configured), and additionally validates the `Origin` header
+(`403` on a present, non-allow-listed origin) and caps the request body
+(`413`). If `mcp.enabled` is set with no `web.authToken` on a routable
+listener, cronstable **fails closed** at config load (raises a `ConfigError`)
+unless `mcp.allowUnauthenticated: true`. Desktop MCP clients reach it over the
+`cronstable mcp` stdio bridge. Full tool catalog and configuration:
+[`mcp`](Configuration-Reference#mcp).
+
 ## Response headers
 
 The `web.headers` map (merged upstream but never released in yacron 0.19) is a

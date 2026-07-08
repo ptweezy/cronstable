@@ -1,0 +1,30 @@
+# MCP demo: a single cronstable node with the Model Context Protocol server
+# enabled, so an AI agent (Claude, Cursor, VS Code Copilot, ...) can observe
+# and control the scheduler over POST /mcp.
+#
+#   docker compose -f docker-compose-mcp.yml up --build      # start
+#   docker compose -f docker-compose-mcp.yml down            # stop and remove
+#
+# Then open http://localhost:8080/ for the dashboard, and point an MCP client
+# at http://localhost:8080/mcp with the bearer token below. A quick check with
+# the bundled stdio bridge (from a checkout, no client needed):
+#
+#   CRONSTABLE_WEB_TOKEN=dev-token \
+#     cronstable mcp --url http://127.0.0.1:8080 --check
+#
+# See example/mcp/README.md for the full walkthrough.
+
+services:
+  cronstable-mcp:
+    build:
+      context: .
+    container_name: cronstable-mcp
+    ports:
+      - "8080:8080"
+    environment:
+      # The bearer token that gates both the web API and /mcp. Change it for
+      # anything beyond a local demo (and prefer a secret over an inline value).
+      CRONSTABLE_WEB_TOKEN: dev-token
+    volumes:
+      - ./example/mcp/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
+    restart: unless-stopped
