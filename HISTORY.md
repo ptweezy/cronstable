@@ -5,6 +5,37 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.12 (2026-07-08)
+
+The package finishes becoming **cronstable**.  Everything that was still
+named `yacron2` -- the import package, the `python -m` entry point, the
+console-script command, and the PyPI distribution -- is now `cronstable`, so
+the name is consistent all the way from `pip install` through `import` to the
+CLI.  The fork has shipped as cronstable in its repo and docs for a while;
+this release moves the code's own identifiers to match, so nothing user-facing
+still answers to the old name.
+
+- **The `yacron2` package is renamed to `cronstable`.** The source tree moves
+  from `yacron2/` to `cronstable/` and every intra-package import follows, so
+  `import yacron2...` becomes `import cronstable...` and `python -m yacron2`
+  becomes `python -m cronstable`.  The web assets, backends, and cluster
+  modules move with it; no module contents change, only their home.
+
+- **The CLI command and PyPI distribution are renamed.** The console script the
+  wheel installs is now `cronstable` (it was `yacron2`), and the project
+  publishes to PyPI as `cronstable` -- `pip install cronstable`.  The repo,
+  Docker image, and container registry are `ptweezy/cronstable`.  Update any
+  scripts, service/unit files, or `pip`/import references that still say
+  `yacron2`; there is no compatibility shim, so the old names stop resolving.
+
+- **Release-pipeline hardening.** The release workflow now pushes the version
+  tag with a scoped `RELEASE_TOKEN` rather than the default `GITHUB_TOKEN` --
+  GitHub refuses to let the Actions app push a tag whose commit touches
+  `.github/workflows/` without the `workflows` scope it cannot be granted -- and
+  the PyPI publish runs with `skip-existing`, so a release interrupted after the
+  upload (before the tag and GitHub Release) can be retried without burning the
+  version.
+
 ## 1.2.10 (2026-07-07)
 
 cronstable now parses cron expressions itself.  This release retires the
