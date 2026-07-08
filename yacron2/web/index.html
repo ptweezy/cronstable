@@ -15,6 +15,8 @@
     color-scheme: dark;
     --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Cascadia Code",
             Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue",
+            Arial, "Noto Sans", sans-serif;
 
     /* semantic status colors — tuned to read on any dark phosphor bg */
     --ok: #3fd271;
@@ -251,6 +253,59 @@
     --peer-self: #0b5ed7;
   }
 
+  /* ---------- color-vision palettes (Settings → Color vision) ---------- */
+  /* Status / peer / ANSI inks remapped so every meaningful pair stays apart
+     under dichromacy (validated with Machado severity-1.0 simulation and the
+     same paper-contrast floor as the blocks above). Status glyphs already
+     differ per state; these make the colors carry too. Each -light pair MUST
+     re-ink every key its dark twin sets: these blocks follow the paper
+     palettes in source order, so an unset key would leak a phosphor-bright
+     ink onto paper. */
+  html[data-cvd="deutan"] {
+    /* red-green (deuter-/protanopia): success → teal, failure → vermillion,
+       pending → bright yellow, cancelled → pink; spread along the
+       blue↔yellow + lightness axes these deficiencies retain */
+    --ok: #26dcb2;
+    --fail: #ff6a30;
+    --pending: #ffd847;
+    --cancelled: #ee9cc8;
+    --peer-agreed: #17c39b;
+    --peer-syncing: #ecd23d;
+    --peer-bad: #ff6a30;
+    --ansi-31: #ff7040; --ansi-32: #1fbf9c; --ansi-91: #ffa075; --ansi-92: #7ceccf;
+  }
+  html[data-cvd="deutan"][data-theme$="-light"] {
+    /* paper: failure → raspberry (its blue component keeps it off the olive
+       band red and green both collapse into); ok darker + pending lighter so
+       lightness splits what hue can't */
+    --ok: #0a4f1c;
+    --fail: #ad2456;
+    --pending: #835c08;
+    --cancelled: #a92b86;
+    --disabled: #495057;
+    --peer-agreed: #0a4f1c;
+    --peer-syncing: #835c08;
+    --peer-bad: #ad2456;
+    --ansi-31: #c2185f; --ansi-32: #116329; --ansi-91: #971a4a; --ansi-92: #1a7f37;
+  }
+  html[data-cvd="tritan"] {
+    /* blue-yellow (tritanopia): red/green stay; the blue family splits by
+       lightness + redness (run pale, self lavender), warm colors by lightness */
+    --run: #abceff;
+    --pending: #ffcf87;
+    --peer-syncing: #e5c15c;
+    --peer-self: #b39dff;
+    --ansi-32: #2db85f; --ansi-36: #82e9f2;
+  }
+  html[data-cvd="tritan"][data-theme$="-light"] {
+    --run: #4c3fd6;      /* indigo, so cancelled moves off violet below */
+    --pending: #7d5300;
+    --cancelled: #96406f;
+    --peer-syncing: #7d5300;
+    --peer-self: #5a45c9;
+    --ansi-32: #0d5c25; --ansi-36: #187884;
+  }
+
   * { box-sizing: border-box; }
   html, body { height: 100%; }
   body {
@@ -266,6 +321,13 @@
   }
   body.density-compact { font-size: 12px; }
 
+  /* reader mode (Settings → Interface font): proportional UI text for easier
+     reading. Tabular numerals keep the ticking clocks / countdowns from
+     jittering; terminal panes, cron/code chips, keycaps and the wordmark are
+     pinned to --mono below so nothing alignment-critical goes proportional. */
+  html[data-font="sans"] body { font-family: var(--sans); letter-spacing: 0; font-variant-numeric: tabular-nums; }
+  .term, .chip, .sbx-fld .fv, .brand { font-family: var(--mono); }
+
   /* glow only when CRT effects are enabled */
   body.fx .glow,
   body.fx .brand h1,
@@ -277,6 +339,12 @@
 
   a { color: var(--accent); }
   button, input, select { font-family: inherit; font-size: inherit; color: inherit; }
+
+  /* keyboard focus: a themed ring instead of the faint UA default. The
+     settings switches visually hide their checkbox (opacity 0), so their
+     focus ring is drawn on the adjacent slider instead. */
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .switch input:focus-visible + .sl { outline: 2px solid var(--accent); outline-offset: 1px; }
 
   /* ---------- CRT overlay (scanlines + vignette + flicker) ---------- */
   #crt { position: fixed; inset: 0; pointer-events: none; z-index: 9000; }
@@ -315,10 +383,17 @@
   }
   @media (prefers-reduced-motion: reduce) {
     body.fx.flicker #crt { animation: none; }
-    .dot.run, .dot.live, .blink { animation: none !important; }
+    .dot.run, .dot.live, .blink, .dst-running .g { animation: none !important; }
     .iconbtn.spin svg { animation: none !important; }
-    .toast { animation: none; }
+    .toast { animation: none !important; }   /* !important: the base .toast rule is later in the sheet */
   }
+  /* app-level Reduce motion (Settings) — body.reduce-motion twins every
+     @media (prefers-reduced-motion) rule in this sheet, so either switch
+     stops the animation. Keep the pairs in step. */
+  body.reduce-motion.fx.flicker #crt { animation: none; }
+  body.reduce-motion .dot.run, body.reduce-motion .dot.live, body.reduce-motion .blink,
+  body.reduce-motion .dst-running .g, body.reduce-motion .iconbtn.spin svg { animation: none !important; }
+  body.reduce-motion .toast { animation: none; }
 
   /* ---------- header ---------- */
   header {
@@ -862,6 +937,7 @@
   body.tv .overlay { z-index: 8060; }
   body.tv .toasts { z-index: 8080; }
   @media (prefers-reduced-motion: reduce) { .wb-tile.flip { animation: none; } }
+  body.reduce-motion .wb-tile.flip { animation: none; }
 
   /* ---------- activity heatmap ---------- */
   .heat { margin-bottom: 12px; }
@@ -1092,6 +1168,7 @@
   .zen-sub { color: var(--fg-dim); font-variant-numeric: tabular-nums; font-size: 15px; text-align: center; }
   .zen-hint { position: absolute; bottom: 16px; color: var(--fg-faint); font-size: 11px; }
   @media (prefers-reduced-motion: reduce) { .zen-dot.due { animation: none; } }
+  body.reduce-motion .zen-dot.due { animation: none; }
 
   /* ---------- adaptive alarm escalation (wallboard) ---------- */
   #wbAlarm { position: absolute; inset: 0; z-index: 2; pointer-events: none; opacity: 0;
@@ -1107,6 +1184,8 @@
     50% { box-shadow: 0 0 22px color-mix(in srgb, var(--fail) 65%, transparent); border-color: var(--fail); }
   }
   @media (prefers-reduced-motion: reduce) { .wb-tile.st-fail.escalate { animation: none; } #wbAlarm { transition: none; } }
+  body.reduce-motion .wb-tile.st-fail.escalate { animation: none; }
+  body.reduce-motion #wbAlarm { transition: none; }
 
   /* ==================================================================
      DAG orchestration  (index card + run drawer + task graph)
@@ -1553,9 +1632,32 @@
           </optgroup>
         </select>
       </div>
+      <div class="setrow">
+        <span class="lab">Color vision<small>remap status colors for red-green or blue-yellow color blindness (status glyphs always differ too)</small></span>
+        <select class="mini" id="setCvd">
+          <option value="none">default</option>
+          <option value="deutan">red-green friendly</option>
+          <option value="tritan">blue-yellow friendly</option>
+        </select>
+      </div>
       <div class="setrow"><span class="lab">CRT effects<small>glow, vignette, flicker</small></span><label class="switch"><input type="checkbox" id="setFx"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Scanlines</span><label class="switch"><input type="checkbox" id="setScan"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Compact density<small>tighter rows</small></span><label class="switch"><input type="checkbox" id="setDensity"><span class="sl"></span></label></div>
+      <div class="setrow">
+        <span class="lab">Interface font<small>terminal monospace, or a proportional sans for easier reading (logs &amp; cron strings stay monospace)</small></span>
+        <select class="mini" id="setFont">
+          <option value="mono">monospace</option>
+          <option value="sans">sans-serif</option>
+        </select>
+      </div>
+      <div class="setrow">
+        <span class="lab">UI scale<small>enlarge the whole dashboard</small></span>
+        <select class="mini" id="setScale">
+          <option value="100">100%</option><option value="110">110%</option>
+          <option value="125">125%</option><option value="140">140%</option>
+        </select>
+      </div>
+      <div class="setrow"><span class="lab">Reduce motion<small>suppress spinners, pulsing dots &amp; flicker (your OS setting is always honored too)</small></span><label class="switch"><input type="checkbox" id="setMotion"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Boot self-test<small>BIOS-style POST screen on load (replays after 12h)</small></span><label class="switch"><input type="checkbox" id="setBoot"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Desktop notifications<small>alert when a job fails</small></span><label class="switch"><input type="checkbox" id="setNotify"><span class="sl"></span></label></div>
       <div class="setrow"><span class="lab">Audible cues<small>tick on ok, buzz on failure, alarm until ack (a)</small></span><label class="switch"><input type="checkbox" id="setSound"><span class="sl"></span></label></div>
@@ -1713,6 +1815,10 @@
   // ---- preferences ----
   const prefs = {
     theme: "carolina", fx: true, scan: true, density: false, notify: false,
+    // accessibility: interface font (mono/sans), whole-UI zoom %, app-level
+    // reduce-motion (ORed with the OS prefers-reduced-motion setting), and
+    // color-vision remap (none/deutan/tritan)
+    font: "mono", scale: 100, motion: false, cvd: "none",
     pollMs: 3000, follow: true, wrap: true, ts: false, ansi: true,
     // add-on panels + audible cues
     sound: false, volume: 50, radar: false, heat: false, heatWindow: "24h", swim: false, fleet: false,
@@ -1929,7 +2035,7 @@
     if (low === "@reboot") return { type: "reboot", raw: expr };
     const expanded = MACROS[low] || expr;
     const f = expanded.split(/\s+/);
-    // parse-crontab field layout: [second] minute hour dom month dow [year].
+    // yacron2 cron field layout: [second] minute hour dom month dow [year].
     // 5 fields -> implicit second 0 and any year; 6 -> a trailing year column;
     // 7 -> a leading second column as well. Normalise to the 7-field shape.
     let sec = "0", yr = "*", core;
@@ -2032,7 +2138,7 @@
     const out = [];
     let guard = 0;
     while (out.length < n && guard++ < 500000) {
-      if (c.Y > 2099) break;   // parse-crontab's year ceiling; nothing matches beyond it
+      if (c.Y > 2099) break;   // the engine's year ceiling; nothing matches beyond it
       if (parsed.year.restricted && !parsed.year.has(c.Y)) { advYear(); continue; }
       if (!parsed.month.has(c.Mo)) { advMonth(); continue; }
       if (!dayMatches(parsed, c)) { advDay(); continue; }
@@ -4280,6 +4386,10 @@
       { ic: "▤", lbl: "Toggle CRT effects", run: () => setFx(!prefs.fx) },
       { ic: "≡", lbl: "Toggle scanlines", run: () => setScan(!prefs.scan) },
       { ic: "⊟", lbl: "Toggle compact density", run: () => setDensity(!prefs.density) },
+      { ic: "A", lbl: "Toggle readable font", sub: "proportional sans-serif UI", run: () => setFont(fontPref() === "sans" ? "mono" : "sans") },
+      { ic: "⤢", lbl: "Cycle UI scale", sub: "100 → 110 → 125 → 140%", run: cycleScale },
+      { ic: "≈", lbl: "Toggle reduce motion", run: () => setMotion(!prefs.motion) },
+      { ic: "◓", lbl: "Cycle color vision mode", sub: "red-green / blue-yellow friendly status colors", run: cycleCvd },
       { ic: "⊞", lbl: "Choose table columns", run: () => toggleColsMenu(true) },
       { ic: "✦", lbl: "Toggle desktop notifications", run: () => setNotify(!prefs.notify) },
       { ic: "♪", lbl: "Toggle audible cues", run: () => setSound(!prefs.sound) },
@@ -4411,6 +4521,43 @@
   function setFx(v) { prefs.fx = v; savePref("fx"); applyTheme(); syncSettings(); }
   function setScan(v) { prefs.scan = v; savePref("scan"); applyTheme(); syncSettings(); }
   function setDensity(v) { prefs.density = v; savePref("density"); document.body.classList.toggle("density-compact", v); syncSettings(); }
+
+  // ---- accessibility: interface font / UI scale / reduce motion / color vision ----
+  const UI_SCALES = [100, 110, 125, 140];
+  const CVD_MODES = ["none", "deutan", "tritan"];
+  const CVD_LABELS = { none: "default", deutan: "red-green friendly", tritan: "blue-yellow friendly" };
+  // self-heal garbage stored prefs, same contract as themeParts()
+  const fontPref = () => (prefs.font === "sans" ? "sans" : "mono");
+  const scalePref = () => (UI_SCALES.includes(prefs.scale) ? prefs.scale : 100);
+  const cvdPref = () => (CVD_MODES.includes(prefs.cvd) ? prefs.cvd : "none");
+  // OS preference OR the app-level Settings override; every motion gate in
+  // the app (CSS class below, logo cruise, zen pulses, boot POST) funnels
+  // through here so the two switches can never disagree.
+  const reduceMotion = () => !!(prefs.motion || (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches));
+  function applyA11y() {
+    document.documentElement.setAttribute("data-font", fontPref());
+    // zoom scales every hardcoded px (chrome, charts, wallboard) in one move;
+    // engines without CSS zoom simply ignore the property
+    const scale = scalePref();
+    document.documentElement.style.zoom = scale === 100 ? "" : scale + "%";
+    document.body.classList.toggle("reduce-motion", reduceMotion());
+    const cvd = cvdPref();
+    if (cvd === "none") document.documentElement.removeAttribute("data-cvd");
+    else document.documentElement.setAttribute("data-cvd", cvd);
+  }
+  function setFont(v) { prefs.font = v === "sans" ? "sans" : "mono"; savePref("font"); applyA11y(); syncSettings(); }
+  function setScale(v) { prefs.scale = UI_SCALES.includes(v) ? v : 100; savePref("scale"); applyA11y(); syncSettings(); }
+  function cycleScale() {
+    setScale(UI_SCALES[(UI_SCALES.indexOf(scalePref()) + 1) % UI_SCALES.length]);
+    toast("info", "UI scale: " + prefs.scale + "%");
+  }
+  // flipping motion back on re-kicks the logo cruise (it parks while reduced)
+  function setMotion(v) { prefs.motion = !!v; savePref("motion"); applyA11y(); kickMark(); syncSettings(); }
+  function setCvd(v) { prefs.cvd = CVD_MODES.includes(v) ? v : "none"; savePref("cvd"); applyA11y(); syncSettings(); }
+  function cycleCvd() {
+    setCvd(CVD_MODES[(CVD_MODES.indexOf(cvdPref()) + 1) % CVD_MODES.length]);
+    toast("info", "color vision: " + CVD_LABELS[prefs.cvd]);
+  }
   function setPoll(v) { prefs.pollMs = v; savePref("pollMs"); restartPolling(); syncSettings(); }
   function setNotify(v) {
     if (v && "Notification" in window && Notification.permission !== "granted") {
@@ -4427,6 +4574,10 @@
     $("setFx").checked = prefs.fx;
     $("setScan").checked = prefs.scan;
     $("setDensity").checked = prefs.density;
+    $("setFont").value = fontPref();
+    $("setScale").value = String(scalePref());
+    $("setMotion").checked = prefs.motion;
+    $("setCvd").value = cvdPref();
     $("setNotify").checked = prefs.notify;
     $("setSound").checked = prefs.sound;
     $("setVol").value = String(prefs.volume);
@@ -5559,10 +5710,11 @@
     $("brandName").addEventListener("click", bumpMark);
     $("brandName").addEventListener("contextmenu", slowMark);
     kickMark();                                               // start the idle cruise
-    // restart the cruise if the OS motion preference is relaxed while parked
+    // follow live OS motion-preference flips: resync the reduce-motion CSS
+    // class and restart the cruise if it was parked
     if (window.matchMedia) {
       const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
-      if (mq.addEventListener) mq.addEventListener("change", kickMark);
+      if (mq.addEventListener) mq.addEventListener("change", () => { applyA11y(); kickMark(); });
     }
     // header text is unselectable; these chips hand out their value on click
     $("ver").addEventListener("click", () => { const v = $("ver").textContent; if (v) copyText(v, "version"); });
@@ -5741,6 +5893,10 @@
     $("setFx").addEventListener("change", (e) => setFx(e.target.checked));
     $("setScan").addEventListener("change", (e) => setScan(e.target.checked));
     $("setDensity").addEventListener("change", (e) => setDensity(e.target.checked));
+    $("setFont").addEventListener("change", (e) => setFont(e.target.value));
+    $("setScale").addEventListener("change", (e) => setScale(parseInt(e.target.value, 10)));
+    $("setMotion").addEventListener("change", (e) => setMotion(e.target.checked));
+    $("setCvd").addEventListener("change", (e) => setCvd(e.target.value));
     $("setNotify").addEventListener("change", (e) => setNotify(e.target.checked));
     $("setSound").addEventListener("change", (e) => setSound(e.target.checked));
     $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
@@ -6511,7 +6667,7 @@
       html += '<p class="sbx-desc' + (impossible ? " sbx-bad" : "") + '">' + esc(impossible ? "This schedule can never occur (impossible date)." : describeCron(expr)) + "</p>";
       const low = expr.toLowerCase();
       const f = (MACROS[low] || expr).split(/\s+/);
-      // Label each present column by parse-crontab's end-column rule: 5 fields
+      // Label each present column by the engine's end-column rule: 5 fields
       // are minute..dow, a 6th adds a trailing year, a 7th adds a leading
       // second. Mislabelling these (or dropping the second/year columns) would
       // contradict the plain-English description above.
@@ -6623,7 +6779,7 @@
   // ===================================================================
   const ZEN_IDLE = 30000;                        // default idle before zen (overridable in Settings)
   const ALARM_BASE = 6000, ALARM_FLOOR = 1600;   // adaptive alarm interval bounds
-  const reduceMotion = () => !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  // (motion gating uses the shared reduceMotion() from the accessibility section)
   function anyRunning() { return state.jobs.some((j) => j.running); }
 
   // track when this browser first observed each job failing (honest age basis)
@@ -6891,6 +7047,7 @@
   // ===================================================================
   loadPrefs();
   applyTheme();
+  applyA11y();
   applyCols();
   document.body.classList.toggle("density-compact", prefs.density);
   $("optFollow").checked = prefs.follow;
@@ -6939,8 +7096,7 @@
   setInterval(alarmTick, 1000);                               // adaptive failure alarm (self-gates its cadence)
   setInterval(() => { if (prefs.heat) loadHeatmap(false); }, 60000);  // slow heatmap refresh
   tick();
-  const reducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-  if (prefs.boot && !reducedMotion && bootDue()) {
+  if (prefs.boot && !reduceMotion() && bootDue()) {
     runBootSequence(startApp);          // POST screen types out, then starts the app
   } else {
     startApp();
