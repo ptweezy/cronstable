@@ -1,0 +1,806 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>cronstable vs. the field — cron scheduler feature comparison</title>
+<style>
+  :root{
+    --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", sans-serif;
+
+    /* light (default) — cronstable's own GitHub-style ops palette */
+    --bg:#eef1f5;
+    --surface:#ffffff;
+    --surface-2:#f6f8fa;
+    --surface-3:#eceff3;
+    --border:#d5dbe2;
+    --border-strong:#c0c8d1;
+    --text:#1b2028;
+    --text-muted:#586372;
+    --text-faint:#8b95a2;
+    --accent:#0969da;
+    --accent-strong:#0a58ca;
+    --accent-tint:rgba(9,105,218,.07);
+    --accent-band:rgba(9,105,218,.05);--glow:rgba(9,105,218,.30);
+    --brass:#9a6700;
+    --brass-strong:#8a5b00;
+    --brass-tint:rgba(154,103,0,.10);
+    --yes:#1a7f37;
+    --yes-tint:rgba(26,127,55,.10);
+    --partial:#9a6700;
+    --no:#b0b8c1;
+    --shadow:0 1px 2px rgba(16,24,40,.06), 0 8px 28px rgba(16,24,40,.06);
+    --shadow-lift:0 2px 6px rgba(16,24,40,.08), 0 18px 46px rgba(16,24,40,.12);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0a0e14;
+      --surface:#12181f;
+      --surface-2:#0f151c;
+      --surface-3:#161d26;
+      --border:#262f3a;
+      --border-strong:#39434f;
+      --text:#e6edf3;
+      --text-muted:#9aa5b1;
+      --text-faint:#616d7a;
+      --accent:#4c8dff;
+      --accent-strong:#79aaff;
+      --accent-tint:rgba(76,141,255,.13);
+      --accent-band:rgba(76,141,255,.07);--glow:rgba(76,141,255,.5);
+      --brass:#e3b341;
+      --brass-strong:#f0c65a;
+      --brass-tint:rgba(227,179,65,.13);
+      --yes:#3fb950;
+      --yes-tint:rgba(63,185,80,.12);
+      --partial:#e3b341;
+      --no:#48525e;
+      --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.4);
+      --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 22px 54px rgba(0,0,0,.55);
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0a0e14;--surface:#12181f;--surface-2:#0f151c;--surface-3:#161d26;
+    --border:#262f3a;--border-strong:#39434f;--text:#e6edf3;--text-muted:#9aa5b1;--text-faint:#616d7a;
+    --accent:#4c8dff;--accent-strong:#79aaff;--accent-tint:rgba(76,141,255,.13);--accent-band:rgba(76,141,255,.07);--glow:rgba(76,141,255,.5);
+    --brass:#e3b341;--brass-strong:#f0c65a;--brass-tint:rgba(227,179,65,.13);
+    --yes:#3fb950;--yes-tint:rgba(63,185,80,.12);--partial:#e3b341;--no:#48525e;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 10px 30px rgba(0,0,0,.4);
+    --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 22px 54px rgba(0,0,0,.55);
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f5;--surface:#ffffff;--surface-2:#f6f8fa;--surface-3:#eceff3;
+    --border:#d5dbe2;--border-strong:#c0c8d1;--text:#1b2028;--text-muted:#586372;--text-faint:#8b95a2;
+    --accent:#0969da;--accent-strong:#0a58ca;--accent-tint:rgba(9,105,218,.07);--accent-band:rgba(9,105,218,.05);--glow:rgba(9,105,218,.30);
+    --brass:#9a6700;--brass-strong:#8a5b00;--brass-tint:rgba(154,103,0,.10);
+    --yes:#1a7f37;--yes-tint:rgba(26,127,55,.10);--partial:#9a6700;--no:#b0b8c1;
+    --shadow:0 1px 2px rgba(16,24,40,.06), 0 8px 28px rgba(16,24,40,.06);
+    --shadow-lift:0 2px 6px rgba(16,24,40,.08), 0 18px 46px rgba(16,24,40,.12);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .page{
+    font-family:var(--sans);
+    background:
+      radial-gradient(1200px 420px at 82% -8%, var(--accent-tint), transparent 60%),
+      var(--bg);
+    color:var(--text);
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    padding:clamp(18px,4vw,56px) clamp(14px,4vw,44px) 72px;
+  }
+  .wrap{max-width:1200px;margin:0 auto}
+
+  /* ---------- hero ---------- */
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--text-muted);
+    display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;
+    margin:0 0 22px;
+  }
+  .eyebrow .dot{width:5px;height:5px;border-radius:50%;background:var(--accent);display:inline-block}
+  .wordmark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+  /* the real cronstable brand mark: the ▚ glyph, ink-coloured with a themed glow,
+     spinning the way it does in the live dashboard (which cruises it at 345deg/s) */
+  .wordmark .mark{
+    font-family:var(--mono);font-weight:700;color:var(--text);
+    font-size:32px;line-height:1;flex:0 0 auto;align-self:center;
+    display:inline-block;transform-origin:50% 50%;
+    text-shadow:0 0 10px var(--glow);
+    animation:markspin 2.6s linear infinite;
+    -webkit-user-select:none;user-select:none;
+  }
+  .wordmark .mark:hover{animation-duration:1.04s}
+  @keyframes markspin{to{transform:rotate(360deg)}}
+  .wordmark .name{font-family:var(--mono);font-weight:680;font-size:clamp(22px,3.2vw,30px);letter-spacing:-.01em}
+  .wordmark .say{font-family:var(--mono);color:var(--text-faint);font-size:13px}
+
+  h1{
+    font-family:var(--mono);
+    font-weight:680;
+    font-size:clamp(27px,4.9vw,50px);
+    line-height:1.04;
+    letter-spacing:-.02em;
+    text-wrap:balance;
+    margin:.15em 0 0;
+    max-width:16ch;
+  }
+  h1 .hl{color:var(--accent)}
+  h1 .hl-b{
+    color:var(--brass);
+    box-shadow:inset 0 -.16em 0 var(--brass-tint);
+  }
+  .lede{
+    font-size:clamp(15px,1.7vw,18px);
+    color:var(--text-muted);
+    max-width:64ch;
+    margin:22px 0 0;
+    text-wrap:pretty;
+  }
+  .lede strong{color:var(--text);font-weight:620}
+
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin:28px 0 0}
+  .chip{
+    display:inline-flex;align-items:center;gap:9px;
+    background:var(--surface);border:1px solid var(--border);
+    border-radius:999px;padding:8px 14px 8px 11px;
+    box-shadow:var(--shadow);
+  }
+  .chip b{font-family:var(--mono);font-size:15px;font-variant-numeric:tabular-nums;letter-spacing:-.01em;color:var(--text)}
+  .chip span{font-size:12px;color:var(--text-muted)}
+  .chip .cd{width:7px;height:7px;border-radius:50%;background:var(--accent)}
+  .chip.brass .cd{background:var(--brass)}
+  .chip.green .cd{background:var(--yes)}
+
+  /* ---------- section framing ---------- */
+  .sec-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:60px 0 16px}
+  .sec-head h2{
+    font-family:var(--mono);font-weight:640;font-size:clamp(16px,2vw,20px);letter-spacing:-.01em;margin:0;
+  }
+  .sec-head p{margin:4px 0 0;color:var(--text-muted);font-size:13.5px;max-width:64ch}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--text-muted);font-family:var(--mono)}
+  .legend .lk{display:inline-flex;align-items:center;gap:6px}
+
+  /* ---------- matrix ---------- */
+  .matrix-card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:16px;
+    box-shadow:var(--shadow-lift);
+    overflow:hidden;
+  }
+  .matrix-scroll{overflow-x:auto;overflow-y:visible}
+  table.matrix{border-collapse:separate;border-spacing:0;width:100%;min-width:1060px}
+  table.matrix th,table.matrix td{text-align:center;vertical-align:middle}
+
+  thead th{
+    position:sticky;top:0;z-index:3;
+    background:var(--surface-2);
+    border-bottom:1px solid var(--border-strong);
+    padding:14px 10px 12px;
+  }
+  thead th.feat{z-index:5;text-align:left;padding-left:20px}
+  th.feat,td.feat{
+    position:sticky;left:0;z-index:2;background:var(--surface);
+    text-align:left;min-width:214px;width:214px;
+    border-right:1px solid var(--border);
+  }
+  thead th.feat{background:var(--surface-2)}
+
+  .th-name{font-family:var(--mono);font-size:13px;font-weight:640;color:var(--text);white-space:nowrap;letter-spacing:-.01em}
+  .th-sub{font-size:10.5px;color:var(--text-faint);margin-top:2px;white-space:nowrap}
+  .meter{height:4px;border-radius:3px;background:var(--surface-3);margin:9px auto 0;width:74px;overflow:hidden}
+  .meter i{display:block;height:100%;background:var(--text-faint);border-radius:3px}
+  .th-count{font-family:var(--mono);font-size:10.5px;color:var(--text-muted);margin-top:6px;font-variant-numeric:tabular-nums}
+
+  /* cronstable column */
+  col.cs-col{background:var(--accent-band)}
+  th.cs,td.cs{background:var(--accent-band);border-left:1.5px solid var(--accent);border-right:1.5px solid var(--accent)}
+  thead th.cs{
+    background:linear-gradient(180deg,var(--accent-tint),var(--accent-band));
+    border-top:2px solid var(--accent);
+  }
+  thead th.cs .th-name{color:var(--accent-strong)}
+  thead th.cs .meter i{background:var(--accent)}
+  .th-tag{
+    display:inline-block;font-family:var(--mono);font-size:9px;letter-spacing:.12em;text-transform:uppercase;
+    color:var(--accent-strong);border:1px solid var(--accent);border-radius:5px;padding:1px 6px;margin-top:7px;
+  }
+  /* orchestrator column — set apart from the cron-family group */
+  th.orch,td.orch{border-left:1px dashed var(--border-strong)}
+  .th-tag.orch{color:var(--text-muted);border-color:var(--border-strong)}
+
+  /* group rows */
+  tr.group td{
+    position:sticky;left:0;
+    background:var(--surface-3);
+    border-top:1px solid var(--border);border-bottom:1px solid var(--border);
+    text-align:left;padding:9px 20px;
+  }
+  tr.group .g-label{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-muted);font-weight:640}
+  tr.group.ai td{background:linear-gradient(90deg,var(--brass-tint),transparent 70%);border-top:1px solid var(--brass)}
+  tr.group.ai .g-label{color:var(--brass-strong)}
+  tr.group .g-uniq{color:var(--brass-strong);border:1px solid var(--brass);border-radius:5px;font-size:8.5px;padding:1px 5px;margin-left:8px;letter-spacing:.1em}
+
+  /* body cells */
+  tbody td{padding:11px 10px;border-bottom:1px solid var(--border)}
+  tbody tr:last-child td{border-bottom:none}
+  td.feat{padding:11px 14px 11px 20px}
+  .f-name{font-size:13px;font-weight:560;color:var(--text);line-height:1.3}
+  .f-sub{font-size:11px;color:var(--text-faint);margin-top:2px;font-family:var(--mono)}
+  tr.spot td{background:var(--brass-tint)}
+  /* sticky column must stay opaque so scrolled cells don't bleed through it */
+  tr.spot td.feat{background-color:var(--surface);background-image:linear-gradient(var(--brass-tint),var(--brass-tint))}
+  tr.spot td.cs{background:linear-gradient(180deg,var(--accent-band),var(--brass-tint))}
+  tbody tr:hover td{background:var(--surface-2)}
+  tbody tr:hover td.cs{background:var(--accent-tint)}
+  tbody tr.spot:hover td{background:var(--brass-tint)}
+
+  /* status marks */
+  .mk{display:inline-grid;place-items:center;width:23px;height:23px;border-radius:50%;font-size:13px;line-height:1;margin:0 auto}
+  .yes .mk{background:var(--yes);color:#fff;font-weight:700}
+  .cs .mk{background:var(--yes);color:#fff;box-shadow:0 0 0 3px var(--yes-tint)}
+  .partial .mk{background:transparent;color:var(--partial);border:1.6px solid var(--partial);font-size:12px;font-weight:700}
+  .addon .mk{background:transparent;color:var(--brass);border:1.6px dashed var(--brass);font-weight:700;font-size:14px}
+  .no .mk{color:var(--no);background:transparent;font-size:16px}
+  .cap{display:block;font-family:var(--mono);font-size:9.5px;line-height:1.25;color:var(--text-muted);margin-top:5px;max-width:132px;margin-left:auto;margin-right:auto}
+  td.cs .cap{color:var(--accent-strong);opacity:.92}
+  .addon .cap,.partial .cap{color:var(--partial)}
+
+  /* ---------- MCP spotlight ---------- */
+  .mcp{
+    margin-top:26px;
+    border:1px solid var(--border);
+    border-radius:18px;
+    background:
+      radial-gradient(700px 300px at 90% -20%, var(--accent-tint), transparent 65%),
+      var(--surface);
+    box-shadow:var(--shadow-lift);
+    overflow:hidden;
+  }
+  .mcp-top{padding:clamp(22px,3vw,34px);border-bottom:1px solid var(--border);display:flex;gap:26px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between}
+  .mcp-top .lead{max-width:60ch}
+  .mcp-kicker{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--brass-strong);display:flex;align-items:center;gap:8px}
+  .mcp-kicker .sq{width:8px;height:8px;background:var(--brass);border-radius:2px;transform:rotate(45deg)}
+  .mcp h3{font-family:var(--mono);font-weight:660;font-size:clamp(19px,2.5vw,26px);letter-spacing:-.015em;margin:12px 0 0;text-wrap:balance}
+  .mcp h3 .a{color:var(--accent)}
+  .mcp-top p{color:var(--text-muted);font-size:14.5px;margin:12px 0 0}
+  .mcp-top p code{font-family:var(--mono);font-size:.86em;background:var(--surface-3);padding:1px 6px;border-radius:5px;color:var(--text)}
+
+  .snip{
+    font-family:var(--mono);font-size:12px;line-height:1.7;
+    background:var(--surface-2);border:1px solid var(--border);border-radius:12px;
+    padding:14px 16px;color:var(--text-muted);min-width:270px;
+    overflow-x:auto;
+  }
+  .snip .p{color:var(--text-faint)}
+  .snip .c{color:var(--accent)}
+  .snip .k{color:var(--brass-strong)}
+  .snip .ok{color:var(--yes)}
+  .snip b{color:var(--text);font-weight:600}
+
+  .mcp-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--border)}
+  .quad{background:var(--surface);padding:22px 20px}
+  .quad .qh{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:12.5px;font-weight:640;letter-spacing:.02em;color:var(--text)}
+  .quad .qi{width:22px;height:22px;flex:0 0 auto;display:grid;place-items:center;border-radius:6px;background:var(--accent-tint);color:var(--accent)}
+  .quad.act .qi{background:var(--yes-tint);color:var(--yes)}
+  .quad.safe .qi{background:var(--brass-tint);color:var(--brass-strong)}
+  .quad ul{list-style:none;margin:14px 0 0;padding:0;display:flex;flex-direction:column;gap:9px}
+  .quad li{font-size:12.5px;color:var(--text-muted);padding-left:16px;position:relative;line-height:1.42}
+  .quad li::before{content:"";position:absolute;left:0;top:8px;width:5px;height:5px;border-radius:50%;background:var(--text-faint)}
+  .quad.act li::before{background:var(--yes)}
+  .quad.safe li::before{background:var(--brass)}
+  .quad li b{color:var(--text);font-weight:600}
+  .quad li code{font-family:var(--mono);font-size:11px;background:var(--surface-3);padding:0 5px;border-radius:4px;color:var(--text)}
+
+  /* ---------- takeaways ---------- */
+  .takeaways{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:22px}
+  .tk{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:var(--shadow)}
+  .tk .n{font-family:var(--mono);font-size:26px;font-weight:680;letter-spacing:-.02em;color:var(--accent);font-variant-numeric:tabular-nums}
+  .tk .n.brass{color:var(--brass)}
+  .tk .t{font-weight:620;margin-top:6px;font-size:14px}
+  .tk p{margin:6px 0 0;color:var(--text-muted);font-size:13px}
+
+  /* ---------- footer ---------- */
+  footer{margin-top:44px;border-top:1px solid var(--border);padding-top:20px;color:var(--text-faint);font-size:12px;line-height:1.6}
+  footer .m{font-family:var(--mono)}
+  footer b{color:var(--text-muted);font-weight:600}
+  footer a{color:var(--accent);text-decoration:none}
+  footer a:hover{text-decoration:underline}
+
+  a:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+
+  @media (max-width:860px){
+    .mcp-grid{grid-template-columns:repeat(2,1fr)}
+    .takeaways{grid-template-columns:1fr}
+  }
+  @media (max-width:560px){
+    .mcp-grid{grid-template-columns:1fr}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .wordmark .mark{animation:none}
+    *{scroll-behavior:auto}
+  }</style>
+</head>
+<body>
+<div class="page">
+<div class="wrap">
+
+  <!-- HERO -->
+  <header>
+    <p class="eyebrow"><span class="dot"></span>Feature comparison<span class="dot"></span>Cron-family schedulers &amp; orchestrators<span class="dot"></span>July 2026</p>
+
+    <div class="wordmark">
+      <span class="mark" aria-hidden="true">&#x259A;</span>
+      <span class="name">cronstable</span>
+      <span class="say">/ kraahn-stuh-bl /</span>
+    </div>
+
+    <h1>The only cron your <span class="hl-b">AI agent</span> can actually <span class="hl">drive</span>.</h1>
+
+    <p class="lede"><strong>cronstable ships a built-in Model Context Protocol server</strong> — so Claude, Cursor or Copilot can observe every job, DAG and node, and act on them when you opt in. Nothing else in the field ships one natively — not even Apache Airflow. And it arrives alongside durable state, a real DAG engine, leader-elected clustering and a live dashboard, in a single hardened, dependency-free daemon.</p>
+
+    <div class="chips">
+      <span class="chip brass"><span class="cd"></span><b>23</b><span>MCP tools</span></span>
+      <span class="chip brass"><span class="cd"></span><b>5</b><span>triage playbooks</span></span>
+      <span class="chip green"><span class="cd"></span><b>24 / 24</b><span>native features</span></span>
+      <span class="chip"><span class="cd"></span><b>0</b><span>new dependencies</span></span>
+      <span class="chip"><span class="cd"></span><b>13</b><span>OS &times; arch builds</span></span>
+    </div>
+  </header>
+
+  <!-- MATRIX -->
+  <div class="sec-head">
+    <div>
+      <h2>How it stacks up</h2>
+      <p>cronstable versus its closest cron-family competitors — plus Apache Airflow, the heavyweight orchestrator, for scale. Every competitor cell was fact-checked against the project's official docs, then adversarially re-verified.</p>
+    </div>
+    <div class="legend" aria-hidden="true">
+      <span class="lk"><span class="mk yes" style="width:16px;height:16px;font-size:10px">✓</span> Native</span>
+      <span class="lk"><span class="mk partial" style="width:16px;height:16px;font-size:9px">◐</span> Partial</span>
+      <span class="lk"><span class="mk addon" style="width:16px;height:16px;font-size:10px">+</span> Add-on</span>
+      <span class="lk"><span class="mk no" style="width:16px;height:16px;font-size:12px">–</span> None</span>
+    </div>
+  </div>
+
+  <div class="matrix-card">
+   <div class="matrix-scroll">
+    <table class="matrix">
+      <colgroup>
+        <col><col class="cs-col"><col><col><col><col><col><col><col>
+      </colgroup>
+      <thead>
+        <tr>
+          <th class="feat" scope="col"><span class="th-name">Capability</span></th>
+          <th class="cs" scope="col">
+            <span class="th-name">cronstable</span>
+            <div class="meter"><i style="width:100%"></i></div>
+            <div class="th-count">24 native</div>
+            <span class="th-tag">This is us</span>
+          </th>
+          <th scope="col"><span class="th-name">yacron</span><div class="th-sub">Python · YAML</div><div class="meter"><i style="width:29%"></i></div><div class="th-count">7 native</div></th>
+          <th scope="col"><span class="th-name">supercronic</span><div class="th-sub">Go · crontab</div><div class="meter"><i style="width:21%"></i></div><div class="th-count">5 native</div></th>
+          <th scope="col"><span class="th-name">Ofelia</span><div class="th-sub">Go · Docker</div><div class="meter"><i style="width:13%"></i></div><div class="th-count">3 native</div></th>
+          <th scope="col"><span class="th-name">dkron</span><div class="th-sub">Go · distributed</div><div class="meter"><i style="width:33%"></i></div><div class="th-count">8 native</div></th>
+          <th scope="col"><span class="th-name">Cronicle</span><div class="th-sub">Node · master/worker</div><div class="meter"><i style="width:38%"></i></div><div class="th-count">9 native</div></th>
+          <th scope="col"><span class="th-name">K8s CronJob</span><div class="th-sub">native resource</div><div class="meter"><i style="width:25%"></i></div><div class="th-count">6 native</div></th>
+          <th class="orch" scope="col"><span class="th-name">Airflow</span><div class="th-sub">Python · orchestrator</div><div class="meter"><i style="width:54%"></i></div><div class="th-count">13 native</div><span class="th-tag orch">Diff. class</span></th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <!-- GROUP: AI -->
+        <tr class="group ai"><td colspan="9"><span class="g-label">AI &amp; agent control</span><span class="g-uniq">Signature</span></td></tr>
+
+        <tr class="spot">
+          <td class="feat"><div class="f-name">MCP server for AI agents</div><div class="f-sub">observe &amp; control</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">23 tools · read-only default</span></td>
+          <td class="no" title="No MCP server; no config keys or code reference MCP."><span class="mk">–</span></td>
+          <td class="no" title="No MCP server; nothing AI-related in code, README, or flags."><span class="mk">–</span></td>
+          <td class="no" title="No Model Context Protocol server; absent from all code and docs."><span class="mk">–</span></td>
+          <td class="no" title="No MCP server; no AI-agent integration in OSS or Pro."><span class="mk">–</span></td>
+          <td class="no" title="No MCP server anywhere in docs or repo."><span class="mk">–</span></td>
+          <td class="addon" title="No native MCP; third-party Kubernetes MCP servers drive the whole cluster, not the CronJob."><span class="mk">+</span><span class="cap">3rd-party cluster MCP</span></td>
+          <td class="addon orch" title="No core MCP server: AIP-91 native server is still a draft; only third-party REST wrappers (mcp-server-apache-airflow) exist."><span class="mk">+</span><span class="cap">draft; 3rd-party wrapper</span></td>
+        </tr>
+
+        <tr class="spot">
+          <td class="feat"><div class="f-name">Agent triage &amp; resources</div><div class="f-sub">canned playbooks + context</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">5 prompts + URI resources</span></td>
+          <td class="no" title="No AI-agent features, triage prompts, or resources of any kind."><span class="mk">–</span></td>
+          <td class="no" title="No AI-agent features, canned prompts, or resources of any kind."><span class="mk">–</span></td>
+          <td class="no" title="No AI-agent features, prompts, or resources of any kind."><span class="mk">–</span></td>
+          <td class="no" title="No AI features, canned triage prompts, or agent resources."><span class="mk">–</span></td>
+          <td class="no" title="No AI/agent features or triage prompts documented."><span class="mk">–</span></td>
+          <td class="no" title="CronJob ships no canned triage prompts or AI-agent resources."><span class="mk">–</span></td>
+          <td class="no orch" title="AIP-101 AI Assistant is only a draft proposal; no shipped triage prompts or agent resources."><span class="mk">–</span></td>
+        </tr>
+
+        <!-- GROUP: SCHEDULING -->
+        <tr class="group"><td colspan="9"><span class="g-label">Scheduling core</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">YAML job configuration</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">native YAML crontab</span></td>
+          <td class="yes" title="YAML is the native and only config format (strictyaml)."><span class="mk">✓</span></td>
+          <td class="no" title="Configuration is a crontab file only; no YAML."><span class="mk">–</span></td>
+          <td class="no" title="INI-style config files and Docker labels only; no YAML."><span class="mk">–</span></td>
+          <td class="no" title="Jobs are JSON via REST API/UI; only the daemon config file is YAML."><span class="mk">–</span></td>
+          <td class="no" title="Config is JSON (config.json); events stored in DB, not YAML."><span class="mk">–</span></td>
+          <td class="yes" title="Defined as a YAML/JSON manifest (spec.schedule, jobTemplate)."><span class="mk">✓</span></td>
+          <td class="addon orch" title="DAGs are Python code; declarative YAML jobs only via the third-party astronomer/dag-factory library."><span class="mk">+</span><span class="cap">via dag-factory</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Classic crontab files as-is</div><div class="f-sub">Vixie <code style="font-family:var(--mono);font-size:11px">/etc/crontab</code></div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">runs it unchanged</span></td>
+          <td class="no" title="Requires YAML; schedule uses crontab-syntax strings, not Vixie crontab files."><span class="mk">–</span></td>
+          <td class="yes" title="Crontab-compatible; adds optional seconds resolution and CRON_TZ."><span class="mk">✓</span></td>
+          <td class="no" title="Per-job cron-syntax schedules in INI/labels; does not ingest crontab files."><span class="mk">–</span></td>
+          <td class="no" title="6-field cron expressions via API; does not ingest Vixie crontab files."><span class="mk">–</span></td>
+          <td class="partial" title="Event editor 'Import' accepts classic 5-field crontab syntax, converting it to a timing object; not crontab files as-is."><span class="mk">◐</span><span class="cap">import only</span></td>
+          <td class="no" title="Single cron expression in spec.schedule; not Vixie crontab files."><span class="mk">–</span></td>
+          <td class="no orch" title="Accepts cron expression strings in a schedule field; does not ingest Vixie crontab files."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Arbitrary per-job timezones</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">any IANA zone, per job</span></td>
+          <td class="yes" title="Per-job timezone attribute since v0.11 (pytz), plus utc flag."><span class="mk">✓</span></td>
+          <td class="yes" title="Per-crontab CRON_TZ lines plus TZ / etc-localtime override."><span class="mk">✓</span></td>
+          <td class="partial" title="Works via robfig/cron CRON_TZ= schedule prefix; undocumented, no tz field."><span class="mk">◐</span><span class="cap">prefix hack</span></td>
+          <td class="yes" title="Per-job timezone field; DST/leap-aware scheduling."><span class="mk">✓</span></td>
+          <td class="yes" title="Per-event IANA timezone saved with each event."><span class="mk">✓</span></td>
+          <td class="yes" title="spec.timeZone IANA field, stable since v1.27; per-CronJob."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Per-DAG timezone via pendulum; DST-aware scheduling built in."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Concurrency policy + timeouts</div><div class="f-sub">execution &amp; kill timeout</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">policy + exec/kill timeout</span></td>
+          <td class="yes" title="concurrencyPolicy Allow/Forbid/Replace plus executionTimeout and killTimeout."><span class="mk">✓</span></td>
+          <td class="partial" title="Serial by default, -overlapping opt-in; no execution or kill timeout."><span class="mk">◐</span><span class="cap">no timeout</span></td>
+          <td class="partial" title="Has no-overlap concurrency option but no execution or kill timeout."><span class="mk">◐</span><span class="cap">no timeout</span></td>
+          <td class="yes" title="Concurrency allow/forbid; shell executor timeout kills overrunning process."><span class="mk">✓</span></td>
+          <td class="yes" title="Event concurrency limit plus timeout that aborts overrunning jobs."><span class="mk">✓</span></td>
+          <td class="yes" title="concurrencyPolicy Allow/Forbid/Replace + Job activeDeadlineSeconds kill timeout."><span class="mk">✓</span></td>
+          <td class="yes orch" title="max_active_runs / max_active_tasks, pools, execution_timeout (kills task), dagrun_timeout."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Retries with exponential backoff</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">backoff · survives restart</span></td>
+          <td class="yes" title="onFailure retry: maximumRetries, initialDelay, maximumDelay, backoffMultiplier (exponential)."><span class="mk">✓</span></td>
+          <td class="no" title="No retry or backoff logic in code or docs."><span class="mk">–</span></td>
+          <td class="no" title="No automatic retry or exponential backoff option."><span class="mk">–</span></td>
+          <td class="partial" title="Retry count, same node only; no exponential backoff or configurable delay."><span class="mk">◐</span><span class="cap">no backoff</span></td>
+          <td class="partial" title="Up to 32 retries with fixed retry delay, not exponential backoff."><span class="mk">◐</span><span class="cap">fixed delay</span></td>
+          <td class="yes" title="Job backoffLimit (default 6), exponential backoff 10s to 6min cap."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Per-task retries with retry_delay, retry_exponential_backoff, and max_retry_delay cap."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Missed-run catch-up</div><div class="f-sub">after downtime</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">durable catch-up</span></td>
+          <td class="no" title="No missed-run catch-up; no config key or documented behavior."><span class="mk">–</span></td>
+          <td class="no" title="No catch-up; missed runs during downtime are skipped."><span class="mk">–</span></td>
+          <td class="no" title="No missed-run catch-up; robfig/cron with no run persistence."><span class="mk">–</span></td>
+          <td class="no" title="No missed-run catch-up after downtime; only schedules next fire."><span class="mk">–</span></td>
+          <td class="yes" title="'Run All (Catch-Up)' mode reruns missed jobs after downtime."><span class="mk">✓</span></td>
+          <td class="partial" title="startingDeadlineSeconds gates missed runs; only one catch-up Job, not per-interval."><span class="mk">◐</span><span class="cap">one run only</span></td>
+          <td class="yes orch" title="catchup parameter schedules every missed interval after downtime (default off in Airflow 3)."><span class="mk">✓</span></td>
+        </tr>
+
+        <!-- GROUP: ORCHESTRATION -->
+        <tr class="group"><td colspan="9"><span class="g-label">Orchestration &amp; workflows</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">DAGs / dependency graphs</div><div class="f-sub">durable workflow engine</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">fan-out · sensors · resume</span></td>
+          <td class="no" title="No job dependencies or workflow engine; jobs run independently."><span class="mk">–</span></td>
+          <td class="no" title="Independent jobs only; no dependency graph or workflow engine."><span class="mk">–</span></td>
+          <td class="no" title="No dependencies/DAGs in upstream; DAGs exist only in a fork."><span class="mk">–</span></td>
+          <td class="partial" title="parent_job / dependent_jobs chaining on completion; not a full DAG workflow engine."><span class="mk">◐</span><span class="cap">chaining only</span></td>
+          <td class="partial" title="Chain reaction with success/error branching, not a declarative multi-parent DAG."><span class="mk">◐</span><span class="cap">chains only</span></td>
+          <td class="addon" title="No native dependencies; requires Argo Workflows or Tekton."><span class="mk">+</span><span class="cap">Argo / Tekton</span></td>
+          <td class="yes orch" title="Python-defined DAGs with rich task dependency graphs — Airflow's core purpose."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Cross-task data hand-off</div><div class="f-sub">XCom</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">XCom between tasks</span></td>
+          <td class="no" title="No cross-task data hand-off; no workflow tasks exist."><span class="mk">–</span></td>
+          <td class="no" title="No workflow tasks, so no cross-task data hand-off."><span class="mk">–</span></td>
+          <td class="no" title="No cross-task data hand-off between jobs."><span class="mk">–</span></td>
+          <td class="no" title="No cross-task data hand-off between chained jobs."><span class="mk">–</span></td>
+          <td class="yes" title="chain_data passes arbitrary JSON to the next chained event."><span class="mk">✓</span></td>
+          <td class="addon" title="Not in CronJob; Argo Workflows passes parameters/artifacts between steps."><span class="mk">+</span><span class="cap">Argo</span></td>
+          <td class="yes orch" title="XCom passes data between tasks; pluggable custom XCom backends supported. (cronstable borrows the name.)"><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Human approval gates</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">pause for sign-off</span></td>
+          <td class="no" title="No human approval gates; no workflow concept at all."><span class="mk">–</span></td>
+          <td class="no" title="No workflows or human approval gates."><span class="mk">–</span></td>
+          <td class="no" title="No human approval gates."><span class="mk">–</span></td>
+          <td class="no" title="No human approval gates in workflows."><span class="mk">–</span></td>
+          <td class="no" title="No human approval gates documented in workflows."><span class="mk">–</span></td>
+          <td class="addon" title="None native; Argo Workflows suspend/resume steps provide manual gates."><span class="mk">+</span><span class="cap">Argo</span></td>
+          <td class="yes orch" title="Airflow 3.1+ HITL ApprovalOperator / HITLOperator in the bundled standard provider, with UI forms."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Backfill / historical reruns</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">whole-DAG backfill</span></td>
+          <td class="no" title="No backfill or historical rerun capability documented."><span class="mk">–</span></td>
+          <td class="no" title="No backfill or historical rerun capability."><span class="mk">–</span></td>
+          <td class="no" title="No backfill or historical rerun capability."><span class="mk">–</span></td>
+          <td class="no" title="No backfill/historical rerun; only immediate on-demand run endpoint."><span class="mk">–</span></td>
+          <td class="partial" title="Event 'Time Machine' resets an event cursor to a past time and re-runs forward; requires Catch-Up mode."><span class="mk">◐</span><span class="cap">time machine</span></td>
+          <td class="no" title="No schedule/DAG backfill; would manually create Jobs for past runs."><span class="mk">–</span></td>
+          <td class="yes orch" title="airflow dags backfill CLI; Airflow 3 adds backfill via the UI/API."><span class="mk">✓</span></td>
+        </tr>
+
+        <!-- GROUP: DISTRIBUTED -->
+        <tr class="group"><td colspan="9"><span class="g-label">Distributed &amp; fault-tolerant</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Clustering + no double-run</div><div class="f-sub">replicas from one config</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">mTLS leader election · quorum</span></td>
+          <td class="no" title="Single-instance only; no leader election or replica coordination."><span class="mk">–</span></td>
+          <td class="no" title="Single-process; no clustering or leader election."><span class="mk">–</span></td>
+          <td class="no" title="Single instance; no clustering or leader election."><span class="mk">–</span></td>
+          <td class="yes" title="Serf gossip + Raft leader election; tag-targeted single execution."><span class="mk">✓</span></td>
+          <td class="yes" title="Multi-server auto-failover; primary elected by hostname sort, shared storage."><span class="mk">✓</span></td>
+          <td class="yes" title="HA control plane leader-elects controllers (Lease); single active CronJob controller."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Active-active multiple schedulers dedupe via DB row-locks (no double-run); no leader election."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Fenced exactly-once</div><div class="f-sub">lease / lock fenced</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">fenced via lease backend</span></td>
+          <td class="no" title="No fenced leases or exactly-once execution; no clustering primitives."><span class="mk">–</span></td>
+          <td class="no" title="No leases or fencing; each replica runs independently."><span class="mk">–</span></td>
+          <td class="no" title="No lease/fencing; no exactly-once execution guarantee."><span class="mk">–</span></td>
+          <td class="partial" title="Leader election avoids double-schedule, but no lease fencing; retries are at-least-once."><span class="mk">◐</span><span class="cap">no fencing</span></td>
+          <td class="no" title="Single-primary scheduler; no fenced-lease / etcd exactly-once guarantee."><span class="mk">–</span></td>
+          <td class="no" title="Docs: two Jobs or none may be created; jobs must be idempotent."><span class="mk">–</span></td>
+          <td class="partial orch" title="Scheduler DB row-locks dedupe scheduling; no fencing token, zombie/duplicate runs possible."><span class="mk">◐</span><span class="cap">no fencing</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Durable state store for jobs</div><div class="f-sub">KV · locks · cursors · secrets</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">+ idempotency &amp; artifacts</span></td>
+          <td class="no" title="No KV, locks, cursors, idempotency, secrets, or artifact store."><span class="mk">–</span></td>
+          <td class="no" title="Stateless; no KV, locks, cursors, secrets, or artifacts."><span class="mk">–</span></td>
+          <td class="no" title="History in-memory; save driver writes reports, no state store for jobs."><span class="mk">–</span></td>
+          <td class="no" title="Internal BoltDB not exposed to jobs; no KV/locks/cursors/secrets/artifacts API."><span class="mk">–</span></td>
+          <td class="no" title="No KV/locks/cursors/idempotency/secrets store exposed to jobs."><span class="mk">–</span></td>
+          <td class="partial" title="Secrets/ConfigMaps + PersistentVolumes exist; no job-facing KV/locks/cursors/idempotency store."><span class="mk">◐</span><span class="cap">PV/Secrets only</span></td>
+          <td class="partial orch" title="Variables (KV), Connections/secrets backends and XCom; no locks, cursors, idempotency, or artifacts."><span class="mk">◐</span><span class="cap">Variables/secrets</span></td>
+        </tr>
+
+        <!-- GROUP: OBSERVABILITY -->
+        <tr class="group"><td colspan="9"><span class="g-label">Observability &amp; control</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Live web dashboard</div><div class="f-sub">tail · run · cancel</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">live tail · 10 themes</span></td>
+          <td class="no" title="REST API only; no HTML dashboard, log tailing, or cancel."><span class="mk">–</span></td>
+          <td class="no" title="Only a Prometheus /metrics endpoint; no web dashboard or run/cancel."><span class="mk">–</span></td>
+          <td class="no" title="No web UI; open feature request, no --enable-web flag."><span class="mk">–</span></td>
+          <td class="partial" title="Web UI with on-demand run and execution output; no cancel or live tail."><span class="mk">◐</span><span class="cap">no cancel/tail</span></td>
+          <td class="yes" title="Real-time web UI, live log viewer, run/abort on demand."><span class="mk">✓</span></td>
+          <td class="addon" title="Kubernetes Dashboard is a separate Helm add-on, not default; otherwise kubectl logs."><span class="mk">+</span><span class="cap">separate UI</span></td>
+          <td class="yes orch" title="Web UI: Grid/Graph views, live log viewing, trigger DAG, clear/mark tasks."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">HTTP REST control API</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">status · start · cancel · history</span></td>
+          <td class="yes" title="Optional HTTP API: /version, /status, /jobs/{name}/start; no cancel endpoint."><span class="mk">✓</span></td>
+          <td class="no" title="No control API; /metrics is a read-only Prometheus scrape."><span class="mk">–</span></td>
+          <td class="no" title="No HTTP/REST control API in the daemon."><span class="mk">–</span></td>
+          <td class="yes" title="Full HTTP REST API for jobs and executions."><span class="mk">✓</span></td>
+          <td class="yes" title="Full HTTP REST API with API keys for automation."><span class="mk">✓</span></td>
+          <td class="yes" title="Kubernetes API server is REST; full CronJob CRUD via API/kubectl."><span class="mk">✓</span></td>
+          <td class="yes orch" title="Stable REST API (v1 in 2.x; a redesigned API server in Airflow 3)."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Prometheus + statsd metrics</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">both, native</span></td>
+          <td class="yes" title="Native statsd only (prefix/host/port); no Prometheus exporter."><span class="mk">✓</span></td>
+          <td class="yes" title="-prometheus-listen-address exposes /metrics (exec, success/fail, duration)."><span class="mk">✓</span></td>
+          <td class="no" title="No native Prometheus or statsd metrics endpoint."><span class="mk">–</span></td>
+          <td class="yes" title="Prometheus /metrics endpoint, statsd, DogStatsD, and OTel."><span class="mk">✓</span></td>
+          <td class="no" title="No native Prometheus/statsd; JSON stats API only."><span class="mk">–</span></td>
+          <td class="addon" title="No native metrics; kube-state-metrics add-on exposes kube_cronjob_* for Prometheus."><span class="mk">+</span><span class="cap">kube-state-metrics</span></td>
+          <td class="yes orch" title="Native statsd and OpenTelemetry metrics in core (Prometheus via a statsd exporter)."><span class="mk">✓</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Per-job resource monitoring</div><div class="f-sub">CPU time · peak memory</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">whole process tree</span></td>
+          <td class="no" title="No per-job CPU-time or peak-memory monitoring documented."><span class="mk">–</span></td>
+          <td class="no" title="Tracks execution duration only; no CPU time or peak memory."><span class="mk">–</span></td>
+          <td class="no" title="No per-job CPU time or peak memory monitoring."><span class="mk">–</span></td>
+          <td class="partial" title="Shell executor exposes per-job Prometheus gauges dkron_job_cpu_usage / mem_usage_kb (port 9422); recent addition."><span class="mk">◐</span><span class="cap">Prom gauges</span></td>
+          <td class="yes" title="Monitors per-job CPU, memory and log size every 10s, with limits."><span class="mk">✓</span></td>
+          <td class="addon" title="Needs metrics-server or cAdvisor+Prometheus; no native per-Job CPU/peak-memory."><span class="mk">+</span><span class="cap">metrics-server</span></td>
+          <td class="no orch" title="No native per-task CPU-time or peak-memory tracking in Airflow core."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Failure reporting</div><div class="f-sub">mail · Sentry · Slack</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">+ webhook &amp; shell</span></td>
+          <td class="yes" title="Native mail and Sentry; Slack/webhook via shell reporter."><span class="mk">✓</span></td>
+          <td class="partial" title="Native Sentry integration (-sentry-dsn); no email, Slack, or webhook."><span class="mk">◐</span><span class="cap">Sentry only</span></td>
+          <td class="yes" title="Mail (SMTP), Slack webhook, and save-to-directory drivers, with only-on-error options."><span class="mk">✓</span></td>
+          <td class="partial" title="OSS global Slack webhook; per-job Slack/email processors are Pro-only; no Sentry."><span class="mk">◐</span><span class="cap">Pro for per-job</span></td>
+          <td class="yes" title="Failure email plus web hooks (Slack via webhook); no native Sentry."><span class="mk">✓</span></td>
+          <td class="addon" title="Events only; needs a Prometheus Alertmanager add-on for Slack/email/webhook."><span class="mk">+</span><span class="cap">Alertmanager</span></td>
+          <td class="yes orch" title="Native email_on_failure and Sentry integration; Slack/PagerDuty via provider packages."><span class="mk">✓</span></td>
+        </tr>
+
+        <!-- GROUP: PLATFORM -->
+        <tr class="group"><td colspan="9"><span class="g-label">Platform &amp; deployment</span></td></tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Native Windows + macOS + Linux</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">all three, first-class</span></td>
+          <td class="no" title="Linux-only; binary targets glibc 2.23+, no Windows/macOS."><span class="mk">–</span></td>
+          <td class="no" title="Only Linux binaries published; pure-Go, so buildable from source."><span class="mk">–</span></td>
+          <td class="partial" title="Prebuilt Windows/macOS/Linux binaries, but Docker-centric; only job-local runs on host."><span class="mk">◐</span><span class="cap">Docker-centric</span></td>
+          <td class="yes" title="Prebuilt Windows, macOS, Linux, FreeBSD binaries (amd64/arm64)."><span class="mk">✓</span></td>
+          <td class="partial" title="POSIX only: Linux and macOS; Windows not natively supported."><span class="mk">◐</span><span class="cap">no Windows</span></td>
+          <td class="no" title="Requires a cluster; Linux (with Windows worker nodes) only, container-only, no macOS."><span class="mk">–</span></td>
+          <td class="no orch" title="Windows unsupported; Linux only (macOS for local dev only), plus containers."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Self-contained multi-arch binaries</div><div class="f-sub">no runtime install</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">8 Linux arches + mac + win</span></td>
+          <td class="partial" title="Self-contained binary exists but Linux x86-64 only, not multi-arch."><span class="mk">◐</span><span class="cap">x86-64 only</span></td>
+          <td class="yes" title="Static Go binaries: linux amd64/386/arm/arm64; no runtime install."><span class="mk">✓</span></td>
+          <td class="yes" title="Self-contained Go binaries: linux/darwin/windows across amd64/arm64/386."><span class="mk">✓</span></td>
+          <td class="yes" title="Static CGO-free multi-arch binaries; deb/rpm/tar.gz, no runtime install."><span class="mk">✓</span></td>
+          <td class="no" title="Installed via npm; requires the Node.js runtime, no self-contained binaries."><span class="mk">–</span></td>
+          <td class="no" title="Ships component binaries/images, but a CronJob needs a full cluster, not one binary."><span class="mk">–</span></td>
+          <td class="no orch" title="Distributed as a Python pip package that needs a Python runtime; no self-contained binaries."><span class="mk">–</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Hardened container images</div><div class="f-sub">non-root · read-only · distroless</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">+ 8 distro variants</span></td>
+          <td class="no" title="No official hardened/non-root/distroless image; users build their own."><span class="mk">–</span></td>
+          <td class="no" title="Ships no image; you COPY the binary into your own (scratch/distroless-capable)."><span class="mk">–</span></td>
+          <td class="no" title="alpine image runs as root, not read-only, not distroless."><span class="mk">–</span></td>
+          <td class="no" title="Alpine image runs as root; no distroless or read-only variant."><span class="mk">–</span></td>
+          <td class="no" title="No official image; only third-party Docker, none hardened/distroless."><span class="mk">–</span></td>
+          <td class="partial" title="No shipped image; you bring the container; securityContext / Pod Security Standards harden it."><span class="mk">◐</span><span class="cap">you harden it</span></td>
+          <td class="partial orch" title="Official image runs non-root (UID 50000) but is Debian-slim, not distroless and not read-only-rootfs friendly."><span class="mk">◐</span><span class="cap">not distroless</span></td>
+        </tr>
+
+        <tr>
+          <td class="feat"><div class="f-name">Minimal runtime dependencies</div></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">pure Python · MCP adds none</span></td>
+          <td class="partial" title="pip pulls aiohttp, ruamel.yaml, strictyaml, crontab, sentry-sdk, aiosmtplib, jinja2, pytz."><span class="mk">◐</span><span class="cap">8 pip deps</span></td>
+          <td class="yes" title="Single statically-linked Go binary; zero runtime dependencies."><span class="mk">✓</span></td>
+          <td class="yes" title="Single static Go binary; needs a Docker daemon for container jobs."><span class="mk">✓</span></td>
+          <td class="yes" title="Single static Go binary; embedded BoltDB, no external database required."><span class="mk">✓</span></td>
+          <td class="no" title="Requires the Node.js runtime plus roughly 24 npm packages."><span class="mk">–</span></td>
+          <td class="no" title="Requires a full cluster: etcd, apiserver, controller-manager, scheduler, kubelet, runtime."><span class="mk">–</span></td>
+          <td class="no orch" title="Heavy: needs Python plus a metadata DB, scheduler, API server, workers, and a triggerer."><span class="mk">–</span></td>
+        </tr>
+
+      </tbody>
+    </table>
+   </div>
+  </div>
+
+  <!-- MCP SPOTLIGHT -->
+  <div class="sec-head">
+    <div>
+      <h2>The part nobody else has</h2>
+      <p>The dashed column above tells the story. Here is what that one green cell actually gives you.</p>
+    </div>
+  </div>
+
+  <div class="mcp">
+    <div class="mcp-top">
+      <div class="lead">
+        <div class="mcp-kicker"><span class="sq"></span>Built-in MCP server</div>
+        <h3>Point <span class="a">Claude, Cursor or Copilot</span> straight at your scheduler.</h3>
+        <p>cronstable speaks the Model Context Protocol natively — served at <code>POST /mcp</code> over Streamable HTTP and through a <code>cronstable mcp</code> stdio bridge for desktop clients. It's hand-rolled in pure Python against MCP revision <b style="font-weight:600">2025-11-25</b>, so enabling it adds <b style="font-weight:600">zero</b> new dependencies. An agent gets look-but-don't-touch access until you deliberately hand it the keys.</p>
+      </div>
+      <pre class="snip" aria-label="Wiring cronstable's MCP server to Claude Code"><span class="p"># wire it to Claude Code — remote or local</span>
+claude mcp add <span class="k">--transport</span> http \
+  cronstable https://host/<span class="c">mcp</span> \
+  <span class="k">--header</span> <span class="c">"Authorization: Bearer $TOKEN"</span>
+
+$ cronstable mcp <span class="k">--check</span>
+<span class="ok">mcp check: ok</span> — protocol 2025-11-25,
+  <b>23 tool(s)</b> at http://127.0.0.1:8080/mcp</pre>
+    </div>
+
+    <div class="mcp-grid">
+      <div class="quad">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"></path><circle cx="12" cy="12" r="2.6"></circle></svg>
+        </span>Observe</div>
+        <ul>
+          <li>Every <b>job, run &amp; trend</b> — status, history, live log tails</li>
+          <li><b>DAGs</b>, their runs and XCom data hand-offs</li>
+          <li>The <b>cluster &amp; fleet</b>, node-by-node</li>
+          <li><b>Metrics</b> and the durable <b>state store</b></li>
+        </ul>
+      </div>
+      <div class="quad act">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m13 2-9 12h7l-1 8 9-12h-7l1-8Z"></path></svg>
+        </span>Act — on opt-in</div>
+        <ul>
+          <li><b>Run</b> or <b>cancel</b> a job on demand</li>
+          <li><b>Trigger</b>, <b>backfill</b> or <b>approve</b> a DAG</li>
+          <li>Every write needs <code>confirm: true</code></li>
+          <li>Backfills default to a <b>dry-run</b> preview</li>
+        </ul>
+      </div>
+      <div class="quad">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 12h16M4 19h10"></path></svg>
+        </span>Triage playbooks</div>
+        <ul>
+          <li><b>Root-cause</b> a failing job</li>
+          <li>Walk <b>why a DAG run failed</b></li>
+          <li>Scope the <b>blast radius</b> of a change</li>
+          <li>Fleet-health digest &amp; <b>backfill plan</b></li>
+        </ul>
+      </div>
+      <div class="quad safe">
+        <div class="qh"><span class="qi" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 5 6v5c0 4.5 3 8 7 10 4-2 7-5.5 7-10V6l-7-3Z"></path></svg>
+        </span>Safe by default</div>
+        <ul>
+          <li><b>Read-only</b> until you opt in to mutating tools</li>
+          <li>Inherits web auth; <b>fails closed</b> with no token</li>
+          <li>Secret values &amp; KV data <b>redacted</b></li>
+          <li>Origin &amp; body defenses against rebinding</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAKEAWAYS -->
+  <div class="takeaways">
+    <div class="tk">
+      <div class="n brass">1 of 8</div>
+      <div class="t">Only cronstable ships a native MCP server</div>
+      <p>Across every tool surveyed, it's the sole native agent interface. Airflow and Kubernetes reach it only through third-party, whole-system MCP add-ons — Airflow's own is still a draft proposal.</p>
+    </div>
+    <div class="tk">
+      <div class="n">4-in-1</div>
+      <div class="t">The DAG engine without the Airflow tax</div>
+      <p>Scheduler, durable DAG engine, leader-elected cluster and live console in one binary — matching Airflow's orchestration, minus the metadata DB, the workers, and the Python-only footprint.</p>
+    </div>
+    <div class="tk">
+      <div class="n">0 deps</div>
+      <div class="t">Hardened, portable, batteries-included</div>
+      <p>Pure-Python with no new dependencies, self-contained binaries for 13 OS/arch targets, and images that run non-root on a read-only root filesystem.</p>
+    </div>
+  </div>
+
+  <footer>
+    <p class="m"><b>Methodology.</b> Rows are cronstable's own capability set. Competitor cells were researched against each project's official documentation, README and changelog, then adversarially re-verified — every "not available" mark survived a dedicated attempt to refute it. Four claims were revised on evidence: dkron per-job resource gauges and Cronicle crontab-import / Time-Machine backfill were softened to "partial", and Airflow's statsd/OpenTelemetry metrics were confirmed native. Airflow's own MCP server is a draft proposal (AIP-91) with only third-party REST wrappers today, so it is graded "add-on" like Kubernetes; "classic crontab" is scored "no" for tools that accept a cron <em>expression</em> but do not ingest crontab <em>files</em>.</p>
+    <p class="m" style="margin-top:10px"><b>Compared:</b> yacron, supercronic, Ofelia, dkron (OSS + Pro noted), Cronicle, native Kubernetes CronJob, and Apache Airflow (the heavyweight orchestrator, shown for scale). Snapshot July 2026; features move — verify against current docs before quoting. Native counts reflect these 24 comparison rows and are directional, not a benchmark.</p>
+  </footer>
+
+</div>
+</div>
+</body>
+</html>
