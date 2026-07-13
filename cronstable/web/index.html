@@ -406,11 +406,11 @@
     user-select: none;
   }
   .brand { display: flex; align-items: baseline; gap: 9px; white-space: nowrap; }
-  /* the mark is a live cart-and-double-pendulum simulation (see the logo
-     engine script). its svg is ~44px tall but the negative margins keep the
-     layout box at 30px — same as the header buttons — so the header height
-     is untouched and the pendulum swings inside the header's padding band. */
-  .brand .mark { display: inline-flex; align-self: center; margin: -7px 0; cursor: pointer; }
+  /* the mark is the wordmark's l: a live cart-and-double-pendulum simulation
+     (see the logo engine script) scaled to the glyph and overlaid on its cell,
+     so the balanced pendulum IS the letter. the svg is absolutely positioned
+     by CronstableLogo.mountGlyph — zero layout impact; the swing plays out
+     inside the header's padding band. without JS the span just prints its l. */
   .brand .mark svg { display: block; filter: drop-shadow(0 0 5px var(--glow)); }
   .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
   .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; }
@@ -1320,8 +1320,7 @@
 
 <header>
   <div class="brand">
-    <span class="mark" id="mark" title="self-balancing double pendulum — click to nudge it, right-click to knock it over"></span>
-    <h1 class="glow" id="brandName">cronstable</h1>
+    <h1 class="glow" id="brandName" title="the l is a self-balancing double pendulum — sweep your cursor through it to nudge it, right-click to knock it over">cronstab<span class="mark" id="mark">l</span>e</h1>
     <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
@@ -1964,6 +1963,12 @@
         seed: 1,
         gusts: true,
       }, opts || {});
+      // track bounds (m, relative to the balance point x = 0). trackMin/
+      // trackMax params make the track asymmetric — the wordmark mount
+      // stretches it to the ends of "cronstable" while the equilibrium
+      // stays at the l's cell.
+      this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
+      this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
       this.rand = mulberry32(this.opts.seed);
       const lq = computeLQR(this.p);
       this.K = lq.K; this.P = lq.P;
@@ -1996,6 +2001,51 @@
       const dir = this.rand() < 0.5 ? -1 : 1;
       this.s[3] += dir * k;
       this.s[5] += dir * k * (0.6 + 0.8 * this.rand());
+    }
+    // a pointer sweeping through the linkage brushes it aside: quadratic
+    // ("wind") drag at the closest approach between the cursor's swept path
+    // (ax,ay)→(bx,by) and each link, projected through the point Jacobian
+    // onto the joint velocities — the lever arm and the angle of attack both
+    // shape the kick. Swept-path contact (not point sampling) so a fast
+    // flick can't tunnel between mousemove events; a slow hover barely
+    // stirs it. Args in sim units (m, s, m); per-event clamps keep
+    // teleporting cursors from exploding the state.
+    brush(ax, ay, bx, by, dt, R) {
+      const p = this.p, s = this.s;
+      const vx = (bx - ax) / dt, vy = (by - ay) / dt;
+      const v2 = vx * vx + vy * vy;
+      if (v2 < 1e-4) return;
+      const sp = Math.sqrt(v2);
+      const s1 = Math.sin(s[2]), c1 = Math.cos(s[2]);
+      const s2 = Math.sin(s[4]), c2 = Math.cos(s[4]);
+      const ex = s[0] + p.L1 * s1, ey = p.L1 * c1;
+      const tx = ex + p.L2 * s2, ty = ey + p.L2 * c2;
+      // closest approach between the path and a link segment (clamped
+      // projections, one refinement pass — exact enough for a brush)
+      const hit = (q0x, q0y, q1x, q1y) => {
+        const ux = bx - ax, uy = by - ay;
+        const wx = q1x - q0x, wy = q1y - q0y;
+        const rx = ax - q0x, ry = ay - q0y;
+        const A = ux * ux + uy * uy, B = ux * wx + uy * wy, C = wx * wx + wy * wy;
+        const D = ux * rx + uy * ry, E = wx * rx + wy * ry;
+        const den = A * C - B * B;
+        let sc = den > 1e-12 ? clamp((B * E - C * D) / den, 0, 1) : 0;
+        let tc = C > 1e-12 ? clamp((B * sc + E) / C, 0, 1) : 0;
+        sc = A > 1e-12 ? clamp((B * tc - D) / A, 0, 1) : 0;
+        tc = C > 1e-12 ? clamp((B * sc + E) / C, 0, 1) : 0;
+        const dx = (ax + sc * ux) - (q0x + tc * wx), dy = (ay + sc * uy) - (q0y + tc * wy);
+        return { t: tc, d: Math.hypot(dx, dy) };
+      };
+      const G1 = 0.09, G2 = 0.14;
+      const av1 = (vx * c1 - vy * s1) * sp;        // drag along link 1's swing direction
+      const h1 = hit(s[0], 0, ex, ey);
+      if (h1.d < R) s[3] += clamp(G1 * (1 - h1.d / R) * av1 * h1.t * dt, -0.5, 0.5);
+      const h2 = hit(ex, ey, tx, ty);
+      if (h2.d < R) {
+        const fall = 1 - h2.d / R;
+        s[5] += clamp(G2 * fall * (vx * c2 - vy * s2) * sp * h2.t * dt, -0.7, 0.7);
+        s[3] += clamp(0.6 * G1 * fall * av1 * dt, -0.4, 0.4);  // the elbow carries the blow too
+      }
     }
     _toMode(m) {
       if (m === this.mode) return;
@@ -2064,7 +2114,7 @@
       let s = s0.slice(), best = Infinity;
       for (let i = 0; i < SEG_N * SEG_STEPS; i++) {
         s = rk4(p, s, clamp(segs[(i / SEG_STEPS) | 0], -aCap, aCap), 1 / 120);
-        if (Math.abs(s[0]) > p.trackHalf * 0.95) return Infinity;
+        if (s[0] > this.xMax * 0.95 || s[0] < this.xMin * 0.95) return Infinity;
         if ((i & 1) === 1) {
           const c = this._vCost(s);
           if (c < best) best = c;
@@ -2126,7 +2176,7 @@
       const dt = 1 / 240;
       for (let i = 0; i < Math.round(2.0 / dt); i++) {
         const zz = this._wrapped(s);
-        if (Math.abs(zz[2]) > 1.0 || Math.abs(zz[4]) > 1.25 || Math.abs(zz[0]) > p.trackHalf) return false;
+        if (Math.abs(zz[2]) > 1.0 || Math.abs(zz[4]) > 1.25 || zz[0] > this.xMax || zz[0] < this.xMin) return false;
         s = rk4(p, s, this._lqrAccel(zz, i * dt < 1.2 ? aCatch : p.aMaxBalance), dt);
       }
       const zf = this._wrapped(s);
@@ -2160,14 +2210,14 @@
         let a = 0;
         if (this.mode === "balance") {
           const z = this._wrapped();
-          if (Math.abs(z[2]) > 1.0 || Math.abs(z[4]) > 1.3 || Math.abs(z[0]) > p.trackHalf * 1.02) {
+          if (Math.abs(z[2]) > 1.0 || Math.abs(z[4]) > 1.3 || z[0] > this.xMax * 1.02 || z[0] < this.xMin * 1.02) {
             this._toMode(this.connected ? "swing" : "limp");
           } else {
             a = this._lqrAccel(z, this._balanceAuthority());
             if (this.opts.gusts) {
               const n = this.noise;
               if (this.t > n.gustT) {
-                n.gust = (this.rand() - 0.5) * 2.2;
+                n.gust = (this.rand() - 0.5) * 0.55;  // a whisper: the standing l should sway, not lurch
                 n.gustEnd = this.t + 0.25;
                 n.gustT = this.t + 2.5 + 5 * this.rand();
               }
@@ -2186,8 +2236,8 @@
         }
         this.a = a;
         this.s = rk4(p, this.s, a, dt);
-        if (Math.abs(this.s[0]) > p.trackHalf * 1.05) {  // hard end-stops
-          this.s[0] = clamp(this.s[0], -p.trackHalf * 1.05, p.trackHalf * 1.05);
+        if (this.s[0] > this.xMax * 1.05 || this.s[0] < this.xMin * 1.05) {  // hard end-stops
+          this.s[0] = clamp(this.s[0], this.xMin * 1.05, this.xMax * 1.05);
           this.s[1] = 0;
           if (this.mode === "balance") this._toMode("swing");
         }
@@ -2214,6 +2264,9 @@
         connected: () => true,
         reducedMotion: () => false,
         scale: 28,                    // px per meter
+        ui: 1,                        // cart/bobs/rail are drawn for the 28px/m mark; ×ui rescales that chrome
+        railX: null,                  // rail gates override, signed [x1, x2] px (default: flush with the box edges)
+        decorative: null,             // aria-hidden svg — for mounts where host text already names the logo
         seed: (Math.random() * 1e9) | 0,
       }, opts || {});
       this.sim = new PendulumSim(this.opts.params, { seed: this.opts.seed });
@@ -2227,15 +2280,19 @@
     }
     _build() {
       const NS = "http://www.w3.org/2000/svg";
-      const S = this.opts.scale, p = this.sim.p;
+      const S = this.opts.scale, U = this.opts.ui, p = this.sim.p;
       const reach = (p.L1 + p.L2) * S;
-      const hw = Math.ceil(p.trackHalf * S + reach + 4);
+      const wL = Math.ceil(-this.sim.xMin * S + reach + 4);  // box extent left of the balance point
+      const wR = Math.ceil(this.sim.xMax * S + reach + 4);   // … and right (symmetric by default)
       const hh = Math.ceil(reach + 5);
-      // the rail spans the full box so the end gates sit flush with the
-      // logo's edges (snug against the wordmark). the cart's travel is
-      // shorter, and the tip's worst-case reach (trackHalf + L1 + L2,
-      // which sizes hw) stays ~2px inside the gates — nothing ever clips.
-      this._geom = { S: S, railY: 4.2, railX: hw - 2 };
+      // by default the rail spans the full box so the end gates sit flush
+      // with the logo's edges. the cart's travel is shorter, and the tip's
+      // worst-case reach (|track bound| + L1 + L2, which sizes the box)
+      // stays ~2px inside the gates — nothing ever clips. a railX override
+      // ([x1, x2] px) places the gates explicitly instead: the glyph mount
+      // puts them at the outer ends of the wordmark.
+      const rx = this.opts.railX != null ? this.opts.railX : [2 - wL, wR - 2];
+      this._geom = { S: S, U: U, railY: 4.2 * U, railX: rx };
       const mk = (t, at, parent) => {
         const n = document.createElementNS(NS, t);
         for (const k in at) n.setAttribute(k, at[k]);
@@ -2244,22 +2301,26 @@
       };
       this.svg = document.createElementNS(NS, "svg");
       const svgAt = {
-        viewBox: (-hw) + " " + (-hh) + " " + (2 * hw) + " " + (2 * hh),
-        width: 2 * hw, height: 2 * hh, role: "img",
-        "aria-label": "cronstable logo: a self-balancing double pendulum on a cart",
+        viewBox: (-wL) + " " + (-hh) + " " + (wL + wR) + " " + (2 * hh),
+        width: wL + wR, height: 2 * hh,
       };
+      if (this.opts.decorative) svgAt["aria-hidden"] = "true";
+      else {
+        svgAt.role = "img";
+        svgAt["aria-label"] = "cronstable logo: a self-balancing double pendulum on a cart";
+      }
       for (const k in svgAt) this.svg.setAttribute(k, svgAt[k]);
       const g = this._geom;
       this.eTrail = mk("polyline", { class: "p-trail", fill: "none", stroke: "var(--accent)", "stroke-width": 1, opacity: 0.35, points: "" });
-      mk("line", { class: "p-rail", x1: -g.railX, y1: g.railY, x2: g.railX, y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
-      mk("line", { class: "p-stop", x1: -g.railX, y1: g.railY - 3, x2: -g.railX, y2: g.railY + 0.6, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
-      mk("line", { class: "p-stop", x1: g.railX, y1: g.railY - 3, x2: g.railX, y2: g.railY + 0.6, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      mk("line", { class: "p-rail", x1: g.railX[0], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
+      mk("line", { class: "p-stop", x1: g.railX[0], y1: g.railY - 3 * U, x2: g.railX[0], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      mk("line", { class: "p-stop", x1: g.railX[1], y1: g.railY - 3 * U, x2: g.railX[1], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
       this.eL1 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
       this.eL2 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
-      this.eCart = mk("rect", { class: "p-cart", width: 7, height: 2.8, rx: 0.9, y: 0.7, fill: "var(--fg)" });
-      this.ePivot = mk("circle", { class: "p-pivot", r: 0.85, cy: 0, fill: "var(--fg)" });
-      this.eElbow = mk("circle", { class: "p-bob", r: 1.7, fill: "var(--accent)" });
-      this.eTip = mk("circle", { class: "p-bob", r: 2.1, fill: "var(--accent)" });
+      this.eCart = mk("rect", { class: "p-cart", width: 7 * U, height: 2.8 * U, rx: 0.9 * U, y: 0.7 * U, fill: "var(--fg)" });
+      this.ePivot = mk("circle", { class: "p-pivot", r: 0.85 * U, cy: 0, fill: "var(--fg)" });
+      this.eElbow = mk("circle", { class: "p-bob", r: 1.7 * U, fill: "var(--accent)" });
+      this.eTip = mk("circle", { class: "p-bob", r: 2.1 * U, fill: "var(--accent)" });
       this.el.appendChild(this.svg);
       this._render();
     }
@@ -2269,7 +2330,7 @@
       const cx = w.cart * S;
       const j2x = w.j2.x * S, j2y = -w.j2.y * S;
       const tx = w.tip.x * S, ty = -w.tip.y * S;
-      this.eCart.setAttribute("x", cx - 3.5);
+      this.eCart.setAttribute("x", cx - 3.5 * g.U);
       this.ePivot.setAttribute("cx", cx);
       this.eL1.setAttribute("x1", cx); this.eL1.setAttribute("y1", 0);
       this.eL1.setAttribute("x2", j2x); this.eL1.setAttribute("y2", j2y);
@@ -2322,14 +2383,114 @@
     poke(k) {
       if (!this.opts.reducedMotion()) this.sim.poke(k);
     }
+    /** The cursor is weather: mousemoves over `el` become viscous brushes on
+     *  whichever link the pointer grazes — direction, speed and where along
+     *  the link it hits all shape the response (see PendulumSim.brush). */
+    attachPointer(el) {
+      if (this._ptrEl) this.detachPointer();
+      const move = (e) => {
+        if (this.opts.reducedMotion()) { this._ptrLast = null; return; }
+        const r = this.svg.getBoundingClientRect();
+        if (!r.width) return;
+        const vb = this.svg.viewBox.baseVal;
+        const S = this._geom.S, k = vb.width / r.width;
+        const px = ((e.clientX - r.left) * k + vb.x) / S;      // sim meters,
+        const py = -((e.clientY - r.top) * k + vb.y) / S;      // y up, pivot line = 0
+        const t = e.timeStamp / 1000;
+        const last = this._ptrLast;
+        this._ptrLast = { x: px, y: py, t: t };
+        if (!last || t - last.t > 0.1) return;                 // stroke start (or stall): no velocity yet
+        const dt = Math.max(1e-3, t - last.t);
+        this.sim.brush(last.x, last.y, px, py, dt, Math.max(0.06, 7 / S));
+      };
+      const leave = () => { this._ptrLast = null; };
+      this._ptrEl = el;
+      this._ptrFns = [["mousemove", move], ["mouseleave", leave]];
+      for (const nf of this._ptrFns) el.addEventListener(nf[0], nf[1]);
+    }
+    detachPointer() {
+      if (!this._ptrEl) return;
+      for (const nf of this._ptrFns) this._ptrEl.removeEventListener(nf[0], nf[1]);
+      this._ptrEl = null;
+      this._ptrFns = null;
+      this._ptrLast = null;
+    }
     destroy() {
+      this.detachPointer();
       if (this._raf) cancelAnimationFrame(this._raf);
       this._raf = 0;
       if (this.svg) this.svg.remove();
     }
   }
 
+  // ---- glyph mount: the pendulum stands in for a letter of the wordmark ----
+  // `slot` is an inline element wrapping the letter (the l of "cronstable").
+  // The glyph is measured (canvas TextMetrics) and the sim scaled so the
+  // balanced pendulum — cart pivot on the baseline, tip at the stem's top —
+  // spans the letter exactly, with the svg anchored to the letter's cell.
+  // The sim's equilibrium is x = 0, so the controller literally targets the
+  // letter's position, while the cart's track runs the full width of the
+  // surrounding word — the end gates are the wordmark's outer edges. The
+  // printed glyph stays in the DOM for copy/paste, screen readers and no-JS,
+  // and is only blanked here, once its live replacement is standing.
+  CronstableLogo.mountGlyph = function (slot, opts) {
+    const cs = getComputedStyle(slot);
+    // computed lengths are unzoomed CSS px (standardized zoom does not
+    // premultiply getComputedStyle values), so they are already the right
+    // measurement space: the UI zoom (Settings → scale) then scales the
+    // finished svg together with the text, keeping the l in register
+    const fpx = parseFloat(cs.fontSize) || 15;
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (ctx) ctx.font = cs.fontStyle + " " + cs.fontWeight + " " + fpx + "px " + cs.fontFamily;
+    const m = ctx ? ctx.measureText(slot.textContent || "l") : null;
+    const stem = (m && m.actualBoundingBoxAscent) || fpx * 0.72;  // glyph height above the baseline
+    const asc = (m && m.fontBoundingBoxAscent) || fpx * 0.78;     // font box: locates the baseline
+    const desc = (m && m.fontBoundingBoxDescent) || fpx * 0.22;
+    const lh = parseFloat(cs.lineHeight) || fpx * 1.5;            // slot line-box height
+    const p = CronstableLogo.PARAMS;
+    const S = stem / (p.L1 + p.L2), U = S / 28;
+    // the track runs the full word: the text around the slot ("cronstab",
+    // "e") is measured with the same font, the gates sit at the wordmark's
+    // outer ends and the cart's hard stops just inside them — while the
+    // balance point stays x = 0, the l's cell.
+    let prefix = "", suffix = "";
+    for (let n = slot.previousSibling; n; n = n.previousSibling) prefix = (n.textContent || "") + prefix;
+    for (let n = slot.nextSibling; n; n = n.nextSibling) suffix += n.textContent || "";
+    const ls = parseFloat(cs.letterSpacing) || 0;
+    const adv = (t) => (m ? ctx.measureText(t).width + t.length * ls : t.length * fpx * 0.6);
+    const slotW = adv(slot.textContent || "l");
+    const pad = 3.5 * U + 0.8;   // gate → cart-center clearance (cart half-width + a hair)
+    // tuck the neighbors in: the live stem is a hairline, not a full bold
+    // glyph, so a whole printed cell reads loose around it. negative margins
+    // (applied only here, once the pendulum takes over, so the no-JS printed
+    // l keeps exact metrics) pull the flanking letters toward the stem; the
+    // slot's content box — and with it x = 0 — stays midway between them.
+    const tuck = slotW * 0.12;
+    const railL = prefix ? -(adv(prefix) + slotW / 2 - tuck) : -(p.trackHalf * 1.05 * S + pad);
+    const railR = suffix ? adv(suffix) + slotW / 2 - ls - tuck : p.trackHalf * 1.05 * S + pad;
+    const logo = new CronstableLogo(slot, Object.assign({
+      scale: S,
+      ui: U,
+      railX: [railL, railR],
+      params: { trackMin: (railL + pad) / (1.05 * S), trackMax: (railR - pad) / (1.05 * S) },
+      decorative: true,                               // the wordmark itself already reads "cronstable"
+    }, opts));
+    slot.style.position = "relative";
+    slot.style.display = "inline-block";
+    const svg = logo.svg;
+    const vb = svg.viewBox.baseVal;
+    svg.style.position = "absolute";
+    svg.style.pointerEvents = "none";
+    svg.style.left = "calc(50% + " + vb.x + "px)";
+    svg.style.top = ((lh - asc - desc) / 2 + asc - vb.height / 2).toFixed(2) + "px";
+    slot.style.color = "transparent";   // the printed l yields to the live one
+    slot.style.textShadow = "none";     // (a transparent glyph still casts its text-shadow glow)
+    slot.style.margin = "0 " + (-tuck).toFixed(2) + "px";
+    return logo;
+  };
+
   CronstableLogo.Sim = PendulumSim;
+  CronstableLogo.PARAMS = DP;
   window.CronstableLogo = CronstableLogo;
 })();
 </script>
@@ -6223,26 +6384,32 @@
       applyCols();
     });
     document.addEventListener("click", () => toggleColsMenu(false));
-    // the mark is a live self-balancing double pendulum (see the logo engine
-    // script above the main script). while the daemon is live it balances,
-    // riding out little gusts; losing the signal cuts its motor so it
-    // collapses and keeps swinging; on reconnect the cart swings it back
-    // upright and the balance controller catches it. reduced-motion shows a
-    // still pose (upright when live, hanging when not).
-    const pendLogo = new CronstableLogo($("mark"), {
+    // the wordmark's l is a live self-balancing double pendulum (see the logo
+    // engine script above the main script), scaled to the glyph and balanced
+    // over its cell — the controller's equilibrium IS the l's position. while
+    // the daemon is live it stands as the letter, riding out little gusts;
+    // losing the signal cuts its motor, so the l collapses out of the word
+    // and keeps swinging; on reconnect the cart swings it back upright and
+    // the balance controller catches it — the word heals. reduced-motion
+    // shows a still pose (the l when live, hanging when not).
+    const pendLogo = CronstableLogo.mountGlyph($("mark"), {
       connected: () => !!state.connected,
       reducedMotion: reduceMotion,
     });
     kickMark = () => pendLogo.sync();   // setConnected()/setMotion() call this
-    // a click gives it a shove it usually rides out; right-click knocks it
-    // clean over (instead of popping the browser menu) to watch the recovery
-    const pokeMark = () => pendLogo.poke(1.6 + Math.random() * 0.9);
-    const toppleMark = (e) => { e.preventDefault(); pendLogo.poke(4.4); };
-    $("mark").addEventListener("click", pokeMark);
-    $("mark").addEventListener("contextmenu", toppleMark);
-    // the wordmark pokes it too
-    $("brandName").addEventListener("click", pokeMark);
-    $("brandName").addEventListener("contextmenu", toppleMark);
+    // the cursor is weather: sweeping the pointer anywhere across the header
+    // brushes the linkage — speed, direction and where you graze it all
+    // matter. right-click still knocks it clean over (instead of popping the
+    // browser menu) to watch a full recovery.
+    pendLogo.attachPointer(document.querySelector("header"));
+    // there is no hover on touch screens: a tap on the wordmark keeps the
+    // nudge alive there, while mouse users' clicks stay inert (they brush)
+    $("brandName").addEventListener("click", (e) => {
+      const touch = e.pointerType === "touch" ||
+        (window.matchMedia && window.matchMedia("(hover: none)").matches);
+      if (touch) pendLogo.poke(1.6 + Math.random() * 0.9);
+    });
+    $("brandName").addEventListener("contextmenu", (e) => { e.preventDefault(); pendLogo.poke(4.4); });
     // follow live OS motion-preference flips: resync the reduce-motion CSS
     // class and park/resume the pendulum
     if (window.matchMedia) {
