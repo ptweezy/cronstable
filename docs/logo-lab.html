@@ -289,8 +289,11 @@
  *  This is not a canned animation. The header mark integrates the full
  *  nonlinear cart/double-pendulum dynamics (RK4 at 240 Hz) and balances
  *  itself with an LQR controller whose gains are computed at page load
- *  from a numerical linearization (discrete Riccati iteration). While the
- *  daemon is live it stands upright, riding out little gusts; lose the
+ *  from a numerical linearization (discrete Riccati iteration). A weak
+ *  detent spring at the elbow gives the stand its deliberate slight bend —
+ *  the leaned pose is a true equilibrium, solved in the constructor, and
+ *  the controller regulates to it. While the daemon is live the letter
+ *  stands with that easy bend, riding out little gusts; lose the
  *  signal and the motor cuts — it collapses and swings, pumping energy
  *  (dE/dt = -a*G exactly) but held just short of the top. When the signal
  *  returns, a receding-horizon cross-entropy planner threads the swing
@@ -309,6 +312,12 @@
     L1: 0.34, L2: 0.26,      // link lengths (m)
     m1: 0.14, m2: 0.09,      // point masses at link tips (kg)
     d1: 0.005, d2: 0.002,    // joint viscous damping
+    kElbow: 0.06,            // elbow detent: sinusoidal (magnetic-style), torque k*sin(rel-rest).
+                             // Deliberately WEAK: it only has to define the bent stand (the rest
+                             // angle absorbs the difference); anything stiffer measurably drags
+                             // on the swing-up (Monte-Carlo'd — k=0.25 strands recoveries whirling)
+    bendStand: 0.10,         // the stand is deliberately bent: link 2 leans this far (rad)
+    elbowRest: 0,            // detent rest angle; computed from bendStand in the constructor
     trackHalf: 0.42,         // cart travel each side of center (m)
     aMaxBalance: 18,         // accel authority while balancing (m/s^2)
     aMaxCatch: 24,           // extra muscle in the first 1.2 s of a catch
@@ -347,8 +356,14 @@
     const M11 = M * p.L1 * p.L1;
     const M12 = p.m2 * p.L1 * p.L2 * cD;
     const M22 = p.m2 * p.L2 * p.L2;
-    const Q1 = -p.d1 * w1 + p.d2 * (w2 - w1);
-    const Q2 = -p.d2 * (w2 - w1);
+    // elbow detent: a weak SINUSOIDAL spring (magnetic-cogging style) with a
+    // bent rest angle — it is what makes the standing l lean. Sinusoidal, not
+    // linear-wrapped: the torque is smooth and periodic over full elbow
+    // rotations (a wrapped linear spring flips sign discontinuously at the
+    // fold, which poisons RK4 and the CEM rollouts during a tumble).
+    const spr = p.kElbow ? p.kElbow * Math.sin(th2 - th1 - p.elbowRest) : 0;
+    const Q1 = -p.d1 * w1 + p.d2 * (w2 - w1) + spr;
+    const Q2 = -p.d2 * (w2 - w1) - spr;
     const b1 = -p.m2 * p.L1 * p.L2 * w2 * w2 * sD + p.g * M * p.L1 * s1 - M * p.L1 * c1 * a + Q1;
     const b2 = p.m2 * p.L1 * p.L2 * w1 * w1 * sD + p.g * p.m2 * p.L2 * s2 - p.m2 * p.L2 * c2 * a + Q2;
     const det = M11 * M22 - M12 * M12;
@@ -364,22 +379,23 @@
     const k4 = deriv(p, s4, a);
     return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
   }
-  // pendulum energy in the cart frame; upright = eUp
+  // pendulum energy in the cart frame (incl. the detent's PE); the swing-up
+  // target is the energy AT the bent stand — sim.EUP, computed per instance
   function energy(p, s) {
     const th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
     const M = p.m1 + p.m2;
     return 0.5 * M * p.L1 * p.L1 * w1 * w1
       + 0.5 * p.m2 * p.L2 * p.L2 * w2 * w2
       + p.m2 * p.L1 * p.L2 * w1 * w2 * Math.cos(th1 - th2)
-      + p.g * (M * p.L1 * Math.cos(th1) + p.m2 * p.L2 * Math.cos(th2));
+      + p.g * (M * p.L1 * Math.cos(th1) + p.m2 * p.L2 * Math.cos(th2))
+      + p.kElbow * (1 - Math.cos(th2 - th1 - p.elbowRest));
   }
-  const eUp = (p) => p.g * ((p.m1 + p.m2) * p.L1 + p.m2 * p.L2);
   // energy-flow coupling: dE/dt = -a * G(s); the pump pushes against G
   const Gterm = (p, s) =>
     (p.m1 + p.m2) * p.L1 * Math.cos(s[2]) * s[3] + p.m2 * p.L2 * Math.cos(s[4]) * s[5];
 
-  // ---- LQR gains from a numerical linearization at the upright ----
-  function computeLQR(p) {
+  // ---- LQR gains from a numerical linearization at the (bent) stand ----
+  function computeLQR(p, s0) {
     const n = 6, eps = 1e-6, dtc = 0.002;
     const mm = (A, B) => {
       const rn = A.length, cm = B[0].length, kk = B.length;
@@ -393,7 +409,7 @@
       return C;
     };
     const eye = (k) => Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) => (i === j ? 1 : 0)));
-    const s0 = [0, 0, 0, 0, 0, 0], f0 = deriv(p, s0, 0);
+    const f0 = deriv(p, s0, 0);
     const A = eye(n).map((r) => r.map(() => 0));
     for (let j = 0; j < n; j++) {
       const sp = s0.slice(); sp[j] += eps;
@@ -463,9 +479,26 @@
       this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
       this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
       this.rand = mulberry32(this.opts.seed);
-      const lq = computeLQR(this.p);
+      // the stand is deliberately BENT (bendStand): solve the elbow detent's
+      // rest angle so the leaned pose is a true equilibrium — link 2 leans by
+      // bendStand, link 1 counter-leans so the chain's CG sits plumb over the
+      // cart, and gravity's torque about the elbow is held by the spring.
+      // The LQR is linearized there and _wrapped() measures errors from
+      // there, so the controller balances the bent letter on purpose.
+      {
+        const p = this.p;
+        const A = (p.m1 + p.m2) * p.L1, B = p.m2 * p.L2;
+        const th2s = p.kElbow ? p.bendStand : 0;   // no spring, no bend to hold
+        const th1s = Math.asin(clamp(-(B / A) * Math.sin(th2s), -1, 1));
+        const stretch = p.kElbow
+          ? Math.asin(clamp(B * p.g * Math.sin(th2s) / p.kElbow, -1, 1)) : 0;
+        p.elbowRest = (th2s - th1s) - stretch;
+        this.sEq = [0, 0, th1s, 0, th2s, 0];
+        this.EUP = energy(p, this.sEq);
+      }
+      const lq = computeLQR(this.p, this.sEq);
       this.K = lq.K; this.P = lq.P;
-      this.s = [0, 0, 0, 0, 0, 0];
+      this.s = this.sEq.slice();
       this.mode = "balance";
       this.connected = true;
       this.t = 0;
@@ -552,7 +585,8 @@
     }
     _wrapped(s) {
       s = s || this.s;
-      return [s[0], s[1], wrapA(s[2]), s[3], wrapA(s[4]), s[5]];
+      const q = this.sEq;   // errors are measured from the bent stand
+      return [s[0], s[1], wrapA(s[2] - q[2]), s[3], wrapA(s[4] - q[4]), s[5]];
     }
     _lqrAccel(z, aMax) {
       let a = 0;
@@ -587,7 +621,7 @@
       return Math.min(1.35, 1.10 + Math.floor(tSw / 6) * 0.05);
     }
     _pumpAccel() {
-      const p = this.p, s = this.s, EUP = eUp(p);
+      const p = this.p, s = this.s, EUP = this.EUP;
       const E = energy(p, s);
       const dE = EUP * this._pumpTarget() - E;
       let a;
@@ -678,7 +712,7 @@
              Math.abs(zf[3]) < 0.5 && Math.abs(zf[5]) < 0.6;
     }
     _swingFrame() {
-      const p = this.p, EUP = eUp(p);
+      const p = this.p, EUP = this.EUP;
       const E = energy(p, this.s);
       const z2 = wrapA(this.s[2]);
       const inRegion = this.connected &&
@@ -862,7 +896,16 @@
       this._raf = 0;
       this._last = 0;
       const up = this.sim.connected;
-      this.sim.s = up ? [0, 0, 0, 0, 0, 0] : [0, 0, Math.PI, 0, Math.PI, 0];
+      if (up) this.sim.s = this.sim.sEq.slice();
+      else {
+        // dead hang, settled numerically: the elbow detent keeps a hint of
+        // the bend even hanging, so the honest still pose keeps its character
+        const p = this.sim.p, hd = Object.assign({}, p, { d1: 0.5, d2: 0.35 });
+        let s = [0, 0, Math.PI, 0, Math.PI, 0];
+        for (let i = 0; i < 960; i++) s = rk4(hd, s, 0, p.dt);
+        s[1] = 0; s[3] = 0; s[5] = 0;
+        this.sim.s = s;
+      }
       this.sim.mode = up ? "balance" : "limp";
       this.trail.length = 0;
       this._render();
@@ -958,7 +1001,7 @@
     // (applied only here, once the pendulum takes over, so the no-JS printed
     // l keeps exact metrics) pull the flanking letters toward the stem; the
     // slot's content box — and with it x = 0 — stays midway between them.
-    const tuck = slotW * 0.12;
+    const tuck = slotW * 0.16;
     const railL = prefix ? -(adv(prefix) + slotW / 2 - tuck) : -(p.trackHalf * 1.05 * S + pad);
     const railR = suffix ? adv(suffix) + slotW / 2 - ls - tuck : p.trackHalf * 1.05 * S + pad;
     const logo = new CronstableLogo(slot, Object.assign({
