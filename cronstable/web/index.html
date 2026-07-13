@@ -6343,9 +6343,10 @@
   // ===================================================================
   //  wiring
   // ===================================================================
-  // restarts the logo's idle-cruise loop when it's parked; assigned the real
-  // implementation in wire(), but callable from anywhere (setConnected fires
-  // it when the live state flips, which happens well after wire() has run)
+  // re-syncs the pendulum mark (park/resume + connected state); assigned the
+  // real implementation in wire(), but callable from anywhere (setConnected
+  // fires it when the live state flips, which happens well after wire() has
+  // run)
   let kickMark = () => {};
   function wire() {
     $("rows").addEventListener("click", (e) => {

@@ -21,7 +21,7 @@ ONLY = set(sys.argv[1:])
 
 # clean release-style version for the header (the local build carries a long
 # setuptools-scm dev string; a release install shows a clean one like this)
-VERSION = "1.2.8"
+VERSION = "1.2.14"
 
 results = {}
 
@@ -156,13 +156,19 @@ def main():
             "try{if(!localStorage.getItem('cronstable.bootWant'))"
             "localStorage.setItem('cronstable.boot','false');"
             "localStorage.setItem('cronstable.zen','false');}catch(e){}"
-            # the logo idle-cruises via JS inline transforms, which the
-            # reduced-motion CSS can't suppress; pin it upright so shots
-            # don't catch it at a random angle
-            "document.addEventListener('DOMContentLoaded',()=>{"
-            "const s=document.createElement('style');"
-            "s.textContent='#mark{transform:none !important}';"
-            "document.head.appendChild(s)});"
+            # the mark is a live pendulum sim (rAF-driven, so reduced-motion
+            # CSS can't freeze it); park it balanced at exact upright the
+            # moment it mounts so no shot catches it mid-sway. The hook wraps
+            # mountGlyph as window.CronstableLogo is assigned — page code runs
+            # unmodified, and a reload re-parks automatically. sync() is
+            # stubbed so nothing (kickMark, live-state flips) restarts it.
+            "(()=>{let CL;Object.defineProperty(window,'CronstableLogo',{"
+            "configurable:true,get:()=>CL,set:(v)=>{const orig=v.mountGlyph;"
+            "v.mountGlyph=function(slot,opts){const L=orig.call(v,slot,opts);"
+            "L.sync=()=>{};if(L._raf)cancelAnimationFrame(L._raf);L._raf=0;"
+            "L.sim.opts.gusts=false;L.sim.setConnected(true);"
+            "L.sim.s=[0,0,0,0,0,0];L.sim.mode='balance';L.sim.a=0;"
+            "L._render();window.__pendLogo=L;return L;};CL=v;}});})();"
         )
         page = ctx.new_page()
         page.goto(BASE)
