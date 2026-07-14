@@ -10,13 +10,16 @@ name: CI
 # -- and gates on ALL of it. Nothing is published on an ordinary commit.
 #
 # A release happens ONLY when either:
-#   - a push to `main` carries a [release] marker in ANY of its commits:
+#   - a push to `main` carries a [release] marker at the START of the SUBJECT
+#     line of any of its commits:
 #         [release]          -> minor (default)
 #         [release:major]    -> major
 #         [release:minor]    -> minor
 #         [release:patch]    -> patch
-#     (most significant marker across the push wins; substring match, so don't
-#     quote the marker verbatim in a message unless you mean it), or
+#     (most significant marker across the push wins; bodies are never scanned,
+#     so prose that merely mentions a marker cannot trigger or escalate a
+#     release -- 1.3.0 shipped off a [release:patch] push because a commit
+#     body discussing the bare [release] marker out-bumped it), or
 #   - it is started via workflow_dispatch (bump from the dropdown, or an exact
 #     `tag` to release a specific X.Y.Z; the `tag` input wins over `bump`).
 #
@@ -34,10 +37,8 @@ name: CI
 # This file replaces the former build.yml + docker.yml + tox.yml + release.yml,
 # whose binary/tox builds it deduplicates into one definition each.
 #
-# Example commit message:
-#     Add retry backoff to the HTTP reporter
-#
-#     [release:minor]
+# Example commit message (marker leads the subject line):
+#     [release:minor] Add retry backoff to the HTTP reporter
 
 on:
   push:
@@ -118,20 +119,25 @@ jobs:
             bump="${INPUT_BUMP:-minor}"
           elif [ "$EVENT" = "push" ] && [ "$REF" = "refs/heads/main" ]; then
             # Trigger if ANY commit introduced by this push has a [release]
-            # marker anywhere in its message -- not just the tip commit. The
-            # range is the commits new in this push (BEFORE..AFTER); on a
+            # marker -- not just the tip commit (the marker usually sits on a
+            # develop commit one behind the merge commit that lands on main).
+            # The range is the commits new in this push (BEFORE..AFTER); on a
             # brand-new branch BEFORE is all-zeros, so fall back to the tip.
             zero="0000000000000000000000000000000000000000"
             if [ -z "${BEFORE:-}" ] || [ "$BEFORE" = "$zero" ] \
                  || ! git rev-parse -q --verify "${BEFORE}^{commit}" >/dev/null; then
-              msgs="$(git log -1 --pretty=%B "$AFTER")"
+              subjects="$(git log -1 --pretty=%s "$AFTER")"
             else
-              msgs="$(git log --pretty=%B "${BEFORE}..${AFTER}")"
+              subjects="$(git log --pretty=%s "${BEFORE}..${AFTER}")"
             fi
-            # Collect every marker token (substring match, anywhere in any
-            # message), lowercased.
-            markers="$(printf '%s\n' "$msgs" \
-              | grep -oiE '\[release(:(major|minor|patch))?\]' \
+            # Only commit SUBJECTS are scanned, and the marker must be at the
+            # very start of the subject. Bodies are never scanned: prose that
+            # merely mentions a marker (a changelog quote, a commit that
+            # documents this very syntax, dependabot notes) must not trigger
+            # or escalate a release -- that is exactly how 1.3.0 shipped from
+            # a [release:patch] push.
+            markers="$(printf '%s\n' "$subjects" \
+              | grep -oiE '^\[release(:(major|minor|patch))?\]' \
               | tr '[:upper:]' '[:lower:]' || true)"
             if [ -n "$markers" ]; then
               release=true
