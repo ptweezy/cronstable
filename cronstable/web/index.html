@@ -1802,7 +1802,11 @@
  *  (dE/dt = -a*G exactly) but held just short of the top. When the signal
  *  returns, a receding-horizon cross-entropy planner threads the swing
  *  into the balance controller's basin — every catch is verified by a
- *  2-second closed-loop rollout before it is committed. Stability isn't
+ *  2-second closed-loop rollout before it is committed. A hard recovery
+ *  gets running room: the right end of the track swings open toward
+ *  mid-page — the physics bound leaps at once, while a phantom rail
+ *  and a fleeing end gate keep the picture honest — and eases back
+ *  to the end of the word once the letter stands at home. Stability isn't
  *  a metaphor here; it is recomputed 240 times a second.
  *
  *  State s = [x, xd, th1, w1, th2, w2]; angles from upright; control is
@@ -2266,6 +2270,7 @@
         scale: 28,                    // px per meter
         ui: 1,                        // cart/bobs/rail are drawn for the 28px/m mark; ×ui rescales that chrome
         railX: null,                  // rail gates override, signed [x1, x2] px (default: flush with the box edges)
+        railMax: null,                // dynamic right gate: how far (px) it may open during a recovery (null = fixed)
         decorative: null,             // aria-hidden svg — for mounts where host text already names the logo
         seed: (Math.random() * 1e9) | 0,
       }, opts || {});
@@ -2283,7 +2288,8 @@
       const S = this.opts.scale, U = this.opts.ui, p = this.sim.p;
       const reach = (p.L1 + p.L2) * S;
       const wL = Math.ceil(-this.sim.xMin * S + reach + 4);  // box extent left of the balance point
-      const wR = Math.ceil(this.sim.xMax * S + reach + 4);   // … and right (symmetric by default)
+      // … and right (symmetric by default; a dynamic gate needs room to its cap)
+      const wR = Math.ceil(Math.max(this.sim.xMax * S, this.opts.railMax || 0) + reach + 4);
       const hh = Math.ceil(reach + 5);
       // by default the rail spans the full box so the end gates sit flush
       // with the logo's edges. the cart's travel is shorter, and the tip's
@@ -2293,6 +2299,21 @@
       // puts them at the outer ends of the wordmark.
       const rx = this.opts.railX != null ? this.opts.railX : [2 - wL, wR - 2];
       this._geom = { S: S, U: U, railY: 4.2 * U, railX: rx };
+      // dynamic right gate (opt-in via railMax): while the mark is recovering
+      // the physics bound opens out and the drawn gate flees ahead of the
+      // cart — state here, policy in _gateStep. gate travel is measured
+      // RELATIVE to rest, so the physics bound extends relative to restM and
+      // any railX/track pairing stays in register.
+      this._gate = this.opts.railMax == null ? null : {
+        x: rx[1], rest: rx[1],
+        cap: Math.max(this.opts.railMax, rx[1]),
+        min: 12 * U,            // drawn gate → cart-edge clearance
+        restM: this.sim.xMax,   // the word-edge physics bound to come home to
+        settledAt: -1,
+        pending: null,          // resize shrink arriving mid-recovery, held (see setRailMax)
+        v: 0,                   // low-passed rightward cart charge, px/s (see _gateStep)
+        rv: 0,                  // retract speed slew, px/s — eases the ride home in from zero
+      };
       const mk = (t, at, parent) => {
         const n = document.createElementNS(NS, t);
         for (const k in at) n.setAttribute(k, at[k]);
@@ -2313,8 +2334,11 @@
       const g = this._geom;
       this.eTrail = mk("polyline", { class: "p-trail", fill: "none", stroke: "var(--accent)", "stroke-width": 1, opacity: 0.35, points: "" });
       mk("line", { class: "p-rail", x1: g.railX[0], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2 });
+      // phantom track: the temporary rail that fills in behind the fleeing
+      // right gate while the track is opened out (see _gateStep)
+      this.eGhost = !this._gate ? null : mk("line", { class: "p-rail-ext", x1: g.railX[1], y1: g.railY, x2: g.railX[1], y2: g.railY, stroke: "var(--border2)", "stroke-width": 1.2, opacity: 0 });
       mk("line", { class: "p-stop", x1: g.railX[0], y1: g.railY - 3 * U, x2: g.railX[0], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
-      mk("line", { class: "p-stop", x1: g.railX[1], y1: g.railY - 3 * U, x2: g.railX[1], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
+      this.eStopR = mk("line", { class: "p-stop", x1: g.railX[1], y1: g.railY - 3 * U, x2: g.railX[1], y2: g.railY + 0.6 * U, stroke: "var(--fg-faint)", "stroke-width": 1.4 });
       this.eL1 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
       this.eL2 = mk("line", { class: "p-link", stroke: "var(--fg)", "stroke-width": 1.5, "stroke-linecap": "round" });
       this.eCart = mk("rect", { class: "p-cart", width: 7 * U, height: 2.8 * U, rx: 0.9 * U, y: 0.7 * U, fill: "var(--fg)" });
@@ -2345,6 +2369,17 @@
         this.trail.splice(0, 2); // fade the trail out after a catch
       }
       this.eTrail.setAttribute("points", this.trail.join(" "));
+      const gt = this._gate;
+      if (gt && gt.x !== this._gateDrawn) {
+        this._gateDrawn = gt.x;
+        this.eStopR.setAttribute("x1", gt.x);
+        this.eStopR.setAttribute("x2", gt.x);
+        // the phantom rail runs flush to the fleeing gate, so the track's
+        // bottom edge visibly extends with it; it fades in over the first
+        // few px of travel instead of blinking
+        this.eGhost.setAttribute("x2", gt.x);
+        this.eGhost.setAttribute("opacity", Math.min(1, (gt.x - gt.rest) / (6 * g.U)).toFixed(3));
+      }
       if (w.mode !== this._mode) {
         this._mode = w.mode;
         this.svg.setAttribute("data-mode", w.mode);
@@ -2359,6 +2394,7 @@
       const dt = this._last ? (t - this._last) / 1000 : 1 / 60;
       this._last = t;
       this.sim.step(dt);
+      this._gateStep(dt);
       this._render();
       this._raf = requestAnimationFrame(this._frame);
     }
@@ -2371,8 +2407,102 @@
       const up = this.sim.connected;
       this.sim.s = up ? [0, 0, 0, 0, 0, 0] : [0, 0, Math.PI, 0, Math.PI, 0];
       this.sim.mode = up ? "balance" : "limp";
+      if (this._gate) { this._gate.x = this._gate.rest; this._gate.settledAt = -1; this._gate.v = 0; this._gate.rv = 0; this.sim.xMax = this._gate.restM; }
       this.trail.length = 0;
       this._render();
+    }
+    // dynamic right gate. the moment balance is lost the physics bound leaps
+    // to the cap (the wall turns almost imaginary — mid-page by default — so
+    // the planner can run the cart out under the header instead of dying
+    // against the "e"), while the DRAWN gate only flees as the cart actually
+    // charges it — velocity-led, riding just `min` ahead of the envelope of
+    // the cart's excursions (fast out, slow back) and never letting the
+    // cart's edge within `min`; the phantom track fills in flush
+    // behind it. once the
+    // catch is verified and the cart has walked the letter home (a beat of
+    // dwell so a wobble can't flutter it), gate and track glide back to the
+    // end of the word, the physics bound riding them in.
+    _gateStep(dt) {
+      const gt = this._gate;
+      if (!gt) return;
+      dt = clamp(dt, 0, 0.05);   // mirror sim.step: a refocused tab must not teleport the gate
+      // a resize shrink that arrived mid-recovery applies as soon as the new
+      // cap wouldn't move the drawn gate
+      if (gt.pending != null && gt.x <= Math.max(gt.rest, gt.pending)) {
+        const px = gt.pending;
+        gt.pending = null;
+        this.setRailMax(px);
+      }
+      const S = this._geom.S, U = this._geom.U, sim = this.sim;
+      // the bound extends RELATIVE to restM by the gate's travel beyond rest,
+      // with `min` reserved so the drawn gate can always clear a cart parked
+      // on the extended hard stop without itself crossing `cap`
+      const capM = gt.restM + Math.max(0, gt.cap - gt.rest - gt.min) / (1.05 * S);
+      const cartEdge = sim.s[0] * S + 3.5 * U;
+      const home = sim.mode === "balance" && Math.abs(sim.s[0]) < 0.06 && Math.abs(sim.s[1]) < 0.3;
+      if (!home) gt.settledAt = -1;
+      else if (gt.settledAt < 0) gt.settledAt = sim.t;
+      if (sim.mode !== "balance") sim.xMax = capM;
+      if (gt.settledAt >= 0 && sim.t - gt.settledAt > 1.1) {
+        // verified catch + the letter stands at home: glide everything back.
+        // xMax is set even when the gate is already home — the escort below
+        // may have brought it in before the dwell elapsed, and the physics
+        // bound must still come home with it
+        if (gt.x > gt.rest) {
+          // stately ride home: the speed eases in from zero (velocity-
+          // continuous with the escort's gentle drift) and tracks
+          // distance/1.4 s clamped to [30, 200] px/s — the floor keeps a
+          // far gate from dawdling, the ceiling and ease-in keep a
+          // half-retracted one from snapping
+          const dist = gt.x - gt.rest;
+          const wantRate = clamp(dist / 1.4, 30, 200);
+          gt.rv += (wantRate - gt.rv) * (1 - Math.exp(-dt / 0.4));
+          gt.x -= Math.min(gt.rv * dt, dist);
+          if (gt.x - gt.rest < 0.5) gt.x = gt.rest;
+        }
+        sim.xMax = gt.restM + Math.max(0, gt.x - gt.rest - gt.min) / (1.05 * S);   // same min reserve as capM: xMax rides [restM, capM] exactly
+      } else {
+        gt.rv = 0;   // any new action re-arms the soft start of the ride home
+        // recovering, or walking the catch home: the gate stays put until
+        // the cart genuinely approaches, then rides just `min` ahead of it,
+        // leading further the faster the rightward charge — the velocity
+        // anticipation outruns the smoothing lag, so the hard floor below
+        // almost never has to snap (no bulldozing), and a cart nowhere near
+        // the gate never moves it at all (no lurch at recovery start).
+        // the charge is low-passed and the ease-back rate-capped below, so
+        // the gate rides the ENVELOPE of the swing instead of chasing each
+        // stroke out and back
+        const charge = Math.max(0, sim.s[1]) * S;   // rightward cart speed, px/s
+        gt.v += (charge - gt.v) * (1 - Math.exp(-dt / 0.35));
+        const want = clamp(cartEdge + gt.min + 0.45 * gt.v, gt.rest, gt.cap);
+        // fast out, slow back: the gate rides the envelope of the cart's
+        // excursions instead of flapping with every swing
+        let dx = (want - gt.x) * (1 - Math.exp(-dt / (want > gt.x ? 0.1 : 2.2)));
+        if (dx < 0) dx = Math.max(dx, -22 * dt);   // ease back gently: ride the envelope, don't chase the cart back in
+        gt.x += dx;
+      }
+      // the wall never exceeds the current allowance (a resize shrink can
+      // finish applying while balance holds, a window where no branch above
+      // rewrites xMax) — and never lands inside the cart itself
+      sim.xMax = Math.max(Math.min(sim.xMax, capM), sim.s[0] + 0.02);
+      gt.x = clamp(Math.max(gt.x, cartEdge + gt.min), gt.rest, gt.cap);
+    }
+    /** Re-cap the dynamic right gate (glyph mounts re-measure on resize).
+     *  The svg box tracks the cap BOTH ways — an oversized box left behind by
+     *  a window shrink would push a horizontal scrollbar. A cap below the
+     *  current gate position is held in gt.pending and applied by _gateStep
+     *  once the gate is back under it, so nothing on screen ever jumps. */
+    setRailMax(px) {
+      const gt = this._gate;
+      if (!gt || !isFinite(px)) return;
+      gt.pending = px < gt.x ? px : null;   // shrink while out: hold until the gate is back
+      gt.cap = Math.max(gt.rest, gt.x, px);
+      const vb = this.svg.viewBox.baseVal;
+      const need = Math.ceil(gt.cap + (this.sim.p.L1 + this.sim.p.L2) * this._geom.S + 4);
+      if (need !== vb.x + vb.width) {
+        this.svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + (need - vb.x) + " " + vb.height);
+        this.svg.setAttribute("width", need - vb.x);
+      }
     }
     /** Re-read connected()/reducedMotion() and start/stop the loop. */
     sync() {
@@ -2433,6 +2563,8 @@
   // surrounding word — the end gates are the wordmark's outer edges. The
   // printed glyph stays in the DOM for copy/paste, screen readers and no-JS,
   // and is only blanked here, once its live replacement is standing.
+  // During a hard recovery the right gate opens out toward mid-page and
+  // closes back to the wordmark's edge once the letter stands (railMax).
   CronstableLogo.mountGlyph = function (slot, opts) {
     const cs = getComputedStyle(slot);
     // computed lengths are unzoomed CSS px (standardized zoom does not
@@ -2468,10 +2600,21 @@
     const tuck = slotW * 0.12;
     const railL = prefix ? -(adv(prefix) + slotW / 2 - tuck) : -(p.trackHalf * 1.05 * S + pad);
     const railR = suffix ? adv(suffix) + slotW / 2 - ls - tuck : p.trackHalf * 1.05 * S + pad;
+    // the dynamic right gate may open out to the middle of the page during
+    // a recovery (see _gateStep). Its cap is measured in the svg's own
+    // unzoomed px: the slot's rendered width against its measured advance
+    // cancels any host UI zoom (rects are zoomed, canvas metrics are not).
+    const midPage = () => {
+      const r = slot.getBoundingClientRect();
+      return r.width > 0 && slotW > 0
+        ? (window.innerWidth / 2 - (r.left + r.width / 2)) * (slotW / r.width)
+        : railR;
+    };
     const logo = new CronstableLogo(slot, Object.assign({
       scale: S,
       ui: U,
       railX: [railL, railR],
+      railMax: Math.max(railR, midPage()),
       params: { trackMin: (railL + pad) / (1.05 * S), trackMax: (railR - pad) / (1.05 * S) },
       decorative: true,                               // the wordmark itself already reads "cronstable"
     }, opts));
@@ -2486,6 +2629,13 @@
     slot.style.color = "transparent";   // the printed l yields to the live one
     slot.style.textShadow = "none";     // (a transparent glyph still casts its text-shadow glow)
     slot.style.margin = "0 " + (-tuck).toFixed(2) + "px";
+    // the mid-page cap follows the window; measured once more right away,
+    // because the tuck margins just shifted the slot under the first reading
+    const recap = () => logo.setRailMax(Math.max(railR, midPage()));
+    recap();
+    window.addEventListener("resize", recap);
+    const bye = logo.destroy.bind(logo);
+    logo.destroy = () => { window.removeEventListener("resize", recap); bye(); };
     return logo;
   };
 
