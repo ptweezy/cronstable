@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## 1.2.15 (2026-07-13)
+## 1.2.15 (2026-07-14)
 
 A maintenance release: no functional changes to cronstable itself -- the
 package, the CLI, and every shipped binary behave exactly as in 1.2.14.  It
@@ -29,6 +29,14 @@ docs to match.
   Homebrew tap update is no longer best-effort -- if the tap cannot be updated
   (for example, a missing token) the release now fails loudly instead of
   finishing green with a stale formula.
+
+- **Hardened release trigger.** A `1.3.0` was published in error before this
+  release: the trigger substring-matched whole commit messages, so a commit
+  *body* that merely discussed the bare `[release]` marker out-bumped the
+  intended `[release:patch]`. `1.3.0` is withdrawn (yanked on PyPI, its GitHub
+  release and container tags removed) and contains exactly what ships here as
+  `1.2.15`. The trigger now scans only commit subject lines and only honors a
+  marker at the very start of the subject.
 
 - **Contributor docs.** `CONTRIBUTING.md` and the "Contributing and Releasing"
   wiki page are rewritten for the single-pipeline flow.
