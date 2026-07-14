@@ -295,7 +295,15 @@ def main():
                 page.wait_for_selector(
                     "#bootScreen", state="visible", timeout=8000
                 )
-                page.wait_for_timeout(1600)
+                # shoot inside the READY hold (650 ms at full opacity, every
+                # POST line printed) — a fixed sleep races the fade-out
+                page.wait_for_selector("#bootLog .boot-ready", timeout=8000)
+                # pin the READY cursor on (its 1s blink is 50/50 at shot time)
+                page.add_style_tag(
+                    content=".boot-cur{animation:none!important;"
+                    "opacity:1!important}"
+                )
+                page.wait_for_timeout(150)
                 page.screenshot(path=str(OUT / "boot@carolina.png"))
                 manifest["boot"] = ["carolina"]
                 results["boot"] = "ok"
@@ -535,7 +543,9 @@ def main():
         if wants("wallboard"):
             try:
                 close_overlays(page)
-                page.keyboard.type("w")
+                # the toolbar button is deterministic; the "w" hotkey is
+                # swallowed if a closing overlay still holds focus
+                page.click("#tvBtn")
                 page.wait_for_selector(
                     "#wallboard", state="visible", timeout=4000
                 )

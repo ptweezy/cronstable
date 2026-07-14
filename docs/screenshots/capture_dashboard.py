@@ -187,7 +187,16 @@ def main():
                 page.wait_for_selector(
                     "#bootScreen", state="visible", timeout=8000
                 )
-                page.wait_for_timeout(1600)  # let a few POST lines print
+                # shoot inside the READY hold (650 ms at full opacity, every
+                # POST line printed) — a fixed sleep races the fade-out and
+                # catches a washed-out overlay instead
+                page.wait_for_selector("#bootLog .boot-ready", timeout=8000)
+                # pin the READY cursor on (its 1s blink is 50/50 at shot time)
+                page.add_style_tag(
+                    content=".boot-cur{animation:none!important;"
+                    "opacity:1!important}"
+                )
+                page.wait_for_timeout(150)
                 shot(page, "dashboard-boot")
             except Exception as e:
                 results["dashboard-boot"] = f"FAIL {e}"
@@ -509,7 +518,9 @@ def main():
         if wants("dashboard-wallboard"):
             try:
                 close_overlays(page)
-                page.keyboard.type("w")
+                # the toolbar button is deterministic; the "w" hotkey is
+                # swallowed if a closing overlay still holds focus
+                page.click("#tvBtn")
                 page.wait_for_selector(
                     "#wallboard", state="visible", timeout=4000
                 )
