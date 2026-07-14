@@ -155,15 +155,19 @@ def events_map():
 
 # Captures the header's mounted CronstableLogo instance the moment the page
 # creates it: mountGlyph is wrapped as window.CronstableLogo is assigned, and
-# the returned logo lands on window.__pendLogo. Noninvasive — the page's own
-# code runs unmodified.
+# the returned logo lands on window.__pendLogo. The dynamic right gate
+# (railMax) is pinned OFF: the capture drives sim.step()+_render() directly
+# (never _gateStep), the seed search is choreographed against the word-edge
+# track, and a mid-page gate cap would balloon the '#mark svg' rect — and
+# with it the clip box — to half the viewport. Otherwise noninvasive — the
+# page's own code runs unmodified.
 INIT_HOOK = (
     "(() => { let CL;"
     "Object.defineProperty(window, 'CronstableLogo', {"
     " configurable: true, get: () => CL,"
     " set: (v) => { const orig = v.mountGlyph;"
     "  v.mountGlyph = function (slot, opts) {"
-    "   const logo = orig.call(v, slot, opts);"
+    "   const logo = orig.call(v, slot, Object.assign({}, opts, { railMax: null }));"
     "   window.__pendLogo = logo; return logo; };"
     "  CL = v; } }); })();"
 )
@@ -177,6 +181,10 @@ JS_SETUP = """(seed) => {
   if (L._raf) cancelAnimationFrame(L._raf);
   L._raf = 0;
   L.sim = new window.CronstableLogo.Sim(L.sim.p, { seed });
+  // defensive: railMax is pinned off above, but if the dynamic gate is ever
+  // re-enabled here, a pre-setup disconnect must not freeze it extended
+  const gt = L._gate;
+  if (gt) { gt.x = gt.rest; gt.settledAt = -1; gt.pending = null; L._gateDrawn = null; }
   L.trail.length = 0;
   L._render();
 }"""
