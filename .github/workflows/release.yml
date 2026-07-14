@@ -1133,8 +1133,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${TAP_TOKEN:-}" ]; then
-            echo "::warning::HOMEBREW_TAP_TOKEN not set; skipping Homebrew formula update."
-            exit 0
+            # A release MUST update the tap. Skipping silently is exactly how the
+            # yacron2 -> cronstable rename shipped for several versions without
+            # ever publishing a cronstable formula -- the tap froze while every
+            # release stayed green. Fail loudly so a stale tap can't hide behind
+            # a successful run.
+            echo "::error::HOMEBREW_TAP_TOKEN is not set; cannot update the Homebrew tap. Add it as a repo secret (fine-grained PAT with Contents: read/write on ptweezy/homebrew-tap) and re-run this release." >&2
+            exit 1
           fi
 
           # Fetch the checksums this release just published (retry: the asset can
