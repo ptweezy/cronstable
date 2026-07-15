@@ -25,8 +25,9 @@ import sys
 
 import pytest
 
-from cronstable import dag, dagrun
+from cronstable import dag, dagrun, jobstate
 from cronstable.cron import Cron
+from tests.test_state_job_primitives import _break_record_reads
 
 _PY = sys.executable
 _UTC = datetime.timezone.utc
@@ -321,6 +322,47 @@ async def test_mapped_upstream_publishes_nothing_expands_empty(tmp_path):
         assert body["state"] == dag.SUCCESS, _states(body)
         assert body["mapped"]["work"]["items"] == []
         assert body["tasks"]["after"]["state"] == dag.SUCCESS
+    finally:
+        await _teardown(cron)
+
+
+async def test_mapped_expansion_transient_read_error_is_not_an_empty_fanout(
+    tmp_path, monkeypatch
+):
+    # The counterpart to the test above: an upstream that DID publish its list,
+    # read at an instant the store cannot answer for (an ESTALE/EIO blip on a
+    # shared NFS/EFS mount). Expansion is recorded once and never recomputed,
+    # so reading that blip as "published nothing" would freeze it into a
+    # vacuously-successful empty fan-out -- the whole task's work silently
+    # skipped, with downstream tasks seeing success. It must read as UNKNOWN
+    # (None), leaving the task unexpanded to retry on a later pass.
+    yaml = (
+        "dags:\n  - name: tr\n    tasks:\n"
+        "      - id: gen\n        command: 'x'\n"
+        "      - id: work\n        command: 'x'\n        dependsOn:\n"
+        "          - gen\n        expand:\n"
+        "          fromTask: gen\n          key: items\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        backend = cron.state_backend
+        scope = dag.xcom_scope("tr", "run-1")
+        await jobstate.artifact_put(
+            backend, scope, dag.xcom_name("gen", "items"), b'["a", "b"]'
+        )
+        read = cron._dag._read_xcom_list
+        assert await read("run-1", "tr", "gen", "items") == ["a", "b"]
+
+        _break_record_reads(
+            monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + scope
+        )
+        # the fix: None (unknown -> retry), NOT [] (empty -> permanent)
+        assert await read("run-1", "tr", "gen", "items") is None
+
+        # the blip clears and the real fan-out is still there to be found: the
+        # run resumes with its work intact rather than having skipped it.
+        monkeypatch.undo()
+        assert await read("run-1", "tr", "gen", "items") == ["a", "b"]
     finally:
         await _teardown(cron)
 

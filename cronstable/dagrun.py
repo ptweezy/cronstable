@@ -839,12 +839,19 @@ class DagScheduler:
         """The JSON list an upstream published, for a mapped task to fan out.
 
         Only ever read after the upstream has *succeeded*, so its output is
-        final: a genuine list expands to itself; a definitively absent or
-        non-list output expands to the **empty list** (a mapped task with no
-        items -> success), so a mis-publishing upstream cannot wedge the run
-        forever.  Only a transient store failure (timeout / error / a swept
-        blob) returns ``None``, which leaves the task unexpanded to retry on a
-        later pass rather than guessing an empty fan-out.
+        final: a genuine list expands to itself; a **definitively** absent,
+        non-list or unrecoverable output (including a swept blob) expands to
+        the **empty list** (a mapped task with no items -> success), so a
+        mis-publishing upstream cannot wedge the run forever.
+
+        A store failure that says nothing about what the upstream published --
+        a timeout, an I/O error, a record this build cannot read -- returns
+        ``None`` instead, leaving the task unexpanded to retry on a later pass.
+        The distinction is the whole point: the expansion is recorded once and
+        never recomputed, so guessing "empty" on a bad instant would silently
+        skip the task's entire fan-out and still report success downstream.
+        Hence the strict read below -- best-effort, an unreadable record is
+        skipped, and absence becomes indistinguishable from a blip.
         """
         backend = self._backend()
         if backend is None:
@@ -854,8 +861,15 @@ class DagScheduler:
         scope = dag.xcom_scope(dag_name, run_id)
         name = dag.xcom_name(taskkey, key)
         try:
+            # strict: an unreadable record must NOT read back as "never
+            # published". The expansion below is recorded once and never
+            # recomputed, so a best-effort read that swallowed an ESTALE/EIO
+            # blip would turn one bad instant into a permanent, vacuously
+            # successful empty fan-out -- the task's whole work silently
+            # skipped, with downstream tasks seeing success. Strict turns that
+            # blip back into the exception this returns None for.
             got = await asyncio.wait_for(
-                jobstate.artifact_get(backend, scope, name),
+                jobstate.artifact_get(backend, scope, name, strict=True),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -874,8 +888,19 @@ class DagScheduler:
                 taskkey,
             )
             return []
-        except OSError:
-            return None  # transient store error
+        except Exception as ex:  # noqa: BLE001 - the store, not the xcom
+            # A store that could not be read (an I/O error, a record only a
+            # newer node understands) leaves the fan-out UNKNOWN, never empty:
+            # stay unexpanded and retry on a later pass.
+            logger.warning(
+                "dag %s: xcom %r from %r could not be read (%s); leaving the "
+                "task unexpanded to retry",
+                dag_name,
+                key,
+                taskkey,
+                ex,
+            )
+            return None
         if got is None:
             # upstream succeeded without publishing this key: no items to map.
             return []

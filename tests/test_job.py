@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import signal
 import tempfile
 from unittest.mock import Mock, patch
 
@@ -10,12 +11,14 @@ from sentry_sdk.utils import Dsn
 
 import cronstable.config
 import cronstable.job
+import cronstable.platform
 import cronstable.statsd
 from cronstable.platform import DEFAULT_SHELL, IS_WINDOWS
 from tests._commands import (
     cmd_print,
     cmd_print_sleep_print,
     cmd_sleep,
+    cmd_spawn_helper_then_sleep,
     cmd_write_env,
     yaml_command,
 )
@@ -25,6 +28,20 @@ def _argv(*parts):
     """Expected subprocess argv for this platform (str on Windows, bytes on
     POSIX) -- mirrors cronstable.platform.encode_argv."""
     return tuple(parts) if IS_WINDOWS else tuple(p.encode() for p in parts)
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_join_timeout_keeps_partial_output():
+    # The read loop only ends at EOF, i.e. once EVERY write-end of the pipe is
+    # closed -- including one a descendant of the job inherited and never
+    # closes. join() must be able to give up on that and keep what it read:
+    # the lines already collected live here, not in the pipe.
+    fake_stream = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader("test", "stdout", fake_stream, "", 10)
+    fake_stream.feed_data(b"line1\n")  # note: no feed_eof() -- ever
+    output, discarded = await asyncio.wait_for(reader.join(0.2), 5)
+    assert output == "line1\n"
+    assert discarded == 0
 
 
 @pytest.mark.parametrize(
@@ -969,6 +986,110 @@ async def test_execution_timeout():
     await job.start()
     await job.wait()
     assert job.stdout == "hello\n"
+
+
+def _spawner_yaml(name="test", execution_timeout=0.25, kill_timeout=1):
+    return (
+        "jobs:\n  - name: {}\n".format(name)
+        + yaml_command(cmd_spawn_helper_then_sleep(30))
+        + """
+    executionTimeout: {}
+    killTimeout: {}
+    schedule: "* * * * *"
+    captureStderr: false
+    captureStdout: true
+""".format(
+            execution_timeout, kill_timeout
+        )
+    )
+
+
+async def _await_reaped(pid, timeout=10.0):
+    """Wait for ``pid`` to disappear; return whether it did."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if cronstable.platform.pid_alive(pid) is not True:
+            return True
+        await asyncio.sleep(0.05)
+    return cronstable.platform.pid_alive(pid) is not True
+
+
+@pytest.mark.skipif(
+    IS_WINDOWS, reason="process groups (and killpg) are POSIX-only"
+)
+@pytest.mark.asyncio
+async def test_execution_timeout_kills_the_whole_process_group():
+    # A job that leaves a helper behind (`sh -c 'helper & main'`) hits its
+    # executionTimeout. Terminating only the process we spawned kills the
+    # shell but not the helper, which still holds the job's stdout write-end
+    # open -- so the pipe never reaches EOF and wait() never returns: the run
+    # is stranded in running_jobs forever, and under concurrencyPolicy: Forbid
+    # the job never runs again. Killing the whole process group reaps the
+    # helper too, so the pipe closes and the run completes.
+    conf = cronstable.config.parse_config_string(_spawner_yaml(), "")
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    # before the fix this hangs forever, not for `timeout` seconds.
+    await asyncio.wait_for(job.wait(), 20)
+    assert job.retcode == -100  # cancelled by executionTimeout
+    helper_pid = int(job.stdout.strip())
+    # the helper went down WITH the group rather than outliving the job --
+    # executionTimeout bounds the run's work, not just its root process.
+    assert await _await_reaped(helper_pid), "the helper outlived the group kill"
+
+
+@pytest.mark.asyncio
+async def test_killed_job_with_an_escaped_descendant_still_finishes(
+    monkeypatch,
+):
+    # Defense in depth for the same wedge: where the group kill cannot reach a
+    # descendant -- it made its own session, or Windows lost the orphan from
+    # the process tree -- the job's pipe still never reaches EOF. The drain
+    # must be bounded anyway, so the run always leaves running_jobs; the output
+    # captured before the kill is kept.
+    async def never_reaches_the_group(pid, *, force):
+        return False  # simulate a descendant outside the group's reach
+
+    monkeypatch.setattr(
+        cronstable.platform, "kill_process_group", never_reaches_the_group
+    )
+    monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 1.0)
+    conf = cronstable.config.parse_config_string(_spawner_yaml(), "")
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    # without the bound this hangs on the surviving helper's pipe forever.
+    await asyncio.wait_for(job.wait(), 20)
+    assert job.retcode == -100
+    helper_pid = int(job.stdout.strip())  # partial output kept, not discarded
+    # the helper really did survive (that is what made the drain hang), so
+    # this test must not leak it into the rest of the run.
+    os.kill(helper_pid, signal.SIGKILL if not IS_WINDOWS else signal.SIGTERM)
+
+
+@pytest.mark.asyncio
+async def test_untouched_job_drain_is_not_bounded(monkeypatch):
+    # The bound is only for a run we killed: a job left to exit on its own owns
+    # its lifetime, and its output is not ours to cut short. Assert the gate,
+    # not the timeout -- an unbounded join is the absence of a deadline.
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="hi"))
+        + '\n    schedule: "* * * * *"\n',
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    joined = []
+    real_join = cronstable.job.StreamReader.join
+
+    async def spy(self, timeout=None):
+        joined.append(timeout)
+        return await real_join(self, timeout)
+
+    monkeypatch.setattr(cronstable.job.StreamReader, "join", spy)
+    await job.start()
+    await job.wait()
+    assert job._terminated is False
+    assert joined and all(t is None for t in joined)
 
 
 @pytest.mark.asyncio
