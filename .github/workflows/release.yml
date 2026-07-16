@@ -7,7 +7,9 @@ name: CI
 # and musl/Alpine flavors, plus armv6 in musl only), macOS (arm64 + amd64 on
 # macOS 15, shipped; plus macOS 26/Tahoe as non-gating CI coverage) and Windows
 # (amd64 + arm64), and every Docker image (8 distros, full arch set, build-only)
-# -- and gates on ALL of it. Nothing is published on an ordinary commit.
+# -- and gates on ALL of it. No SOFTWARE is published on an ordinary commit; the
+# one thing that is, is documentation -- a push to `develop` publishes wiki/ to
+# the GitHub wiki (the `wiki` job, ungated, since a doc is not an artifact).
 #
 # A release happens ONLY when either:
 #   - a push to `main` carries a [release] marker at the START of the SUBJECT
@@ -1173,3 +1175,100 @@ jobs:
           fi
           git commit -m "cronstable ${VERSION}"
           git push
+
+  # ---------------------------------------------------------------------------
+  # Docs. Runs on an ordinary commit and is NOT gated on the build+test matrix:
+  # a wiki page is not a build artifact, so it neither waits on a release nor
+  # lets a flaky emulated arch hold up a typo fix.
+  # ---------------------------------------------------------------------------
+
+  # Publish wiki/ to this repository's GitHub wiki. The wiki is a SEPARATE git
+  # repo (<repo>.wiki.git), so committing wiki/ here has never updated the live
+  # wiki -- that was a manual clone-copy-push, and it drifted exactly the way an
+  # unautomated step always does (7 pages, some a week stale, when this job was
+  # written). wiki/ is the source of truth; the wiki is the render target (the
+  # pages use ~460 bare `[Page](Page)` wiki links, which ONLY resolve there).
+  #
+  # Publishes from `develop`, not `main`: develop is the default branch and
+  # where wiki/ is edited, and the pages hardcode /blob/develop/ links and
+  # raw.githubusercontent.com/.../develop/ screenshots -- the wiki documents
+  # develop by construction. Syncing from both would also race: `concurrency` is
+  # keyed per branch, so a develop push and a main merge are NOT serialized
+  # against each other and their wiki pushes would collide.
+  #
+  # GITHUB_TOKEN with `contents: write` can push a repo's OWN wiki -- no PAT.
+  # The widespread "wikis need a PAT" advice traces to one archived action's
+  # README, last touched the day BEFORE GitHub shipped configurable
+  # GITHUB_TOKEN permissions (2021-04-20); it has been wrong ever since. A PAT
+  # is only needed for a wiki in a DIFFERENT repo -- which is why the Homebrew
+  # tap push above needs HOMEBREW_TAP_TOKEN and this job needs no secret at all.
+  wiki:
+    # The repository guard is not redundant: a fork has its OWN develop, and a
+    # fork's wiki is uninitialized (a wiki repo does not exist until someone
+    # creates a page), so `<fork>/cronstable.wiki` 404s and the checkout fails.
+    # Every other job in this pipeline is fork-clean, so without this the wiki
+    # job would be a permanent red X on every fork's develop push.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop' && github.repository == 'ptweezy/cronstable'
+    runs-on: ubuntu-latest
+    permissions:
+      # The one grant that allows pushing the wiki. GitHub's docs never mention
+      # wikis under `contents`, but staff confirm it and both maintained wiki
+      # actions default to GITHUB_TOKEN. Nothing in THIS repo is written.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.0    # for the wiki/ page sources
+      - uses: actions/checkout@v7.0.0    # the wiki is its own repo; its default branch is always master
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: .wiki
+
+      - name: Publish wiki/ to the GitHub wiki
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Mirror, so a page deleted from wiki/ is deleted from the wiki too.
+          # The corollary is deliberate: a page created in the wiki's web UI is
+          # transient and this job will remove it. Edit wiki/ and let CI publish.
+          mirror() {
+            find .wiki -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            cp -R wiki/. .wiki/
+          }
+
+          git -C .wiki config user.name  "github-actions[bot]"
+          git -C .wiki config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The wiki accepts web-UI edits and two develop pushes can overlap
+          # before cancel-in-progress lands, so a push CAN lose a race. The
+          # commit is a pure snapshot of wiki/, so there is nothing to rebase --
+          # re-mirror onto the new tip and retry instead of reddening a docs run.
+          for attempt in 1 2 3; do
+            git -C .wiki fetch -q origin master
+            git -C .wiki reset -q --hard origin/master
+            mirror
+
+            # Stage FIRST, then compare the index: a plain `git diff` ignores
+            # untracked files, so a brand-new page would report "no changes" and
+            # this job would exit green having published nothing -- the same way
+            # the tap above stayed empty through green releases.
+            git -C .wiki add -A
+            if git -C .wiki diff --cached --quiet; then
+              echo "Wiki already current for ${SHA:0:7}."
+              exit 0
+            fi
+
+            # Print the change set: a mirror deletes, and a deletion must never
+            # be silent in the log.
+            git -C .wiki diff --cached --name-status
+
+            git -C .wiki commit -q -m "Sync wiki from ${SHA:0:7}"
+            if git -C .wiki push -q origin HEAD:master; then
+              echo "::notice::Wiki published from ${SHA:0:7}."
+              exit 0
+            fi
+            echo "::warning::Wiki push rejected (attempt ${attempt}/3); re-mirroring onto the new tip."
+          done
+
+          echo "::error::Could not push the wiki after 3 attempts; the wiki repo is being written concurrently. Re-run this job." >&2
+          exit 1
