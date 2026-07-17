@@ -84,7 +84,7 @@ Note `pre-commit`'s ruff runs with `--fix` (auto-applies fixes), whereas `tox -e
 
 There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is unchanged from before: `tox-lint` (`tox -e lint`) and `tox-mypy` (`tox -e mypy`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**.
 
-Alongside the tests, the same run builds every release artifact at the computed version (all the PyInstaller binaries, the wheel + sdist) and does a **build-only pass over every Docker image** (the `docker` job — all 8 distros at their full published arch sets, no push), so a broken `Dockerfile` fails CI before a release. On an ordinary commit the version is the natural `setuptools_scm` dev version; nothing is published, pushed, tagged, or signed. See [Production and Container Deployment](Production-Deployment).
+Alongside the tests, the same run builds every release artifact at the computed version (all the PyInstaller binaries, the wheel + sdist) and does a **build-only pass over every Docker image** (the `docker` job — all 8 distros at their full published arch sets, no push), so a broken `Dockerfile` fails CI before a release. On an ordinary commit the version is the natural `setuptools_scm` dev version; no **software** is published, pushed, tagged, or signed. The lone exception is documentation: the `wiki` job publishes `wiki/` to the GitHub wiki whenever it changes on `develop` (see [Editing the wiki](#editing-the-wiki)). See [Production and Container Deployment](Production-Deployment).
 
 ## Releasing
 
@@ -114,7 +114,7 @@ The marker match is performed in the `decide` job with `grep -oiE '^\[release(:(
 
 ### What the pipeline does
 
-The `release.yml` jobs run in dependency order. Top-level `permissions` default to `contents: read`; only the `release` job (`contents: write` + `id-token: write`) and the `docker-push` job (`packages: write`) opt up to the write scopes they need. `decide` / `version` and the whole build+test gate run on **every** event; only the `release`, `docker-push` and `homebrew` publish jobs are guarded by `needs.decide.outputs.release == 'true'`.
+The `release.yml` jobs run in dependency order. Top-level `permissions` default to `contents: read`; only the `release` job (`contents: write` + `id-token: write`), the `docker-push` job (`packages: write`) and the `wiki` job (`contents: write`) opt up to the write scopes they need. `decide` / `version` and the whole build+test gate run on **every** event; only the `release`, `docker-push` and `homebrew` publish jobs are guarded by `needs.decide.outputs.release == 'true'`. The `wiki` job (8) is the one exception to "no software is published on an ordinary commit" — it publishes documentation, so it is gated on the branch rather than on a release, and on nothing else.
 
 1. **`decide`**: determines `release` (true/false) and `bump`. Trigger logic lives in a real shell script rather than a fuzzy `contains()` expression, and it releases **only** on a `workflow_dispatch` or a push to `main` carrying a marker (a marker on any other branch, or in a PR, never releases).
 2. **`version`**: computes the version once, so every builder (and the publish job) use the same number. On a release it finds the latest tag matching `^[0-9]+\.[0-9]+\.[0-9]+$` (via `git tag -l | … | sort -V | tail -n1`, defaulting to `0.0.0`), applies the bump, and **refuses with an error if the computed tag already exists** (`refs/tags/$new`); otherwise it emits the natural `setuptools_scm` dev version for the build-only run.
@@ -130,8 +130,9 @@ The `release.yml` jobs run in dependency order. Top-level `permissions` default 
    - **Only after a successful publish**: creates an annotated tag `X.Y.Z` and pushes it (with `RELEASE_TOKEN` so the tag can point at a commit that touches `.github/workflows/`); downloads every per-arch binary artifact (pattern `cronstable-*`, `merge-multiple: true`); generates one `SHA256SUMS` over the shipped set; extracts the release notes; and creates the GitHub Release with **all** binaries + `SHA256SUMS` attached in a single step (there is no separate later attach step, so nothing ever collides with immutable-release protection).
 6. **`docker-push`**: after `release` (so the tag it checks out exists, and it is thus gated on the whole gate including the `docker` build), builds and pushes every distro's multi-arch image at the released version (see below).
 7. **`homebrew`**: after `release`, re-renders and pushes the tap formula from the published `SHA256SUMS`.
+8. **`wiki`**: publishes [`wiki/`](https://github.com/ptweezy/cronstable/tree/develop/wiki) to this repository's GitHub wiki. It is **not** a release job and **not** gated on the build+test matrix: a wiki page is not a build artifact, so it neither waits for a release nor lets a flaky emulated arch hold up a typo fix. It runs on **every push to `develop`** and on nothing else — see [Editing the wiki](#editing-the-wiki).
 
-Because no file is committed back to the repo, a release never re-triggers the workflow. Because the tag is created **after** publishing, a failed publish leaves no orphan tag and a re-run cleanly retries the same version.
+Because no file is committed back to *this* repo, a release never re-triggers the workflow. (Two jobs do push elsewhere — `homebrew` to the tap on a release, and `wiki` to the wiki on a `develop` commit — but both targets are separate repositories, and a push to either raises no event here.) Because the tag is created **after** publishing, a failed publish leaves no orphan tag and a re-run cleanly retries the same version.
 
 ### macOS signing and notarization
 
@@ -179,6 +180,17 @@ The version is baked in by installing the package under `SETUPTOOLS_SCM_PRETEND_
 `pyinstaller/Makefile` wraps that: `make` (target `all`) builds the image, copies `dist/cronstable` out of the container, and runs `dist/cronstable --version`.
 
 > The standalone binaries unpack their embedded runtime to a temp directory at startup; the temp directory must be writable and executable. See [Installation](Installation) and [Troubleshooting and FAQ](Troubleshooting).
+
+## Editing the wiki
+
+**Edit [`wiki/`](https://github.com/ptweezy/cronstable/tree/develop/wiki) in the repo, not the wiki in the browser.** The wiki you are reading is a *published copy*: every push to `develop` runs the `wiki` job, which mirrors `wiki/*.md` onto it. The pages are ordinary Markdown, one file per page, named exactly as the page's URL (`Web-Dashboard.md` → `/wiki/Web-Dashboard`), plus `Home.md`, `_Sidebar.md` and `_Footer.md`.
+
+Two consequences worth knowing:
+
+- **The mirror is authoritative, so it deletes.** A page edited or created from the wiki's *web UI* survives only until the next push to `develop`, which will revert or remove it. There is no merge and no warning — the job makes the wiki's tree equal `wiki/`, and prints every add/modify/delete it makes to the run log. If you edit in the browser, copy your change into `wiki/` before it is overwritten.
+- **Links only resolve once published.** Pages link to each other with bare wiki links — `[Installation](Installation)` — which GitHub resolves relative to the wiki. They are *expected* to be dead when browsing `wiki/*.md` in the repo; that is not a bug to fix. Screenshots are absolute `raw.githubusercontent.com/.../develop/docs/img/*.png` URLs for the same reason.
+
+The job publishes from `develop` (the default branch), never from `main`: that is where `wiki/` is edited, and the pages' `develop`-pinned links and images mean the wiki documents `develop` by construction. It needs no secret — `GITHUB_TOKEN` with `contents: write` can push a repository's own wiki.
 
 ## Related pages
 

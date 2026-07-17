@@ -98,7 +98,9 @@ workflow**, then pick the bump level from the dropdown.
 ### What the pipeline does
 
 The same pipeline runs on every commit and PR; only the publish steps are
-gated behind the release check. On a release it, in order:
+gated behind the release check (the lone exception is the `wiki` job, which
+publishes documentation on every push to `develop` — see [Editing the
+wiki](#editing-the-wiki)). On a release it, in order:
 
 1. **decides** whether to release and at what level (the strict marker check,
    which only fires on a push to `main` or a manual dispatch);
@@ -123,9 +125,12 @@ gated behind the release check. On a release it, in order:
    attached, then pushes the multi-arch container images and updates the
    Homebrew tap.
 
-Because no file is committed back to the repo, a release never re-triggers the
-workflow. Because the tag is created *after* publishing, a failed publish leaves
-no orphan tag and a re-run cleanly retries the same version.
+Because no file is committed back to *this* repo, a release never re-triggers
+the workflow. (Two jobs do push elsewhere — the Homebrew tap on a release, and
+the wiki on a `develop` commit — but both targets are separate repositories and
+a push to either raises no event here.) Because the tag is
+created *after* publishing, a failed publish leaves no orphan tag and a re-run
+cleanly retries the same version.
 
 ## Container image
 
@@ -151,3 +156,19 @@ Build it locally the same way CI does (the version is read from git, or pass
 docker build -t cronstable .
 docker run --rm -v "$PWD/example/docker/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" cronstable
 ```
+
+## Editing the wiki
+
+Edit [`wiki/`](wiki) in this repo — not the wiki in the browser. The
+[GitHub wiki](https://github.com/ptweezy/cronstable/wiki) is a published copy:
+every push to `develop` runs the pipeline's `wiki` job, which mirrors
+`wiki/*.md` onto it (one file per page, named as the page's URL:
+`Web-Dashboard.md` → `/wiki/Web-Dashboard`).
+
+The mirror is authoritative, so it **deletes**: a page created or edited from
+the wiki's web UI is reverted on the next push to `develop`. The job prints
+every add/modify/delete to the run log.
+
+Pages link to each other with bare wiki links — `[Installation](Installation)` —
+which only resolve once published. Those links are expected to be dead when
+browsing `wiki/*.md` here; that is not a bug.
