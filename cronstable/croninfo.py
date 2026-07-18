@@ -511,6 +511,7 @@ def _lint_steps(expression: str) -> List[Finding]:
     """
     low = expression.strip().lower()
     fields = _MACROS.get(low, low).split()
+    labels: Sequence[str]
     if len(fields) == 7:
         labels = (
             "second",
