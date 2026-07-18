@@ -982,8 +982,8 @@ the year). Every job lands on its own **stable** slot, so a fleet of hourly
 jobs spreads across the hour instead of stampeding at `:00`, and because the
 slot is a pure function of the name rather than random jitter, it survives
 restarts, reloads and replicas, and "was this run late?" stays answerable.
-Bare `H` in day-of-month hashes over 1 to 28 so short months are never
-skipped; renaming a job re-hashes its slots. The linter notes the concrete
+In day-of-month, rangeless `H` forms (bare `H` and `H/n`) hash over 1 to 28
+so short months are never skipped; renaming a job re-hashes its slots. The linter notes the concrete
 values each `H` resolved to, and `/jobs` serves them as `schedule_resolved`.
 See [Hashed Schedules](https://github.com/ptweezy/cronstable/wiki/Hashed-Schedules).
 

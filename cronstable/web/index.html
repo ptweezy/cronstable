@@ -3032,9 +3032,12 @@
     } catch (_) { return { type: "unknown", raw: expr }; }
   }
   function dayMatches(p, c) {
-    // standard cron OR-semantics between day-of-month and day-of-week
+    // Both restricted: BOTH must match. This dialect keeps parse-crontab's
+    // AND rule between day-of-month and day-of-week, mirroring the daemon's
+    // engine (cronexpr._day_matches), unlike standard cron's OR:
+    // '0 0 13 * 5' is Friday the 13th, not every Friday plus every 13th.
     const domR = p.dom.restricted, dowR = p.dow.restricted;
-    if (domR && dowR) return p.dom.has(c.D) || p.dow.has(c.dow);
+    if (domR && dowR) return p.dom.has(c.D) && p.dow.has(c.dow);
     if (domR) return p.dom.has(c.D);
     if (dowR) return p.dow.has(c.dow);
     return true;
@@ -3175,13 +3178,16 @@
       timePart = "At " + mp + " past " + hp;
     }
 
-    // day-of-month and day-of-week combine with OR when BOTH are restricted
-    // (standard cron) — reflect that in the prose with "or", not a comma.
+    // dom and dow must BOTH match when both are restricted: the client
+    // engine (dayMatches, mirroring the daemon's cronexpr._day_matches)
+    // keeps parse-crontab's AND rule ('0 0 13 * 5' is Friday the 13th),
+    // unlike standard cron's OR, so the prose must say so too; the
+    // wording mirrors the server describer (croninfo.describe_cron).
     const dayClauses = [];
     if (!everyDow) dayClauses.push("on " + listJoin(p.dow.values.map((d) => DOWN[d])));
     if (!everyDom) dayClauses.push("on the " + listJoin(p.dom.values.map((d) => ordinal(d))) + (everyDow ? " of the month" : ""));
     const clauses = [];
-    if (dayClauses.length === 2) clauses.push(dayClauses.join(" or "));
+    if (dayClauses.length === 2) clauses.push(dayClauses[1] + ", and only " + dayClauses[0]);
     else if (dayClauses.length === 1) clauses.push(dayClauses[0]);
     if (!everyMon) clauses.push("in " + listJoin(p.month.values.map((m) => MONTHS[m])));
     else if (everyDom && everyDow) clauses.push("every day");
@@ -4135,7 +4141,7 @@
   }
 
   // ===================================================================
-  //  schedule pressure — forward-looking fleet collision heatmap
+  //  schedule pressure: forward-looking fleet collision heatmap
   // ===================================================================
   // The daemon enumerates every enabled schedule's fires over the next 24h
   // with its own engine (/schedule/pressure), so this panel shows what WILL
@@ -8060,6 +8066,34 @@
     return '<div class="sbx-uses"><span class="faint">recent:</span><div class="sbx-recent">' +
       list.map((x) => '<span class="chip" data-expr="' + escAttr(x) + '">' + esc(x) + "</span>").join("") + "</div></div>";
   }
+  // True only when the expression is valid APART from its H items: H is
+  // opaque to parseCron, so substitute each H item with the plain form it
+  // resolves into (H -> *, H/n -> */n, H(a-b) -> a-b, H(a-b)/n -> a-b/n)
+  // and require the rebuilt expression to parse. A backwards H(a-b) range
+  // or an H in the year column (the trailing field of the 6-/7-field
+  // forms) is invalid, the daemon's engine rejects both, so those fall
+  // through to the normal invalid-expression error instead of the
+  // reassuring H info message.
+  function sbxLooksHashed(expr) {
+    const fields = expr.split(/\s+/);
+    if (fields.length < 5 || fields.length > 7) return false;
+    const yearIdx = fields.length === 5 ? -1 : fields.length - 1;
+    let sawH = false;
+    const rebuilt = [];
+    for (let i = 0; i < fields.length; i++) {
+      const items = [];
+      for (const item of fields[i].split(",")) {
+        const m = item.match(/^[hH](?:\((\d+)-(\d+)\))?(?:\/(\d+))?$/);
+        if (!m) { items.push(item); continue; }
+        sawH = true;
+        if (i === yearIdx) return false;
+        if (m[1] != null && +m[1] > +m[2]) return false;
+        items.push((m[1] != null ? m[1] + "-" + m[2] : "*") + (m[3] != null ? "/" + m[3] : ""));
+      }
+      rebuilt.push(items.join(","));
+    }
+    return sawH && parseCron(rebuilt.join(" ")).type === "fields";
+  }
   function renderSandbox() {
     const expr = $("sbxInput").value.trim();
     const frame = $("sbxFrame").value || "UTC";
@@ -8070,7 +8104,7 @@
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when cronstable starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
-      if (/(^|[\s,])[hH]([\s,\/(]|$)/.test(expr))
+      if (sbxLooksHashed(expr))
         html += '<p class="sbx-desc">An <b>H</b> slot is a stable hash of the job name, so it resolves per job, not in this sandbox. Open a job\'s <b>schedule</b> tab to see the values its H resolved to.</p>';
       else
         html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';

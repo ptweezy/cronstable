@@ -1002,13 +1002,21 @@ class MCPHandler:
     async def _t_schedule_pressure(
         self, args: Dict[str, Any]
     ) -> Dict[str, Any]:
+        # no clamp here: croninfo.schedule_pressure clamps hours to
+        # [1, 168] authoritatively and echoes the clamped value back in
+        # the payload; only the default is applied at this layer.
         hours = _opt_int(args.get("hours"))
-        hours = 24 if hours is None else max(1, min(hours, 168))
+        hours = 24 if hours is None else hours
         tz = args.get("tz")
         if tz is not None and not isinstance(tz, str):
             raise _ToolInputError("`tz` must be an IANA timezone string")
         try:
-            payload = self._cron.schedule_pressure_payload(hours, tz or None)
+            # offloaded to the default executor (see the _async wrapper in
+            # cron.py): the up-to-168h occurrence walk is pure CPU and must
+            # not stall job dispatch on the scheduler's event loop.
+            payload = await self._cron.schedule_pressure_payload_async(
+                hours, tz or None
+            )
         except ValueError as err:
             return _tool_error(str(err))
         busiest = payload["busiest_minute"]
@@ -1028,7 +1036,8 @@ class MCPHandler:
     async def _t_schedule_duplicates(
         self, args: Dict[str, Any]
     ) -> Dict[str, Any]:
-        payload = self._cron.schedule_duplicates_payload()
+        # offloaded (see cron.py): the fleet walk must not block the loop.
+        payload = await self._cron.schedule_duplicates_payload_async()
         groups = payload["groups"]
         biggest = (
             "; biggest: {} job(s) sharing '{}'".format(
@@ -1050,7 +1059,12 @@ class MCPHandler:
         if tz is not None and not isinstance(tz, str):
             raise _ToolInputError("`tz` must be an IANA timezone string")
         try:
-            payload = self._cron.schedule_suggest_payload(period, tz or None)
+            # offloaded (see cron.py): the 24h fleet walk must not block
+            # the loop; the bad-period/timezone ValueError still surfaces
+            # at the await.
+            payload = await self._cron.schedule_suggest_payload_async(
+                period, tz or None
+            )
         except ValueError as err:
             return _tool_error(str(err))
         return _result(
