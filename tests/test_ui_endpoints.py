@@ -579,3 +579,116 @@ async def test_schedule_preview_bad_requests_are_400s():
     )
     assert resp.status == 400
     assert "unknown timezone" in json.loads(resp.text)["error"]
+
+
+# ---------------------------------------------------------------------------
+# fleet schedule analysis: /schedule/pressure, /duplicates, /suggest
+# ---------------------------------------------------------------------------
+
+_FLEET_YAML = """
+jobs:
+  - name: herd-a
+    command: "true"
+    schedule: "0 * * * *"
+  - name: herd-b
+    command: "true"
+    schedule: "0 * * * *"
+  - name: herd-c
+    command: "true"
+    schedule: "@hourly"
+  - name: spread
+    command: "true"
+    schedule: "H * * * *"
+  - name: parked
+    command: "true"
+    schedule: "0 0 * * *"
+    enabled: false
+  - name: boot
+    command: "true"
+    schedule: "@reboot"
+"""
+
+
+async def test_schedule_pressure_endpoint_counts_and_excludes():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_pressure(Req(query={}))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["hours"] == 24
+    assert body["timezone"] == "UTC"
+    assert body["jobs"] == 4  # parked + boot excluded
+    assert body["excluded"] == {"disabled": 1, "reboot": 1}
+    assert body["by_minute_jobs"][0] == 3  # the herd (semantic @hourly too)
+    assert len(body["grid"]) == 24 and len(body["grid"][0]) == 60
+    # the H job fired somewhere: total fires exceed the herd's own
+    assert body["total_fires"] > body["by_minute_fires"][0]
+    resp = await cron._web_schedule_pressure(Req(query={"tz": "Nope/Zone"}))
+    assert resp.status == 400
+
+
+async def test_schedule_pressure_hours_are_clamped():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_pressure(Req(query={"hours": "9999"}))
+    assert json.loads(resp.text)["hours"] == 168
+    resp = await cron._web_schedule_pressure(Req(query={"hours": "junk"}))
+    assert json.loads(resp.text)["hours"] == 24
+
+
+async def test_schedule_duplicates_endpoint_groups_semantically():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_duplicates(Req())
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["jobs"] == 4
+    assert len(body["groups"]) == 1
+    group = body["groups"][0]
+    assert group["count"] == 3
+    assert group["jobs"] == ["herd-a", "herd-b", "herd-c"]
+    assert group["timezone"] == "UTC"
+    assert group["description"]
+
+
+async def test_schedule_suggest_endpoint_and_validation():
+    cron = _cron(_FLEET_YAML)
+    resp = await cron._web_schedule_suggest(Req(query={}))
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["period"] == "hourly"
+    assert body["minute"] != 0  # never lands on the herd
+    assert body["hash_hint"] == "H * * * *"
+    resp = await cron._web_schedule_suggest(Req(query={"period": "daily"}))
+    assert json.loads(resp.text)["period"] == "daily"
+    resp = await cron._web_schedule_suggest(Req(query={"period": "weekly"}))
+    assert resp.status == 400
+    resp = await cron._web_schedule_suggest(Req(query={"tz": "Nope/Zone"}))
+    assert resp.status == 400
+
+
+async def test_schedule_preview_seed_resolves_h():
+    cron = _cron(_RETRY_JOB)
+    resp = await cron._web_schedule_preview(
+        Req(query={"expr": "H H * * *", "seed": "report-gen"})
+    )
+    body = json.loads(resp.text)
+    assert body["valid"] is True
+    assert body["seed"] == "report-gen"
+    assert body["resolved"] == "43 9 * * *"  # pinned by test_cronexpr
+    assert "hashed from the job name" in body["description"]
+    assert "hashed-slot" in [f["code"] for f in body["lint"]]
+    # without a seed the engine's own error explains what is missing
+    resp = await cron._web_schedule_preview(Req(query={"expr": "H * * * *"}))
+    body = json.loads(resp.text)
+    assert body["valid"] is False
+    assert "hash key" in body["error"]
+
+
+def test_jobs_payload_ships_schedule_resolved_only_for_h():
+    cron = _cron(_FLEET_YAML)
+    jobs = {j["name"]: j for j in cron.jobs_payload()}
+    assert jobs["spread"]["schedule"] == "H * * * *"
+    resolved = jobs["spread"]["schedule_resolved"]
+    assert resolved.endswith(" * * * *") and resolved[0].isdigit()
+    assert "schedule_resolved" not in jobs["herd-a"]
+    assert "hashed-slot" in [
+        f["code"] for f in jobs["spread"]["schedule_findings"]
+    ]

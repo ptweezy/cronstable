@@ -85,6 +85,9 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/node/history` | `_web_node_history` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
 | `GET` | `/schedule/preview` | `_web_schedule_preview` | `200` (`400` for a missing `expr` or unknown `tz`) |
+| `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
+| `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
+| `GET` | `/schedule/suggest` | `_web_schedule_suggest` | `200` (`400` for a bad `period` or unknown `tz`) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
@@ -206,6 +209,7 @@ Query parameters:
 | `expr` | **Required.** The expression to decode (URL-encoded). `400` when missing or blank. |
 | `tz` | Optional IANA zone for the preview frame and the DST lint checks (default `UTC`). `400` for an unknown name. |
 | `count` | Optional number of upcoming fires to return, clamped to 1–60 (default 12). |
+| `seed` | Optional hash key (a job name, real or prospective) that resolves [`H` items](Hashed-Schedules). Without it an `H` expression comes back `valid: false` with the engine's own error; with it the response echoes `seed` and adds `resolved`, the expression with every `H` replaced by its hashed values. |
 
 For an expression the engine accepts, the response carries `valid: true`,
 the whitespace-`normalized` form, the plain-English `description`, the next
@@ -235,6 +239,37 @@ $ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&count=2"
     ]
 }
 ```
+
+### `GET /schedule/pressure`
+
+The fleet's forward-looking collision heatmap: every enabled schedule's
+fires over the next `hours` (1 to 168, default 24), enumerated with the
+scheduler's own engine and bucketed by civil hour and minute in `tz`
+(default `UTC`; `400` for an unknown name). The payload carries the 24x60
+`grid`, the 60-bin `by_minute_fires`/`by_minute_jobs` histograms,
+`by_hour`, the `busiest_minute` headline, `empty_minutes`, `top_cells`
+(each naming up to ten jobs), and an `excluded` count of disabled and
+`@reboot` jobs. Full field reference on the
+[Schedule Pressure](Schedule-Pressure) page.
+
+### `GET /schedule/duplicates`
+
+Groups of jobs whose schedules fire on the identical instants, by the
+engine's semantic equality (`*/5` equals `0-59/5`; grouping includes the
+resolved timezone). Each group carries the most common source
+`expression`, a plain-English `description`, `timezone`, `count`, and the
+member `jobs`, sorted largest group first. See
+[Duplicate Schedule Detection](Duplicate-Schedule-Detection).
+
+### `GET /schedule/suggest`
+
+The least-loaded slot for a new job, scored on the same 24-hour fire walk
+as `/schedule/pressure`. `period` is `hourly` (pick a minute) or `daily`
+(pick a minute and hour; `400` otherwise), `tz` frames the daily pick.
+Returns the winning `expression`, its `fires_in_window`, the `busiest`
+slot for contrast, two `alternatives`, and a `hash_hint` naming the
+[`H` spelling](Hashed-Schedules) that spreads jobs without this endpoint.
+See [Suggest a Slot](Suggest-a-Slot).
 
 ### `GET /cluster`
 
@@ -540,6 +575,7 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
 | `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this job's crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own timezone. |
+| `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |

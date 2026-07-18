@@ -402,3 +402,103 @@ def test_field_set_properties_seconds_year_and_l_dow():
     assert ct.years == frozenset({2027})
     # 7 (Sunday) folds to 0 in the exposed set, like matching itself
     assert CronTab("0 0 * * 7").days_of_week == frozenset({0})
+
+
+# ---------------------------------------------------------------------------
+# the H (hashed slot) form
+# ---------------------------------------------------------------------------
+
+
+def test_hash_slot_is_stable_and_semantic():
+    a = CronTab("H * * * *", hash_key="backup-db")
+    b = CronTab("H * * * *", hash_key="backup-db")
+    assert len(a.minutes) == 1
+    assert a.minutes == b.minutes
+    (minute,) = a.minutes
+    assert 0 <= minute <= 59
+    # semantic equality against the plain spelling of the same instants,
+    # which is what the scheduler's reload path compares
+    assert a == CronTab("{} * * * *".format(minute))
+
+
+def test_hash_algorithm_is_pinned():
+    # The slot is part of the product contract: a job's hashed minute must
+    # never move across releases, restarts or hosts (that predictability is
+    # the whole point vs random jitter).  These literals freeze the
+    # sha256 over "<field label> newline <key>"; if this test breaks, the
+    # H slots of every deployed fleet just moved.
+    tab = CronTab("H H H H H", hash_key="report-gen")
+    assert tab.resolved_source == "43 9 21 8 6"
+    assert CronTab("H * * * * * *", hash_key="tick").seconds == {9}
+    assert CronTab("H/15 * * * *", hash_key="x").resolved_source == (
+        "1,16,31,46 * * * *"
+    )
+
+
+def test_hash_step_and_range_forms():
+    stepped = CronTab("H/15 * * * *", hash_key="x")
+    (phase,) = {m % 15 for m in stepped.minutes}
+    assert stepped.minutes == {phase, phase + 15, phase + 30, phase + 45}
+    ranged = CronTab("H(0-29) * * * *", hash_key="x")
+    (minute,) = ranged.minutes
+    assert 0 <= minute <= 29
+    both = CronTab("H(10-49)/10 * * * *", hash_key="x")
+    assert len(both.minutes) == 4
+    assert all(10 <= m <= 49 for m in both.minutes)
+
+
+def test_hash_fields_are_salted_per_field():
+    # the same key hashed in different fields draws from per-field-salted
+    # values; pin one witness pair rather than asserting on distributions
+    tab = CronTab("H H * * *", hash_key="report-gen")
+    assert (tab.resolved_source.split()[:2]) == ["43", "9"]
+    # 43 % 24 == 19 != 9: the hour is NOT the minute reduced mod 24
+    assert next(iter(tab.hours)) != next(iter(tab.minutes)) % 24
+
+
+def test_hash_bare_dom_stays_within_short_months():
+    for key in ("a", "b", "c", "backup", "report-gen", "x7"):
+        (day,) = CronTab("0 0 H * *", hash_key=key).days_of_month
+        assert 1 <= day <= 28
+
+
+def test_hash_resolved_source_reparses_without_a_key():
+    tab = CronTab("H H(2-6) * * H", hash_key="etl")
+    again = CronTab(tab.resolved_source)
+    assert tab == again
+    # non-H expressions resolve to themselves, byte-identical
+    plain = CronTab("*/5 10-12 * * MON", hash_key="x")
+    assert plain.resolved_source == str(plain) == "*/5 10-12 * * MON"
+    assert CronTab("@daily", hash_key="x").resolved_source == "@daily"
+
+
+def test_hash_key_does_not_change_plain_expressions():
+    assert CronTab("*/5 * * * *", hash_key="a") == CronTab("*/5 * * * *")
+
+
+def test_hash_next_and_occurrences_work():
+    tab = CronTab("H * * * *", hash_key="backup-db")
+    (minute,) = tab.minutes
+    now = datetime.datetime(2026, 7, 18, 0, 0, 0)
+    delay = tab.next(now=now)
+    assert delay == minute * 60 or delay == (minute + 60) * 60
+    first = next(iter(tab.occurrences(now)))
+    assert first.minute == minute
+
+
+def test_hash_errors():
+    with pytest.raises(ValueError, match="hash key"):
+        CronTab("H * * * *")
+    with pytest.raises(ValueError, match="year field"):
+        CronTab("* * * * * H", hash_key="x")
+    with pytest.raises(ValueError, match="forms"):
+        CronTab("H-5 * * * *", hash_key="x")
+    with pytest.raises(ValueError, match="exceeds"):
+        CronTab("H(0-3)/6 * * * *", hash_key="x")
+    with pytest.raises(ValueError, match="start 9 > end 2"):
+        CronTab("H(9-2) * * * *", hash_key="x")
+    with pytest.raises(ValueError, match="out of range"):
+        CronTab("H(0-99) * * * *", hash_key="x")
+    # a '#' in a failed H item still carries the Quartz hint
+    with pytest.raises(ValueError, match="Quartz"):
+        CronTab("H#3 * * * *", hash_key="x")

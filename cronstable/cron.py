@@ -56,7 +56,15 @@ from cronstable.config import (
     schedule_object_to_crontab,
 )
 from cronstable.cronexpr import CronTab
-from cronstable.croninfo import describe_cron, lint_schedule, next_fires
+from cronstable.croninfo import (
+    ScheduleEntry,
+    describe_cron,
+    duplicate_schedules,
+    lint_schedule,
+    next_fires,
+    schedule_pressure,
+    suggest_slot,
+)
 from cronstable.dagrun import DagScheduler
 from cronstable.fingerprint import job_digest, job_set_id
 from cronstable.job import JobOutputStream, JobRetryState, RunningJob
@@ -1705,11 +1713,26 @@ class Cron:
                 headers=self.web_config.get("headers", None),
             )
 
+    @staticmethod
+    def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
+        """A ``?tz=`` query value as a tzinfo (UTC when absent).
+
+        Raises ValueError for an unknown name; the handlers turn that
+        into a 400.
+        """
+        if not tz_name:
+            return datetime.timezone.utc
+        try:
+            return ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            raise ValueError("unknown timezone: {}".format(tz_name)) from None
+
     def schedule_preview_payload(
         self,
         expr: str,
         tz_name: Optional[str] = None,
         count: int = 12,
+        seed: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Parse, describe, preview and lint one schedule expression.
 
@@ -1718,21 +1741,19 @@ class Cron:
         linter the scheduler itself runs, so a preview can never disagree
         with what the daemon will do (the web page's client-side preview is
         a convenience, not an authority).  Raises ValueError for an unknown
-        timezone name; the handler turns that into a 400.
+        timezone name; the handler turns that into a 400.  ``seed`` is the
+        hash key for the ``H`` form (a job name, real or prospective);
+        without it an ``H`` expression comes back invalid, with the
+        engine's own error saying a hash key is needed.
         """
-        zone: datetime.tzinfo = datetime.timezone.utc
-        if tz_name:
-            try:
-                zone = ZoneInfo(tz_name)
-            except (ZoneInfoNotFoundError, ValueError, KeyError):
-                raise ValueError(
-                    "unknown timezone: {}".format(tz_name)
-                ) from None
+        zone = self._zone_from_name(tz_name)
         text = (expr or "").strip()
         payload = {
             "expression": text,
             "timezone": str(zone),
         }  # type: Dict[str, Any]
+        if seed is not None:
+            payload["seed"] = seed
         if text.lower() == "@reboot":
             payload.update(
                 {
@@ -1746,25 +1767,29 @@ class Cron:
             )
             return payload
         try:
-            tab = CronTab(text)
+            tab = CronTab(text, hash_key=seed)
         except (ValueError, KeyError) as err:
             payload.update({"valid": False, "error": str(err)})
             return payload
-        fires = next_fires(text, count, tz=zone)
+        fires = next_fires(text, count, tz=zone, hash_key=seed)
         payload.update(
             {
                 "valid": True,
                 "reboot": False,
                 "normalized": str(tab),
-                "description": describe_cron(text),
+                "description": describe_cron(text, hash_key=seed),
                 "fires": [when.isoformat() for when in fires],
                 "never_fires": not fires,
                 "lint": [
                     finding._asdict()
-                    for finding in lint_schedule(text, timezone=zone)
+                    for finding in lint_schedule(
+                        text, timezone=zone, hash_key=seed
+                    )
                 ],
             }
         )
+        if tab.resolved_source != str(tab):
+            payload["resolved"] = tab.resolved_source
         return payload
 
     async def _web_schedule_preview(
@@ -1783,7 +1808,128 @@ class Cron:
         count = self._web_int_query(request, "count", default=12, lo=1, hi=60)
         try:
             payload = self.schedule_preview_payload(
-                expr, request.query.get("tz") or None, count
+                expr,
+                request.query.get("tz") or None,
+                count,
+                request.query.get("seed"),
+            )
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        return web.json_response(payload, headers=headers)
+
+    def _schedule_entries(self) -> List[ScheduleEntry]:
+        """The analyzable fleet: every enabled, cron-scheduled job.
+
+        DAG schedules ride along as their synthetic ``dag:<name>`` job
+        (they launch real work on real instants, so they belong in the
+        collision picture).  @reboot jobs and disabled jobs are excluded:
+        neither fires on a schedule, so neither can collide.
+        """
+        entries = [
+            ScheduleEntry(name, job.schedule, job.timezone)
+            for name, job in self.cron_jobs.items()
+            if job.enabled and isinstance(job.schedule, CronTab)
+        ]
+        for dag in self.cron_dags.values():
+            sched = dag.schedule_job
+            if (
+                sched is not None
+                and sched.enabled
+                and isinstance(sched.schedule, CronTab)
+            ):
+                entries.append(
+                    ScheduleEntry(sched.name, sched.schedule, sched.timezone)
+                )
+        return entries
+
+    def schedule_pressure_payload(
+        self, hours: int = 24, tz_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """The fleet collision heatmap (``GET /schedule/pressure``).
+
+        Every enabled schedule's fires over the next ``hours``, bucketed
+        into the hour-by-minute grid by :func:`schedule_pressure`, plus
+        how many jobs were excluded as disabled or @reboot.  Raises
+        ValueError for an unknown timezone name.
+        """
+        payload = schedule_pressure(
+            self._schedule_entries(),
+            hours=hours,
+            tz=self._zone_from_name(tz_name),
+        )
+        jobs = self.cron_jobs.values()
+        payload["excluded"] = {
+            "disabled": sum(1 for job in jobs if not job.enabled),
+            "reboot": sum(
+                1
+                for job in jobs
+                if job.enabled and not isinstance(job.schedule, CronTab)
+            ),
+        }
+        return payload
+
+    def schedule_duplicates_payload(self) -> Dict[str, Any]:
+        """Semantically identical schedules (``GET /schedule/duplicates``).
+
+        Groups via the engine's own equality (``*/5`` == ``0-59/5``), so
+        the answer can never disagree with how the scheduler itself
+        compares schedules across reloads.
+        """
+        entries = self._schedule_entries()
+        return {
+            "jobs": len(entries),
+            "groups": duplicate_schedules(entries),
+        }
+
+    def schedule_suggest_payload(
+        self, period: str = "hourly", tz_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """The least-loaded slot for a new job (``GET /schedule/suggest``).
+
+        Raises ValueError for an unknown period or timezone name.
+        """
+        return suggest_slot(
+            self._schedule_entries(),
+            period=period,
+            tz=self._zone_from_name(tz_name),
+        )
+
+    async def _web_schedule_pressure(
+        self, request: web.Request
+    ) -> web.Response:
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
+        try:
+            payload = self.schedule_pressure_payload(
+                hours, request.query.get("tz") or None
+            )
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        return web.json_response(payload, headers=headers)
+
+    async def _web_schedule_duplicates(
+        self, request: web.Request
+    ) -> web.Response:
+        assert self.web_config is not None
+        return web.json_response(
+            self.schedule_duplicates_payload(),
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def _web_schedule_suggest(
+        self, request: web.Request
+    ) -> web.Response:
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        try:
+            payload = self.schedule_suggest_payload(
+                request.query.get("period") or "hourly",
+                request.query.get("tz") or None,
             )
         except ValueError as err:
             return web.json_response(
@@ -2021,6 +2167,14 @@ class Cron:
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
+        if isinstance(
+            job.schedule, CronTab
+        ) and job.schedule.resolved_source != str(job.schedule):
+            # the H hash form: also ship the plain-dialect spelling it
+            # resolved to, so the dashboards display the H the user wrote
+            # while their client-side engines (which know no H) compute
+            # previews from this. Omitted for every other schedule.
+            result["schedule_resolved"] = job.schedule.resolved_source
         # live CPU/memory of the currently-running instances (monitorResources
         # jobs only). Summed across instances so a job running N copies shows
         # its aggregate footprint; omitted entirely when nothing is monitored
@@ -2866,6 +3020,9 @@ class Cron:
                 web.get("/node/history", self._web_node_history),
                 web.get("/status", self._web_get_status),
                 web.get("/schedule/preview", self._web_schedule_preview),
+                web.get("/schedule/pressure", self._web_schedule_pressure),
+                web.get("/schedule/duplicates", self._web_schedule_duplicates),
+                web.get("/schedule/suggest", self._web_schedule_suggest),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
                 web.get("/jobs/{name}/resources", self._web_job_resources),

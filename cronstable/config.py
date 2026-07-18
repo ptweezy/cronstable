@@ -1243,7 +1243,11 @@ class JobConfig:
         # year is also the working idiom for parking a job, and failing the
         # whole config load over it would turn an upgrade into an outage.
         self.schedule_findings: List[Finding] = (
-            lint_schedule(str(self.schedule), timezone=self.timezone)
+            lint_schedule(
+                str(self.schedule),
+                timezone=self.timezone,
+                hash_key=self.name,
+            )
             if isinstance(self.schedule, CronTab)
             else []
         )
@@ -1302,9 +1306,11 @@ class JobConfig:
         # out-of-range second, the wrong field count). Surface it as a
         # ConfigError naming the offending expression, so a bad schedule fails
         # the config load with a clear message the reload loop can log, rather
-        # than as an anonymous traceback.
+        # than as an anonymous traceback.  The job's name seeds the H hash
+        # form (self.name is assigned before the schedule parses), so an
+        # H slot is stable across restarts, reloads and replicas.
         try:
-            return CronTab(tab)
+            return CronTab(tab, hash_key=self.name)
         except ValueError as err:
             raise ConfigError(
                 "invalid schedule {!r}: {}".format(tab, err)

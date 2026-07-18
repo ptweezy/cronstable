@@ -70,10 +70,14 @@ from typing import (
 
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
+    ScheduleEntry,
     describe_cron,
+    duplicate_schedules,
     lint_schedule,
     next_fires,
     pad2,
+    schedule_pressure,
+    suggest_slot,
 )
 from cronstable.platform import IS_WINDOWS
 
@@ -1970,6 +1974,7 @@ ESC_PRIORITY = [
     "cluster",
     "fleet",
     "heat",
+    "press",
     "radar",
     "node",
 ]
@@ -2096,6 +2101,13 @@ class App:
         # ---- cards ----
         self.heat_data: Dict[str, List[Dict[str, Any]]] = {}
         self.heat_loaded = 0.0
+        # schedule pressure: computed LOCALLY from the /jobs snapshot via
+        # croninfo (the same analyzers the daemon serves), so the panel
+        # works against any daemon version; recomputed when stale.
+        self.pressure: Optional[Dict[str, Any]] = None
+        self.press_dups: List[Dict[str, Any]] = []
+        self.press_suggest: Dict[str, Dict[str, Any]] = {}
+        self.press_computed = 0.0
         self.state_tab = "view"
         self.state_detail: Optional[Dict[str, Any]] = None
         self.state_sel = 0
@@ -2349,6 +2361,10 @@ class App:
                 self.state_data = await self.api.get_json("/state")
         if self.is_open("heat") and (time.monotonic() - self.heat_loaded > 60):
             await self._load_heat()
+        if self.is_open("press") and (
+            time.monotonic() - self.press_computed > 60
+        ):
+            self._recompute_pressure()
 
     def _fleet_sound(self, first: bool) -> None:
         """Poll-diff for failure cues + the standing alarm (web port)."""
@@ -2443,6 +2459,58 @@ class App:
             with contextlib.suppress(Exception):
                 data = await self.api.get_json("/jobs/%s/runs" % _quote(name))
                 self.heat_data[name] = data.get("runs", [])
+        self.mark()
+
+    def _pressure_entries(self) -> List[ScheduleEntry]:
+        """Analyzable rows from the /jobs snapshot (mirrors the daemon's
+        own entry builder: enabled, cron-scheduled jobs only).  An H job's
+        ``schedule_resolved`` is parsed instead of its source, so no hash
+        key is needed here."""
+        from zoneinfo import ZoneInfo
+
+        entries: List[ScheduleEntry] = []
+        for job in self.jobs:
+            if not job.get("enabled"):
+                continue
+            text = str(
+                job.get("schedule_resolved") or job.get("schedule") or ""
+            ).strip()
+            if not text or text.lower() == "@reboot":
+                continue
+            try:
+                tab = CronTab(text)
+            except (ValueError, KeyError):
+                continue
+            tz: Optional[datetime.tzinfo]
+            tz_name = job.get("timezone")
+            if tz_name:
+                try:
+                    tz = ZoneInfo(str(tz_name))
+                except Exception:  # noqa: BLE001 - unknown zone: fall back
+                    tz = datetime.timezone.utc
+            else:
+                tz = datetime.timezone.utc if job.get("utc", True) else None
+            entries.append(ScheduleEntry(str(job.get("name", "")), tab, tz))
+        return entries
+
+    def _recompute_pressure(self) -> None:
+        """Refresh the schedule-pressure panel's data, locally.
+
+        Same analyzers the daemon serves on /schedule/pressure (croninfo),
+        run over the /jobs snapshot, so the panel needs no new endpoint
+        and works against an older daemon.  Failures keep the last data.
+        """
+        try:
+            entries = self._pressure_entries()
+            self.pressure = schedule_pressure(entries)
+            self.press_dups = duplicate_schedules(entries)
+            self.press_suggest = {
+                "hourly": suggest_slot(entries, "hourly"),
+                "daily": suggest_slot(entries, "daily"),
+            }
+            self.press_computed = time.monotonic()
+        except Exception:  # noqa: BLE001 - an analyzer bug must not kill
+            logger.exception("schedule pressure recompute failed")
         self.mark()
 
     async def _load_drawer_runs(self) -> None:
@@ -3022,6 +3090,7 @@ class AppPalette(AppActions):
             ("♪", "Toggle audible cues", self._toggle_sound),
             ("⌁", "Toggle next-fire radar", lambda: self._toggle("radar")),
             ("▦", "Toggle activity heatmap", lambda: self._toggle("heat")),
+            ("▥", "Toggle schedule pressure", lambda: self._toggle("press")),
             ("⊞", "Toggle fleet view", lambda: self._toggle("fleet")),
             ("◉", "Toggle cluster panel", lambda: self._toggle("cluster")),
             ("▤", "Toggle node resources", lambda: self._toggle("node")),
@@ -3152,6 +3221,8 @@ class AppPalette(AppActions):
             self._spawn(self._refresh_json("state_data", "/state"))
         elif name == "heat":
             self._spawn(self._load_heat())
+        elif name == "press":
+            self._recompute_pressure()
         elif name == "node":
             self._spawn(self._refresh_json("node_history", "/node/history"))
 
@@ -3592,6 +3663,12 @@ class AppKeys(AppPalette):
         if key == "r":
             self.heat_loaded = 0.0
             self._spawn(self._load_heat())
+        else:
+            await self._panel_scroll_key(key)
+
+    async def _key_press(self, key: str) -> None:
+        if key == "r":
+            self._recompute_pressure()
         else:
             await self._panel_scroll_key(key)
 
@@ -5262,6 +5339,131 @@ class AppOverlays(AppRender):
         return panel_frame(
             paint,
             "activity heatmap",
+            body,
+            width,
+            "j/k scroll · r refresh · esc close",
+        )
+
+    # ---- schedule pressure ------------------------------------------
+    def render_press(self, paint: Painter, cols: int, lines: int) -> List[str]:
+        """Forward-looking fleet collision view (web pressure card port):
+        the next 24h of fires by minute of hour, the hour by minute grid,
+        duplicate schedule groups, and the least-loaded slot."""
+        width = min(96, cols - 4)
+        data = self.pressure
+        if not data:
+            return panel_frame(
+                paint,
+                "schedule pressure",
+                [paint.style("  computing the fire forecast…", "dim")],
+                width,
+                "r refresh · esc close",
+            )
+        body: List[str] = []
+        busiest = data["busiest_minute"]
+        body.append(
+            paint.style(
+                " next %dh: %d fires from %d schedules · busiest :%02d "
+                "(%d jobs) · %d/60 minutes empty"
+                % (
+                    data["hours"],
+                    data["total_fires"],
+                    data["jobs"],
+                    busiest["minute"],
+                    busiest["jobs"],
+                    len(data["empty_minutes"]),
+                ),
+                "dim",
+            )
+        )
+        fires = data["by_minute_fires"]
+        peak = max(fires) if any(fires) else 1
+        spans = [paint.style(" by min ", "dim")]
+        for value in fires:
+            if not value:
+                spans.append(paint.style(" ", "fg"))
+                continue
+            idx = max(
+                1,
+                min(
+                    len(_SPARK_BARS) - 1,
+                    int(value / peak * (len(_SPARK_BARS) - 1) + 0.5),
+                ),
+            )
+            hot = value >= max(2, peak * 0.7)
+            spans.append(
+                paint.style(_SPARK_BARS[idx], "fail" if hot else "run")
+            )
+        body.append("".join(spans))
+        axis = [" "] * 60
+        for minute in range(0, 60, 10):
+            for offset, char in enumerate(":%02d" % minute):
+                axis[minute + offset] = char
+        body.append(paint.style(" " * 8 + "".join(axis), "dim"))
+        sug = self.press_suggest
+        if sug:
+            body.append(
+                paint.style(" suggest ", "dim")
+                + paint.style(sug["hourly"]["expression"], "accent", bold=True)
+                + paint.style(" (hourly) · ", "dim")
+                + paint.style(sug["daily"]["expression"], "accent", bold=True)
+                + paint.style(" (daily) · or ", "dim")
+                + paint.style("H * * * *", "accent", bold=True)
+                + paint.style(" per-job hashed slots", "dim")
+            )
+        if self.press_dups:
+            body.append(paint.style("", "fg"))
+            body.append(
+                paint.style(
+                    " duplicate schedules (%d group%s, firing on identical "
+                    "instants)"
+                    % (
+                        len(self.press_dups),
+                        "" if len(self.press_dups) == 1 else "s",
+                    ),
+                    "dim",
+                )
+            )
+            for group in self.press_dups[:4]:
+                names = ", ".join(group["jobs"][:5])
+                if len(group["jobs"]) > 5:
+                    names += ", +%d more" % (len(group["jobs"]) - 5)
+                body.append(
+                    paint.style(
+                        pad_to(" %s" % truncate(group["expression"], 18), 20),
+                        "pending",
+                        bold=True,
+                    )
+                    + paint.style("×%-3d " % group["count"], "bright")
+                    + paint.style(truncate(names, width - 28), "fg")
+                )
+        body.append(paint.style("", "fg"))
+        body.append(
+            paint.style(
+                " hour × minute fire grid (%s)" % data["timezone"], "dim"
+            )
+        )
+        grid = data["grid"]
+        grid_max = max((c for row in grid for c in row), default=0) or 1
+        shades = " ░▒▓█"
+        for hour in range(24):
+            spans = [paint.style(" %02d " % hour, "dim")]
+            for count in grid[hour]:
+                if not count:
+                    spans.append(paint.style("·", "off"))
+                    continue
+                shade = shades[max(1, min(4, 1 + int(3 * count / grid_max)))]
+                hot = count >= max(5, grid_max * 0.7)
+                spans.append(paint.style(shade, "fail" if hot else "run"))
+            body.append("".join(spans))
+        visible = max(6, lines - 6)
+        self.panel_scroll = max(
+            0, min(self.panel_scroll, max(0, len(body) - visible))
+        )
+        body = body[self.panel_scroll : self.panel_scroll + visible]
+        return panel_frame(
+            paint,
+            "schedule pressure",
             body,
             width,
             "j/k scroll · r refresh · esc close",

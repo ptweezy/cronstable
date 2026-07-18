@@ -962,6 +962,48 @@ to say what you mean. `GET /schedule/preview` runs the same
 parse/describe/preview/lint for any expression before it becomes a job.
 See [Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting).
 
+#### Hashed schedules: H
+
+`H * * * *` runs a job every hour at a minute hashed from the job's name
+(Jenkins-style; `H`, `H(a-b)`, `H/n`, and `H(a-b)/n` work in any field but
+the year). Every job lands on its own **stable** slot, so a fleet of hourly
+jobs spreads across the hour instead of stampeding at `:00`, and because the
+slot is a pure function of the name rather than random jitter, it survives
+restarts, reloads and replicas, and "was this run late?" stays answerable.
+Bare `H` in day-of-month hashes over 1 to 28 so short months are never
+skipped; renaming a job re-hashes its slots. The linter notes the concrete
+values each `H` resolved to, and `/jobs` serves them as `schedule_resolved`.
+See [Hashed Schedules](https://github.com/ptweezy/cronstable/wiki/Hashed-Schedules).
+
+#### Schedule pressure: the fleet's collision heatmap
+
+`GET /schedule/pressure` enumerates every enabled schedule's fires over the
+next 24 hours with the scheduler's own engine (timezone- and DST-exact) and
+buckets them into an hour-by-minute grid: "37 jobs fire at :00, minute 23
+is empty", as data. The web dashboard draws it as a heatmap card (with a
+compact strip on the wallboard), the TUI has the same panel as an overlay,
+and the `cron_schedule_pressure` MCP tool serves it to agents. See
+[Schedule Pressure](https://github.com/ptweezy/cronstable/wiki/Schedule-Pressure).
+
+#### Duplicate-schedule detection
+
+`GET /schedule/duplicates` groups jobs whose schedules fire on the
+identical instants, using the engine's semantic equality (`*/5` equals
+`0-59/5`, `@hourly` equals `0 * * * *`) and the resolved timezone, so
+"these 14 jobs all share `0 0 * * *`" surfaces before midnight proves it.
+Shown in the pressure card and TUI overlay. See
+[Duplicate Schedule Detection](https://github.com/ptweezy/cronstable/wiki/Duplicate-Schedule-Detection).
+
+#### Suggest a slot
+
+`GET /schedule/suggest?period=hourly|daily` recommends the least-loaded
+minute (or hour:minute) for a new job from the fleet's real fires,
+deterministically, with ties breaking away from the busiest slot; the
+response includes runners-up and the `H` spelling that would keep future
+jobs spreading themselves. Also available as one-click buttons in the
+pressure card and via the `cron_suggest_slot` MCP tool. See
+[Suggest a Slot](https://github.com/ptweezy/cronstable/wiki/Suggest-a-Slot).
+
 #### Second-level schedules
 
 Schedules are minute-granular by default, but cronstable can also run jobs at

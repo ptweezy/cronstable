@@ -43,6 +43,20 @@ documentation):
   else ``?`` stays an error, and parse errors whose text smells of Quartz
   (``#``, ``W``, the seconds-first 6-field layout) carry a hint naming that
   dialect instead of leaving the user to guess.
+- ``H`` (Jenkins-style) in any field but the year: a value hashed from the
+  job's name, stable across restarts, reloads and hosts, so a fleet of
+  ``H * * * *`` jobs spreads across the hour instead of stampeding at :00
+  while each job keeps ONE predictable slot (random jitter would break
+  late-run detection; a hashed slot does not).  Forms: bare ``H`` (whole
+  field range; in day-of-month it hashes over 1-28 so a short month is
+  never silently skipped), ``H(a-b)`` (a numeric range), ``H/n`` and
+  ``H(a-b)/n`` (every ``n`` starting at a hashed offset).  The seed is the
+  ``hash_key`` handed to :class:`CronTab` (the job name everywhere
+  cronstable constructs one), salted per field so ``H H * * *`` picks
+  uncorrelated minute and hour; renaming a job re-hashes its slots.  A
+  context that supplies no ``hash_key`` rejects ``H`` with a clear error.
+  :attr:`CronTab.resolved_source` is the expression with every ``H``
+  replaced by the values it hashed to.
 - When day-of-month AND day-of-week are both restricted, a day must satisfy
   BOTH (``0 0 13 * 5`` = Friday the 13th).  This is parse-crontab's rule,
   deliberately preserved (Vixie cron fires on either) so that no existing
@@ -75,8 +89,17 @@ occurrence only, so consumers never see one real instant twice.
 
 import calendar
 import datetime
+import hashlib
 import re
-from typing import FrozenSet, Iterator, Mapping, Optional, Set, Tuple
+from typing import (
+    FrozenSet,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+)
 
 __all__ = ["CronTab"]
 
@@ -125,6 +148,18 @@ _YEAR_FLOOR = 1970
 
 #: a day-field item that is Quartz's nearest-weekday form (``15W``, ``LW``)
 _QUARTZ_W = re.compile(r"(?:l|\d+)w\Z")
+
+#: the accepted spellings of a hashed item: ``h``, ``h/n``, ``h(a-b)``,
+#: ``h(a-b)/n`` (matched against the lowercased item).  Anything else that
+#: opens with ``h`` is a malformed hash item, not a value (no month or
+#: weekday name starts with an ``h``).
+_HASH_ITEM = re.compile(r"h(?:\((\d+)-(\d+)\))?(?:/(\d+))?\Z")
+
+#: bare ``H`` in day-of-month hashes over this range, not 1-31: a hashed
+#: day of 29, 30 or 31 would silently skip the months too short to reach
+#: it, which is exactly the surprise ``H`` exists to avoid.  An explicit
+#: ``H(1-31)`` still opts in to the full range.
+_HASH_DOM_END = 28
 
 
 def _quartz_hint(fields: Tuple[str, ...]) -> Optional[str]:
@@ -176,6 +211,113 @@ _DOW = ("day-of-week", 0, 7, 6, _DOW_NAMES)
 _YEAR = ("year", 1970, _YEAR_HORIZON, _YEAR_HORIZON, None)
 
 _FieldSpec = Tuple[str, int, int, int, Optional[Mapping[str, int]]]
+
+#: field layouts by column count, mirroring ``CronTab.__init__``'s slicing
+_LAYOUTS: Mapping[int, Tuple[_FieldSpec, ...]] = {
+    5: (_MINUTE, _HOUR, _DOM, _MONTH, _DOW),
+    6: (_MINUTE, _HOUR, _DOM, _MONTH, _DOW, _YEAR),
+    7: (_SECOND, _MINUTE, _HOUR, _DOM, _MONTH, _DOW, _YEAR),
+}
+
+
+def _hash_value(hash_key: str, label: str) -> int:
+    """The stable integer a hashed item draws its value from.
+
+    sha256 rather than ``hash()``: the slot must be identical across
+    processes, restarts and hosts (PYTHONHASHSEED randomizes ``hash()``),
+    exactly like the job-set fingerprint (:mod:`cronstable.fingerprint`).
+    Salted with the field label so ``H H * * *`` picks an uncorrelated
+    minute and hour instead of the same residue twice.
+    """
+    digest = hashlib.sha256(
+        "{}\n{}".format(label, hash_key).encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _expand_hash_item(
+    item: str, low: str, spec: _FieldSpec, hash_key: Optional[str]
+) -> str:
+    """One ``H`` item, expanded to the explicit values it hashes to.
+
+    Returns a comma-joined numeric list (``"7,22,37,52"`` for a minute
+    ``H/15``), which the ordinary item parser then treats like any other
+    values, so ``H`` needs no cases in the matching or search code.
+    """
+    label, lo, hi, step_end, _names = spec
+    if label == "year":
+        raise ValueError(
+            "'H' is not supported in the year field (a hashed year would "
+            "pin the schedule to one arbitrary year)"
+        )
+    match = _HASH_ITEM.match(low)
+    if match is None:
+        raise ValueError(
+            "invalid {} field {!r}: an 'H' item takes the forms H, H/n, "
+            "H(a-b) or H(a-b)/n (numeric range only)".format(label, item)
+        )
+    if hash_key is None:
+        raise ValueError(
+            "'H' in the {} field needs a hash key (the job name), which "
+            "this context does not supply".format(label)
+        )
+    a_text, b_text, step_text = match.groups()
+    if a_text is not None:
+        start, end = int(a_text, 10), int(b_text, 10)
+        for value in (start, end):
+            if not lo <= value <= hi:
+                raise ValueError(
+                    "{} value {} out of range [{}, {}]".format(
+                        label, value, lo, hi
+                    )
+                )
+        if start > end:
+            raise ValueError(
+                "{} range start {} > end {}".format(label, start, end)
+            )
+    else:
+        start, end = lo, step_end
+        if spec is _DOM and step_text is None:
+            end = _HASH_DOM_END  # bare H: never land on a day short
+            # months lack (see _HASH_DOM_END); H(1-31) opts back in
+    span = end - start + 1
+    value = _hash_value(hash_key, label)
+    if step_text is None:
+        return str(start + value % span)
+    step = int(step_text, 10)
+    if step <= 0:
+        raise ValueError(
+            "{} step must be positive, got {}".format(label, step)
+        )
+    if step > span:
+        raise ValueError(
+            "{} step {} exceeds the H range's span of {} (the hashed "
+            "offset could fall past the range's end)".format(label, step, span)
+        )
+    values = range(start + value % step, end + 1, step)
+    return ",".join(str(v) for v in values)
+
+
+def _expand_hash_field(
+    text: str, spec: _FieldSpec, hash_key: Optional[str]
+) -> str:
+    """Replace every ``H`` item of one field with its hashed values.
+
+    Case and non-``H`` items pass through byte-identical, so an expression
+    without ``H`` is untouched (and the golden-vector compatibility suite
+    keeps proving the engine unchanged for the whole legacy dialect).
+    """
+    items = text.split(",")
+    out: List[str] = []
+    changed = False
+    for item in items:
+        low = item.lower()
+        if low.startswith("h"):
+            out.append(_expand_hash_item(item, low, spec, hash_key))
+            changed = True
+        else:
+            out.append(item)
+    return ",".join(out) if changed else text
 
 
 def _resolve(token: str, spec: _FieldSpec, item: str) -> int:
@@ -350,6 +492,7 @@ class CronTab:
 
     __slots__ = (
         "_source",
+        "_resolved",
         "_seconds",
         "_minutes",
         "_hours",
@@ -366,12 +509,16 @@ class CronTab:
         "_years_sorted",
     )
 
-    def __init__(self, crontab: str) -> None:
+    def __init__(self, crontab: str, hash_key: Optional[str] = None) -> None:
         self._source = " ".join(crontab.split())
+        self._resolved = self._source
         fields = crontab.lower().split()
+        display: Optional[List[str]] = self._source.split()
         if len(fields) == 1 and fields[0] in _MACROS:
             self._source = fields[0]
+            self._resolved = fields[0]
             fields = _MACROS[fields[0]].split()
+            display = None  # macros carry no H item to resolve
         if not 5 <= len(fields) <= 7:
             raise ValueError(
                 "expected 5 to 7 whitespace-separated cron fields "
@@ -380,6 +527,27 @@ class CronTab:
         # kept for the dialect hint below: the columns as the user wrote
         # them, before the second/year columns are sliced away.
         raw_fields = tuple(fields)
+        if display is not None:
+            # Expand every H item to the explicit values it hashes to,
+            # BEFORE the ordinary field parse: the substituted text is
+            # plain dialect, so matching and search need no hash cases.
+            # Expansion runs over the original-case tokens and non-H items
+            # pass through byte-identical, keeping ``resolved_source``
+            # faithful to how the user spelled the rest of the field.
+            try:
+                expanded = [
+                    _expand_hash_field(text, spec, hash_key)
+                    for text, spec in zip(
+                        display, _LAYOUTS[len(fields)], strict=True
+                    )
+                ]
+            except ValueError as err:
+                hint = _quartz_hint(raw_fields)
+                if hint is not None:
+                    raise ValueError("{} ({})".format(err, hint)) from None
+                raise
+            self._resolved = " ".join(expanded)
+            fields = [text.lower() for text in expanded]
         # 5 fields: implicit second 0, any year.  6 fields: a trailing year
         # column.  7 fields: a leading second column as well.
         if len(fields) == 7:
@@ -433,6 +601,18 @@ class CronTab:
 
     def __repr__(self) -> str:
         return "CronTab({!r})".format(self._source)
+
+    @property
+    def resolved_source(self) -> str:
+        """The source with every ``H`` item replaced by its hashed values.
+
+        Equal to ``str(self)`` for an expression without ``H``.  Always
+        plain dialect (a bare value or a comma list per expanded item), so
+        it re-parses without a hash key; the dashboards' client-side
+        engines and the fire previews run on this text while displaying
+        the ``H`` original.
+        """
+        return self._resolved
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CronTab):

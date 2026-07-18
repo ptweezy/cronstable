@@ -66,6 +66,8 @@ The engine reads **extra columns from the ends**, so the field count selects the
 
 So a seven-field string schedules at **second granularity** (see [Second-level schedules](#second-level-schedules) below), while a six-field string pins a `year`. A six-field string is *not* seconds — the extra column is the year.
 
+Any field except the year also takes the Jenkins-style **`H` hash form** (`H`, `H(a-b)`, `H/n`, `H(a-b)/n`), which resolves to a slot hashed from the job's name: stable across restarts, reloads, and replicas, so a fleet of `H * * * *` jobs spreads across the hour without stampeding at `:00` while each job keeps one predictable fire time. See [Hashed Schedules](Hashed-Schedules) for the forms, the guarantees, and the rename caveat.
+
 ## Second-level schedules
 
 cronstable can run jobs at second granularity. Give the schedule a `second` (via the seven-field string above, or the `second:` object key in [Form 3](#form-3-schedule-object)); both jobs below run every 15 seconds:

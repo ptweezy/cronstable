@@ -16,21 +16,45 @@ assumes the expression already parses and reports advisory
 they say (level ``"warning"``) or behave in a way worth knowing about
 (level ``"note"``).  Config loading logs the findings per job and the
 status payloads carry them to the dashboards.
+
+The fleet-level analyzers live here too, one :class:`ScheduleEntry` row
+per scheduled job: :func:`schedule_pressure` (every fire over the next
+24 hours, bucketed into an hour by minute collision grid),
+:func:`duplicate_schedules` (groups of jobs whose schedules fire on the
+identical instants, via the engine's semantic equality) and
+:func:`suggest_slot` (the least-loaded minute or hour:minute for a new
+job).  The daemon serves them as ``GET /schedule/pressure``,
+``/schedule/duplicates`` and ``/schedule/suggest``; the TUI computes the
+same payloads locally from its ``/jobs`` snapshot.
 """
 
 import datetime
 import itertools
 import re
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set
+from collections import Counter
+from typing import (
+    Any,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 from cronstable.cronexpr import CronTab
 
 __all__ = [
     "Finding",
+    "ScheduleEntry",
     "describe_cron",
+    "duplicate_schedules",
     "lint_schedule",
     "next_fires",
     "pad2",
+    "schedule_pressure",
+    "suggest_slot",
 ]
 
 
@@ -184,18 +208,36 @@ _DOW_NAMES = {
 }
 
 
-def describe_cron(expr: str) -> str:
+#: cheap gate for "does this expression use the H hash form?": an ``h``
+#: opening an item (start of a field or after a comma) followed by one of
+#: the delimiters an H item can continue with.  Weekday and month names
+#: never OPEN with an h, so this cannot fire on ``thu``.
+_HASH_HINT = re.compile(r"(?i)(?:^|[\s,])h(?:[\s,/(]|$)")
+
+
+def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
     """Plain-English schedule text, a port of the web ``describeCron``.
 
     Handles the 5-field core plus the 6-/7-field (year / second) forms the
     daemon accepts; anything it cannot phrase degrades to ``Custom
-    schedule: <expr>`` rather than raising.
+    schedule: <expr>`` rather than raising.  With a ``hash_key`` (the job
+    name), Jenkins-style ``H`` items are resolved through the engine and
+    the prose describes the hashed slot, marked as such.
     """
     low = (expr or "").strip().lower()
     if low == "@reboot":
         return "Once, when cronstable starts (@reboot)"
     if low in _MACRO_TEXT:
         return _MACRO_TEXT[low]
+    if hash_key is not None and _HASH_HINT.search(expr or ""):
+        try:
+            tab = CronTab(expr, hash_key=hash_key)
+        except (ValueError, KeyError):
+            return "Custom schedule: %s" % expr
+        if tab.resolved_source != str(tab):
+            return "%s (H slots hashed from the job name)" % describe_cron(
+                tab.resolved_source
+            )
     fields = _MACROS.get(low, expr).split()
     try:
         sec_spec, year_spec = "0", "*"
@@ -348,6 +390,7 @@ def next_fires(
     count: int,
     tz: Optional[datetime.tzinfo] = None,
     start: Optional[datetime.datetime] = None,
+    hash_key: Optional[str] = None,
 ) -> List[datetime.datetime]:
     """The next ``count`` fire times of a schedule, straight from the
     daemon's own engine (:meth:`CronTab.occurrences`), so the preview
@@ -355,13 +398,15 @@ def next_fires(
     ``[]`` for @reboot, for an expression the engine rejects, and for a
     schedule with no remaining occurrence.  ``tz`` picks the frame when
     ``start`` is omitted (UTC by default); with an aware start the
-    returned datetimes are aware in that frame.
+    returned datetimes are aware in that frame.  ``hash_key`` (the job
+    name) resolves ``H`` items; without it an ``H`` schedule previews as
+    ``[]``, like any other text the engine rejects.
     """
     text = (schedule or "").strip()
     if text.lower() == "@reboot":
         return []
     try:
-        tab = CronTab(text)
+        tab = CronTab(text, hash_key=hash_key)
     except (ValueError, KeyError):
         return []
     zone = tz or datetime.timezone.utc
@@ -421,6 +466,7 @@ def lint_schedule(
     expression: str,
     timezone: Optional[datetime.tzinfo] = None,
     now: Optional[datetime.datetime] = None,
+    hash_key: Optional[str] = None,
 ) -> List[Finding]:
     """Advisory findings for a schedule the engine accepts.
 
@@ -431,18 +477,32 @@ def lint_schedule(
     (skipped when ``None``, since the daemon's local zone rules are not
     knowable here, and for fixed-offset zones, which never transition).
     ``now`` fixes the reference instant for determinism in tests; it
-    defaults to the current time in ``timezone`` (or UTC).
+    defaults to the current time in ``timezone`` (or UTC).  ``hash_key``
+    (the job name) resolves ``H`` items; a schedule that uses them gains
+    a note naming the concrete slots they hashed to.
     """
     text = (expression or "").strip()
     if text.lower() == "@reboot":
         return []
     try:
-        tab = CronTab(text)
+        tab = CronTab(text, hash_key=hash_key)
     except (ValueError, KeyError):
         return []
     if now is None:
         now = datetime.datetime.now(timezone or datetime.timezone.utc)
     findings: List[Finding] = []
+    if tab.resolved_source != str(tab):
+        findings.append(
+            Finding(
+                "hashed-slot",
+                LEVEL_NOTE,
+                "'H' resolves to '{}' for this job: the slot is a stable "
+                "hash of the job name, so it survives restarts and "
+                "reloads, but renaming the job re-hashes it".format(
+                    tab.resolved_source
+                ),
+            )
+        )
     dead = tab.next(now=now, default_utc=True) is None
     if dead:
         findings.append(
@@ -504,10 +564,11 @@ def _lint_steps(expression: str) -> List[Finding]:
     """Star steps that do not divide their field's span run unevenly.
 
     ``*/7`` in the minute field fires at :56 and then :00 four minutes
-    later, because the values restart at the wrap.  Only ``*/n`` items are
-    flagged: an explicit range with a step reads as deliberate.
-    Day-of-month gets its own note (steps restart at day 1 each month and
-    month lengths differ), and the year column never wraps.
+    later, because the values restart at the wrap.  Only ``*/n`` and the
+    hashed ``H/n`` (which spans the same full field) are flagged: an
+    explicit range with a step reads as deliberate.  Day-of-month gets
+    its own note (steps restart at day 1 each month and month lengths
+    differ), and the year column never wraps.
     """
     low = expression.strip().lower()
     fields = _MACROS.get(low, low).split()
@@ -531,7 +592,7 @@ def _lint_steps(expression: str) -> List[Finding]:
     for label, field in zip(labels, fields, strict=False):
         for item in field.split(","):
             head, slash, step_text = item.partition("/")
-            if not slash or head != "*" or not step_text.isdigit():
+            if not slash or head not in ("*", "h") or not step_text.isdigit():
                 continue
             step = int(step_text)
             if step <= 1:
@@ -722,3 +783,334 @@ def _classify(
     if roundtrip.replace(tzinfo=None, fold=0) == civil:
         return "fold"
     return "gap"
+
+
+# ===================================================================
+#  fleet-level schedule analysis
+# ===================================================================
+class ScheduleEntry(NamedTuple):
+    """One scheduled job, as the fleet analyzers see it.
+
+    ``timezone`` is the job's RESOLVED zone (``JobConfig.timezone``):
+    ``None`` means the daemon's local wall clock, exactly as it does
+    there.  Rows are built by the daemon from its live job set and by the
+    TUI from its ``/jobs`` snapshot; @reboot jobs and disabled jobs never
+    become entries, they cannot collide with anything.
+    """
+
+    name: str
+    tab: CronTab
+    timezone: Optional[datetime.tzinfo] = None
+
+
+#: job names carried per grid cell and per duplicate group before the
+#: payload switches to a count: keeps the pressure payload bounded when
+#: hundreds of jobs share one cell.
+_NAME_CAP = 10
+
+
+def _minute_tab(tab: CronTab) -> Tuple[CronTab, int]:
+    """A minute-granular twin of ``tab``, plus its fires per minute.
+
+    A 7-field schedule can fire many times inside one minute; walking
+    every second-level occurrence of a ``*/5``-seconds job across 24
+    hours would be 17280 engine steps for information the field sets
+    already hold.  Re-parse the resolved source (always plain dialect,
+    so no hash key is needed) with the seconds column pinned to 0 and
+    weight each matched minute by how many seconds it fires on.
+    """
+    fields = tab.resolved_source.split()
+    if len(fields) == 7:
+        return (
+            CronTab(" ".join(["0"] + fields[1:])),
+            len(tab.seconds),
+        )
+    return tab, 1
+
+
+def _local_tzinfo() -> Optional[datetime.tzinfo]:
+    """The daemon's own zone, for entries scheduled on the local clock."""
+    return datetime.datetime.now().astimezone().tzinfo
+
+
+def _fire_cells(
+    entries: Sequence[ScheduleEntry],
+    start: datetime.datetime,
+    hours: int,
+    tz: datetime.tzinfo,
+) -> Tuple[
+    List[List[int]],
+    Dict[Tuple[int, int], List[str]],
+    List[Set[str]],
+]:
+    """Walk every entry's fires over ``[start, start+hours)``.
+
+    Returns the 24x60 grid of fire counts keyed by the DISPLAY zone's
+    civil (hour, minute) label, the per-cell job names (capped at
+    ``_NAME_CAP``), and the set of jobs firing at each minute-of-hour.
+    Enumerates real instants through the engine's own
+    :meth:`CronTab.occurrences`, so DST behaviour matches the scheduler:
+    on a fall-back day both real fires of a repeated wall time land in
+    (and truthfully double-count at) the same cell.
+    """
+    end = start + datetime.timedelta(hours=hours)
+    local_tz = _local_tzinfo()
+    grid = [[0] * 60 for _ in range(24)]
+    cell_jobs: Dict[Tuple[int, int], List[str]] = {}
+    minute_jobs: List[Set[str]] = [set() for _ in range(60)]
+    cap = hours * 60 + 2  # backstop; a minute-granular walk cannot exceed it
+    for entry in entries:
+        zone = entry.timezone or local_tz
+        try:
+            mtab, weight = _minute_tab(entry.tab)
+        except (ValueError, KeyError):  # pragma: no cover - defensive
+            continue
+        walked = 0
+        for when in mtab.occurrences(start.astimezone(zone)):
+            if when >= end or walked >= cap:
+                break
+            walked += 1
+            label = when.astimezone(tz)
+            grid[label.hour][label.minute] += weight
+            minute_jobs[label.minute].add(entry.name)
+            names = cell_jobs.setdefault((label.hour, label.minute), [])
+            if len(names) < _NAME_CAP and entry.name not in names:
+                names.append(entry.name)
+    return grid, cell_jobs, minute_jobs
+
+
+def schedule_pressure(
+    entries: Sequence[ScheduleEntry],
+    start: Optional[datetime.datetime] = None,
+    hours: int = 24,
+    tz: Optional[datetime.tzinfo] = None,
+) -> Dict[str, Any]:
+    """The fleet's collision heatmap: every fire over the next 24 hours.
+
+    Enumerates each entry's fire instants over ``[start, start+hours)``
+    with the scheduler's own engine and buckets them by the civil
+    (hour, minute) label in ``tz`` (UTC by default), answering "37 jobs
+    fire at :00 and minute 23 is empty" with data instead of vibes.
+
+    The payload is JSON-ready: ``grid`` is 24 rows (hour of day) of 60
+    fire counts (minute), ``by_minute_jobs``/``by_minute_fires`` collapse
+    it to the 60-bin histogram the dashboards draw, ``top_cells`` names
+    the worst offenders (job names capped at ``_NAME_CAP`` per cell) and
+    ``empty_minutes`` lists the minutes nothing fires on.  Fire COUNTS
+    weigh sub-minute schedules by their fires per matched minute; the
+    per-minute JOB counts stay distinct job names.
+    """
+    zone = tz or datetime.timezone.utc
+    if start is None:
+        start = datetime.datetime.now(datetime.timezone.utc)
+    hours = max(1, min(int(hours), 168))
+    grid, cell_jobs, minute_jobs = _fire_cells(entries, start, hours, zone)
+    by_minute_fires = [
+        sum(grid[hour][minute] for hour in range(24)) for minute in range(60)
+    ]
+    by_minute_jobs = [len(minute_jobs[minute]) for minute in range(60)]
+    by_hour = [sum(row) for row in grid]
+    busiest = max(
+        range(60), key=lambda m: (by_minute_jobs[m], by_minute_fires[m])
+    )
+    empty = [m for m in range(60) if by_minute_fires[m] == 0]
+    ranked = sorted(
+        cell_jobs,
+        key=lambda cell: (-grid[cell[0]][cell[1]], cell),
+    )
+    top_cells = [
+        {
+            "hour": hour,
+            "minute": minute,
+            "fires": grid[hour][minute],
+            "jobs": cell_jobs[(hour, minute)],
+        }
+        for hour, minute in ranked[:6]
+    ]
+    return {
+        "start": start.astimezone(zone).isoformat(),
+        "hours": hours,
+        "timezone": str(zone),
+        "jobs": len(entries),
+        "total_fires": sum(by_hour),
+        "grid": grid,
+        "by_minute_fires": by_minute_fires,
+        "by_minute_jobs": by_minute_jobs,
+        "by_hour": by_hour,
+        "busiest_minute": {
+            "minute": busiest,
+            "jobs": by_minute_jobs[busiest],
+            "fires": by_minute_fires[busiest],
+        },
+        "empty_minutes": empty,
+        "top_cells": top_cells,
+    }
+
+
+def _tz_label(timezone: Optional[datetime.tzinfo]) -> str:
+    return str(timezone) if timezone is not None else "local"
+
+
+def _semantic_key(tab: CronTab) -> Tuple[Any, ...]:
+    """A hashable stand-in for the engine's semantic ``==``.
+
+    Two CronTabs are equal exactly when every parsed field set matches
+    (see :meth:`CronTab.__eq__`); this tuple lists the same sets, so
+    grouping by it groups by "fires on the identical instants".
+    """
+    return (
+        tab.seconds,
+        tab.minutes,
+        tab.hours,
+        tab.days_of_month,
+        tab.last_day_of_month,
+        tab.months,
+        tab.days_of_week,
+        tab.last_days_of_week,
+        tab.years,
+    )
+
+
+def duplicate_schedules(
+    entries: Sequence[ScheduleEntry],
+) -> List[Dict[str, Any]]:
+    """Groups of jobs whose schedules fire on the identical instants.
+
+    Grouping is SEMANTIC, by the engine's own equality, so ``*/5``,
+    ``0-59/5`` and an ``H`` slot that happens to resolve to the same set
+    all land in one group; and it includes the resolved timezone, so two
+    ``0 0 * * *`` jobs in different zones (which never fire together) do
+    NOT count as duplicates.  Each group reports the most common source
+    spelling, a description of the shared schedule, and the member job
+    names; groups of one are omitted.  Sorted largest first.
+    """
+    groups: Dict[Tuple[Any, ...], List[ScheduleEntry]] = {}
+    for entry in entries:
+        key = _semantic_key(entry.tab) + (_tz_label(entry.timezone),)
+        groups.setdefault(key, []).append(entry)
+    out: List[Dict[str, Any]] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        sources = Counter(str(entry.tab) for entry in members)
+        resolved = Counter(entry.tab.resolved_source for entry in members)
+        out.append(
+            {
+                "expression": sources.most_common(1)[0][0],
+                "description": describe_cron(resolved.most_common(1)[0][0]),
+                "timezone": _tz_label(members[0].timezone),
+                "count": len(members),
+                "jobs": sorted(entry.name for entry in members),
+            }
+        )
+    out.sort(key=lambda group: (-group["count"], group["expression"]))
+    return out
+
+
+def _circular_distance(a: int, b: int, span: int) -> int:
+    return min((a - b) % span, (b - a) % span)
+
+
+def suggest_slot(
+    entries: Sequence[ScheduleEntry],
+    period: str = "hourly",
+    start: Optional[datetime.datetime] = None,
+    tz: Optional[datetime.tzinfo] = None,
+) -> Dict[str, Any]:
+    """The least-loaded slot for a new job, from the fleet's real fires.
+
+    ``period="hourly"`` picks a minute (a ``<m> * * * *`` schedule),
+    ``period="daily"`` a minute and hour (``<m> <h> * * *``), scored on
+    the same 24-hour fire walk as :func:`schedule_pressure`.  Ties break
+    toward the slot circularly FARTHEST from the busiest one (on an idle
+    fleet that lands mid-hour, away from the :00 stampede the outside
+    world defaults to), then toward the earliest slot, so the answer is
+    deterministic.  ``alternatives`` lists the two runners-up, and
+    ``hash_hint`` names the ``H`` spelling that would keep spreading
+    future jobs without anyone picking slots by hand.
+    """
+    if period not in ("hourly", "daily"):
+        raise ValueError(
+            "period must be 'hourly' or 'daily', got {!r}".format(period)
+        )
+    zone = tz or datetime.timezone.utc
+    if start is None:
+        start = datetime.datetime.now(datetime.timezone.utc)
+    grid, _cells, _minute_jobs = _fire_cells(entries, start, 24, zone)
+    if period == "hourly":
+        loads = [
+            sum(grid[hour][minute] for hour in range(24))
+            for minute in range(60)
+        ]
+        busiest = max(range(60), key=lambda m: (loads[m], -m))
+        order = sorted(
+            range(60),
+            key=lambda m: (
+                loads[m],
+                -_circular_distance(m, busiest, 60),
+                m,
+            ),
+        )
+        slots = [
+            {
+                "minute": minute,
+                "expression": "{} * * * *".format(minute),
+                "fires_in_window": loads[minute],
+            }
+            for minute in order[:3]
+        ]
+        busiest_out: Dict[str, Any] = {
+            "minute": busiest,
+            "fires_in_window": loads[busiest],
+        }
+        hash_hint = "H * * * *"
+    else:
+        loads_by_cell = {
+            (hour, minute): grid[hour][minute]
+            for hour in range(24)
+            for minute in range(60)
+        }
+        busiest_cell = max(
+            loads_by_cell,
+            key=lambda cell: (loads_by_cell[cell], -cell[0], -cell[1]),
+        )
+        busiest_of_day = busiest_cell[0] * 60 + busiest_cell[1]
+        order_cells = sorted(
+            loads_by_cell,
+            key=lambda cell: (
+                loads_by_cell[cell],
+                -_circular_distance(
+                    cell[0] * 60 + cell[1], busiest_of_day, 1440
+                ),
+                cell,
+            ),
+        )
+        slots = [
+            {
+                "hour": hour,
+                "minute": minute,
+                "expression": "{} {} * * *".format(minute, hour),
+                "fires_in_window": loads_by_cell[(hour, minute)],
+            }
+            for hour, minute in order_cells[:3]
+        ]
+        busiest_out = {
+            "hour": busiest_cell[0],
+            "minute": busiest_cell[1],
+            "fires_in_window": loads_by_cell[busiest_cell],
+        }
+        hash_hint = "H H * * *"
+    suggestion = slots[0]
+    return {
+        "period": period,
+        "timezone": str(zone),
+        "based_on": {
+            "jobs": len(entries),
+            "start": start.astimezone(zone).isoformat(),
+            "hours": 24,
+        },
+        **suggestion,
+        "busiest": busiest_out,
+        "alternatives": slots[1:],
+        "hash_hint": hash_hint,
+    }

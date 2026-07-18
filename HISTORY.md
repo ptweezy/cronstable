@@ -57,6 +57,55 @@ also the working idiom for parking a job).
   golden compatibility vectors against the replaced parse-crontab library
   still pass byte-for-byte.
 
+### Hashed schedules: `H * * * *`
+
+- **Jenkins-style `H` fields** (`H`, `H(a-b)`, `H/n`, `H(a-b)/n`, any field
+  but the year) hash the job's name to a stable slot, killing the `:00`
+  thundering herd without random jitter, which would break the "was this
+  run late?" question a monitoring product must keep answerable.  The hash
+  is a per-field-salted SHA-256 of the job name: identical across
+  restarts, reloads, replicas and versions (the concrete slots are pinned
+  by tests), so `H H * * *` picks an uncorrelated minute and hour, and a
+  job's bare `H` minute agrees with its `H/15` phase.  Bare `H` in
+  day-of-month hashes over 1 to 28, never skipping short months; renaming
+  a job re-hashes its slots.  Resolution happens at parse time, so
+  matching, the next-fire search and semantic equality see plain values;
+  the linter attaches a `hashed-slot` note naming the resolved
+  expression, `GET /jobs` serves it as `schedule_resolved`, and
+  `GET /schedule/preview` grew a `seed` parameter so sandboxes can
+  resolve prospective `H` schedules.  Classic crontab files accept `H`
+  lines too (seeded by their line-derived names).
+
+### Fleet-level schedule analysis
+
+- **`GET /schedule/pressure`**, the collision heatmap: every enabled
+  schedule's fires over the next 24h (up to 168h), enumerated with the
+  scheduler's own engine (timezone- and DST-exact, sub-minute schedules
+  weighted, DAG schedules included) and bucketed into an hour-by-minute
+  grid with per-minute histograms, the busiest-minute headline, the empty
+  minutes, and the heaviest cells with their jobs.  Disabled and @reboot
+  jobs are excluded and counted.
+- **`GET /schedule/duplicates`**: groups of jobs whose schedules fire on
+  the identical instants, by the engine's own semantic equality (`*/5`
+  equals `0-59/5`, `@hourly` equals `0 * * * *`) and the resolved
+  timezone, so two midnight jobs in different zones are not called
+  duplicates.
+- **`GET /schedule/suggest`**: the least-loaded minute (`period=hourly`)
+  or minute and hour (`period=daily`) for a new job, scored on the same
+  24h fire walk, deterministic ties breaking circularly away from the
+  busiest slot (an idle fleet is told `:30`, not `:00`), with runners-up
+  and the `H` spelling that keeps future jobs spreading themselves.
+- **The web dashboard** grew a schedule-pressure card (grid heatmap,
+  minute histogram, duplicate groups as clickable chips, suggest-a-slot
+  buttons, UTC/local display toggle) plus a compact pressure strip on the
+  wallboard; the job drawer shows what an `H` schedule resolved to, and
+  every client-side preview computes from the resolved form.  **The TUI**
+  has the same panel as an overlay, computed locally from its `/jobs`
+  snapshot with the identical shared analyzers, so it works against older
+  daemons.  **Three read-only MCP tools** (`cron_schedule_pressure`,
+  `cron_schedule_duplicates`, `cron_suggest_slot`) serve the same
+  payloads to agents.
+
 ## 1.2.20 (2026-07-17)
 
 This release gives the web dashboard a **terminal twin**: `cronstable tui`

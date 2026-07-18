@@ -638,6 +638,52 @@ class MCPHandler:
                 False,
                 True,
             ),
+            (
+                "observe",
+                False,
+                "cron_schedule_pressure",
+                "Schedule pressure",
+                "The fleet's collision heatmap: every enabled schedule's "
+                "fires over the next `hours` (default 24, max 168), bucketed "
+                "by hour and minute in `tz` (default UTC). Answers 'how many "
+                "jobs fire at :00?' and 'which minutes are empty?'.",
+                obj({"hours": _INT, "tz": _STR}),
+                self._t_schedule_pressure,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_schedule_duplicates",
+                "Duplicate schedules",
+                "Groups of jobs whose schedules fire on the identical "
+                "instants (semantic equality: */5 == 0-59/5, same timezone). "
+                "Use to spot copy-pasted schedules worth spreading out.",
+                obj({}),
+                self._t_schedule_duplicates,
+                False,
+                True,
+            ),
+            (
+                "observe",
+                False,
+                "cron_suggest_slot",
+                "Suggest a slot",
+                "The least-loaded slot for a new job, from the fleet's real "
+                "fires over the next 24h: `period` 'hourly' picks a minute, "
+                "'daily' a minute and hour; returns the cron expression, two "
+                "runners-up, and the busiest slot for contrast.",
+                obj(
+                    {
+                        "period": _enum(["hourly", "daily"]),
+                        "tz": _STR,
+                    }
+                ),
+                self._t_suggest_slot,
+                False,
+                True,
+            ),
             # ---- dags ----
             (
                 "dags",
@@ -950,6 +996,70 @@ class MCPHandler:
             },
             "{} metric sample(s) matched, {} returned".format(
                 total, len(samples)
+            ),
+        )
+
+    async def _t_schedule_pressure(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        hours = _opt_int(args.get("hours"))
+        hours = 24 if hours is None else max(1, min(hours, 168))
+        tz = args.get("tz")
+        if tz is not None and not isinstance(tz, str):
+            raise _ToolInputError("`tz` must be an IANA timezone string")
+        try:
+            payload = self._cron.schedule_pressure_payload(hours, tz or None)
+        except ValueError as err:
+            return _tool_error(str(err))
+        busiest = payload["busiest_minute"]
+        return _result(
+            payload,
+            "{} fire(s) from {} job(s) in the next {}h; busiest minute :{:02d}"
+            " ({} job(s)), {} minute(s) empty".format(
+                payload["total_fires"],
+                payload["jobs"],
+                payload["hours"],
+                busiest["minute"],
+                busiest["jobs"],
+                len(payload["empty_minutes"]),
+            ),
+        )
+
+    async def _t_schedule_duplicates(
+        self, args: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        payload = self._cron.schedule_duplicates_payload()
+        groups = payload["groups"]
+        biggest = (
+            "; biggest: {} job(s) sharing '{}'".format(
+                groups[0]["count"], groups[0]["expression"]
+            )
+            if groups
+            else ""
+        )
+        return _result(
+            payload,
+            "{} duplicate group(s) across {} scheduled job(s){}".format(
+                len(groups), payload["jobs"], biggest
+            ),
+        )
+
+    async def _t_suggest_slot(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        period = args.get("period") or "hourly"
+        tz = args.get("tz")
+        if tz is not None and not isinstance(tz, str):
+            raise _ToolInputError("`tz` must be an IANA timezone string")
+        try:
+            payload = self._cron.schedule_suggest_payload(period, tz or None)
+        except ValueError as err:
+            return _tool_error(str(err))
+        return _result(
+            payload,
+            "least-loaded {} slot: '{}' ({} fire(s) already there "
+            "in 24h)".format(
+                payload["period"],
+                payload["expression"],
+                payload["fires_in_window"],
             ),
         )
 

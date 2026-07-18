@@ -105,6 +105,14 @@ Everything an operator drives from the web page:
 - the **cluster panel**, **fleet matrix** (jobs × nodes, failing-only
   filter), **node resources**, **activity heatmap** punchcard, and
   **next-fire radar**;
+- the **schedule pressure** overlay (`Ctrl-K` → "Toggle schedule
+  pressure"): the next 24 hours of fires as an hour-by-minute collision
+  grid with a minute histogram, the fleet's
+  [duplicate-schedule groups](Duplicate-Schedule-Detection), and the
+  [least-loaded-slot suggestions](Suggest-a-Slot), computed locally from
+  the `/jobs` snapshot with the daemon's own shared analyzers (see
+  [Schedule Pressure](Schedule-Pressure)), so it works against older
+  daemons too;
 - the **state inspector** for the durable store (inventory, document
   namespaces, record streams);
 - the **cron sandbox** (`Ctrl-K` → "Cron sandbox"), evaluating
