@@ -44,9 +44,12 @@ from cronstable.tui import (
     health,
     load_prefs,
     next_fires,
+    oneline,
     pad_to,
     rewrite_sgr,
+    sanitize_log_line,
     save_prefs,
+    scrub_non_sgr,
     spark_cells,
     strip_ansi,
     text_width,
@@ -245,9 +248,13 @@ def test_describe_cron_common_shapes():
     assert describe_cron("30 * * * *") == "Every hour at :30, every day"
     assert describe_cron("0 0 * * 0") == "At 00:00, on Sunday"
     assert describe_cron("0 12 1 * *") == ("At 12:00, on the 1st of the month")
-    # dom + dow combine with OR, like standard cron
+    # dom + dow must BOTH match -- the engine's deliberate AND rule
+    # ("0 0 13 * 5" is Friday the 13th), unlike standard cron's OR
     text = describe_cron("0 0 1 * 1")
-    assert "on Monday or on the 1st" in text
+    assert "on the 1st, and only on Monday" in text
+    # out-of-range fields degrade to prose instead of raising
+    assert describe_cron("* * * 13 *") == "Custom schedule: * * * 13 *"
+    assert describe_cron("* * * * 8") == "Custom schedule: * * * * 8"
     # a step that does not divide 60 is enumerated, not phrased
     assert "Every 7 minutes" not in describe_cron("*/7 * * * *")
     # seconds column (7-field): true cadence only when top is free
@@ -265,6 +272,29 @@ def test_next_fires_agrees_with_the_engine():
     assert fires[1].date().isoformat() == "2026-07-18"
     assert next_fires("@reboot", 3) == []
     assert next_fires("not a schedule", 3) == []
+
+
+def test_next_fires_steps_in_absolute_time_across_dst():
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/New_York")
+    # spring forward (2026-03-08): exactly one 06:00 fire per day, no
+    # phantom 05:00 fire on the transition day
+    start = datetime.datetime(2026, 3, 7, 12, 0, tzinfo=tz)
+    fires = next_fires("0 6 * * *", 3, tz=tz, start=start)
+    assert [f.strftime("%m-%d %H:%M") for f in fires] == [
+        "03-08 06:00",
+        "03-09 06:00",
+        "03-10 06:00",
+    ]
+    # fall back (2026-11-01): the first fire after the transition is
+    # still at 06:00 wall time, not shifted an hour
+    start = datetime.datetime(2026, 10, 31, 12, 0, tzinfo=tz)
+    fires = next_fires("0 6 * * *", 2, tz=tz, start=start)
+    assert [f.strftime("%m-%d %H:%M") for f in fires] == [
+        "11-01 06:00",
+        "11-02 06:00",
+    ]
 
 
 # ===================================================================
@@ -355,8 +385,6 @@ def test_rewrite_sgr_reinks_log_colors():
 
 
 def test_oneline_flattens_multiline_commands():
-    from cronstable.tui import oneline
-
     # grand-tour-style multi-line shell commands must not break rows
     assert oneline("set -eu\ntoken=$(get)\ncurl x") == (
         "set -eu token=$(get) curl x"
@@ -365,8 +393,6 @@ def test_oneline_flattens_multiline_commands():
 
 
 def test_sanitize_log_line_defuses_control_chars():
-    from cronstable.tui import sanitize_log_line
-
     # cmd.exe CRLF tail: the stray \r must not reach a painted row
     assert sanitize_log_line("heartbeat ok\r") == "heartbeat ok"
     # mid-line \r gets log-viewer overwrite semantics (progress bars)
@@ -376,6 +402,50 @@ def test_sanitize_log_line_defuses_control_chars():
     assert sanitize_log_line("a\x00b\x07c") == "abc"
     # ESC survives so rewrite_sgr can re-ink colours
     assert "\x1b[31m" in sanitize_log_line("\x1b[31mred")
+
+
+def test_hostile_escapes_never_reach_a_frame():
+    """Every non-SGR escape family must die in every paint path: a job
+    name or log line is attacker-influenced (under clustering it comes
+    from other machines over gossip), and a survivor could reset the
+    terminal, rewrite the clipboard (OSC 52), or retitle the window."""
+    theme = Theme("carolina", light=False)
+    hostile = [
+        "a\x1bcb",  # RIS hard reset
+        "a\x1b(0b",  # DEC line-drawing charset
+        "a\x1bP1;2|payload\x1b\\b",  # DCS
+        "a\x1b_apc payload\x1b\\b",  # APC
+        "a\x1b]52;c;cHduZWQ=\x07b",  # OSC 52 clipboard write
+        "a\x1b]0;title\x07b",  # OSC 0 window title
+        "a\x1b[<0;3;4Myb",  # CSI private-param mouse report
+        "a\x1b7\x1b8b",  # cursor save/restore
+        "a\x1b",  # bare trailing ESC
+    ]
+    for text in hostile:
+        for out in (
+            rewrite_sgr(sanitize_log_line(text), theme),
+            scrub_non_sgr(text),
+            pad_to(text, 24),
+            truncate(text, 24),
+            cut_to_width(text, 24),
+            oneline(text),
+        ):
+            for pos in range(len(out)):
+                if out[pos] == "\x1b":
+                    # any surviving ESC must open an SGR token
+                    assert out[pos : pos + 2] == "\x1b[", repr((text, out))
+                    end = out.find("m", pos)
+                    body = out[pos + 2 : end]
+                    assert end > 0 and all(
+                        c.isdigit() or c in ";:" for c in body
+                    ), repr((text, out))
+        # visible payload text still renders
+        assert "a" in strip_ansi(scrub_non_sgr(text))
+    # the painter's own SGR styling survives the same paths
+    styled = "\x1b[31mred\x1b[0m plain"
+    assert "\x1b[31m" in cut_to_width(styled, 30)
+    assert "\x1b[31m" in scrub_non_sgr(styled)
+    assert "\x1b[31m" in pad_to(styled, 30)
 
 
 def test_spark_cells_scale_and_color():
@@ -425,25 +495,27 @@ def test_prefs_roundtrip(tmp_path):
 
 def test_help_overlay_carries_the_web_table():
     """Keyboard parity is the feature: the help overlay must list the
-    web dashboard's shortcut table verbatim (from fillHelp)."""
-    web_rows = [
-        ("⌘K / Ctrl+K", "Command palette"),
-        ("/", "Focus filter"),
-        ("j / ↓", "Next job"),
-        ("k / ↑", "Previous job"),
-        ("Enter", "Open selected job"),
-        ("r", "Run selected job"),
-        ("x", "Cancel selected (running) job"),
-        ("c", "Copy selected command"),
-        ("g", "Refresh now"),
-        ("t", "Cycle theme"),
-        ("T", "Light / dark theme"),
-        ("i", "Incident timeline"),
-        ("w", "Wallboard (TV) mode"),
-        ("a", "Acknowledge failure alarm"),
-        ("?", "This help"),
-        ("Esc", "Close panel / drawer"),
-    ]
+    web dashboard's shortcut table verbatim -- parsed out of the real
+    ``fillHelp()`` in ``cronstable/web/index.html``, so a web-side edit
+    fails here instead of silently drifting the two frontends apart."""
+    import pathlib
+    import re
+
+    web_html = (
+        pathlib.Path(tui.__file__).parent / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+    block = re.search(
+        r"function fillHelp\(\)\s*\{\s*const rows = \[(.*?)\];",
+        web_html,
+        re.S,
+    )
+    assert block, "fillHelp() rows array not found in web/index.html"
+    web_rows = re.findall(
+        r'\[\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\]',
+        block.group(1),
+    )
+    # a parse regression must fail loudly, never pass as [] == []
+    assert len(web_rows) >= 10, "fillHelp parse found %d rows" % len(web_rows)
     assert tui.HELP_ROWS == web_rows
 
 
@@ -1020,6 +1092,131 @@ async def test_quit_key_ends_the_app(tmp_path):
         assert app.quit
     finally:
         await h.stop()
+
+
+async def test_manual_refresh_works_while_paused(tmp_path):
+    """--poll 0 is a first-class mode: g (and every post-action
+    refresh) must still fetch exactly once per press."""
+    h = Harness()
+    h.daemon.jobs = [_job("alpha")]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 1)
+        app.prefs["poll_ms"] = 0
+        await asyncio.sleep(0.05)  # let the poll loop park itself
+        h.daemon.jobs = [_job("alpha"), _job("bravo")]
+        h.keys.send("g")
+        await _wait_for(lambda: len(app.jobs) == 2)
+    finally:
+        await h.stop()
+
+
+async def test_wallboard_keeps_the_palette_closed(tmp_path):
+    """Ctrl-K on the TV board must stay inert: the wallboard composes
+    no overlays, so an invisible palette would swallow keys and could
+    fire unseen job actions on Enter."""
+    h = Harness()
+    h.daemon.jobs = [_job("alpha", outcome="success")]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 1)
+        h.keys.send("w")
+        await _wait_for(lambda: app.wallboard)
+        h.keys.send("ctrl+k")
+        await asyncio.sleep(0.1)
+        assert not app.is_open("palette")
+        h.keys.send("w")  # and w still leaves the board
+        await _wait_for(lambda: not app.wallboard)
+    finally:
+        await h.stop()
+
+
+async def test_log_search_cycles_and_esc_blurs_first(tmp_path):
+    h = Harness()
+    h.daemon.jobs = [_job("tailme", outcome="success")]
+    h.daemon.log_lines["tailme"] = [
+        {"stream": "stdout", "line": "alpha error"},
+        {"stream": "stdout", "line": "quiet middle"},
+        {"stream": "stdout", "line": "beta error"},
+    ]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 1)
+        h.keys.send("enter")
+        await _wait_for(
+            lambda: app.log_tail is not None and len(app.log_tail.lines) >= 3
+        )
+        for ch in "/error":
+            h.keys.send(ch)
+        await _wait_for(lambda: app.inputs["logsearch"] == "error")
+        # Enter releases the input and lands on the FIRST match
+        h.keys.send("enter")
+        await _wait_for(lambda: app.focus is None)
+        assert app.log_matches == [0, 2]
+        assert app.log_match_idx == 0
+        # n / N cycle with wrap-around instead of pinning
+        h.keys.send("n")
+        await _wait_for(lambda: app.log_match_idx == 1)
+        h.keys.send("n")
+        await _wait_for(lambda: app.log_match_idx == 0)
+        h.keys.send("N")
+        await _wait_for(lambda: app.log_match_idx == 1)
+        # Esc while typing blurs the search; the drawer survives
+        h.keys.send("/")
+        await _wait_for(lambda: app.focus == "logsearch")
+        h.keys.send("esc")
+        await _wait_for(lambda: app.focus is None)
+        assert app.is_open("drawer")
+        h.keys.send("esc")
+        await _wait_for(lambda: not app.is_open("drawer"))
+    finally:
+        await h.stop()
+
+
+async def test_log_tail_does_not_duplicate_a_finished_run(
+    tmp_path, monkeypatch
+):
+    """The daemon replays a finished run's whole buffer on every SSE
+    re-attach; the tail must show that run once, not once per 5s."""
+    monkeypatch.setattr(tui, "TAIL_RETRY_MS", 20)
+    h = Harness()
+    h.daemon.jobs = [_job("tailme", outcome="success")]
+    h.daemon.log_lines["tailme"] = [
+        {"stream": "stdout", "line": "one"},
+        {"stream": "stdout", "line": "two"},
+    ]
+    try:
+        app = await h.start(tmp_path)
+        await _wait_for(lambda: len(app.jobs) == 1)
+        h.keys.send("enter")
+        await _wait_for(
+            lambda: app.log_tail is not None and len(app.log_tail.lines) >= 3
+        )
+        # sit through several re-attach cycles of the finished run
+        await asyncio.sleep(0.5)
+        texts = [line for _, line, _ in app.log_tail.lines]
+        assert texts == ["one", "two", "end of run output"]
+    finally:
+        await h.stop()
+
+
+async def test_race_skip_lets_the_skip_key_win():
+    loop = asyncio.get_running_loop()
+
+    async def slow():
+        await asyncio.sleep(5)
+        return "late"
+
+    skip = loop.create_task(asyncio.sleep(0.01))
+    assert await tui._race_skip(slow(), skip, "skipped") == "skipped"
+    # a finished probe wins while the skip key is still pending
+    pending = loop.create_task(asyncio.sleep(5))
+
+    async def fast():
+        return "value"
+
+    assert await tui._race_skip(fast(), pending, "skipped") == "value"
+    pending.cancel()
 
 
 def test_dispatch_refuses_without_a_tty(monkeypatch):
