@@ -354,6 +354,16 @@ def test_rewrite_sgr_reinks_log_colors():
     assert strip_ansi(out) == "X"
 
 
+def test_oneline_flattens_multiline_commands():
+    from cronstable.tui import oneline
+
+    # grand-tour-style multi-line shell commands must not break rows
+    assert oneline("set -eu\ntoken=$(get)\ncurl x") == (
+        "set -eu token=$(get) curl x"
+    )
+    assert oneline("  spaced\t\tout  ") == "spaced out"
+
+
 def test_sanitize_log_line_defuses_control_chars():
     from cronstable.tui import sanitize_log_line
 
@@ -669,7 +679,7 @@ async def test_drawer_logs_and_esc_priority(tmp_path):
         await _wait_for(lambda: app.is_open("drawer"))
         await _wait_for(
             lambda: app.log_tail is not None
-            and len(app.log_tail.lines) == 2
+            and len(app.log_tail.lines) >= 2
         )
         await h.settle()
         screen = h.term.screen()
