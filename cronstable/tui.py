@@ -70,6 +70,7 @@ from typing import (
 
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
+    Finding,
     ScheduleEntry,
     describe_cron,
     duplicate_schedules,
@@ -1900,6 +1901,30 @@ class Painter:
         return table.get(key, "?")
 
 
+def finding_rows(
+    findings: List[Finding],
+    paint: "Painter",
+    width: int,
+    limit: int,
+) -> List[str]:
+    """Painted rows for schedule-lint findings, shared by the cron
+    sandbox and the job drawer so the two panels cannot drift in how a
+    finding level looks."""
+    rows: List[str] = []
+    for finding in findings[:limit]:
+        if finding.code == "never-fires":
+            marker, color = "✕", "fail"
+        elif finding.level == "warning":
+            marker, color = "⚠", "warn"
+        else:
+            marker, color = "·", "dim"
+        segments = textwrap.wrap(finding.message, max(20, width - 7)) or [""]
+        for i, segment in enumerate(segments):
+            prefix = " %s " % marker if i == 0 else "   "
+            rows.append(paint.style(prefix + segment, color))
+    return rows
+
+
 def panel_frame(
     paint: Painter,
     title: str,
@@ -2108,6 +2133,7 @@ class App:
         self.press_dups: List[Dict[str, Any]] = []
         self.press_suggest: Dict[str, Dict[str, Any]] = {}
         self.press_computed = 0.0
+        self._press_busy = False
         self.state_tab = "view"
         self.state_detail: Optional[Dict[str, Any]] = None
         self.state_sel = 0
@@ -2364,7 +2390,7 @@ class App:
         if self.is_open("press") and (
             time.monotonic() - self.press_computed > 60
         ):
-            self._recompute_pressure()
+            await self._recompute_pressure_bg()
 
     def _fleet_sound(self, first: bool) -> None:
         """Poll-diff for failure cues + the standing alarm (web port)."""
@@ -2462,10 +2488,19 @@ class App:
         self.mark()
 
     def _pressure_entries(self) -> List[ScheduleEntry]:
-        """Analyzable rows from the /jobs snapshot (mirrors the daemon's
-        own entry builder: enabled, cron-scheduled jobs only).  An H job's
+        """Analyzable rows from the /jobs and /dags snapshots.
+
+        Mirrors the daemon's own entry builder: enabled cron-scheduled
+        jobs plus each scheduled DAG's synthetic ``dag:<name>`` job (the
+        /dags rows graft its schedule string).  An H job's
         ``schedule_resolved`` is parsed instead of its source, so no hash
-        key is needed here."""
+        key is needed here.  Two remote-TUI approximations the payloads
+        force: a job on the daemon's local clock (``utc: false``, no
+        explicit timezone) resolves in THIS terminal's zone, which only
+        matches the daemon when the two hosts share a zone, and a DAG
+        schedule is assumed to be in the config default frame (UTC),
+        because /dags carries neither flag.
+        """
         from zoneinfo import ZoneInfo
 
         entries: List[ScheduleEntry] = []
@@ -2491,7 +2526,32 @@ class App:
             else:
                 tz = datetime.timezone.utc if job.get("utc", True) else None
             entries.append(ScheduleEntry(str(job.get("name", "")), tab, tz))
+        seen = {entry.name for entry in entries}
+        for dag in self.dags:
+            name = "dag:%s" % dag.get("name", "")
+            text = str(dag.get("schedule") or "").strip()
+            if not text or text.lower() == "@reboot" or name in seen:
+                continue
+            try:
+                tab = CronTab(text)
+            except (ValueError, KeyError):
+                continue  # e.g. an H form; /dags has no resolved spelling
+            entries.append(ScheduleEntry(name, tab, datetime.timezone.utc))
         return entries
+
+    async def _recompute_pressure_bg(self) -> None:
+        """The pressure walk on a worker thread.
+
+        The compute is pure CPU over a snapshot of the /jobs and /dags
+        rows, so running it off the loop keeps keys and repaints live on
+        a large fleet; the guard collapses overlapping requests."""
+        if self._press_busy:
+            return
+        self._press_busy = True
+        try:
+            await asyncio.to_thread(self._recompute_pressure)
+        finally:
+            self._press_busy = False
 
     def _recompute_pressure(self) -> None:
         """Refresh the schedule-pressure panel's data, locally.
@@ -2502,12 +2562,20 @@ class App:
         """
         try:
             entries = self._pressure_entries()
-            self.pressure = schedule_pressure(entries)
-            self.press_dups = duplicate_schedules(entries)
+            start = datetime.datetime.now(datetime.timezone.utc)
+            pressure = schedule_pressure(entries, start=start)
+            # both suggestions score the pressure walk's own grid, so the
+            # panel pays for ONE fire enumeration instead of three
             self.press_suggest = {
-                "hourly": suggest_slot(entries, "hourly"),
-                "daily": suggest_slot(entries, "daily"),
+                "hourly": suggest_slot(
+                    entries, "hourly", start=start, grid=pressure["grid"]
+                ),
+                "daily": suggest_slot(
+                    entries, "daily", start=start, grid=pressure["grid"]
+                ),
             }
+            self.pressure = pressure
+            self.press_dups = duplicate_schedules(entries)
             self.press_computed = time.monotonic()
         except Exception:  # noqa: BLE001 - an analyzer bug must not kill
             logger.exception("schedule pressure recompute failed")
@@ -3222,7 +3290,7 @@ class AppPalette(AppActions):
         elif name == "heat":
             self._spawn(self._load_heat())
         elif name == "press":
-            self._recompute_pressure()
+            self._spawn(self._recompute_pressure_bg())
         elif name == "node":
             self._spawn(self._refresh_json("node_history", "/node/history"))
 
@@ -3668,7 +3736,7 @@ class AppKeys(AppPalette):
 
     async def _key_press(self, key: str) -> None:
         if key == "r":
-            self._recompute_pressure()
+            await self._recompute_pressure_bg()
         else:
             await self._panel_scroll_key(key)
 
@@ -4811,12 +4879,28 @@ class AppOverlays(AppRender):
         if expr.strip():
             text = describe_cron(expr.strip())
             valid = not text.startswith("Custom schedule:")
+            hashed = False
             try:
                 CronTab(expr.strip())
                 parses = True
             except (ValueError, KeyError):
                 parses = expr.strip().lower() == "@reboot"
-            body.append(paint.style(" " + text, "ok" if parses else "fail"))
+                if not parses:
+                    # a valid H schedule parses for any NAMED job; the
+                    # empty hash key is the engine's own "validate the
+                    # fields only" convention (crontab sniffing uses it),
+                    # so this tells real H schedules from broken ones
+                    try:
+                        CronTab(expr.strip(), hash_key="")
+                        hashed = True
+                    except (ValueError, KeyError):
+                        pass
+            body.append(
+                paint.style(
+                    " " + text,
+                    "ok" if parses else ("dim" if hashed else "fail"),
+                )
+            )
             if parses and valid:
                 fires = next_fires(expr.strip(), 6)
                 if fires:
@@ -4829,6 +4913,18 @@ class AppOverlays(AppRender):
                                 "fg",
                             )
                         )
+            elif hashed:
+                body.append(paint.style("", "fg"))
+                body.append(
+                    paint.style(
+                        " an H slot is a stable hash of the job name,", "dim"
+                    )
+                )
+                body.append(
+                    paint.style(
+                        " so it resolves per job, not in this sandbox", "dim"
+                    )
+                )
             elif not parses:
                 body.append(
                     paint.style(
@@ -4844,19 +4940,7 @@ class AppOverlays(AppRender):
                 )
                 if findings:
                     body.append(paint.style("", "fg"))
-                for finding in findings[:4]:
-                    if finding.code == "never-fires":
-                        marker, color = "✕", "fail"
-                    elif finding.level == "warning":
-                        marker, color = "⚠", "warn"
-                    else:
-                        marker, color = "·", "dim"
-                    segments = textwrap.wrap(
-                        finding.message, max(20, width - 7)
-                    ) or [""]
-                    for i, segment in enumerate(segments):
-                        prefix = " %s " % marker if i == 0 else "   "
-                        body.append(paint.style(prefix + segment, color))
+                body.extend(finding_rows(findings, paint, width, 4))
         else:
             body.append(
                 paint.style(
@@ -5898,11 +5982,19 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         schedule = str(job.get("schedule", ""))
+        resolved = str(job.get("schedule_resolved") or "").strip()
+        name = str(job.get("name", "")) or None
+        # an H schedule: analyze the daemon's resolved spelling when the
+        # payload carries it; hashing locally with the job's name is the
+        # identical fallback (same salt) against an older daemon
+        text = resolved or schedule
         rows = [
             " " + paint.style(schedule, "accent", bold=True),
-            " " + paint.style(describe_cron(schedule), "bright"),
-            paint.style("", "fg"),
+            " " + paint.style(describe_cron(text, hash_key=name), "bright"),
         ]
+        if resolved and resolved != schedule:
+            rows.append(" " + paint.style("resolves to %s" % resolved, "dim"))
+        rows.append(paint.style("", "fg"))
         tz_name = job.get("timezone")
         frame = "UTC" if job.get("utc", True) or not tz_name else str(tz_name)
         rows.append(paint.style(" reference frame: %s" % frame, "dim"))
@@ -5914,7 +6006,7 @@ class AppDrawers(AppOverlays):
                 tz = ZoneInfo(str(tz_name))
             except Exception:  # noqa: BLE001 - fall back to UTC
                 pass
-        fires = next_fires(schedule, 8, tz)
+        fires = next_fires(text, 8, tz, hash_key=name)
         if fires:
             rows.append(paint.style("", "fg"))
             rows.append(paint.style(" next runs:", "dim"))
@@ -5925,24 +6017,26 @@ class AppDrawers(AppOverlays):
                 )
         elif schedule.strip().lower() == "@reboot":
             rows.append(paint.style(" runs once, at daemon start", "dim"))
-        # advisory lint in the job's own frame, so DST notes carry real
-        # dates; never-fires arrives as its own (red) finding here.
-        findings = lint_schedule(schedule, timezone=tz)
+        # the daemon computed the findings at config load in the job's own
+        # frame; render those when the payload ships them (an empty list
+        # means "linted clean"), and lint locally with the same rules only
+        # against an older daemon whose /jobs lacks the key.
+        shipped = job.get("schedule_findings")
+        if isinstance(shipped, list):
+            findings = [
+                Finding(
+                    str(f.get("code", "")),
+                    str(f.get("level", "note")),
+                    str(f.get("message", "")),
+                )
+                for f in shipped
+                if isinstance(f, dict)
+            ]
+        else:
+            findings = lint_schedule(text, timezone=tz, hash_key=name)
         if findings:
             rows.append(paint.style("", "fg"))
-        for finding in findings[:3]:
-            if finding.code == "never-fires":
-                marker, color = "✕", "fail"
-            elif finding.level == "warning":
-                marker, color = "⚠", "warn"
-            else:
-                marker, color = "·", "dim"
-            segments = textwrap.wrap(finding.message, max(20, width - 7)) or [
-                ""
-            ]
-            for i, segment in enumerate(segments):
-                prefix = " %s " % marker if i == 0 else "   "
-                rows.append(paint.style(prefix + segment, color))
+        rows.extend(finding_rows(findings, paint, width, 3))
         sched_in = self.next_run_seconds(job)
         if sched_in is not None:
             rows.append(paint.style("", "fg"))

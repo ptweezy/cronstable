@@ -476,6 +476,23 @@ def test_status_payload_marks_dead_schedules():
     assert rows["live"]["scheduled_in"] > 0
 
 
+def test_status_payload_running_dead_schedule_keeps_never_fires():
+    # /status and /jobs must agree: a RUNNING job whose schedule has no
+    # future occurrence keeps its never_fires flag (the two surfaces used
+    # to drift for exactly this case).
+    class _Run:
+        proc = None
+
+    cron = _cron(_DEAD_JOB)
+    cron.running_jobs["parked"] = [_Run()]
+    cron.running_jobs["live"] = [_Run()]
+    rows = {row["job"]: row for row in cron.status_payload()}
+    assert rows["parked"]["status"] == "running"
+    assert rows["parked"]["never_fires"] is True
+    assert rows["live"]["status"] == "running"
+    assert "never_fires" not in rows["live"]
+
+
 async def test_web_status_text_says_never_fires():
     cron = _cron(_DEAD_JOB)
     resp = await cron._web_get_status(Req())

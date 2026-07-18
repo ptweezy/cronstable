@@ -521,10 +521,19 @@ def lint_schedule(
 def _never_fires_message(tab: CronTab) -> str:
     years = tab.years
     if years is not None:
-        return (
-            "no future occurrence: the year column ends at {}, so this "
-            "schedule will never fire again".format(max(years))
+        # Blame the year column only when it is actually the culprit: a
+        # probe from before the year floor tells an exhausted column ("0 0
+        # 1 1 * 2020" did fire once) apart from a date that never exists
+        # in ANY listed year ("0 0 30 2 * 2099" is dead because February
+        # 30 is, not because 2099 is).
+        rewound = tab.next(
+            now=datetime.datetime(1969, 12, 31), default_utc=True
         )
+        if rewound is not None:
+            return (
+                "no future occurrence: the year column ends at {}, so this "
+                "schedule will never fire again".format(max(years))
+            )
     return (
         "no future occurrence: the day, month and weekday fields never all "
         "line up on a real date, so this schedule will never fire"
@@ -1016,6 +1025,7 @@ def suggest_slot(
     period: str = "hourly",
     start: Optional[datetime.datetime] = None,
     tz: Optional[datetime.tzinfo] = None,
+    grid: Optional[List[List[int]]] = None,
 ) -> Dict[str, Any]:
     """The least-loaded slot for a new job, from the fleet's real fires.
 
@@ -1028,6 +1038,11 @@ def suggest_slot(
     deterministic.  ``alternatives`` lists the two runners-up, and
     ``hash_hint`` names the ``H`` spelling that would keep spreading
     future jobs without anyone picking slots by hand.
+
+    ``grid`` skips the walk: pass the 24x60 ``grid`` of a
+    :func:`schedule_pressure` payload computed for the SAME entries, zone
+    and a 24-hour window, so a caller wanting the heatmap plus both
+    suggestions pays for one enumeration instead of three.
     """
     if period not in ("hourly", "daily"):
         raise ValueError(
@@ -1036,7 +1051,8 @@ def suggest_slot(
     zone = tz or datetime.timezone.utc
     if start is None:
         start = datetime.datetime.now(datetime.timezone.utc)
-    grid, _cells, _minute_jobs = _fire_cells(entries, start, 24, zone)
+    if grid is None:
+        grid, _cells, _minute_jobs = _fire_cells(entries, start, 24, zone)
     if period == "hourly":
         loads = [
             sum(grid[hour][minute] for hour in range(24))

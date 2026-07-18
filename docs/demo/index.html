@@ -1963,7 +1963,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (c.domStar && c.dowStar) return true;
     if (c.domStar) return dowOk;
     if (c.dowStar) return domOk;
-    return domOk || dowOk;                            // Vixie OR semantics
+    return domOk && dowOk;               // engine AND rule (cronexpr._day_matches)
   }
   // previous fire times (newest-first), not before `floor` ms, capped
   function prevFires(expr, from, count, floor) {
@@ -2480,11 +2480,37 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   function J200(body) { return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }); }
   function T200(text) { return new Response(String(text), { status: 200, headers: { "Content-Type": "text/plain" } }); }
   function E(code, msg) { return new Response(msg || "", { status: code }); }
+  function J400(msg) { return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } }); }
   function wantsJSON(opts) { var h = (opts && opts.headers) || {}; var acc = (h instanceof Headers) ? h.get("Accept") : (h.Accept || h.accept || ""); return /application\/json/.test(acc || ""); }
 
 
   // ---- fleet schedule analyzers (mirror /schedule/*) ---------------
-  function pressureGrid() {
+  // Mirror of the daemon's _zone_from_name: a ?tz= query value as an
+  // Intl formatter (null when absent, meaning UTC); throws a flagged
+  // error for an unknown name, which the router turns into the same
+  // 400 {"error": "unknown timezone: <name>"} payload the real daemon
+  // sends for /schedule/pressure and /schedule/suggest.
+  function zoneFmt(tz) {
+    if (!tz) return null;
+    try {
+      return new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit" });
+    } catch (err) {
+      var e = new Error("unknown timezone: " + tz); e.badTz = true; throw e;
+    }
+  }
+  // hour/minute labels of an instant in the requested zone (UTC when fmt
+  // is null); some ICU builds render midnight as "24" under hour12:false,
+  // hence the % 24
+  function hmIn(fmt, d) {
+    if (!fmt) return { h: d.getUTCHours(), m: d.getUTCMinutes() };
+    var h = 0, m = 0;
+    fmt.formatToParts(d).forEach(function (p) {
+      if (p.type === "hour") h = (+p.value) % 24;
+      else if (p.type === "minute") m = +p.value;
+    });
+    return { h: h, m: m };
+  }
+  function pressureGrid(fmt) {
     var grid = [], mJobs = [], h, m;
     for (h = 0; h < 24; h++) { var row = []; for (m = 0; m < 60; m++) row.push(0); grid.push(row); }
     for (m = 0; m < 60; m++) mJobs.push({});
@@ -2497,20 +2523,22 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       for (var i = 0; i < 1440; i++) {
         var d = new Date(t0 + i * 60000);
         if (!matches(cc, d)) continue;
-        grid[d.getUTCHours()][d.getUTCMinutes()] += weight;
-        mJobs[d.getUTCMinutes()][job.name] = 1;
+        var hm = hmIn(fmt, d);
+        grid[hm.h][hm.m] += weight;
+        mJobs[hm.m][job.name] = 1;
       }
     });
     return { grid: grid, mJobs: mJobs, jobs: jobs, t0: t0 };
   }
-  function buildPressure() {
-    var p = pressureGrid(), grid = p.grid, m, h;
+  function buildPressure(tz) {
+    var fmt = zoneFmt(tz);
+    var p = pressureGrid(fmt), grid = p.grid, m, h;
     var bmf = [], bmj = [], byHour = [], total = 0;
     for (m = 0; m < 60; m++) { var s = 0; for (h = 0; h < 24; h++) s += grid[h][m]; bmf.push(s); bmj.push(Object.keys(p.mJobs[m]).length); total += s; }
     for (h = 0; h < 24; h++) { var hs = 0; for (m = 0; m < 60; m++) hs += grid[h][m]; byHour.push(hs); }
     var busiest = 0; for (m = 1; m < 60; m++) if (bmj[m] > bmj[busiest] || (bmj[m] === bmj[busiest] && bmf[m] > bmf[busiest])) busiest = m;
     var empty = []; for (m = 0; m < 60; m++) if (!bmf[m]) empty.push(m);
-    return { start: iso(p.t0), hours: 24, timezone: "UTC", jobs: p.jobs, total_fires: total,
+    return { start: iso(p.t0), hours: 24, timezone: tz || "UTC", jobs: p.jobs, total_fires: total,
              grid: grid, by_minute_fires: bmf, by_minute_jobs: bmj, by_hour: byHour,
              busiest_minute: { minute: busiest, jobs: bmj[busiest], fires: bmf[busiest] },
              empty_minutes: empty, top_cells: [],
@@ -2537,8 +2565,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     return { jobs: count, groups: out };
   }
   function circDist(a, b, n) { var d = Math.abs(a - b) % n; return Math.min(d, n - d); }
-  function buildSuggest(period) {
-    var p = pressureGrid(), grid = p.grid, m, h;
+  function buildSuggest(period, tz) {
+    var fmt = zoneFmt(tz);
+    var p = pressureGrid(fmt), grid = p.grid, m, h;
     if (period === "daily") {
       var busiest = { h: 0, m: 0, c: grid[0][0] }, best = null;
       for (h = 0; h < 24; h++) for (m = 0; m < 60; m++) if (grid[h][m] > busiest.c) busiest = { h: h, m: m, c: grid[h][m] };
@@ -2547,7 +2576,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         var cand = { h: h, m: m, c: grid[h][m], d: circDist(h * 60 + m, bmod, 1440) };
         if (!best || cand.c < best.c || (cand.c === best.c && cand.d > best.d)) best = cand;
       }
-      return { period: "daily", timezone: "UTC", hour: best.h, minute: best.m,
+      return { period: "daily", timezone: tz || "UTC", hour: best.h, minute: best.m,
                expression: best.m + " " + best.h + " * * *", fires_in_window: best.c,
                busiest: { hour: busiest.h, minute: busiest.m, fires_in_window: busiest.c },
                alternatives: [], hash_hint: "H H * * *" };
@@ -2556,7 +2585,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     var bus = 0; for (m = 1; m < 60; m++) if (loads[m] > loads[bus]) bus = m;
     var bm = 0;
     for (m = 1; m < 60; m++) if (loads[m] < loads[bm] || (loads[m] === loads[bm] && circDist(m, bus, 60) > circDist(bm, bus, 60))) bm = m;
-    return { period: "hourly", timezone: "UTC", minute: bm, expression: bm + " * * * *",
+    return { period: "hourly", timezone: tz || "UTC", minute: bm, expression: bm + " * * * *",
              fires_in_window: loads[bm], busiest: { minute: bus, fires_in_window: loads[bus] },
              alternatives: [], hash_hint: "H * * * *" };
   }
@@ -2575,9 +2604,9 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (url === "/node/history") return J200(buildNodeHistory());
     if (url === "/status") return wantsJSON(opts) ? J200(buildStatus()) : T200(buildStatus().map(function (r) { return r.job + ": " + r.status; }).join("\n"));
     if (url === "/jobs") return J200(buildJobs());
-    if (url === "/schedule/pressure") return J200(buildPressure());
+    if (url === "/schedule/pressure") { try { return J200(buildPressure(qs.tz)); } catch (e) { if (e && e.badTz) return J400(e.message); throw e; } }
     if (url === "/schedule/duplicates") return J200(buildDuplicates());
-    if (url === "/schedule/suggest") return J200(buildSuggest(qs.period || "hourly"));
+    if (url === "/schedule/suggest") { try { return J200(buildSuggest(qs.period || "hourly", qs.tz)); } catch (e) { if (e && e.badTz) return J400(e.message); throw e; } }
     if (url === "/dags") return J200(buildDags());
     if (url === "/state") return J200(buildState());
     if (url === "/state/documents") return qs.ns ? J200(buildStateDocs(qs.ns)) : E(400, "ns required");
@@ -3775,9 +3804,12 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     } catch (_) { return { type: "unknown", raw: expr }; }
   }
   function dayMatches(p, c) {
-    // standard cron OR-semantics between day-of-month and day-of-week
+    // Both restricted: BOTH must match. This dialect keeps parse-crontab's
+    // AND rule between day-of-month and day-of-week, mirroring the daemon's
+    // engine (cronexpr._day_matches), unlike standard cron's OR:
+    // '0 0 13 * 5' is Friday the 13th, not every Friday plus every 13th.
     const domR = p.dom.restricted, dowR = p.dow.restricted;
-    if (domR && dowR) return p.dom.has(c.D) || p.dow.has(c.dow);
+    if (domR && dowR) return p.dom.has(c.D) && p.dow.has(c.dow);
     if (domR) return p.dom.has(c.D);
     if (dowR) return p.dow.has(c.dow);
     return true;
@@ -3918,13 +3950,16 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       timePart = "At " + mp + " past " + hp;
     }
 
-    // day-of-month and day-of-week combine with OR when BOTH are restricted
-    // (standard cron) — reflect that in the prose with "or", not a comma.
+    // dom and dow must BOTH match when both are restricted: the client
+    // engine (dayMatches, mirroring the daemon's cronexpr._day_matches)
+    // keeps parse-crontab's AND rule ('0 0 13 * 5' is Friday the 13th),
+    // unlike standard cron's OR, so the prose must say so too; the
+    // wording mirrors the server describer (croninfo.describe_cron).
     const dayClauses = [];
     if (!everyDow) dayClauses.push("on " + listJoin(p.dow.values.map((d) => DOWN[d])));
     if (!everyDom) dayClauses.push("on the " + listJoin(p.dom.values.map((d) => ordinal(d))) + (everyDow ? " of the month" : ""));
     const clauses = [];
-    if (dayClauses.length === 2) clauses.push(dayClauses.join(" or "));
+    if (dayClauses.length === 2) clauses.push(dayClauses[1] + ", and only " + dayClauses[0]);
     else if (dayClauses.length === 1) clauses.push(dayClauses[0]);
     if (!everyMon) clauses.push("in " + listJoin(p.month.values.map((m) => MONTHS[m])));
     else if (everyDom && everyDow) clauses.push("every day");
@@ -4878,7 +4913,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
 
   // ===================================================================
-  //  schedule pressure — forward-looking fleet collision heatmap
+  //  schedule pressure: forward-looking fleet collision heatmap
   // ===================================================================
   // The daemon enumerates every enabled schedule's fires over the next 24h
   // with its own engine (/schedule/pressure), so this panel shows what WILL
@@ -8803,6 +8838,34 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     return '<div class="sbx-uses"><span class="faint">recent:</span><div class="sbx-recent">' +
       list.map((x) => '<span class="chip" data-expr="' + escAttr(x) + '">' + esc(x) + "</span>").join("") + "</div></div>";
   }
+  // True only when the expression is valid APART from its H items: H is
+  // opaque to parseCron, so substitute each H item with the plain form it
+  // resolves into (H -> *, H/n -> */n, H(a-b) -> a-b, H(a-b)/n -> a-b/n)
+  // and require the rebuilt expression to parse. A backwards H(a-b) range
+  // or an H in the year column (the trailing field of the 6-/7-field
+  // forms) is invalid, the daemon's engine rejects both, so those fall
+  // through to the normal invalid-expression error instead of the
+  // reassuring H info message.
+  function sbxLooksHashed(expr) {
+    const fields = expr.split(/\s+/);
+    if (fields.length < 5 || fields.length > 7) return false;
+    const yearIdx = fields.length === 5 ? -1 : fields.length - 1;
+    let sawH = false;
+    const rebuilt = [];
+    for (let i = 0; i < fields.length; i++) {
+      const items = [];
+      for (const item of fields[i].split(",")) {
+        const m = item.match(/^[hH](?:\((\d+)-(\d+)\))?(?:\/(\d+))?$/);
+        if (!m) { items.push(item); continue; }
+        sawH = true;
+        if (i === yearIdx) return false;
+        if (m[1] != null && +m[1] > +m[2]) return false;
+        items.push((m[1] != null ? m[1] + "-" + m[2] : "*") + (m[3] != null ? "/" + m[3] : ""));
+      }
+      rebuilt.push(items.join(","));
+    }
+    return sawH && parseCron(rebuilt.join(" ")).type === "fields";
+  }
   function renderSandbox() {
     const expr = $("sbxInput").value.trim();
     const frame = $("sbxFrame").value || "UTC";
@@ -8813,7 +8876,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
     if (parsed.type === "reboot") {
       html += '<p class="sbx-desc">Runs once, when cronstable starts (@reboot).</p>';
     } else if (parsed.type !== "fields") {
-      if (/(^|[\s,])[hH]([\s,\/(]|$)/.test(expr))
+      if (sbxLooksHashed(expr))
         html += '<p class="sbx-desc">An <b>H</b> slot is a stable hash of the job name, so it resolves per job, not in this sandbox. Open a job\'s <b>schedule</b> tab to see the values its H resolved to.</p>';
       else
         html += '<p class="sbx-desc sbx-bad">Not a valid cron expression (5, 6, or 7 fields) or known @macro.</p>';

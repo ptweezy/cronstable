@@ -22,9 +22,9 @@ The cost of that predictability: **renaming a job re-hashes its slots** (the nam
 
 | Form | Meaning |
 |------|---------|
-| `H` | One hashed value from the field's whole range. In day-of-month, bare `H` hashes over 1 to 28, so a short month is never silently skipped; write `H(1-31)` to opt back in to the full range. |
+| `H` | One hashed value from the field's whole range. In day-of-month, every rangeless `H` form (bare `H` and `H/n` alike) hashes over 1 to 28, so a short month is never silently skipped; write `H(1-31)` to opt back in to the full range. |
 | `H(a-b)` | One hashed value from the numeric range `a` to `b` (`H(0-29)` picks a first-half-hour minute). |
-| `H/n` | Every `n`, starting at a hashed offset: a minute `H/15` fires four times an hour at `p`, `p+15`, `p+30`, `p+45` for this job's own phase `p`. |
+| `H/n` | Every `n`, starting at a hashed offset: a minute `H/15` fires four times an hour at `p`, `p+15`, `p+30`, `p+45` for this job's own phase `p`. In day-of-month the steps stay within 1 to 28, like bare `H`. |
 | `H(a-b)/n` | Every `n` within `a` to `b`, phase hashed. The step must not exceed the range's span. |
 
 Details that keep the behavior boring and predictable:

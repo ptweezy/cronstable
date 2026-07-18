@@ -6,7 +6,10 @@ parsed, ``next()`` from fixed naive and timezone-aware instants, ``test()``
 over fixed datetimes, and semantic-equality verdicts.  These tests replay
 every vector against :mod:`cronstable.cronexpr` -- a full compatibility proof
 that needs no copy of the old package (the vectors are program OUTPUT, not
-code).  Regenerate/extend the vectors with ``tests/gen_cron_golden.py``.
+code).  One deliberate exception: the ``aware_next`` vectors pin the
+in-house engine's real-instant DST policy, because at a DST edge the legacy
+library can answer a NEGATIVE delay.  Regenerate/extend the vectors with
+``tests/gen_cron_golden.py``.
 
 If the old package happens to be importable (a dev machine, never CI), a live
 differential test ALSO cross-checks every vector directly, so corpus edits
@@ -152,11 +155,19 @@ def test_live_differential_against_old_library():
                 new_ct.next(now=now, default_utc=True),
                 old_ct.next(now=now, default_utc=True),
             ), (expr, now_s)
-        for spec in _G["aware_next_nows"]:
+        for spec, pinned in zip(
+            _G["aware_next_nows"], entry["aware_next"], strict=True
+        ):
             now = _aware(spec)
+            old_value = old_ct.next(now=now, default_utc=False)
+            if not _close(old_value, pinned):
+                # Intentional divergence: at a DST edge the legacy library
+                # answers with civil arithmetic (even a negative delay);
+                # the aware vectors pin the in-house real-instant policy,
+                # and test_golden already holds the engine to them.
+                continue
             assert _close(
-                new_ct.next(now=now, default_utc=False),
-                old_ct.next(now=now, default_utc=False),
+                new_ct.next(now=now, default_utc=False), old_value
             ), (expr, spec)
         for dt_s in _G["test_dts"]:
             dt = datetime.datetime.fromisoformat(dt_s)

@@ -277,9 +277,9 @@ def _expand_hash_item(
             )
     else:
         start, end = lo, step_end
-        if spec is _DOM and step_text is None:
-            end = _HASH_DOM_END  # bare H: never land on a day short
-            # months lack (see _HASH_DOM_END); H(1-31) opts back in
+        if spec is _DOM:
+            end = _HASH_DOM_END  # rangeless H, bare or H/n: never land
+            # on a day short months lack; H(1-31) opts back in
     span = end - start + 1
     value = _hash_value(hash_key, label)
     if step_text is None:
@@ -739,18 +739,33 @@ class CronTab:
             else:
                 now = datetime.datetime.now()
         civil = now.replace(tzinfo=None)
-        target = self._next_civil(civil)
-        if target is None:
-            return None
-        if now.tzinfo is not None:
-            # Subtracting two datetimes that share a tzinfo is NAIVE (civil)
-            # arithmetic in Python; route through UTC so the delay is true
-            # elapsed seconds across a DST offset change.
-            target_utc = target.replace(tzinfo=now.tzinfo).astimezone(
+        if now.tzinfo is None:
+            target = self._next_civil(civil)
+            if target is None:
+                return None
+            return (target - civil).total_seconds()
+        # Aware: the delay to the next REAL instant, i.e. the first
+        # :meth:`occurrences` yield after ``now``.  Each civil match is
+        # resolved in the zone (fold=0) and compared through UTC, so a
+        # match the spring-forward gap swallows counts once at its shifted
+        # label, and a wall time ``now`` has already passed on the first
+        # leg of a fall-back hour is not offered again on the second leg
+        # (comparisons between datetimes sharing a tzinfo ignore ``fold``,
+        # which is why the civil answer alone can come out negative).
+        now_utc = now.astimezone(datetime.timezone.utc)
+        while True:
+            target = self._next_civil(civil)
+            if target is None:
+                return None
+            resolved_utc = target.replace(tzinfo=now.tzinfo).astimezone(
                 datetime.timezone.utc
             )
-            return (target_utc - now).total_seconds()
-        return (target - civil).total_seconds()
+            if resolved_utc > now_utc:
+                return (resolved_utc - now_utc).total_seconds()
+            resolved_civil = resolved_utc.astimezone(now.tzinfo).replace(
+                tzinfo=None
+            )
+            civil = max(target, resolved_civil)
 
     def _next_civil(
         self, civil: datetime.datetime
@@ -838,11 +853,13 @@ class CronTab:
 
         The mirror of :meth:`next`: ``None`` when the schedule has no
         occurrence at or after 1970 (the year column's floor).  For an
-        aware ``now`` the result is true elapsed seconds, with the matching
-        civil instant resolved in ``now``'s own zone (``fold=0``), so a DST
-        change inside the interval is accounted for.  Callers use this to
-        answer "when should the last run have been?" (missed-run and
-        late-run detection) without replaying the schedule forward.
+        aware ``now`` the result is true elapsed seconds since the most
+        recent REAL instant, under the same DST policy as
+        :meth:`occurrences`: a match the spring-forward gap swallows
+        counts once at its shifted label, and a fall-back wall time counts
+        on its first leg only.  Callers use this to answer "when should
+        the last run have been?" (missed-run and late-run detection)
+        without replaying the schedule forward themselves.
         """
         if now is None:
             if default_utc:
@@ -852,15 +869,42 @@ class CronTab:
             else:
                 now = datetime.datetime.now()
         civil = now.replace(tzinfo=None)
-        target = self._prev_civil(civil)
-        if target is None:
-            return None
-        if now.tzinfo is not None:
-            target_utc = target.replace(tzinfo=now.tzinfo).astimezone(
-                datetime.timezone.utc
+        if now.tzinfo is None:
+            target = self._prev_civil(civil)
+            if target is None:
+                return None
+            return (civil - target).total_seconds()
+        # Aware: seconds since the last REAL instant, i.e. the final
+        # :meth:`occurrences` yield strictly before ``now``.  A backward
+        # civil scan alone goes wrong at DST edges: a match inside the
+        # spring-forward gap resolves FORWARD, possibly past ``now``, and
+        # when ``now`` sits on the second leg of a fall-back hour the most
+        # recent fire lives at a LATER civil label than ``now``'s.  So
+        # walk back to a match whose label the zone leaves in place, then
+        # replay the forward iterator (the fire policy itself) from there
+        # and keep the last instant before ``now``.
+        tz = now.tzinfo
+        utc = datetime.timezone.utc
+        now_utc = now.astimezone(utc)
+        anchor = self._prev_civil(civil)
+        while anchor is not None:
+            resolved = (
+                anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)
             )
-            return (now - target_utc).total_seconds()
-        return (civil - target).total_seconds()
+            if resolved.replace(tzinfo=None) == anchor:
+                last: Optional[datetime.datetime] = None
+                start = (anchor - datetime.timedelta(seconds=1)).replace(
+                    tzinfo=tz
+                )
+                for instant in self.occurrences(start):
+                    instant_utc = instant.astimezone(utc)
+                    if instant_utc >= now_utc:
+                        break
+                    last = instant_utc
+                if last is not None:
+                    return (now_utc - last).total_seconds()
+            anchor = self._prev_civil(anchor)
+        return None
 
     def _prev_civil(
         self, civil: datetime.datetime
