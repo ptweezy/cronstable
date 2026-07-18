@@ -17,6 +17,13 @@ they say (level ``"warning"``) or behave in a way worth knowing about
 (level ``"note"``).  Config loading logs the findings per job and the
 status payloads carry them to the dashboards.
 
+:func:`why_no_run` is the linter's sibling for one instant instead of
+the whole schedule: it decomposes the engine's own :meth:`CronTab.test`
+into a per-field verdict ("minute matched; day-of-week Tuesday is not in
+Monday and Friday"), so "why didn't it run at 09:00?" gets answered from
+ground truth.  The daemon serves it per job as ``GET /schedule/why`` and
+the MCP server as the ``cron_why_no_run`` tool.
+
 The fleet-level analyzers live here too, one :class:`ScheduleEntry` row
 per scheduled job: :func:`schedule_pressure` (every fire over the next
 24 hours, bucketed into an hour by minute collision grid),
@@ -28,6 +35,7 @@ job).  The daemon serves them as ``GET /schedule/pressure``,
 same payloads locally from its ``/jobs`` snapshot.
 """
 
+import calendar
 import datetime
 import itertools
 import re
@@ -35,6 +43,7 @@ from collections import Counter
 from typing import (
     Any,
     Dict,
+    Iterable,
     List,
     NamedTuple,
     Optional,
@@ -55,6 +64,7 @@ __all__ = [
     "pad2",
     "schedule_pressure",
     "suggest_slot",
+    "why_no_run",
 ]
 
 
@@ -792,6 +802,247 @@ def _classify(
     if roundtrip.replace(tzinfo=None, fold=0) == civil:
         return "fold"
     return "gap"
+
+
+# ===================================================================
+#  the no-run explainer
+# ===================================================================
+def _value_runs(
+    values: Iterable[int], names: Optional[Sequence[str]] = None
+) -> List[str]:
+    """Sorted values with consecutive runs collapsed to ``a-b`` ranges.
+
+    ``[1, 2, 3, 7]`` becomes ``["1-3", "7"]``; with ``names`` (the
+    weekday or month table), ``[1, 2, 3, 4, 5]`` becomes
+    ``["Monday-Friday"]``.  Runs of two stay listed ("1", "2"), a range
+    of two would obscure more than it saves.
+    """
+
+    def label(value: int) -> str:
+        return names[value] if names is not None else str(value)
+
+    ordered = sorted(values)
+    runs: List[str] = []
+    i = 0
+    while i < len(ordered):
+        j = i
+        while j + 1 < len(ordered) and ordered[j + 1] == ordered[j] + 1:
+            j += 1
+        if j - i >= 2:
+            runs.append("{}-{}".format(label(ordered[i]), label(ordered[j])))
+        else:
+            runs.extend(label(value) for value in ordered[i : j + 1])
+        i = j + 1
+    return runs
+
+
+def _compact_values(
+    values: Iterable[int], names: Optional[Sequence[str]] = None
+) -> str:
+    """:func:`_value_runs` as prose: "0, 15, 30 and 45", "1-3 and 7"."""
+    return _list_join(_value_runs(values, names))
+
+
+def _allowed_dom(tab: CronTab) -> str:
+    """The day-of-month constraint as prose (explicit days plus ``L``)."""
+    if _FULL_DOM <= tab.days_of_month:
+        return "any"
+    parts = _value_runs(tab.days_of_month)
+    if tab.last_day_of_month:
+        parts.append("the month's last day (L)")
+    return _list_join(parts)
+
+
+def _allowed_dow(tab: CronTab) -> str:
+    """The day-of-week constraint as prose (plain days plus ``L<n>``)."""
+    if _FULL_DOW <= tab.days_of_week:
+        return "any"
+    parts = _value_runs(tab.days_of_week, _DOWN)
+    parts.extend(
+        "the month's last {}".format(_DOWN[dow])
+        for dow in sorted(tab.last_days_of_week)
+    )
+    return _list_join(parts)
+
+
+def why_no_run(
+    tab: CronTab,
+    when: datetime.datetime,
+    timezone: Optional[datetime.tzinfo] = None,
+) -> Dict[str, Any]:
+    """Field-by-field verdict on whether ``tab`` selects the instant
+    ``when``, decomposing exactly what :meth:`CronTab.test` computes.
+
+    ``when`` is a CIVIL wall-clock instant in the schedule's own frame
+    (naive; callers convert an aware timestamp into the job's zone
+    first; microseconds are ignored, as the engine ignores them).  The
+    result is JSON-ready: ``matches`` agrees with ``tab.test(when)`` by
+    construction, ``checks`` holds one row per cron field with the
+    probed ``value``, its human ``label``, the field's accepted values
+    as prose (``allowed``, "any" for an unrestricted field) and whether
+    it ``matched``; ``failed`` lists the failing field names in field
+    order.
+
+    ``notes`` (Finding-shaped dicts) spells out the two semantics that
+    make a no-run or an odd run genuinely surprising: the dialect's
+    day-field AND rule, reported when it is the SOLE blocker (both day
+    fields restricted, exactly one matched, every other field matched:
+    classic Vixie cron fires when EITHER day field matches, so an
+    imported schedule WOULD have run there), and, for a matching wall
+    time probed with a real ``timezone``, a DST transition that skips
+    (the run fires at the shifted label) or repeats it (the run fires on
+    the first occurrence only).
+    """
+    month_end = calendar.monthrange(when.year, when.month)[1]
+    dow = (datetime.date(when.year, when.month, when.day).weekday() + 1) % 7
+    dom_ok = when.day in tab.days_of_month or (
+        tab.last_day_of_month and when.day == month_end
+    )
+    dow_ok = dow in tab.days_of_week or (
+        dow in tab.last_days_of_week and when.day > month_end - 7
+    )
+    checks = [
+        {
+            "field": "second",
+            "value": when.second,
+            "label": str(when.second),
+            "allowed": (
+                "any"
+                if len(tab.seconds) >= 60
+                else _compact_values(tab.seconds)
+            ),
+            "matched": when.second in tab.seconds,
+        },
+        {
+            "field": "minute",
+            "value": when.minute,
+            "label": str(when.minute),
+            "allowed": (
+                "any"
+                if len(tab.minutes) >= 60
+                else _compact_values(tab.minutes)
+            ),
+            "matched": when.minute in tab.minutes,
+        },
+        {
+            "field": "hour",
+            "value": when.hour,
+            "label": str(when.hour),
+            "allowed": (
+                "any" if len(tab.hours) >= 24 else _compact_values(tab.hours)
+            ),
+            "matched": when.hour in tab.hours,
+        },
+        {
+            "field": "day-of-month",
+            "value": when.day,
+            "label": str(when.day),
+            "allowed": _allowed_dom(tab),
+            "matched": dom_ok,
+        },
+        {
+            "field": "month",
+            "value": when.month,
+            "label": _MONTHS[when.month],
+            "allowed": (
+                "any"
+                if len(tab.months) >= 12
+                else _compact_values(tab.months, _MONTHS)
+            ),
+            "matched": when.month in tab.months,
+        },
+        {
+            "field": "day-of-week",
+            "value": dow,
+            "label": _DOWN[dow],
+            "allowed": _allowed_dow(tab),
+            "matched": dow_ok,
+        },
+        {
+            "field": "year",
+            "value": when.year,
+            "label": str(when.year),
+            "allowed": (
+                "any" if tab.years is None else _compact_values(tab.years)
+            ),
+            "matched": tab.years is None or when.year in tab.years,
+        },
+    ]
+    matches = all(check["matched"] for check in checks)
+    notes: List[Finding] = []
+    dom_restricted = not (_FULL_DOM <= tab.days_of_month)
+    dow_restricted = not (_FULL_DOW <= tab.days_of_week)
+    # the "Vixie would have fired" claim is only true when the day-field
+    # AND rule is the SOLE blocker, so every non-day field must match too.
+    others_ok = all(
+        check["matched"]
+        for check in checks
+        if check["field"] not in ("day-of-month", "day-of-week")
+    )
+    if dom_restricted and dow_restricted and dom_ok != dow_ok and others_ok:
+        ok_field, bad_field = (
+            ("day-of-month", "day-of-week")
+            if dom_ok
+            else ("day-of-week", "day-of-month")
+        )
+        notes.append(
+            Finding(
+                "day-fields-and-rule",
+                LEVEL_NOTE,
+                "day-of-month and day-of-week are both restricted and a "
+                "day must satisfy BOTH here: {} matched but {} did not, "
+                "so classic Vixie cron (which fires when either field "
+                "matches) WOULD have run this schedule at this "
+                "instant".format(ok_field, bad_field),
+            )
+        )
+    if (
+        matches
+        and timezone is not None
+        and not isinstance(timezone, datetime.timezone)
+    ):
+        civil = when.replace(microsecond=0)
+        kind = _classify(timezone, civil)
+        if kind == "gap":
+            shifted = (
+                civil.replace(tzinfo=timezone)
+                .astimezone(datetime.timezone.utc)
+                .astimezone(timezone)
+            )
+            notes.append(
+                Finding(
+                    "dst-skipped-time",
+                    LEVEL_NOTE,
+                    "the wall time {} did not exist on {} in {} (clocks "
+                    "jump forward); the scheduler fired once at the "
+                    "shifted wall time {} instead".format(
+                        civil.time().isoformat(),
+                        civil.date().isoformat(),
+                        timezone,
+                        shifted.time().isoformat(),
+                    ),
+                )
+            )
+        elif kind == "fold":
+            notes.append(
+                Finding(
+                    "dst-repeated-time",
+                    LEVEL_NOTE,
+                    "the wall time {} occurred twice on {} in {} (clocks "
+                    "fall back); the schedule fired on the first "
+                    "occurrence only".format(
+                        civil.time().isoformat(),
+                        civil.date().isoformat(),
+                        timezone,
+                    ),
+                )
+            )
+    return {
+        "matches": matches,
+        "checks": checks,
+        "failed": [c["field"] for c in checks if not c["matched"]],
+        "notes": [note._asdict() for note in notes],
+    }
 
 
 # ===================================================================

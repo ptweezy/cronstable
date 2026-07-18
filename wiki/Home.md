@@ -44,6 +44,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Schedule Pressure](Schedule-Pressure): The fleet's forward-looking collision heatmap: every fire over the next 24 hours, bucketed hour by minute, on the API, the dashboard, and the wallboard.
 - [Duplicate Schedule Detection](Duplicate-Schedule-Detection): Groups of jobs whose schedules fire on the identical instants, by the engine's own semantic equality.
 - [Suggest a Slot](Suggest-a-Slot): The least-loaded minute or hour:minute for a new job, recommended from the fleet's real fires.
+- [Why Didn't It Run?](Why-No-Run): Field-by-field explanations of why a job's schedule did or did not select a timestamp, with the nearest real fires and notes on the AND day rule and DST, over the API and MCP.
 - [MCP Server (Model Context Protocol)](MCP): The optional MCP server: `POST /mcp` on the web listeners plus the `cronstable mcp` stdio bridge, with read-only-by-default toolsets so AI agents can observe and, when you opt in, act.
 
 ### Reference and Development

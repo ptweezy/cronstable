@@ -88,6 +88,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
 | `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
 | `GET` | `/schedule/suggest` | `_web_schedule_suggest` | `200` (`400` for a bad `period` or unknown `tz`) |
+| `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
@@ -217,7 +218,9 @@ the whitespace-`normalized` form, the plain-English `description`, the next
 remaining occurrence), and the [schedule linter's](Schedule-Linting)
 findings. For a rejected expression it carries `valid: false` and the
 parser's `error` (including the Quartz dialect hints). `@reboot` returns
-`valid: true, reboot: true` with no fires.
+`valid: true, reboot: true` with no fires. The `cron_validate_schedule`
+and `cron_explain_schedule` [MCP tools](MCP) serve this same payload to
+agents.
 
 ```shell
 $ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&count=2"
@@ -270,6 +273,35 @@ Returns the winning `expression`, its `fires_in_window`, the `busiest`
 slot for contrast, two `alternatives`, and a `hash_hint` naming the
 [`H` spelling](Hashed-Schedules) that spreads jobs without this endpoint.
 See [Suggest a Slot](Suggest-a-Slot).
+
+### `GET /schedule/why`
+
+Explains field by field why one job's schedule did or did not select one
+timestamp, decomposing the same match test the scheduler runs.
+
+Query parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `job` | **Required.** The job name; a DAG's synthetic `dag:<name>` schedule job resolves too. `404` for an unknown name. |
+| `at` | **Required.** An ISO-8601 timestamp. With a UTC offset (`2026-07-14T09:00:00+02:00`, trailing `Z` accepted) it converts into the job's resolved timezone; a naive timestamp reads as wall time there. `400` when missing or unparseable. |
+
+The response carries one `checks` row per cron field (`field`, the
+probed `value` with its human `label`, the field's accepted values as
+prose in `allowed`, and `matched`), the overall `matches` verdict with
+the `failed` field names in field order, and the nearest real
+`previous_fire` / `next_fire` around the probe, computed with the
+scheduler's own occurrence walk in the job's zone. `notes` flags the
+semantics that make an answer genuinely surprising: `day-fields-and-rule`
+(both day fields restricted, exactly one matched, so classic Vixie cron
+would have fired; see [Schedule Linting](Schedule-Linting)) and
+`dst-skipped-time` / `dst-repeated-time` for a matching wall time a DST
+transition skips or repeats. An [`H` schedule](Hashed-Schedules) reports
+its `resolved` spelling and checks against the resolved slots. `@reboot`
+jobs answer `reboot: true` with no checks; a disabled job still explains
+its timetable and reports `enabled: false`. The `cron_why_no_run`
+[MCP tool](MCP) serves the same payload to agents. See
+[Why Didn't It Run?](Why-No-Run) for a walkthrough.
 
 ### `GET /cluster`
 
