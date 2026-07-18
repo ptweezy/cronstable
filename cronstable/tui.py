@@ -195,6 +195,22 @@ def fmt_ago(iso: Optional[str], now: Optional[float] = None) -> str:
     return "%dd ago" % (delta // 86400)
 
 
+def fmt_ago_any(value: Any, now: Optional[float] = None) -> str:
+    """:func:`fmt_ago` over either an ISO string or epoch seconds.
+
+    DAG run documents stamp epoch floats (``createdAt``/``updatedAt``)
+    where job payloads use ISO strings; the age column takes both.
+    """
+    if isinstance(value, bool) or value is None:
+        return "—"
+    if isinstance(value, (int, float)):
+        stamp = datetime.datetime.fromtimestamp(
+            float(value), tz=datetime.timezone.utc
+        ).isoformat()
+        return fmt_ago(stamp, now)
+    return fmt_ago(value, now)
+
+
 def ago_short(iso: Optional[str], now: Optional[float] = None) -> str:
     """Compact age for dense cells: ``42s`` / ``3m`` / ``7h`` / ``2d``."""
     t = parse_iso(iso)
@@ -1112,6 +1128,16 @@ def pad_to(text: str, width: int) -> str:
     return text + " " * (width - w)
 
 
+def oneline(text: Any) -> str:
+    """Collapse whitespace runs (incl. newlines) to single spaces.
+
+    Multi-line job commands are common (``set -eu\\n...``); a literal
+    newline inside a table cell would break the painted row, so cells
+    show the command flattened -- copying still yields the original.
+    """
+    return " ".join(str(text).split())
+
+
 #: C0 controls that must never reach a painted frame (ESC survives for
 #: :func:`rewrite_sgr`; \\r and \\t are handled semantically below).
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
@@ -1779,8 +1805,8 @@ class Api:
             )
         return self._session
 
-    def _headers(self) -> Dict[str, str]:
-        headers = {"Accept": "application/json"}
+    def _headers(self, accept: str = "application/json") -> Dict[str, str]:
+        headers = {"Accept": accept}
         if self.token:
             headers["Authorization"] = "Bearer %s" % self.token
         return headers
@@ -1804,9 +1830,11 @@ class Api:
         import aiohttp
 
         session = await self._ensure()
+        # text/plain, deliberately: /job-set-id content-negotiates and
+        # would answer a JSON Accept with its JSON shape
         async with session.get(
             self.url + path,
-            headers=self._headers(),
+            headers=self._headers(accept="text/plain"),
             timeout=aiohttp.ClientTimeout(total=timeout_s),
         ) as resp:
             if resp.status == 401:
@@ -1924,19 +1952,22 @@ class LogTail:
             self._task = None
 
     async def _run(self) -> None:
-        attempt = 0
+        clear_next = False  # the previous attempt died mid-run
         while True:
             self.ended = None
             self.error = None
-            fresh_attempt = attempt > 0
-            attempt += 1
+            fresh_attempt = clear_next
+            clear_next = False
             try:
                 async for event, payload in self.api.stream(self.path):
                     if event == "line":
                         if fresh_attempt:
-                            # the daemon replays its whole retained
-                            # buffer on every attach: start clean so a
-                            # re-attach doesn't duplicate history
+                            # a mid-run reconnect replays the same run's
+                            # retained buffer: start clean rather than
+                            # duplicate it. A clean end-of-run re-attach
+                            # keeps history instead (the next run's
+                            # buffer is new lines), so runs stack up
+                            # behind their end markers, like the page.
                             self.lines = []
                             fresh_attempt = False
                         self.lines.append(
@@ -1953,6 +1984,10 @@ class LogTail:
                         self._on_change()
                     elif event == "end":
                         self.ended = str(payload.get("reason") or "")
+                        if payload.get("reason") != "no-output":
+                            self.lines.append(
+                                ("meta", "end of run output", time.time())
+                            )
                         self._on_change()
             except asyncio.CancelledError:
                 raise
@@ -1962,6 +1997,7 @@ class LogTail:
                 return
             except Exception as exc:  # noqa: BLE001 - surfaced in-pane
                 self.error = str(exc) or exc.__class__.__name__
+                clear_next = True  # replay would duplicate this run
                 self._on_change()
             if not self.follow:
                 return
@@ -2690,6 +2726,20 @@ class App:
                 if not str(k).startswith("logs/")
             )
         return []
+
+    @staticmethod
+    def _dag_state_color(state: str) -> str:
+        """Theme colour key for a DAG run/task state string."""
+        low = state.lower()
+        if low in ("success", "succeeded", "done"):
+            return "ok"
+        if low in ("failed", "failure", "error"):
+            return "fail"
+        if low in ("running", "launched"):
+            return "run"
+        if low in ("awaiting", "waiting", "queued", "pending", "scheduled"):
+            return "pending"
+        return "dim"
 
     # -- implemented by the mixin layers below (one concrete class,
     #    :class:`TuiApp`; the stubs keep each layer type-checkable) ----
@@ -4223,7 +4273,7 @@ class AppRender(AppKeys):
             elif col == "schedule":
                 cells.append(
                     paint.style(
-                        pad_to(str(job.get("schedule", "")), width),
+                        pad_to(oneline(job.get("schedule", "")), width),
                         "dim",
                         bg=bg,
                     )
@@ -4303,7 +4353,7 @@ class AppRender(AppKeys):
             elif col == "cmd":
                 cells.append(
                     paint.style(
-                        pad_to(str(job.get("command", "")), width),
+                        pad_to(oneline(job.get("command", "")), width),
                         "dim",
                         bg=bg,
                     )
@@ -4405,7 +4455,6 @@ class AppRender(AppKeys):
                         if stale
                         else fmt_in(self.next_run_seconds(job))
                     )
-                spark = sparkline(job.get("history") or [], tile_w - 4)
                 dim_all = stale
                 lines3[0].append(
                     paint.style(
@@ -4421,9 +4470,16 @@ class AppRender(AppKeys):
                         color if not dim_all else "dim",
                     )
                 )
-                lines3[2].append(
-                    paint.style(pad_to("  " + spark, tile_w), "dim")
+                spark_row = "  " + "".join(
+                    paint.style(ch, "dim" if dim_all else ck)
+                    for ch, ck in spark_cells(
+                        job.get("history") or [], tile_w - 4
+                    )
                 )
+                pad_cells = (
+                    tile_w - 2 - min(tile_w - 4, len(job.get("history") or []))
+                )
+                lines3[2].append(spark_row + " " * max(0, pad_cells))
             for triple in lines3:
                 rows.append(cut_to_width(paint.row(" ".join(triple)), cols))
             rows.append(paint.row())
@@ -4889,6 +4945,8 @@ class AppOverlays(AppRender):
                 else dag.get("taskCount", "?")
             )
             sched = str(dag.get("schedule", "") or "manual")
+            latest = dag.get("latestRun") or {}
+            lstate = str(latest.get("state", ""))
             body.append(
                 paint.style(
                     pad_to(" ⧉ %s" % name, 28),
@@ -4902,7 +4960,12 @@ class AppOverlays(AppRender):
                     bg="sel" if selected else None,
                 )
                 + paint.style(
-                    truncate(sched, max(0, width - 46)),
+                    pad_to(lstate, 11),
+                    self._dag_state_color(lstate) if lstate else "dim",
+                    bg="sel" if selected else None,
+                )
+                + paint.style(
+                    truncate(sched, max(0, width - 56)),
                     "dim",
                     bg="sel" if selected else None,
                 )
@@ -5153,7 +5216,9 @@ class AppOverlays(AppRender):
 
     # ---- fleet matrix ------------------------------------------------
     def render_fleet(self, paint: Painter, cols: int, lines: int) -> List[str]:
-        width = min(cols - 4, 110)
+        # no fixed cap: a 9-node matrix needs the room, and the per-node
+        # cell width below already shrinks to fit what the terminal gives
+        width = cols - 4
         data = self.fleet or {}
         body = []
         if not data.get("enabled"):
@@ -5235,9 +5300,15 @@ class AppOverlays(AppRender):
                         "cancelled": "cancelled",
                         "unknown": "unknown",
                     }.get(outcome, "ok")
+                    label = {
+                        "success": "ok",
+                        "failure": "fail",
+                        "cancelled": "cancel",
+                        "unknown": "lost",
+                    }.get(outcome, outcome[:6])
                     text = "%s %s %s" % (
                         paint.glyph(key, ascii_mode),
-                        "ok" if outcome == "success" else outcome[:6],
+                        label,
                         ago_short((cell["last"] or {}).get("finished_at")),
                     )
                     color = {
@@ -5551,6 +5622,9 @@ class AppDrawers(AppOverlays):
         display: List[str] = []
         needle = search.strip().lower()
         for stream, line, when in tail.lines:
+            if stream == "meta":  # inline end-of-run separator
+                display.append(paint.style("  ── %s ──" % line, "dim"))
+                continue
             text = rewrite_sgr(line, self.theme)
             plain = strip_ansi(line)
             prefix = ""
@@ -5575,10 +5649,9 @@ class AppDrawers(AppOverlays):
             display.append(" " + marker + prefix + text)
         if tail.error:
             display.append(paint.style("  ⚠ %s" % tail.error, "fail"))
-        elif tail.ended is not None:
-            reason = (" (%s)" % tail.ended) if tail.ended else ""
+        elif tail.ended == "no-output":
             display.append(
-                paint.style("  ── end of run output%s ──" % reason, "dim")
+                paint.style("  ── end of run output (no-output) ──", "dim")
             )
         max_scroll = max(0, len(display) - available)
         self.log_scroll = min(self.log_scroll, max_scroll)
@@ -5837,19 +5910,6 @@ class AppDrawers(AppOverlays):
             rows.extend(self._dag_logs_tab(paint, width, body_lines))
         return rows
 
-    @staticmethod
-    def _dag_state_color(state: str) -> str:
-        low = state.lower()
-        if low in ("success", "succeeded", "done"):
-            return "ok"
-        if low in ("failed", "failure", "error"):
-            return "fail"
-        if low in ("running", "launched"):
-            return "run"
-        if low in ("awaiting", "waiting", "queued", "pending", "scheduled"):
-            return "pending"
-        return "dim"
-
     def _dag_runs_tab(
         self, paint: Painter, width: int, body_lines: int
     ) -> List[str]:
@@ -5860,7 +5920,11 @@ class AppDrawers(AppOverlays):
             selected = start + idx == self.dag_sel
             run_key = str(run.get("runKey") or run.get("run_key") or "?")
             state = str(run.get("state", "?"))
-            when = run.get("started_at") or run.get("created_at")
+            when = (
+                run.get("started_at")
+                or run.get("createdAt")
+                or run.get("created_at")
+            )
             rows.append(
                 paint.style(
                     pad_to(" " + truncate(run_key, 28), 30),
@@ -5874,7 +5938,7 @@ class AppDrawers(AppOverlays):
                     bg="sel" if selected else None,
                 )
                 + paint.style(
-                    fmt_ago(when) if when else "",
+                    fmt_ago_any(when),
                     "dim",
                     bg="sel" if selected else None,
                 )
@@ -5903,7 +5967,12 @@ class AppDrawers(AppOverlays):
             task_list = []
         if not task_list:
             return [paint.style("  no task metadata", "dim")]
-        by_key = {str(t.get("key") or t.get("name", "")): t for t in task_list}
+        # config entries name a task "id" (see dags_payload); run docs
+        # key their tasks dict by the same string
+        by_key = {
+            str(t.get("id") or t.get("key") or t.get("name", "")): t
+            for t in task_list
+        }
         depth_cache: Dict[str, int] = {}
 
         def depth(key: str, seen: Tuple[str, ...] = ()) -> int:
@@ -5977,11 +6046,18 @@ class AppDrawers(AppOverlays):
             selected = start + idx == self.dag_sel
             key = str(task.get("key", "?"))
             state = str(task.get("state", "?"))
+            # a parked approval gate reports state "running" with an
+            # awaitingApproval flag riding along (see the dagrun docs)
+            awaiting = bool(task.get("awaitingApproval")) or (
+                state.lower() == "awaiting"
+            )
+            if awaiting:
+                state = "awaiting"
             attempts = task.get("attempts") or task.get("attempt")
             extra = ""
             if attempts:
                 extra += " · try %s" % attempts
-            if state.lower() == "awaiting":
+            if awaiting:
                 extra += "  ► a approve · R reject"
             rows.append(
                 paint.style(
@@ -6049,14 +6125,17 @@ class AppDrawers(AppOverlays):
         rows = [paint.style(" task: %s" % tail.label, "dim")]
         display: List[str] = []
         for stream, line, _when in tail.lines:
+            if stream == "meta":
+                display.append(paint.style("  ── end of log ──", "dim"))
+                continue
             marker = paint.style(
                 "▏", "fail" if stream == "stderr" else "border"
             )
             display.append(" " + marker + rewrite_sgr(line, self.theme))
         if tail.error:
             display.append(paint.style("  ⚠ %s" % tail.error, "fail"))
-        elif tail.ended is not None:
-            display.append(paint.style("  ── end of log ──", "dim"))
+        elif tail.ended == "no-output":
+            display.append(paint.style("  ── no output ──", "dim"))
         available = body_lines - 1
         max_scroll = max(0, len(display) - available)
         self.panel_scroll = min(self.panel_scroll, max_scroll)
@@ -6090,17 +6169,9 @@ class AppDrawers(AppOverlays):
         merged: List[Tuple[float, int, str, str, str]] = []
         for idx, tail in enumerate(self.tails):
             for stream, line, when in tail.lines:
+                if stream == "meta":
+                    line = "── %s ──" % line
                 merged.append((when, idx, tail.label, stream, line))
-            if tail.ended is not None:
-                merged.append(
-                    (
-                        time.time(),
-                        idx,
-                        tail.label,
-                        "meta",
-                        "── end of run output ──",
-                    )
-                )
         merged.sort(key=lambda item: item[0])
         available = max(3, lines - 10)
         max_scroll = max(0, len(merged) - available)
