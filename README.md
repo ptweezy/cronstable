@@ -41,6 +41,11 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 * "Crontab" is in YAML format; classic crontab files are accepted as-is too
   (see [Classic crontab files](#classic-crontab-files))
+* Built-in **schedule linting**: dead schedules that can never fire again are
+  called out loudly (never silently dropped), and common footguns — AND day
+  semantics, uneven `*/n` steps, day-31-in-April, schedules that DST skips or
+  repeats — are flagged at config load, in the dashboards, and over the API
+  (see [Schedule linting](#schedule-linting))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
 * Flexible configuration: you decide how to determine if a cron job fails or not
@@ -921,7 +926,7 @@ jobs:
     schedule: "*/5 * * * *"
 ```
 
-The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists and `jan`/`mon` names), parsed by cronstable's built-in cron engine; see [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) for the full dialect.
+The `schedule` option can be a string in the classic crontab format (5, 6 or 7 fields; ranges, steps, lists, `jan`/`mon` names, and Quartz's `?` standing alone in a day field), parsed by cronstable's built-in cron engine; see [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) for the full dialect. Expressions in other dialects (Quartz `#`/`W`, the seconds-first 6-field layout) fail with an error naming the dialect and how to convert.
 Additionally @reboot can be included , which will only run the job when cronstable is initially
 executed. Further `schedule` can be an object with properties.  The following configuration
 runs a command every 5 minutes, but only on the specific date 2017-07-19, and
@@ -938,6 +943,24 @@ jobs:
       year: 2017
       dayOfWeek: "*"
 ```
+
+#### Schedule linting
+
+Every schedule is linted at config load. The linter flags legal expressions
+that probably do not mean what they say: a schedule with **no future
+occurrence** (a fixed past year, `0 0 30 2 *`), day-of-month and day-of-week
+both restricted (a day must match BOTH here, unlike Vixie cron's either),
+`*/n` steps that do not divide their field (`*/7` minutes fires at :56 and
+then :00), day values no selected month is long enough to reach, Feb 29
+schedules that only fire in leap years, and wall times a DST transition in
+the job's timezone skips or repeats. Findings are logged per job at load
+time, served as `schedule_findings` (plus a `never_fires` flag) on the
+`/jobs` and `/status` endpoints, and shown in the dashboards' cron
+sandboxes. A dead schedule stays a loud warning rather than an error, so a
+parked job (`year: "2020"`) cannot fail an upgrade; prefer `enabled: false`
+to say what you mean. `GET /schedule/preview` runs the same
+parse/describe/preview/lint for any expression before it becomes a job.
+See [Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting).
 
 #### Second-level schedules
 
@@ -2008,6 +2031,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 * **Configure it**:
   [Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference) ·
   [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) ·
+  [Schedule Linting](https://github.com/ptweezy/cronstable/wiki/Schedule-Linting) ·
   [Classic Crontabs](https://github.com/ptweezy/cronstable/wiki/Classic-Crontabs) ·
   [Includes and Defaults](https://github.com/ptweezy/cronstable/wiki/Includes-and-Defaults) ·
   [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment) ·

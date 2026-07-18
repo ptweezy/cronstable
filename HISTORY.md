@@ -5,6 +5,58 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.21 (unreleased)
+
+The in-house cron engine grows a safety net and a toolbox.  A schedule that
+can never fire again -- a fixed past year, `0 0 30 2 *` -- used to vanish
+silently: it simply never entered the fire index.  Now it is loud everywhere:
+config load logs a `never-fires` warning, the scheduler warns once when it
+drops the job, `/status` and `/jobs` report `never_fires`, and the dashboards
+badge it.  It stays a warning rather than an error on purpose (a past year is
+also the working idiom for parking a job).
+
+### The schedule linter
+
+- **Advisory findings for legal-but-suspect schedules**, computed by the new
+  shared `cronstable/croninfo.py` and reported identically by config-load
+  logging, `GET /jobs` (`schedule_findings`), the TUI cron sandbox, and the
+  job drawer's schedule tab: `never-fires`,
+  `day-fields-both-restricted` (this dialect's AND rule vs. Vixie's OR, the
+  classic crontab-import surprise), `uneven-step` (`*/7` minutes fires at
+  :56 then :00 four minutes later), `skipped-months` (day 31 never occurs in
+  April), `leap-day-only`, and DST notes (`dst-skipped-time`,
+  `dst-repeated-time`) with the actual transition dates, computed in the
+  job's own timezone.
+
+### One preview to rule them all
+
+- **`GET /schedule/preview`** parses, describes, previews and lints any
+  expression with the daemon's own engine -- the single source of truth
+  behind the sandboxes, so a preview cannot disagree with what the scheduler
+  will do.  `describe_cron`/`next_fires` moved from the TUI into
+  `cronstable/croninfo.py` (the TUI re-exports them) to make that sharing
+  real.
+
+### Engine additions (`cronstable/cronexpr.py`)
+
+- **`CronTab.prev()`**: the backward mirror of `next()` -- seconds since the
+  most recent occurrence strictly before now, for missed-run and late-run
+  reasoning without replaying the schedule forward.
+- **`CronTab.occurrences()`**: iterate the exact instants the scheduler
+  would fire.  Steps through real instants across DST: a spring-forward
+  wall time is yielded once at its shifted label, a fall-back repeat fires
+  its first occurrence only.  `next_fires` previews now ride this iterator.
+- **Read-only field-set properties** (`minutes`, `hours`, `days_of_month`,
+  `last_day_of_month`, `months`, `days_of_week`, `last_days_of_week`,
+  `years`, `seconds`), so tooling works from the engine's ground truth
+  instead of re-parsing expression text.
+- **`?` accepted** standing alone in the day fields (the Quartz spelling of
+  "unrestricted"; a 7-field Quartz expression now parses verbatim), and
+  parse errors that smell of Quartz -- `#`, `W`, the seconds-first 6-field
+  layout -- carry a hint naming the dialect and how to convert.  All 180+
+  golden compatibility vectors against the replaced parse-crontab library
+  still pass byte-for-byte.
+
 ## 1.2.20 (2026-07-17)
 
 This release gives the web dashboard a **terminal twin**: `cronstable tui`

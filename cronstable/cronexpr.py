@@ -3,6 +3,11 @@
 :class:`CronTab` parses the crontab dialect cronstable has always accepted and
 answers the two questions the scheduler asks: "when does this fire next?"
 (:meth:`CronTab.next`) and "does this instant match?" (:meth:`CronTab.test`).
+The tooling around the scheduler gets three more: :meth:`CronTab.prev` (the
+most recent past occurrence), :meth:`CronTab.occurrences` (iterate the exact
+instants the scheduler would fire) and read-only properties exposing the
+parsed field sets, so linters and describers work from ground truth instead
+of re-parsing the text.
 
 It replaces the third-party ``crontab`` (parse-crontab) dependency cronstable
 previously leaned on, moving the one piece of syntax every job depends on
@@ -32,6 +37,12 @@ documentation):
   expand to their classic five-field forms.  ``@reboot`` never reaches this
   parser (the scheduler gives it meaning) and ``@midnight`` is rewritten to
   ``@daily`` by the classic-crontab loader, exactly as before.
+- ``?`` standing alone in day-of-month or day-of-week reads as ``*``: the
+  Quartz spelling of "unrestricted", accepted so a 7-field Quartz expression
+  (whose column layout matches this dialect's) parses verbatim.  Anywhere
+  else ``?`` stays an error, and parse errors whose text smells of Quartz
+  (``#``, ``W``, the seconds-first 6-field layout) carry a hint naming that
+  dialect instead of leaving the user to guess.
 - When day-of-month AND day-of-week are both restricted, a day must satisfy
   BOTH (``0 0 13 * 5`` = Friday the 13th).  This is parse-crontab's rule,
   deliberately preserved (Vixie cron fires on either) so that no existing
@@ -52,10 +63,19 @@ seconds across any UTC-offset change.  Concretely, on a spring-forward day a
 an ambiguous fall-back wall time fires on its first occurrence only.
 :meth:`test` reads the civil fields of the datetime it is handed (aware or
 naive) and ignores microseconds.
+
+:meth:`prev` mirrors :meth:`next` into the past: seconds since the most
+recent occurrence STRICTLY before ``now``, ``None`` when nothing occurs at or
+after 1970 (the year column's floor).  :meth:`occurrences` iterates forward
+and, for an aware start, steps through REAL instants the way the scheduler
+does: a wall time a spring-forward transition skips is yielded once at its
+shifted label, and a repeated fall-back wall time is yielded on its first
+occurrence only, so consumers never see one real instant twice.
 """
 
 import calendar
 import datetime
+import re
 from typing import FrozenSet, Iterator, Mapping, Optional, Set, Tuple
 
 __all__ = ["CronTab"]
@@ -98,6 +118,50 @@ _DOW_NAMES = {
 #: the horizon that makes a never-occurring schedule (Feb 30) come back as
 #: ``None`` instead of looping forever.
 _YEAR_HORIZON = 2099
+
+#: prev() never searches before this year: the year column's own minimum,
+#: the backward mirror of ``_YEAR_HORIZON``.
+_YEAR_FLOOR = 1970
+
+#: a day-field item that is Quartz's nearest-weekday form (``15W``, ``LW``)
+_QUARTZ_W = re.compile(r"(?:l|\d+)w\Z")
+
+
+def _quartz_hint(fields: Tuple[str, ...]) -> Optional[str]:
+    """Extra text for a parse error that smells like Quartz syntax.
+
+    Quartz cron differs from this dialect in the ways users actually trip
+    over: ``#`` (nth weekday), ``W`` (nearest weekday), and a seconds-FIRST
+    6-field layout where this dialect's 6th field is a trailing year.  When
+    a failed expression carries one of those signatures, name the dialect
+    and say what to do, instead of leaving a bare field error.
+    """
+    for field in fields:
+        for item in field.split(","):
+            if "#" in item:
+                return (
+                    "'#' is Quartz's nth-weekday form, which is not "
+                    "supported; 'L<n>' selects the month's last such weekday"
+                )
+            if _QUARTZ_W.match(item):
+                return (
+                    "'W' is Quartz's nearest-weekday form, "
+                    "which is not supported"
+                )
+    if "?" in fields:
+        if len(fields) == 6:
+            return (
+                "this looks like a 6-field Quartz expression (seconds "
+                "first); here the 6th field is a year, so append a "
+                "trailing '*' to read it as second minute hour "
+                "day-of-month month day-of-week year"
+            )
+        return (
+            "'?' is only accepted standing alone in the day-of-month "
+            "and day-of-week fields, where it reads as '*'"
+        )
+    return None
+
 
 # (label, lo, hi, step_end, names): ``hi`` bounds explicit values, while
 # ``step_end`` is the implicit end of star/bare-start expansions.  They only
@@ -313,6 +377,9 @@ class CronTab:
                 "expected 5 to 7 whitespace-separated cron fields "
                 "(or a supported @-nickname), got {}".format(len(fields))
             )
+        # kept for the dialect hint below: the columns as the user wrote
+        # them, before the second/year columns are sliced away.
+        raw_fields = tuple(fields)
         # 5 fields: implicit second 0, any year.  6 fields: a trailing year
         # column.  7 fields: a leading second column as well.
         if len(fields) == 7:
@@ -326,15 +393,30 @@ class CronTab:
                 year_text = None  # matches like an absent column
         else:
             year_text = None
-        self._seconds = _parse_plain(second_text, _SECOND)
-        self._minutes = _parse_plain(fields[0], _MINUTE)
-        self._hours = _parse_plain(fields[1], _HOUR)
-        self._dom, self._dom_last = _parse_dom(fields[2])
-        self._months = _parse_plain(fields[3], _MONTH)
-        self._dow, self._dow_last = _parse_dow(fields[4])
-        self._years: Optional[FrozenSet[int]] = (
-            _parse_plain(year_text, _YEAR) if year_text is not None else None
-        )
+        # Quartz compatibility: '?' standing alone in a day field is that
+        # dialect's "unrestricted", read here as '*'.  Only the day fields:
+        # a '?' anywhere else keeps failing (with a hint), which is what
+        # turns a mis-pasted seconds-first Quartz layout into a clear error
+        # instead of a silently shifted schedule.
+        dom_text = "*" if fields[2] == "?" else fields[2]
+        dow_text = "*" if fields[4] == "?" else fields[4]
+        try:
+            self._seconds = _parse_plain(second_text, _SECOND)
+            self._minutes = _parse_plain(fields[0], _MINUTE)
+            self._hours = _parse_plain(fields[1], _HOUR)
+            self._dom, self._dom_last = _parse_dom(dom_text)
+            self._months = _parse_plain(fields[3], _MONTH)
+            self._dow, self._dow_last = _parse_dow(dow_text)
+            self._years: Optional[FrozenSet[int]] = (
+                _parse_plain(year_text, _YEAR)
+                if year_text is not None
+                else None
+            )
+        except ValueError as err:
+            hint = _quartz_hint(raw_fields)
+            if hint is not None:
+                raise ValueError("{} ({})".format(err, hint)) from None
+            raise
         self._seconds_sorted = tuple(sorted(self._seconds))
         self._minutes_sorted = tuple(sorted(self._minutes))
         self._hours_sorted = tuple(sorted(self._hours))
@@ -369,6 +451,59 @@ class CronTab:
 
     # __eq__ without __hash__ makes instances unhashable, matching the old
     # class; nothing in cronstable keys on a CronTab.
+
+    # ------------------------------------------------------------------
+    # Parsed field sets
+    # ------------------------------------------------------------------
+    # Ground truth for the tooling around the engine (the linter, the
+    # describers, the preview endpoint), which would otherwise have to
+    # re-parse the expression text and could drift from what actually
+    # matches.  Every value is immutable and already normalized.
+
+    @property
+    def seconds(self) -> FrozenSet[int]:
+        """Matching seconds, 0-59 (``{0}`` unless a 7-field form set them)."""
+        return self._seconds
+
+    @property
+    def minutes(self) -> FrozenSet[int]:
+        """Matching minutes, 0-59."""
+        return self._minutes
+
+    @property
+    def hours(self) -> FrozenSet[int]:
+        """Matching hours, 0-23."""
+        return self._hours
+
+    @property
+    def days_of_month(self) -> FrozenSet[int]:
+        """Explicit day-of-month values, 1-31 (a bare ``L`` is separate)."""
+        return self._dom
+
+    @property
+    def last_day_of_month(self) -> bool:
+        """Whether a bare ``L`` also matches each month's final day."""
+        return self._dom_last
+
+    @property
+    def months(self) -> FrozenSet[int]:
+        """Matching months, 1-12."""
+        return self._months
+
+    @property
+    def days_of_week(self) -> FrozenSet[int]:
+        """Matching weekdays, 0-6 with Sunday as 0 (7 already folded)."""
+        return self._dow
+
+    @property
+    def last_days_of_week(self) -> FrozenSet[int]:
+        """Weekdays matched only as the month's LAST such day (``L<n>``)."""
+        return self._dow_last
+
+    @property
+    def years(self) -> Optional[FrozenSet[int]]:
+        """Explicit years, or ``None`` when the column is ``*`` or absent."""
+        return self._years
 
     # ------------------------------------------------------------------
     # Matching
@@ -510,3 +645,172 @@ class CronTab:
                     if second >= at_or_after.second:
                         return datetime.time(hour, minute, second)
         return None
+
+    # ------------------------------------------------------------------
+    # Previous occurrence
+    # ------------------------------------------------------------------
+    def prev(
+        self,
+        now: Optional[datetime.datetime] = None,
+        default_utc: bool = False,
+    ) -> Optional[float]:
+        """Seconds since the most recent occurrence STRICTLY before ``now``.
+
+        The mirror of :meth:`next`: ``None`` when the schedule has no
+        occurrence at or after 1970 (the year column's floor).  For an
+        aware ``now`` the result is true elapsed seconds, with the matching
+        civil instant resolved in ``now``'s own zone (``fold=0``), so a DST
+        change inside the interval is accounted for.  Callers use this to
+        answer "when should the last run have been?" (missed-run and
+        late-run detection) without replaying the schedule forward.
+        """
+        if now is None:
+            if default_utc:
+                now = datetime.datetime.now(datetime.timezone.utc).replace(
+                    tzinfo=None
+                )
+            else:
+                now = datetime.datetime.now()
+        civil = now.replace(tzinfo=None)
+        target = self._prev_civil(civil)
+        if target is None:
+            return None
+        if now.tzinfo is not None:
+            target_utc = target.replace(tzinfo=now.tzinfo).astimezone(
+                datetime.timezone.utc
+            )
+            return (now - target_utc).total_seconds()
+        return (civil - target).total_seconds()
+
+    def _prev_civil(
+        self, civil: datetime.datetime
+    ) -> Optional[datetime.datetime]:
+        """Largest whole-second civil instant strictly before ``civil``."""
+        if civil.microsecond:
+            base = civil.replace(microsecond=0)
+        else:
+            base = civil - datetime.timedelta(seconds=1)
+        year, month, day = base.year, base.month, base.day
+        tod: Optional[datetime.time] = base.time()
+        while year >= _YEAR_FLOOR:
+            years_sorted = self._years_sorted
+            if years_sorted is not None and year not in years_sorted:
+                prev_year = self._prev_in(years_sorted, year)
+                if prev_year is None:
+                    return None
+                year, month, day, tod = prev_year, 12, 31, None
+                continue
+            if month not in self._months:
+                prv = self._prev_in(self._months_sorted, month)
+                if prv is None:
+                    year, month = year - 1, self._months_sorted[-1]
+                else:
+                    month = prv
+                day, tod = 31, None
+                continue
+            month_end = calendar.monthrange(year, month)[1]
+            if day > month_end:
+                day = month_end  # clamp the rollback sentinel into the month
+            while day >= 1:
+                if self._day_matches(year, month, day):
+                    t = self._last_time(tod)
+                    if t is not None:
+                        return datetime.datetime.combine(
+                            datetime.date(year, month, day), t
+                        )
+                day -= 1
+                tod = None
+            month -= 1
+            day, tod = 31, None
+            if month < 1:
+                year, month = year - 1, 12
+        return None
+
+    @staticmethod
+    def _prev_in(ordered: Tuple[int, ...], current: int) -> Optional[int]:
+        """Last element of ``ordered`` less than ``current``."""
+        for value in reversed(ordered):
+            if value < current:
+                return value
+        return None
+
+    def _last_time(
+        self, at_or_before: Optional[datetime.time]
+    ) -> Optional[datetime.time]:
+        """Latest matching time of day, at/before ``at_or_before`` if set."""
+        if at_or_before is None:
+            return datetime.time(
+                self._hours_sorted[-1],
+                self._minutes_sorted[-1],
+                self._seconds_sorted[-1],
+            )
+        for hour in reversed(self._hours_sorted):
+            if hour > at_or_before.hour:
+                continue
+            if hour < at_or_before.hour:
+                return datetime.time(
+                    hour, self._minutes_sorted[-1], self._seconds_sorted[-1]
+                )
+            for minute in reversed(self._minutes_sorted):
+                if minute > at_or_before.minute:
+                    continue
+                if minute < at_or_before.minute:
+                    return datetime.time(
+                        hour, minute, self._seconds_sorted[-1]
+                    )
+                for second in reversed(self._seconds_sorted):
+                    if second <= at_or_before.second:
+                        return datetime.time(hour, minute, second)
+        return None
+
+    # ------------------------------------------------------------------
+    # Occurrence iteration
+    # ------------------------------------------------------------------
+    def occurrences(
+        self,
+        start: Optional[datetime.datetime] = None,
+        default_utc: bool = False,
+    ) -> Iterator[datetime.datetime]:
+        """Yield successive fire instants strictly after ``start``.
+
+        Exactly the instants the scheduler would fire, in order, ending
+        when the schedule has no further occurrence (the 2099 horizon).
+        With an aware ``start`` every yield is an aware datetime in
+        ``start``'s zone and the iteration steps through REAL instants: a
+        wall time a spring-forward transition skips is yielded once at its
+        shifted label (the clock that actually exists at that instant) and
+        a repeated fall-back wall time is yielded on its first occurrence
+        only, so one real instant is never yielded twice.  With a naive
+        ``start`` the yields are civil wall-clock datetimes.
+        ``default_utc`` matters only when ``start`` is omitted, exactly as
+        in :meth:`next`.
+        """
+        if start is None:
+            if default_utc:
+                start = datetime.datetime.now(datetime.timezone.utc).replace(
+                    tzinfo=None
+                )
+            else:
+                start = datetime.datetime.now()
+        tz = start.tzinfo
+        civil = start.replace(tzinfo=None)
+        while True:
+            target = self._next_civil(civil)
+            if target is None:
+                return
+            if tz is None:
+                yield target
+                civil = target
+                continue
+            # Resolve in the zone (fold=0, next()'s rule), then re-render
+            # through UTC: a nonexistent spring-forward wall time comes back
+            # as the label the wall clock actually shows at that instant,
+            # and continuing the civil search from the rendered label steps
+            # past both the skipped hour and a fall-back repeat.
+            resolved = (
+                target.replace(tzinfo=tz)
+                .astimezone(datetime.timezone.utc)
+                .astimezone(tz)
+            )
+            yield resolved
+            civil = resolved.replace(tzinfo=None)

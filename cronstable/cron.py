@@ -29,6 +29,7 @@ from typing import (  # noqa
     Union,
 )
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
     from cronstable.jobapi import JobStateAPI
@@ -55,6 +56,7 @@ from cronstable.config import (
     schedule_object_to_crontab,
 )
 from cronstable.cronexpr import CronTab
+from cronstable.croninfo import describe_cron, lint_schedule, next_fires
 from cronstable.dagrun import DagScheduler
 from cronstable.fingerprint import job_digest, job_set_id
 from cronstable.job import JobOutputStream, JobRetryState, RunningJob
@@ -799,6 +801,10 @@ class Cron:
         # sleeps until the soonest fire and only touches jobs actually due.
         self._next_fire = {}  # type: Dict[str, datetime.datetime]
         self._fire_heap = []  # type: List[tuple[datetime.datetime, str]]
+        # names already warned about a schedule with no future occurrence,
+        # so the seeding pass says it loudly ONCE instead of every minute;
+        # pruned on reload so a changed schedule re-warns if still dead.
+        self._dead_schedules = set()  # type: Set[str]
         # wall-clock minute of the last housekeeping pass (config reload,
         # cluster/web (re)start, logging). Gates that work to once per minute
         # even while a second-level job wakes the loop far more often. run().
@@ -1646,17 +1652,21 @@ class Cron:
             else:
                 crontab = job.schedule  # type: Union[CronTab, str]
                 now = get_now(job.timezone)
-                out.append(
-                    {
-                        "job": name,
-                        "status": "scheduled",
-                        "scheduled_in": (
-                            crontab.next(now=now, default_utc=job.utc)
-                            if isinstance(crontab, CronTab)
-                            else str(crontab)
-                        ),
-                    }
+                scheduled_in = (
+                    crontab.next(now=now, default_utc=job.utc)
+                    if isinstance(crontab, CronTab)
+                    else str(crontab)
                 )
+                row = {
+                    "job": name,
+                    "status": "scheduled",
+                    "scheduled_in": scheduled_in,
+                }  # type: Dict[str, Any]
+                if isinstance(crontab, CronTab) and scheduled_in is None:
+                    # "scheduled" with no instant means NEVER; say so
+                    # instead of leaving a null for consumers to guess at
+                    row["never_fires"] = True
+                out.append(row)
         return out
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
@@ -1675,6 +1685,8 @@ class Cron:
                     )
                 elif jobstat["status"] == "disabled":
                     status = "disabled"
+                elif jobstat.get("never_fires"):
+                    status = "never fires (schedule has no future occurrence)"
                 else:
                     status = "scheduled ({})".format(
                         (
@@ -1692,6 +1704,92 @@ class Cron:
                 text="\n".join(lines),
                 headers=self.web_config.get("headers", None),
             )
+
+    def schedule_preview_payload(
+        self,
+        expr: str,
+        tz_name: Optional[str] = None,
+        count: int = 12,
+    ) -> Dict[str, Any]:
+        """Parse, describe, preview and lint one schedule expression.
+
+        The data behind ``GET /schedule/preview``: the single source of
+        truth for sandboxes, computed by the same engine, describer and
+        linter the scheduler itself runs, so a preview can never disagree
+        with what the daemon will do (the web page's client-side preview is
+        a convenience, not an authority).  Raises ValueError for an unknown
+        timezone name; the handler turns that into a 400.
+        """
+        zone: datetime.tzinfo = datetime.timezone.utc
+        if tz_name:
+            try:
+                zone = ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError, KeyError):
+                raise ValueError(
+                    "unknown timezone: {}".format(tz_name)
+                ) from None
+        text = (expr or "").strip()
+        payload = {
+            "expression": text,
+            "timezone": str(zone),
+        }  # type: Dict[str, Any]
+        if text.lower() == "@reboot":
+            payload.update(
+                {
+                    "valid": True,
+                    "reboot": True,
+                    "description": describe_cron(text),
+                    "fires": [],
+                    "never_fires": False,
+                    "lint": [],
+                }
+            )
+            return payload
+        try:
+            tab = CronTab(text)
+        except (ValueError, KeyError) as err:
+            payload.update({"valid": False, "error": str(err)})
+            return payload
+        fires = next_fires(text, count, tz=zone)
+        payload.update(
+            {
+                "valid": True,
+                "reboot": False,
+                "normalized": str(tab),
+                "description": describe_cron(text),
+                "fires": [when.isoformat() for when in fires],
+                "never_fires": not fires,
+                "lint": [
+                    finding._asdict()
+                    for finding in lint_schedule(text, timezone=zone)
+                ],
+            }
+        )
+        return payload
+
+    async def _web_schedule_preview(
+        self, request: web.Request
+    ) -> web.Response:
+        """Decode an arbitrary expression for the dashboards' sandboxes."""
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        expr = request.query.get("expr", "")
+        if not expr.strip():
+            return web.json_response(
+                {"error": "missing ?expr= query parameter"},
+                status=400,
+                headers=headers,
+            )
+        count = self._web_int_query(request, "count", default=12, lo=1, hi=60)
+        try:
+            payload = self.schedule_preview_payload(
+                expr, request.query.get("tz") or None, count
+            )
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        return web.json_response(payload, headers=headers)
 
     async def start_job_by_name(self, name: str) -> None:
         """Launch a job now (`POST /jobs/{name}/start`, MCP `cron_run_job`).
@@ -1864,6 +1962,18 @@ class Cron:
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).
         scheduled_in = self._scheduled_in(job, bool(running))
+        # a dead schedule's None means NEVER, which the dashboards must be
+        # able to tell apart from the running/disabled Nones above.
+        # Computed from the schedule alone (a running job with a dead
+        # schedule still never fires again).
+        never_fires = (
+            job.enabled
+            and isinstance(job.schedule, CronTab)
+            and job.schedule.next(
+                now=get_now(job.timezone), default_utc=job.utc
+            )
+            is None
+        )
 
         last = self.last_run.get(name)
         last_run = last.to_dict() if last is not None else None
@@ -1902,6 +2012,12 @@ class Cron:
                 if runjob.proc is not None
             ],
             "scheduled_in": scheduled_in,
+            "never_fires": never_fires,
+            # advisory lint from config load (see JobConfig), so the
+            # dashboards can badge footguns without re-deriving them
+            "schedule_findings": [
+                finding._asdict() for finding in job.schedule_findings
+            ],
             "last_run": last_run,
             "history": recent,
         }  # type: Dict[str, Any]
@@ -2749,6 +2865,7 @@ class Cron:
                 web.get("/node", self._web_get_node),
                 web.get("/node/history", self._web_node_history),
                 web.get("/status", self._web_get_status),
+                web.get("/schedule/preview", self._web_schedule_preview),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
                 web.get("/jobs/{name}/resources", self._web_job_resources),
@@ -3948,6 +4065,19 @@ class Cron:
                 nxt = self._compute_next_fire(job, now)
                 if nxt is not None:
                     self._set_next_fire(name, nxt)
+                    self._dead_schedules.discard(name)
+                elif name not in self._dead_schedules:
+                    # without this, a schedule with no future occurrence
+                    # (Feb 30, a past year) would just never enter the fire
+                    # index and vanish without a trace
+                    self._dead_schedules.add(name)
+                    logger.warning(
+                        "job %r: schedule %r has no future occurrence and "
+                        "will NEVER fire; fix the schedule or disable the "
+                        "job (its status reports never_fires)",
+                        name,
+                        schedule_str(job),
+                    )
 
     @staticmethod
     def _same_schedule(a: JobConfig, b: JobConfig) -> bool:
@@ -3991,6 +4121,16 @@ class Cron:
                 or not self._same_schedule(old, job)
             ):
                 del self._next_fire[name]
+        # keep the never-fires warning latch only for jobs whose schedule
+        # survived the reload unchanged; anything removed or edited gets a
+        # fresh chance to warn (or to seed) in _ensure_seeded below
+        self._dead_schedules = {
+            name
+            for name in self._dead_schedules
+            if name in self.cron_jobs
+            and (old := old_jobs.get(name)) is not None
+            and self._same_schedule(old, self.cron_jobs[name])
+        }
         self._ensure_seeded(now)
 
     def _peek_soonest_fire(self) -> Optional[datetime.datetime]:

@@ -108,7 +108,10 @@ Everything an operator drives from the web page:
 - the **state inspector** for the durable store (inventory, document
   namespaces, record streams);
 - the **cron sandbox** (`Ctrl-K` → "Cron sandbox"), evaluating
-  expressions live against the daemon's own engine;
+  expressions live against the daemon's own engine, with the
+  [schedule linter's](Schedule-Linting) advisory findings inline (a
+  job's schedule drawer shows the same findings in the job's own
+  timezone, so DST notes carry real dates);
 - the **wallboard** (`w`) with worst-first tiles, the tally foot, a
   `NO SIGNAL` banner when data goes stale, and the zen screensaver on an
   idle, healthy board;
