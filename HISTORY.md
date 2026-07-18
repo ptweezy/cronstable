@@ -5,6 +5,113 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.20 (2026-07-17)
+
+This release gives the web dashboard a **terminal twin**: `cronstable tui`
+opens the same board in a terminal -- an SSH session, a tmux pane, a box where
+a browser is one window too many.  It is a pure client of the daemon's
+existing HTTP control API (the daemon itself is untouched by this release),
+it adds **zero new dependencies** (the standard library plus the already-core
+`aiohttp`), and it keeps the web page's muscle memory: the shortcut table is
+the same sixteen keys, now enforced by a test that parses the rows out of the
+web page's own source.  The final cut also reflects an adversarial review of
+the whole surface -- the notable outcomes are documented below because they
+are load-bearing guarantees, not incidental polish.
+
+### The terminal dashboard (`cronstable tui`)
+
+- **The whole board makes the trip.** The jobs table (status glyphs,
+  next-fire countdowns, duration sparklines, live CPU/memory chips, the owner
+  column under a spread cluster, filter/sort/status segments); the job drawer
+  with the live **SSE log tail** (search with `n`/`N`, follow/wrap/timestamps
+  toggles, save-to-file), run **history** with success rate and per-run bars,
+  **resources** for monitored jobs, and the **schedule tab**; the fuzzy
+  **command palette**; the **verdict bar**, **incident timeline**, and
+  **mitigate console** with its Markdown writeup; the **multi-tail** merging
+  up to four live logs; the **DAG drawer** (runs, an ASCII task graph,
+  per-task states, approval gates decided with `a`/`R`, XCom, task logs,
+  trigger and backfill); the **cluster panel**, **fleet matrix**, node
+  resources, activity **heatmap**, and next-fire radar; the durable-state
+  inspector; the **cron sandbox**; the **wallboard** with its `NO SIGNAL`
+  banner and zen screensaver; and the BIOS-style **boot self-test**, probing
+  the daemon for real (at most every 12 hours; any key, `--no-boot`, or a
+  settings toggle skips it).
+
+- **The schedule tab cannot disagree with the scheduler.** The next-fire
+  preview runs the daemon's own `CronTab` engine, stepping in absolute time
+  so a window that crosses a DST transition shows the true fire instants (no
+  phantom or hour-shifted entries), and the plain-English description states
+  the engine's deliberate rule that a day must satisfy **both** day-of-month
+  and day-of-week when both are restricted ("on the 13th, and only on
+  Friday") -- the daemon's documented parse-crontab semantics, not standard
+  cron's OR.  An expression the engine would reject (month `13`, weekday `8`)
+  degrades to prose in the sandbox instead of raising.
+
+- **Hostile bytes die before the frame.** A TUI paints raw bytes into the
+  operator's terminal, so everything remote is scrubbed in layers: log
+  content keeps only SGR colour (re-inked per theme) while every other
+  escape family -- CSI with private parameters, OSC (title, clipboard),
+  DCS/SOS/PM/APC strings, single-character escapes like a hard reset, bare
+  trailing ESC -- is stripped; every *other* API-derived string (job and DAG
+  names, node/peer names arriving over cluster gossip, XCom keys, server
+  error text in toasts) passes the same scrub in the text helpers; and the
+  final row assembly drops any non-SGR escape as a last line of defense.  A
+  malicious peer advertising an OSC 52 node name cannot write the operator's
+  clipboard; a job that runs `reset` cannot tear down the board from inside
+  its own log pane.
+
+- **Tails do not repeat themselves.** The daemon replays a finished run's
+  retained buffer on every SSE re-attach, and the stream carries no run
+  identity -- so the tail holds a replay aside until it diverges from what is
+  already on screen: an identical replay that simply ends again is the old
+  run repeated and is dropped whole, while divergence is the next run's
+  output and flushes through (runs stack up behind their end markers, like
+  the page).  Idle re-attaches back off geometrically, so an open drawer on
+  a finished job stops re-downloading its log every five seconds.
+
+- **Responsive from the first frame.** The input and paint loops start
+  before the first data load, boot-probe API calls race the skip key, and
+  every HTTP call carries a bounded connect timeout (with a read timeout
+  above the daemon's SSE keep-alive cadence on streams) -- so against an
+  unreachable daemon the header says "disconnected" and `q`/Ctrl-C work,
+  rather than a blank, un-quittable screen while probes time out.  Manual
+  refresh (`g`, and the refresh after every action or token entry) performs
+  a fetch even with polling paused (`--poll 0`), and Ctrl-K on the wallboard
+  stays inert rather than opening an invisible palette that could fire
+  unseen actions.
+
+- **Same themes, same accessibility, same keys.** The five hues in phosphor
+  (dark) and paper (light) variants, `t`/`T` cycling, the colour-vision-safe
+  remaps, and an `--ascii` glyph mode for limited fonts; preferences persist
+  in a small JSON file (`%APPDATA%\cronstable\tui.json` on Windows,
+  `$XDG_CONFIG_HOME/cronstable/tui.json` elsewhere).  Flags mirror the
+  page's hash routes: `--tv` (the wallboard), `--job NAME` (deep-link a
+  drawer), plus `--url`, `--token`/`--token-env` (default
+  `CRONSTABLE_WEB_TOKEN`; a `401` opens the token prompt, and the token is
+  kept for the session only, never written to the prefs file), `--theme`,
+  `--poll`, `--boot`/`--no-boot`.  Works on Linux, macOS, and Windows (a
+  msvcrt reader thread and VT-mode enablement stand in for termios), and
+  ships in the same package and binaries as the daemon.
+
+- **The CLI stays light.** `cronstable.tui` defers its `aiohttp` import
+  until the app actually starts, so registering the subcommand costs every
+  other `cronstable` invocation nothing.
+
+### Documentation and tests
+
+- **A README section and a Terminal-Dashboard wiki page** (options, every
+  key, the panel tour), with screenshots captured from the real TUI driven
+  against the running grand-tour fleet by a new
+  `docs/screenshots/capture_tui.py`, alongside the web dashboard's existing
+  pipeline.
+
+- **A headless, tty-free test harness** boots the real app against a fake
+  daemon on a loopback port, drives it with a scripted key queue, and
+  asserts on painted frames -- the same suite runs on POSIX CI and a Windows
+  checkout.  The keyboard-parity test extracts the shortcut table from
+  `fillHelp()` in the web page's source (failing loudly if the parse finds
+  nothing), so the two frontends cannot drift apart silently.
+
 ## 1.2.19 (2026-07-17)
 
 A docs-website-and-CI release: no functional changes -- the package, the CLI,

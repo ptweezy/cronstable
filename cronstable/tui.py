@@ -637,7 +637,12 @@ def _field_values(
                 range(lo, end + 1, step)
             )
         for v in values:
-            out.add(0 if (hi == 6 and v == 7) else v)
+            v = 0 if (hi == 6 and v == 7) else v
+            if v < lo or v > hi:
+                # out-of-range values (month 13, dow 8, minute 60) would
+                # index past the name tables below; degrade to prose.
+                raise ValueError("out of range: %s" % part)
+            out.add(v)
     return sorted(out)
 
 
@@ -715,8 +720,11 @@ def describe_cron(expr: str) -> str:
         )
     clauses = []
     if len(day_clauses) == 2:
-        # dom and dow combine with OR when both are restricted (std cron)
-        clauses.append(" or ".join(day_clauses))
+        # dom and dow must BOTH match when both are restricted: the
+        # daemon's engine (cronexpr._day_matches) deliberately keeps
+        # parse-crontab's AND rule -- "0 0 13 * 5" is Friday the 13th --
+        # unlike std cron's OR, so the prose must say so too.
+        clauses.append("%s, and only %s" % (day_clauses[1], day_clauses[0]))
     elif day_clauses:
         clauses.append(day_clauses[0])
     if months is not None:
@@ -847,7 +855,17 @@ def next_fires(
         delay = tab.next(current)
         if delay is None:
             break
-        current = current + datetime.timedelta(seconds=delay)
+        if current.tzinfo is not None:
+            # timedelta on an aware datetime is wall-clock arithmetic:
+            # it does not renormalize across a UTC-offset change, so a
+            # window spanning a DST transition would show phantom or
+            # shifted fires.  Step in absolute time instead.
+            current = (
+                current.astimezone(datetime.timezone.utc)
+                + datetime.timedelta(seconds=delay)
+            ).astimezone(current.tzinfo)
+        else:
+            current = current + datetime.timedelta(seconds=delay)
         out.append(current)
     return out
 
@@ -1077,12 +1095,34 @@ REVERSE = "\x1b[7m"
 #  text measurement + ANSI handling
 # ===================================================================
 _ANSI_RE = re.compile(
-    r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)"
-)  # noqa: E501
+    r"\x1b(?:"
+    r"\[[0-?]*[ -/]*[@-~]"  # CSI, incl. private params < = > (mouse, DEC)
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC (title, clipboard, ...)
+    r"|[PX^_][^\x1b]*(?:\x1b\\)?"  # DCS / SOS / PM / APC strings
+    r"|[ -/]*[0-~]"  # ESC+intermediates+final: RIS, charset, ESC 7/8/M...
+    r"|)"  # a bare or trailing ESC
+)
 
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
+
+
+def scrub_non_sgr(text: str) -> str:
+    """Drop every escape sequence except SGR styling.
+
+    API-derived strings (job and node names arrive from the daemon, and
+    under clustering from *other machines* over gossip) are painted to
+    the live terminal, so anything that could move the cursor, retitle
+    the window, or write the clipboard (OSC 52) must never survive into
+    a frame; the painter's own SGR colours do.
+    """
+    if "\x1b" not in text:
+        return text
+    return _ANSI_RE.sub(
+        lambda m: m.group(0) if _SGR_TOKEN_RE.fullmatch(m.group(0)) else "",
+        text,
+    )
 
 
 def char_width(ch: str) -> int:
@@ -1105,6 +1145,7 @@ def truncate(text: str, width: int, ellipsis: str = "…") -> str:
     """Cut plain text to ``width`` display cells (ellipsis included)."""
     if width <= 0:
         return ""
+    text = scrub_non_sgr(text)
     if text_width(text) <= width:
         return text
     ell_w = text_width(ellipsis)
@@ -1121,6 +1162,7 @@ def truncate(text: str, width: int, ellipsis: str = "…") -> str:
 
 def pad_to(text: str, width: int) -> str:
     """Pad (or truncate) plain text to exactly ``width`` cells."""
+    text = scrub_non_sgr(text)
     w = text_width(text)
     if w > width:
         text = truncate(text, width)
@@ -1134,8 +1176,10 @@ def oneline(text: Any) -> str:
     Multi-line job commands are common (``set -eu\\n...``); a literal
     newline inside a table cell would break the painted row, so cells
     show the command flattened -- copying still yields the original.
+    Escapes and C0 controls are dropped outright: these strings come
+    from the API and carry no legitimate styling of their own.
     """
-    return " ".join(str(text).split())
+    return " ".join(_CTRL_RE.sub("", strip_ansi(str(text))).split())
 
 
 #: C0 controls that must never reach a painted frame (ESC survives for
@@ -1818,7 +1862,11 @@ class Api:
         async with session.get(
             self.url + path,
             headers=self._headers(),
-            timeout=aiohttp.ClientTimeout(total=timeout_s),
+            # a bounded connect keeps an unreachable host (VPN down,
+            # firewall DROP) from eating the whole request budget
+            timeout=aiohttp.ClientTimeout(
+                total=timeout_s, connect=min(3.0, timeout_s)
+            ),
         ) as resp:
             if resp.status == 401:
                 raise Unauthorized()
@@ -1835,7 +1883,9 @@ class Api:
         async with session.get(
             self.url + path,
             headers=self._headers(accept="text/plain"),
-            timeout=aiohttp.ClientTimeout(total=timeout_s),
+            timeout=aiohttp.ClientTimeout(
+                total=timeout_s, connect=min(3.0, timeout_s)
+            ),
         ) as resp:
             if resp.status == 401:
                 raise Unauthorized()
@@ -1878,9 +1928,19 @@ class Api:
         keep-alives, which are skipped).  The caller cancels the iterator
         (closing the response) when its panel closes.
         """
+        import aiohttp
+
         session = await self._ensure()
+        # no total timeout (the stream is held open indefinitely), but a
+        # bounded connect, and a read timeout comfortably above the
+        # daemon's 15s SSE keep-alive ping so a silently dead connection
+        # surfaces as an error instead of freezing the tail forever
         async with session.get(
-            self.url + path, headers=self._headers()
+            self.url + path,
+            headers=self._headers(),
+            timeout=aiohttp.ClientTimeout(
+                total=None, connect=5.0, sock_read=60.0
+            ),
         ) as resp:
             if resp.status == 401:
                 raise Unauthorized()
@@ -1951,44 +2011,97 @@ class LogTail:
             self._task.cancel()
             self._task = None
 
+    def _last_block(self) -> List[Tuple[str, str]]:
+        """The ``(stream, line)`` pairs of the newest run on screen --
+        the entries between the last two end markers."""
+        block: List[Tuple[str, str]] = []
+        for stream, line, _ in reversed(self.lines):
+            if stream == "meta":
+                if not block:
+                    continue  # skip the trailing end marker itself
+                break
+            block.append((stream, line))
+        block.reverse()
+        return block
+
     async def _run(self) -> None:
         clear_next = False  # the previous attempt died mid-run
+        dedupe_next = False  # the previous attempt saw its run end
+        retry = TAIL_RETRY_MS / 1000
         while True:
             self.ended = None
             self.error = None
             fresh_attempt = clear_next
             clear_next = False
+            # After a clean end the daemon replays the *same finished
+            # run's* retained buffer on every re-attach (the stream
+            # carries no run identity), so replayed lines are held
+            # aside until they diverge from the block already on
+            # screen: an identical replay that just ends again is the
+            # old run repeated and is dropped whole, while divergence
+            # is the next run's output and flushes through -- so runs
+            # stack up behind their end markers, like the page.
+            expect = self._last_block() if dedupe_next else []
+            staged: Optional[List[Tuple[str, str, float]]] = (
+                [] if dedupe_next else None
+            )
+            dedupe_next = False
             try:
                 async for event, payload in self.api.stream(self.path):
                     if event == "line":
                         if fresh_attempt:
                             # a mid-run reconnect replays the same run's
                             # retained buffer: start clean rather than
-                            # duplicate it. A clean end-of-run re-attach
-                            # keeps history instead (the next run's
-                            # buffer is new lines), so runs stack up
-                            # behind their end markers, like the page.
+                            # duplicate it.
                             self.lines = []
                             fresh_attempt = False
-                        self.lines.append(
-                            (
-                                str(payload.get("stream", "")),
-                                sanitize_log_line(
-                                    str(payload.get("line", ""))
-                                ),
-                                time.time(),
-                            )
+                        entry = (
+                            str(payload.get("stream", "")),
+                            sanitize_log_line(str(payload.get("line", ""))),
+                            time.time(),
                         )
+                        if staged is not None:
+                            if (
+                                len(staged) < len(expect)
+                                and expect[len(staged)] == entry[:2]
+                            ):
+                                staged.append(entry)
+                                continue
+                            self.lines.extend(staged)  # diverged: new run
+                            staged = None
+                        self.lines.append(entry)
                         if len(self.lines) > self.MAX_LINES:
                             del self.lines[: -self.MAX_LINES]
                         self._on_change()
                     elif event == "end":
                         self.ended = str(payload.get("reason") or "")
-                        if payload.get("reason") != "no-output":
-                            self.lines.append(
-                                ("meta", "end of run output", time.time())
-                            )
-                        self._on_change()
+                        duplicate = staged is not None and len(staged) == len(
+                            expect
+                        )
+                        if staged is not None and not duplicate:
+                            self.lines.extend(staged)
+                        staged = None
+                        dedupe_next = True
+                        # each duplicate replay backs the re-attach off
+                        # (the daemon re-serves the whole retained
+                        # buffer per attach); new output resets it
+                        retry = (
+                            min(retry * 2, 30.0)
+                            if duplicate
+                            else TAIL_RETRY_MS / 1000
+                        )
+                        if not duplicate:
+                            if payload.get("reason") != "no-output":
+                                self.lines.append(
+                                    (
+                                        "meta",
+                                        "end of run output",
+                                        time.time(),
+                                    )
+                                )
+                            if len(self.lines) > self.MAX_LINES:
+                                del self.lines[: -self.MAX_LINES]
+                            self._on_change()
             except asyncio.CancelledError:
                 raise
             except Unauthorized:
@@ -1998,10 +2111,12 @@ class LogTail:
             except Exception as exc:  # noqa: BLE001 - surfaced in-pane
                 self.error = str(exc) or exc.__class__.__name__
                 clear_next = True  # replay would duplicate this run
+                dedupe_next = False
+                retry = TAIL_RETRY_MS / 1000
                 self._on_change()
             if not self.follow:
                 return
-            await asyncio.sleep(TAIL_RETRY_MS / 1000)
+            await asyncio.sleep(retry)
 
 
 # ===================================================================
@@ -2010,10 +2125,11 @@ class LogTail:
 def cut_to_width(row: str, width: int) -> str:
     """Cut an ANSI row string to ``width`` visible cells.
 
-    Escape sequences are copied through verbatim (they occupy no cells),
-    so styling survives the cut; a trailing reset keeps later splices
-    clean.  This is what lets the job drawer sit beside the dimmed table
-    like the web page's right-hand aside.
+    SGR sequences are copied through (they occupy no cells), so styling
+    survives the cut; every other escape is dropped here as the last
+    line of defense before a row reaches the terminal.  A trailing
+    reset keeps later splices clean.  This is what lets the job drawer
+    sit beside the dimmed table like the web page's right-hand aside.
     """
     if width <= 0:
         return RESET
@@ -2023,8 +2139,9 @@ def cut_to_width(row: str, width: int) -> str:
     while idx < len(row) and used < width:
         match = _ANSI_RE.match(row, idx)
         if match:
-            out.append(match.group(0))
-            idx = match.end()
+            if _SGR_TOKEN_RE.fullmatch(match.group(0)):
+                out.append(match.group(0))
+            idx = max(match.end(), idx + 1)
             continue
         ch = row[idx]
         w = char_width(ch)
@@ -2344,7 +2461,9 @@ class App:
         self._dirty_event.set()
 
     def toast(self, kind: str, message: str) -> None:
-        self.toasts.append((kind, message, time.monotonic() + 3.0))
+        # toasts embed job names and server error strings; flatten and
+        # strip escapes so API-derived text cannot reach the tty raw
+        self.toasts.append((kind, oneline(message), time.monotonic() + 3.0))
         self.mark()
 
     def top_overlay(self) -> Optional[str]:
@@ -2434,9 +2553,12 @@ class App:
             )
             if do_boot:
                 await self._boot_sequence()
-            await self._first_load()
-            if self._start_job:
-                self.open_drawer(self._start_job, "logs")
+            # first load runs OFF the critical path: the input and
+            # paint loops are live first, so against an unreachable
+            # daemon the header says "disconnected" and q/Ctrl-C work
+            # instead of freezing a blank, un-quittable screen while
+            # the startup probes time out.
+            startup = asyncio.get_running_loop().create_task(self._startup())
             self._tasks = [
                 asyncio.get_running_loop().create_task(coro)
                 for coro in (
@@ -2449,6 +2571,9 @@ class App:
             done, pending = await asyncio.wait(
                 self._tasks, return_when=asyncio.FIRST_COMPLETED
             )
+            startup.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await startup
             for task in pending:
                 task.cancel()
             for task in done:  # surface a crashed task's traceback
@@ -2471,6 +2596,13 @@ class App:
         self.term.invalidate()
         self.mark()
 
+    async def _startup(self) -> None:
+        """First load plus the ``--job`` deep link, as a background task
+        so the UI is responsive from the first frame."""
+        await self._first_load()
+        if self._start_job:
+            self.open_drawer(self._start_job, "logs")
+
     async def _first_load(self) -> None:
         with contextlib.suppress(Exception):
             self.version = (await self.api.get_text("/version")).strip()
@@ -2486,9 +2618,12 @@ class App:
     async def _poll_loop(self) -> None:
         while not self.quit:
             poll_ms = int(self.prefs["poll_ms"])
-            if poll_ms <= 0:  # paused: wait for a manual refresh
-                self._poll_wakeup.clear()
+            if poll_ms <= 0:  # paused: poll only on a manual refresh
                 await self._poll_wakeup.wait()
+                self._poll_wakeup.clear()
+                if self.quit:
+                    return
+                await self._poll_once()
                 continue
             try:
                 await asyncio.wait_for(
@@ -3430,6 +3565,12 @@ class AppKeys(AppPalette):
             await self._palette_key(key)
             return
         if key in ("ctrl+k", "ctrl+p"):
+            if self.wallboard:
+                # the TV board composes no overlays: an invisible
+                # palette would swallow keys and could fire unseen
+                # actions on Enter, so it stays inert like every
+                # other surface here (leave with w or Esc first)
+                return
             self.open("palette")
             self.inputs["palette"] = ""
             self.palette_sel = 0
@@ -3457,6 +3598,13 @@ class AppKeys(AppPalette):
 
     # ---------------------------------------------------------------
     def _close_topmost(self) -> None:
+        if self.focus == "logsearch":
+            # blur the in-drawer search box first; Esc again closes
+            # the drawer itself (the other inputs live in dedicated
+            # overlays, which close() blurs via INPUT_HOMES)
+            self.focus = None
+            self.mark()
+            return
         for name in ESC_PRIORITY:
             if self.is_open(name):
                 self.close(name)
@@ -3515,7 +3663,10 @@ class AppKeys(AppPalette):
             self.toast("ok", "⚿ token %s" % ("set" if value else "cleared"))
             self.refresh_now()
         elif name == "logsearch":
-            self._log_search_jump(1)
+            # release the input so n/N/f/t/w/d act on the drawer again,
+            # and land on the current (first) match, not the second
+            self.focus = None
+            self._log_search_jump(0)
         elif name == "tailadd":
             self.inputs["tailadd"] = ""
             self.focus = None
@@ -3560,7 +3711,7 @@ class AppKeys(AppPalette):
             self.filter_text = buf
             self.recompute_view()
         if name == "logsearch":
-            self._log_search_recompute()
+            self._log_search_recompute(reset=True)
         self.mark()
 
     # ---------------------------------------------------------------
@@ -3890,9 +4041,17 @@ class AppKeys(AppPalette):
         elif key == "x" and self.drawer_job:
             await self.cancel_job(self.drawer_job)
 
-    def _log_search_recompute(self) -> None:
+    def _log_search_recompute(self, reset: bool = False) -> None:
+        """Rebuild the match list; keep the cursor on its match unless
+        ``reset`` (the needle changed) -- resetting on every repaint or
+        jump would pin n/N to the same match forever."""
         needle = self.inputs["logsearch"].strip().lower()
         tail = self.log_tail
+        prev: Optional[int] = None
+        if not reset and self.log_matches:
+            prev = self.log_matches[
+                min(self.log_match_idx, len(self.log_matches) - 1)
+            ]
         self.log_matches = []
         self.log_match_idx = 0
         if not needle or tail is None:
@@ -3900,6 +4059,13 @@ class AppKeys(AppPalette):
         for idx, (_, line, _) in enumerate(tail.lines):
             if needle in strip_ansi(line).lower():
                 self.log_matches.append(idx)
+        if prev is not None and self.log_matches:
+            for pos, line_idx in enumerate(self.log_matches):
+                if line_idx >= prev:
+                    self.log_match_idx = pos
+                    break
+            else:
+                self.log_match_idx = len(self.log_matches) - 1
 
     def _log_search_jump(self, step: int) -> None:
         self._log_search_recompute()
@@ -6257,7 +6423,9 @@ class TuiApp(AppDrawers):
             ok = True
             version = ""
             try:
-                version = (await self.api.get_text("/version")).strip()
+                version = (
+                    await _race_skip(self.api.get_text("/version"), skip, "")
+                ).strip()
             except Unauthorized:
                 version = "locked (token needed)"
             except Exception:  # noqa: BLE001 - reported on the line
@@ -6281,12 +6449,16 @@ class TuiApp(AppDrawers):
                 return
             jobs: List[Dict[str, Any]] = []
             with contextlib.suppress(Exception):
-                data = await self.api.get_json("/jobs")
+                data = await _race_skip(self.api.get_json("/jobs"), skip, None)
                 if isinstance(data, list):
                     jobs = data
             job_set = ""
             with contextlib.suppress(Exception):
-                job_set = (await self.api.get_text("/job-set-id")).strip()[:12]
+                job_set = (
+                    await _race_skip(
+                        self.api.get_text("/job-set-id"), skip, ""
+                    )
+                ).strip()[:12]
             push()
             if await type_line(
                 " job set ..... %d job%s%s"
@@ -6316,7 +6488,9 @@ class TuiApp(AppDrawers):
                 return
             cluster_line = "standalone"
             with contextlib.suppress(Exception):
-                cluster = await self.api.get_json("/cluster")
+                cluster = await _race_skip(
+                    self.api.get_json("/cluster"), skip, {}
+                )
                 if cluster.get("enabled"):
                     cluster_line = "%s · %s" % (
                         cluster.get("backend", "gossip"),
@@ -6356,6 +6530,23 @@ class TuiApp(AppDrawers):
 # ===================================================================
 #  CLI plumbing (registered from cronstable.__main__, mcpcli-style)
 # ===================================================================
+async def _race_skip(
+    coro: Coroutine[Any, Any, Any],
+    skip: "asyncio.Task[Any]",
+    default: Any,
+) -> Any:
+    """Await a boot-probe API call, but let the skip key win the race --
+    a hung daemon must not hold the keyboard hostage during boot."""
+    task = asyncio.get_running_loop().create_task(coro)
+    await asyncio.wait({task, skip}, return_when=asyncio.FIRST_COMPLETED)
+    if not task.done():
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        return default
+    return task.result()
+
+
 def add_tui_command(sub: Any) -> None:
     """Attach the ``tui`` subcommand to the root parser's subparsers."""
     parser = sub.add_parser(
