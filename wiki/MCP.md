@@ -86,14 +86,19 @@ uneven. Resources are an optimization, never the only path.
 
 ### Prompts (canned triage playbooks)
 
-Enabled by default (`prompts: true`). Slash-command workflows that chain the
-read tools:
+Enabled by default (`prompts: true`), and scoped by the same toolsets as
+resources. Slash-command workflows that chain the read tools:
 
 - `triage_job_failure(job)`: root-cause a failing job
-- `why_did_dag_run_fail(dag, run_key)`: walk a failed DAG run
+- `why_did_dag_run_fail(dag, run_key)`: walk a failed DAG run (needs the
+  `dags` toolset)
 - `blast_radius(target)`: scope what else is at risk
 - `fleet_health_summary()`: a wallboard-style digest
 - `backfill_plan(dag, from, to)`: reason about a backfill before running it
+  (needs the `dags` toolset)
+
+With the default `toolsets: [observe]`, only the three `observe` prompts are
+served.
 
 ## Wiring a client to it
 
@@ -140,6 +145,11 @@ ops tool. Flags:
 - `--url` (default `http://127.0.0.1:8080`): the daemon's web base URL
 - `--token` / `--token-env`: the bearer token (defaults to the
   `CRONSTABLE_WEB_TOKEN` env var if set)
+- `--protocol-version`: pin the `MCP-Protocol-Version` header the bridge
+  sends before `initialize` completes (default `2025-11-25`); once
+  `initialize` returns, the bridge adopts the server's negotiated version
+- `--timeout` (default `30.0`): per-request deadline, in seconds, for each
+  forwarded frame
 - `--check`: handshake the endpoint (`initialize` + `tools/list`) and exit,
   a quick "is it wired up?" test
 
@@ -190,6 +200,8 @@ CRONSTABLE_WEB_TOKEN=dev-token \
 - [`mcp` configuration reference](Configuration-Reference#mcp): every field.
 - [HTTP Control API](HTTP-API): the REST endpoints the tools project, and the
   `POST /mcp` entry.
+- [MCP Server Design](MCP-Server-Design): the design document this server was
+  built from, with notes on where the implementation diverged.
 - The [MCP specification](https://modelcontextprotocol.io/specification/2025-11-25)
   and the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector)
   for debugging a server.
