@@ -18,6 +18,7 @@ Each finding has a stable `code`, a `level`, and a one-line `message`. `warning`
 | `leap-day-only` | note | February runs can only match day 29, which exists only in leap years. |
 | `dst-skipped-time` | note | The scheduled wall time falls in a spring-forward gap of the job's timezone (with the actual date, e.g. `2027-03-14` for `America/New_York`). The run is *not* lost: it fires at the shifted wall time. |
 | `dst-repeated-time` | note | The scheduled wall time occurs twice on a fall-back date; the run fires on the first occurrence only. |
+| `hashed-slot` | note | The schedule uses the [`H` hash form](Hashed-Schedules); the note names the exact expression it resolved to for this job, and reminds that renaming the job re-hashes the slot. |
 
 The DST rules need a resolvable zone, so they run only for jobs with an explicit `timezone:` (a fixed-offset frame like UTC never transitions, and the daemon cannot see the DST rules behind a bare local clock). They are also skipped for schedules with unrestricted hours, which fire straight through a transition with nothing to call out.
 

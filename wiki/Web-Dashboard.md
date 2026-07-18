@@ -508,6 +508,24 @@ click a cell or a job name to open that job. It is built by fetching each
 job's [run history](HTTP-API#get-jobsnameruns) (capped and cached in the
 browser), so its horizon is bounded by the daemon's in-memory history.
 
+## Schedule pressure
+
+The **`▥ pressure`** header button (or *Toggle schedule pressure* in the
+palette) adds the forward-looking twin of the activity heatmap: instead of
+what DID run, it shows every fire the fleet WILL attempt over the next 24
+hours, fetched from [`/schedule/pressure`](HTTP-API#get-schedulepressure)
+where the daemon enumerates each schedule with its own engine. The card
+draws the hour-by-minute collision grid (hot cells highlighted), the
+minute-of-hour histogram, the fleet's
+[duplicate-schedule groups](Duplicate-Schedule-Detection) as clickable job
+chips, and [suggest-a-slot](Suggest-a-Slot) buttons whose answer arrives as
+a copy-to-clipboard chip alongside the `H * * * *` hint. A selector switches
+the display zone between UTC and the browser's local zone; the data
+refreshes about once a minute. With the panel enabled, the
+[wallboard](#wallboard--tv-mode) shows a compact pressure strip above the
+tile grid, so the room sees the `:00` stampede before it happens. See
+[Schedule Pressure](Schedule-Pressure).
+
 ## Cron sandbox
 
 *Cron sandbox* in the palette opens a scratchpad for schedule expressions: type

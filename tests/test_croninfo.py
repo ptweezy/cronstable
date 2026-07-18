@@ -235,3 +235,147 @@ def test_next_fires_dst_gap_keeps_the_wall_clock_label():
 
 def test_describe_cron_question_mark_matches_star():
     assert describe_cron("0 12 ? * ?") == describe_cron("0 12 * * *")
+
+
+# ---------------------------------------------------------------------------
+# H threading through the describers and linter
+# ---------------------------------------------------------------------------
+
+
+def test_describe_cron_resolves_h_with_a_key():
+    from cronstable.cronexpr import CronTab
+
+    resolved = CronTab("H H * * *", hash_key="report-gen").resolved_source
+    assert describe_cron("H H * * *", hash_key="report-gen") == (
+        describe_cron(resolved) + " (H slots hashed from the job name)"
+    )
+    # without a key the tolerant fallback stays
+    assert describe_cron("H * * * *").startswith("Custom schedule")
+
+
+def test_lint_hashed_slot_note_and_uneven_h_step():
+    findings = lint_schedule("H * * * *", hash_key="spread")
+    codes = [f.code for f in findings]
+    assert "hashed-slot" in codes
+    note = next(f for f in findings if f.code == "hashed-slot")
+    assert note.level == "note"
+    assert "renaming the job re-hashes" in note.message
+    # H/7 spans the whole minute field like */7, so the uneven-step
+    # warning applies to it too
+    uneven = lint_schedule("H/7 * * * *", hash_key="spread")
+    assert "uneven-step" in [f.code for f in uneven]
+    # a plain schedule with a key gains no hashed-slot note
+    assert "hashed-slot" not in [
+        f.code for f in lint_schedule("*/5 * * * *", hash_key="spread")
+    ]
+
+
+def test_next_fires_uses_the_hash_key():
+    fires = next_fires("H * * * *", 2, tz=_UTC, hash_key="backup-db")
+    assert len(fires) == 2
+    assert fires[0].minute == fires[1].minute
+    assert next_fires("H * * * *", 2, tz=_UTC) == []
+
+
+# ---------------------------------------------------------------------------
+# fleet analyzers: pressure, duplicates, suggest
+# ---------------------------------------------------------------------------
+from cronstable.cronexpr import CronTab  # noqa: E402
+from cronstable.croninfo import (  # noqa: E402
+    ScheduleEntry,
+    duplicate_schedules,
+    schedule_pressure,
+    suggest_slot,
+)
+
+#: aligned to a midnight so every civil label is predictable
+_P_START = datetime.datetime(2026, 7, 20, 0, 0, tzinfo=_UTC)
+
+
+def _entry(name, expr, tz=_UTC, key=None):
+    return ScheduleEntry(name, CronTab(expr, hash_key=key), tz)
+
+
+def test_schedule_pressure_counts_the_herd():
+    entries = [
+        _entry("herd-%02d" % i, "0 * * * *") for i in range(37)
+    ] + [_entry("mid", "30 3 * * *")]
+    payload = schedule_pressure(entries, start=_P_START)
+    # occurrences are strictly after start, and the window end is
+    # exclusive, so an hourly job fires 23 times in an aligned 24h window
+    assert payload["jobs"] == 38
+    assert payload["by_minute_jobs"][0] == 37
+    assert payload["by_minute_fires"][0] == 37 * 23
+    assert payload["grid"][3][30] == 1
+    assert payload["busiest_minute"]["minute"] == 0
+    assert payload["busiest_minute"]["jobs"] == 37
+    # 58 empty minutes: only :00 and :30 see fires
+    assert len(payload["empty_minutes"]) == 58
+    assert 23 not in [payload["busiest_minute"]["minute"]]
+    top = payload["top_cells"][0]
+    assert top["minute"] == 0 and top["fires"] == 37
+    assert len(top["jobs"]) == 10  # capped names
+
+
+def test_schedule_pressure_weighs_subminute_and_frames_timezones():
+    entries = [
+        _entry("ticker", "*/15 30 3 * * * *"),  # 4 fires inside 03:30
+        _entry("ny", "0 0 * * *", tz=ZoneInfo("America/New_York")),
+    ]
+    payload = schedule_pressure(entries, start=_P_START)
+    assert payload["grid"][3][30] == 4
+    # NY midnight in July is 04:00 UTC
+    assert payload["grid"][4][0] == 1
+
+
+def test_duplicate_schedules_semantic_and_tz_aware():
+    entries = [
+        _entry("a", "*/5 * * * *"),
+        _entry("b", "0-59/5 * * * *"),
+        _entry("c", "@hourly"),
+        _entry("d", "0 * * * *"),
+        _entry("e", "0 * * * *", tz=ZoneInfo("America/New_York")),
+        _entry("f", "17 4 * * *"),
+        _entry("hashed", "H * * * *", key="hashed"),
+    ]
+    groups = duplicate_schedules(entries)
+    assert len(groups) == 2
+    exprs = {g["expression"]: g for g in groups}
+    assert exprs["*/5 * * * *"]["jobs"] == ["a", "b"]
+    assert exprs["@hourly"]["jobs"] == ["c", "d"]
+    # e shares d's instants only textually: its zone differs, so it is
+    # NOT a duplicate; f and the hashed job are singletons
+    for g in groups:
+        assert "e" not in g["jobs"]
+    assert groups[0]["count"] == 2
+    assert "description" in groups[0] and groups[0]["description"]
+
+
+def test_suggest_slot_prefers_quiet_minutes_far_from_the_herd():
+    herd = [_entry("h%d" % i, "0 * * * *") for i in range(10)]
+    got = suggest_slot(herd, "hourly", start=_P_START)
+    assert got["minute"] != 0
+    assert got["fires_in_window"] == 0
+    assert got["expression"].endswith(" * * * *")
+    # ties break circularly FARTHEST from the busiest minute (:00 herd)
+    assert got["minute"] == 30
+    assert got["hash_hint"] == "H * * * *"
+    assert len(got["alternatives"]) == 2
+
+
+def test_suggest_slot_daily_and_empty_fleet():
+    empty = suggest_slot([], "hourly", start=_P_START)
+    assert empty["expression"] == "30 * * * *"
+    daily = suggest_slot(
+        [_entry("h%d" % i, "0 0 * * *") for i in range(3)],
+        "daily",
+        start=_P_START,
+    )
+    assert "hour" in daily
+    assert daily["fires_in_window"] == 0
+    assert daily["expression"].split()[2:] == ["*", "*", "*"]
+    assert daily["hash_hint"] == "H H * * *"
+    import pytest
+
+    with pytest.raises(ValueError, match="period"):
+        suggest_slot([], "weekly")
