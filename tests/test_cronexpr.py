@@ -161,3 +161,244 @@ def test_live_differential_against_old_library():
         for dt_s in _G["test_dts"]:
             dt = datetime.datetime.fromisoformat(dt_s)
             assert new_ct.test(dt) is bool(old_ct.test(dt)), (expr, dt_s)
+
+
+# ---------------------------------------------------------------------------
+# prev(): the backward mirror of next()
+# ---------------------------------------------------------------------------
+
+
+def test_prev_basic_and_strictly_before():
+    ct = CronTab("30 9 * * *")
+    ago = ct.prev(
+        now=datetime.datetime(2026, 7, 18, 12, 0), default_utc=True
+    )
+    assert ago == 2.5 * 3600
+    # an instant that matches "now" yields the PREVIOUS occurrence, the
+    # mirror of next()'s strictly-future rule
+    ago = ct.prev(now=datetime.datetime(2026, 7, 18, 9, 30), default_utc=True)
+    assert ago == 86400.0
+
+
+def test_prev_microseconds_round_toward_the_match():
+    ct = CronTab("* * * * *")
+    # 12:00:00.5 is strictly after 12:00:00, so :00 is the previous match
+    ago = ct.prev(
+        now=datetime.datetime(2026, 7, 18, 12, 0, 0, 500000),
+        default_utc=True,
+    )
+    assert ago == 0.5
+
+
+def test_prev_none_when_nothing_earlier():
+    assert (
+        CronTab("0 0 1 1 * 2030").prev(
+            now=datetime.datetime(2026, 1, 1), default_utc=True
+        )
+        is None
+    )
+    # nothing strictly before the 1970 floor
+    assert (
+        CronTab("* * * * *").prev(
+            now=datetime.datetime(1970, 1, 1, 0, 0, 0), default_utc=True
+        )
+        is None
+    )
+
+
+def test_prev_past_year_column_is_reachable():
+    ago = CronTab("0 0 1 1 * 2020").prev(
+        now=datetime.datetime(2020, 1, 2), default_utc=True
+    )
+    assert ago == 86400.0
+
+
+def test_prev_aware_returns_true_elapsed_across_fall_back():
+    ny = ZoneInfo("America/New_York")
+    # 2026-11-01: 01:30 EDT fired at 05:30Z; from 03:00 EST (08:00Z) the
+    # civil gap is 1.5h but the true elapsed time is 2.5h
+    ago = CronTab("30 1 * * *").prev(
+        now=datetime.datetime(2026, 11, 1, 3, 0, tzinfo=ny)
+    )
+    assert ago == 2.5 * 3600
+
+
+def test_prev_next_round_trip():
+    ct = CronTab("*/15 2-4 * * mon-fri")
+    now = datetime.datetime(2026, 7, 15, 13, 37, 21)
+    delay = ct.next(now=now, default_utc=True)
+    fire = now + datetime.timedelta(seconds=delay)
+    assert ct.test(fire)
+    # one second past the fire, prev() finds it again
+    ago = ct.prev(
+        now=fire + datetime.timedelta(seconds=1), default_utc=True
+    )
+    assert ago == 1.0
+
+
+# ---------------------------------------------------------------------------
+# occurrences(): iteration that matches the scheduler's own stepping
+# ---------------------------------------------------------------------------
+
+
+def _accumulate(ct, start, count):
+    """The pre-occurrences() algorithm: step an aware now through next()."""
+    fires = []
+    current = start
+    for _ in range(count):
+        delay = ct.next(current)
+        if delay is None:
+            break
+        current = (
+            current.astimezone(datetime.timezone.utc)
+            + datetime.timedelta(seconds=delay)
+        ).astimezone(current.tzinfo)
+        fires.append(current)
+    return fires
+
+
+@pytest.mark.parametrize(
+    "expr",
+    ["*/5 * * * *", "30 2 * * *", "0 0 l * *", "15 14 1 * *", "30 1 * * 0"],
+)
+def test_occurrences_equals_stepping_next_across_dst(expr):
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab(expr)
+    start = datetime.datetime(2026, 3, 1, 12, 0, tzinfo=ny)
+    got = []
+    for when in ct.occurrences(start):
+        got.append(when)
+        if len(got) >= 120:
+            break
+    assert got == _accumulate(ct, start, 120)
+
+
+def test_occurrences_spring_forward_fires_once_at_shifted_label():
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("30 2 * * *")
+    start = datetime.datetime(2026, 3, 7, 12, 0, tzinfo=ny)
+    it = ct.occurrences(start)
+    first, second = next(it), next(it)
+    # 02:30 does not exist on 2026-03-08; the fire lands at 07:30Z, whose
+    # wall label is 03:30 EDT, and the day yields exactly one fire
+    assert first.astimezone(datetime.timezone.utc) == datetime.datetime(
+        2026, 3, 8, 7, 30, tzinfo=datetime.timezone.utc
+    )
+    assert (first.hour, first.minute) == (3, 30)
+    assert second.astimezone(datetime.timezone.utc) == datetime.datetime(
+        2026, 3, 9, 6, 30, tzinfo=datetime.timezone.utc
+    )
+
+
+def test_occurrences_fall_back_first_occurrence_only():
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("30 1 * * *")
+    start = datetime.datetime(2026, 10, 31, 12, 0, tzinfo=ny)
+    it = ct.occurrences(start)
+    first, second = next(it), next(it)
+    utc = datetime.timezone.utc
+    # 01:30 EDT (05:30Z), and NOT again at 01:30 EST (06:30Z); the next
+    # fire is the following day, 25 real hours later
+    assert first.astimezone(utc) == datetime.datetime(
+        2026, 11, 1, 5, 30, tzinfo=utc
+    )
+    assert second.astimezone(utc) == datetime.datetime(
+        2026, 11, 2, 6, 30, tzinfo=utc
+    )
+
+
+def test_occurrences_naive_and_exhaustion():
+    fires = list(
+        CronTab("0 0 1 1 * 2027").occurrences(datetime.datetime(2026, 6, 1))
+    )
+    assert fires == [datetime.datetime(2027, 1, 1)]
+    assert (
+        list(CronTab("0 0 30 2 *").occurrences(datetime.datetime(2026, 6, 1)))
+        == []
+    )
+
+
+def test_occurrences_matches_test_and_is_strictly_future():
+    ct = CronTab("*/20 6,18 * * *")
+    start = datetime.datetime(2026, 7, 18, 6, 0)
+    fires = []
+    for when in ct.occurrences(start):
+        fires.append(when)
+        if len(fires) >= 12:
+            break
+    assert all(ct.test(when) for when in fires)
+    assert fires[0] > start
+    assert fires == sorted(fires)
+
+
+# ---------------------------------------------------------------------------
+# '?' (Quartz) day fields and dialect hints
+# ---------------------------------------------------------------------------
+
+
+def test_question_mark_reads_as_star_in_day_fields():
+    assert CronTab("0 12 ? * ?") == CronTab("0 12 * * *")
+    assert CronTab("0 12 ? * mon") == CronTab("0 12 * * mon")
+    # a 7-field Quartz layout (identical column order) parses verbatim
+    assert CronTab("0 0 12 ? * mon *") == CronTab("0 0 12 * * mon *")
+
+
+def test_question_mark_rejected_outside_day_fields():
+    with pytest.raises(ValueError, match="day-of-month"):
+        CronTab("? 0 * * *")
+    with pytest.raises(ValueError, match="day-of-month"):
+        CronTab("0 ? * * *")
+    # not accepted inside a list either
+    with pytest.raises(ValueError):
+        CronTab("0 0 1,? * *")
+
+
+def test_quartz_six_field_layout_gets_a_conversion_hint():
+    with pytest.raises(ValueError, match="Quartz"):
+        CronTab("0 */5 * * * ?")
+    with pytest.raises(ValueError, match="append a trailing"):
+        CronTab("0 15 10 ? * *")
+
+
+def test_quartz_hash_and_w_keep_raising_with_hints():
+    with pytest.raises(ValueError, match="nth-weekday"):
+        CronTab("0 0 * * 1#2")
+    with pytest.raises(ValueError, match="nearest-weekday"):
+        CronTab("0 0 15w * *")
+    with pytest.raises(ValueError, match="nearest-weekday"):
+        CronTab("0 0 lw * *")
+
+
+def test_weekday_names_do_not_trip_the_w_hint():
+    ct = CronTab("0 0 * * wed")
+    assert ct.days_of_week == frozenset({3})
+    with pytest.raises(ValueError) as excinfo:
+        CronTab("0 0 * * wde")  # a typo, not Quartz
+    assert "Quartz" not in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# introspection properties
+# ---------------------------------------------------------------------------
+
+
+def test_field_set_properties():
+    ct = CronTab("*/15 9-17 1,15,l * mon-fri")
+    assert ct.seconds == frozenset({0})
+    assert ct.minutes == frozenset({0, 15, 30, 45})
+    assert ct.hours == frozenset(range(9, 18))
+    assert ct.days_of_month == frozenset({1, 15})
+    assert ct.last_day_of_month is True
+    assert ct.months == frozenset(range(1, 13))
+    assert ct.days_of_week == frozenset({1, 2, 3, 4, 5})
+    assert ct.last_days_of_week == frozenset()
+    assert ct.years is None
+
+
+def test_field_set_properties_seconds_year_and_l_dow():
+    ct = CronTab("*/10 0 0 * * l5 2027")
+    assert ct.seconds == frozenset({0, 10, 20, 30, 40, 50})
+    assert ct.last_days_of_week == frozenset({5})
+    assert ct.years == frozenset({2027})
+    # 7 (Sunday) folds to 0 in the exposed set, like matching itself
+    assert CronTab("0 0 * * 7").days_of_week == frozenset({0})

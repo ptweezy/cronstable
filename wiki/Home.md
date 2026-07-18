@@ -16,6 +16,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Configuration Reference](Configuration-Reference): The full YAML schema: top-level sections and per-job options.
 - [Classic Crontabs](Classic-Crontabs): Running plain Vixie-style crontab files as-is, how entries map onto cronstable's standard defaults, and the documented deviations from cron.
 - [Schedules and Timezones](Schedules-and-Timezones): Crontab strings, schedule objects, `@reboot`, UTC vs. local, and arbitrary timezones.
+- [Schedule Linting](Schedule-Linting): Advisory findings for legal-but-suspect schedules: dead never-fires schedules, AND day semantics, uneven steps, skipped months, and DST anomalies.
 - [Commands and Environment](Commands-and-Environment): Shell vs. argv commands, environment variables, env files, and per-job user/group.
 - [Output Capturing](Output-Capturing): Capturing stdout/stderr and customizing stream prefixes.
 - [Includes, Defaults, and Multi-File Config](Includes-and-Defaults): Sharing settings via `defaults`, the `include` directive, and multi-file config directories.
