@@ -60,6 +60,12 @@ fire enumeration becomes something you can put on a calendar.
   than ~8x/day summarize into a "background hum" strip under the grid
   instead of flooding it.  The demo mirror carries the full view, and its
   synthetic fleet gained business-day showcase jobs.
+- **The terminal dashboard keeps feature parity**: the same panel under
+  the same palette command ("Toggle week calendar"), terminal-shaped: a
+  seven-day by 24-hour shaded fire grid, a scrollable UTC agenda of the
+  calendar-worthy fires, and the identical background-hum rule, computed
+  locally from the `/jobs` snapshot like the pressure panel, so it works
+  against older daemons too.
 
 The in-house cron engine grows a safety net and a toolbox.  A schedule that
 can never fire again (a fixed past year, `0 0 30 2 *`) used to vanish

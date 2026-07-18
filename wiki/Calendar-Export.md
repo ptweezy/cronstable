@@ -63,6 +63,6 @@ The `◫ week` toolbar button opens a seven-day grid of the same enumeration, st
 - **High-frequency jobs stay out of the grid.** A job firing more than about eight times a day summarizes into the "background hum" strip below the grid, where its cadence reads better than hundreds of sliver chips would; the strip chips open the same drawer.
 - The card header links the fleet `.ics` feed, and each job's drawer Schedule tab links its per-job feed, both token-aware.
 
-The view is a persisted preference like the other dashboard panels, and appears in the command palette as "Toggle week calendar".
+The view is a persisted preference like the other dashboard panels, and appears in the command palette as "Toggle week calendar". The [terminal dashboard](Terminal-Dashboard) carries the same panel under the same palette command: a day-by-hour fire grid, the agenda, and the hum strip, rendered in UTC.
 
 See also: [Web Dashboard](Web-Dashboard), [HTTP Control API](HTTP-API), [Business-Day Schedules](Business-Day-Schedules) for the month-shaped day forms that make these calendars worth watching, [Schedule Pressure](Schedule-Pressure) for the collision view of the same enumeration.
