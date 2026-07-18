@@ -67,6 +67,8 @@ fire enumeration becomes something you can put on a calendar.
   locally from the `/jobs` snapshot like the pressure panel, so it works
   against older daemons too.
 
+## 1.2.21 (2026-07-18)
+
 The in-house cron engine grows a safety net and a toolbox.  A schedule that
 can never fire again (a fixed past year, `0 0 30 2 *`) used to vanish
 silently: it simply never entered the fire index.  Now it is loud everywhere:
