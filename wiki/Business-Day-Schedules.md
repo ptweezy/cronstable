@@ -18,8 +18,6 @@ jobs:
     schedule: "0 6 * * 5#3"       # the third Friday (also spelled fri#3)
 ```
 
-All four are additive extensions: each was a parse error in every earlier release, so no pre-existing schedule changed meaning when they landed. The golden compatibility corpus (`tests/data/cron_golden.json`) pins both halves of that claim: the legacy dialect vector-for-vector, and the extension forms from the current engine's own recorded vectors.
-
 ## The forms
 
 | Form | Field | Meaning |

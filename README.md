@@ -43,9 +43,8 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Classic crontab files](#classic-crontab-files))
 * **Business-day schedules**: `LW` (the month's last weekday), `L-3` (three
   days before month-end), `15W` (the weekday nearest the 15th), and `5#3`
-  (the third Friday) express payroll/billing-style cadences directly, as
-  additive extensions of the classic dialect, so Quartz day expressions
-  largely paste straight in (see the
+  (the third Friday) express payroll/billing-style cadences directly, and
+  Quartz day expressions largely paste straight in (see the
   [Business-Day Schedules](https://github.com/ptweezy/cronstable/wiki/Business-Day-Schedules)
   wiki page)
 * Built-in **schedule linting**: dead schedules that can never fire again are

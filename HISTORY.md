@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## Unreleased
+## 1.2.22 (2026-07-18)
 
 The schedule dialect learns to speak business days, and the scheduler's own
 fire enumeration becomes something you can put on a calendar.
@@ -19,10 +19,9 @@ fire enumeration becomes something you can put on a calendar.
   Sunday 15th to Monday the 16th, flipped inward at the month's edges so the
   fire never leaves the month), `LW` is the month's last weekday, and
   `<d>#<n>` in day-of-week is the month's n-th such weekday (`5#3` = third
-  Friday, the sibling `L5` always wanted).  Every one was a parse error
-  before, so no pre-existing schedule changed meaning; the golden
-  compatibility corpus now pins the extended behavior from the engine's own
-  recorded vectors (flagged `"extension": true`) alongside the legacy ones.
+  Friday, the sibling `L5` always wanted).  The golden compatibility
+  corpus pins the new forms from the engine's own recorded vectors
+  (flagged `"extension": true`) alongside the legacy ones.
 - **Every schedule surface understands them from parsed ground truth**: the
   plain-English describers (server and dashboard), the linter (month
   reachability generalizes: `31W` warns about April, `L-28` in February
