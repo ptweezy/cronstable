@@ -4,7 +4,7 @@ Two layers, mirroring the module's own split:
 
 * pure-logic tests for the ports of the web dashboard's client-side
   brain (health/verdict/fuzzy/describeCron/formatting) and for the
-  terminal plumbing (key decoding, ANSI measurement, themes, prefs) --
+  terminal plumbing (key decoding, ANSI measurement, themes, prefs);
   these must agree with the web page, so several fixtures are lifted
   verbatim from ``cronstable/web/index.html``;
 * end-to-end app tests that boot the real :class:`TuiApp` headless
@@ -248,7 +248,7 @@ def test_describe_cron_common_shapes():
     assert describe_cron("30 * * * *") == "Every hour at :30, every day"
     assert describe_cron("0 0 * * 0") == "At 00:00, on Sunday"
     assert describe_cron("0 12 1 * *") == ("At 12:00, on the 1st of the month")
-    # dom + dow must BOTH match -- the engine's deliberate AND rule
+    # dom + dow must BOTH match: the engine's deliberate AND rule
     # ("0 0 13 * 5" is Friday the 13th), unlike standard cron's OR
     text = describe_cron("0 0 1 * 1")
     assert "on the 1st, and only on Monday" in text
@@ -495,7 +495,7 @@ def test_prefs_roundtrip(tmp_path):
 
 def test_help_overlay_carries_the_web_table():
     """Keyboard parity is the feature: the help overlay must list the
-    web dashboard's shortcut table verbatim -- parsed out of the real
+    web dashboard's shortcut table verbatim, parsed out of the real
     ``fillHelp()`` in ``cronstable/web/index.html``, so a web-side edit
     fails here instead of silently drifting the two frontends apart."""
     import pathlib

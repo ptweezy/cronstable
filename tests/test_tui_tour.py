@@ -1,11 +1,11 @@
 """A full tour of the TUI's surfaces, headless against the fake daemon.
 
 `tests/test_tui.py` covers the ported client logic and the core key
-flows; this module walks every remaining surface — the drawers' four
-tabs, the DAG drawer end to end (runs → tasks → approve → graph → xcom
-→ task logs → backfill), the cluster/fleet/state/heat/radar/node
-panels, mitigate, multi-tail, wallboard + zen, the boot self-test, the
-settings sheet, themes, and the terminal engine's painter — so the
+flows; this module walks every remaining surface (the drawers' four
+tabs, the DAG drawer end to end: runs, tasks, approve, graph, xcom,
+task logs, backfill; the cluster/fleet/state/heat/radar/node panels;
+mitigate, multi-tail, wallboard + zen, the boot self-test, the
+settings sheet, themes, and the terminal engine's painter) so the
 render and dispatch paths that only a live daemon exercised before are
 pinned by tests (they are where the live grand-tour fleet exposed real
 payload-shape bugs).

@@ -3,7 +3,7 @@
 ``cronstable tui`` opens a keyboard-driven control room in the terminal,
 talking to a running daemon over the same HTTP control API the web
 dashboard uses (``GET /jobs``, the SSE log streams, ``POST .../start``,
-and friends -- see the HTTP-API wiki page).  It works against a local or
+and friends; see the HTTP-API wiki page).  It works against a local or
 remote daemon and needs nothing on the daemon side beyond the existing
 ``web:`` listener.
 
@@ -92,7 +92,7 @@ POLL_CHOICES = [1000, 2000, 3000, 5000, 10000, 0]
 DEFAULT_POLL_MS = 3000
 
 #: Failures whose finishes fall inside this window may share a cause
-#: (verdict correlation) -- same constant as the web UI.
+#: (verdict correlation); the same constant as the web UI.
 CORR_WINDOW_MS = 60000
 
 #: Wallboard "NO SIGNAL" floor: data older than max(this, 2 polls) is stale.
@@ -106,7 +106,7 @@ TAIL_RETRY_MS = 5000
 #: The boot self-test replays after this long, like the web page's.
 BOOT_EVERY_S = 12 * 3600
 
-#: Status glyphs -- identical to the web dashboard's GLYPH map, with a
+#: Status glyphs, identical to the web dashboard's GLYPH map, with a
 #: plain-ASCII fallback for terminals/fonts that lack them (--ascii).
 GLYPH = {
     "ok": "●",
@@ -164,7 +164,7 @@ def pad2(n: int) -> str:
 
 
 def fmt_in(sec: Optional[float]) -> str:
-    """``in 42s`` / ``in 3m`` / ``now`` -- the next-fire column."""
+    """``in 42s`` / ``in 3m`` / ``now``: the next-fire column."""
     if sec is None:
         return "—"
     if sec <= 0:
@@ -295,7 +295,7 @@ def utc_clock(now: Optional[float] = None) -> str:
 #  status / health / verdict  (ports of the web page's client logic)
 # ===================================================================
 def health(job: Dict[str, Any]) -> Tuple[str, str]:
-    """``(key, label)`` for a /jobs entry -- the web ``health()`` port."""
+    """``(key, label)`` for a /jobs entry: the web ``health()`` port."""
     if not job.get("enabled"):
         return ("disabled", "Disabled")
     if job.get("running"):
@@ -458,7 +458,7 @@ def verdict_info(
 
 
 def fuzzy(query: str, label: str) -> int:
-    """The palette's fuzzy score -- an exact port of the web ``fuzzy()``.
+    """The palette's fuzzy score, an exact port of the web ``fuzzy()``.
 
     Substring match scores ``100 - index`` (earlier is better), a scattered
     subsequence scores 1, no match scores 0, an empty query scores 1.
@@ -672,7 +672,7 @@ _DOW_NAMES = {
 
 
 def describe_cron(expr: str) -> str:
-    """Plain-English schedule text -- a port of the web ``describeCron``.
+    """Plain-English schedule text, a port of the web ``describeCron``.
 
     Handles the 5-field core plus the 6-/7-field (year / second) forms the
     daemon accepts; anything it cannot phrase degrades to ``Custom
@@ -722,7 +722,7 @@ def describe_cron(expr: str) -> str:
     if len(day_clauses) == 2:
         # dom and dow must BOTH match when both are restricted: the
         # daemon's engine (cronexpr._day_matches) deliberately keeps
-        # parse-crontab's AND rule -- "0 0 13 * 5" is Friday the 13th --
+        # parse-crontab's AND rule ("0 0 13 * 5" is Friday the 13th),
         # unlike std cron's OR, so the prose must say so too.
         clauses.append("%s, and only %s" % (day_clauses[1], day_clauses[0]))
     elif day_clauses:
@@ -834,7 +834,7 @@ def next_fires(
     start: Optional[datetime.datetime] = None,
 ) -> List[datetime.datetime]:
     """The next ``count`` fire times of a schedule, via the daemon's own
-    :class:`CronTab` engine -- so the preview always agrees with what the
+    :class:`CronTab` engine, so the preview always agrees with what the
     scheduler will actually do (unlike the web page, which re-implements
     the arithmetic client-side).  Returns ``[]`` for @reboot or an
     expression the engine rejects.  ``CronTab.next()`` yields seconds
@@ -871,7 +871,7 @@ def next_fires(
 
 
 # ===================================================================
-#  themes -- the web dashboard's ten looks, re-inked in ANSI
+#  themes: the web dashboard's ten looks, re-inked in ANSI
 # ===================================================================
 #: hue -> (dark aka phosphor, light aka paper) palettes.  Each palette is
 #: a flat name->#rrggbb map; the painter turns them into SGR sequences.
@@ -1175,7 +1175,7 @@ def oneline(text: Any) -> str:
 
     Multi-line job commands are common (``set -eu\\n...``); a literal
     newline inside a table cell would break the painted row, so cells
-    show the command flattened -- copying still yields the original.
+    show the command flattened; copying still yields the original.
     Escapes and C0 controls are dropped outright: these strings come
     from the API and carry no legitimate styling of their own.
     """
@@ -1193,7 +1193,7 @@ def sanitize_log_line(line: str) -> str:
     A stray ``\\r`` would yank the cursor to column 1 mid-row (cmd.exe
     jobs emit CRLF; progress bars emit many), so carriage returns get
     log-viewer overwrite semantics: keep the last non-empty segment.
-    Tabs expand, and the remaining C0 controls are dropped -- except
+    Tabs expand, and the remaining C0 controls are dropped, except
     ``ESC``, which :func:`rewrite_sgr` re-inks or strips.
     """
     if "\r" in line:
@@ -1236,7 +1236,7 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
 
     Bold/dim/reset survive; the 16-colour and 256/truecolour foregrounds
     are mapped onto the theme's log palette (background requests are
-    dropped -- the TUI owns the background).  All non-SGR escapes are
+    dropped: the TUI owns the background).  All non-SGR escapes are
     stripped.
     """
 
@@ -1280,7 +1280,7 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
 
 def sparkline(history: List[Dict[str, Any]], width: int = 10) -> str:
     """Recent-run sparkline: bar height = relative duration, one bar per
-    run, oldest first -- the terminal cousin of the web SVG sparkline.
+    run, oldest first (the terminal cousin of the web SVG sparkline).
     Returns a plain string; the caller colours per-bar via
     :func:`spark_cells`.
     """
@@ -1326,7 +1326,7 @@ def spark_cells(
 
 
 # ===================================================================
-#  preferences -- the localStorage analogue (a small JSON file)
+#  preferences: the localStorage analogue (a small JSON file)
 # ===================================================================
 #: Defaults mirror the web page's prefs where they translate to a tty.
 PREF_DEFAULTS: Dict[str, Any] = {
@@ -1397,7 +1397,7 @@ def save_prefs(prefs: Dict[str, Any], path: Optional[str] = None) -> None:
 
 
 # ===================================================================
-#  terminal engine -- raw mode, ANSI painting, key decoding
+#  terminal engine: raw mode, ANSI painting, key decoding
 # ===================================================================
 ALT_SCREEN_ON = "\x1b[?1049h"
 ALT_SCREEN_OFF = "\x1b[?1049l"
@@ -1472,7 +1472,7 @@ class KeyDecoder:
     """Incremental bytes -> key-name decoder for the POSIX byte stream.
 
     Escape sequences may arrive split across reads, and a bare ``Esc``
-    press is only distinguishable from the head of a sequence by time --
+    press is only distinguishable from the head of a sequence by time;
     ``flush_escape()`` is called by the reader after a short quiet gap to
     resolve a pending lone escape.
     """
@@ -1652,7 +1652,7 @@ class Term:
         self._last_rows: List[str] = []
         self._last_size = (0, 0)
 
-    # -- lifecycle -----------------------------------------------------
+    # ---- lifecycle ---------------------------------------------------
     def enter(self) -> None:
         if sys.platform == "win32":  # pragma: no cover - Windows only
             _enable_vt_windows()
@@ -1671,7 +1671,7 @@ class Term:
                 sys.stdin.fileno(), termios.TCSADRAIN, self._saved
             )
 
-    # -- painting ------------------------------------------------------
+    # ---- painting ----------------------------------------------------
     def size(self) -> Tuple[int, int]:
         """``(cols, rows)`` right now."""
         try:
@@ -1708,7 +1708,7 @@ class Term:
         self._last_size = (0, 0)
         self._last_rows = []
 
-    # -- little extras -------------------------------------------------
+    # ---- little extras -----------------------------------------------
     def bell(self) -> None:
         self._write("\x07")
         self.flush()
@@ -1828,7 +1828,7 @@ class Api:
     """Bearer-authenticated JSON/SSE client over the core aiohttp dep.
 
     ``aiohttp`` is imported on first use (not at module import), so the
-    CLI's subcommand registration stays light -- see the module
+    CLI's subcommand registration stays light; see the module
     docstring.  A missing/wrong token surfaces as :class:`Unauthorized`
     exactly where the web page would pop its token modal.
     """
@@ -2012,7 +2012,7 @@ class LogTail:
             self._task = None
 
     def _last_block(self) -> List[Tuple[str, str]]:
-        """The ``(stream, line)`` pairs of the newest run on screen --
+        """The ``(stream, line)`` pairs of the newest run on screen:
         the entries between the last two end markers."""
         block: List[Tuple[str, str]] = []
         for stream, line, _ in reversed(self.lines):
@@ -2039,7 +2039,7 @@ class LogTail:
             # aside until they diverge from the block already on
             # screen: an identical replay that just ends again is the
             # old run repeated and is dropped whole, while divergence
-            # is the next run's output and flushes through -- so runs
+            # is the next run's output and flushes through, so runs
             # stack up behind their end markers, like the page.
             expect = self._last_block() if dedupe_next else []
             staged: Optional[List[Tuple[str, str, float]]] = (
@@ -2164,8 +2164,8 @@ def overlay_center(
 ) -> List[str]:
     """Replace a centered band of ``base`` rows with ``panel`` rows.
 
-    Modal surfaces (palette, help, settings, ...) take whole rows -- the
-    margins are painted with the dimmed ``fill`` style -- which keeps the
+    Modal surfaces (palette, help, settings, ...) take whole rows (the
+    margins are painted with the dimmed ``fill`` style), which keeps the
     compositor trivial and every frame byte-identical for the differ.
     """
     rows = list(base)
@@ -2881,8 +2881,8 @@ class App:
             return "pending"
         return "dim"
 
-    # -- implemented by the mixin layers below (one concrete class,
-    #    :class:`TuiApp`; the stubs keep each layer type-checkable) ----
+    # ---- implemented by the mixin layers below (one concrete class,
+    #      :class:`TuiApp`; the stubs keep each layer type-checkable) ----
     def open_drawer(self, name: str, tab: str = "logs") -> None:
         raise NotImplementedError
 
@@ -2934,7 +2934,7 @@ def _quote(text: str) -> str:
 
 
 # ===================================================================
-#  the application -- actions
+#  the application: actions
 # ===================================================================
 class AppActions(App):
     """Operator actions (run/cancel/theme/palette/...), kept apart from
@@ -3331,11 +3331,11 @@ class AppActions(App):
 
 
 # ===================================================================
-#  the application -- command palette
+#  the application: command palette
 # ===================================================================
 class AppPalette(AppActions):
     def palette_commands(self) -> List[Tuple[str, str, Callable[[], Any]]]:
-        """(icon, label, action) rows -- the page's three command pools.
+        """(icon, label, action) rows: the page's three command pools.
 
         Web-only rows (CRT effects, desktop notifications, UI scale, run
         ledger, columns) have no terminal analogue and are omitted; the
@@ -3547,7 +3547,7 @@ class AppPalette(AppActions):
 
 
 # ===================================================================
-#  the application -- key dispatch (the web keymap, ported)
+#  the application: key dispatch (the web keymap, ported)
 # ===================================================================
 class AppKeys(AppPalette):
     async def handle_key(self, key: str) -> None:
@@ -4043,7 +4043,7 @@ class AppKeys(AppPalette):
 
     def _log_search_recompute(self, reset: bool = False) -> None:
         """Rebuild the match list; keep the cursor on its match unless
-        ``reset`` (the needle changed) -- resetting on every repaint or
+        ``reset`` (the needle changed): resetting on every repaint or
         jump would pin n/N to the same match forever."""
         needle = self.inputs["logsearch"].strip().lower()
         tail = self.log_tail
@@ -4169,7 +4169,7 @@ class AppKeys(AppPalette):
 
 
 # ===================================================================
-#  the application -- rendering, part 1: base screen + wallboard
+#  the application: rendering, part 1 (base screen + wallboard)
 # ===================================================================
 class AppRender(AppKeys):
     def paint(self) -> None:
@@ -4684,7 +4684,7 @@ class AppRender(AppKeys):
 
     def render_zen(self, paint: Painter, cols: int, lines: int) -> List[str]:
         """The calm all-clear field: one breathing dot per job, pulsing
-        on its real next fire -- a terminal read of the web screensaver."""
+        on its real next fire, a terminal read of the web screensaver."""
         rows = [paint.row() for _ in range(lines)]
         now = time.monotonic()
         for job in self.jobs:
@@ -4712,7 +4712,7 @@ class AppRender(AppKeys):
 
 
 # ===================================================================
-#  the application -- rendering, part 2: overlays + drawers
+#  the application: rendering, part 2 (overlays + drawers)
 # ===================================================================
 #: The shared shortcut table (web help overlay), plus terminal extras.
 HELP_ROWS = [
@@ -4922,7 +4922,7 @@ class AppOverlays(AppRender):
         self,
     ) -> List[Tuple[str, Optional[str], str, Any, str, Any]]:
         """(name, finished_at, outcome, exit, reason, duration), newest
-        first -- every job's most recent finish, like the web overlay."""
+        first: every job's most recent finish, like the web overlay."""
         out = []
         for job in self.jobs:
             last = job.get("last_run")
@@ -5673,7 +5673,7 @@ class AppOverlays(AppRender):
 
 
 # ===================================================================
-#  the application -- rendering, part 3: the drawers + multi-tail
+#  the application: rendering, part 3 (the drawers + multi-tail)
 # ===================================================================
 class AppDrawers(AppOverlays):
     def _compose_drawer(
@@ -6380,7 +6380,7 @@ class AppDrawers(AppOverlays):
 
 
 # ===================================================================
-#  the application -- boot self-test + concrete class
+#  the application: boot self-test + concrete class
 # ===================================================================
 class TuiApp(AppDrawers):
     """The concrete application class the CLI (and the tests) drive."""
@@ -6535,7 +6535,7 @@ async def _race_skip(
     skip: "asyncio.Task[Any]",
     default: Any,
 ) -> Any:
-    """Await a boot-probe API call, but let the skip key win the race --
+    """Await a boot-probe API call, but let the skip key win the race:
     a hung daemon must not hold the keyboard hostage during boot."""
     task = asyncio.get_running_loop().create_task(coro)
     await asyncio.wait({task, skip}, return_when=asyncio.FIRST_COMPLETED)
