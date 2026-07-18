@@ -431,6 +431,30 @@ jobs:
       # container. amd64/arm64/i686 run natively and skip this.
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.2.0
+      # Warm pip's cache (downloaded sdists AND the wheels pip built from them)
+      # across runs: the QEMU rows spend most of their wall clock compiling
+      # uvloop and orjson from source (22 + 9 min on riscv64, re-done on every
+      # push), and with the cache mounted pip installs the previously built
+      # wheel in seconds; install_orjson.sh's plain `pip install` then succeeds
+      # without ever invoking RUST_SETUP. Restore and save are split so the
+      # save key can hash the RESOLVED dependency set (.pip-versions.txt,
+      # written inside the container): an unchanged dep set re-saves nothing,
+      # while a new upstream uvloop/orjson/pyinstaller release is source-built
+      # once and re-cached immediately (a plain hashFiles key would already
+      # exist, so the fresh wheel would be dropped and rebuilt under QEMU on
+      # every run until pyproject.toml happened to change). The exact restore
+      # key therefore never matches; the prefix restore-key returning the
+      # NEWEST matching entry is the real lookup. Feature branches read the
+      # caches develop writes (cross-branch restore from the default branch),
+      # so this warms everywhere. The arch + libc flavor live in the key: a
+      # musl-built linux_<arch> wheel must never reach the glibc job.
+      - name: Restore pip cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: pip-${{ matrix.arch }}-musl-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-${{ matrix.arch }}-musl-
       - name: Build binary (Alpine/musl)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -439,6 +463,7 @@ jobs:
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
             -e PIP_RETRIES -e PIP_TIMEOUT \
+            -v "$RUNNER_TEMP/pip-cache:/root/.cache/pip" \
             -v "$PWD:/src" -w /src \
             python:3.14-alpine sh -euc '
               # build-base brings the C toolchain + strip (the spec sets
@@ -465,7 +490,20 @@ jobs:
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: a musl binary on a musl host
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}-musl
+              # Record the resolved dep set for the cache-save key below.
+              # cronstable itself is filtered out: its dev version embeds the
+              # commit sha, which would rotate the key (and re-save the cache)
+              # on every push.
+              pip freeze | grep -v "^cronstable" > .pip-versions.txt
+              # The save step tars the cache as the unprivileged runner user;
+              # everything in here was written by root, so open it up.
+              chmod -R a+rX /root/.cache/pip
             '
+      - name: Save pip cache
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: pip-${{ matrix.arch }}-musl-${{ hashFiles('pyproject.toml', '.pip-versions.txt') }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}-musl
@@ -510,6 +548,18 @@ jobs:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.2.0
+      # Warm pip's cache across runs so the QEMU rows stop re-compiling uvloop
+      # and orjson from source on every push; see the twin steps in
+      # `binaries-musl` for the full design (split restore/save keyed on the
+      # resolved dep set, prefix restore-key as the real lookup, arch + libc
+      # flavor in the key so musl- and glibc-built wheels never cross).
+      - name: Restore pip cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: pip-${{ matrix.arch }}-glibc-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-${{ matrix.arch }}-glibc-
       - name: Build binary (Debian/glibc container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -518,6 +568,7 @@ jobs:
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
             -e PIP_RETRIES -e PIP_TIMEOUT \
+            -v "$RUNNER_TEMP/pip-cache:/root/.cache/pip" \
             -v "$PWD:/src" -w /src \
             python:3.14-slim sh -euc '
               # build-essential brings gcc + strip (the spec sets strip=True);
@@ -546,7 +597,18 @@ jobs:
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+              # Resolved dep set for the cache-save key; cronstable itself is
+              # filtered out (its dev version embeds the commit sha and would
+              # rotate the key on every push). chmod: the save step tars the
+              # cache as the unprivileged runner user, but root wrote it.
+              pip freeze | grep -v "^cronstable" > .pip-versions.txt
+              chmod -R a+rX /root/.cache/pip
             '
+      - name: Save pip cache
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ runner.temp }}/pip-cache
+          key: pip-${{ matrix.arch }}-glibc-${{ hashFiles('pyproject.toml', '.pip-versions.txt') }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}
