@@ -80,11 +80,13 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   read per-job run history on demand
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
   AI agents (Claude, Cursor, VS Code Copilot). An agent can **observe**
-  cronstable, and **control** it when you opt in. It is read-only by default and
-  exposes tools, resources, and triage prompts covering jobs, DAGs, the
-  cluster/fleet, metrics, and durable state. It is served at `POST /mcp` on the
-  web listeners and through a `cronstable mcp` stdio bridge, and is hand-rolled
-  in pure Python with no new dependencies
+  cronstable, **author and debug schedules** with the daemon's own engine
+  (validate/explain an expression, explain field-by-field why a job did not
+  run at a timestamp), and **control** it when you opt in. It is read-only by
+  default and exposes tools, resources, and triage prompts covering jobs,
+  DAGs, the cluster/fleet, metrics, and durable state. It is served at
+  `POST /mcp` on the web listeners and through a `cronstable mcp` stdio
+  bridge, and is hand-rolled in pure Python with no new dependencies
 * Native **Prometheus metrics** at `/metrics` (plus per-job statsd push
   metrics), covering run outcomes, durations, retries, schedules, and cluster
   health (see [Metrics](#metrics))
@@ -1015,6 +1017,22 @@ response includes runners-up and the `H` spelling that would keep future
 jobs spreading themselves. Also available as one-click buttons in the
 pressure card and via the `cron_suggest_slot` MCP tool. See
 [Suggest a Slot](https://github.com/ptweezy/cronstable/wiki/Suggest-a-Slot).
+
+#### Why didn't it run?
+
+`GET /schedule/why?job=<name>&at=<timestamp>` decomposes the scheduler's
+own match test field by field for one job and one instant: "minute
+matched; day-of-week Tuesday is not in Monday and Friday", with each
+field's accepted values rendered as prose, the nearest real fire on each
+side of the timestamp, and notes when the answer is genuinely surprising
+(the day-field AND rule where Vixie cron would have fired, and DST wall
+times that were skipped or repeated). Aware timestamps convert into the
+job's timezone, naive ones read as wall time there, and `@reboot`,
+disabled, hashed-`H` and `dag:<name>` schedules all answer honestly.
+Agents get the same explainer as the `cron_why_no_run` MCP tool,
+alongside `cron_validate_schedule` and `cron_explain_schedule` for
+checking an expression before it becomes a job. See
+[Why Didn't It Run?](https://github.com/ptweezy/cronstable/wiki/Why-No-Run).
 
 #### Second-level schedules
 

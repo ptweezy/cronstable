@@ -599,6 +599,67 @@ async def test_schedule_preview_bad_requests_are_400s():
 
 
 # ---------------------------------------------------------------------------
+# GET /schedule/why: the per-instant no-run explainer
+# ---------------------------------------------------------------------------
+
+_WHY_YAML = """
+jobs:
+  - name: weekday
+    command: echo hi
+    schedule: "0 9 * * mon,fri"
+    utc: true
+dags:
+  - name: pipe
+    schedule: "0 4 * * *"
+    utc: true
+    tasks:
+      - id: a
+        command: 'true'
+"""
+
+
+async def test_schedule_why_explains_a_miss_field_by_field():
+    cron = _cron(_WHY_YAML)
+    resp = await cron._web_schedule_why(
+        Req(query={"job": "weekday", "at": "2026-07-14T09:00:00"})
+    )
+    body = json.loads(resp.text)
+    assert body["matches"] is False
+    assert body["failed"] == ["day-of-week"]
+    dow = body["checks"][5]
+    assert (dow["label"], dow["allowed"]) == ("Tuesday", "Monday and Friday")
+    assert body["previous_fire"] == "2026-07-13T09:00:00+00:00"
+    assert body["next_fire"] == "2026-07-17T09:00:00+00:00"
+    assert body["timezone"] == "UTC"
+
+
+async def test_schedule_why_resolves_dag_schedule_jobs():
+    cron = _cron(_WHY_YAML)
+    resp = await cron._web_schedule_why(
+        Req(query={"job": "dag:pipe", "at": "2026-07-14T04:00:00"})
+    )
+    body = json.loads(resp.text)
+    assert body["job"] == "dag:pipe"
+    assert body["expression"] == "0 4 * * *"
+    assert body["matches"] is True
+
+
+async def test_schedule_why_bad_requests():
+    cron = _cron(_WHY_YAML)
+    resp = await cron._web_schedule_why(Req(query={"job": "weekday"}))
+    assert resp.status == 400
+    resp = await cron._web_schedule_why(
+        Req(query={"job": "weekday", "at": "not-a-time"})
+    )
+    assert resp.status == 400
+    assert "ISO 8601" in json.loads(resp.text)["error"]
+    with pytest.raises(web.HTTPNotFound):
+        await cron._web_schedule_why(
+            Req(query={"job": "ghost", "at": "2026-07-14T09:00:00"})
+        )
+
+
+# ---------------------------------------------------------------------------
 # fleet schedule analysis: /schedule/pressure, /duplicates, /suggest
 # ---------------------------------------------------------------------------
 

@@ -64,6 +64,7 @@ from cronstable.croninfo import (
     next_fires,
     schedule_pressure,
     suggest_slot,
+    why_no_run,
 )
 from cronstable.dagrun import DagScheduler
 from cronstable.fingerprint import job_digest, job_set_id
@@ -1732,6 +1733,28 @@ class Cron:
         except (ZoneInfoNotFoundError, ValueError, KeyError):
             raise ValueError("unknown timezone: {}".format(tz_name)) from None
 
+    @staticmethod
+    def _parse_probe_timestamp(text: str) -> datetime.datetime:
+        """An ``at=`` timestamp as a datetime (aware when it has an offset).
+
+        Accepts ISO 8601 as :func:`datetime.datetime.fromisoformat` does,
+        plus the ubiquitous trailing ``Z`` (which the py310 parser still
+        rejects).  Raises ValueError, with the accepted forms in the
+        message, for anything else; the handlers turn that into a 400.
+        """
+        raw = (text or "").strip()
+        iso = raw
+        if iso.endswith(("Z", "z")):
+            iso = iso[:-1] + "+00:00"
+        try:
+            return datetime.datetime.fromisoformat(iso)
+        except ValueError:
+            raise ValueError(
+                "invalid timestamp {!r}: pass ISO 8601, e.g. "
+                "2026-07-14T09:00, 2026-07-14T09:00:00+02:00 or "
+                "2026-07-14T09:00:00Z".format(raw)
+            ) from None
+
     def schedule_preview_payload(
         self,
         expr: str,
@@ -1822,6 +1845,135 @@ class Cron:
             return web.json_response(
                 {"error": str(err)}, status=400, headers=headers
             )
+        return web.json_response(payload, headers=headers)
+
+    def _job_or_dag_schedule(self, name: str) -> Optional[JobConfig]:
+        """The named job, or a DAG's synthetic ``dag:<name>`` schedule job.
+
+        DAG schedule jobs launch real work on real instants, so "why did
+        this not run?" is as answerable for them as for any job; they are
+        just not in ``cron_jobs``.
+        """
+        job = self.cron_jobs.get(name)
+        if job is not None:
+            return job
+        for dag in self.cron_dags.values():
+            sched = dag.schedule_job
+            if sched is not None and sched.name == name:
+                return sched
+        return None
+
+    def schedule_why_payload(
+        self, name: str, at: str
+    ) -> Optional[Dict[str, Any]]:
+        """Why a job's schedule did (not) select a timestamp
+        (``GET /schedule/why``, MCP ``cron_why_no_run``).
+
+        Decomposes the engine's own match test field by field via
+        :func:`cronstable.croninfo.why_no_run`, in the job's OWN resolved
+        timezone: an aware ``at`` is converted into that zone, a naive one
+        reads as wall time there.  The payload adds the job-level facts an
+        answer needs (``enabled``, the ``@reboot`` case) and the nearest
+        real fire on each side of the probe, from the same occurrence walk
+        the scheduler runs.  Returns ``None`` for an unknown job; raises
+        ValueError for an unparseable timestamp.
+        """
+        job = self._job_or_dag_schedule(name)
+        if job is None:
+            return None
+        zone = job.timezone or datetime.datetime.now().astimezone().tzinfo
+        payload: Dict[str, Any] = {
+            "job": name,
+            "enabled": job.enabled,
+            "timezone": (
+                str(job.timezone) if job.timezone is not None else "local"
+            ),
+            "at": at,
+        }
+        if not isinstance(job.schedule, CronTab):
+            # "@reboot": no timetable exists for any timestamp to match.
+            payload.update(
+                {
+                    "expression": str(job.schedule),
+                    "reboot": True,
+                    "description": describe_cron(str(job.schedule)),
+                    "matches": False,
+                    "checks": [],
+                    "failed": [],
+                    "notes": [
+                        {
+                            "code": "reboot",
+                            "level": "note",
+                            "message": "@reboot runs once when the daemon "
+                            "starts; it never fires on a timetable, so no "
+                            "timestamp can match",
+                        }
+                    ],
+                    "previous_fire": None,
+                    "next_fire": None,
+                }
+            )
+            return payload
+        tab = job.schedule
+        probe = self._parse_probe_timestamp(at)
+        if probe.tzinfo is not None:
+            aware = probe.astimezone(zone)
+            civil = aware.replace(tzinfo=None)
+        else:
+            civil = probe
+            # fold=0, the engine's own rule for resolving a wall time.
+            aware = probe.replace(tzinfo=zone)
+        payload.update(
+            {
+                "expression": str(tab),
+                "reboot": False,
+                "description": describe_cron(str(tab), hash_key=job.name),
+                "at_in_zone": aware.isoformat(),
+            }
+        )
+        if tab.resolved_source != str(tab):
+            payload["resolved"] = tab.resolved_source
+        payload.update(why_no_run(tab, civil, timezone=zone))
+        next_fire = next(iter(tab.occurrences(aware)), None)
+        prev_delta = tab.prev(now=aware)
+        previous_fire = None
+        if prev_delta is not None:
+            fire_utc = aware.astimezone(
+                datetime.timezone.utc
+            ) - datetime.timedelta(seconds=prev_delta)
+            # fires are whole seconds; round away float/microsecond residue
+            # from the elapsed-seconds reconstruction.
+            if fire_utc.microsecond >= 500000:
+                fire_utc += datetime.timedelta(seconds=1)
+            previous_fire = (
+                fire_utc.replace(microsecond=0).astimezone(zone).isoformat()
+            )
+        payload["previous_fire"] = previous_fire
+        payload["next_fire"] = (
+            next_fire.isoformat() if next_fire is not None else None
+        )
+        return payload
+
+    async def _web_schedule_why(self, request: web.Request) -> web.Response:
+        """Explain one job's schedule against one timestamp."""
+        assert self.web_config is not None
+        headers = self.web_config.get("headers", None)
+        name = request.query.get("job", "").strip()
+        at = request.query.get("at", "").strip()
+        if not name or not at:
+            return web.json_response(
+                {"error": "missing ?job= or ?at= query parameter"},
+                status=400,
+                headers=headers,
+            )
+        try:
+            payload = self.schedule_why_payload(name, at)
+        except ValueError as err:
+            return web.json_response(
+                {"error": str(err)}, status=400, headers=headers
+            )
+        if payload is None:
+            raise web.HTTPNotFound()
         return web.json_response(payload, headers=headers)
 
     def _schedule_entries(self) -> List[ScheduleEntry]:
@@ -3127,6 +3279,7 @@ class Cron:
                 web.get("/schedule/pressure", self._web_schedule_pressure),
                 web.get("/schedule/duplicates", self._web_schedule_duplicates),
                 web.get("/schedule/suggest", self._web_schedule_suggest),
+                web.get("/schedule/why", self._web_schedule_why),
                 web.get("/jobs", self._web_list_jobs),
                 web.get("/jobs/{name}/runs", self._web_job_runs),
                 web.get("/jobs/{name}/resources", self._web_job_resources),

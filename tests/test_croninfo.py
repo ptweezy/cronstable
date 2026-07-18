@@ -379,3 +379,180 @@ def test_suggest_slot_daily_and_empty_fleet():
 
     with pytest.raises(ValueError, match="period"):
         suggest_slot([], "weekly")
+
+
+# ---------------------------------------------------------------------------
+# why_no_run: the per-instant, per-field no-run explainer
+# ---------------------------------------------------------------------------
+from cronstable.croninfo import why_no_run  # noqa: E402
+
+
+def _why(expr, when, tz=None, key=None):
+    return why_no_run(CronTab(expr, hash_key=key), when, timezone=tz)
+
+
+def test_why_agrees_with_the_engine_everywhere():
+    # the explainer is a DECOMPOSITION of CronTab.test, so on any instant
+    # its verdict must equal the engine's own answer, bit for bit
+    schedules = [
+        "* * * * *",
+        "0 9 * * mon,fri",
+        "0 0 13 * 5",
+        "*/7 * * * *",
+        "0 0 L * *",
+        "0 12 * * L5",
+        "0 0 1 1 * 2030",
+        "15 0 9 * * mon-fri *",
+        "0 0 29 2 *",
+        "5,10 8-10 1-15 mar,jun 1-5",
+    ]
+    base = datetime.datetime(2026, 1, 1)
+    probes = [
+        base + datetime.timedelta(hours=7 * i, minutes=13 * i % 60)
+        for i in range(300)
+    ] + [
+        datetime.datetime(2028, 2, 29),
+        datetime.datetime(2026, 1, 31, 23, 59, 59),
+        datetime.datetime(2030, 1, 1),
+    ]
+    for expr in schedules:
+        tab = CronTab(expr)
+        for probe in probes:
+            got = why_no_run(tab, probe)
+            assert got["matches"] == tab.test(probe), (expr, probe)
+            assert got["matches"] == (not got["failed"])
+
+
+def test_why_names_the_failing_field():
+    # Tuesday 2026-07-14 against a Monday/Friday schedule: every other
+    # field matched, and the verdict says who did not and what it wanted
+    got = _why("0 9 * * mon,fri", datetime.datetime(2026, 7, 14, 9, 0))
+    assert got["matches"] is False
+    assert got["failed"] == ["day-of-week"]
+    dow = got["checks"][5]
+    assert dow["field"] == "day-of-week"
+    assert dow["value"] == 2
+    assert dow["label"] == "Tuesday"
+    assert dow["allowed"] == "Monday and Friday"
+    assert dow["matched"] is False
+
+
+def test_why_checks_are_ordered_and_json_shaped():
+    got = _why("0 9 * * mon,fri", datetime.datetime(2026, 7, 17, 9, 0))
+    assert got["matches"] is True
+    assert [c["field"] for c in got["checks"]] == [
+        "second",
+        "minute",
+        "hour",
+        "day-of-month",
+        "month",
+        "day-of-week",
+        "year",
+    ]
+    for check in got["checks"]:
+        assert set(check) == {"field", "value", "label", "allowed", "matched"}
+    # unrestricted fields read "any"; month labels are month names
+    assert got["checks"][3]["allowed"] == "any"
+    assert got["checks"][4]["label"] == "July"
+
+
+def test_why_seconds_field_of_a_five_field_schedule():
+    # a 5-field schedule fires at second 0 only; probing :30s says so
+    got = _why("0 9 * * mon,fri", datetime.datetime(2026, 7, 17, 9, 0, 30))
+    assert got["failed"] == ["second"]
+    assert got["checks"][0]["allowed"] == "0"
+
+
+def test_why_year_column():
+    got = _why("0 0 1 1 * 2030,2031,2032", datetime.datetime(2026, 1, 1))
+    assert got["failed"] == ["year"]
+    assert got["checks"][6]["allowed"] == "2030-2032"
+
+
+def test_why_and_rule_note_fires_when_exactly_one_day_field_matched():
+    # 2026-07-13 is a Monday the 13th: dom matched, dow did not, and in
+    # Vixie cron (either-field) this WOULD have run; the note says so
+    got = _why("0 0 13 * 5", datetime.datetime(2026, 7, 13, 0, 0))
+    assert got["failed"] == ["day-of-week"]
+    codes = [n["code"] for n in got["notes"]]
+    assert codes == ["day-fields-and-rule"]
+    assert "Vixie" in got["notes"][0]["message"]
+    # both matched (a real Friday the 13th): no note, it fires
+    got = _why("0 0 13 * 5", datetime.datetime(2026, 3, 13, 0, 0))
+    assert got["matches"] is True
+    assert got["notes"] == []
+    # neither matched: no note, Vixie would not have fired either
+    got = _why("0 0 13 * 5", datetime.datetime(2026, 7, 14, 0, 0))
+    assert [n["code"] for n in got["notes"]] == []
+    # only one day field restricted: the AND rule cannot be the story
+    got = _why("0 9 * * mon,fri", datetime.datetime(2026, 7, 14, 9, 0))
+    assert got["notes"] == []
+    # another field failed too: Vixie would NOT have fired at this
+    # instant either, so the note must not overclaim
+    got = _why("0 0 13 * 5", datetime.datetime(2026, 7, 13, 0, 30))
+    assert got["failed"] == ["minute", "day-of-week"]
+    assert got["notes"] == []
+
+
+def test_why_last_day_forms():
+    # bare L in day-of-month
+    got = _why("0 0 L * *", datetime.datetime(2026, 7, 30, 0, 0))
+    assert got["failed"] == ["day-of-month"]
+    assert got["checks"][3]["allowed"] == "the month's last day (L)"
+    assert _why("0 0 L * *", datetime.datetime(2026, 7, 31))["matches"]
+    # L5 in day-of-week: only the month's LAST Friday
+    got = _why("0 12 * * L5", datetime.datetime(2026, 7, 24, 12, 0))
+    assert got["failed"] == ["day-of-week"]
+    assert got["checks"][5]["allowed"] == "the month's last Friday"
+    assert _why("0 12 * * L5", datetime.datetime(2026, 7, 31, 12, 0))[
+        "matches"
+    ]
+    # mixed spellings list every accepted form
+    got = _why("0 9 1,15,L * *", datetime.datetime(2026, 7, 2, 9, 0))
+    assert got["checks"][3]["allowed"] == "1, 15 and the month's last day (L)"
+    got = _why("0 9 * * mon,L5", datetime.datetime(2026, 7, 14, 9, 0))
+    assert got["checks"][5]["allowed"] == "Monday and the month's last Friday"
+
+
+def test_why_allowed_prose_compacts_runs():
+    base = datetime.datetime(2026, 1, 1)
+    assert _why("1,2,3,7 * * * *", base)["checks"][1]["allowed"] == "1-3 and 7"
+    assert (
+        _why("0 9 * * mon-fri", base)["checks"][5]["allowed"]
+        == "Monday-Friday"
+    )
+
+
+def test_why_hashed_schedule_reports_the_resolved_slot():
+    got = _why(
+        "H * * * *", datetime.datetime(2026, 7, 18, 3, 0), key="hashed"
+    )
+    minute = CronTab("H * * * *", hash_key="hashed").resolved_source.split()[0]
+    assert got["failed"] == ["minute"]
+    assert got["checks"][1]["allowed"] == minute
+
+
+def test_why_dst_gap_note_on_a_matching_skipped_wall_time():
+    # 2026-03-08 02:30 does not exist in America/New_York
+    got = _why("30 2 * * *", datetime.datetime(2026, 3, 8, 2, 30), tz=_NY)
+    assert got["matches"] is True
+    assert [n["code"] for n in got["notes"]] == ["dst-skipped-time"]
+    assert "03:30:00" in got["notes"][0]["message"]
+
+
+def test_why_dst_fold_note_on_a_matching_repeated_wall_time():
+    # 2026-11-01 01:30 occurs twice in America/New_York
+    got = _why("30 1 * * *", datetime.datetime(2026, 11, 1, 1, 30), tz=_NY)
+    assert got["matches"] is True
+    assert [n["code"] for n in got["notes"]] == ["dst-repeated-time"]
+    assert "first occurrence" in got["notes"][0]["message"]
+
+
+def test_why_dst_notes_skip_fixed_offset_zones_and_misses():
+    # UTC never transitions, so a matching instant carries no DST note
+    got = _why("30 2 * * *", datetime.datetime(2026, 3, 8, 2, 30), tz=_UTC)
+    assert got["matches"] is True and got["notes"] == []
+    # a NON-matching instant in the gap explains the fields, not the zone
+    got = _why("0 5 * * *", datetime.datetime(2026, 3, 8, 2, 30), tz=_NY)
+    assert got["matches"] is False
+    assert got["notes"] == []

@@ -126,6 +126,35 @@ also the working idiom for parking a job).
   `cron_schedule_duplicates`, `cron_suggest_slot`) serve the same
   payloads to agents.
 
+### Schedule authoring and debugging for agents
+
+- **`GET /schedule/why`** answers "why didn't this job run at 09:00?"
+  from ground truth: given a job and a timestamp, the new
+  `croninfo.why_no_run` decomposes the engine's own match test field by
+  field ("minute matched; day-of-week Tuesday is not in Monday and
+  Friday"), renders each field's accepted values in prose (ranges
+  collapse, weekday and month names, the `L` forms spelled out), and
+  brackets the probe with the nearest real fire on each side.  Notes
+  call out the two semantics that make a miss genuinely confusing: the
+  dialect's day-field AND rule (when exactly one restricted day field
+  matched, classic Vixie cron would have fired) and DST transitions (a
+  skipped wall time fired at its shifted label instead; a repeated one
+  fired once).  Aware timestamps convert into the job's own timezone,
+  naive ones read as wall time there; `@reboot` and disabled jobs
+  answer honestly, and a DAG's `dag:<name>` schedule job resolves too.
+- **Three more read-only MCP tools** make an agent a schedule author,
+  not just a reader: `cron_validate_schedule` (parse and lint an
+  expression before it becomes a job: the engine's exact error with its
+  Quartz dialect hints, advisory lint findings, the first upcoming
+  fire, and prospective `H` resolution via `seed`),
+  `cron_explain_schedule` (plain-English description plus the next N
+  fires in a chosen zone plus lint, for round-tripping a proposed
+  schedule to a human before it ships), and `cron_why_no_run` (the
+  explainer above, with a one-line verdict that points at
+  `cron_list_runs` when the schedule DID select the instant).  All
+  three ride the `observe` toolset; the server's `initialize`
+  instructions steer agents to validate before proposing.
+
 ### Packaging
 
 - **winget**: `winget install ptweezy.cronstable` installs the self-contained

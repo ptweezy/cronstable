@@ -45,4 +45,8 @@ and every status surface reports `never_fires` until the schedule changes. If a 
 
 ## Linting expressions before they become jobs
 
-`GET /schedule/preview?expr=<expression>&tz=<zone>&count=<n>` parses, describes, previews and lints any expression with the daemon's own engine, the single source of truth behind the sandboxes. See [HTTP API](HTTP-API) for the full response shape.
+`GET /schedule/preview?expr=<expression>&tz=<zone>&count=<n>` parses, describes, previews and lints any expression with the daemon's own engine, the single source of truth behind the sandboxes. See [HTTP API](HTTP-API) for the full response shape. AI agents get the same payload through the `cron_validate_schedule` and `cron_explain_schedule` [MCP tools](MCP).
+
+## Explaining one instant instead of a whole schedule
+
+The linter judges a schedule in the abstract; `GET /schedule/why` judges it against one concrete timestamp, decomposing the match test field by field ("day-of-week Tuesday is not in Monday and Friday") with notes for the AND day rule and DST effects at that instant. See [Why Didn't It Run?](Why-No-Run).
