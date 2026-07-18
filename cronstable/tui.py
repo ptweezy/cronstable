@@ -404,8 +404,10 @@ def verdict_info(
             if failing
             else "leadership / quorum degraded"
         )
-        return ({"sev": "crit", "glyph": "☢", "head": head, "sub": sub},
-                incident)
+        return (
+            {"sev": "crit", "glyph": "☢", "head": head, "sub": sub},
+            incident,
+        )
     if not failing:
         return (None, [])
     if len(failing) == 1:
@@ -624,11 +626,27 @@ def _field_values(
 
 
 _MON_NAMES = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
 }
 _DOW_NAMES = {
-    "sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+    "sun": 0,
+    "mon": 1,
+    "tue": 2,
+    "wed": 3,
+    "thu": 4,
+    "fri": 5,
+    "sat": 6,
 }
 
 
@@ -663,9 +681,7 @@ def describe_cron(expr: str) -> str:
         dows = _field_values(dow, 0, 6, _DOW_NAMES)
         seconds = _field_values(sec_spec, 0, 59)
         years = (
-            _field_values(year_spec, 1970, 2099)
-            if year_spec != "*"
-            else None
+            _field_values(year_spec, 1970, 2099) if year_spec != "*" else None
         )
     except (ValueError, KeyError):
         return "Custom schedule: %s" % expr
@@ -831,77 +847,157 @@ THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
 _P = {
     # carolina: the default Carolina-blue CRT phosphor
     "carolina": {
-        "bg": "#06131d", "fg": "#9ed3f5", "bright": "#d3ecfd",
-        "dim": "#3f6d8c", "accent": "#4b9cd3", "border": "#1d4056",
-        "sel": "#12324a", "ok": "#37d495", "fail": "#ff5d5d",
-        "run": "#4b9cd3", "pending": "#c9a94a", "warn": "#ffb64a",
+        "bg": "#06131d",
+        "fg": "#9ed3f5",
+        "bright": "#d3ecfd",
+        "dim": "#3f6d8c",
+        "accent": "#4b9cd3",
+        "border": "#1d4056",
+        "sel": "#12324a",
+        "ok": "#37d495",
+        "fail": "#ff5d5d",
+        "run": "#4b9cd3",
+        "pending": "#c9a94a",
+        "warn": "#ffb64a",
         "off": "#3f5b6e",
     },
     "carolina-light": {
-        "bg": "#eef4f9", "fg": "#173751", "bright": "#0a2437",
-        "dim": "#6d8ba1", "accent": "#20618f", "border": "#b9cedd",
-        "sel": "#cfe2f0", "ok": "#0d7a4f", "fail": "#c22929",
-        "run": "#20618f", "pending": "#8a6d1c", "warn": "#a05e00",
+        "bg": "#eef4f9",
+        "fg": "#173751",
+        "bright": "#0a2437",
+        "dim": "#6d8ba1",
+        "accent": "#20618f",
+        "border": "#b9cedd",
+        "sel": "#cfe2f0",
+        "ok": "#0d7a4f",
+        "fail": "#c22929",
+        "run": "#20618f",
+        "pending": "#8a6d1c",
+        "warn": "#a05e00",
         "off": "#8aa0b1",
     },
     # amber phosphor CRT
     "amber": {
-        "bg": "#160d02", "fg": "#f5c169", "bright": "#ffe3ad",
-        "dim": "#8a6a34", "accent": "#ffb000", "border": "#4d3510",
-        "sel": "#3a2a0c", "ok": "#8fd44a", "fail": "#ff5d43",
-        "run": "#ffb000", "pending": "#c9a94a", "warn": "#ffcf6a",
+        "bg": "#160d02",
+        "fg": "#f5c169",
+        "bright": "#ffe3ad",
+        "dim": "#8a6a34",
+        "accent": "#ffb000",
+        "border": "#4d3510",
+        "sel": "#3a2a0c",
+        "ok": "#8fd44a",
+        "fail": "#ff5d43",
+        "run": "#ffb000",
+        "pending": "#c9a94a",
+        "warn": "#ffcf6a",
         "off": "#6e5a35",
     },
     "amber-light": {
-        "bg": "#faf3e4", "fg": "#4a3510", "bright": "#2d1f05",
-        "dim": "#9a8557", "accent": "#9a6b00", "border": "#e0d0a8",
-        "sel": "#f0e2bd", "ok": "#3d7a0d", "fail": "#c23415",
-        "run": "#9a6b00", "pending": "#8a6d1c", "warn": "#a05e00",
+        "bg": "#faf3e4",
+        "fg": "#4a3510",
+        "bright": "#2d1f05",
+        "dim": "#9a8557",
+        "accent": "#9a6b00",
+        "border": "#e0d0a8",
+        "sel": "#f0e2bd",
+        "ok": "#3d7a0d",
+        "fail": "#c23415",
+        "run": "#9a6b00",
+        "pending": "#8a6d1c",
+        "warn": "#a05e00",
         "off": "#a8956a",
     },
     # green phosphor CRT
     "green": {
-        "bg": "#03130a", "fg": "#7ee2a1", "bright": "#c8f7d8",
-        "dim": "#37744e", "accent": "#33ff66", "border": "#124d28",
-        "sel": "#0c3a1e", "ok": "#33ff66", "fail": "#ff6e5d",
-        "run": "#57d9ff", "pending": "#c9c94a", "warn": "#ffd24a",
+        "bg": "#03130a",
+        "fg": "#7ee2a1",
+        "bright": "#c8f7d8",
+        "dim": "#37744e",
+        "accent": "#33ff66",
+        "border": "#124d28",
+        "sel": "#0c3a1e",
+        "ok": "#33ff66",
+        "fail": "#ff6e5d",
+        "run": "#57d9ff",
+        "pending": "#c9c94a",
+        "warn": "#ffd24a",
         "off": "#3f6e51",
     },
     "green-light": {
-        "bg": "#eef8f0", "fg": "#123a22", "bright": "#07230f",
-        "dim": "#5f8f70", "accent": "#0e7a33", "border": "#b6dcc2",
-        "sel": "#cdeccf", "ok": "#0e7a33", "fail": "#c22f18",
-        "run": "#106a8a", "pending": "#7a7a10", "warn": "#a05e00",
+        "bg": "#eef8f0",
+        "fg": "#123a22",
+        "bright": "#07230f",
+        "dim": "#5f8f70",
+        "accent": "#0e7a33",
+        "border": "#b6dcc2",
+        "sel": "#cdeccf",
+        "ok": "#0e7a33",
+        "fail": "#c22f18",
+        "run": "#106a8a",
+        "pending": "#7a7a10",
+        "warn": "#a05e00",
         "off": "#7fa38c",
     },
     # flat modern (no CRT physics on the web; plain here too)
     "modern": {
-        "bg": "#101418", "fg": "#d7dde3", "bright": "#ffffff",
-        "dim": "#788591", "accent": "#5aa7e8", "border": "#2a343d",
-        "sel": "#22303c", "ok": "#4cc38a", "fail": "#f2555a",
-        "run": "#5aa7e8", "pending": "#d6a648", "warn": "#f0a13c",
+        "bg": "#101418",
+        "fg": "#d7dde3",
+        "bright": "#ffffff",
+        "dim": "#788591",
+        "accent": "#5aa7e8",
+        "border": "#2a343d",
+        "sel": "#22303c",
+        "ok": "#4cc38a",
+        "fail": "#f2555a",
+        "run": "#5aa7e8",
+        "pending": "#d6a648",
+        "warn": "#f0a13c",
         "off": "#5c6770",
     },
     "modern-light": {
-        "bg": "#f7f9fb", "fg": "#22303c", "bright": "#101418",
-        "dim": "#7d8b98", "accent": "#1d6cb0", "border": "#d4dde4",
-        "sel": "#dbe7f1", "ok": "#177a4c", "fail": "#c62f34",
-        "run": "#1d6cb0", "pending": "#8a6d1c", "warn": "#a05e00",
+        "bg": "#f7f9fb",
+        "fg": "#22303c",
+        "bright": "#101418",
+        "dim": "#7d8b98",
+        "accent": "#1d6cb0",
+        "border": "#d4dde4",
+        "sel": "#dbe7f1",
+        "ok": "#177a4c",
+        "fail": "#c62f34",
+        "run": "#1d6cb0",
+        "pending": "#8a6d1c",
+        "warn": "#a05e00",
         "off": "#93a1ad",
     },
     # plain white-and-saturated-color "standard"
     "standard": {
-        "bg": "#000000", "fg": "#c0c0c0", "bright": "#ffffff",
-        "dim": "#707070", "accent": "#3b78ff", "border": "#3a3a3a",
-        "sel": "#264f78", "ok": "#16c60c", "fail": "#e74856",
-        "run": "#3b78ff", "pending": "#c19c00", "warn": "#f9f1a5",
+        "bg": "#000000",
+        "fg": "#c0c0c0",
+        "bright": "#ffffff",
+        "dim": "#707070",
+        "accent": "#3b78ff",
+        "border": "#3a3a3a",
+        "sel": "#264f78",
+        "ok": "#16c60c",
+        "fail": "#e74856",
+        "run": "#3b78ff",
+        "pending": "#c19c00",
+        "warn": "#f9f1a5",
         "off": "#767676",
     },
     "standard-light": {
-        "bg": "#ffffff", "fg": "#1f1f1f", "bright": "#000000",
-        "dim": "#767676", "accent": "#0037da", "border": "#d0d0d0",
-        "sel": "#cde5ff", "ok": "#107c10", "fail": "#c42b1c",
-        "run": "#0037da", "pending": "#805b00", "warn": "#9d5d00",
+        "bg": "#ffffff",
+        "fg": "#1f1f1f",
+        "bright": "#000000",
+        "dim": "#767676",
+        "accent": "#0037da",
+        "border": "#d0d0d0",
+        "sel": "#cde5ff",
+        "ok": "#107c10",
+        "fail": "#c42b1c",
+        "run": "#0037da",
+        "pending": "#805b00",
+        "warn": "#9d5d00",
         "off": "#909090",
     },
 }
@@ -964,7 +1060,9 @@ REVERSE = "\x1b[7m"
 # ===================================================================
 #  text measurement + ANSI handling
 # ===================================================================
-_ANSI_RE = re.compile(r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)")  # noqa: E501
+_ANSI_RE = re.compile(
+    r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)"
+)  # noqa: E501
 
 
 def strip_ansi(text: str) -> str:
@@ -1018,8 +1116,22 @@ def pad_to(text: str, width: int) -> str:
 #: job's coloured log output stays legible on every background (the web
 #: page does the same with its log-ANSI palette).
 _LOG_BASE = [
-    "dim", "fail", "ok", "pending", "run", "accent", "run", "fg",
-    "dim", "fail", "ok", "warn", "run", "accent", "bright", "bright",
+    "dim",
+    "fail",
+    "ok",
+    "pending",
+    "run",
+    "accent",
+    "run",
+    "fg",
+    "dim",
+    "fail",
+    "ok",
+    "warn",
+    "run",
+    "accent",
+    "bright",
+    "bright",
 ]
 _SGR_TOKEN_RE = re.compile(r"\x1b\[([0-9;]*)m")
 
@@ -1064,11 +1176,11 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
             i += 1
         return "".join(out)
 
-    cleaned = _ANSI_RE.sub(
-        lambda m: replace(m) if _SGR_TOKEN_RE.fullmatch(m.group(0)) else "",
-        line,
-    )
-    return cleaned
+    def dispatch(outer: "re.Match[str]") -> str:
+        sgr = _SGR_TOKEN_RE.fullmatch(outer.group(0))
+        return replace(sgr) if sgr is not None else ""
+
+    return _ANSI_RE.sub(dispatch, line)
 
 
 def sparkline(history: List[Dict[str, Any]], width: int = 10) -> str:
@@ -1089,9 +1201,7 @@ def spark_cells(
     """``(bar-char, health-colour-key)`` cells for the recent-run tail."""
     tail = history[-width:] if history else []
     durations = [
-        float(r["duration"])
-        for r in tail
-        if r.get("duration") is not None
+        float(r["duration"]) for r in tail if r.get("duration") is not None
     ]
     top = max(durations) if durations else 0.0
     cells: List[Tuple[str, str]] = []
@@ -1125,19 +1235,19 @@ def spark_cells(
 # ===================================================================
 #: Defaults mirror the web page's prefs where they translate to a tty.
 PREF_DEFAULTS: Dict[str, Any] = {
-    "theme": "carolina",     # hue
-    "light": False,          # phosphor (dark) vs paper (light)
-    "cvd": "none",           # colour-vision remap
+    "theme": "carolina",  # hue
+    "light": False,  # phosphor (dark) vs paper (light)
+    "cvd": "none",  # colour-vision remap
     "poll_ms": DEFAULT_POLL_MS,
-    "wrap": False,           # log line wrap
-    "timestamps": False,     # per-line log timestamps
-    "compact": False,        # compact density
-    "sound": False,          # terminal bell on failure cues
-    "boot": True,            # BIOS-style boot self-test
-    "boot_last": 0.0,        # last boot POST, epoch seconds
-    "zen": True,             # wallboard screensaver
+    "wrap": False,  # log line wrap
+    "timestamps": False,  # per-line log timestamps
+    "compact": False,  # compact density
+    "sound": False,  # terminal bell on failure cues
+    "boot": True,  # BIOS-style boot self-test
+    "boot_last": 0.0,  # last boot POST, epoch seconds
+    "zen": True,  # wallboard screensaver
     "zen_idle_s": 90,
-    "ascii": False,          # ASCII status glyphs
+    "ascii": False,  # ASCII status glyphs
 }
 
 
@@ -1199,26 +1309,52 @@ ALT_SCREEN_OFF = "\x1b[?1049l"
 CURSOR_HIDE = "\x1b[?25l"
 CURSOR_SHOW = "\x1b[?25h"
 CLEAR = "\x1b[2J"
-SYNC_ON = "\x1b[?2026h"   # "synchronized output"; ignored where unknown
+SYNC_ON = "\x1b[?2026h"  # "synchronized output"; ignored where unknown
 SYNC_OFF = "\x1b[?2026l"
 
 #: CSI/SS3 escape tails -> key names (POSIX byte-stream decoding).
 _CSI_KEYS = {
-    "A": "up", "B": "down", "C": "right", "D": "left",
-    "H": "home", "F": "end", "Z": "shift+tab",
-    "1~": "home", "4~": "end", "3~": "delete",
-    "5~": "pgup", "6~": "pgdn", "2~": "insert",
+    "A": "up",
+    "B": "down",
+    "C": "right",
+    "D": "left",
+    "H": "home",
+    "F": "end",
+    "Z": "shift+tab",
+    "1~": "home",
+    "4~": "end",
+    "3~": "delete",
+    "5~": "pgup",
+    "6~": "pgdn",
+    "2~": "insert",
 }
-_SS3_KEYS = {"A": "up", "B": "down", "C": "right", "D": "left",
-             "H": "home", "F": "end"}
+_SS3_KEYS = {
+    "A": "up",
+    "B": "down",
+    "C": "right",
+    "D": "left",
+    "H": "home",
+    "F": "end",
+}
 
 #: msvcrt scan codes (after a '\x00'/'\xe0' prefix) -> key names.
 _WIN_KEYS = {
-    "H": "up", "P": "down", "K": "left", "M": "right",
-    "I": "pgup", "Q": "pgdn", "G": "home", "O": "end",
-    "S": "delete", "R": "insert", "\x0f": "shift+tab",
+    "H": "up",
+    "P": "down",
+    "K": "left",
+    "M": "right",
+    "I": "pgup",
+    "Q": "pgdn",
+    "G": "home",
+    "O": "end",
+    "S": "delete",
+    "R": "insert",
+    "\x0f": "shift+tab",
     # ctrl-arrow variants collapse onto the plain arrows
-    "\x8d": "up", "\x91": "down", "s": "left", "t": "right",
+    "\x8d": "up",
+    "\x91": "down",
+    "s": "left",
+    "t": "right",
 }
 
 
@@ -1536,7 +1672,7 @@ class HeadlessTerm(Term):
         return "\n".join(strip_ansi(row) for row in self.frames[-1])
 
 
-class TestKeys:
+class ScriptedKeys:
     """A scriptable key source for the test-suite."""
 
     def __init__(self) -> None:
@@ -1763,12 +1899,21 @@ class LogTail:
             self._task = None
 
     async def _run(self) -> None:
+        attempt = 0
         while True:
             self.ended = None
             self.error = None
+            fresh_attempt = attempt > 0
+            attempt += 1
             try:
                 async for event, payload in self.api.stream(self.path):
                     if event == "line":
+                        if fresh_attempt:
+                            # the daemon replays its whole retained
+                            # buffer on every attach: start clean so a
+                            # re-attach doesn't duplicate history
+                            self.lines = []
+                            fresh_attempt = False
                         self.lines.append(
                             (
                                 str(payload.get("stream", "")),
@@ -1851,8 +1996,14 @@ def overlay_center(
             pw = text_width(prow)
             left = max(0, (cols - pw) // 2)
             rows[idx] = (
-                fill + " " * left + RESET + prow + RESET + fill
-                + " " * max(0, cols - left - pw) + RESET
+                fill
+                + " " * left
+                + RESET
+                + prow
+                + RESET
+                + fill
+                + " " * max(0, cols - left - pw)
+                + RESET
             )
     return rows
 
@@ -1926,9 +2077,7 @@ def panel_frame(
             + paint.style(" │", "accent")
         )
     if footer:
-        rows.append(
-            paint.style("├" + "─" * inner + "┤", "accent")
-        )
+        rows.append(paint.style("├" + "─" * inner + "┤", "accent"))
         rows.append(
             paint.style("│ ", "accent")
             + paint.style(pad_to(footer, inner - 2), "dim")
@@ -1938,9 +2087,7 @@ def panel_frame(
     return rows
 
 
-def scroll_window(
-    total: int, visible: int, cursor: int, offset: int
-) -> int:
+def scroll_window(total: int, visible: int, cursor: int, offset: int) -> int:
     """Keep ``cursor`` inside the ``visible`` window; returns new offset."""
     if total <= visible:
         return 0
@@ -2215,8 +2362,7 @@ class App:
                 self._boot_override
                 if self._boot_override is not None
                 else bool(self.prefs["boot"])
-                and time.time() - float(self.prefs["boot_last"])
-                > BOOT_EVERY_S
+                and time.time() - float(self.prefs["boot_last"]) > BOOT_EVERY_S
             )
             if do_boot:
                 await self._boot_sequence()
@@ -2261,9 +2407,7 @@ class App:
         with contextlib.suppress(Exception):
             self.version = (await self.api.get_text("/version")).strip()
         with contextlib.suppress(Exception):
-            self.job_set_id = (
-                await self.api.get_text("/job-set-id")
-            ).strip()
+            self.job_set_id = (await self.api.get_text("/job-set-id")).strip()
         await self._poll_once()
         with contextlib.suppress(Exception):
             await self._load_dags()
@@ -2334,9 +2478,7 @@ class App:
         if self.is_open("state") and self.state_tab == "view":
             with contextlib.suppress(Exception):
                 self.state_data = await self.api.get_json("/state")
-        if self.is_open("heat") and (
-            time.monotonic() - self.heat_loaded > 60
-        ):
+        if self.is_open("heat") and (time.monotonic() - self.heat_loaded > 60):
             await self._load_heat()
 
     def _fleet_sound(self, first: bool) -> None:
@@ -2430,9 +2572,7 @@ class App:
         for job in self.jobs[:40]:  # same spirit as the web page's cap
             name = job.get("name", "")
             with contextlib.suppress(Exception):
-                data = await self.api.get_json(
-                    "/jobs/%s/runs" % _quote(name)
-                )
+                data = await self.api.get_json("/jobs/%s/runs" % _quote(name))
                 self.heat_data[name] = data.get("runs", [])
         self.mark()
 
@@ -2587,9 +2727,7 @@ class AppActions(App):
     # ---- job actions (instant + toast, exactly like the page) -------
     async def run_job(self, name: str) -> None:
         try:
-            status, _ = await self.api.post(
-                "/jobs/%s/start" % _quote(name)
-            )
+            status, _ = await self.api.post("/jobs/%s/start" % _quote(name))
         except Unauthorized:
             self.open("token")
             self.focus = "token"
@@ -2609,9 +2747,7 @@ class AppActions(App):
 
     async def cancel_job(self, name: str) -> None:
         try:
-            status, _ = await self.api.post(
-                "/jobs/%s/cancel" % _quote(name)
-            )
+            status, _ = await self.api.post("/jobs/%s/cancel" % _quote(name))
         except Unauthorized:
             self.open("token")
             self.focus = "token"
@@ -2628,9 +2764,7 @@ class AppActions(App):
             self.toast("fail", "cancel %s: HTTP %d" % (name, status))
 
     async def run_all_failing(self) -> None:
-        failing = [
-            j["name"] for j in self.jobs if health(j)[0] == "fail"
-        ]
+        failing = [j["name"] for j in self.jobs if health(j)[0] == "fail"]
         if not failing:
             self.toast("info", "nothing failing")
             return
@@ -2666,8 +2800,9 @@ class AppActions(App):
         self.prefs["light"] = not bool(self.prefs["light"])
         self.save_prefs()
         self._retheme()
-        self.toast("info", "◑ %s" % ("paper" if self.prefs["light"]
-                                     else "phosphor"))
+        self.toast(
+            "info", "◑ %s" % ("paper" if self.prefs["light"] else "phosphor")
+        )
 
     def cycle_cvd(self) -> None:
         idx = CVD_MODES.index(str(self.prefs["cvd"]))
@@ -2759,11 +2894,9 @@ class AppActions(App):
         self.mark()
 
     def tail_preset(self, kind: str) -> None:
-        wanted = [
-            j["name"]
-            for j in self.jobs
-            if (health(j)[0] == kind)
-        ][:TAIL_MAX]
+        wanted = [j["name"] for j in self.jobs if (health(j)[0] == kind)][
+            :TAIL_MAX
+        ]
         if not wanted:
             self.toast("info", "no %s jobs right now" % kind)
             return
@@ -2793,9 +2926,7 @@ class AppActions(App):
                 targets.append(name)
         verb = "cancel" if kind == "cancel" else "start"
         if not targets:
-            self.mitigate_log.append(
-                "nothing to %s (no eligible jobs)" % verb
-            )
+            self.mitigate_log.append("nothing to %s (no eligible jobs)" % verb)
             self.mark()
             return
         self.mitigate_running = True
@@ -2832,8 +2963,8 @@ class AppActions(App):
             self.mark()
             await asyncio.sleep(0.3)  # the page's 300ms stagger
         self.mitigate_log.append(
-            "done: %d ok%s" % (done, (", %d failed" % failed)
-                               if failed else "")
+            "done: %d ok%s"
+            % (done, (", %d failed" % failed) if failed else "")
         )
         self.mitigate_running = False
         self.mark()
@@ -2865,8 +2996,11 @@ class AppActions(App):
                 )
             )
         if self.verdict:
-            lines += ["", "Verdict: %s — %s" % (
-                self.verdict["head"], self.verdict["sub"])]
+            lines += [
+                "",
+                "Verdict: %s — %s"
+                % (self.verdict["head"], self.verdict["sub"]),
+            ]
         return "\n".join(lines) + "\n"
 
     def ack_alarm(self) -> None:
@@ -2893,16 +3027,12 @@ class AppActions(App):
             self.toast("fail", "trigger %s: %s" % (name, exc))
             return
         if status == 200 and isinstance(payload, dict):
-            self.toast(
-                "ok", "▶ %s run %s" % (name, payload.get("runKey", ""))
-            )
+            self.toast("ok", "▶ %s run %s" % (name, payload.get("runKey", "")))
             self._spawn(self._load_dag_runs())
         else:
             self.toast("fail", "trigger %s: HTTP %d" % (name, status))
 
-    async def dag_decision(
-        self, task_key: str, decision: str
-    ) -> None:
+    async def dag_decision(self, task_key: str, decision: str) -> None:
         if not self.dag_name or not self.dag_run_key:
             return
         try:
@@ -2997,8 +3127,11 @@ class AppPalette(AppActions):
         """
         out: List[Tuple[str, str, Callable[[], Any]]] = [
             ("↻", "Refresh now", self.refresh_now),
-            ("▶", "Run all failing jobs",
-             lambda: self._spawn(self.run_all_failing())),
+            (
+                "▶",
+                "Run all failing jobs",
+                lambda: self._spawn(self.run_all_failing()),
+            ),
             ("◐", "Cycle theme", self.cycle_theme),
             ("◑", "Toggle light / dark", self.toggle_light_dark),
             ("◓", "Cycle color vision mode", self.cycle_cvd),
@@ -3007,58 +3140,94 @@ class AppPalette(AppActions):
             ("⌁", "Toggle next-fire radar", lambda: self._toggle("radar")),
             ("▦", "Toggle activity heatmap", lambda: self._toggle("heat")),
             ("⊞", "Toggle fleet view", lambda: self._toggle("fleet")),
-            ("◉", "Toggle cluster panel",
-             lambda: self._toggle("cluster")),
+            ("◉", "Toggle cluster panel", lambda: self._toggle("cluster")),
             ("▤", "Toggle node resources", lambda: self._toggle("node")),
             ("≋", "Multi-tail console", lambda: self.open_tail([])),
-            ("≋", "Multi-tail: failing jobs",
-             lambda: self.tail_preset("fail")),
-            ("≋", "Multi-tail: running jobs",
-             lambda: self.tail_preset("run")),
-            ("▣", "Wallboard / TV mode",
-             lambda: self.set_wallboard(not self.wallboard)),
+            (
+                "≋",
+                "Multi-tail: failing jobs",
+                lambda: self.tail_preset("fail"),
+            ),
+            ("≋", "Multi-tail: running jobs", lambda: self.tail_preset("run")),
+            (
+                "▣",
+                "Wallboard / TV mode",
+                lambda: self.set_wallboard(not self.wallboard),
+            ),
             ("▤", "Incident timeline", lambda: self.open("timeline")),
             ("▸", "Mitigate failing jobs", self._mitigate_failing),
             ("◴", "Cron sandbox", lambda: self.open("sandbox")),
             ("▮", "Toggle boot self-test", self._toggle_boot),
             ("❏", "Copy version", lambda: self._copy_chip(self.version)),
-            ("❏", "Copy job set id",
-             lambda: self._copy_chip(self.job_set_id)),
+            ("❏", "Copy job set id", lambda: self._copy_chip(self.job_set_id)),
             ("⚙", "Open settings", lambda: self.open("settings")),
             ("?", "Keyboard shortcuts", lambda: self.open("help")),
             ("⚿", "Set access token", self._open_token),
             ("⧉", "Toggle DAGs panel", self._toggle_dags),
-            ("⛁", "Toggle state inspector",
-             lambda: self._toggle("state")),
+            ("⛁", "Toggle state inspector", lambda: self._toggle("state")),
             ("⌕", "Focus filter", self._focus_filter),
         ]
         ascii_mode = bool(self.prefs["ascii"])
         for dag in self.dags:
             name = str(dag.get("name", ""))
-            out.append(("⧉", "DAG: %s" % name,
-                        functools.partial(self.open_dag, name)))
-            out.append(("▶", "Trigger DAG: %s" % name,
-                        functools.partial(self._act_trigger_dag, name)))
+            out.append(
+                ("⧉", "DAG: %s" % name, functools.partial(self.open_dag, name))
+            )
+            out.append(
+                (
+                    "▶",
+                    "Trigger DAG: %s" % name,
+                    functools.partial(self._act_trigger_dag, name),
+                )
+            )
         for job in self.jobs:
             name = str(job.get("name", ""))
             key = health(job)[0]
             glyph = (GLYPH_ASCII if ascii_mode else GLYPH).get(key, "?")
-            out.append((glyph, "Logs: %s" % name,
-                        functools.partial(self.open_drawer, name, "logs")))
+            out.append(
+                (
+                    glyph,
+                    "Logs: %s" % name,
+                    functools.partial(self.open_drawer, name, "logs"),
+                )
+            )
             if job.get("enabled") and not job.get("running"):
-                out.append(("▶", "Run: %s" % name,
-                            functools.partial(self._act_run_job, name)))
+                out.append(
+                    (
+                        "▶",
+                        "Run: %s" % name,
+                        functools.partial(self._act_run_job, name),
+                    )
+                )
             if job.get("running"):
-                out.append(("■", "Cancel: %s" % name,
-                            functools.partial(self._act_cancel_job,
-                                              name)))
-            out.append(("❏", "Copy command: %s" % name,
-                        functools.partial(self._copy_job_command, name)))
-            out.append(("◴", "Schedule: %s" % name,
-                        functools.partial(self.open_drawer, name,
-                                          "schedule")))
-            out.append(("≋", "Tail: %s" % name,
-                        functools.partial(self._act_tail_one, name)))
+                out.append(
+                    (
+                        "■",
+                        "Cancel: %s" % name,
+                        functools.partial(self._act_cancel_job, name),
+                    )
+                )
+            out.append(
+                (
+                    "❏",
+                    "Copy command: %s" % name,
+                    functools.partial(self._copy_job_command, name),
+                )
+            )
+            out.append(
+                (
+                    "◴",
+                    "Schedule: %s" % name,
+                    functools.partial(self.open_drawer, name, "schedule"),
+                )
+            )
+            out.append(
+                (
+                    "≋",
+                    "Tail: %s" % name,
+                    functools.partial(self._act_tail_one, name),
+                )
+            )
         return out
 
     def _act_trigger_dag(self, name: str) -> None:
@@ -3081,8 +3250,11 @@ class AppPalette(AppActions):
             (fuzzy(query, label), (icon, label, action))
             for icon, label, action in self.palette_commands()
         ]
-        matches = [item for score, item in sorted(
-            scored, key=lambda pair: -pair[0]) if score > 0]
+        matches = [
+            item
+            for score, item in sorted(scored, key=lambda pair: -pair[0])
+            if score > 0
+        ]
         return matches[:60]
 
     # small palette helpers -------------------------------------------
@@ -3115,25 +3287,28 @@ class AppPalette(AppActions):
     def _toggle_compact(self) -> None:
         self.prefs["compact"] = not bool(self.prefs["compact"])
         self.save_prefs()
-        self.toast("info", "⊟ compact: %s"
-                   % ("on" if self.prefs["compact"] else "off"))
+        self.toast(
+            "info",
+            "⊟ compact: %s" % ("on" if self.prefs["compact"] else "off"),
+        )
 
     def _toggle_sound(self) -> None:
         self.prefs["sound"] = not bool(self.prefs["sound"])
         self.save_prefs()
-        self.toast("info", "♪ cues: %s"
-                   % ("on" if self.prefs["sound"] else "off"))
+        self.toast(
+            "info", "♪ cues: %s" % ("on" if self.prefs["sound"] else "off")
+        )
 
     def _toggle_boot(self) -> None:
         self.prefs["boot"] = not bool(self.prefs["boot"])
         self.save_prefs()
-        self.toast("info", "▮ boot self-test: %s"
-                   % ("on" if self.prefs["boot"] else "off"))
+        self.toast(
+            "info",
+            "▮ boot self-test: %s" % ("on" if self.prefs["boot"] else "off"),
+        )
 
     def _mitigate_failing(self) -> None:
-        failing = [
-            j["name"] for j in self.jobs if health(j)[0] == "fail"
-        ]
+        failing = [j["name"] for j in self.jobs if health(j)[0] == "fail"]
         self.open_mitigate(failing, "failing jobs")
 
     def _copy_chip(self, value: str) -> None:
@@ -3378,8 +3553,11 @@ class AppKeys(AppPalette):
         elif key == "S":
             self.sort_dir = -self.sort_dir
             self.recompute_view()
-            self.toast("info", "sort: %s%s" % (
-                self.sort_key, " ↓" if self.sort_dir < 0 else " ↑"))
+            self.toast(
+                "info",
+                "sort: %s%s"
+                % (self.sort_key, " ↓" if self.sort_dir < 0 else " ↑"),
+            )
         elif key == "f":
             idx = STATUS_SEGMENTS.index(self.status_filter)
             self.status_filter = STATUS_SEGMENTS[
@@ -3469,9 +3647,7 @@ class AppKeys(AppPalette):
 
     async def _key_dags(self, key: str) -> None:
         if key in ("j", "down"):
-            self.dags_sel = min(
-                max(0, len(self.dags) - 1), self.dags_sel + 1
-            )
+            self.dags_sel = min(max(0, len(self.dags) - 1), self.dags_sel + 1)
         elif key in ("k", "up"):
             self.dags_sel = max(0, self.dags_sel - 1)
         elif key == "enter":
@@ -3547,9 +3723,7 @@ class AppKeys(AppPalette):
                 self.tails.pop(idx).stop()
                 self.tail_sel = max(0, self.tail_sel - 1)
         elif key in ("j", "down"):
-            self.tail_sel = min(
-                max(0, len(self.tails) - 1), self.tail_sel + 1
-            )
+            self.tail_sel = min(max(0, len(self.tails) - 1), self.tail_sel + 1)
         elif key in ("k", "up"):
             self.tail_sel = max(0, self.tail_sel - 1)
         elif key == "t":
@@ -3615,8 +3789,10 @@ class AppKeys(AppPalette):
             self._log_search_jump(-1)
         elif key == "f" and self.log_tail is not None:
             self.log_tail.follow = not self.log_tail.follow
-            self.toast("info", "follow: %s"
-                       % ("on" if self.log_tail.follow else "off"))
+            self.toast(
+                "info",
+                "follow: %s" % ("on" if self.log_tail.follow else "off"),
+            )
         elif key == "t":
             self.timestamps = not self.timestamps
             self.prefs["timestamps"] = self.timestamps
@@ -3772,9 +3948,7 @@ class AppRender(AppKeys):
         self.term.paint(rows, self.theme.bg("bg"))
 
     # ---------------------------------------------------------------
-    def render_base(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_base(self, paint: Painter, cols: int, lines: int) -> List[str]:
         rows = [self.render_header(paint, cols)]
         rows.append(self.render_toolbar(paint, cols))
         if self.verdict is not None:
@@ -3796,9 +3970,7 @@ class AppRender(AppKeys):
         if self.version:
             left.append(paint.style("v%s " % self.version, "dim"))
         if self.job_set_id:
-            left.append(
-                paint.style("· %s " % self.job_set_id[:10], "dim")
-            )
+            left.append(paint.style("· %s " % self.job_set_id[:10], "dim"))
         node = self.node or {}
         stats = node.get("resources") or None
         if stats:
@@ -3815,14 +3987,14 @@ class AppRender(AppKeys):
         if self.connected:
             live = paint.style("● live ", "ok")
         else:
-            live = paint.style("◌ %s " % (self.conn_error or "offline"),
-                               "fail", bold=True)
+            live = paint.style(
+                "◌ %s " % (self.conn_error or "offline"), "fail", bold=True
+            )
         clock = paint.style(utc_clock() + " ", "bright")
         left_text = "".join(left)
         right_text = live + clock
         gap = cols - text_width(left_text) - text_width(right_text)
-        return paint.row(left_text, paint.style(" " * max(1, gap)),
-                         right_text)
+        return paint.row(left_text, paint.style(" " * max(1, gap)), right_text)
 
     def render_toolbar(self, paint: Painter, cols: int) -> str:
         filter_active = self.focus == "filter"
@@ -3849,16 +4021,16 @@ class AppRender(AppKeys):
             )
         spans.append(
             paint.style(
-                "  sort:%s%s" % (
-                    self.sort_key, "↓" if self.sort_dir < 0 else "↑"),
+                "  sort:%s%s"
+                % (self.sort_key, "↓" if self.sort_dir < 0 else "↑"),
                 "dim",
             )
         )
         poll_ms = int(self.prefs["poll_ms"])
         spans.append(
             paint.style(
-                "  poll:%s" % ("off" if not poll_ms
-                               else "%gs" % (poll_ms / 1000)),
+                "  poll:%s"
+                % ("off" if not poll_ms else "%gs" % (poll_ms / 1000)),
                 "dim",
             )
         )
@@ -3870,9 +4042,11 @@ class AppRender(AppKeys):
             if counts.get(key):
                 spans.append(
                     paint.style(
-                        "%s %d " % (paint.glyph(
-                            key, bool(self.prefs["ascii"])),
-                            counts[key]),
+                        "%s %d "
+                        % (
+                            paint.glyph(key, bool(self.prefs["ascii"])),
+                            counts[key],
+                        ),
                         color,
                     )
                 )
@@ -3882,7 +4056,10 @@ class AppRender(AppKeys):
         v = self.verdict or {}
         color = "fail" if v.get("sev") == "crit" else "warn"
         text = " %s %s — %s" % (
-            v.get("glyph", "▲"), v.get("head", ""), v.get("sub", ""))
+            v.get("glyph", "▲"),
+            v.get("head", ""),
+            v.get("sub", ""),
+        )
         if v.get("ago"):
             text += " · %s" % fmt_ago(v["ago"])
         text += "   (i timeline)"
@@ -3923,8 +4100,9 @@ class AppRender(AppKeys):
         # the name and command columns flex into whatever is left
         slack = cols - (sum(w for _, w in layout) + len(layout))
         if slack > 0:
-            names = [i for i, (c, _) in enumerate(layout)
-                     if c in ("cmd", "name")]
+            names = [
+                i for i, (c, _) in enumerate(layout) if c in ("cmd", "name")
+            ]
             for idx in names:
                 col, width = layout[idx]
                 extra = slack // len(names)
@@ -3936,20 +4114,24 @@ class AppRender(AppKeys):
     ) -> List[str]:
         layout = self._columns(cols)
         titles = {
-            "status": "status", "name": "name", "schedule": "schedule",
-            "last": "last", "next": "next", "dur": "dur",
-            "spark": "runs", "res": "cpu/mem", "owner": "owner",
+            "status": "status",
+            "name": "name",
+            "schedule": "schedule",
+            "last": "last",
+            "next": "next",
+            "dur": "dur",
+            "spark": "runs",
+            "res": "cpu/mem",
+            "owner": "owner",
             "cmd": "command",
         }
-        header = " ".join(
-            pad_to(titles[c], w) for c, w in layout
-        )
+        header = " ".join(pad_to(titles[c], w) for c, w in layout)
         rows = [paint.style(pad_to(" " + header, cols), "dim", bold=True)]
         view = self.view
         self.table_offset = scroll_window(
             len(view), body_rows, self.sel, self.table_offset
         )
-        visible = view[self.table_offset:self.table_offset + body_rows]
+        visible = view[self.table_offset : self.table_offset + body_rows]
         for offset, job in enumerate(visible):
             idx = self.table_offset + offset
             rows.append(
@@ -3959,8 +4141,11 @@ class AppRender(AppKeys):
             hint = (
                 "no jobs match the filter"
                 if self.jobs
-                else ("waiting for the daemon…"
-                      if not self.connected else "no jobs configured")
+                else (
+                    "waiting for the daemon…"
+                    if not self.connected
+                    else "no jobs configured"
+                )
             )
             rows.append(paint.style("   " + hint, "dim"))
         return rows
@@ -3976,9 +4161,13 @@ class AppRender(AppKeys):
         key, label = health(job)
         ascii_mode = bool(self.prefs["ascii"])
         color = {
-            "ok": "ok", "fail": "fail", "run": "run",
-            "pending": "pending", "disabled": "off",
-            "cancelled": "off", "unknown": "pending",
+            "ok": "ok",
+            "fail": "fail",
+            "run": "run",
+            "pending": "pending",
+            "disabled": "off",
+            "cancelled": "off",
+            "unknown": "pending",
         }[key]
         last = job.get("last_run") or {}
         cells: List[str] = []
@@ -3986,29 +4175,52 @@ class AppRender(AppKeys):
         for col, width in layout:
             if col == "status":
                 text = "%s %s" % (paint.glyph(key, ascii_mode), label)
-                cells.append(paint.style(pad_to(text, width), color, bg=bg,
-                                         bold=key in ("fail", "run")))
+                cells.append(
+                    paint.style(
+                        pad_to(text, width),
+                        color,
+                        bg=bg,
+                        bold=key in ("fail", "run"),
+                    )
+                )
             elif col == "name":
                 flash = job.get("name") in self.just_failed
-                cells.append(paint.style(
-                    pad_to(str(job.get("name", "")), width),
-                    "bright" if selected or flash else "fg",
-                    bg=bg, bold=flash))
+                cells.append(
+                    paint.style(
+                        pad_to(str(job.get("name", "")), width),
+                        "bright" if selected or flash else "fg",
+                        bg=bg,
+                        bold=flash,
+                    )
+                )
             elif col == "schedule":
-                cells.append(paint.style(
-                    pad_to(str(job.get("schedule", "")), width),
-                    "dim", bg=bg))
+                cells.append(
+                    paint.style(
+                        pad_to(str(job.get("schedule", "")), width),
+                        "dim",
+                        bg=bg,
+                    )
+                )
             elif col == "last":
                 retry = job.get("retry")
                 if retry:
                     text = "↻ try %s" % retry.get("attempt")
-                    cells.append(paint.style(pad_to(text, width),
-                                             "warn", bg=bg))
+                    cells.append(
+                        paint.style(pad_to(text, width), "warn", bg=bg)
+                    )
                 else:
-                    cells.append(paint.style(
-                        pad_to(fmt_ago(last.get("finished_at"))
-                               if last else "—", width),
-                        "fg", bg=bg))
+                    cells.append(
+                        paint.style(
+                            pad_to(
+                                fmt_ago(last.get("finished_at"))
+                                if last
+                                else "—",
+                                width,
+                            ),
+                            "fg",
+                            bg=bg,
+                        )
+                    )
             elif col == "next":
                 if job.get("running"):
                     text = "· · ·"
@@ -4018,20 +4230,29 @@ class AppRender(AppKeys):
                     text = fmt_in(self.next_run_seconds(job))
                 cells.append(paint.style(pad_to(text, width), "fg", bg=bg))
             elif col == "dur":
-                cells.append(paint.style(
-                    pad_to(fmt_duration(last.get("duration"))
-                           if last else "—", width),
-                    "dim", bg=bg))
+                cells.append(
+                    paint.style(
+                        pad_to(
+                            fmt_duration(last.get("duration"))
+                            if last
+                            else "—",
+                            width,
+                        ),
+                        "dim",
+                        bg=bg,
+                    )
+                )
             elif col == "spark":
                 spark = "".join(
                     paint.style(ch, ck, bg=bg)
                     for ch, ck in spark_cells(
-                        job.get("history") or [], width - 1)
+                        job.get("history") or [], width - 1
+                    )
                 )
-                pad_w = width - min(
-                    width - 1, len(job.get("history") or []))
-                cells.append(spark + paint.style(" " * max(0, pad_w),
-                                                 "fg", bg=bg))
+                pad_w = width - min(width - 1, len(job.get("history") or []))
+                cells.append(
+                    spark + paint.style(" " * max(0, pad_w), "fg", bg=bg)
+                )
             elif col == "res":
                 res = job.get("running_resources")
                 if res:
@@ -4039,22 +4260,30 @@ class AppRender(AppKeys):
                         fmt_percent(res.get("cpu_percent")),
                         fmt_bytes(res.get("rss_bytes")),
                     )
-                    cells.append(paint.style(pad_to(text, width),
-                                             "run", bg=bg))
+                    cells.append(
+                        paint.style(pad_to(text, width), "run", bg=bg)
+                    )
                 else:
-                    cells.append(paint.style(pad_to("", width),
-                                             "dim", bg=bg))
+                    cells.append(paint.style(pad_to("", width), "dim", bg=bg))
             elif col == "owner":
                 owner = job.get("clusterOwner")
-                text = str(owner) if owner else (
-                    "∅" if "clusterOwner" in job else "")
+                text = (
+                    str(owner)
+                    if owner
+                    else ("∅" if "clusterOwner" in job else "")
+                )
                 cells.append(paint.style(pad_to(text, width), "dim", bg=bg))
             elif col == "cmd":
-                cells.append(paint.style(
-                    pad_to(str(job.get("command", "")), width),
-                    "dim", bg=bg))
-        marker = paint.style("▎" if selected else " ",
-                             "accent", bg=bg, bold=True)
+                cells.append(
+                    paint.style(
+                        pad_to(str(job.get("command", "")), width),
+                        "dim",
+                        bg=bg,
+                    )
+                )
+        marker = paint.style(
+            "▎" if selected else " ", "accent", bg=bg, bold=True
+        )
         row = marker + (paint.style(" ", "fg", bg=bg).join(cells))
         return cut_to_width(paint.row(row), cols)
 
@@ -4074,15 +4303,15 @@ class AppRender(AppKeys):
     ) -> List[str]:
         if not self.toasts:
             return rows
-        colors = {"ok": "ok", "fail": "fail", "warn": "warn",
-                  "info": "accent"}
+        colors = {"ok": "ok", "fail": "fail", "warn": "warn", "info": "accent"}
         for offset, (kind, message, _) in enumerate(self.toasts[-4:]):
             row_idx = lines - 2 - offset
             if row_idx < 0:
                 break
             body = " %s " % truncate(message, max(10, cols // 2))
-            toast = paint.style(body, "bright",
-                                bg=colors.get(kind, "accent"), bold=True)
+            toast = paint.style(
+                body, "bright", bg=colors.get(kind, "accent"), bold=True
+            )
             width = text_width(body)
             base = cut_to_width(rows[row_idx], cols - width - 1)
             rows[row_idx] = base + toast
@@ -4095,8 +4324,7 @@ class AppRender(AppKeys):
         ascii_mode = bool(self.prefs["ascii"])
         jobs = sorted(
             self.jobs,
-            key=lambda j: (WB_ORDER.get(health(j)[0], 9),
-                           j.get("name", "")),
+            key=lambda j: (WB_ORDER.get(health(j)[0], 9), j.get("name", "")),
         )
         stale = self.stale()
         rows: List[str] = []
@@ -4104,9 +4332,14 @@ class AppRender(AppKeys):
             rows.append(self.render_verdict_bar(paint, cols))
         if stale:
             banner = "  ◌ NO SIGNAL — data is stale  "
-            rows.append(paint.style(
-                pad_to(banner.center(cols), cols),
-                "bright", bg="fail", bold=True))
+            rows.append(
+                paint.style(
+                    pad_to(banner.center(cols), cols),
+                    "bright",
+                    bg="fail",
+                    bold=True,
+                )
+            )
         tile_w = max(20, min(30, cols // max(1, min(len(jobs), 4))))
         per_row = max(1, cols // (tile_w + 1))
         tile_rows = 3
@@ -4115,14 +4348,18 @@ class AppRender(AppKeys):
         max_tiles = max(per_row, per_row * max(1, avail // (tile_rows + 1)))
         shown = jobs[:max_tiles]
         for chunk_start in range(0, len(shown), per_row):
-            chunk = shown[chunk_start:chunk_start + per_row]
+            chunk = shown[chunk_start : chunk_start + per_row]
             lines3: List[List[str]] = [[], [], []]
             for job in chunk:
                 key, _label = health(job)
                 color = {
-                    "ok": "ok", "fail": "fail", "run": "run",
-                    "pending": "pending", "disabled": "off",
-                    "cancelled": "off", "unknown": "pending",
+                    "ok": "ok",
+                    "fail": "fail",
+                    "run": "run",
+                    "pending": "pending",
+                    "disabled": "off",
+                    "cancelled": "off",
+                    "unknown": "pending",
                 }[key]
                 last = job.get("last_run") or {}
                 name = truncate(str(job.get("name", "")), tile_w - 4)
@@ -4136,23 +4373,32 @@ class AppRender(AppKeys):
                 elif not job.get("enabled"):
                     line2 = "—"
                 else:
-                    line2 = ("stale" if stale
-                             else fmt_in(self.next_run_seconds(job)))
+                    line2 = (
+                        "stale"
+                        if stale
+                        else fmt_in(self.next_run_seconds(job))
+                    )
                 spark = sparkline(job.get("history") or [], tile_w - 4)
                 dim_all = stale
-                lines3[0].append(paint.style(
-                    pad_to(" " + head, tile_w), "bright" if not dim_all
-                    else "dim", bg=color if key == "fail" and not dim_all
-                    else None, bold=key == "fail"))
-                lines3[1].append(paint.style(
-                    pad_to("  " + line2, tile_w),
-                    color if not dim_all else "dim"))
-                lines3[2].append(paint.style(
-                    pad_to("  " + spark, tile_w),
-                    "dim"))
+                lines3[0].append(
+                    paint.style(
+                        pad_to(" " + head, tile_w),
+                        "bright" if not dim_all else "dim",
+                        bg=color if key == "fail" and not dim_all else None,
+                        bold=key == "fail",
+                    )
+                )
+                lines3[1].append(
+                    paint.style(
+                        pad_to("  " + line2, tile_w),
+                        color if not dim_all else "dim",
+                    )
+                )
+                lines3[2].append(
+                    paint.style(pad_to("  " + spark, tile_w), "dim")
+                )
             for triple in lines3:
-                rows.append(cut_to_width(
-                    paint.row(" ".join(triple)), cols))
+                rows.append(cut_to_width(paint.row(" ".join(triple)), cols))
             rows.append(paint.row())
         while len(rows) < lines - 1:
             rows.append(paint.row())
@@ -4161,21 +4407,28 @@ class AppRender(AppKeys):
         for job in self.jobs:
             counts[health(job)[0]] = counts.get(health(job)[0], 0) + 1
         foot = " %d jobs · %d fail · %d run · %d ok" % (
-            len(self.jobs), counts.get("fail", 0),
-            counts.get("run", 0), counts.get("ok", 0))
+            len(self.jobs),
+            counts.get("fail", 0),
+            counts.get("run", 0),
+            counts.get("ok", 0),
+        )
         if self.any_failing and not self.alarm_ack:
             foot += " · ◔ ALARM (a to ack)"
         right = "esc/w exit · %s " % utc_clock()
         gap = cols - text_width(foot) - text_width(right)
-        rows.append(cut_to_width(paint.row(
-            paint.style(foot, "fg"),
-            paint.style(" " * max(1, gap)),
-            paint.style(right, "dim")), cols))
+        rows.append(
+            cut_to_width(
+                paint.row(
+                    paint.style(foot, "fg"),
+                    paint.style(" " * max(1, gap)),
+                    paint.style(right, "dim"),
+                ),
+                cols,
+            )
+        )
         return rows
 
-    def render_zen(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_zen(self, paint: Painter, cols: int, lines: int) -> List[str]:
         """The calm all-clear field: one breathing dot per job, pulsing
         on its real next fire -- a terminal read of the web screensaver."""
         rows = [paint.row() for _ in range(lines)]
@@ -4196,11 +4449,11 @@ class AppRender(AppKeys):
             row = rows[row_idx]
             pad_needed = col_idx - text_width(row)
             if pad_needed >= 0:
-                rows[row_idx] = row + " " * pad_needed + paint.style(
-                    dot, color)
+                rows[row_idx] = (
+                    row + " " * pad_needed + paint.style(dot, color)
+                )
         label = "all clear · %s" % utc_clock()
-        rows[lines - 2] = paint.style(
-            pad_to(label.center(cols), cols), "dim")
+        rows[lines - 2] = paint.style(pad_to(label.center(cols), cols), "dim")
         return rows
 
 
@@ -4249,9 +4502,7 @@ class AppOverlays(AppRender):
         return cast(List[str], renderer(paint, cols, lines))
 
     # ---- help --------------------------------------------------------
-    def render_help(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_help(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(64, cols - 4)
         body = [paint.style("the web dashboard's keys", "dim")]
         for keycap, action in HELP_ROWS:
@@ -4270,9 +4521,10 @@ class AppOverlays(AppRender):
         self.panel_scroll = max(
             0, min(self.panel_scroll, max(0, len(body) - visible))
         )
-        body = body[self.panel_scroll:self.panel_scroll + visible]
-        return panel_frame(paint, "keyboard shortcuts", body, width,
-                           "esc close · j/k scroll")
+        body = body[self.panel_scroll : self.panel_scroll + visible]
+        return panel_frame(
+            paint, "keyboard shortcuts", body, width, "esc close · j/k scroll"
+        )
 
     # ---- palette -----------------------------------------------------
     def render_palette(
@@ -4280,20 +4532,16 @@ class AppOverlays(AppRender):
     ) -> List[str]:
         width = min(72, cols - 4)
         matches = self.palette_matches()
-        self.palette_sel = min(
-            self.palette_sel, max(0, len(matches) - 1)
-        )
+        self.palette_sel = min(self.palette_sel, max(0, len(matches) - 1))
         query = self.inputs["palette"]
         body = [
             paint.style("⌕ ", "accent", bold=True)
             + paint.style(query + "▌", "bright")
         ]
         visible = max(4, min(lines - 8, 14))
-        start = scroll_window(
-            len(matches), visible, self.palette_sel, 0
-        )
+        start = scroll_window(len(matches), visible, self.palette_sel, 0)
         for idx, (icon, label, _action) in enumerate(
-            matches[start:start + visible]
+            matches[start : start + visible]
         ):
             selected = start + idx == self.palette_sel
             body.append(
@@ -4306,8 +4554,13 @@ class AppOverlays(AppRender):
             )
         if not matches:
             body.append(paint.style("  no matching command", "dim"))
-        return panel_frame(paint, "command palette", body, width,
-                           "↑/↓ move · enter run · esc close")
+        return panel_frame(
+            paint,
+            "command palette",
+            body,
+            width,
+            "↑/↓ move · enter run · esc close",
+        )
 
     # ---- settings ----------------------------------------------------
     def settings_rows(
@@ -4335,13 +4588,17 @@ class AppOverlays(AppRender):
                 if key in ("wrap", "timestamps"):
                     setattr(self, key, bool(prefs[key]))
                 self.mark()
+
             return action
 
         onoff = lambda k: "on" if prefs[k] else "off"  # noqa: E731
         return [
             ("Theme", "%s" % self.theme.name, self.cycle_theme),
-            ("Light / dark", "paper" if prefs["light"] else "phosphor",
-             self.toggle_light_dark),
+            (
+                "Light / dark",
+                "paper" if prefs["light"] else "phosphor",
+                self.toggle_light_dark,
+            ),
             ("Color vision", str(prefs["cvd"]), self.cycle_cvd),
             ("Refresh interval", poll_label(), self.cycle_poll),
             ("Wrap log lines", onoff("wrap"), flip("wrap")),
@@ -4349,8 +4606,7 @@ class AppOverlays(AppRender):
             ("Compact density", onoff("compact"), flip("compact")),
             ("Audible cues (bell)", onoff("sound"), flip("sound")),
             ("Zen screensaver", onoff("zen"), flip("zen")),
-            ("Zen idle", "%ds" % int(prefs["zen_idle_s"]),
-             zen_idle_cycle),
+            ("Zen idle", "%ds" % int(prefs["zen_idle_s"]), zen_idle_cycle),
             ("Boot self-test", onoff("boot"), flip("boot")),
             ("ASCII glyphs", onoff("ascii"), flip("ascii")),
         ]
@@ -4378,27 +4634,34 @@ class AppOverlays(AppRender):
                 )
             )
         body.append(paint.style("", "fg"))
-        body.append(paint.style(
-            " prefs file: %s" % (self.prefs_file or prefs_path()), "dim"))
-        return panel_frame(paint, "settings", body, width,
-                           "j/k move · enter change · esc close")
+        body.append(
+            paint.style(
+                " prefs file: %s" % (self.prefs_file or prefs_path()), "dim"
+            )
+        )
+        return panel_frame(
+            paint,
+            "settings",
+            body,
+            width,
+            "j/k move · enter change · esc close",
+        )
 
     # ---- token modal -------------------------------------------------
-    def render_token(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_token(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(56, cols - 4)
         masked = "•" * len(self.inputs["token"])
         body = [
             paint.style("the daemon wants a bearer token", "fg"),
-            paint.style("(web.authToken; stored only for this session)",
-                        "dim"),
+            paint.style(
+                "(web.authToken; stored only for this session)", "dim"
+            ),
             paint.style("", "fg"),
-            paint.style("⚿ ", "accent") + paint.style(
-                masked + "▌", "bright"),
+            paint.style("⚿ ", "accent") + paint.style(masked + "▌", "bright"),
         ]
-        return panel_frame(paint, "access token", body, width,
-                           "enter save · esc cancel")
+        return panel_frame(
+            paint, "access token", body, width, "enter save · esc cancel"
+        )
 
     # ---- incident timeline ------------------------------------------
     def timeline_entries(
@@ -4436,21 +4699,22 @@ class AppOverlays(AppRender):
         body = []
         blast = set(self.incident_set)
         visible = max(4, lines - 8)
-        self.timeline_sel = min(
-            self.timeline_sel, max(0, len(entries) - 1)
-        )
-        start = scroll_window(
-            len(entries), visible, self.timeline_sel, 0
-        )
-        for idx, entry in enumerate(entries[start:start + visible]):
+        self.timeline_sel = min(self.timeline_sel, max(0, len(entries) - 1))
+        start = scroll_window(len(entries), visible, self.timeline_sel, 0)
+        for idx, entry in enumerate(entries[start : start + visible]):
             name, fin, outcome, exit_code, reason, duration = entry
             selected = start + idx == self.timeline_sel
             key = {
-                "failure": "fail", "cancelled": "cancelled",
+                "failure": "fail",
+                "cancelled": "cancelled",
                 "unknown": "unknown",
             }.get(outcome, "ok")
-            color = {"fail": "fail", "cancelled": "off",
-                     "unknown": "pending", "ok": "ok"}[key]
+            color = {
+                "fail": "fail",
+                "cancelled": "off",
+                "unknown": "pending",
+                "ok": "ok",
+            }[key]
             line = "%s %s %s" % (
                 pad_to(fmt_ago(fin), 9),
                 paint.glyph(key, ascii_mode),
@@ -4458,8 +4722,7 @@ class AppOverlays(AppRender):
             )
             detail = ""
             if outcome == "failure":
-                detail = "exit %s" % (
-                    "?" if exit_code is None else exit_code)
+                detail = "exit %s" % ("?" if exit_code is None else exit_code)
                 if reason:
                     detail += " · %s" % reason
             if duration is not None:
@@ -4468,22 +4731,33 @@ class AppOverlays(AppRender):
                 detail += "  ◉ blast radius"
             body.append(
                 paint.style(
-                    line, color, bg="sel" if selected else None,
-                    bold=selected)
+                    line, color, bg="sel" if selected else None, bold=selected
+                )
                 + paint.style(
                     truncate(detail, max(0, width - 42)),
-                    "dim", bg="sel" if selected else None)
+                    "dim",
+                    bg="sel" if selected else None,
+                )
             )
         if not entries:
-            body.append(paint.style(
-                "  nothing has finished yet"
-                if not self.timeline_fail_only
-                else "  nothing failing — clear the filter (f)", "dim"))
+            body.append(
+                paint.style(
+                    "  nothing has finished yet"
+                    if not self.timeline_fail_only
+                    else "  nothing failing — clear the filter (f)",
+                    "dim",
+                )
+            )
         title = "incident timeline%s" % (
-            " — failing only" if self.timeline_fail_only else "")
-        return panel_frame(paint, title, body, width,
-                           "j/k move · enter open · f fail-only · "
-                           "m mitigate · esc close")
+            " — failing only" if self.timeline_fail_only else ""
+        )
+        return panel_frame(
+            paint,
+            title,
+            body,
+            width,
+            "j/k move · enter open · f fail-only · m mitigate · esc close",
+        )
 
     # ---- mitigate console -------------------------------------------
     def render_mitigate(
@@ -4498,7 +4772,9 @@ class AppOverlays(AppRender):
                     "s" if len(self.mitigate_names) != 1 else "",
                     self.mitigate_label,
                 ),
-                "bright", bold=True),
+                "bright",
+                bold=True,
+            ),
         ]
         preview = ", ".join(self.mitigate_names[:6])
         if len(self.mitigate_names) > 6:
@@ -4507,13 +4783,21 @@ class AppOverlays(AppRender):
         body.append(paint.style("", "fg"))
         log_rows = max(3, min(lines - 12, 12))
         for line in self.mitigate_log[-log_rows:]:
-            color = ("ok" if "✓" in line
-                     else "fail" if "✕" in line or "!" in line else "fg")
+            color = (
+                "ok"
+                if "✓" in line
+                else "fail"
+                if "✕" in line or "!" in line
+                else "fg"
+            )
             body.append(paint.style(" " + line, color))
         if self.mitigate_running:
             body.append(paint.style(" … running (a to abort)", "warn"))
         return panel_frame(
-            paint, "mitigate console", body, width,
+            paint,
+            "mitigate console",
+            body,
+            width,
             "s start all · x cancel all · a abort · y writeup · esc close",
         )
 
@@ -4524,8 +4808,7 @@ class AppOverlays(AppRender):
         width = min(64, cols - 4)
         expr = self.inputs["sandbox"]
         body = [
-            paint.style("◴ ", "accent") + paint.style(expr + "▌",
-                                                      "bright"),
+            paint.style("◴ ", "accent") + paint.style(expr + "▌", "bright"),
             paint.style("", "fg"),
         ]
         if expr.strip():
@@ -4536,32 +4819,36 @@ class AppOverlays(AppRender):
                 parses = True
             except (ValueError, KeyError):
                 parses = expr.strip().lower() == "@reboot"
-            body.append(paint.style(
-                " " + text, "ok" if parses else "fail"))
+            body.append(paint.style(" " + text, "ok" if parses else "fail"))
             if parses and valid:
                 fires = next_fires(expr.strip(), 6)
                 if fires:
                     body.append(paint.style("", "fg"))
                     body.append(paint.style(" next fires (UTC):", "dim"))
                     for when in fires:
-                        body.append(paint.style(
-                            "   %s" % when.strftime("%Y-%m-%d %H:%M:%S"),
-                            "fg"))
+                        body.append(
+                            paint.style(
+                                "   %s" % when.strftime("%Y-%m-%d %H:%M:%S"),
+                                "fg",
+                            )
+                        )
             elif not parses:
-                body.append(paint.style(
-                    "  the daemon's engine rejects this expression",
-                    "dim"))
+                body.append(
+                    paint.style(
+                        "  the daemon's engine rejects this expression", "dim"
+                    )
+                )
         else:
-            body.append(paint.style(
-                " type a cron expression — e.g. */5 9-17 * * mon-fri",
-                "dim"))
-        return panel_frame(paint, "cron sandbox", body, width,
-                           "esc close")
+            body.append(
+                paint.style(
+                    " type a cron expression — e.g. */5 9-17 * * mon-fri",
+                    "dim",
+                )
+            )
+        return panel_frame(paint, "cron sandbox", body, width, "esc close")
 
     # ---- DAGs index --------------------------------------------------
-    def render_dags(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_dags(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(76, cols - 4)
         body = []
         self.dags_sel = min(self.dags_sel, max(0, len(self.dags) - 1))
@@ -4569,30 +4856,42 @@ class AppOverlays(AppRender):
             selected = idx == self.dags_sel
             name = str(dag.get("name", ""))
             tasks = dag.get("tasks")
-            count = (len(tasks) if isinstance(tasks, (list, dict))
-                     else dag.get("taskCount", "?"))
+            count = (
+                len(tasks)
+                if isinstance(tasks, (list, dict))
+                else dag.get("taskCount", "?")
+            )
             sched = str(dag.get("schedule", "") or "manual")
             body.append(
                 paint.style(
                     pad_to(" ⧉ %s" % name, 28),
                     "bright" if selected else "fg",
-                    bg="sel" if selected else None, bold=selected)
+                    bg="sel" if selected else None,
+                    bold=selected,
+                )
                 + paint.style(
                     pad_to("%s tasks" % count, 12),
-                    "dim", bg="sel" if selected else None)
+                    "dim",
+                    bg="sel" if selected else None,
+                )
                 + paint.style(
                     truncate(sched, max(0, width - 46)),
-                    "dim", bg="sel" if selected else None)
+                    "dim",
+                    bg="sel" if selected else None,
+                )
             )
         if not self.dags:
             body.append(paint.style("  no DAGs configured", "dim"))
-        return panel_frame(paint, "orchestration DAGs", body, width,
-                           "enter open · t trigger · r reload · esc close")
+        return panel_frame(
+            paint,
+            "orchestration DAGs",
+            body,
+            width,
+            "enter open · t trigger · r reload · esc close",
+        )
 
     # ---- durable-state inspector ------------------------------------
-    def render_state(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_state(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(80, cols - 4)
         data = self.state_data or {}
         body = []
@@ -4600,24 +4899,36 @@ class AppOverlays(AppRender):
         tab_spans = []
         for tab in tabs:
             active = tab == self.state_tab
-            tab_spans.append(paint.style(
-                " %s " % tab, "bright" if active else "dim",
-                bg="sel" if active else None, bold=active))
+            tab_spans.append(
+                paint.style(
+                    " %s " % tab,
+                    "bright" if active else "dim",
+                    bg="sel" if active else None,
+                    bold=active,
+                )
+            )
         body.append("".join(tab_spans))
         body.append(paint.style("", "fg"))
         if not data.get("enabled"):
-            body.append(paint.style(
-                " durable state is not configured (no state: block)",
-                "dim"))
-            return panel_frame(paint, "state inspector", body, width,
-                               "esc close")
+            body.append(
+                paint.style(
+                    " durable state is not configured (no state: block)", "dim"
+                )
+            )
+            return panel_frame(
+                paint, "state inspector", body, width, "esc close"
+            )
         if self.state_tab == "view":
             body.extend(self._render_state_view(paint, data, width))
         else:
             body.extend(self._render_state_listing(paint, width, lines))
         return panel_frame(
-            paint, "state inspector", body, width,
-            "←/→ tabs · j/k move · enter inspect · r refresh · esc close")
+            paint,
+            "state inspector",
+            body,
+            width,
+            "←/→ tabs · j/k move · enter inspect · r refresh · esc close",
+        )
 
     def _render_state_view(
         self, paint: Painter, data: Dict[str, Any], width: int
@@ -4630,43 +4941,62 @@ class AppOverlays(AppRender):
                     body.append(
                         paint.style(pad_to(" %s" % name, 30), "dim")
                         + paint.style(
-                            truncate(json.dumps(value, default=str),
-                                     width - 36), "fg"))
+                            truncate(
+                                json.dumps(value, default=str), width - 36
+                            ),
+                            "fg",
+                        )
+                    )
         node = data.get("node")
         if isinstance(node, dict):
             retries = node.get("retries") or []
             slots = node.get("slots") or []
-            body.append(paint.style(
-                " armed retries: %d · held slots: %d"
-                % (len(retries), len(slots)), "fg"))
+            body.append(
+                paint.style(
+                    " armed retries: %d · held slots: %d"
+                    % (len(retries), len(slots)),
+                    "fg",
+                )
+            )
         docs = data.get("documents")
         if isinstance(docs, dict):
-            body.append(paint.style(
-                " document namespaces: %d (documents tab)" % len(docs),
-                "dim"))
+            body.append(
+                paint.style(
+                    " document namespaces: %d (documents tab)" % len(docs),
+                    "dim",
+                )
+            )
         records = data.get("records")
         if isinstance(records, dict):
-            body.append(paint.style(
-                " record streams: %d (records tab)" % len(records),
-                "dim"))
+            body.append(
+                paint.style(
+                    " record streams: %d (records tab)" % len(records), "dim"
+                )
+            )
         return body
 
     def _render_state_listing(
         self, paint: Painter, width: int, lines: int
     ) -> List[str]:
         body = []
-        names = (self._state_namespaces()
-                 if self.state_tab == "documents"
-                 else self._state_streams())
+        names = (
+            self._state_namespaces()
+            if self.state_tab == "documents"
+            else self._state_streams()
+        )
         self.state_sel = min(self.state_sel, max(0, len(names) - 1))
         visible = max(3, min(8, lines - 16))
         start = scroll_window(len(names), visible, self.state_sel, 0)
-        for idx, name in enumerate(names[start:start + visible]):
+        for idx, name in enumerate(names[start : start + visible]):
             selected = start + idx == self.state_sel
-            body.append(paint.style(
-                pad_to(" %s" % name, width - 6),
-                "bright" if selected else "fg",
-                bg="sel" if selected else None, bold=selected))
+            body.append(
+                paint.style(
+                    pad_to(" %s" % name, width - 6),
+                    "bright" if selected else "fg",
+                    bg="sel" if selected else None,
+                    bold=selected,
+                )
+            )
         if not names:
             body.append(paint.style("  nothing here yet", "dim"))
         detail = self.state_detail or {}
@@ -4674,9 +5004,13 @@ class AppOverlays(AppRender):
         if items:
             body.append(paint.style("", "fg"))
             for item in items[: max(3, lines - 18)]:
-                body.append(paint.style(
-                    " " + truncate(json.dumps(item, default=str),
-                                   width - 8), "dim"))
+                body.append(
+                    paint.style(
+                        " "
+                        + truncate(json.dumps(item, default=str), width - 8),
+                        "dim",
+                    )
+                )
         return body
 
     # ---- cluster panel ----------------------------------------------
@@ -4687,92 +5021,121 @@ class AppOverlays(AppRender):
         data = self.cluster or {}
         body = []
         if not data.get("enabled"):
-            body.append(paint.style(
-                " no cluster configured (single node)", "dim"))
+            body.append(
+                paint.style(" no cluster configured (single node)", "dim")
+            )
             return panel_frame(paint, "cluster", body, width, "esc close")
         node_stats = data.get("node_stats") or {}
-        role = ("leader" if data.get("is_leader")
-                else "follower (leader: %s)" % data["leader"]
-                if data.get("quorate") and data.get("leader")
-                else "follower" if data.get("quorate")
-                else "no quorum")
+        role = (
+            "leader"
+            if data.get("is_leader")
+            else "follower (leader: %s)" % data["leader"]
+            if data.get("quorate") and data.get("leader")
+            else "follower"
+            if data.get("quorate")
+            else "no quorum"
+        )
         line = " %s · %s · %s" % (
-            data.get("node_name", "?"), data.get("backend", "gossip"),
-            role)
+            data.get("node_name", "?"),
+            data.get("backend", "gossip"),
+            role,
+        )
         if node_stats:
             line += " · this node %s cpu / %s mem" % (
                 fmt_percent(node_stats.get("cpu_percent")),
-                fmt_percent(node_stats.get("mem_percent")))
+                fmt_percent(node_stats.get("mem_percent")),
+            )
         body.append(paint.style(line, "bright", bold=True))
         alert = cluster_alert(data)
         if alert and alert.get("bad"):
-            body.append(paint.style(" ☢ %s" % alert["reason"], "fail",
-                                    bold=True))
+            body.append(
+                paint.style(" ☢ %s" % alert["reason"], "fail", bold=True)
+            )
         body.append(paint.style("", "fg"))
         peers = data.get("peers") or []
         if peers:
             for peer in peers[: max(3, lines - 14)]:
                 if not isinstance(peer, dict):
                     continue
-                name = str(peer.get("node_name") or peer.get("name")
-                           or peer.get("host") or "?")
+                name = str(
+                    peer.get("node_name")
+                    or peer.get("name")
+                    or peer.get("host")
+                    or "?"
+                )
                 status = str(peer.get("status", "?"))
                 agreed = peer.get("agree")
                 if agreed is None:
                     agreed = peer.get("agreed")
-                mark = ("✓" if agreed else "✕"
-                        if agreed is not None else "·")
-                color = ("ok" if agreed else "fail"
-                         if agreed is not None else "dim")
+                mark = "✓" if agreed else "✕" if agreed is not None else "·"
+                color = (
+                    "ok" if agreed else "fail" if agreed is not None else "dim"
+                )
                 extra = ""
                 stats = peer.get("node_stats") or {}
                 if stats:
                     extra = " · %s cpu %s mem" % (
                         fmt_percent(stats.get("cpu_percent")),
-                        fmt_percent(stats.get("mem_percent")))
+                        fmt_percent(stats.get("mem_percent")),
+                    )
                 owns = peer.get("owns")
                 if owns is not None:
                     extra += " · owns %s" % owns
-                body.append(paint.style(
-                    " %s %s %s%s" % (mark, pad_to(name, 22),
-                                     pad_to(status, 12), extra), color))
+                body.append(
+                    paint.style(
+                        " %s %s %s%s"
+                        % (mark, pad_to(name, 22), pad_to(status, 12), extra),
+                        color,
+                    )
+                )
         lease = data.get("lease")
         if isinstance(lease, dict) and lease:
             body.append(paint.style("", "fg"))
-            labels = [("holder", "held by"), ("expiry", "expires"),
-                      ("fence", "fence"), ("electionName", "election"),
-                      ("identity", "our identity"), ("path", "store path")]
+            labels = [
+                ("holder", "held by"),
+                ("expiry", "expires"),
+                ("fence", "fence"),
+                ("electionName", "election"),
+                ("identity", "our identity"),
+                ("path", "store path"),
+            ]
             for key, label in labels:
                 if lease.get(key) is None:
                     continue
                 value = str(lease[key])
                 if key == "expiry":
                     secs = (parse_iso(value) or 0) - time.time()
-                    value = ("%s · %s" % (fmt_in(secs)
-                                          if secs > 0 else "expired",
-                                          value.replace("T", " ")[:19]))
-                ok_mark = (key == "holder"
-                           and lease.get("holder") is not None
-                           and lease.get("holder") == lease.get(
-                               "identity"))
+                    value = "%s · %s" % (
+                        fmt_in(secs) if secs > 0 else "expired",
+                        value.replace("T", " ")[:19],
+                    )
+                ok_mark = (
+                    key == "holder"
+                    and lease.get("holder") is not None
+                    and lease.get("holder") == lease.get("identity")
+                )
                 body.append(
                     paint.style(pad_to(" %s" % label, 16), "dim")
-                    + paint.style(truncate(value, width - 22),
-                                  "ok" if ok_mark else "fg"))
-        return panel_frame(paint, "cluster", body, width,
-                           "j/k scroll · esc close")
+                    + paint.style(
+                        truncate(value, width - 22), "ok" if ok_mark else "fg"
+                    )
+                )
+        return panel_frame(
+            paint, "cluster", body, width, "j/k scroll · esc close"
+        )
 
     # ---- fleet matrix ------------------------------------------------
-    def render_fleet(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_fleet(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(cols - 4, 110)
         data = self.fleet or {}
         body = []
         if not data.get("enabled"):
-            body.append(paint.style(
-                " fleet view needs a cluster with a node-to-node channel",
-                "dim"))
+            body.append(
+                paint.style(
+                    " fleet view needs a cluster with a node-to-node channel",
+                    "dim",
+                )
+            )
             return panel_frame(paint, "fleet", body, width, "esc close")
         nodes = [n for n in data.get("nodes", []) if isinstance(n, dict)]
         names: Set[str] = set()
@@ -4783,9 +5146,11 @@ class AppOverlays(AppRender):
         def failing(job_name: str) -> bool:
             for node in nodes:
                 cell = (node.get("jobs") or {}).get(job_name)
-                if (cell and not cell.get("running")
-                        and (cell.get("last") or {}).get("outcome")
-                        == "failure"):
+                if (
+                    cell
+                    and not cell.get("running")
+                    and (cell.get("last") or {}).get("outcome") == "failure"
+                ):
                     return True
             return False
 
@@ -4799,7 +5164,10 @@ class AppOverlays(AppRender):
             if cell.get("running")
         )
         summary = " %d nodes · %d jobs · %d running" % (
-            len(nodes), len(names), running_cells)
+            len(nodes),
+            len(names),
+            running_cells,
+        )
         if fail_count:
             summary += " · %d failing" % fail_count
         if self.fleet_fail_only:
@@ -4816,11 +5184,12 @@ class AppOverlays(AppRender):
         ascii_mode = bool(self.prefs["ascii"])
         visible = max(3, lines - 12)
         self.panel_scroll = max(
-            0, min(self.panel_scroll, max(0, len(rows) - visible)))
-        for job_name in rows[self.panel_scroll:
-                             self.panel_scroll + visible]:
-            spans = [paint.style(pad_to(" " + truncate(job_name, 22), 24),
-                                 "fg")]
+            0, min(self.panel_scroll, max(0, len(rows) - visible))
+        )
+        for job_name in rows[self.panel_scroll : self.panel_scroll + visible]:
+            spans = [
+                paint.style(pad_to(" " + truncate(job_name, 22), 24), "fg")
+            ]
             for node in nodes:
                 cell = (node.get("jobs") or {}).get(job_name)
                 if node.get("jobs") is None:
@@ -4829,57 +5198,78 @@ class AppOverlays(AppRender):
                     text, color = "—", "dim"
                 elif cell.get("running"):
                     text, color = (
-                        paint.glyph("run", ascii_mode) + " run", "run")
+                        paint.glyph("run", ascii_mode) + " run",
+                        "run",
+                    )
                 elif cell.get("last"):
-                    outcome = str((cell["last"] or {}).get(
-                        "outcome", ""))
-                    key = {"failure": "fail", "cancelled": "cancelled",
-                           "unknown": "unknown"}.get(outcome, "ok")
+                    outcome = str((cell["last"] or {}).get("outcome", ""))
+                    key = {
+                        "failure": "fail",
+                        "cancelled": "cancelled",
+                        "unknown": "unknown",
+                    }.get(outcome, "ok")
                     text = "%s %s %s" % (
                         paint.glyph(key, ascii_mode),
                         "ok" if outcome == "success" else outcome[:6],
-                        ago_short((cell["last"] or {}).get(
-                            "finished_at")))
-                    color = {"fail": "fail", "cancelled": "off",
-                             "unknown": "pending", "ok": "ok"}[key]
+                        ago_short((cell["last"] or {}).get("finished_at")),
+                    )
+                    color = {
+                        "fail": "fail",
+                        "cancelled": "off",
+                        "unknown": "pending",
+                        "ok": "ok",
+                    }[key]
                 elif cell.get("enabled") is False:
                     text, color = (
                         paint.glyph("disabled", ascii_mode) + " off",
-                        "off")
+                        "off",
+                    )
                 else:
                     text, color = paint.glyph("pending", ascii_mode), "dim"
-                spans.append(paint.style(
-                    pad_to(truncate(text, cell_w - 1), cell_w), color))
+                spans.append(
+                    paint.style(
+                        pad_to(truncate(text, cell_w - 1), cell_w), color
+                    )
+                )
             body.append(cut_to_width("".join(spans), width - 4))
         if not rows:
-            body.append(paint.style(
-                "  nothing failing — clear the filter (f)"
-                if self.fleet_fail_only and names
-                else "  no jobs advertised yet", "dim"))
-        return panel_frame(paint, "fleet — every node's runs", body,
-                           width, "f failing-only · j/k scroll · "
-                           "r refresh · esc close")
+            body.append(
+                paint.style(
+                    "  nothing failing — clear the filter (f)"
+                    if self.fleet_fail_only and names
+                    else "  no jobs advertised yet",
+                    "dim",
+                )
+            )
+        return panel_frame(
+            paint,
+            "fleet — every node's runs",
+            body,
+            width,
+            "f failing-only · j/k scroll · r refresh · esc close",
+        )
 
     # ---- activity heatmap -------------------------------------------
-    def render_heat(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_heat(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(96, cols - 4)
         buckets = 24
-        body = [paint.style(
-            " last %d hours, one cell per hour — worst outcome, shaded "
-            "by volume" % buckets, "dim")]
+        body = [
+            paint.style(
+                " last %d hours, one cell per hour — worst outcome, shaded "
+                "by volume" % buckets,
+                "dim",
+            )
+        ]
         now = time.time()
         shades = " ░▒▓█"
         names = sorted(self.heat_data.keys())
         visible = max(3, lines - 10)
         self.panel_scroll = max(
-            0, min(self.panel_scroll, max(0, len(names) - visible)))
-        for name in names[self.panel_scroll:
-                          self.panel_scroll + visible]:
+            0, min(self.panel_scroll, max(0, len(names) - visible))
+        )
+        for name in names[self.panel_scroll : self.panel_scroll + visible]:
             runs = self.heat_data.get(name, [])
-            cells: List[Tuple[int, str]] = [
-                (0, "ok") for _ in range(buckets)]
+            cells: List[Tuple[int, str]] = [(0, "ok") for _ in range(buckets)]
             for run in runs:
                 t = parse_iso(run.get("finished_at"))
                 if t is None:
@@ -4890,31 +5280,38 @@ class AppOverlays(AppRender):
                 idx = buckets - 1 - int(age_h)
                 count, worst = cells[idx]
                 outcome = str(run.get("outcome", ""))
-                rank = {"ok": 0, "unknown": 1, "cancelled": 2,
-                        "fail": 3}
-                key = {"failure": "fail", "cancelled": "cancelled",
-                       "unknown": "unknown"}.get(outcome, "ok")
+                rank = {"ok": 0, "unknown": 1, "cancelled": 2, "fail": 3}
+                key = {
+                    "failure": "fail",
+                    "cancelled": "cancelled",
+                    "unknown": "unknown",
+                }.get(outcome, "ok")
                 if rank.get(key, 0) >= rank.get(worst, 0):
                     worst = key
                 cells[idx] = (count + 1, worst)
-            spans = [paint.style(pad_to(" " + truncate(name, 22), 24),
-                                 "fg")]
+            spans = [paint.style(pad_to(" " + truncate(name, 22), 24), "fg")]
             for count, worst in cells:
                 shade = shades[min(len(shades) - 1, count)]
-                color = {"ok": "ok", "fail": "fail",
-                         "cancelled": "off", "unknown": "pending"}[worst]
+                color = {
+                    "ok": "ok",
+                    "fail": "fail",
+                    "cancelled": "off",
+                    "unknown": "pending",
+                }[worst]
                 spans.append(paint.style(shade, color))
             body.append("".join(spans))
         if not names:
-            body.append(paint.style(
-                "  gathering run history…", "dim"))
-        return panel_frame(paint, "activity heatmap", body, width,
-                           "j/k scroll · r refresh · esc close")
+            body.append(paint.style("  gathering run history…", "dim"))
+        return panel_frame(
+            paint,
+            "activity heatmap",
+            body,
+            width,
+            "j/k scroll · r refresh · esc close",
+        )
 
     # ---- next-fire radar --------------------------------------------
-    def render_radar(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_radar(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(56, cols - 4)
         items = []
         for job in self.jobs:
@@ -4928,12 +5325,13 @@ class AppOverlays(AppRender):
         body = [paint.style(" %d upcoming" % len(items), "dim")]
         for nxt, name in items[:10]:
             body.append(
-                paint.style(pad_to(" " + fmt_countdown(nxt), 10),
-                            "accent", bold=True)
-                + paint.style(truncate(name, width - 16), "fg"))
+                paint.style(
+                    pad_to(" " + fmt_countdown(nxt), 10), "accent", bold=True
+                )
+                + paint.style(truncate(name, width - 16), "fg")
+            )
         if not items:
-            body.append(paint.style(
-                "  no jobs scheduled to fire soon", "dim"))
+            body.append(paint.style("  no jobs scheduled to fire soon", "dim"))
         # a 10-minute track with a mark per fire, like the web timeline
         track = [" "] * (width - 8)
         for nxt, _name in items:
@@ -4942,18 +5340,17 @@ class AppOverlays(AppRender):
                 track[pos] = "◆"
         body.append(paint.style("", "fg"))
         body.append(paint.style(" now" + "".join(track)[3:], "dim"))
-        return panel_frame(paint, "next-fire radar", body, width,
-                           "esc close")
+        return panel_frame(paint, "next-fire radar", body, width, "esc close")
 
     # ---- node resources ---------------------------------------------
-    def render_node(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_node(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(64, cols - 4)
         node = self.node or {}
-        body = [paint.style(
-            " node: %s" % node.get("node_name", "?"), "bright",
-            bold=True)]
+        body = [
+            paint.style(
+                " node: %s" % node.get("node_name", "?"), "bright", bold=True
+            )
+        ]
         resources = node.get("resources")
         if isinstance(resources, dict):
             for key, value in resources.items():
@@ -4968,33 +5365,42 @@ class AppOverlays(AppRender):
                     text = str(value)
                 body.append(
                     paint.style(pad_to(" %s" % key, 26), "dim")
-                    + paint.style(text, "fg"))
+                    + paint.style(text, "fg")
+                )
         else:
-            body.append(paint.style(
-                " resource sampling unavailable", "dim"))
+            body.append(paint.style(" resource sampling unavailable", "dim"))
         history = self.node_history or {}
         points = history.get("points") or []
         if points:
-            tail = points[-(width - 10):]
+            tail = points[-(width - 10) :]
             cpu_bar = "".join(
-                _SPARK_BARS[min(len(_SPARK_BARS) - 1,
-                                int((p[1] / 100) * (len(_SPARK_BARS) - 1))
-                                )]
-                for p in tail if isinstance(p, (list, tuple))
-                and len(p) >= 3)
+                _SPARK_BARS[
+                    min(
+                        len(_SPARK_BARS) - 1,
+                        int((p[1] / 100) * (len(_SPARK_BARS) - 1)),
+                    )
+                ]
+                for p in tail
+                if isinstance(p, (list, tuple)) and len(p) >= 3
+            )
             body.append(paint.style("", "fg"))
-            body.append(paint.style(" cpu  ", "dim")
-                        + paint.style(cpu_bar, "run"))
+            body.append(
+                paint.style(" cpu  ", "dim") + paint.style(cpu_bar, "run")
+            )
             mem_bar = "".join(
-                _SPARK_BARS[min(len(_SPARK_BARS) - 1,
-                                int((p[2] / 100) * (len(_SPARK_BARS) - 1))
-                                )]
-                for p in tail if isinstance(p, (list, tuple))
-                and len(p) >= 3)
-            body.append(paint.style(" mem  ", "dim")
-                        + paint.style(mem_bar, "accent"))
-        return panel_frame(paint, "node resources", body, width,
-                           "esc close")
+                _SPARK_BARS[
+                    min(
+                        len(_SPARK_BARS) - 1,
+                        int((p[2] / 100) * (len(_SPARK_BARS) - 1)),
+                    )
+                ]
+                for p in tail
+                if isinstance(p, (list, tuple)) and len(p) >= 3
+            )
+            body.append(
+                paint.style(" mem  ", "dim") + paint.style(mem_bar, "accent")
+            )
+        return panel_frame(paint, "node resources", body, width, "esc close")
 
 
 # ===================================================================
@@ -5026,23 +5432,22 @@ class AppDrawers(AppOverlays):
             )
             row = panel[idx] if idx < len(panel) else ""
             rows.append(
-                left + border + cut_to_width(
-                    paint.row(row), drawer_w - 1)
+                left + border + cut_to_width(paint.row(row), drawer_w - 1)
             )
         return self._compose_toasts(paint, rows, cols, lines)
 
-    def _tabs_row(
-        self, paint: Painter, tabs: List[str], active: str
-    ) -> str:
+    def _tabs_row(self, paint: Painter, tabs: List[str], active: str) -> str:
         spans = []
         for tab in tabs:
             is_active = tab == active
-            spans.append(paint.style(
-                " %s " % tab,
-                "bright" if is_active else "dim",
-                bg="sel" if is_active else None,
-                bold=is_active,
-            ))
+            spans.append(
+                paint.style(
+                    " %s " % tab,
+                    "bright" if is_active else "dim",
+                    bg="sel" if is_active else None,
+                    bold=is_active,
+                )
+            )
         return " " + "".join(spans) + paint.style("  ←/→ switch", "dim")
 
     # ---- the job drawer ---------------------------------------------
@@ -5051,15 +5456,24 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         key, label = health(job) if job else ("unknown", "?")
-        color = {"ok": "ok", "fail": "fail", "run": "run",
-                 "pending": "pending", "disabled": "off",
-                 "cancelled": "off", "unknown": "pending"}[key]
+        color = {
+            "ok": "ok",
+            "fail": "fail",
+            "run": "run",
+            "pending": "pending",
+            "disabled": "off",
+            "cancelled": "off",
+            "unknown": "pending",
+        }[key]
         ascii_mode = bool(self.prefs["ascii"])
         rows = [
-            " " + paint.style(
-                "%s %s" % (paint.glyph(key, ascii_mode),
-                           self.drawer_job or "?"),
-                color, bold=True)
+            " "
+            + paint.style(
+                "%s %s"
+                % (paint.glyph(key, ascii_mode), self.drawer_job or "?"),
+                color,
+                bold=True,
+            )
             + paint.style("  %s" % label, "dim")
             + paint.style("   r run · x cancel · esc close", "dim"),
             self._tabs_row(paint, self.DRAWER_TABS, self.drawer_tab),
@@ -5084,19 +5498,25 @@ class AppDrawers(AppOverlays):
         search = self.inputs["logsearch"]
         status_bits = []
         if tail is not None:
-            status_bits.append("follow %s" % (
-                "on" if tail.follow else "off"))
+            status_bits.append("follow %s" % ("on" if tail.follow else "off"))
         if search:
             self._log_search_recompute()
-            status_bits.append("%d match%s" % (
-                len(self.log_matches),
-                "es" if len(self.log_matches) != 1 else ""))
-        head = " ⌕ " + (search + "▌" if self.focus == "logsearch"
-                        else (search or "/ to search"))
+            status_bits.append(
+                "%d match%s"
+                % (
+                    len(self.log_matches),
+                    "es" if len(self.log_matches) != 1 else "",
+                )
+            )
+        head = " ⌕ " + (
+            search + "▌"
+            if self.focus == "logsearch"
+            else (search or "/ to search")
+        )
         rows.append(
-            paint.style(head, "bright" if self.focus == "logsearch"
-                        else "dim")
-            + paint.style("   " + " · ".join(status_bits), "dim"))
+            paint.style(head, "bright" if self.focus == "logsearch" else "dim")
+            + paint.style("   " + " · ".join(status_bits), "dim")
+        )
         available = body_lines - len(rows)
         if tail is None:
             rows.append(paint.style("  no stream", "dim"))
@@ -5109,34 +5529,34 @@ class AppDrawers(AppOverlays):
             prefix = ""
             if self.timestamps:
                 stamp = datetime.datetime.fromtimestamp(when)
-                prefix = paint.style(
-                    stamp.strftime("%H:%M:%S "), "dim")
+                prefix = paint.style(stamp.strftime("%H:%M:%S "), "dim")
             marker = paint.style(
-                "▏", "fail" if stream == "stderr" else "border")
+                "▏", "fail" if stream == "stderr" else "border"
+            )
             content_width = width - 4 - (9 if self.timestamps else 0)
             if needle and needle in plain.lower():
                 text = paint.style(plain, "bright", bg="sel")
             if self.wrap and text_width(plain) > content_width:
                 start = 0
                 while start < len(plain):
-                    chunk = plain[start:start + content_width]
+                    chunk = plain[start : start + content_width]
                     display.append(
-                        " " + marker + prefix
-                        + paint.style(chunk, "fg"))
+                        " " + marker + prefix + paint.style(chunk, "fg")
+                    )
                     start += content_width
                 continue
             display.append(" " + marker + prefix + text)
         if tail.error:
-            display.append(paint.style(
-                "  ⚠ %s" % tail.error, "fail"))
+            display.append(paint.style("  ⚠ %s" % tail.error, "fail"))
         elif tail.ended is not None:
             reason = (" (%s)" % tail.ended) if tail.ended else ""
-            display.append(paint.style(
-                "  ── end of run output%s ──" % reason, "dim"))
+            display.append(
+                paint.style("  ── end of run output%s ──" % reason, "dim")
+            )
         max_scroll = max(0, len(display) - available)
         self.log_scroll = min(self.log_scroll, max_scroll)
         end = len(display) - self.log_scroll
-        rows.extend(display[max(0, end - available):end])
+        rows.extend(display[max(0, end - available) : end])
         if not tail.lines and tail.ended is None and not tail.error:
             rows.append(paint.style("  waiting for output…", "dim"))
         return rows
@@ -5151,45 +5571,73 @@ class AppDrawers(AppOverlays):
         stats = data.get("stats") or {}
         rate = stats.get("success_rate")
         rows.append(
-            " " + paint.style("%d runs" % (stats.get("total") or 0),
-                              "bright", bold=True)
+            " "
             + paint.style(
-                "  %s ok · %s fail · %s cancelled · %s unknown" % (
-                    stats.get("success", 0), stats.get("failure", 0),
-                    stats.get("cancelled", 0), stats.get("unknown", 0)),
-                "dim"))
+                "%d runs" % (stats.get("total") or 0), "bright", bold=True
+            )
+            + paint.style(
+                "  %s ok · %s fail · %s cancelled · %s unknown"
+                % (
+                    stats.get("success", 0),
+                    stats.get("failure", 0),
+                    stats.get("cancelled", 0),
+                    stats.get("unknown", 0),
+                ),
+                "dim",
+            )
+        )
         rows.append(
-            " " + paint.style(
-                "success %s" % (
-                    "—" if rate is None else "%d%%" % round(rate * 100)),
-                "ok" if (rate or 0) >= 0.9 else "warn")
+            " "
             + paint.style(
-                "  avg %s · min %s · max %s" % (
+                "success %s"
+                % ("—" if rate is None else "%d%%" % round(rate * 100)),
+                "ok" if (rate or 0) >= 0.9 else "warn",
+            )
+            + paint.style(
+                "  avg %s · min %s · max %s"
+                % (
                     fmt_duration(stats.get("avg_duration")),
                     fmt_duration(stats.get("min_duration")),
-                    fmt_duration(stats.get("max_duration"))),
-                "dim"))
+                    fmt_duration(stats.get("max_duration")),
+                ),
+                "dim",
+            )
+        )
         if stats.get("avg_cpu_seconds") is not None:
-            rows.append(paint.style(
-                "  cpu avg %.1fs · peak rss %s" % (
-                    stats.get("avg_cpu_seconds") or 0,
-                    fmt_bytes(stats.get("max_rss_bytes"))), "dim"))
+            rows.append(
+                paint.style(
+                    "  cpu avg %.1fs · peak rss %s"
+                    % (
+                        stats.get("avg_cpu_seconds") or 0,
+                        fmt_bytes(stats.get("max_rss_bytes")),
+                    ),
+                    "dim",
+                )
+            )
         rows.append(paint.hline(width - 2))
         runs = list(reversed(data.get("runs") or []))
-        durations = [r.get("duration") for r in runs
-                     if r.get("duration") is not None]
+        durations = [
+            r.get("duration") for r in runs if r.get("duration") is not None
+        ]
         top = max(durations) if durations else 0
         ascii_mode = bool(self.prefs["ascii"])
         available = body_lines - len(rows)
         self.panel_scroll = max(
-            0, min(self.panel_scroll, max(0, len(runs) - available)))
-        for run in runs[self.panel_scroll:
-                        self.panel_scroll + available]:
+            0, min(self.panel_scroll, max(0, len(runs) - available))
+        )
+        for run in runs[self.panel_scroll : self.panel_scroll + available]:
             outcome = str(run.get("outcome", ""))
-            key = {"failure": "fail", "cancelled": "cancelled",
-                   "unknown": "unknown"}.get(outcome, "ok")
-            color = {"fail": "fail", "cancelled": "off",
-                     "unknown": "pending", "ok": "ok"}[key]
+            key = {
+                "failure": "fail",
+                "cancelled": "cancelled",
+                "unknown": "unknown",
+            }.get(outcome, "ok")
+            color = {
+                "fail": "fail",
+                "cancelled": "off",
+                "unknown": "pending",
+                "ok": "ok",
+            }[key]
             dur = run.get("duration")
             bar_w = 12
             bar = ""
@@ -5201,24 +5649,25 @@ class AppDrawers(AppOverlays):
             t = parse_iso(started)
             if t is not None:
                 stamp = datetime.datetime.fromtimestamp(t).strftime(
-                    "%m-%d %H:%M:%S")
+                    "%m-%d %H:%M:%S"
+                )
             detail = ""
             if outcome == "failure":
                 exit_code = run.get("exit_code")
-                detail = " exit %s" % (
-                    "?" if exit_code is None else exit_code)
+                detail = " exit %s" % ("?" if exit_code is None else exit_code)
                 if run.get("fail_reason"):
                     detail += " · %s" % run["fail_reason"]
             resources = run.get("resources") or {}
             if resources.get("cpu_total_seconds") is not None:
                 detail += " · %.1fs cpu" % resources["cpu_total_seconds"]
             rows.append(
-                " " + paint.style(paint.glyph(key, ascii_mode), color)
+                " "
+                + paint.style(paint.glyph(key, ascii_mode), color)
                 + paint.style(" %s " % stamp, "fg")
                 + paint.style(pad_to(fmt_duration(dur), 8), "dim")
                 + paint.style(pad_to(bar, bar_w + 1), color)
-                + paint.style(truncate(detail, max(0, width - 44)),
-                              "dim"))
+                + paint.style(truncate(detail, max(0, width - 44)), "dim")
+            )
         if not runs:
             rows.append(paint.style("  no runs retained yet", "dim"))
         return rows
@@ -5231,37 +5680,56 @@ class AppDrawers(AppOverlays):
             return [paint.style("  loading resource data…", "dim")]
         if not data.get("monitored"):
             return [
+                paint.style("  this job has no resource monitoring", "dim"),
                 paint.style(
-                    "  this job has no resource monitoring", "dim"),
-                paint.style(
-                    "  (set monitorResources: true on the job)", "dim"),
+                    "  (set monitorResources: true on the job)", "dim"
+                ),
             ]
         rows: List[str] = []
         live = data.get("live") or []
         if live:
             snap = live[-1] if isinstance(live, list) else {}
-            rows.append(" " + paint.style(
-                "live: %s cpu · %s rss" % (
-                    fmt_percent(snap.get("cpu_percent")),
-                    fmt_bytes(snap.get("rss_bytes"))),
-                "run", bold=True))
+            rows.append(
+                " "
+                + paint.style(
+                    "live: %s cpu · %s rss"
+                    % (
+                        fmt_percent(snap.get("cpu_percent")),
+                        fmt_bytes(snap.get("rss_bytes")),
+                    ),
+                    "run",
+                    bold=True,
+                )
+            )
         runs = list(reversed(data.get("runs") or []))
         available = body_lines - len(rows) - 1
-        rows.append(paint.style(
-            pad_to(" started", 18) + pad_to("cpu", 10) + "peak rss",
-            "dim", bold=True))
+        rows.append(
+            paint.style(
+                pad_to(" started", 18) + pad_to("cpu", 10) + "peak rss",
+                "dim",
+                bold=True,
+            )
+        )
         for run in runs[:available]:
             started = parse_iso(run.get("started_at"))
-            stamp = (datetime.datetime.fromtimestamp(started).strftime(
-                "%m-%d %H:%M") if started else "?")
+            stamp = (
+                datetime.datetime.fromtimestamp(started).strftime(
+                    "%m-%d %H:%M"
+                )
+                if started
+                else "?"
+            )
             usage = run.get("resources") or run
             rows.append(
                 paint.style(pad_to(" " + stamp, 18), "fg")
                 + paint.style(
-                    pad_to("%.1fs" % (usage.get("cpu_total_seconds")
-                                      or 0), 10), "dim")
-                + paint.style(fmt_bytes(usage.get("max_rss_bytes")),
-                              "dim"))
+                    pad_to(
+                        "%.1fs" % (usage.get("cpu_total_seconds") or 0), 10
+                    ),
+                    "dim",
+                )
+                + paint.style(fmt_bytes(usage.get("max_rss_bytes")), "dim")
+            )
         return rows
 
     def _drawer_schedule(
@@ -5275,10 +5743,8 @@ class AppDrawers(AppOverlays):
             paint.style("", "fg"),
         ]
         tz_name = job.get("timezone")
-        frame = ("UTC" if job.get("utc", True) or not tz_name
-                 else str(tz_name))
-        rows.append(paint.style(
-            " reference frame: %s" % frame, "dim"))
+        frame = "UTC" if job.get("utc", True) or not tz_name else str(tz_name)
+        rows.append(paint.style(" reference frame: %s" % frame, "dim"))
         tz: datetime.tzinfo = datetime.timezone.utc
         if tz_name:
             try:
@@ -5292,16 +5758,21 @@ class AppDrawers(AppOverlays):
             rows.append(paint.style("", "fg"))
             rows.append(paint.style(" next runs:", "dim"))
             for when in fires:
-                rows.append(" " + paint.style(
-                    when.strftime("%Y-%m-%d %H:%M:%S %Z"), "fg"))
+                rows.append(
+                    " "
+                    + paint.style(when.strftime("%Y-%m-%d %H:%M:%S %Z"), "fg")
+                )
         elif schedule.strip().lower() == "@reboot":
-            rows.append(paint.style(
-                " runs once, at daemon start", "dim"))
+            rows.append(paint.style(" runs once, at daemon start", "dim"))
         sched_in = self.next_run_seconds(job)
         if sched_in is not None:
             rows.append(paint.style("", "fg"))
-            rows.append(" " + paint.style(
-                "daemon says: next fire %s" % fmt_in(sched_in), "ok"))
+            rows.append(
+                " "
+                + paint.style(
+                    "daemon says: next fire %s" % fmt_in(sched_in), "ok"
+                )
+            )
         return rows
 
     # ---- the DAG drawer ---------------------------------------------
@@ -5309,26 +5780,28 @@ class AppDrawers(AppOverlays):
         self, paint: Painter, width: int, lines: int
     ) -> List[str]:
         dag = next(
-            (d for d in self.dags
-             if str(d.get("name", "")) == self.dag_name), {})
+            (d for d in self.dags if str(d.get("name", "")) == self.dag_name),
+            {},
+        )
         rows = [
-            " " + paint.style("⧉ %s" % (self.dag_name or "?"),
-                              "accent", bold=True)
-            + paint.style(
-                "  t trigger · b backfill · esc close", "dim"),
+            " "
+            + paint.style("⧉ %s" % (self.dag_name or "?"), "accent", bold=True)
+            + paint.style("  t trigger · b backfill · esc close", "dim"),
             self._tabs_row(paint, self.DAG_TABS, self.dag_tab),
             paint.hline(width - 2),
         ]
         if self.focus == "backfill":
-            rows.insert(2, " " + paint.style("backfill FROM..TO: ", "dim")
-                        + paint.style(self.inputs["backfill"] + "▌",
-                                      "bright"))
+            rows.insert(
+                2,
+                " "
+                + paint.style("backfill FROM..TO: ", "dim")
+                + paint.style(self.inputs["backfill"] + "▌", "bright"),
+            )
         body_lines = lines - len(rows) - 1
         if self.dag_tab == "runs":
             rows.extend(self._dag_runs_tab(paint, width, body_lines))
         elif self.dag_tab == "graph":
-            rows.extend(self._dag_graph_tab(paint, dag, width,
-                                            body_lines))
+            rows.extend(self._dag_graph_tab(paint, dag, width, body_lines))
         elif self.dag_tab == "tasks":
             rows.extend(self._dag_tasks_tab(paint, width, body_lines))
         elif self.dag_tab == "xcom":
@@ -5346,8 +5819,7 @@ class AppDrawers(AppOverlays):
             return "fail"
         if low in ("running", "launched"):
             return "run"
-        if low in ("awaiting", "waiting", "queued", "pending",
-                   "scheduled"):
+        if low in ("awaiting", "waiting", "queued", "pending", "scheduled"):
             return "pending"
         return "dim"
 
@@ -5356,27 +5828,32 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         rows: List[str] = []
         self.dag_sel = min(self.dag_sel, max(0, len(self.dag_runs) - 1))
-        start = scroll_window(
-            len(self.dag_runs), body_lines, self.dag_sel, 0)
-        for idx, run in enumerate(
-                self.dag_runs[start:start + body_lines]):
+        start = scroll_window(len(self.dag_runs), body_lines, self.dag_sel, 0)
+        for idx, run in enumerate(self.dag_runs[start : start + body_lines]):
             selected = start + idx == self.dag_sel
             run_key = str(run.get("runKey") or run.get("run_key") or "?")
             state = str(run.get("state", "?"))
             when = run.get("started_at") or run.get("created_at")
             rows.append(
-                paint.style(pad_to(" " + truncate(run_key, 28), 30),
-                            "bright" if selected else "fg",
-                            bg="sel" if selected else None,
-                            bold=selected)
-                + paint.style(pad_to(state, 12),
-                              self._dag_state_color(state),
-                              bg="sel" if selected else None)
-                + paint.style(fmt_ago(when) if when else "",
-                              "dim", bg="sel" if selected else None))
+                paint.style(
+                    pad_to(" " + truncate(run_key, 28), 30),
+                    "bright" if selected else "fg",
+                    bg="sel" if selected else None,
+                    bold=selected,
+                )
+                + paint.style(
+                    pad_to(state, 12),
+                    self._dag_state_color(state),
+                    bg="sel" if selected else None,
+                )
+                + paint.style(
+                    fmt_ago(when) if when else "",
+                    "dim",
+                    bg="sel" if selected else None,
+                )
+            )
         if not self.dag_runs:
-            rows.append(paint.style(
-                "  no runs yet — t to trigger one", "dim"))
+            rows.append(paint.style("  no runs yet — t to trigger one", "dim"))
         return rows
 
     def _dag_graph_tab(
@@ -5399,8 +5876,7 @@ class AppDrawers(AppOverlays):
             task_list = []
         if not task_list:
             return [paint.style("  no task metadata", "dim")]
-        by_key = {str(t.get("key") or t.get("name", "")): t
-                  for t in task_list}
+        by_key = {str(t.get("key") or t.get("name", "")): t for t in task_list}
         depth_cache: Dict[str, int] = {}
 
         def depth(key: str, seen: Tuple[str, ...] = ()) -> int:
@@ -5414,7 +5890,8 @@ class AppDrawers(AppOverlays):
                 deps = [deps]
             level = (
                 1 + max(depth(str(d), seen + (key,)) for d in deps)
-                if deps else 0
+                if deps
+                else 0
             )
             depth_cache[key] = level
             return level
@@ -5424,8 +5901,7 @@ class AppDrawers(AppOverlays):
             layers.setdefault(depth(key), []).append(key)
         run_states: Dict[str, str] = {}
         for task in self.dag_run_tasks():
-            run_states[str(task.get("key", ""))] = str(
-                task.get("state", ""))
+            run_states[str(task.get("key", ""))] = str(task.get("state", ""))
         rows: List[str] = []
         ascii_mode = bool(self.prefs["ascii"])
         arrow = "->" if ascii_mode else "─▶"
@@ -5434,22 +5910,27 @@ class AppDrawers(AppOverlays):
             spans = [paint.style(" %d " % level, "dim")]
             for name in names:
                 state = run_states.get(name, "")
-                color = (self._dag_state_color(state)
-                         if state else "fg")
-                spans.append(paint.style(
-                    "[%s%s]" % (name, (" " + state) if state else ""),
-                    color, bold=bool(state)))
+                color = self._dag_state_color(state) if state else "fg"
+                spans.append(
+                    paint.style(
+                        "[%s%s]" % (name, (" " + state) if state else ""),
+                        color,
+                        bold=bool(state),
+                    )
+                )
                 spans.append(paint.style(" ", "fg"))
             rows.append(cut_to_width("".join(spans), width - 4))
             for name in names:
                 task = by_key[name] or {}
-                deps = (task.get("dependsOn")
-                        or task.get("depends_on") or [])
+                deps = task.get("dependsOn") or task.get("depends_on") or []
                 if isinstance(deps, str):
                     deps = [deps]
                 for dep in deps:
-                    rows.append(paint.style(
-                        "     %s %s %s" % (dep, arrow, name), "dim"))
+                    rows.append(
+                        paint.style(
+                            "     %s %s %s" % (dep, arrow, name), "dim"
+                        )
+                    )
         return rows[:body_lines]
 
     def _dag_tasks_tab(
@@ -5458,15 +5939,14 @@ class AppDrawers(AppOverlays):
         tasks = self.dag_run_tasks()
         rows: List[str] = []
         if not self.dag_run_key:
-            rows.append(paint.style(
-                "  open a run first (runs tab, enter)", "dim"))
+            rows.append(
+                paint.style("  open a run first (runs tab, enter)", "dim")
+            )
             return rows
-        rows.append(paint.style(
-            " run %s" % self.dag_run_key, "dim"))
+        rows.append(paint.style(" run %s" % self.dag_run_key, "dim"))
         self.dag_sel = min(self.dag_sel, max(0, len(tasks) - 1))
-        start = scroll_window(
-            len(tasks), body_lines - 1, self.dag_sel, 0)
-        for idx, task in enumerate(tasks[start:start + body_lines - 1]):
+        start = scroll_window(len(tasks), body_lines - 1, self.dag_sel, 0)
+        for idx, task in enumerate(tasks[start : start + body_lines - 1]):
             selected = start + idx == self.dag_sel
             key = str(task.get("key", "?"))
             state = str(task.get("state", "?"))
@@ -5477,15 +5957,23 @@ class AppDrawers(AppOverlays):
             if state.lower() == "awaiting":
                 extra += "  ► a approve · R reject"
             rows.append(
-                paint.style(pad_to(" " + truncate(key, 26), 28),
-                            "bright" if selected else "fg",
-                            bg="sel" if selected else None,
-                            bold=selected)
-                + paint.style(pad_to(state, 11),
-                              self._dag_state_color(state),
-                              bg="sel" if selected else None)
-                + paint.style(truncate(extra, max(0, width - 44)),
-                              "dim", bg="sel" if selected else None))
+                paint.style(
+                    pad_to(" " + truncate(key, 26), 28),
+                    "bright" if selected else "fg",
+                    bg="sel" if selected else None,
+                    bold=selected,
+                )
+                + paint.style(
+                    pad_to(state, 11),
+                    self._dag_state_color(state),
+                    bg="sel" if selected else None,
+                )
+                + paint.style(
+                    truncate(extra, max(0, width - 44)),
+                    "dim",
+                    bg="sel" if selected else None,
+                )
+            )
         if not tasks:
             rows.append(paint.style("  loading run detail…", "dim"))
         return rows
@@ -5495,14 +5983,14 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         data = self.dag_xcom
         if not self.dag_run_key:
-            return [paint.style(
-                "  open a run first (runs tab, enter)", "dim")]
+            return [paint.style("  open a run first (runs tab, enter)", "dim")]
         if data is None:
             return [paint.style("  loading xcom…", "dim")]
         entries = data.get("xcom") if isinstance(data, dict) else None
         if entries is None and isinstance(data, dict):
             entries = {
-                k: v for k, v in data.items()
+                k: v
+                for k, v in data.items()
                 if k not in ("dag", "runKey", "run_key")
             }
         rows: List[str] = []
@@ -5511,8 +5999,12 @@ class AppDrawers(AppOverlays):
                 rows.append(
                     paint.style(pad_to(" %s" % key, 24), "accent")
                     + paint.style(
-                        truncate(json.dumps(value, default=str),
-                                 max(0, width - 30)), "fg"))
+                        truncate(
+                            json.dumps(value, default=str), max(0, width - 30)
+                        ),
+                        "fg",
+                    )
+                )
         else:
             rows.append(paint.style("  no xcom values", "dim"))
         return rows
@@ -5522,14 +6014,17 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         tail = self.dag_task_tail
         if tail is None:
-            return [paint.style(
-                "  pick a task (tasks tab, enter) to read its log",
-                "dim")]
+            return [
+                paint.style(
+                    "  pick a task (tasks tab, enter) to read its log", "dim"
+                )
+            ]
         rows = [paint.style(" task: %s" % tail.label, "dim")]
         display: List[str] = []
         for stream, line, _when in tail.lines:
             marker = paint.style(
-                "▏", "fail" if stream == "stderr" else "border")
+                "▏", "fail" if stream == "stderr" else "border"
+            )
             display.append(" " + marker + rewrite_sgr(line, self.theme))
         if tail.error:
             display.append(paint.style("  ⚠ %s" % tail.error, "fail"))
@@ -5539,63 +6034,80 @@ class AppDrawers(AppOverlays):
         max_scroll = max(0, len(display) - available)
         self.panel_scroll = min(self.panel_scroll, max_scroll)
         end = len(display) - self.panel_scroll
-        rows.extend(display[max(0, end - available):end])
+        rows.extend(display[max(0, end - available) : end])
         return rows
 
     # ---- multi-tail console -----------------------------------------
-    def render_tail(
-        self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    def render_tail(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(cols - 4, 110)
         identity = ["run", "ok", "pending", "warn"]
         head_spans = []
         for idx, tail in enumerate(self.tails):
             selected = idx == self.tail_sel
-            head_spans.append(paint.style(
-                " %s " % tail.label, identity[idx % len(identity)],
-                bg="sel" if selected else None, bold=selected))
+            head_spans.append(
+                paint.style(
+                    " %s " % tail.label,
+                    identity[idx % len(identity)],
+                    bg="sel" if selected else None,
+                    bold=selected,
+                )
+            )
         if not self.tails:
-            head_spans.append(paint.style(
-                " empty — a to add a job ", "dim"))
+            head_spans.append(paint.style(" empty — a to add a job ", "dim"))
         body = ["".join(head_spans)]
         if self.focus == "tailadd":
-            body.append(paint.style(" add: ", "dim") + paint.style(
-                self.inputs["tailadd"] + "▌", "bright"))
+            body.append(
+                paint.style(" add: ", "dim")
+                + paint.style(self.inputs["tailadd"] + "▌", "bright")
+            )
         merged: List[Tuple[float, int, str, str, str]] = []
         for idx, tail in enumerate(self.tails):
             for stream, line, when in tail.lines:
                 merged.append((when, idx, tail.label, stream, line))
             if tail.ended is not None:
-                merged.append((
-                    time.time(), idx, tail.label, "meta",
-                    "── end of run output ──"))
+                merged.append(
+                    (
+                        time.time(),
+                        idx,
+                        tail.label,
+                        "meta",
+                        "── end of run output ──",
+                    )
+                )
         merged.sort(key=lambda item: item[0])
         available = max(3, lines - 10)
         max_scroll = max(0, len(merged) - available)
         self.panel_scroll = min(self.panel_scroll, max_scroll)
         end = len(merged) - self.panel_scroll
         for when, idx, label, stream, line in merged[
-                max(0, end - available):end]:
+            max(0, end - available) : end
+        ]:
             color = identity[idx % len(identity)]
             prefix = paint.style(pad_to(label, 14) + "▏", color)
             stamp = ""
             if self.timestamps:
                 stamp = paint.style(
                     datetime.datetime.fromtimestamp(when).strftime(
-                        "%H:%M:%S "), "dim")
+                        "%H:%M:%S "
+                    ),
+                    "dim",
+                )
             if stream == "meta":
-                body.append(" " + prefix + stamp
-                            + paint.style(line, "dim"))
+                body.append(" " + prefix + stamp + paint.style(line, "dim"))
             else:
-                body.append(" " + prefix + stamp
-                            + rewrite_sgr(line, self.theme))
+                body.append(
+                    " " + prefix + stamp + rewrite_sgr(line, self.theme)
+                )
         if self.tails and not merged:
             body.append(paint.style("  waiting for output…", "dim"))
         return panel_frame(
-            paint, "multi-tail (%d/%d)" % (len(self.tails), TAIL_MAX),
-            body, width,
+            paint,
+            "multi-tail (%d/%d)" % (len(self.tails), TAIL_MAX),
+            body,
+            width,
             "a add · x remove · j/k pick · t timestamps · w wrap · "
-            "pgup/pgdn scroll · esc close")
+            "pgup/pgdn scroll · esc close",
+        )
 
 
 # ===================================================================
@@ -5617,7 +6129,8 @@ class TuiApp(AppDrawers):
             """Type one line; True when the user skipped."""
             for idx in range(0, len(text) + 1, 3):
                 self.boot_rows = self.boot_rows[:-1] + [
-                    paint.style(text[:idx] + "▌", style)]
+                    paint.style(text[:idx] + "▌", style)
+                ]
                 self.paint()
                 if skip.done():
                     return True
@@ -5631,8 +6144,9 @@ class TuiApp(AppDrawers):
 
         try:
             push()
-            if await type_line(" CRONSTABLE TUI — POWER-ON SELF-TEST",
-                               "accent"):
+            if await type_line(
+                " CRONSTABLE TUI — POWER-ON SELF-TEST", "accent"
+            ):
                 return
             push()
             push()
@@ -5648,8 +6162,11 @@ class TuiApp(AppDrawers):
             latency = (time.monotonic() - start) * 1000
             if await type_line(
                 " link ........ %s"
-                % ("OK %s (%dms)" % (self.api.url, latency)
-                   if ok else "FAIL %s unreachable" % self.api.url),
+                % (
+                    "OK %s (%dms)" % (self.api.url, latency)
+                    if ok
+                    else "FAIL %s unreachable" % self.api.url
+                ),
                 "ok" if ok else "fail",
             ):
                 return
@@ -5666,27 +6183,31 @@ class TuiApp(AppDrawers):
                     jobs = data
             job_set = ""
             with contextlib.suppress(Exception):
-                job_set = (
-                    await self.api.get_text("/job-set-id")).strip()[:12]
+                job_set = (await self.api.get_text("/job-set-id")).strip()[:12]
             push()
             if await type_line(
                 " job set ..... %d job%s%s"
-                % (len(jobs), "s" if len(jobs) != 1 else "",
-                   (" · %s" % job_set) if job_set else ""),
+                % (
+                    len(jobs),
+                    "s" if len(jobs) != 1 else "",
+                    (" · %s" % job_set) if job_set else "",
+                ),
                 "fg",
             ):
                 return
             soonest: Optional[float] = None
             for job in jobs:
                 sched = job.get("scheduled_in")
-                if sched is not None and (
-                        soonest is None or sched < soonest):
+                if sched is not None and (soonest is None or sched < soonest):
                     soonest = float(sched)
             push()
             if await type_line(
                 " schedules ... %s"
-                % ("next fire %s" % fmt_in(soonest)
-                   if soonest is not None else "nothing scheduled"),
+                % (
+                    "next fire %s" % fmt_in(soonest)
+                    if soonest is not None
+                    else "nothing scheduled"
+                ),
                 "fg",
             ):
                 return
@@ -5696,8 +6217,8 @@ class TuiApp(AppDrawers):
                 if cluster.get("enabled"):
                     cluster_line = "%s · %s" % (
                         cluster.get("backend", "gossip"),
-                        "quorate" if cluster.get("quorate")
-                        else "NO QUORUM")
+                        "quorate" if cluster.get("quorate") else "NO QUORUM",
+                    )
             push()
             if await type_line(" cluster ..... %s" % cluster_line, "fg"):
                 return
@@ -5719,8 +6240,7 @@ class TuiApp(AppDrawers):
         finally:
             if not skip.done():
                 skip.cancel()
-            with contextlib.suppress(
-                    asyncio.CancelledError, Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await skip
             self.booting = False
             self.prefs["boot_last"] = time.time()

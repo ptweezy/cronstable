@@ -28,7 +28,7 @@ from cronstable.tui import (
     Api,
     HeadlessTerm,
     KeyDecoder,
-    TestKeys,
+    ScriptedKeys,
     Theme,
     TuiApp,
     compute_view,
@@ -548,7 +548,7 @@ class Harness:
     def __init__(self) -> None:
         self.daemon = FakeDaemon()
         self.term = HeadlessTerm(110, 32)
-        self.keys = TestKeys()
+        self.keys = ScriptedKeys()
         self.app: Optional[TuiApp] = None
         self._task: Optional[asyncio.Task] = None
 
@@ -736,9 +736,12 @@ async def test_wallboard_and_stale_banner(tmp_path):
         assert "tile-b" in screen
         assert "esc/w exit" in screen
         assert "NO SIGNAL" not in screen
-        # age the data past the stale floor: the banner must appear
+        # age the data past the stale floor: the banner must appear.
+        # Pause polling FIRST and let any in-flight cycle drain, so a
+        # late poll cannot re-stamp fetched_mono under the assertion.
+        app.prefs["poll_ms"] = 0
+        await asyncio.sleep(0.35)
         app.fetched_mono -= 120
-        app.prefs["poll_ms"] = 0        # stop fresh polls re-arming it
         app.mark()
         await h.settle()
         assert "NO SIGNAL" in h.term.screen()
@@ -767,11 +770,8 @@ async def test_incident_timeline_overlay(tmp_path):
         assert "ok-b" in screen      # every job's most recent finish
         # f narrows to failures only
         h.keys.send("f")
-        await h.settle()
-        screen = h.term.screen()
-        assert "bad-a" in screen
-        assert "ok-b" not in screen.split("incident timeline")[1]
-        # i toggles it closed again (web parity)
+        await _wait_for(lambda: app.timeline_fail_only)
+        assert [e[0] for e in app.timeline_entries()] == ["bad-a"]
         h.keys.send("esc")
         await _wait_for(lambda: not app.is_open("timeline"))
     finally:
@@ -847,7 +847,7 @@ async def test_quit_key_ends_the_app(tmp_path):
         await h.stop()
 
 
-def test_dispatch_refuses_without_a_tty(monkeypatch, capsys):
+def test_dispatch_refuses_without_a_tty(monkeypatch):
     class NotATty:
         def isatty(self):
             return False
