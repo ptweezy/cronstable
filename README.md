@@ -2020,15 +2020,20 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
   [Troubleshooting](https://github.com/ptweezy/cronstable/wiki/Troubleshooting)
 * **Watch it**:
   [Web Dashboard](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard) ·
+  [Terminal Dashboard](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard) ·
   [HTTP API](https://github.com/ptweezy/cronstable/wiki/HTTP-API) ·
+  [MCP Server](https://github.com/ptweezy/cronstable/wiki/MCP) ·
   [Metrics with Prometheus](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Prometheus) ·
   [Metrics with Statsd](https://github.com/ptweezy/cronstable/wiki/Metrics-with-Statsd) ·
+  [Resource Monitoring](https://github.com/ptweezy/cronstable/wiki/Resource-Monitoring) ·
   [CLI Reference](https://github.com/ptweezy/cronstable/wiki/CLI-Reference)
 * **Scale it**:
   [Durable State](https://github.com/ptweezy/cronstable/wiki/Durable-State) ·
   [Orchestration and DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs) ·
   [Clustering and Leader Election](https://github.com/ptweezy/cronstable/wiki/Clustering-and-Leader-Election) ·
-  [Architecture and Internals](https://github.com/ptweezy/cronstable/wiki/Architecture-and-Internals)
+  [Job-Set ID](https://github.com/ptweezy/cronstable/wiki/Job-Set-ID) ·
+  [Architecture and Internals](https://github.com/ptweezy/cronstable/wiki/Architecture-and-Internals) ·
+  [MCP Server Design](https://github.com/ptweezy/cronstable/wiki/MCP-Server-Design)
 
 ## Contributing and license
 
