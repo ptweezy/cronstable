@@ -84,6 +84,10 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/node` | `_web_get_node` | `200` |
 | `GET` | `/node/history` | `_web_node_history` | `200` |
 | `GET` | `/status` | `_web_get_status` | `200` |
+| `GET` | `/schedule/preview` | `_web_schedule_preview` | `200` (`400` for a missing `expr` or unknown `tz`) |
+| `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
+| `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
+| `GET` | `/schedule/suggest` | `_web_schedule_suggest` | `200` (`400` for a bad `period` or unknown `tz`) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
@@ -154,6 +158,11 @@ For `scheduled` jobs, `scheduled_in` is the number of seconds until the next run
 (a float, computed from the job's crontab in the job's timezone). For an `@reboot`
 schedule, `scheduled_in` is the literal string `"@reboot"`.
 
+A `scheduled` job whose crontab has **no future occurrence** (a fixed past
+year, an impossible date) reports `scheduled_in: null` plus `never_fires:
+true`, and the text form says `never fires (schedule has no future
+occurrence)`; see [Schedule Linting](Schedule-Linting).
+
 The `disabled` status is reported honestly instead of an inapplicable
 `scheduled (in N seconds)`.
 
@@ -186,6 +195,81 @@ Content-Type: application/json; charset=utf-8
     {"job": "test-03", "status": "disabled"}
 ]
 ```
+
+### `GET /schedule/preview`
+
+Parses, describes, previews and lints one cron expression with the daemon's
+own engine, the single source of truth behind the dashboards' sandboxes, so
+a preview can never disagree with what the scheduler will actually do.
+
+Query parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `expr` | **Required.** The expression to decode (URL-encoded). `400` when missing or blank. |
+| `tz` | Optional IANA zone for the preview frame and the DST lint checks (default `UTC`). `400` for an unknown name. |
+| `count` | Optional number of upcoming fires to return, clamped to 1–60 (default 12). |
+| `seed` | Optional hash key (a job name, real or prospective) that resolves [`H` items](Hashed-Schedules). Without it an `H` expression comes back `valid: false` with the engine's own error; with it the response echoes `seed` and adds `resolved`, the expression with every `H` replaced by its hashed values. |
+
+For an expression the engine accepts, the response carries `valid: true`,
+the whitespace-`normalized` form, the plain-English `description`, the next
+`fires` as ISO-8601 instants in the requested frame, `never_fires` (no
+remaining occurrence), and the [schedule linter's](Schedule-Linting)
+findings. For a rejected expression it carries `valid: false` and the
+parser's `error` (including the Quartz dialect hints). `@reboot` returns
+`valid: true, reboot: true` with no fires.
+
+```shell
+$ http get "http://127.0.0.1:8080/schedule/preview?expr=*/7 * * * *&count=2"
+{
+    "expression": "*/7 * * * *",
+    "timezone": "UTC",
+    "valid": true,
+    "reboot": false,
+    "normalized": "*/7 * * * *",
+    "description": "At minutes 00, 07, 14, 21, 28, 35, 42, 49, 56 past every hour, every day",
+    "fires": ["2026-07-18T15:42:00+00:00", "2026-07-18T15:49:00+00:00"],
+    "never_fires": false,
+    "lint": [
+        {
+            "code": "uneven-step",
+            "level": "warning",
+            "message": "'*/7' in the minute field: 7 does not divide the field's span of 60, so one interval at the wrap is only 4 minutes"
+        }
+    ]
+}
+```
+
+### `GET /schedule/pressure`
+
+The fleet's forward-looking collision heatmap: every enabled schedule's
+fires over the next `hours` (1 to 168, default 24), enumerated with the
+scheduler's own engine and bucketed by civil hour and minute in `tz`
+(default `UTC`; `400` for an unknown name). The payload carries the 24x60
+`grid`, the 60-bin `by_minute_fires`/`by_minute_jobs` histograms,
+`by_hour`, the `busiest_minute` headline, `empty_minutes`, `top_cells`
+(each naming up to ten jobs), and an `excluded` count of disabled and
+`@reboot` jobs. Full field reference on the
+[Schedule Pressure](Schedule-Pressure) page.
+
+### `GET /schedule/duplicates`
+
+Groups of jobs whose schedules fire on the identical instants, by the
+engine's semantic equality (`*/5` equals `0-59/5`; grouping includes the
+resolved timezone). Each group carries the most common source
+`expression`, a plain-English `description`, `timezone`, `count`, and the
+member `jobs`, sorted largest group first. See
+[Duplicate Schedule Detection](Duplicate-Schedule-Detection).
+
+### `GET /schedule/suggest`
+
+The least-loaded slot for a new job, scored on the same 24-hour fire walk
+as `/schedule/pressure`. `period` is `hourly` (pick a minute) or `daily`
+(pick a minute and hour; `400` otherwise), `tz` frames the daily pick.
+Returns the winning `expression`, its `fires_in_window`, the `busiest`
+slot for contrast, two `alternatives`, and a `hash_hint` naming the
+[`H` spelling](Hashed-Schedules) that spreads jobs without this endpoint.
+See [Suggest a Slot](Suggest-a-Slot).
 
 ### `GET /cluster`
 
@@ -489,6 +573,9 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `running`, `pids` | Whether any instance is currently running, and the PIDs of running instances whose subprocess has started. |
 | `running_resources` | Present only while a [`monitorResources`](Resource-Monitoring) job has a running instance: the **live** CPU/memory of the running instance(s), summed — `{cpu_percent, cpu_seconds, rss_bytes, instances}`. Omitted otherwise. `cpu_percent` is usage since the last sample and can exceed 100 across cores. |
 | `scheduled_in` | Seconds until the next scheduled run (a float), or `null` when not applicable (disabled, currently running, or a one-off `@reboot` schedule). |
+| `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
+| `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this job's crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own timezone. |
+| `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
 | `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
@@ -508,6 +595,8 @@ $ http get http://127.0.0.1:8080/jobs
         "running": false,
         "pids": [],
         "scheduled_in": 42.1,
+        "never_fires": false,
+        "schedule_findings": [],
         "last_run": {
             "outcome": "success",
             "exit_code": 0,

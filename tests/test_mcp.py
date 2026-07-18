@@ -597,3 +597,57 @@ def test_mcpcli_import_is_featherweight():
     )
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == ""
+
+
+async def test_schedule_analysis_tools_registered_and_callable():
+    h = _handler()
+    names = await _tool_names(h)
+    for expected in (
+        "cron_schedule_pressure",
+        "cron_schedule_duplicates",
+        "cron_suggest_slot",
+    ):
+        assert expected in names
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"hours": 24}},
+    )
+    data = resp["result"]["structuredContent"]
+    assert data["hours"] == 24
+    assert len(data["grid"]) == 24
+    assert "busiest minute" in resp["result"]["content"][0]["text"]
+    resp = await _req(
+        h, "tools/call", {"name": "cron_schedule_duplicates", "arguments": {}}
+    )
+    assert "groups" in resp["result"]["structuredContent"]
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_suggest_slot", "arguments": {"period": "daily"}},
+    )
+    assert resp["result"]["structuredContent"]["period"] == "daily"
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"tz": "Nope/Zone"}},
+    )
+    assert resp["result"]["isError"] is True
+
+
+async def test_schedule_pressure_engine_clamps_hours():
+    # the tool no longer clamps hours itself; the engine's authoritative
+    # [1, 168] clamp must still reach the payload through the offload path
+    h = _handler()
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"hours": 9999}},
+    )
+    assert resp["result"]["structuredContent"]["hours"] == 168
+    resp = await _req(
+        h,
+        "tools/call",
+        {"name": "cron_schedule_pressure", "arguments": {"hours": -3}},
+    )
+    assert resp["result"]["structuredContent"]["hours"] == 1
