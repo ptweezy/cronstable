@@ -354,7 +354,7 @@ async def capture_all():  # noqa: C901 - one linear staging walk
         # the staged db-health jobs only FAIL while the UTC minute is
         # 15-19 (a simulated outage window; see platform.yaml). Wait
         # for the window, nudge all four to run right away, then wait
-        # for the ×4 CORRELATED verdict -- not merely a crit one, which
+        # for the ×4 CORRELATED verdict, not merely a crit one, which
         # the other staged failures already keep lit.
         now = time.time()
         minute = int((now // 60) % 60)
