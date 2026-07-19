@@ -1705,18 +1705,28 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path):
         await _teardown(cron)
 
 
-async def test_subprocess_start_failure_fails_task_cleanly(tmp_path):
-    # a subprocess that cannot even start (missing executable) is failed
-    # explicitly with exit 127 by the launch path itself, contributes no
-    # pid stamp to the batch, and terminalises the run.
+async def test_subprocess_start_failure_fails_task_cleanly(
+    tmp_path, monkeypatch
+):
+    # a launch whose start() blows up is failed explicitly with exit 127 by
+    # the launch path itself, contributes NO pid stamp to the batch, and the
+    # run still terminalises.
+    from cronstable.job import RunningJob
+
     yaml = (
         "dags:\n  - name: sf\n    tasks:\n"
         "      - id: a\n        command: 'x'\n"
     )
     cron = await _make_cron(tmp_path, yaml)
     try:
-        _set_cmd(cron, "sf", "a", [str(tmp_path / "no-such-exe")])
+        _set_cmd(cron, "sf", "a", [_PY, "-c", "pass"])
+
+        async def boom(self):
+            raise RuntimeError("start blew up")
+
+        monkeypatch.setattr(RunningJob, "start", boom)
         run_key = await cron._dag.trigger_run("sf")
+        monkeypatch.undo()
         await _drain_pending(cron)
         body = await _drive(cron, "sf", run_key)
         assert body["state"] == dag.FAILED
