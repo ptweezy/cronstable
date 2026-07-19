@@ -886,10 +886,16 @@ def bench_dag_finish_fanin():
             if batched is not None:
                 marks = [
                     {
-                        "taskkey": t.id, "success": True, "exit_code": 0,
-                        "fail_reason": None, "task": t, "jitter": 0.0,
-                        "expected_proc": "p", "expected_attempt": 0,
-                        "expected_poke": None, "resources": None,
+                        "taskkey": t.id,
+                        "success": True,
+                        "exit_code": 0,
+                        "fail_reason": None,
+                        "task": t,
+                        "jitter": 0.0,
+                        "expected_proc": "p",
+                        "expected_attempt": 0,
+                        "expected_poke": None,
+                        "resources": None,
                     }
                     for t in tasks
                 ]
@@ -900,8 +906,13 @@ def bench_dag_finish_fanin():
                 t0 = time.perf_counter()
                 for t in tasks:
                     transform = dag.mark_task_finished(
-                        t.id, success=True, exit_code=0, fail_reason=None,
-                        now=now, task=t, expected_proc="p",
+                        t.id,
+                        success=True,
+                        exit_code=0,
+                        fail_reason=None,
+                        now=now,
+                        task=t,
+                        expected_proc="p",
                         expected_attempt=0,
                     )
                     await backend.mutate_document(ns, run_key, transform)
@@ -915,6 +926,124 @@ def bench_dag_finish_fanin():
         return asyncio.run(run())
     except TypeError as exc:
         raise Skip("dag completion signature changed: %r" % exc) from None
+
+
+def _cron_cls():
+    try:
+        from cronstable.cron import Cron
+    except ImportError as exc:
+        raise Skip("cronstable.cron unavailable: %r" % exc) from None
+    return Cron
+
+
+async def _teardown_cron(cron):
+    """Best-effort release of a bench Cron's resources (no job API was started
+    here, so just the dag scheduler and the state backend)."""
+    import contextlib
+
+    dagsched = getattr(cron, "_dag", None)
+    if dagsched is not None and hasattr(dagsched, "shutdown"):
+        with contextlib.suppress(Exception):
+            await dagsched.shutdown()
+    backend = getattr(cron, "state_backend", None)
+    if backend is not None:
+        with contextlib.suppress(Exception):
+            await backend.stop()
+
+
+_BENCH_DAG_YAML = (
+    "dags:\n  - name: benchdag\n    tasks:\n"
+    "      - id: a\n        command: 'x'\n"
+)
+
+
+def _seeded_dag_runs():
+    """A dag namespace pre-seeded with terminal run documents, built once."""
+
+    def build():
+        import asyncio
+
+        from cronstable import dag
+
+        path = os.path.join(_tmpdir(), "dag-runs")
+        os.makedirs(path, exist_ok=True)
+        runs = _n(50)
+        ns = dag.DAG_RUN_NS_PREFIX + "benchdag"
+
+        async def seed():
+            backend = _state_backend(path)
+            await backend.start()
+            for i in range(runs):
+                body = {
+                    "dag": "benchdag",
+                    "runKey": "r%05d" % i,
+                    "runId": "id%d" % i,
+                    "state": "success",
+                    "kind": "scheduled",
+                    "createdAt": 1700000000.0 + i,
+                    "updatedAt": 1700000000.0 + i,
+                    "tasks": {},
+                    "mapped": {},
+                }
+                await backend.mutate_document(
+                    ns, "r%05d" % i, lambda cur, b=body: (b, None)
+                )
+            await backend.stop()
+
+        asyncio.run(seed())
+        return path
+
+    return fixture("seeded_dag_runs", build)
+
+
+@bench(
+    "dag.list_dags_warm",
+    "dag",
+    detail="list_dags steady poll over a dag with 50 terminal runs",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_dag_list_dags_warm():
+    """The /dags dashboard poll's rollup for one dag with many terminal runs.
+
+    A release that caches immutable terminal runs re-reads nothing on the
+    steady poll; one that re-reads every run document each call pays the full
+    scan every time -- the difference this steady-state measurement surfaces.
+    """
+    import asyncio
+
+    Cron = _cron_cls()
+    path = _seeded_dag_runs()
+    cfg = "state:\n  path: %s\n%s" % (
+        path.replace("\\", "/"),
+        _BENCH_DAG_YAML,
+    )
+
+    async def run():
+        try:
+            cron = Cron(None, config_yaml=cfg)
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+        backend = _state_backend(path)
+        await backend.start()
+        cron.state_backend = backend
+        cron._state_configured = True
+        dagsched = getattr(cron, "_dag", None)
+        if dagsched is None or not hasattr(dagsched, "list_dags"):
+            await _teardown_cron(cron)
+            raise Skip("cron._dag.list_dags not present")
+        try:
+            await dagsched.list_dags()  # warm any terminal-run cache
+            t0 = time.perf_counter()
+            for _ in range(5):
+                await dagsched.list_dags()
+            dt = time.perf_counter() - t0
+        finally:
+            await _teardown_cron(cron)
+        return dt
+
+    return asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
@@ -1167,6 +1296,101 @@ def bench_artifact_list_churn():
         except TypeError as exc:
             raise Skip("artifact_list signature changed: %r" % exc) from None
         await backend.stop()
+        return dt
+
+    return asyncio.run(run())
+
+
+_BENCH_GATE_YAML = (
+    "jobs:\n  - name: gated\n    command: 'x'\n"
+    "    schedule: '* * * * *'\n    onlyIfLastSucceeded: true\n"
+)
+
+
+def _seeded_run_ledger():
+    """A job's durable run ledger pre-seeded with success records, built once.
+    The newest is a real outcome, so a release that probes a small newest page
+    reads a few records where one reading the full window reads them all."""
+
+    def build():
+        import asyncio
+
+        Cron = _cron_cls()
+        path = os.path.join(_tmpdir(), "run-ledger")
+        os.makedirs(path, exist_ok=True)
+        n = max(_n(60), 2)
+        stream = Cron._run_stream("gated")
+
+        async def seed():
+            backend = _state_backend(path)
+            await backend.start()
+            for i in range(n):
+                await backend.append_record(
+                    stream,
+                    {
+                        "outcome": "success",
+                        "exit_code": 0,
+                        "started_at": None,
+                        "finished_at": "2026-07-01T10:%02d:%02d+00:00"
+                        % (i // 60, i % 60),
+                        "duration": None,
+                        "fail_reason": None,
+                    },
+                )
+            await backend.stop()
+
+        asyncio.run(seed())
+        return path
+
+    return fixture("seeded_run_ledger", build)
+
+
+@bench(
+    "state.depends_on_past_gate",
+    "state",
+    detail="onlyIfLastSucceeded gate read against a 60-record ledger",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_depends_on_past_gate():
+    """The onlyIfLastSucceeded fire gate's durable read.
+
+    The gate needs only the newest real outcome; a release that probes a small
+    newest page reads a few records, one that always materialises the full
+    RUN_HISTORY_LIMIT window reads them all -- what this measures, per fire.
+    """
+    import asyncio
+
+    Cron = _cron_cls()
+    path = _seeded_run_ledger()
+    cfg = "state:\n  path: %s\n%s" % (
+        path.replace("\\", "/"),
+        _BENCH_GATE_YAML,
+    )
+
+    async def run():
+        try:
+            cron = Cron(None, config_yaml=cfg)
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+        if not hasattr(cron, "_depends_on_past_ok"):
+            raise Skip("_depends_on_past_ok not present")
+        job = cron.cron_jobs.get("gated")
+        if job is None:
+            raise Skip("gated job not configured")
+        backend = _state_backend(path)
+        await backend.start()
+        cron.state_backend = backend
+        cron._state_configured = True
+        try:
+            await cron._depends_on_past_ok(job)  # warm imports/paths
+            t0 = time.perf_counter()
+            for _ in range(20):
+                await cron._depends_on_past_ok(job)
+            dt = time.perf_counter() - t0
+        finally:
+            await _teardown_cron(cron)
         return dt
 
     return asyncio.run(run())

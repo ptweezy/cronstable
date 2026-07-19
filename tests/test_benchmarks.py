@@ -47,12 +47,19 @@ def test_bench_smoke_produces_results(tmp_path):
     for r in ran:
         assert r["value"] >= 0.0
         assert r["unit"] in ("s", "MB")
-    # The headline metrics must never silently skip.
+    # The headline metrics must never silently skip -- including the terminal
+    # UI and the branch-win backend metrics (the web UI ones legitimately skip
+    # in smoke, since they would launch a browser).
     for name in (
         "startup.version",
         "schedule.cold_build_100k",
         "config.parse_yaml_300",
         "state.append_1k",
+        "state.artifact_list_churn",
+        "state.depends_on_past_gate",
+        "dag.finish_fanin_1k",
+        "dag.list_dags_warm",
+        "tui.log_restyle_5k",
     ):
         assert not results[name]["skipped"], results[name]
 
