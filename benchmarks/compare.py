@@ -356,7 +356,11 @@ def build_svg(rows, base_label, cur_label):
         ".num{font-variant-numeric:tabular-nums}"
         ".grid{stroke:%(grid)s;stroke-width:1}"
         ".zero{stroke:%(baseline)s;stroke-width:1}"
-        ".fast{fill:%(faster)s}.slow{fill:%(slower)s}" % _LIGHT
+        ".fast{fill:%(faster)s}.slow{fill:%(slower)s}"
+        # a label drawn INSIDE a clamped bar: near-black reads on both the
+        # blue and the red fill, in either theme (>=4.5:1), where white would
+        # fail on the red; so it needs no per-theme override.
+        ".inlabel{fill:#000000}" % _LIGHT
     )
     dark_css = (
         "@media(prefers-color-scheme:dark){"
@@ -424,23 +428,38 @@ def build_svg(rows, base_label, cur_label):
         label = "%+.1f%%" % delta
         if row["gated"]:
             label += " (gate)"
+        rightward = delta > 0
         if length >= 0.75:
-            cls = "slow" if delta > 0 else "fast"
+            cls = "slow" if rightward else "fast"
             parts.append(
                 '<path class="%s" d="%s"/>'
-                % (cls, _bar_path(center, y_bar, length, bar_h, delta > 0))
+                % (cls, _bar_path(center, y_bar, length, bar_h, rightward))
             )
-        if delta > 0:
-            parts.append(
-                '<text class="t2 num" x="%.1f" y="%.1f" font-size="10">'
-                "%s</text>" % (center + length + 6, y_mid + 4, label)
-            )
+        # Place the percentage just past the bar's data-end -- UNLESS a large
+        # (clamped) bar would push it off the plot: past the right edge, or
+        # left into the metric-name gutter (the bug where a -94% label landed
+        # on top of the name). Then draw it INSIDE the bar's end instead, so
+        # the number stays readable rather than colliding or clipping.
+        pad = 6.0
+        # rough font-size-10 advance; err high so a borderline label goes
+        # inside (always legible) rather than half-off the edge.
+        label_w = len(label) * 6.0 + 3.0
+        end = center + length if rightward else center - length
+        if rightward:
+            if end + pad + label_w <= width - 10.0:
+                lx, anchor, lcls = end + pad, "start", "t2 num"
+            else:
+                lx, anchor, lcls = end - pad, "end", "inlabel num"
         else:
-            parts.append(
-                '<text class="t2 num" x="%.1f" y="%.1f" font-size="10" '
-                'text-anchor="end">%s</text>'
-                % (center - length - 6, y_mid + 4, label)
-            )
+            if end - pad - label_w >= gutter + 4.0:
+                lx, anchor, lcls = end - pad, "end", "t2 num"
+            else:
+                lx, anchor, lcls = end + pad, "start", "inlabel num"
+        parts.append(
+            '<text class="%s" x="%.1f" y="%.1f" font-size="10" '
+            'text-anchor="%s">%s</text>'
+            % (lcls, lx, y_mid + 4, anchor, label)
+        )
 
     if omitted > 0:
         parts.append(
