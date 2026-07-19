@@ -9025,6 +9025,63 @@
   } else {
     startApp();
   }
+
+  // Performance-benchmark hook: EXPOSED ONLY under ?perf=1, so it is entirely
+  // inert in normal use (no global is defined, nothing runs). benchmarks/
+  // bench.py drives these to time the render hot paths (the jobs table, the
+  // fleet matrix, the log-search count) against synthetic data in a headless
+  // browser. Each render wrapper clears its dirty-check signature first so the
+  // timed call does the full rebuild rather than the early-return.
+  if (location.search.indexOf("perf=1") >= 0) {
+    const _pjob = (i) => ({
+      name: "job" + i, enabled: true, running: i % 7 === 0,
+      schedule: "*/5 * * * *", command: "echo " + i,
+      captureStdout: true, utc: true, timezone: null, pids: i % 7 === 0 ? [1] : [],
+      scheduled_in: 30 + (i % 100),
+      last_run: {
+        outcome: i % 5 === 0 ? "failure" : "success",
+        exit_code: i % 5 === 0 ? 1 : 0,
+        started_at: new Date(Date.now() - 61000 - i * 1000).toISOString(),
+        finished_at: new Date(Date.now() - 60000 - i * 1000).toISOString(),
+        duration: 1.2, fail_reason: null, resources: null,
+      },
+      history: [],
+    });
+    window.__perf = {
+      seedJobs(n) {
+        const jobs = Array.from({ length: n }, (_, i) => _pjob(i));
+        state.jobs = jobs; state.byName = {};
+        jobs.forEach((j) => { state.byName[j.name] = j; });
+      },
+      renderRows() { state.lastRowSig = null; renderRows(); },
+      seedFleet(nodes, per) {
+        const ns = Array.from({ length: nodes }, (_, k) => ({
+          node_name: "node" + k, self: k === 0, status: "live",
+          as_of: new Date(Date.now() - 5000).toISOString(),
+          jobs: Object.fromEntries(Array.from({ length: per }, (_, i) => ["job" + i, {
+            running: i % 9 === 0, enabled: true,
+            last: { outcome: i % 6 === 0 ? "failure" : "success",
+              finished_at: new Date(Date.now() - 60000).toISOString(),
+              exit_code: 0, duration: 1 },
+          }])),
+        }));
+        state.fleet.data = { enabled: true, nodes: ns, distribution: "spread",
+          elect_leader: true, interval: 5 };
+        prefs.fleet = true;
+      },
+      renderFleet() { state.fleet.lastSig = null; renderFleet(); },
+      seedLog(n, q) {
+        state.log.lines = Array.from({ length: n }, (_, i) => ({
+          stream: "stdout", kind: null, ts: Date.now(), n: i,
+          text: i % 3 ? "\x1b[32mINFO\x1b[0m worker " + i + " ok" : "plain line " + i,
+        }));
+        $("logSearch").value = q; $("optRegex").checked = false;
+        state.log.matchSig = null;
+      },
+      updateLogCount() { state.log.matchSig = null; updateLogCount(); },
+      tick() { tick(); },
+    };
+  }
 })();
 </script>
 </body>
