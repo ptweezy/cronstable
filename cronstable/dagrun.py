@@ -60,6 +60,17 @@ SCHEDULE_CHECK_INTERVAL = 20.0
 ADOPT_SCAN_INTERVAL = 30.0
 GC_INTERVAL = 3600.0
 
+# How often the adopt scan does a FULL body listing instead of the cheap
+# keys-only pass.  Terminality is monotonic, so the per-dag terminal-key cache
+# lets the ordinary scan skip re-reading runs already known finished (with
+# retainRuns: 50 the old scan re-read and re-parsed all ~50 documents per dag
+# every 30s mostly to rediscover that).  The periodic full pass, plus the
+# hourly GC's full listing, rebuilds the cache from actual bodies, bounding
+# how long the one known stale-cache corner (a terminal run GC-deleted and
+# re-created under the SAME key by an operator backfill within a single scan
+# interval, then orphaned) can delay that run's adoption.
+ADOPT_FULL_REFRESH = 600.0
+
 # How often the owner re-advances a run that is blocked on an approval gate, so
 # a decision recorded on a peer node (which cannot advance a run it does not
 # own) is acted on within a few seconds rather than a full idle re-advance.
@@ -141,6 +152,13 @@ class DagScheduler:
         # soonest wall-clock instant an owned run wants another advance (a due
         # sensor poke or task retry); drives the loop's sleep cap.
         self._wake: Dict[RunRef, float] = {}
+        # dag name -> run keys this node has SEEN terminal.  Terminality is
+        # monotonic, so the adopt scan skips re-reading these (see
+        # _adopt_one_dag); pruned against each key listing, rebuilt from
+        # bodies by every full adopt pass and every GC pass, and a key is
+        # evicted when this node (re-)creates a run under it.
+        self._terminal_run_keys: Dict[str, Set[str]] = {}
+        self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
         self._next_logical: Dict[str, datetime.datetime] = {}
@@ -548,6 +566,13 @@ class DagScheduler:
             return body, True
 
         _stored, created = await self._mutate(dagcfg.name, run_key, _create)
+        if created:
+            # a fresh run now lives under this key: it must not inherit a
+            # stale "known terminal" marking from a GC'd predecessor (an
+            # operator backfill legitimately re-creates a logical date's key).
+            known = self._terminal_run_keys.get(dagcfg.name)
+            if known is not None:
+                known.discard(run_key)
         return bool(created)
 
     # =====================================================================
@@ -647,17 +672,56 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return
+        now = _now()
+        full = now >= self._next_full_adopt
+        if full:
+            self._next_full_adopt = now + ADOPT_FULL_REFRESH
         for name, dagcfg in list(self._dags().items()):
             try:
-                await self._adopt_one_dag(backend, name, dagcfg)
+                await self._adopt_one_dag(backend, name, dagcfg, full=full)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - isolate per-dag failures
                 logger.exception("dag %s: orphan adoption failed", name)
 
     async def _adopt_one_dag(
-        self, backend: StateBackend, name: str, dagcfg: Any
+        self, backend: StateBackend, name: str, dagcfg: Any, *, full: bool
     ) -> None:
+        if not full:
+            try:
+                keys = await asyncio.wait_for(
+                    backend.list_document_keys(self._ns(name)),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                return
+            if keys is not None:
+                # Keys-only pass: one directory listing, plus a body read for
+                # only the runs not already owned here or known terminal;
+                # the steady state re-reads nothing.  A key that vanished
+                # from the listing (GC'd, here or on a peer) is dropped from
+                # the cache by the intersection below.
+                known = self._terminal_run_keys.setdefault(name, set())
+                known.intersection_update(keys)
+                for key in keys:
+                    if key in known or (name, key) in self._owned:
+                        continue
+                    try:
+                        body = await asyncio.wait_for(
+                            backend.read_document(self._ns(name), key),
+                            timeout=STATE_OP_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        return
+                    if body is None:
+                        continue  # deleted (or unreadable) since the listing
+                    if dag.is_terminal_run(body):
+                        known.add(key)
+                        continue
+                    if not isinstance(body.get("runKey"), str):
+                        continue
+                    await self._try_own(dagcfg, (name, key))
+                return
         try:
             docs = await asyncio.wait_for(
                 backend.list_documents(self._ns(name)),
@@ -665,16 +729,23 @@ class DagScheduler:
             )
         except asyncio.TimeoutError:
             return
+        terminal: Set[str] = set()
         for body in docs:
-            if dag.is_terminal_run(body):
-                continue
             run_key = body.get("runKey")
+            if dag.is_terminal_run(body):
+                if isinstance(run_key, str):
+                    terminal.add(run_key)
+                continue
             if not isinstance(run_key, str):
                 continue
             ref = (name, run_key)
             if ref in self._owned:
                 continue
             await self._try_own(dagcfg, ref)
+        # a full pass parsed every body: rebuild the cache from truth (also
+        # the self-heal for the stale-terminal corner ADOPT_FULL_REFRESH
+        # documents).
+        self._terminal_run_keys[name] = terminal
 
     # =====================================================================
     # Advancing an owned run
@@ -1003,6 +1074,9 @@ class DagScheduler:
 
     async def _on_terminal(self, ref: RunRef) -> None:
         logger.info("dag run %s/%s reached a terminal state", ref[0], ref[1])
+        # terminality is monotonic: remember it so the adopt scan never
+        # re-reads this run's document just to rediscover it finished.
+        self._terminal_run_keys.setdefault(ref[0], set()).add(ref[1])
         await self._release(ref)
 
     # =====================================================================
@@ -1694,6 +1768,11 @@ class DagScheduler:
             timeout=STATE_OP_TIMEOUT,
         )
         terminal = [b for b in docs if dag.is_terminal_run(b)]
+        # this pass parsed every body anyway: rebuild the adopt scan's
+        # terminal-key cache from truth (its periodic self-heal).
+        self._terminal_run_keys[name] = {
+            b["runKey"] for b in terminal if isinstance(b.get("runKey"), str)
+        }
         terminal.sort(key=lambda b: float(b.get("createdAt") or 0))
         excess = len(terminal) - dagcfg.retain_runs
         if excess <= 0:
@@ -1724,6 +1803,12 @@ class DagScheduler:
             backend.delete_document(self._ns(name), run_key),
             timeout=STATE_OP_TIMEOUT,
         )
+        known = self._terminal_run_keys.get(name)
+        if known is not None:
+            # the key may legitimately come back (an operator backfill of the
+            # same logical date re-creates it): a deleted key must not linger
+            # as "known terminal".
+            known.discard(run_key)
         if run_id:
             from cronstable.jobstate import ARTIFACT_STREAM_PREFIX
 
