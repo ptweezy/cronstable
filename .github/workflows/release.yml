@@ -1348,10 +1348,18 @@ jobs:
   # fork microsoft/winget-pkgs and open a PR under that account. If it is unset
   # the job fails loudly rather than silently leaving the manifest stale (see the
   # homebrew job above for why silent-skip is the wrong default here).
+  #
+  # TEMPORARY: this job is warning-only (continue-on-error) until the initial
+  # ptweezy.cronstable submission PR is merged into microsoft/winget-pkgs.
+  # `wingetcreate update` fetches the EXISTING manifest to bump it, so it fails
+  # until the package exists there. Once the first PR merges, drop
+  # continue-on-error and restore the hard `exit 1` below so a stale manifest
+  # fails the release loudly again.
   winget:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
     runs-on: windows-latest
+    continue-on-error: true
     defaults:
       run:
         shell: bash
@@ -1363,18 +1371,21 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${WINGET_TOKEN:-}" ]; then
-            echo "::error::WINGET_TOKEN is not set; cannot update the winget manifest. Add it as a repo secret (a GitHub PAT with public_repo scope) and re-run this release." >&2
-            exit 1
+            echo "::warning::WINGET_TOKEN is not set; skipping winget manifest update. Add it as a repo secret (a GitHub PAT with public_repo scope) to enable it." >&2
+            exit 0
           fi
           curl -fsSL -o wingetcreate.exe \
             https://github.com/microsoft/winget-create/releases/latest/download/wingetcreate.exe
-          ./wingetcreate.exe update ptweezy.cronstable \
+          if ! ./wingetcreate.exe update ptweezy.cronstable \
             --version "$VERSION" \
             --urls \
               "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-amd64.exe" \
               "https://github.com/ptweezy/cronstable/releases/download/${VERSION}/cronstable-windows-arm64.exe" \
             --submit --no-open --token "$WINGET_TOKEN" \
-            --prtitle "New version: ptweezy.cronstable version ${VERSION}"
+            --prtitle "New version: ptweezy.cronstable version ${VERSION}"; then
+            echo "::warning::wingetcreate update failed (expected until the initial ptweezy.cronstable PR is merged into microsoft/winget-pkgs). Treating as non-fatal for now." >&2
+            exit 0
+          fi
 
   # ---------------------------------------------------------------------------
   # Docs. Runs on an ordinary commit and is NOT gated on the build+test matrix:
