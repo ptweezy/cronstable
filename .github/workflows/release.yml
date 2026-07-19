@@ -812,7 +812,9 @@ jobs:
   # this commit and the latest published release tag, interleaved on one
   # runner so machine noise cancels out of the comparison, and
   # benchmarks/compare.py then diffs the two sides and enforces each metric's
-  # declared regression limit. It runs on every event, in the same fan-out as
+  # declared regression limit (a regression must also clear the metric's
+  # measured round-to-round noise band to gate, so jitter cannot fail a
+  # release). It runs on every event, in the same fan-out as
   # the builds. Enforcement is release-only: the `release` job needs this one,
   # so a gated regression blocks publishing, while on an ordinary commit the
   # identical comparison merely warns (a branch experiment is never blocked by
@@ -861,22 +863,35 @@ jobs:
             echo "::notice::No release tag yet; recording a baseline without a comparison."
           fi
           echo "prev=$prev" >> "$GITHUB_OUTPUT"
-      - name: Run benchmarks (interleaved rounds)
+      - name: Run benchmarks (interleaved rounds, per tier)
         env:
           PYTHONHASHSEED: "0"
           PREV: ${{ steps.envs.outputs.prev }}
         run: |
           set -euo pipefail
           mkdir -p perf
-          # Old then new, twice: interleaving puts both sides through the same
-          # runner weather; compare.py folds the rounds with each metric's own
-          # estimator (best-of for time, median for memory).
-          for round in 1 2; do
-            if [ -n "$PREV" ]; then
-              .venv-old/bin/python benchmarks/bench.py --json "perf/old.$round.json"
-            fi
-            .venv-new/bin/python benchmarks/bench.py --json "perf/new.$round.json"
-          done
+          # Two tiers with their own round counts. The fast in-process metrics
+          # get more rounds: it is cheap, and more rounds tighten the per-metric
+          # noise band that compare.py now gates against, so a real regression
+          # is easier to tell from jitter. The noisier subprocess metrics (cold
+          # start, import, peak RSS) get fewer, since each round spawns
+          # processes. Old then new within each round interleaves both sides
+          # through the same runner weather; compare.py folds every
+          # perf/{old,new}.*.json with each metric's own estimator (best-of for
+          # time, median for memory).
+          run_tier() {
+            tier="$1"; rounds="$2"
+            for round in $(seq 1 "$rounds"); do
+              if [ -n "$PREV" ]; then
+                .venv-old/bin/python benchmarks/bench.py --tier "$tier" \
+                  --json "perf/old.$tier$round.json"
+              fi
+              .venv-new/bin/python benchmarks/bench.py --tier "$tier" \
+                --json "perf/new.$tier$round.json"
+            done
+          }
+          run_tier inprocess 5
+          run_tier subprocess 2
       - name: Compare and gate
         env:
           RELEASE: ${{ needs.version.outputs.release }}

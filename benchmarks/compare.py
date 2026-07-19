@@ -13,9 +13,11 @@ Outputs:
   --merged-out PATH  the merged current-side results as one JSON document
 
 Gating: a metric fails when it slows down by more than its declared gate
-percentage AND by more than its absolute floor (so microsecond jitter on a
-sub-millisecond metric never gates).  Failures exit 1 unless --warn-only
-(ordinary commits) or --accept (an acknowledged, intentional regression).
+percentage AND by more than its absolute floor AND by more than a couple of
+its measured noise bands (the round-to-round scatter of the two sides, so
+measurement noise on a jittery metric never gates).  Failures exit 1 unless
+--warn-only (ordinary commits) or --accept (an acknowledged, intentional
+regression).
 
 Usage:
     python benchmarks/compare.py \
@@ -25,6 +27,7 @@ Usage:
 
 import argparse
 import json
+import math
 import statistics
 import sys
 
@@ -56,6 +59,17 @@ _DARK = {
 }
 
 _MAX_CHART_ROWS = 16
+
+# Significance guard for the gate.  A metric's round-to-round scatter is
+# estimated as the coefficient of variation of its per-round estimator values;
+# the two sides' CoVs combine in quadrature into a noise band.  A regression
+# gates only when it ALSO exceeds _SIG_SIGMA noise bands -- so measurement
+# noise can never trip the gate, and the gate percentage can be tightened
+# without drowning in false positives.  When a side has fewer than two rounds
+# the noise cannot be estimated, and the guard falls back to not suppressing
+# (the gate behaves exactly as it did before this guard existed).
+_SIG_SIGMA = 2.0
+_MIN_ROUNDS_FOR_NOISE = 2
 
 
 def _fmt(value, unit):
@@ -120,6 +134,35 @@ def _delta_pct(base, cur):
     return (cur - base) / base * 100.0
 
 
+def _rel_cov(entry):
+    """A side's round-to-round scatter as a coefficient of variation.
+
+    Uses the per-round estimator values that _merge preserved in
+    ``round_values``; needs at least two rounds to estimate scatter, else
+    None.  Returned as a fraction of the mean.
+    """
+    rounds = entry.get("round_values") or []
+    if len(rounds) < _MIN_ROUNDS_FOR_NOISE:
+        return None
+    mean = statistics.fmean(rounds)
+    if mean <= 0:
+        return None
+    return statistics.stdev(rounds) / mean
+
+
+def _noise_band(base, cur):
+    """Combined round-to-round noise band as a fraction, or None if unknown.
+
+    The two sides' coefficients of variation add in quadrature; None whenever
+    either side has too few rounds to estimate its own scatter.
+    """
+    noise_base = _rel_cov(base)
+    noise_cur = _rel_cov(cur)
+    if noise_base is None or noise_cur is None:
+        return None
+    return math.hypot(noise_base, noise_cur)
+
+
 def _compare(baseline, current):
     """Per-metric comparison rows plus gate violations."""
     rows = []
@@ -135,28 +178,40 @@ def _compare(baseline, current):
                     "entry": cur,
                     "base_value": None,
                     "delta_pct": None,
+                    "noise_pct": None,
+                    "significant": None,
                     "gated": False,
                 }
             )
             continue
         delta = _delta_pct(base["value"], cur["value"])
+        noise = _noise_band(base, cur)
+        # Unknown noise (too few rounds) never suppresses: the guard is only
+        # allowed to make the gate MORE conservative, never to hide a
+        # regression when it lacks the data to prove it is noise.
+        significant = noise is None or (
+            delta is not None and abs(delta) / 100.0 > _SIG_SIGMA * noise
+        )
         gated = False
         gate_pct = cur.get("gate_pct")
-        if (
+        over_gate = (
             delta is not None
             and gate_pct is not None
             and delta > gate_pct
             and (cur["value"] - base["value"]) > (cur.get("gate_floor") or 0.0)
-        ):
+        )
+        if over_gate and significant:
             gated = True
             violations.append(
-                "%s regressed %+.1f%% (%s to %s, gate %.0f%%)"
+                "%s regressed %+.1f%% (%s to %s, gate %.0f%%, noise band "
+                "+-%s)"
                 % (
                     name,
                     delta,
                     _fmt(base["value"], cur["unit"]),
                     _fmt(cur["value"], cur["unit"]),
                     gate_pct,
+                    "%.1f%%" % (noise * 100) if noise is not None else "n/a",
                 )
             )
         rows.append(
@@ -165,6 +220,11 @@ def _compare(baseline, current):
                 "entry": cur,
                 "base_value": base["value"],
                 "delta_pct": delta,
+                "noise_pct": noise * 100 if noise is not None else None,
+                "significant": significant,
+                # a change that cleared the raw gate but not the noise band:
+                # reported, but explicitly not gated.
+                "suppressed": over_gate and not significant,
                 "gated": gated,
             }
         )
@@ -393,6 +453,25 @@ def build_md(
             "Negative change is faster or smaller."
         )
         lines.append("")
+        lines.append(
+            "A regression gates only when it exceeds its declared limit AND "
+            "%.0f noise bands -- the +- column, the two sides' round-to-round "
+            "scatter combined in quadrature -- so measurement noise alone "
+            "cannot fail the gate." % _SIG_SIGMA
+        )
+        lines.append("")
+        suppressed = [r for r in rows if r.get("suppressed")]
+        if suppressed:
+            lines.append(
+                "Over the raw limit but within the noise band (reported, not "
+                "gated): %s."
+                % ", ".join(
+                    "%s (%+.1f%%, noise +-%.1f%%)"
+                    % (r["name"], r["delta_pct"], r["noise_pct"] or 0.0)
+                    for r in sorted(suppressed, key=lambda r: -r["delta_pct"])
+                )
+            )
+            lines.append("")
 
         comparable = [r for r in rows if r["delta_pct"] is not None]
         comparable.sort(key=lambda r: -abs(r["delta_pct"]))
@@ -403,20 +482,29 @@ def build_md(
         )
         lines.append("")
         lines.append(
-            "| Benchmark | %s | %s | Change |" % (base_label, cur_label)
+            "| Benchmark | %s | %s | Change | Noise +- |"
+            % (base_label, cur_label)
         )
-        lines.append("|---|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|")
         for row in comparable:
             entry = row["entry"]
-            mark = " **(gate)**" if row["gated"] else ""
+            if row["gated"]:
+                mark = " **(gate)**"
+            elif row.get("suppressed"):
+                mark = " (within noise)"
+            else:
+                mark = ""
+            noise = row.get("noise_pct")
+            noise_cell = "%.1f%%" % noise if noise is not None else "n/a"
             lines.append(
-                "| %s | %s | %s | %+.1f%%%s |"
+                "| %s | %s | %s | %+.1f%%%s | %s |"
                 % (
                     row["name"],
                     _fmt(row["base_value"], entry["unit"]),
                     _fmt(entry["value"], entry["unit"]),
                     row["delta_pct"],
                     mark,
+                    noise_cell,
                 )
             )
         lines.append("")
