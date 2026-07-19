@@ -18,12 +18,20 @@ Usage:
     python benchmarks/bench.py --quick              # roughly 10x smaller
     python benchmarks/bench.py --smoke              # minimal, for unit tests
     python benchmarks/bench.py --only cronexpr      # substring filter
+    python benchmarks/bench.py --tier inprocess     # skip the subprocess tier
     python benchmarks/bench.py --list               # list benchmarks
 
 Every timed benchmark returns the wall-clock seconds of a fixed workload
 (lower is better); memory benchmarks return MB.  Per-benchmark repeats give
 the distribution; compare.py uses each metric's declared estimator ("min" for
 time, "median" for memory) so one noisy repeat cannot fake a regression.
+
+To keep that estimator honest the harness works to lower the measurement
+noise floor: it runs untimed warm-up passes before the measured repeats, and
+(best-effort) pins itself to one CPU and raises its priority to cut scheduling
+jitter.  Benchmarks split into two tiers -- the fast in-process metrics and
+the noisier subprocess metrics (cold start, import, peak RSS) -- selectable
+with --tier so CI can give each its own round count.
 """
 
 import argparse
@@ -47,6 +55,13 @@ SCHEMA = 1
 _MODES = {"full": (1.0, 0), "quick": (0.1, 1), "smoke": (0.01, 2)}
 _MODE = "full"
 
+# Untimed warm-up passes per mode, discarded before the measured repeats: they
+# page in code and data and let the CPU reach a steady clock so first-call
+# effects never enter the distribution.  Smoke runs none, keeping the unit test
+# fast.  Overridable with --warmup.
+_WARMUPS = {"full": 1, "quick": 1, "smoke": 0}
+_WARMUP_OVERRIDE = None
+
 
 def _scale() -> float:
     return _MODES[_MODE][0]
@@ -58,6 +73,12 @@ def _n(base: int, floor: int = 1) -> int:
 
 def _reps(spec) -> int:
     return spec[_MODES[_MODE][1]]
+
+
+def _warmups() -> int:
+    if _WARMUP_OVERRIDE is not None:
+        return _WARMUP_OVERRIDE
+    return _WARMUPS[_MODE]
 
 
 class Skip(Exception):
@@ -121,8 +142,14 @@ def bench(
     compare="min",
     repeats=(5, 2, 1),
     info=False,
+    subprocess=False,
 ):
-    """Register a benchmark.  The function returns one measured value."""
+    """Register a benchmark.  The function returns one measured value.
+
+    ``subprocess=True`` marks a benchmark that measures a child process (cold
+    start, import, peak RSS): it belongs to the noisier subprocess tier, which
+    ``--tier`` can select on its own so CI can run it with its own round count.
+    """
 
     def deco(fn):
         _BENCHMARKS.append(
@@ -136,6 +163,7 @@ def bench(
                 "compare": compare,
                 "repeats": repeats,
                 "info": info,
+                "subprocess": subprocess,
                 "fn": fn,
             }
         )
@@ -308,6 +336,7 @@ def _timed_child(args):
     detail="python -c pass",
     repeats=(40, 5, 1),
     info=True,
+    subprocess=True,
 )
 def bench_python_baseline():
     return _timed_child(["-c", "pass"])
@@ -318,6 +347,7 @@ def bench_python_baseline():
     "startup",
     detail="cronstable --version",
     repeats=(40, 5, 2),
+    subprocess=True,
 )
 def bench_startup_version():
     return _timed_child(["-m", "cronstable", "--version"])
@@ -328,6 +358,7 @@ def bench_startup_version():
     "startup",
     detail="import cronstable.cronexpr",
     repeats=(12, 3, 1),
+    subprocess=True,
 )
 def bench_import_cronexpr():
     return _timed_child(["-c", "import cronstable.cronexpr"])
@@ -338,6 +369,7 @@ def bench_import_cronexpr():
     "startup",
     detail="import cronstable.config",
     repeats=(12, 3, 1),
+    subprocess=True,
 )
 def bench_import_config():
     return _timed_child(["-c", "import cronstable.config"])
@@ -348,6 +380,7 @@ def bench_import_config():
     "startup",
     detail="import cronstable.cron (full daemon graph)",
     repeats=(12, 3, 1),
+    subprocess=True,
 )
 def bench_import_daemon():
     return _timed_child(["-c", "import cronstable.cron"])
@@ -358,6 +391,7 @@ def bench_import_daemon():
     "startup",
     detail="cronstable --validate-config, 100 jobs",
     repeats=(8, 2, 1),
+    subprocess=True,
 )
 def bench_validate_config():
     path = _config_path(_n(100))
@@ -369,6 +403,7 @@ def bench_validate_config():
     "startup",
     detail="cronstable --job-set-id, 100 jobs",
     repeats=(8, 2, 1),
+    subprocess=True,
 )
 def bench_job_set_id_cli():
     path = _config_path(_n(100))
@@ -464,10 +499,15 @@ def bench_occurrences():
     return time.perf_counter() - t0
 
 
+# Rescaled (id bumped from the legacy cronexpr.test_match, which was ~7ms and
+# noise-dominated): ten passes over the 20k fixture put the timed region near
+# 70ms so scheduler/GC jitter is a small fraction.  The id carries the new
+# scale so the name keeps meaning one workload across releases; see
+# benchmarks/README.md.
 @bench(
-    "cronexpr.test_match",
+    "cronexpr.test_match_200k",
     "cronexpr",
-    detail="test() one instant against 20k tabs",
+    detail="test() one instant against 20k tabs, 10 passes (200k matches)",
 )
 def bench_test_match():
     tabs = fixture(
@@ -477,8 +517,9 @@ def bench_test_match():
         ),
     )
     t0 = time.perf_counter()
-    for tab in tabs:
-        tab.test(_NAIVE)
+    for _ in range(10):
+        for tab in tabs:
+            tab.test(_NAIVE)
     return time.perf_counter() - t0
 
 
@@ -636,10 +677,13 @@ def bench_next_fires():
     return time.perf_counter() - t0
 
 
+# Rescaled (id bumped from the legacy schedule.duplicates_5k, ~9ms and noisy):
+# its own 20k-entry fixture puts the timed region near 40ms.  Id carries the
+# new scale; see benchmarks/README.md.
 @bench(
-    "schedule.duplicates_5k",
+    "schedule.duplicates_20k",
     "schedule",
-    detail="duplicate_schedules over 5k entries",
+    detail="duplicate_schedules over 20k entries",
     repeats=(3, 2, 1),
 )
 def bench_duplicates():
@@ -647,7 +691,7 @@ def bench_duplicates():
         from cronstable.croninfo import duplicate_schedules
     except ImportError as exc:
         raise Skip("duplicate_schedules unavailable: %r" % exc) from None
-    entries = fixture("entries_5k", lambda: _schedule_entries(_n(5000)))
+    entries = fixture("entries_dup_20k", lambda: _schedule_entries(_n(20000)))
     t0 = time.perf_counter()
     duplicate_schedules(entries)
     return time.perf_counter() - t0
@@ -732,17 +776,20 @@ def bench_dag_layered():
     return time.perf_counter() - t0
 
 
+# Rescaled (id bumped from the legacy dag.plan_claim_2k, ~5ms): a 10k-task run
+# puts the timed transform near 25ms.  Id carries the new scale; see
+# benchmarks/README.md.
 @bench(
-    "dag.plan_claim_2k",
+    "dag.plan_claim_10k",
     "dag",
-    detail="plan_and_claim over a fresh 2k-task run",
+    detail="plan_and_claim over a fresh 10k-task run",
     repeats=(3, 2, 1),
 )
 def bench_dag_plan():
     dag = _dag_module()
     if not hasattr(dag, "new_run_body") or not hasattr(dag, "plan_and_claim"):
         raise Skip("dag planning API not present")
-    n = _n(2000)
+    n = _n(10000)
     tasks = [dag.TaskSpec(id="t%d" % i) for i in range(n)]
     spec = dag.DagSpec.build("wide", tasks)
     try:
@@ -1215,6 +1262,7 @@ def _child_peak_rss_mb(args):
     gate_floor=3.0,
     compare="median",
     repeats=(5, 2, 1),
+    subprocess=True,
 )
 def bench_rss_version():
     return _child_peak_rss_mb(["-m", "cronstable", "--version"])
@@ -1229,6 +1277,7 @@ def bench_rss_version():
     gate_floor=3.0,
     compare="median",
     repeats=(5, 2, 1),
+    subprocess=True,
 )
 def bench_rss_daemon():
     return _child_peak_rss_mb(["-c", "import cronstable.cron"])
@@ -1265,7 +1314,21 @@ def _run_one(spec):
     reps = _reps(spec["repeats"])
     values = []
     error = None
-    for _ in range(reps):
+    # Untimed warm-up passes, discarded: page in code/data and let the CPU
+    # settle so first-call effects never land in the measured distribution.  A
+    # warm-up that raises the same Skip/error the measured pass would raise
+    # short-circuits to the skip path without running the timed loop.
+    for _ in range(_warmups()):
+        gc.collect()
+        try:
+            spec["fn"]()
+        except Skip as exc:
+            error = str(exc)
+            break
+        except Exception as exc:
+            error = "error: %r" % exc
+            break
+    for _ in range(reps if error is None else 0):
         gc.collect()
         gc_was_enabled = gc.isenabled()
         gc.disable()
@@ -1323,8 +1386,49 @@ def _fmt(value, unit):
     return "%.3f s" % value
 
 
+def _stabilize():
+    """Best-effort: pin to one CPU and raise priority to cut scheduling jitter.
+
+    Every step is optional and independently guarded: a platform (or a runner
+    without the privilege) that refuses one simply runs without it.  Pinning
+    the parent also pins the children it spawns, so the startup-tier subprocess
+    timings inherit the same steady core.  Returns the labels applied, for the
+    result document's provenance.
+    """
+    applied = []
+    try:
+        import psutil
+
+        proc = psutil.Process()
+        ncpu = os.cpu_count() or 1
+        try:
+            if ncpu >= 2 and hasattr(proc, "cpu_affinity"):
+                core = ncpu - 1
+                proc.cpu_affinity([core])
+                applied.append("affinity=cpu%d" % core)
+        except Exception:
+            pass
+        try:
+            if sys.platform == "win32":
+                proc.nice(psutil.HIGH_PRIORITY_CLASS)
+                applied.append("priority=high")
+            else:
+                os.nice(-5)  # needs CAP_SYS_NICE; ignored where unavailable
+                applied.append("nice=-5")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    if applied:
+        print(
+            "note: perf environment pinned: %s" % ", ".join(applied),
+            file=sys.stderr,
+        )
+    return applied
+
+
 def main(argv=None):
-    global _MODE
+    global _MODE, _WARMUP_OVERRIDE
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", help="write results to this JSON file")
     parser.add_argument(
@@ -1340,10 +1444,32 @@ def main(argv=None):
         help="run benchmarks whose name or group contains this substring",
     )
     parser.add_argument(
+        "--tier",
+        choices=["all", "inprocess", "subprocess"],
+        default="all",
+        help="run only the in-process tier or only the subprocess "
+        "(startup / peak-RSS) tier; the two have different noise profiles "
+        "and CI runs them with different round counts",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        metavar="N",
+        help="override the per-mode untimed warm-up passes (default: "
+        "1 full/quick, 0 smoke)",
+    )
+    parser.add_argument(
+        "--no-stabilize",
+        action="store_true",
+        help="do not pin CPU affinity or raise process priority",
+    )
+    parser.add_argument(
         "--list", action="store_true", help="list benchmarks and exit"
     )
     args = parser.parse_args(argv)
     _MODE = "smoke" if args.smoke else "quick" if args.quick else "full"
+    _WARMUP_OVERRIDE = args.warmup
     _ensure_importable()
 
     if args.list:
@@ -1354,16 +1480,28 @@ def main(argv=None):
             )
         return 0
 
+    def _in_tier(spec):
+        if args.tier == "all":
+            return True
+        return bool(spec.get("subprocess")) == (args.tier == "subprocess")
+
     selected = [
         spec
         for spec in _BENCHMARKS
-        if not args.only
-        or any(s in spec["name"] or s in spec["group"] for s in args.only)
+        if _in_tier(spec)
+        and (
+            not args.only
+            or any(s in spec["name"] or s in spec["group"] for s in args.only)
+        )
     ]
     if not selected:
-        print("no benchmark matches %r" % (args.only,), file=sys.stderr)
+        print(
+            "no benchmark matches %r (tier=%s)" % (args.only, args.tier),
+            file=sys.stderr,
+        )
         return 2
 
+    stabilized = [] if args.no_stabilize else _stabilize()
     meta = _cronstable_meta()
     started = time.perf_counter()
     results = []
@@ -1381,6 +1519,9 @@ def main(argv=None):
     doc = {
         "schema": SCHEMA,
         "mode": _MODE,
+        "tier": args.tier,
+        "warmups": _warmups(),
+        "stabilized": stabilized,
         "cronstable_version": meta["version"],
         "orjson": meta["orjson"],
         "python": _platform.python_version(),

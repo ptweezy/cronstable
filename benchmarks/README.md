@@ -12,11 +12,16 @@ measured, and a release that regresses past a metric's limit does not ship.
   stdlib-only and benchmarks whatever cronstable the invoking interpreter can
   import, so the same script can measure an older installed release. A
   benchmark whose API the measured version lacks is recorded as skipped,
-  never failed.
+  never failed. To keep the measurement honest it runs untimed warm-up passes
+  before the timed repeats and (best-effort) pins itself to one CPU and raises
+  its priority; benchmarks split into an in-process tier and a noisier
+  subprocess tier (cold start, import, peak RSS), selectable with `--tier`.
 - `compare.py` takes baseline and current JSON files (several rounds per
   side), merges the rounds, renders a markdown summary and an SVG diverging
   bar chart of the largest changes, and exits nonzero when a gated metric
-  regressed.
+  regressed. A regression gates only when it clears both its declared limit
+  and a couple of its measured noise bands (the per-metric round-to-round
+  scatter), so jitter alone can never fail the gate.
 
 ## Running locally
 
@@ -30,10 +35,11 @@ python benchmarks/compare.py --baseline before.json --current after.json \
 
 `--quick` cuts workloads to roughly a tenth for a fast local loop; CI runs
 the full suite. `--only <substring>` selects benchmarks by name or group
-(for example `--only cronexpr`), `--list` prints the inventory, and
-`--smoke` is the minimal mode the unit tests use. If cronstable is not
-installed in the interpreter, the harness falls back to the source tree it
-lives in and says so on stderr.
+(for example `--only cronexpr`), `--tier inprocess` (or `subprocess`) selects
+one tier, `--warmup N` overrides the warm-up passes, `--no-stabilize` skips
+the CPU pin, `--list` prints the inventory, and `--smoke` is the minimal mode
+the unit tests use. If cronstable is not installed in the interpreter, the
+harness falls back to the source tree it lives in and says so on stderr.
 
 Local numbers are only comparable to other runs on the same machine in the
 same session. The CI comparison is paired for exactly that reason: both
@@ -46,16 +52,22 @@ in parallel with the build matrix:
 
 1. installs the current commit into one venv and the latest release tag into
    another;
-2. runs `bench.py` against both, interleaved, for two rounds (the harness
-   always comes from the current checkout, so both sides run identical
-   measurement code);
-3. runs `compare.py` over the four result files.
+2. runs `bench.py` against both, interleaved, per tier: five rounds of the
+   in-process tier and two of the subprocess tier (the harness always comes
+   from the current checkout, so both sides run identical measurement code);
+3. runs `compare.py` over all the result files.
 
 Per metric, rounds merge with the metric's estimator: best-of-rounds for
 time (the minimum is the least noisy statistic of a fixed workload) and
 median for memory. A metric fails its gate only when it slows down by more
-than its declared percentage limit AND by more than its absolute floor, so
-microsecond jitter on a sub-millisecond metric can never gate.
+than its declared percentage limit AND by more than its absolute floor AND by
+more than a couple of its measured noise bands, where the noise band is the
+two sides' round-to-round scatter (coefficient of variation) combined in
+quadrature. So microsecond jitter on a sub-millisecond metric can never gate,
+and neither can a metric's own run-to-run wobble; a change that clears the
+raw limit but sits inside the noise band is reported (not silently dropped)
+but does not fail the release. More in-process rounds exist precisely to
+tighten that noise-band estimate.
 
 On an ordinary commit the comparison prints warnings only. On a release the
 gate is enforced: the `release` job requires `perf`, so a gated regression
@@ -97,6 +109,17 @@ Ground rules:
   missing, so the harness still runs against older releases.
 - Keep workloads deterministic: fixed datetimes, fixed inputs, no network.
 - Memory metrics use `unit="MB"` and `compare="median"`.
+- A benchmark that measures a child process (cold start, import, peak RSS)
+  passes `subprocess=True` so it lands in the subprocess tier.
+- Size the timed region so it runs long enough (roughly 50ms+) that
+  scheduler and GC jitter are a small fraction; a sub-10ms metric is
+  dominated by noise. Rescaling an existing benchmark is safe for the gate
+  (the comparison re-measures BOTH sides with the current definition, so it
+  never diffs a new workload against a stored old number), but bump the metric
+  id anyway so the name keeps meaning one fixed workload across releases and a
+  release-notes trend is never silently redefined. `cronexpr.test_match_200k`,
+  `schedule.duplicates_20k` and `dag.plan_claim_10k` are such rescales: the id
+  suffix carries the new scale, and the old ids drop out.
 
 The suite's own smoke test is `tests/test_benchmarks.py`; it fails if a
 headline benchmark starts skipping, so a refactor that breaks a measured API
