@@ -825,6 +825,98 @@ def bench_dag_plan():
     return time.perf_counter() - t0
 
 
+@bench(
+    "dag.finish_fanin_1k",
+    "dag",
+    detail="record 1k mapped-task completions to a run doc (durable)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_dag_finish_fanin():
+    """A mapped fan-out's N instances finishing together.
+
+    Fixed workload -- record N task completions durably to one run document --
+    run the way this release records them: a single batched read-modify-write
+    (``mark_tasks_finished``) where that exists, else N separate ones
+    (``mark_task_finished``).  A release that batches pays one full-document
+    serialize + fsync instead of N, so the comparison surfaces exactly that.
+    """
+    import asyncio
+
+    dag = _dag_module()
+    if not hasattr(dag, "new_run_body") or not hasattr(
+        dag, "mark_task_finished"
+    ):
+        raise Skip("dag completion API not present")
+    n = _n(1000)
+    tasks = [dag.TaskSpec(id="t%d" % i) for i in range(n)]
+    spec = dag.DagSpec.build("d", tasks)
+    now = 1700000000.0
+    ns = dag.DAG_RUN_NS_PREFIX + "d"
+    run_key = "r"
+    batched = getattr(dag, "mark_tasks_finished", None)
+
+    def _running_body():
+        body = dag.new_run_body(
+            dag="d",
+            run_key=run_key,
+            run_id="rid",
+            logical_date=None,
+            kind="scheduled",
+            now=now,
+            spec=spec,
+        )
+        for task in tasks:
+            entry = body["tasks"][task.id]
+            entry["state"] = "running"
+            entry["proc"] = "p"
+            entry["attempt"] = 0
+        return body
+
+    async def run():
+        path = tempfile.mkdtemp(prefix="dagfin-", dir=_tmpdir())
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            body = _running_body()
+            await backend.mutate_document(
+                ns, run_key, lambda cur, b=body: (b, None)
+            )
+            if batched is not None:
+                marks = [
+                    {
+                        "taskkey": t.id, "success": True, "exit_code": 0,
+                        "fail_reason": None, "task": t, "jitter": 0.0,
+                        "expected_proc": "p", "expected_attempt": 0,
+                        "expected_poke": None, "resources": None,
+                    }
+                    for t in tasks
+                ]
+                t0 = time.perf_counter()
+                await backend.mutate_document(ns, run_key, batched(marks, now))
+                dt = time.perf_counter() - t0
+            else:
+                t0 = time.perf_counter()
+                for t in tasks:
+                    transform = dag.mark_task_finished(
+                        t.id, success=True, exit_code=0, fail_reason=None,
+                        now=now, task=t, expected_proc="p",
+                        expected_attempt=0,
+                    )
+                    await backend.mutate_document(ns, run_key, transform)
+                dt = time.perf_counter() - t0
+        finally:
+            await backend.stop()
+            shutil.rmtree(path, ignore_errors=True)
+        return dt
+
+    try:
+        return asyncio.run(run())
+    except TypeError as exc:
+        raise Skip("dag completion signature changed: %r" % exc) from None
+
+
 # ---------------------------------------------------------------------------
 # state: the durable filesystem backend (async, real disk I/O).
 # ---------------------------------------------------------------------------
