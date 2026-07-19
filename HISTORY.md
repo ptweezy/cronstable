@@ -5,6 +5,61 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.23 (2026-07-18)
+
+A performance release: the hot paths flagged by a full efficiency review now
+do their work once instead of per poll, per map instance, or per stored
+record.  All figures below are from an A/B benchmark of this release against
+the previous one on the same machine.
+
+### Status payloads read the scheduler's own index
+
+- **`/jobs`, `/status`, and the gossiped fleet summaries** no longer re-run
+  a cron-engine search per job per request: they read the next-fire index
+  the run loop already maintains (the same source the Prometheus next-run
+  gauge reads), keeping the engine search only for the startup window before
+  the index is seeded.  Builds 4-7x faster on a 300-job fleet, and the
+  saving repeats on every dashboard poll and every cluster gossip exchange.
+- **A running job with a dead schedule** used to earn its `never_fires`
+  flag by searching the remaining calendar horizon on every poll (about a
+  millisecond each time for `0 0 31 2 *`); the answer now comes from the
+  dead-schedules latch in constant time.  A schedule that dies while the
+  daemon runs (a fixed year slipping into the past) now joins that latch
+  with the same warning a seed-time-dead schedule gets, instead of leaving
+  the fire index silently.
+
+### DAG runs advance with less store traffic
+
+- **One document read fewer per advance**: the crash-reconcile step already
+  observes the run document inside its locked read-modify-write, so the
+  advance reuses that body instead of re-reading the same document before
+  the claim.
+- **Completion bursts coalesce**: when many task completions land at once
+  (a mapped fan-in), the spawned advances collapse into at most the pass
+  already running plus one follow-up that observes the whole burst, instead
+  of one full pass per completion.  A burst of 20 completions measured 20
+  advance passes and 60 durable document operations before, 2 passes and 4
+  operations now.
+- **The claim transform is cheaper on large fan-outs**: the dependency
+  verdict is resolved once per task instead of once per map instance, and
+  the transform's working copy of the run document is cloned through the
+  orjson fast path when the `speedups` extra is installed.  A claim pass
+  over a 1000-instance fan-out dropped from 3.2ms to 1.5ms, all of it time
+  spent holding the document lock.
+
+### Artifact lookups stop reading whole streams
+
+- **Reading an artifact by name** probes the newest 64 records first and
+  only then falls back to the full scan, so the common lookup (a recently
+  published name) no longer reads the scope's entire publish history: 65ms
+  to 5ms against a 1500-record stream, for every `cronstable artifact get`
+  and every mapped-task expansion.  Looking up a name that was never
+  published costs one probe page on top of the old full scan.
+- **The dashboard's XCom tab** fetches each value directly by the blob
+  digest its own listing already holds, instead of re-listing the run's
+  whole artifact stream per entry: at 200 entries that is one stream read
+  instead of 201, and the tab renders 2.5x faster.
+
 ## 1.2.22 (2026-07-18)
 
 The schedule dialect learns to speak business days, and the scheduler's own
