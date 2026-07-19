@@ -872,6 +872,14 @@ class Cron:
         # never allowed to gate the loop, so _record_run schedules the write
         # here rather than awaiting it.
         self._pending_state_writes: Set[asyncio.Task] = set()
+        # in-flight report+retry-arm sequences of finished jobs, spawned off
+        # the reaper loop (one slow SMTP/webhook reporter must not stall every
+        # other job's completion handling); tracked so shutdown can drain them
+        # after the running-job drain, and chained per job name via
+        # _completion_tail so overlapping instances of one job are handled in
+        # finish order. See _queue_job_completion.
+        self._completion_tasks: Set[asyncio.Task] = set()
+        self._completion_tail: Dict[str, asyncio.Task] = {}
         # whether the in-memory history has been warmed from the durable ledger
         # yet; rehydration runs once, on the first successful backend start.
         self._state_rehydrated = False
@@ -1186,6 +1194,11 @@ class Cron:
             await self.observability_mesh.stop()
             self.observability_mesh = None
         await self._wait_for_running_jobs_task
+        # the reaper spawned each finished run's report+retry-arm sequence as
+        # its own task; drain those too (unbounded, exactly as the old inline
+        # awaits were) so failure/success reports still go out on a graceful
+        # stop.
+        await self._drain_completions()
         # the drain released every slot (each finish cancels its renewer);
         # belt-and-braces for renewers whose release write raced teardown.
         for task in list(self._slot_renewers.values()):
@@ -2468,9 +2481,7 @@ class Cron:
         if name in self._dead_schedules:
             return True
         return (
-            job.schedule.next(
-                now=get_now(job.timezone), default_utc=job.utc
-            )
+            job.schedule.next(now=get_now(job.timezone), default_utc=job.utc)
             is None
         )
 
@@ -4115,8 +4126,9 @@ class Cron:
         }
         stream = self._manifest_stream()
         try:
-            await backend.append_record(stream, record)
-            await backend.prune_records(stream, keep=MANIFEST_STREAM_KEEP)
+            await backend.append_record(
+                stream, record, prune_keep=MANIFEST_STREAM_KEEP
+            )
         except Exception as ex:  # noqa: BLE001 - best-effort; log, survive
             self.metrics.state_write_dropped("manifest")
             logger.warning("state: failed to record the job manifest: %s", ex)
@@ -4900,11 +4912,9 @@ class Cron:
         stream = self._catchup_stream(name)
         try:
             await asyncio.wait_for(
-                backend.append_record(stream, record),
-                timeout=STATE_OP_TIMEOUT,
-            )
-            await asyncio.wait_for(
-                backend.prune_records(stream, keep=CATCHUP_STREAM_KEEP),
+                backend.append_record(
+                    stream, record, prune_keep=CATCHUP_STREAM_KEEP
+                ),
                 timeout=STATE_OP_TIMEOUT,
             )
         except Exception as ex:  # noqa: BLE001 - checkpoint is best-effort
@@ -5600,8 +5610,14 @@ class Cron:
         }
         stream = self._reboot_stream(job.name)
         try:
+            # prune_keep folds the stream bound into the append's own worker
+            # call; the backend applies it only after the append LANDED and
+            # swallows its own failures, so it can never re-decide the launch
+            # the way a separate failing prune op once threatened to.
             await asyncio.wait_for(
-                backend.append_record(stream, record),
+                backend.append_record(
+                    stream, record, prune_keep=REBOOT_STREAM_KEEP
+                ),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.CancelledError:
@@ -5642,21 +5658,8 @@ class Cron:
                 ex,
             )
             return True
-        # the marker landed: the boot run is committed to happen, so a
-        # failed prune must only be logged, never re-decide the launch.
-        try:
-            await asyncio.wait_for(
-                backend.prune_records(stream, keep=REBOOT_STREAM_KEEP),
-                timeout=STATE_OP_TIMEOUT,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as ex:  # noqa: BLE001 - best-effort bound
-            logger.warning(
-                "state: could not prune the @reboot markers for %s: %s",
-                job.name,
-                ex,
-            )
+        # the marker landed (the stream bound rode along inside the append's
+        # worker call): the boot run is committed to happen.
         return True
 
     async def _process_pending_reboots(self) -> None:
@@ -6518,11 +6521,9 @@ class Cron:
         stream = self._slot_name(name)
         try:
             await asyncio.wait_for(
-                backend.append_record(stream, cancel),
-                timeout=STATE_OP_TIMEOUT,
-            )
-            await asyncio.wait_for(
-                backend.prune_records(stream, keep=SLOT_STREAM_KEEP),
+                backend.append_record(
+                    stream, cancel, prune_keep=SLOT_STREAM_KEEP
+                ),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.CancelledError:
@@ -6845,8 +6846,9 @@ class Cron:
         }
         stream = self._inflight_stream(job.name)
         try:
-            await backend.append_record(stream, record)
-            await backend.prune_records(stream, keep=INFLIGHT_STREAM_KEEP)
+            await backend.append_record(
+                stream, record, prune_keep=INFLIGHT_STREAM_KEEP
+            )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget
             self.metrics.state_write_dropped("inflight")
             logger.warning(
@@ -6870,7 +6872,11 @@ class Cron:
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
         try:
-            await backend.append_record(self._inflight_stream(name), record)
+            await backend.append_record(
+                self._inflight_stream(name),
+                record,
+                prune_keep=INFLIGHT_STREAM_KEEP,
+            )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget
             self.metrics.state_write_dropped("inflight")
             logger.warning(
@@ -7079,9 +7085,13 @@ class Cron:
             return
         stream = self._run_stream(name)
         try:
-            await backend.append_record(stream, data)
-            if self._state_max_runs > 0:
-                await backend.prune_records(stream, keep=self._state_max_runs)
+            await backend.append_record(
+                stream,
+                data,
+                prune_keep=(
+                    self._state_max_runs if self._state_max_runs > 0 else None
+                ),
+            )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget
             self.metrics.state_write_dropped("run-record")
             logger.warning(
@@ -7095,47 +7105,66 @@ class Cron:
     async def _wait_for_running_jobs(self) -> None:
         # job -> wait task
         wait_tasks = {}  # type: Dict[RunningJob, asyncio.Task]
-        while self.running_jobs or not self._stop_event.is_set():
-            try:
-                for jobs in self.running_jobs.values():
-                    for job in jobs:
-                        if job not in wait_tasks:
-                            wait_tasks[job] = asyncio.create_task(job.wait())
-                if not wait_tasks:
-                    # Nothing running: block until a job launches or shutdown
-                    # is signalled (both set _jobs_running) rather than polling
-                    # once a second. This is the scheduler's most frequent idle
-                    # wakeup, and the loop condition can only change on those
-                    # two events, so a plain wait loses no liveness.
-                    await self._jobs_running.wait()
-                    continue
-                self._jobs_running.clear()
-                # wait for at least one task with timeout
-                done_tasks, _ = await asyncio.wait(
-                    wait_tasks.values(),
-                    timeout=1.0,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                done_jobs = set()
-                for job, task in list(wait_tasks.items()):
-                    if task in done_tasks:
-                        done_jobs.add(job)
-                for job in done_jobs:
-                    task = wait_tasks.pop(job)
-                    try:
-                        task.result()
-                    except Exception:  # pragma: no cover
-                        logger.exception(
-                            "Unexpected error while waiting on job %s; "
-                            "please report this as a bug (2)",
-                            job.config.name,
+        # the standing wait on _jobs_running that sits in the busy branch's
+        # wait set below, so a launch or the shutdown signal (both set the
+        # event) wakes the reaper immediately. Fully event-driven: with it in
+        # the set there is nothing left for the old 1-second poll timeout to
+        # notice, so a daemon with one long-running job no longer wakes ~86k
+        # times a day just to re-count its running set.
+        event_wait = None  # type: Optional[asyncio.Task]
+        try:
+            while self.running_jobs or not self._stop_event.is_set():
+                try:
+                    for jobs in self.running_jobs.values():
+                        for job in jobs:
+                            if job not in wait_tasks:
+                                wait_tasks[job] = asyncio.create_task(
+                                    job.wait()
+                                )
+                    if not wait_tasks:
+                        # Nothing running: block until a job launches or
+                        # shutdown is signalled rather than polling. This is
+                        # the scheduler's most frequent idle wakeup, and the
+                        # loop condition can only change on those two events,
+                        # so a plain wait loses no liveness.
+                        await self._jobs_running.wait()
+                        continue
+                    # Every job now running has its wait task registered
+                    # above, with no await in between, so clearing here
+                    # cannot swallow a launch notification for a job the
+                    # wait set does not cover.
+                    self._jobs_running.clear()
+                    if event_wait is None or event_wait.done():
+                        event_wait = asyncio.create_task(
+                            self._jobs_running.wait()
                         )
-                    await self._handle_finished_job(job)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover
-                logger.exception("please report this as a bug (3)")
-                await asyncio.sleep(1)
+                    done_tasks, _ = await asyncio.wait(
+                        [event_wait, *wait_tasks.values()],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    done_jobs = set()
+                    for job, task in list(wait_tasks.items()):
+                        if task in done_tasks:
+                            done_jobs.add(job)
+                    for job in done_jobs:
+                        task = wait_tasks.pop(job)
+                        try:
+                            task.result()
+                        except Exception:  # pragma: no cover
+                            logger.exception(
+                                "Unexpected error while waiting on job %s; "
+                                "please report this as a bug (2)",
+                                job.config.name,
+                            )
+                        await self._handle_finished_job(job)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # pragma: no cover
+                    logger.exception("please report this as a bug (3)")
+                    await asyncio.sleep(1)
+        finally:
+            if event_wait is not None and not event_wait.done():
+                event_wait.cancel()
 
     def _record_run(self, name: str, info: JobRunInfo) -> None:
         # the latest finished run (for status/log replay) plus the bounded
@@ -7197,12 +7226,14 @@ class Cron:
         try:
             # include_series: the ledger is what rehydrates the resource
             # charts after a restart. Bounded per record by the job's
-            # monitorResources.history, per stream by the pruning below.
+            # monitorResources.history, per stream by the folded prune.
             await backend.append_record(
-                stream, info.to_dict(include_series=True)
+                stream,
+                info.to_dict(include_series=True),
+                prune_keep=(
+                    self._state_max_runs if self._state_max_runs > 0 else None
+                ),
             )
-            if self._state_max_runs > 0:
-                await backend.prune_records(stream, keep=self._state_max_runs)
             job = self.cron_jobs.get(name)
             if job is not None and job.archiveOutput:
                 await self._archive_output(job, info)
@@ -7244,8 +7275,9 @@ class Cron:
         record["at"] = get_now(datetime.timezone.utc).isoformat()
         stream = self._counters_stream()
         try:
-            await backend.append_record(stream, record)
-            await backend.prune_records(stream, keep=COUNTER_STREAM_KEEP)
+            await backend.append_record(
+                stream, record, prune_keep=COUNTER_STREAM_KEEP
+            )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             self.metrics.state_write_dropped("counters")
             logger.warning(
@@ -7294,9 +7326,13 @@ class Cron:
             "lines": lines,
         }
         stream = self._log_stream(job.name)
-        await backend.append_record(stream, record)
-        if self._state_max_runs > 0:
-            await backend.prune_records(stream, keep=self._state_max_runs)
+        await backend.append_record(
+            stream,
+            record,
+            prune_keep=(
+                self._state_max_runs if self._state_max_runs > 0 else None
+            ),
+        )
 
     async def _rehydrate_from_state(self) -> None:
         """Warm the in-memory history from the durable ledger, once, on boot.
@@ -7825,10 +7861,64 @@ class Cron:
                 resource_usage=getattr(job, "resource_usage", None),
             ),
         )
-        if fail_reason is not None:
-            await self.handle_job_failure(job)
-        else:
-            await self.handle_job_success(job)
+        self._queue_job_completion(job, failed=fail_reason is not None)
+
+    def _queue_job_completion(self, job: RunningJob, *, failed: bool) -> None:
+        """Run a finished job's report+retry-arm sequence as a tracked task.
+
+        Reporters (SMTP, webhooks, shell commands) legitimately take seconds
+        (bounded only in the tens of seconds) and used to run inline on
+        the reaper, the daemon's single job-completion loop, so one slow
+        reporter delayed every other job's completion handling, slot release
+        and retry arming daemon-wide.  Spawned per finished run instead,
+        chained behind the same job's previous sequence (the idiom of
+        :meth:`_queue_inflight_write`): the retry-ladder handling for
+        overlapping instances of one job keeps the reaper's old serial
+        semantics, while distinct jobs no longer wait on each other.
+        Tracked in ``_completion_tasks`` so shutdown drains the in-flight
+        reports after the running-job drain (see :meth:`_drain_completions`).
+        """
+        name = job.config.name
+        prev = self._completion_tail.get(name)
+
+        async def _sequenced() -> None:
+            if prev is not None and not prev.done():
+                await asyncio.wait({prev})
+            try:
+                if failed:
+                    await self.handle_job_failure(job)
+                else:
+                    await self.handle_job_success(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(
+                    "Unexpected error handling the completion of job %s; "
+                    "please report this as a bug (5)",
+                    name,
+                )
+
+        task = asyncio.create_task(_sequenced())
+        self._completion_tasks.add(task)
+        task.add_done_callback(self._completion_tasks.discard)
+        self._completion_tail[name] = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if self._completion_tail.get(name) is done:
+                del self._completion_tail[name]
+
+        task.add_done_callback(_clear)
+
+    async def _drain_completions(self) -> None:
+        """Await every in-flight report+retry-arm sequence.
+
+        The shutdown path runs this after the running-job drain, unbounded
+        exactly as the reaper's old inline awaits were: reports for runs that
+        finished before the stop signal must still go out.  Also the seam
+        tests use to observe completion side effects deterministically.
+        """
+        while self._completion_tasks:
+            await asyncio.wait(set(self._completion_tasks))
 
     async def _handle_finished_dag_task(self, job: RunningJob) -> None:
         """Reap one finished DAG task instance (see ``_handle_finished_job``).
@@ -8136,8 +8226,9 @@ class Cron:
             return
         stream = self._retry_stream(name)
         try:
-            await backend.append_record(stream, record)
-            await backend.prune_records(stream, keep=RETRY_STREAM_KEEP)
+            await backend.append_record(
+                stream, record, prune_keep=RETRY_STREAM_KEEP
+            )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             self.metrics.state_write_dropped("retry")
             logger.warning(
@@ -8197,8 +8288,14 @@ class Cron:
         }
         stream = self._retry_stream(job_name)
         try:
+            # the stream bound rides along inside the append's worker call;
+            # the backend applies it only after the append LANDED and
+            # swallows its own failures, so it cannot affect the settle
+            # decision below.
             await asyncio.wait_for(
-                backend.append_record(stream, record),
+                backend.append_record(
+                    stream, record, prune_keep=RETRY_STREAM_KEEP
+                ),
                 timeout=STATE_OP_TIMEOUT,
             )
         except asyncio.CancelledError:
@@ -8225,16 +8322,6 @@ class Cron:
                 ex,
             )
             return True
-        # settled: bound the stream, best-effort (the launch is committed).
-        try:
-            await asyncio.wait_for(
-                backend.prune_records(stream, keep=RETRY_STREAM_KEEP),
-                timeout=STATE_OP_TIMEOUT,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - prune is bookkeeping only
-            pass
         return True
 
     # --- cross-node retry resume -------------------------------------------
