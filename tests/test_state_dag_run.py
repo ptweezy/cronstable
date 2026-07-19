@@ -1563,6 +1563,16 @@ async def test_expansion_advance_falls_back_to_two_rmws(tmp_path):
         # let gen finish and its completion land, WITHOUT the follow-up
         # advance observing it yet
         await _reap_running(cron)
+        # cancel the completion's spawned auto-advance (it has not started:
+        # _reap_running never yields after creating it) so the counted
+        # advance below is the only one and burst coalescing cannot skew
+        # the RMW tally
+        pend = [
+            t for t in list(cron._pending_state_writes) if not t.done()
+        ]
+        for t in pend:
+            t.cancel()
+        await asyncio.gather(*pend, return_exceptions=True)
         body = await cron._dag.get_run("fb", run_key)
         assert body["tasks"]["gen"]["state"] == dag.SUCCESS
         calls = []
