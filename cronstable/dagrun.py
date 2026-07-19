@@ -218,7 +218,9 @@ class DagScheduler:
 
     # --- backend op helpers (all bounded) --------------------------------
 
-    async def _mutate(self, dag_name: str, key: str, transform):
+    async def _mutate(
+        self, dag_name: str, key: str, transform
+    ) -> "Tuple[Optional[Dict[str, Any]], Any]":
         backend = self._backend()
         if backend is None:
             return None, None

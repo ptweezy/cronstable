@@ -167,6 +167,7 @@ _YEAR_HORIZON = 2099
 #: the backward mirror of ``_YEAR_HORIZON``.
 _YEAR_FLOOR = 1970
 
+
 def _is_quartz_w(item: str) -> bool:
     """A day-field item in the nearest-weekday shape (``15W``, ``LW``): valid
     in day-of-month, hint fodder anywhere else."""
@@ -178,6 +179,7 @@ def _is_trailing_l(item: str) -> bool:
     """A day-of-week item in Quartz's trailing-L shape (``5L``), which this
     dialect spells ``L5``."""
     return item.endswith("l") and item[:-1].isdecimal()
+
 
 #: (day-of-month, day-of-week) column indexes per field count, for the
 #: wrong-field hints in :func:`_quartz_hint`
