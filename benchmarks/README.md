@@ -117,7 +117,9 @@ defined), giving the harness seed helpers and the real render functions;
 (batched, because Chromium clamps that clock to ~100us). The whole `webui`
 group **skips cleanly** when Playwright or its Chromium build is absent, when
 the page predates the `?perf=1` hook (an older release), and in `--smoke`
-(the unit test must not launch a browser). To run them:
+(the unit test must not launch a browser). The CI `perf` job installs
+Playwright + Chromium into the current-side venv (best-effort) so `webui.*`
+runs there; to run them locally:
 
 ```sh
 pip install playwright && playwright install chromium

@@ -858,6 +858,15 @@ jobs:
           uv venv --python 3.14 .venv-new
           SETUPTOOLS_SCM_PRETEND_VERSION="$NEW_VERSION" \
             uv pip install --python .venv-new/bin/python .
+          # Web-UI benchmarks (webui.*) time renders in a headless Chromium via
+          # Playwright. Install it into the CURRENT side only: the baseline
+          # release's page carries no ?perf=1 hook, so those metrics skip there
+          # regardless. Best-effort -- on failure the webui.* metrics simply
+          # skip (recorded, never failed) and the rest of the gate is
+          # unaffected.
+          uv pip install --python .venv-new/bin/python playwright || true
+          .venv-new/bin/python -m playwright install --with-deps chromium \
+            || echo "::warning::playwright/chromium unavailable; webui.* skip"
           git fetch --tags --force
           prev=$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
           if [ -n "$prev" ]; then
