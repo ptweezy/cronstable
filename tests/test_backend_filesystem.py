@@ -1112,10 +1112,16 @@ async def test_renew_loop_warns_and_survives_store_error(
     a = await _started(_backend(tmp_path, "node-a"))
     try:
 
+        rounds = {"n": 0}
+
         async def _boom():
+            rounds["n"] += 1
             raise OSError("mount gone")
 
         monkeypatch.setattr(a, "_renew_once", _boom)
+        monkeypatch.setattr(
+            type(a), "renew_period", property(lambda self: 0.001)
+        )
         caplog.set_level(
             logging.WARNING, logger="cronstable.backends.filesystem"
         )
@@ -1126,11 +1132,20 @@ async def test_renew_loop_warns_and_survives_store_error(
         assert any(
             "election round failed" in r.getMessage() for r in caplog.records
         )
+        # The behaviour this test is named for: the loop RAN AGAIN after the
+        # raising round rather than merely staying alive. Neither
+        # `task.done()` nor `task.cancelled() or task.exception() is None`
+        # could show that; both are true by construction after an awaited
+        # cancel, whatever the loop did.
+        for _ in range(2000):
+            if rounds["n"] >= 2:
+                break
+            await asyncio.sleep(0.001)
+        assert rounds["n"] >= 2, "the loop did not run again after the raise"
         a._stop.set()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert task.done()
     finally:
         await _stop(a)
 
@@ -1145,10 +1160,16 @@ async def test_renew_loop_logs_unexpected_error_and_survives(
     a = await _started(_backend(tmp_path, "node-a"))
     try:
 
+        rounds = {"n": 0}
+
         async def _boom():
+            rounds["n"] += 1
             raise ValueError("unexpected")
 
         monkeypatch.setattr(a, "_renew_once", _boom)
+        monkeypatch.setattr(
+            type(a), "renew_period", property(lambda self: 0.001)
+        )
         caplog.set_level(
             logging.ERROR, logger="cronstable.backends.filesystem"
         )
@@ -1161,11 +1182,20 @@ async def test_renew_loop_logs_unexpected_error_and_survives(
             in r.getMessage()
             for r in caplog.records
         )
+        # The behaviour this test is named for: the loop RAN AGAIN after the
+        # raising round rather than merely staying alive. Neither
+        # `task.done()` nor `task.cancelled() or task.exception() is None`
+        # could show that; both are true by construction after an awaited
+        # cancel, whatever the loop did.
+        for _ in range(2000):
+            if rounds["n"] >= 2:
+                break
+            await asyncio.sleep(0.001)
+        assert rounds["n"] >= 2, "the loop did not run again after the raise"
         a._stop.set()
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
-        assert task.done()
     finally:
         await _stop(a)
 
@@ -1192,8 +1222,9 @@ async def test_renew_loop_sleeps_between_rounds_until_stopped(
 
         monkeypatch.setattr(a, "_renew_once", _round)
         task = asyncio.create_task(a._renew_loop())
+        # wait_for both bounds the hang and re-raises any error the loop died
+        # of, so a `task.done()` assertion after it would add nothing.
         await asyncio.wait_for(task, timeout=2.0)
-        assert task.done()
         assert rounds["n"] >= 2  # ran a second round after the sleep timeout
     finally:
         await _stop(a)

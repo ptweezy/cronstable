@@ -67,6 +67,35 @@ def fixup_pyinstaller_env(env: Dict[str, str]) -> None:
             env[env_var] = env.get(f"{env_var}_ORIG", "")
 
 
+def loggable_spawn_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``kwargs`` with the child environment reduced to a summary.
+
+    The spawn kwargs carry ``env``: a full copy of the daemon's own
+    :data:`os.environ` (whatever the operator exported to cronstable, such as
+    cloud keys, database URLs, or a systemd ``EnvironmentFile``) plus the
+    job's configured variables plus the ``CRONSTABLE_*`` control-channel vars,
+    whose token is a live bearer credential for the loopback state API.
+    Formatting that dict into a log record publishes all of it to
+    journald/syslog and any shipper behind them, at whatever level the record
+    was emitted.
+
+    :func:`cronstable.redact.redact_secrets` deliberately does not help here:
+    it is scoped to archived job output and is pattern-based, so it would miss
+    any variable whose name it doesn't recognise.  Names alone are also not
+    safe to log (a variable can be named after the secret it holds), so the
+    value is replaced wholesale by a count, which is what the surviving
+    diagnostics (a bad ``argv[0]``, a bad encoding, a resource-exhaustion
+    errno) actually need: whether a custom environment was in play, not what
+    was in it.  ``preexec_fn`` and the stream/limit entries are left alone;
+    none of them carries user data.
+    """
+    if "env" not in kwargs:
+        return kwargs
+    redacted = dict(kwargs)
+    redacted["env"] = "<{} vars, values omitted>".format(len(kwargs["env"]))
+    return redacted
+
+
 # How many of the most recent output lines a JobOutputStream retains for the
 # live web log tail. Independent of saveLimit (which bounds the text kept for
 # failure reports); this only bounds the in-memory buffer the UI streams from.
@@ -952,7 +981,11 @@ class RunningJob:
             # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
             # str (CreateProcessW rejects bytes). See platform.encode_argv.
             args = platform.encode_argv(cmd)
-            logger.debug("subprocess: args=%r, kwargs=%r", args, kwargs)
+            logger.debug(
+                "subprocess: args=%r, kwargs=%r",
+                args,
+                loggable_spawn_kwargs(kwargs),
+            )
             self.proc = await create(*args, **kwargs)
         except (
             subprocess.SubprocessError,
@@ -973,7 +1006,7 @@ class RunningJob:
                 "(system encoding: %s)",
                 self.config.name,
                 cmd,
-                kwargs,
+                loggable_spawn_kwargs(kwargs),
                 sys.getdefaultencoding(),
             )
             self.start_failed = True

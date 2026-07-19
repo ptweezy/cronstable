@@ -11,6 +11,7 @@ without orjson -- and :func:`dumps_bytes` enforces it at every write.
 
 import importlib.util
 import json as stdlib_json
+import platform
 import sys
 
 import pytest
@@ -150,12 +151,30 @@ def test_stdlib_flavour_deepcopy_json_is_a_distinct_equal_tree():
     assert original["a"] == [1, 2]  # the copy is independent
 
 
+def test_orjson_is_installed_where_a_wheel_exists():
+    # Guards the two tests below from going silently dead. They are
+    # importorskip-guarded, and for a while orjson was in no test environment
+    # at all, so both skipped in every CI cell and the accelerated JSON arm
+    # shipped unexercised. requirements_dev.txt now installs orjson wherever a
+    # wheel is reliably available; this fails loudly if that line is dropped
+    # or its markers stop matching, instead of degrading back to a skip.
+    if sys.platform == "win32" and platform.machine().upper() == "ARM64":
+        pytest.skip("no orjson wheel for win-arm64; it builds only with Rust")
+    if sys.version_info >= (3, 15):
+        pytest.skip("orjson may not have built for this Python yet")
+    assert importlib.util.find_spec("orjson") is not None, (
+        "orjson is missing from this environment, so the orjson tests below "
+        "silently skip. Check the orjson line in requirements_dev.txt."
+    )
+
+
 def test_orjson_flavour_reraises_unserializable_after_portable_check():
     # live module (orjson installed): a value orjson cannot encode but that is
     # NOT a portability violation (a set) makes ensure_portable pass, so the
     # original orjson error re-raises (the `raise` after the recheck).
-    # orjson is the optional `speedups` extra; skip when it is absent (the
-    # tox/CI env installs requirements_dev.txt only, without speedups).
+    # orjson is the optional `speedups` extra. requirements_dev.txt installs
+    # it for the cells that have wheels (see the guard test above); this skip
+    # only covers the ones that genuinely cannot.
     pytest.importorskip("orjson")
     assert _json.orjson is not None
     with pytest.raises(TypeError):

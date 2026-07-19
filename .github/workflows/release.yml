@@ -859,11 +859,16 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION="$NEW_VERSION" \
             uv pip install --python .venv-new/bin/python .
           # Web-UI benchmarks (webui.*) time renders in a headless Chromium via
-          # Playwright. Install it into the CURRENT side only: the baseline
-          # release's page carries no ?perf=1 hook, so those metrics skip there
-          # regardless. Best-effort -- on failure the webui.* metrics simply
-          # skip (recorded, never failed) and the rest of the gate is
-          # unaffected.
+          # Playwright. Install it on BOTH sides (the baseline venv is created
+          # below): a metric that skips on the baseline is reported with no
+          # comparison and gated: False, so installing only on the current side
+          # left every webui.* gate permanently inert, a 5s render regression
+          # included. Releases before the ?perf=1 hook shipped still skip on the
+          # baseline for that reason, but the gate now self-heals as soon as a
+          # hooked release becomes the baseline instead of staying dead.
+          # Best-effort: on failure the webui.* metrics skip (recorded, never
+          # failed), compare.py flags them as ungated, and the rest of the gate
+          # is unaffected.
           uv pip install --python .venv-new/bin/python playwright || true
           .venv-new/bin/python -m playwright install --with-deps chromium \
             || echo "::warning::playwright/chromium unavailable; webui.* skip"
@@ -880,6 +885,10 @@ jobs:
             uv venv --python 3.14 .venv-old
             SETUPTOOLS_SCM_PRETEND_VERSION="$prev" \
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
+            # Same Playwright install on the baseline side, so webui.* can
+            # actually be compared. The browser download above is cached
+            # per-runner, so this only adds the Python package.
+            uv pip install --python .venv-old/bin/python playwright || true
           else
             echo "::notice::No release tag yet; recording a baseline without a comparison."
           fi
@@ -1294,7 +1303,9 @@ jobs:
   #
   # Cross-repo pushes need a token the default GITHUB_TOKEN can't provide: set a
   # repo secret HOMEBREW_TAP_TOKEN to a PAT (fine-grained, Contents: read/write
-  # on ptweezy/homebrew-tap is enough). If it is unset the job warns and skips.
+  # on ptweezy/homebrew-tap is enough). If it is unset the job fails loudly
+  # rather than leaving the tap stale (the step below says why); this header
+  # described the older warn-and-skip behaviour long after it changed.
   homebrew:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'
@@ -1354,16 +1365,30 @@ jobs:
   #
   # Cross-repo PRs need a token the default GITHUB_TOKEN can't provide: set a repo
   # secret WINGET_TOKEN to a PAT (classic, public_repo scope is enough) that can
-  # fork microsoft/winget-pkgs and open a PR under that account. If it is unset
-  # the job fails loudly rather than silently leaving the manifest stale (see the
-  # homebrew job above for why silent-skip is the wrong default here).
+  # fork microsoft/winget-pkgs and open a PR under that account. Normally an
+  # unset token must fail loudly rather than silently leave the manifest stale
+  # (see the homebrew job above for why silent-skip is the wrong default here);
+  # it currently exits 0 instead, as part of the temporary allowance below.
   #
-  # TEMPORARY: this job is warning-only (continue-on-error) until the initial
-  # ptweezy.cronstable submission PR is merged into microsoft/winget-pkgs.
-  # `wingetcreate update` fetches the EXISTING manifest to bump it, so it fails
-  # until the package exists there. Once the first PR merges, drop
-  # continue-on-error and restore the hard `exit 1` below so a stale manifest
-  # fails the release loudly again.
+  # TEMPORARY: this job is warning-only until the initial ptweezy.cronstable
+  # submission PR is merged into microsoft/winget-pkgs. `wingetcreate update`
+  # fetches the EXISTING manifest to bump it, so it fails until the package
+  # exists there.
+  #
+  # Once that first PR merges, ALL THREE suppressions have to come off, or the
+  # job goes on passing over a genuinely broken manifest update. A silent-skip
+  # default is how the homebrew tap froze across several releases while every
+  # run stayed green (see that job's own note above), which is the failure mode
+  # a partial restore here would recreate:
+  #   1. `continue-on-error: true` on the job (below). This one dominates: while
+  #      it is set, neither of the others can fail the release. They do still
+  #      flip the job's own recorded conclusion in the run view, which is the
+  #      only signal a partial restore leaves.
+  #   2. the missing-token branch's `exit 0` (restore it to `exit 1`).
+  #   3. the `if ! ./wingetcreate.exe update ...; then ... exit 0; fi` wrapper
+  #      around the update itself: delete the wrapper and let the command's own
+  #      exit status fail the step under `set -e`. This is the one with no
+  #      other trace, and it survives removing 1 and 2.
   winget:
     needs: [version, release]
     if: needs.version.outputs.release == 'true'

@@ -1069,9 +1069,17 @@ def test_scheduled_in_reads_index_and_dead_latch():
     cron = _cron(_DEAD_YAML)
     now = datetime.datetime.now(_UTC)
     cron._ensure_seeded(now)
-    # a live schedule is in the fire index: a positive, clamped delay
+    # a live schedule is read from the fire index, not re-walked: */5 puts the
+    # next fire within 300s. (A bare `>= 0.0` here asserted nothing: the value
+    # is naturally positive just after seeding, so it never reached the
+    # max(0.0, ...) clamp it looked like it was testing.)
     live = cron._scheduled_in("live", cron.cron_jobs["live"], False)
-    assert live is not None and live >= 0.0
+    assert live is not None and 0.0 <= live <= 300.0
+    # a fire time already in the past clamps to zero rather than going
+    # negative: this is the clamp branch.
+    cron._next_fire["live"] = now - datetime.timedelta(seconds=90)
+    assert cron._scheduled_in("live", cron.cron_jobs["live"], False) == 0.0
+    cron._ensure_seeded(now)
     # a dead schedule sits in the dead-latch: no next run
     assert cron._scheduled_in("parked", cron.cron_jobs["parked"], False) is None
     # disabled / running jobs short-circuit to None
@@ -1451,9 +1459,22 @@ def test_resolve_web_token_reads_file(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_apply_socket_mode_ignores_non_unix():
-    # a TCP listen url is a no-op (returns without touching the filesystem)
-    Cron._apply_socket_mode("http://127.0.0.1:8080", "600")
+def test_apply_socket_mode_ignores_non_unix(monkeypatch, caplog):
+    # a TCP listen url is a no-op (returns without touching the filesystem).
+    # Asserted by making any chmod fatal: the scheme guard is what has to keep
+    # us out of it. Merely CALLING _apply_socket_mode proves nothing, since
+    # the chmod that a missing guard would reach is itself wrapped in a
+    # try/except that swallows the resulting OSError.
+    import logging
+    import os as _os
+
+    def boom(*a, **kw):
+        raise AssertionError("chmod attempted for a non-unix listen url")
+
+    monkeypatch.setattr(_os, "chmod", boom)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        Cron._apply_socket_mode("http://127.0.0.1:8080", "600")
+    assert caplog.records == []
 
 
 def test_apply_socket_mode_warns_on_chmod_failure(caplog):

@@ -2214,7 +2214,11 @@ async def test_maintenance_tolerates_missing_roots(tmp_path, monkeypatch):
     # directly.  Each op must return its empty-result shape, not raise.
     backend = _backend(tmp_path)
     await backend.start()
-    monkeypatch.setattr(state, "_now", lambda: time.time())
+    # No clock patch here on purpose. Every op under test returns from its
+    # root-missing OSError branch before any aging arithmetic runs, so
+    # patching state._now cannot influence a single assertion below; the
+    # original `lambda: time.time()` patch was _now's own body, and pinning it
+    # to a constant instead was no less inert.
     for sub in (
         state.RECORDS_DIR,
         state.LEASES_DIR,

@@ -14,9 +14,16 @@ from cronstable.statsd import StatsdClientProtocol, StatsdJobMetricWriter
 # ---------------------------------------------------------------------------
 
 
-def test_client_protocol_datagram_received_is_a_noop():
+def test_client_protocol_datagram_received_is_silent(caplog):
+    # The statsd channel is write-only: an inbound datagram (a server reply, a
+    # stray packet on the port) must be dropped without raising and without
+    # logging, so it cannot turn into per-packet log noise. Asserting only
+    # that it returns None would pass for any body that falls off the end,
+    # including one that logged first.
     proto = StatsdClientProtocol("m.start:1|g\n", loop=None)
-    assert proto.datagram_received(b"anything", ("127.0.0.1", 8125)) is None
+    with caplog.at_level(logging.DEBUG, logger="statsd"):
+        proto.datagram_received(b"anything", ("127.0.0.1", 8125))
+    assert caplog.records == []
 
 
 def test_client_protocol_error_received_logs_the_exception_detail(caplog):

@@ -5611,8 +5611,10 @@ def test_parse_str_list_drops_overlong_and_caps_items():
     assert _parse_str_list(["ok", "toolong"], max_len=4) == {"ok"}
     # ...and max_items bounds the resulting set (break branch).
     out = _parse_str_list(["a", "b", "c", "d"], max_items=2)
-    assert len(out) == 2
-    assert out <= {"a", "b", "c", "d"}
+    # the kept items are the FIRST max_items, not an arbitrary subset (a
+    # `out <= {"a","b","c","d"}` check here held by construction, since the
+    # result is built from the input, and so asserted nothing).
+    assert out == {"a", "b"}
     # non-strings and non-lists degrade to empty rather than raising
     assert _parse_str_list([1, 2, "keep"]) == {"keep"}
     assert _parse_str_list("nope") == set()
@@ -5753,7 +5755,7 @@ async def test_observe_peer_rejects_non_bool_elect_leader(tmp_path):
     assert "elect_leader is not a boolean" in peer.last_error
 
 
-async def test_handle_peer_compresses_without_gzip(tmp_path):
+async def test_handle_peer_compresses_without_gzip(tmp_path, monkeypatch):
     # a /peer body over MIN_COMPRESS_BYTES from a client that did NOT advertise
     # gzip still gets compressed via aiohttp's default negotiation (the else
     # branch of the gzip pick). Exercised by calling the handler directly.
@@ -5773,15 +5775,32 @@ async def test_handle_peer_compresses_without_gzip(tmp_path):
             for i in range(60)
         }
     )
+    # Record which coding each branch asks for. enable_compression() acts at
+    # write time and never touches resp.body, so a body-size assertion here
+    # only re-checks the padding fixture above: it stayed green with the
+    # enable_compression() calls deleted outright.
+    codings = []
+    real_enable = aiohttp.web.Response.enable_compression
+
+    def spy_enable(self, force=None, **kw):
+        codings.append(force)
+        return real_enable(self, force, **kw)
+
+    monkeypatch.setattr(
+        aiohttp.web.Response, "enable_compression", spy_enable
+    )
+
     # no gzip in Accept-Encoding -> the else-branch enable_compression()
     req = _FakeReq(b"", {"Accept-Encoding": "identity"})
     resp = await mgr._handle_peer(req)
     assert resp.status == 200
     assert isinstance(resp.body, bytes) and len(resp.body) >= MIN_COMPRESS_BYTES
-    # and the gzip-advertised path also serves a 200 (the sibling branch)
+    assert codings == [None]  # bare call: aiohttp negotiates
+    # and the gzip-advertised path picks gzip EXPLICITLY (the sibling branch)
     req_gzip = _FakeReq(b"", {"Accept-Encoding": "gzip, deflate"})
     resp2 = await mgr._handle_peer(req_gzip)
     assert resp2.status == 200
+    assert codings == [None, aiohttp.web.ContentCoding.gzip]
 
 
 async def test_handle_reboot_ran_truncates_persistent_set(tmp_path):

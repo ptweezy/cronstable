@@ -1354,6 +1354,67 @@ jobs:
 
 
 @pytest.mark.asyncio
+async def test_start_failure_log_does_not_leak_the_child_environment(
+    monkeypatch, caplog
+):
+    # The spawn kwargs carry a full os.environ copy plus the CRONSTABLE_*
+    # loopback credentials, and the spawn-failure handler formats kwargs into
+    # an ERROR record. Logging it verbatim published every environment secret
+    # the daemon holds to journald/syslog and anything shipping from them.
+    conf = cronstable.config.parse_config_string(
+        """
+jobs:
+  - name: test
+    command:
+      - /bin/true
+    schedule: "* * * * *"
+    environment:
+      - key: JOB_VAR
+        value: job-value
+""",
+        "",
+    )
+    monkeypatch.setenv("SPAWN_LEAK_CANARY", "canary-from-os-environ")
+
+    async def boom(*args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job.extra_env = {"CRONSTABLE_STATE_TOKEN": "tok-canary-deadbeef"}
+
+    with caplog.at_level(logging.DEBUG, logger="cronstable"):
+        await job.start()
+    assert job.start_failed
+
+    blob = caplog.text
+    assert "canary-from-os-environ" not in blob
+    assert "tok-canary-deadbeef" not in blob
+    assert "job-value" not in blob
+    # the diagnostic itself survives: the failure, the job, and the fact that
+    # a custom environment was in play
+    assert "Error launching subprocess of job test" in blob
+    assert "vars, values omitted" in blob
+
+
+def test_loggable_spawn_kwargs_passes_through_without_env():
+    # no env in kwargs (the common case: a job with no `environment:` and no
+    # control-channel injection) is returned untouched, same object.
+    kwargs = {"limit": 4096}
+    assert cronstable.job.loggable_spawn_kwargs(kwargs) is kwargs
+
+
+def test_loggable_spawn_kwargs_leaves_other_keys_alone():
+    kwargs = {"env": {"A": "secret-a", "B": "secret-b"}, "limit": 4096}
+    out = cronstable.job.loggable_spawn_kwargs(kwargs)
+    assert out["limit"] == 4096
+    assert out["env"] == "<2 vars, values omitted>"
+    # the caller's dict is not mutated: it is still the real env handed to the
+    # subprocess
+    assert kwargs["env"] == {"A": "secret-a", "B": "secret-b"}
+
+
+@pytest.mark.asyncio
 async def test_statsd_failure_does_not_crash(monkeypatch):
     # statsd is best-effort: a send error (e.g. an unresolvable host) must be
     # swallowed and not propagate out of start()/wait() to crash the scheduler.
@@ -2362,6 +2423,20 @@ async def test_shell_report_timeout_direct_kill_fallback(
     monkeypatch.setattr(
         cronstable.platform, "kill_process_group", never_signalled
     )
+    # Spy on the fallback itself. Asserting on the "did not finish within" log
+    # line cannot test this: job.py emits it BEFORE the kill_process_group
+    # call the patch above replaces, so such an assertion holds even with the
+    # whole fallback branch deleted. It is also exactly what the sibling test
+    # above asserts with no patch at all, which is what gave this one away.
+    killed = []
+    real_kill = asyncio.subprocess.Process.kill
+
+    def spy_kill(self):
+        killed.append(self.pid)
+        return real_kill(self)
+
+    monkeypatch.setattr(asyncio.subprocess.Process, "kill", spy_kill)
+
     conf = cronstable.config.parse_config_string(_SHELL_JOB, "")
     report = conf.jobs[0].onFailure["report"]
     report["shell"]["shell"] = PYTHON
@@ -2377,6 +2452,7 @@ async def test_shell_report_timeout_direct_kill_fallback(
             30,
         )
 
+    assert killed, "direct-kill fallback did not run"
     assert any(
         "did not finish within" in rec.getMessage()
         for rec in caplog.records

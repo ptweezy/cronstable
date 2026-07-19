@@ -36,6 +36,14 @@ scenario sizes noted per figure.
   pid liveness exactly as it recovers a task the daemon died while
   running, so no outcome is lost, but the recovery path is
   reconciliation rather than the record itself.
+- **One job's failure to finish no longer strands the rest of its
+  batch.**  Buffering made the reaper's per-job work shared: a job that
+  raised while being finished (a state backend answering 503 during its
+  finish step is enough) abandoned the remaining jobs in that batch and
+  skipped the flush, leaving completions that earlier jobs in the same
+  batch had already buffered sitting in memory until some unrelated job
+  happened to complete.  Finishing a job is now guarded per job, and
+  the flush runs whether or not one of them raised.
 - **`/dags` stops re-parsing finished runs.**  The rollup listed and
   fully parsed every retained run document of every dag on every call,
   which a three-second dashboard poll repeated forever.  Run terminality
@@ -44,6 +52,11 @@ scenario sizes noted per figure.
   running, falling back to a single bulk sweep past
   `DAG_ROLLUP_BULK_THRESHOLD` (8) unread documents or on a backend with
   no keys-only listing.  A warm rollup dropped from 11.1ms to 1.7ms.
+  Switching state backends drops that cache along with the rest of the
+  per-store bookkeeping: run keys are derived from the dag name and
+  logical date, so the new store's live run reuses the key of whatever
+  the old store had finished under it, and nothing rebuilds this cache
+  on a timer to correct it later.
 
 ### Queues and streams gain ceilings
 
@@ -113,13 +126,31 @@ scenario sizes noted per figure.
 - **Log search match counts update incrementally** as lines arrive
   instead of rescanning the buffer, with a full rescan only when the
   query itself changes.
-- **A hidden tab stops polling.**  A backgrounded viewer kept the
-  daemon serving its full jobs, cluster and dags fan-out every interval
-  forever; polling now pauses while the tab is hidden and resyncs once
-  immediately on return rather than waiting out an interval.
+- **A hidden tab drops to a 30-second poll, or stops.**  A backgrounded
+  viewer kept the daemon serving its full jobs, cluster and dags fan-out
+  every interval forever.  A hidden tab now stops polling entirely and
+  resyncs once immediately on return rather than waiting out an interval,
+  unless one of the three opt-in features that read the poll is on:
+  desktop notifications, the audible alarm, or the run ledger.  With any
+  of those armed it keeps polling at 30 seconds.  All three refresh only
+  off the poll and all three exist for the tab nobody is watching, so
+  pausing outright silenced new-failure notifications, left the alarm
+  sounding on whatever the last poll saw, and punched a hole in the
+  ledger for as long as the tab was backgrounded.
 
 ### Untrusted text stops reaching wire formats verbatim
 
+- **A failed job launch no longer logs the child's environment.**  The
+  spawn arguments carry a full copy of the daemon's own environment
+  plus the loopback state-API token, and both the debug line on every
+  launch and the error path when a spawn fails formatted that whole
+  structure into the log record.  Any secret the operator exported to
+  cronstable, and a live credential for its own state API, reached
+  journald or syslog and anything shipping from them, at a level no
+  production configuration filters out.  The environment is now
+  summarised as a count; the argv, the failure and the encoding that
+  make the message useful are unchanged.  Output redaction covers
+  archived job output only and never applied here.
 - **DAG task ids reject control characters.**  An id reaches log sinks
   and durable keys verbatim, so an embedded CR or LF could forge or
   split daemon log lines.  The C0 range and DEL are now refused at
@@ -158,13 +189,32 @@ scenario sizes noted per figure.
   measured interpreter floor is subtracted before the delta is computed,
   so a change is judged against the part cronstable controls rather than
   diluted by process spawn and interpreter init.  Displayed values stay
-  the raw totals.
+  the raw totals.  The absolute floor a change must also clear is capped
+  on that same subtracted scale: the 10ms default is sized for the ~40ms
+  raw totals, and applied to a single-digit-millisecond own share it
+  swamped the percentage limit entirely, so `startup.import_cronexpr`
+  could double cronstable's own import cost and still pass.  A startup
+  metric now gates where its declared limit says it does, at 25% of the
+  own share, with a 2ms floor below which the own share's scatter is too
+  large to judge.
+- **A metric that ran on neither side is reported as ungated.**  A
+  metric skipped on both the baseline and the current side produced no
+  row, no violation and no mention anywhere in the summary, so a gate
+  that had compared nothing still printed an unqualified pass.  Both
+  sides' skips are now listed in the report and warned about in the job
+  log, and the pass line carries the count of metrics actually compared.
+- **The web-dashboard renders are gated rather than recorded.**
+  Playwright was installed only into the current side's environment, so
+  every `webui.*` metric skipped on the baseline, and a metric with no
+  baseline is reported without a gate; the three render benchmarks could
+  not have failed a release at any magnitude.  Both sides now install
+  it.  Releases predating the `?perf=1` hook still skip on the baseline,
+  so these gate from the next release onward rather than immediately.
 - **Nine benchmarks were added and three rescaled**, covering the DAG
   fan-in and claim paths, the artifact stream, the dependency gate, the
   TUI's log restyle and search, and the schedule duplicate scan.  Three
   more time the web dashboard's row, fleet and log-count renders in a
-  headless browser through a `?perf=1` hook that is inert without it;
-  these are recorded rather than gated.
+  headless browser through a `?perf=1` hook that is inert without it.
 - **Regression labels no longer fall outside the chart.**  A large
   improvement clamped to the axis put its percentage label on top of the
   metric-name gutter; a label that will not fit outside its bar is now

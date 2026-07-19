@@ -170,7 +170,13 @@ class DagScheduler:
         # never re-read; non-terminal (running/pending) runs are re-read each
         # call. Pruned against each key listing (GC'd runs drop out) and the
         # entry is evicted when a run is (re-)created under the key (see
-        # _create_doc), mirroring _terminal_run_keys.
+        # _create_doc). Note this is only PART of _terminal_run_keys'
+        # invalidation: that one is additionally rebuilt from store bodies by
+        # every full adopt and GC pass, whereas nothing rebuilds this cache on
+        # a timer. A terminal entry therefore survives until something evicts
+        # it by key, which is why forget() has to clear it explicitly on a
+        # backend swap: run keys are deterministic, so the new store's runs
+        # would otherwise read the old store's cached terminal state.
         self._dag_summary_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
@@ -2193,8 +2199,23 @@ class DagScheduler:
         # queued completions targeted the old store; the new store's runs are
         # reconciled from scratch (a still-RUNNING entry is recovered there).
         self._pending_completions.clear()
+        self._completion_buffer.clear()
+        # Run keys are deterministic (dag name + logical date), so the new
+        # store's runs collide with whatever the old store left cached here.
+        # _dag_summary_cache is the load-bearing one: _dag_run_rollup skips
+        # re-reading any key whose cached summary is terminal, and unlike
+        # _terminal_run_keys nothing rebuilds it on a timer -- so without this
+        # clear, /dags serves the OLD store's finished state for the NEW
+        # store's live run until an unrelated eviction happens to knock the
+        # key out. _terminal_run_keys would self-heal at the next full adopt
+        # pass, but until then it suppresses adoption of the new store's runs,
+        # so drop it here and bring that pass forward to now.
+        self._dag_summary_cache.clear()
+        self._terminal_run_keys.clear()
+        self._advance_again.clear()
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
+        self._next_full_adopt = 0.0
         self._next_gc = 0.0
 
 

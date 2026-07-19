@@ -2560,6 +2560,150 @@ async def test_dag_run_rollup_missing_body_is_skipped(tmp_path, monkeypatch):
         await _teardown(cron)
 
 
+# --------------------------------------------------------------------------
+# forget() on a backend swap: every per-store cache is dropped, so /dags stops
+# serving the OLD store's finished run for the NEW store's live one.
+# --------------------------------------------------------------------------
+
+
+async def test_forget_clears_every_per_store_cache(tmp_path):
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+        await cron._dag._dag_run_rollup(cron.state_backend, "xc")
+        assert cron._dag._dag_summary_cache["xc"]
+
+        d = cron._dag
+        ref = ("xc", "r1")
+        # every attribute scoped to the CURRENT store, dirtied by hand so
+        # forget() has something to drop in each one. This is the cheap guard
+        # for the next attribute added to the class and forgotten here; the
+        # user-visible consequence of missing one is the test below.
+        d._owned[ref] = Lease(
+            name="l", holder="h", fence=1, expires_at=dagrun._now() + 3600.0
+        )
+        renewer = asyncio.ensure_future(asyncio.sleep(3600))
+        d._renewers[ref] = renewer
+        d._locks[ref] = asyncio.Lock()
+        d._wake[ref] = 1.0
+        d._next_logical["xc"] = _utcnow()
+        d._seeded["xc"] = "sig"
+        d._seed_failed["xc"] = "sig"
+        d._pending_completions[(ref, "a")] = {}
+        d._completion_buffer[ref] = [{"taskId": "a"}]
+        d._terminal_run_keys["xc"] = {"r1"}
+        d._advance_again.add(ref)
+        # ALL four cadence fields are pushed into the future, not just the
+        # full-adopt one: they default to 0.0, so asserting they are 0.0 after
+        # forget() without dirtying them first passes whether or not forget()
+        # touches them.
+        d._next_full_adopt = dagrun._now() + 3600.0
+        d._next_adopt = dagrun._now() + 3600.0
+        d._next_sched_check = dagrun._now() + 3600.0
+        d._next_gc = dagrun._now() + 3600.0
+
+        d.forget()
+
+        assert not d._owned
+        assert not d._renewers
+        assert not d._locks
+        assert not d._wake
+        assert not d._next_logical
+        assert not d._seeded
+        assert not d._seed_failed
+        assert not d._pending_completions
+        assert not d._completion_buffer
+        assert not d._terminal_run_keys
+        assert not d._dag_summary_cache
+        assert not d._advance_again
+        # every cadence is brought forward to now: the next adopt pass has to
+        # be a FULL one (that is what rebuilds _terminal_run_keys from the new
+        # store's bodies).
+        assert d._next_full_adopt == 0.0
+        assert d._next_adopt == 0.0
+        assert d._next_sched_check == 0.0
+        assert d._next_gc == 0.0
+        # renewing a lease against a store that is gone is pointless
+        with pytest.raises(asyncio.CancelledError):
+            await renewer
+    finally:
+        await _teardown(cron)
+
+
+async def test_forget_drops_stale_terminal_summary_across_backend_swap(
+    tmp_path,
+):
+    store_a = tmp_path / "store-a"
+    store_b = tmp_path / "store-b"
+    store_a.mkdir()
+    store_b.mkdir()
+    cron = await _make_cron(store_a, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+
+        # store A: one run driven to SUCCESS, then rolled up so its summary is
+        # cached. A terminal summary is immutable, so nothing ever re-reads it.
+        run_key = await cron._dag.trigger_run("lin")
+        assert (await _drive(cron, "lin", run_key))["state"] == dag.SUCCESS
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "lin")
+        assert roll["runCounts"] == {dag.SUCCESS: 1}
+        assert cron._dag._dag_summary_cache["lin"][run_key]["terminal"]
+        assert run_key in cron._dag._terminal_run_keys["lin"]
+
+        # store B: a PEER node creates a live run under the SAME key (run keys
+        # are deterministic: dag name + logical date), so it collides with what
+        # store A left in this node's caches. It has to be a peer, since this
+        # node's own _create_doc evicts the key from both caches on the way in.
+        peer = await _make_cron(store_b, _LINEAR)
+        try:
+            assert await peer._dag._create_doc(
+                peer.cron_dags["lin"], run_key, None, "manual"
+            )
+        finally:
+            await _teardown(peer)
+
+        # dirty the remaining per-store bookkeeping so the swap has something
+        # to clear in each of them.
+        ref = ("lin", run_key)
+        cron._dag._completion_buffer[ref] = [{"taskId": "a"}]
+        cron._dag._advance_again.add(ref)
+        cron._dag._pending_completions[(ref, "a")] = {}
+        cron._dag._next_full_adopt = dagrun._now() + 3600.0
+
+        # the swap: a different path is a different store config, which is what
+        # drives Cron.start_stop_state through _dag.forget().
+        swap = "state:\n  path: {}\n".format(store_b) + _LINEAR
+        await cron.start_stop_state(_state_cfg(swap))
+        assert cron.state_backend is not None
+
+        # the user-visible symptom, asserted first because it is the whole
+        # point: /dags must report the new store's RUNNING run, not the old
+        # store's finished one. With the summary cache left standing this key
+        # is skipped as "terminal, immutable" and never re-read, so the stale
+        # success is served indefinitely (nothing rebuilds that cache on a
+        # timer, unlike _terminal_run_keys, which the full adopt pass heals).
+        live = await cron._dag.get_run("lin", run_key)
+        assert live["state"] == dag.RUNNING  # the peer's run, in store B
+        roll = await cron._dag._dag_run_rollup(cron.state_backend, "lin")
+        assert roll["runCounts"] == {dag.RUNNING: 1}
+        assert roll["latestRun"]["state"] == dag.RUNNING
+
+        # and nothing else the old store populated survived. (Ownership and
+        # the wake/lock maps are NOT asserted empty here: the swap ends in
+        # _rehydrate_from_state, which legitimately re-adopts the new store's
+        # live run. test_forget_clears_every_per_store_cache pins those.)
+        d = cron._dag
+        assert run_key not in d._terminal_run_keys.get("lin", set())
+        assert not d._completion_buffer
+        assert not d._pending_completions
+        assert not d._advance_again
+
+        await _drive(cron, "lin", run_key)  # reap the re-adopted launch
+    finally:
+        await _teardown(cron)
+
+
 # ===========================================================================
 # DagScheduler lifecycle plumbing: scheduled firing, orphan adoption,
 # advance-lease usability, task-run preparation, completion flushing, boot
