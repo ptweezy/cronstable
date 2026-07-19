@@ -4732,6 +4732,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
   function setSound(v) {
     prefs.sound = v; savePref("sound"); syncSettings();
+    restartPolling();   // an input to the hidden-tab poll gate (see setNotify)
     if (v) { audio(); playCue("ok"); }             // enable is a gesture: unlock + confirm
     else if (audioCtx) { try { audioCtx.suspend(); } catch (_) {} }
   }
@@ -7209,14 +7210,19 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
   function setPoll(v) { prefs.pollMs = v; savePref("pollMs"); restartPolling(); syncSettings(); }
   function setNotify(v) {
+    // restartPolling on every path: notify is an input to the hidden-tab poll
+    // gate, and the permission prompt resolves asynchronously, so a tab that
+    // is already hidden when the user answers would otherwise sit with no
+    // poll armed until the next visibilitychange. It clears before arming,
+    // so calling it when nothing changed is free.
     if (v && "Notification" in window && Notification.permission !== "granted") {
       Notification.requestPermission().then((perm) => {
-        prefs.notify = perm === "granted"; savePref("notify"); syncSettings();
+        prefs.notify = perm === "granted"; savePref("notify"); syncSettings(); restartPolling();
         toast(prefs.notify ? "ok" : "err", prefs.notify ? "notifications on" : "permission denied");
       });
       return;
     }
-    prefs.notify = v && ("Notification" in window); savePref("notify"); syncSettings();
+    prefs.notify = v && ("Notification" in window); savePref("notify"); syncSettings(); restartPolling();
   }
   function syncSettings() {
     $("setTheme").value = prefs.theme;
@@ -8278,13 +8284,40 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   //  polling control
   // ===================================================================
   let pollTimer = null;
+  // Cadence while the tab is hidden and an alerting pref is armed. Slow
+  // enough to keep the hidden-tab saving most of its value, frequent enough
+  // that a failure alert is not meaningfully stale.
+  const HIDDEN_POLL_MS = 30000;
   function restartPolling() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    // Don't poll while the tab is hidden: an idle backgrounded viewer would
-    // otherwise keep the daemon serving its full /jobs + /cluster + /dags fan-
-    // out every pollMs forever. The visibilitychange handler calls this again
-    // (and forces one immediate refresh) when the tab comes back.
-    if (prefs.pollMs > 0 && !document.hidden) pollTimer = setInterval(loadJobs, prefs.pollMs);
+    if (!(prefs.pollMs > 0)) return;
+    // Don't poll at the FOREGROUND rate while the tab is hidden: an idle
+    // backgrounded viewer would otherwise keep the daemon serving its full
+    // /jobs + /cluster + /dags fan-out every pollMs forever. The
+    // visibilitychange handler calls this again (and forces one immediate
+    // refresh) when the tab comes back.
+    //
+    // Stopping outright is wrong when something is consuming the poll,
+    // though. Three opt-in features refresh ONLY off loadJobs and all three
+    // exist precisely for the tab nobody is watching: desktop notifications
+    // (maybeNotify), the standing alarm (state.anyFailing, which alarmTick
+    // reads on its own ungated 1s interval), and the run ledger
+    // (ledgerRecord, which accumulates history per poll). Gating purely on
+    // visibility silenced new-failure notifications while hidden, left
+    // alarmTick pulsing on a stale anyFailing (a resolved failure kept
+    // sounding, a fresh one stayed quiet), and punched a hole in the ledger
+    // for as long as the tab was backgrounded. Polling slowly keeps all
+    // three honest and still drops hidden-tab load by 6x at the default 5s
+    // cadence. With none of them on, nothing reads a hidden-tab poll, so it
+    // is skipped entirely.
+    if (
+      document.hidden
+      && !(prefs.notify || prefs.sound || state.ledger.on)
+    ) return;
+    pollTimer = setInterval(
+      loadJobs,
+      document.hidden ? Math.max(prefs.pollMs, HIDDEN_POLL_MS) : prefs.pollMs,
+    );
   }
   // Pause/resume polling and the per-second tick with page visibility; on
   // return, resync once immediately rather than waiting up to a full interval.
@@ -9065,6 +9098,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
   }
   function setLedger(v) {
     prefs.ledger = v; savePref("ledger"); state.ledger.on = v; syncSettings();
+    restartPolling();   // an input to the hidden-tab poll gate (see setNotify)
     if (v) { state.ledger.ready = false; ledgerLoad().then(() => { refreshLedgerStat(); renderRows(); }); }
     else { state.ledger.stats = {}; refreshLedgerStat(); renderRows(); }
   }

@@ -7208,22 +7208,55 @@ class Cron:
                     for job, task in list(wait_tasks.items()):
                         if task in done_tasks:
                             done_jobs.add(job)
-                    for job in done_jobs:
-                        task = wait_tasks.pop(job)
-                        try:
-                            task.result()
-                        except Exception:  # pragma: no cover
-                            logger.exception(
-                                "Unexpected error while waiting on job %s; "
-                                "please report this as a bug (2)",
-                                job.config.name,
-                            )
-                        await self._handle_finished_job(job)
-                    # Record all DAG-task completions buffered while handling
-                    # this batch in one RMW per run (a mapped fan-out finishing
-                    # together no longer pays a full document write+fsync per
-                    # task). No-op when no DAG tasks finished.
-                    await self._dag.flush_completions()
+                    try:
+                        for job in done_jobs:
+                            task = wait_tasks.pop(job)
+                            try:
+                                task.result()
+                            except Exception:  # pragma: no cover
+                                logger.exception(
+                                    "Unexpected error while waiting on job "
+                                    "%s; please report this as a bug (2)",
+                                    job.config.name,
+                                )
+                            try:
+                                await self._handle_finished_job(job)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                # Per-job, so one job's failure to finish
+                                # (e.g. the state backend 503ing out of
+                                # _job_api.finish_run) does not skip the
+                                # remaining jobs in this batch. No
+                                # `pragma: no cover` unlike its siblings
+                                # below: this arm has a test
+                                # (test_reaper_finishes_whole_batch_when_
+                                # one_job_raises), so let the coverage gate
+                                # notice if it stops being reached.
+                                logger.exception(
+                                    "Unexpected error finishing job %s; "
+                                    "please report this as a bug (6)",
+                                    job.config.name,
+                                )
+                    finally:
+                        # Record all DAG-task completions buffered while
+                        # handling this batch in one RMW per run (a mapped
+                        # fan-out finishing together no longer pays a full
+                        # document write+fsync per task). No-op when no DAG
+                        # tasks finished.
+                        #
+                        # In a finally: the buffer holds completions from jobs
+                        # ALREADY handled in this batch, so letting an
+                        # exception from a later job skip the flush would
+                        # strand their dag_run entries as RUNNING until some
+                        # unrelated job completes and reaches the next flush
+                        # (indefinitely, if none does: nothing else drains
+                        # this buffer; _retry_completions only sees
+                        # _pending_completions, which flush_completions
+                        # populates from its own except arm). Batching is what
+                        # made this cross-job: pre-batching each completion
+                        # wrote itself.
+                        await self._dag.flush_completions()
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # pragma: no cover
