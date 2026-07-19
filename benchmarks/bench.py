@@ -1246,6 +1246,218 @@ def bench_ical():
 
 
 # ---------------------------------------------------------------------------
+# tui: the terminal dashboard's per-frame string work.  The log drawer
+# re-measures, re-cuts and re-inks its whole buffer each frame, and the log
+# search re-scans it, so these functions -- text_width / cut_to_width /
+# rewrite_sgr / strip_ansi -- are the terminal UI's hottest per-frame cost
+# (and where the printable-ASCII fast paths live).  Measured in-process; no
+# terminal, no app loop.
+# ---------------------------------------------------------------------------
+
+
+def _tui_module():
+    try:
+        from cronstable import tui
+    except ImportError as exc:
+        raise Skip("cronstable.tui unavailable: %r" % exc) from None
+    return tui
+
+
+def _tui_log_lines(n):
+    """A realistic log buffer: coloured (SGR) lines, plain ASCII, a wide-glyph
+    line, and one carrying control characters -- the mix a real job emits."""
+    plain = "2026-07-18 12:00:%02d INFO worker %d processed batch in 12ms"
+    colored = (
+        "\x1b[32m2026-07-18 12:00:%02d\x1b[0m \x1b[1mworker %d\x1b[0m "
+        "\x1b[36mOK\x1b[0m done"
+    )
+    wide = "进度 %d%% ▕████████▏ 完了 \x1b[33mwarn\x1b[0m"
+    hostile = "line %d \x07\x08 spinner \r\x1b[2K progress"
+    out = []
+    for i in range(n):
+        r = i % 4
+        if r == 0:
+            out.append(colored % (i % 60, i))
+        elif r == 1:
+            out.append(plain % (i % 60, i))
+        elif r == 2:
+            out.append(wide % (i % 100))
+        else:
+            out.append(hostile % i)
+    return out
+
+
+@bench(
+    "tui.log_restyle_5k",
+    "tui",
+    detail="text_width + cut_to_width + rewrite_sgr over a 5k-line drawer",
+    repeats=(5, 2, 1),
+)
+def bench_tui_log_restyle():
+    tui = _tui_module()
+    for attr in ("text_width", "cut_to_width", "rewrite_sgr", "Theme"):
+        if not hasattr(tui, attr):
+            raise Skip("cronstable.tui lacks %s" % attr)
+    try:
+        theme = tui.Theme("carolina", False)
+    except Exception as exc:  # pragma: no cover - signature drift
+        raise Skip("tui.Theme construction failed: %r" % exc) from None
+    lines = fixture("tui_log_lines_5k", lambda: _tui_log_lines(_n(5000)))
+    width = 110
+    t0 = time.perf_counter()
+    for line in lines:
+        tui.text_width(line)
+        row = tui.cut_to_width(line, width)
+        tui.rewrite_sgr(row, theme)
+    return time.perf_counter() - t0
+
+
+@bench(
+    "tui.log_search_20k",
+    "tui",
+    detail="strip_ansi + substring match over a 20k-line drawer",
+    repeats=(5, 2, 1),
+)
+def bench_tui_log_search():
+    tui = _tui_module()
+    if not hasattr(tui, "strip_ansi"):
+        raise Skip("cronstable.tui lacks strip_ansi")
+    lines = fixture("tui_log_lines_20k", lambda: _tui_log_lines(_n(20000)))
+    needle = "worker"
+    t0 = time.perf_counter()
+    for line in lines:
+        tui.strip_ansi(line).lower().find(needle)
+    return time.perf_counter() - t0
+
+
+# ---------------------------------------------------------------------------
+# webui: the browser dashboard's render hot paths, timed inside a headless
+# Chromium via the page's ?perf=1 __perf hook.  The whole group skips unless
+# Playwright + its Chromium build are installed AND the page carries the hook
+# (an older release predates it), and never runs in --smoke (the unit test must
+# not launch a browser).  These are the client-side twins of the tui.* metrics.
+# ---------------------------------------------------------------------------
+
+
+def _web_page():
+    """Launch headless Chromium once and load the hooked dashboard page.
+
+    Cached for the whole webui group (torn down at interpreter exit); a missing
+    dependency, a failed launch, or a hookless page each raise Skip so the
+    metrics record as skipped, never failed.
+    """
+
+    def build():
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise Skip("playwright not installed: %r" % exc) from None
+        try:
+            import cronstable.web
+
+            page_path = os.path.join(
+                os.path.dirname(cronstable.web.__file__), "index.html"
+            )
+        except ImportError as exc:
+            raise Skip("cronstable.web unavailable: %r" % exc) from None
+        if not os.path.exists(page_path):
+            raise Skip("web/index.html not found next to cronstable.web")
+        try:
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch()
+        except Exception as exc:
+            raise Skip("chromium launch failed: %r" % exc) from None
+        atexit.register(lambda: (browser.close(), pw.stop()))
+        page = browser.new_page()
+        page.goto("file://" + page_path.replace("\\", "/") + "?perf=1")
+        page.wait_for_timeout(300)
+        if not page.evaluate("() => !!(window.__perf)"):
+            raise Skip("page lacks the ?perf=1 __perf hook (older release)")
+        return page
+
+    return fixture("web_page", build)
+
+
+def _web_time(page, setup_js, op_js, batch=10, batches=12):
+    """Min per-op wall time (seconds) of ``op_js`` after ``setup_js``.
+
+    Timed with the page's own ``performance.now()`` so only the render work is
+    measured, never the Python<->browser round trip.  Each batch times
+    ``batch`` ops together and divides -- Chromium clamps ``performance.now()``
+    to ~100us, so a single fast render reads as zero; a batch clears the clamp.
+    The MIN batch-mean over ``batches`` is the least-noisy statistic, matching
+    the suite's ``compare='min'``.
+    """
+    ms = page.evaluate(
+        "() => { %s; for (let w=0; w<2; w++) { %s; }"
+        " let best = Infinity;"
+        " for (let b=0; b<%d; b++) {"
+        "   const a = performance.now();"
+        "   for (let i=0; i<%d; i++) { %s; }"
+        "   best = Math.min(best, (performance.now() - a) / %d); }"
+        " return best; }" % (setup_js, op_js, batches, batch, op_js, batch)
+    )
+    return ms / 1000.0
+
+
+@bench(
+    "webui.render_rows_500",
+    "webui",
+    detail="renderRows full rebuild over 500 jobs (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_render_rows():
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d)" % _n(500),
+        "__perf.renderRows()",
+    )
+
+
+@bench(
+    "webui.render_fleet_15x400",
+    "webui",
+    detail="renderFleet full rebuild, 15 nodes x 400 jobs (headless Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_render_fleet():
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    return _web_time(
+        page,
+        "__perf.seedJobs(%d); __perf.seedFleet(15, %d)" % (_n(400), _n(400)),
+        "__perf.renderFleet()",
+    )
+
+
+@bench(
+    "webui.log_count_5k",
+    "webui",
+    detail="updateLogCount over a 5k-line buffer with a search (Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_log_count():
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    return _web_time(
+        page,
+        "__perf.seedLog(%d, 'worker')" % _n(5000),
+        "__perf.updateLogCount()",
+    )
+
+
+# ---------------------------------------------------------------------------
 # memory: deterministic traced allocations plus real child-process RSS.
 # ---------------------------------------------------------------------------
 

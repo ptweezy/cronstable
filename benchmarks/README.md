@@ -3,8 +3,9 @@
 This directory holds the performance regression harness that CI runs on every
 commit and enforces on every release. It exists to keep cronstable fast and
 small enough for old machines: startup cost, schedule math at 100k-job scale,
-config parsing, DAG planning, durable-state I/O, and memory footprint are all
-measured, and a release that regresses past a metric's limit does not ship.
+config parsing, DAG planning, durable-state I/O, memory footprint, the terminal
+dashboard's per-frame string work, and the web dashboard's render hot paths are
+all measured, and a release that regresses past a metric's limit does not ship.
 
 ## The two tools
 
@@ -62,12 +63,28 @@ time (the minimum is the least noisy statistic of a fixed workload) and
 median for memory. A metric fails its gate only when it slows down by more
 than its declared percentage limit AND by more than its absolute floor AND by
 more than a couple of its measured noise bands, where the noise band is the
-two sides' round-to-round scatter (coefficient of variation) combined in
-quadrature. So microsecond jitter on a sub-millisecond metric can never gate,
-and neither can a metric's own run-to-run wobble; a change that clears the
-raw limit but sits inside the noise band is reported (not silently dropped)
-but does not fail the release. More in-process rounds exist precisely to
-tighten that noise-band estimate.
+two sides' round-to-round scatter combined in quadrature. So microsecond
+jitter on a sub-millisecond metric can never gate, and neither can a metric's
+own run-to-run wobble; a change that clears the raw limit but sits inside the
+noise band is reported (not silently dropped) but does not fail the release.
+More in-process rounds exist precisely to tighten that noise-band estimate.
+
+Three refinements keep the gate both tight and honest:
+
+- **Robust noise band.** From three rounds up, the round-to-round scatter is
+  the median absolute deviation (scaled to a standard-deviation equivalent),
+  not a plain standard deviation. One throttled or GC-stalled round can no
+  longer inflate the band and hide a real regression behind it.
+- **Interpreter-startup subtraction.** The `startup.*` metrics are dominated
+  by Python's own process spawn and interpreter init, which cronstable cannot
+  regress. Each side's `startup.python_baseline` is subtracted before the
+  delta is computed, so the gate sees cronstable's OWN contribution and a real
+  couple-of-ms import regression is not diluted below the limit by ~40ms of
+  un-regressable overhead.
+- **A tighter default limit.** The deterministic in-process compute metrics
+  gate at 15%; the noisier tiers (subprocess process-spawn, real-disk state
+  I/O, peak-RSS, browser render) set a looser limit of their own. The noise
+  band above still protects every one of them from jitter.
 
 On an ordinary commit the comparison prints warnings only. On a release the
 gate is enforced: the `release` job requires `perf`, so a gated regression
@@ -79,6 +96,37 @@ To ship an intentional regression, start a pushed commit's subject with
 `[perf:accept]`. The regression is still measured and reported in the
 release notes, but it does not gate. Only subject lines are scanned, same as
 the `[release]` marker.
+
+## Terminal and web UI benchmarks
+
+The dashboards have their own hot paths, and both are measured.
+
+The **terminal UI** (`tui.*`) is pure Python, so it is benchmarked in process
+like everything else: the log drawer re-measures, re-cuts and re-inks its whole
+buffer each frame and the log search re-scans it, so `tui.log_restyle_5k` and
+`tui.log_search_20k` drive `text_width` / `cut_to_width` / `rewrite_sgr` /
+`strip_ansi` over a realistic buffer (coloured, plain, wide-glyph and
+control-character lines). No terminal and no app loop.
+
+The **web UI** (`webui.*`) is browser JavaScript, so it is timed inside a
+headless Chromium via Playwright. The page exposes a `window.__perf` hook ONLY
+under the `?perf=1` query string (it is entirely inert otherwise — no global is
+defined), giving the harness seed helpers and the real render functions;
+`bench.py` seeds synthetic jobs / fleet / log data and times `renderRows`,
+`renderFleet` and `updateLogCount` with the page's own `performance.now()`
+(batched, because Chromium clamps that clock to ~100us). The whole `webui`
+group **skips cleanly** when Playwright or its Chromium build is absent, when
+the page predates the `?perf=1` hook (an older release), and in `--smoke`
+(the unit test must not launch a browser). To run them:
+
+```sh
+pip install playwright && playwright install chromium
+python benchmarks/bench.py --quick --only webui
+```
+
+Because an older release's page carries no `?perf=1` hook, the `webui` metrics
+compare new-against-new (a forward-looking gate and a recorded number), not an
+old-vs-new delta; the `tui.*` and backend metrics do diff across releases.
 
 ## Adding a benchmark
 

@@ -226,7 +226,7 @@ def test_compare_startup_subtracts_python_baseline(tmp_path):
         _doc(
             [
                 _entry("startup.python_baseline", 0.100, gate_pct=None),
-                _entry("startup.version", 0.200),  # cronstable share 0.05->0.10
+                _entry("startup.version", 0.200),  # cronstable 0.05 -> 0.10
             ],
             version="1.1.0",
         ),
