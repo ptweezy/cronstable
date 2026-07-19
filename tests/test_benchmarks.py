@@ -277,6 +277,47 @@ def test_adjusted_values_only_touches_startup_with_a_floor():
     ) == (0.150, 0.190)
 
 
+def test_svg_large_change_labels_stay_within_the_plot():
+    # Regression: a large (clamped) bar used to place its percentage label just
+    # past the bar end, which for a big FASTER change landed left of the plot,
+    # on top of the metric name (e.g. a -94% label unreadable). Large changes
+    # must now render their label INSIDE the bar and within the plot bounds.
+    import re
+
+    compare = _load_compare()
+
+    def _e(name, value):
+        return {
+            "name": name, "unit": "s", "compare": "min", "gate_pct": 15.0,
+            "gate_floor": 0.01, "value": value, "round_values": [value],
+        }
+
+    base = {"big.win": _e("big.win", 1.0), "big.reg": _e("big.reg", 0.10)}
+    cur = {"big.win": _e("big.win", 0.05), "big.reg": _e("big.reg", 0.50)}
+    rows, _ = compare._compare(base, cur)
+    svg = compare.build_svg(rows, "old", "new")
+
+    width, gutter = 860, 230
+    pat = re.compile(
+        r'<text class="([^"]*num[^"]*)" x="([\d.]+)"[^>]*'
+        r'text-anchor="(\w+)">([+\-][\d.]+%[^<]*)</text>'
+    )
+    inside = []
+    for cls, x, anchor, txt in pat.findall(svg):
+        if anchor == "middle" or "t3" in cls:
+            continue  # axis tick labels, not data labels
+        x = float(x)
+        w = len(txt) * 6.0 + 3.0
+        left, right = (x - w, x) if anchor == "end" else (x, x + w)
+        assert left >= gutter - 3, ("spills into name gutter", txt, left)
+        assert right <= width - 2, ("spills past right edge", txt, right)
+        if "inlabel" in cls:
+            inside.append(txt)
+    # both the big win and the big gated regression were drawn inside the bar
+    assert any(t.startswith("-") for t in inside), inside
+    assert any("gate" in t for t in inside), inside
+
+
 def test_compare_without_baseline_records_first_release(tmp_path):
     cur = _write(tmp_path / "cur.json", _doc([_entry("startup.version", 0.1)]))
     md = tmp_path / "out.md"
