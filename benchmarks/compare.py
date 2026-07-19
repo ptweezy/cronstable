@@ -457,8 +457,7 @@ def build_svg(rows, base_label, cur_label):
                 lx, anchor, lcls = end + pad, "start", "inlabel num"
         parts.append(
             '<text class="%s" x="%.1f" y="%.1f" font-size="10" '
-            'text-anchor="%s">%s</text>'
-            % (lcls, lx, y_mid + 4, anchor, label)
+            'text-anchor="%s">%s</text>' % (lcls, lx, y_mid + 4, anchor, label)
         )
 
     if omitted > 0:

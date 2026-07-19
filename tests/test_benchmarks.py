@@ -288,8 +288,13 @@ def test_svg_large_change_labels_stay_within_the_plot():
 
     def _e(name, value):
         return {
-            "name": name, "unit": "s", "compare": "min", "gate_pct": 15.0,
-            "gate_floor": 0.01, "value": value, "round_values": [value],
+            "name": name,
+            "unit": "s",
+            "compare": "min",
+            "gate_pct": 15.0,
+            "gate_floor": 0.01,
+            "value": value,
+            "round_values": [value],
         }
 
     base = {"big.win": _e("big.win", 1.0), "big.reg": _e("big.reg", 0.10)}
