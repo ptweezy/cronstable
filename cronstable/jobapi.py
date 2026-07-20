@@ -656,7 +656,13 @@ class JobStateAPI:
         return given
 
     @staticmethod
-    def _require(value: Optional[str], what: str) -> str:
+    def _require(value: Any, what: str) -> str:
+        # a JSON body reaches us as arbitrary types: a number, a bool or a
+        # container satisfies a bare truthiness test and only fails much
+        # later inside a string-only encoder (state._fs_safe), as a 500.
+        # Every required field is a string, so say so here, as a 400.
+        if value is not None and not isinstance(value, str):
+            raise JobStateError("{} must be a string".format(what))
         if not value:
             raise JobStateError("{} is required".format(what))
         return value
@@ -852,16 +858,25 @@ class JobStateAPI:
         payload = await self._json_body(request)
         scope = self._scope(ctx, payload.get("scope"))
         name = self._require(payload.get("name"), "name")
+        # int()/float() raise OverflowError -- not ValueError -- for a
+        # non-finite or arbitrarily-wide JSON number, both of which stdlib
+        # json.loads produces without complaint from a well-formed body.
         try:
             permits = int(payload.get("permits", 1))
-        except (TypeError, ValueError) as ex:
+        except (TypeError, ValueError, OverflowError) as ex:
             raise JobStateError("permits must be an integer") from ex
         ttl = payload.get("ttl")
         try:
             ttl_seconds = float(ttl) if ttl is not None else None
             block_seconds = float(payload.get("blockSeconds") or 0.0)
-        except (TypeError, ValueError) as ex:
+        except (TypeError, ValueError, OverflowError) as ex:
             raise JobStateError("ttl and blockSeconds must be numbers") from ex
+        for label, value in (
+            ("ttl", ttl_seconds),
+            ("blockSeconds", block_seconds),
+        ):
+            if value is not None and not math.isfinite(value):
+                raise JobStateError("{} must be a finite number".format(label))
         result = await self.locks.acquire(
             ctx.token,
             scope,
