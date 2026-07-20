@@ -2448,17 +2448,53 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
     return ClusterConfig(cfg)
 
 
+# An RFC 3986 scheme (ALPHA *(ALPHA / DIGIT / "+" / "-" / ".")) followed by
+# ":" -- recognised as a scheme only when "//" (an authority) follows, so a
+# scheme-less "user:pass@host" is NOT mistaken for scheme "user".
+_URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:(?=//)")
+
+
+def _url_authority_span(url: str) -> Tuple[int, int]:
+    """The ``[start, end)`` span of ``url`` that can carry userinfo.
+
+    The ONE authority locator shared by :func:`_url_has_userinfo` and
+    :func:`_redact_userinfo`, so the detector and the redactor can never
+    disagree about where a credential may live (two subtly different ad-hoc
+    ``"://"`` splits previously let a protocol-relative ``//user:pass@host``
+    slip past both, and a malformed trailing ``://`` past the redactor only --
+    leaking the password into the very ConfigError written to prevent that).
+    Per RFC 3986 the authority follows ``scheme://`` (or a protocol-relative
+    ``//``) and ends at the first ``/``, ``?`` or ``#``; for a scheme-less
+    ``user:pass@host`` -- which urlparse misreads as scheme ``user`` -- the
+    whole leading run up to those delimiters is treated as the authority, so
+    a credentialed endpoint is caught whether or not a scheme is present.
+    """
+    match = _URL_SCHEME_RE.match(url)
+    if match is not None:
+        start = match.end() + 2
+    elif url.startswith("//"):
+        start = 2
+    else:
+        start = 0
+    end = len(url)
+    for delimiter in "/?#":
+        found = url.find(delimiter, start)
+        if found != -1 and found < end:
+            end = found
+    return start, end
+
+
 def _url_has_userinfo(url: str) -> bool:
     """Whether ``url``'s authority carries ``user[:pass]@`` userinfo.
 
     Robust to a scheme-less ``user:pass@host:port`` (which urlparse misreads as
     scheme ``user`` with no username/password), so a credentialed endpoint is
     detected -- and rejected/redacted -- regardless of whether a scheme is
-    present.  Userinfo only appears in the authority, before the first ``/``.
+    present.  Shares :func:`_url_authority_span` with :func:`_redact_userinfo`
+    so anything detected here is by construction redactable there.
     """
-    rest = url.partition("://")[2] or url
-    authority = rest.partition("/")[0]
-    return "@" in authority
+    start, end = _url_authority_span(url)
+    return "@" in url[start:end]
 
 
 def _redact_userinfo(url: str) -> str:
@@ -2467,23 +2503,20 @@ def _redact_userinfo(url: str) -> str:
     Deliberately does NOT rely on ``urlparse(...).username``: a scheme-less
     ``user:pass@host`` parses as scheme ``user`` with username/password both
     ``None``, so trusting that would echo the secret verbatim (the leak this
-    helper exists to prevent).  Instead the authority is located directly and
-    any userinfo it carries is redacted, so the credential never reaches a log
-    whether or not a scheme is present.
+    helper exists to prevent).  Instead the authority is located via the same
+    :func:`_url_authority_span` the detector uses and any userinfo it carries
+    is redacted, so the credential never reaches a log whether or not a scheme
+    is present.
     """
-    scheme, sep, rest = url.partition("://")
-    if not sep:
-        # scheme-less: urlparse would misread the userinfo as the scheme.
-        scheme, rest = "", url
-    authority, slash, path = rest.partition("/")
+    start, end = _url_authority_span(url)
+    authority = url[start:end]
     if "@" not in authority:
         return url
     # Split on the LAST '@': userinfo ends at the final '@', so a password that
     # itself contains '@' (e.g. user:p@ss@host) is not split on its first '@',
     # which would leave a tail of the secret ('ss@host') in the output.
     hostpart = authority.rsplit("@", 1)[1]
-    prefix = "{}://".format(scheme) if scheme else ""
-    return "{}***@{}{}{}".format(prefix, hostpart, slash, path)
+    return "{}***@{}{}".format(url[:start], hostpart, url[end:])
 
 
 def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:

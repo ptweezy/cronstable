@@ -242,6 +242,28 @@ def test_prev_aware_returns_true_elapsed_across_fall_back():
     assert ago == 2.5 * 3600
 
 
+def test_prev_aware_past_horizon_is_bounded_and_correct():
+    # No occurrence lives past the 2099 horizon, so an aware ``now`` far
+    # beyond it must NOT step the backward scan one fire at a time from
+    # ``now`` down to 2099 (~1.8s of CPU per year for a per-minute schedule
+    # -- hours of event-loop starvation for at=9999, reachable via a
+    # schema-valid MCP/web ``at`` argument): the scan starts at the
+    # horizon's edge instead.
+    import time as _time
+
+    ny = ZoneInfo("America/New_York")
+    ct = CronTab("* * * * *")
+    started = _time.perf_counter()
+    ago = ct.prev(now=datetime.datetime(9999, 1, 1, tzinfo=ny))
+    assert _time.perf_counter() - started < 2.0
+    # the answer is the real fire set's last member: 2099-12-31 23:59 local
+    now_utc = datetime.datetime(9999, 1, 1, tzinfo=ny).astimezone(
+        datetime.timezone.utc
+    )
+    last = (now_utc - datetime.timedelta(seconds=ago)).astimezone(ny)
+    assert last.replace(tzinfo=None) == datetime.datetime(2099, 12, 31, 23, 59)
+
+
 def test_prev_next_round_trip():
     ct = CronTab("*/15 2-4 * * mon-fri")
     now = datetime.datetime(2026, 7, 15, 13, 37, 21)

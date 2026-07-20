@@ -24,6 +24,7 @@ stays stable and backend-independent whether or not a given host has orjson.
 
 import json as _stdlib
 import math
+import re
 from typing import Any, Union, cast
 
 try:
@@ -49,15 +50,24 @@ except ImportError:  # pragma: no cover - exercised on the no-orjson baseline
 _INT_MIN = -(2**63)
 _INT_MAX = 2**64 - 1
 
+# Lone (unpaired) surrogate code points are the string-shaped portability
+# hazard: the stdlib encoder happily writes ``"\ud800"`` (and its decoder
+# reads it back), but orjson raises on dumps AND refuses to parse those same
+# bytes -- so a stdlib node can persist a record no orjson node can ever read
+# or rewrite.  They cannot appear in well-formed UTF-8 input; they arrive via
+# surrogateescape-decoded OS data or a caller constructing them directly.
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
 
 class UnsupportedValue(ValueError):
     """A value that cannot be encoded identically across a mixed-orjson fleet.
 
     Raised by :func:`dumps_bytes` (and available as a standalone pre-check via
     :func:`ensure_portable`) for a non-finite float (``NaN`` / ``Infinity``),
-    an integer outside the 64-bit window orjson supports, or a non-string
-    object key.  Rejecting at write time is what keeps a record readable by
-    every node regardless of which ones have orjson.
+    an integer outside the 64-bit window orjson supports, a string (or object
+    key) containing a lone surrogate, or a non-string object key.  Rejecting
+    at write time is what keeps a record readable by every node regardless of
+    which ones have orjson.
     """
 
 
@@ -115,6 +125,14 @@ def ensure_portable(obj: Any) -> None:
                 "integer {} is outside the portable signed/unsigned 64-bit "
                 "range [{}, {}]".format(obj, _INT_MIN, _INT_MAX)
             )
+    elif isinstance(obj, str):
+        match = _SURROGATES.search(obj)
+        if match is not None:
+            raise UnsupportedValue(
+                "string containing lone surrogate {!r} is not portable "
+                "across the fleet (the stdlib writes an escape orjson can "
+                "neither emit nor parse)".format(match.group())
+            )
     elif isinstance(obj, dict):
         for key, value in obj.items():
             if not isinstance(key, str):
@@ -124,6 +142,7 @@ def ensure_portable(obj: Any) -> None:
                         key
                     )
                 )
+            ensure_portable(key)
             ensure_portable(value)
     elif isinstance(obj, (list, tuple)):
         for value in obj:
