@@ -96,8 +96,7 @@ def _physical_lines(data: str) -> List[str]:
     number drift from the file's physical lines.
     """
     return [
-        line[:-1] if line.endswith("\r") else line
-        for line in data.split("\n")
+        line[:-1] if line.endswith("\r") else line for line in data.split("\n")
     ]
 
 
