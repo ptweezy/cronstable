@@ -110,6 +110,24 @@ def _require_scope(scope: str) -> str:
     return scope
 
 
+#: How many dict levels the store adds above a client value before writing it:
+#: the record wrapper ``{"schemaVersion": .., "data": <body>}`` plus the body
+#: ``{"key": .., "value": <value>, ..}`` that carries it.  :func:`_check_size`
+#: must judge portability against THAT shape -- gating the bare value instead
+#: let a value within a serializer's nesting bound pass the pre-flight and then
+#: fail inside ``_mutate_document_sync``, after the directory fsync and with
+#: the document flock held, as a 500 rather than the documented 400.
+_STORE_WRAPPER_DEPTH = 2
+
+
+def _as_stored(value: Any) -> Any:
+    """``value`` nested as deeply as the store will actually persist it."""
+    wrapped = value
+    for _ in range(_STORE_WRAPPER_DEPTH):
+        wrapped = {"data": wrapped}
+    return wrapped
+
+
 def _check_size(kind: str, value: Any, max_bytes: int) -> None:
     """Reject a client value that is unportable, then that is over-size.
 
@@ -120,10 +138,14 @@ def _check_size(kind: str, value: Any, max_bytes: int) -> None:
     Rejecting it here, with the SAME serializer that will persist it, gives the
     caller a clean 400 before any store work and on every node identically --
     instead of a 500, a silent ``null``, or an unreadable document downstream.
-    The size is then measured against the persisted (compact) bytes, not a
-    looser stdlib estimate, so the limit means what it says.
+    The check runs against the value in its :data:`_STORE_WRAPPER_DEPTH`
+    wrapper, so a nesting-bound verdict here matches the one the write will
+    reach.  The size is then measured against the persisted (compact) bytes of
+    the value itself, not a looser stdlib estimate, so the limit means what it
+    says.
     """
     try:
+        _json.ensure_portable(_as_stored(value))
         encoded = _json.dumps_bytes(value)
     except _json.UnsupportedValue as ex:
         raise JobStateError(

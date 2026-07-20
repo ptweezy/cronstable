@@ -861,6 +861,30 @@ def _advance_running(
     # A sensor sits in RUNNING across pokes; when a poke is due and no poke is
     # in flight (proc/pid cleared by its completion), claim the next poke.
     if task.type != SENSOR:
+        # RUNNING with nothing in flight is a shape only a SENSOR reaches
+        # legitimately.  If the CURRENT spec no longer types this task as a
+        # sensor, a config reload retyped it while it idled between pokes and
+        # every path now abandons the entry at once: this function returns,
+        # _reconcile_entries skips a proc-less entry (a skip justified only
+        # for sensors) and _maybe_terminalise sees a non-terminal state -- so
+        # the run never terminalises, is never pruned, and holds its
+        # dagadvance lease for the life of the daemon, paying a full document
+        # deepcopy on every advance to change nothing.  Fail it, exactly as
+        # _resolve_stale_placeholder does for the mapped-retype case, so the
+        # run can finish; the next run is created wholly under the new spec.
+        # An approval gate is left alone -- an operator can still resolve it.
+        if (
+            entry.get("proc") is None
+            and entry.get("pid") is None
+            and not entry.get("awaitingApproval")
+        ):
+            entry["failReason"] = (
+                "task was retyped from sensor to {} across a config reload "
+                "while idle between pokes; its pre-reload state cannot be "
+                "resumed under the new shape, so it is failed to let the run "
+                "finish (the next run starts cleanly)".format(task.type)
+            )
+            _terminalise_task(entry, FAILED, now, result)
         return
     if entry.get("pid") is not None or entry.get("proc") is not None:
         return  # a poke is in flight
