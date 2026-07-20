@@ -19,7 +19,7 @@ from typing import (
     Tuple,
     Union,  # noqa
 )
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import strictyaml
@@ -1757,28 +1757,39 @@ def parse_environment_file(path: str) -> Dict[str, str]:
     Variables must be specified in ``VARIABLE_NAME=CONTENT`` format.
 
     :param path: Path to the environment file.
-    :raise ConfigError: If a line in the file is not parsable
-        (the ``=`` key-value separation character is missing).
+    :raise ConfigError: If a line in the file is not parsable (the ``=``
+        key-value separation character is missing), if the file is not
+        valid UTF-8, or if ``path`` is not a usable path.
     :raise OSError: If an error occurred while opening the file at ``path``.
     :return: key-value map of environment variables.
     """
     environ: Dict[str, str] = {}
 
-    with open(path, "r", encoding="utf-8") as env_file:
-        # file parsing
-        # you may want to use the `dotenv` library to do the job
-        for line in env_file.readlines():
-            line = line.strip(" ").rstrip("\n")
-            if line.startswith("#") or not line:
-                continue
-            if "=" not in line:
-                raise ConfigError(
-                    "Invalid line in env_file: '{}'".format(line)
-                )
-            key, value = line.split("=", 1)
-            key = key.strip(" ")
-            value = value.strip(" ")
-            environ[key] = value
+    # open()/readlines() raise ValueError for a NUL in the path and
+    # UnicodeDecodeError (a ValueError, NOT an OSError) for a latin-1/cp1252
+    # file or a stray high byte -- neither is caught by the caller's
+    # `except OSError`, so both would escape parse_config_string entirely.
+    # Config parsing must only ever raise ConfigError.
+    try:
+        with open(path, "r", encoding="utf-8") as env_file:
+            lines = env_file.readlines()
+    except ValueError as err:
+        raise ConfigError(
+            "Could not load env_file {!r}: {}".format(path, err)
+        ) from err
+
+    # file parsing
+    # you may want to use the `dotenv` library to do the job
+    for line in lines:
+        line = line.strip(" ").rstrip("\n")
+        if line.startswith("#") or not line:
+            continue
+        if "=" not in line:
+            raise ConfigError("Invalid line in env_file: '{}'".format(line))
+        key, value = line.split("=", 1)
+        key = key.strip(" ")
+        value = value.strip(" ")
+        environ[key] = value
 
     return environ
 
@@ -2099,7 +2110,10 @@ def _build_state_config(raw: dict) -> StateConfig:
         # a missing port to 0 anyway, and the bind treats both as the
         # OS-assigned ephemeral default -- but anything else must be usable.
         text = str(listen)
-        parsed = urlparse(text if "://" in text else "http://" + text)
+        parsed = _safe_urlparse(
+            text if "://" in text else "http://" + text,
+            "state.jobApi.listen",
+        )
         try:
             port = parsed.port
         except ValueError as err:
@@ -2116,7 +2130,10 @@ def _build_state_config(raw: dict) -> StateConfig:
             )
     if listen and not job_api.get("allowNonLoopbackBind"):
         text = str(listen)
-        parsed = urlparse(text if "://" in text else "http://" + text)
+        parsed = _safe_urlparse(
+            text if "://" in text else "http://" + text,
+            "state.jobApi.listen",
+        )
         host = parsed.hostname or ""
         if host != "localhost" and _loopback_ip_version(host) is None:
             msg = (
@@ -2152,17 +2169,23 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     # the offending value instead of surfacing later as an opaque per-peer
     # connection error. Mirrors cronstable.cluster._split_host_port, plus a
     # port range check; anything this accepts also parses at runtime.
+    def _is_port(port: str) -> bool:
+        # NOT a bare port.isdigit(): str.isdigit() is True for the whole Nd+No
+        # category, so superscript and circled digits ('2', '(1)') pass it and
+        # then raise a bare ValueError inside int() on the same expression;
+        # and an all-ASCII run past CPython's 4300-digit int-conversion limit
+        # raises there too. Both must be a clean ConfigError, so bound the
+        # text before converting it.
+        if not (port.isascii() and port.isdigit() and len(port) <= 5):
+            return False
+        return 0 < int(port) <= 65535
+
     def _require_host_port(addr: str, what: str) -> None:
         # Bracketed IPv6 (``[2001:db8::1]:8900``): host is inside the brackets.
         if addr.startswith("["):
             bracket, sep, port = addr.rpartition("]:")
             host = bracket[1:]
-            if (
-                not sep
-                or not host
-                or not port.isdigit()
-                or not 0 < int(port) <= 65535
-            ):
+            if not sep or not host or not _is_port(port):
                 raise ConfigError(
                     "cluster.{} must be [ipv6]:port, got {!r}".format(
                         what, addr
@@ -2180,7 +2203,7 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
                 "cluster.{} looks like a bare IPv6 address; write it as "
                 "[ipv6]:port, got {!r}".format(what, addr)
             )
-        if not host or not port.isdigit() or not 0 < int(port) <= 65535:
+        if not host or not _is_port(port):
             raise ConfigError(
                 "cluster.{} must be host:port, got {!r}".format(what, addr)
             )
@@ -2572,6 +2595,25 @@ def _redact_userinfo(url: str) -> str:
     return "{}***@{}{}".format(url[:start], hostpart, url[end:])
 
 
+def _safe_urlparse(text: str, what: str) -> "ParseResult":
+    """``urlparse(text)``, with a malformed URL as a ConfigError.
+
+    urlsplit raises ``ValueError('Invalid IPv6 URL')`` on an unterminated
+    ``[`` bracket -- a one-character typo in an IPv6 endpoint.  Config
+    parsing must only ever raise ConfigError (``__main__`` catches only that,
+    and the reload loop logs anything else as 'please report this as a bug'),
+    so every urlparse of operator-supplied text goes through here.  ``what``
+    names the offending key; the value is redacted, since these keys may
+    carry credentials.
+    """
+    try:
+        return urlparse(text)
+    except ValueError as err:
+        raise ConfigError(
+            "{} is not a valid URL: {!r}".format(what, _redact_userinfo(text))
+        ) from err
+
+
 def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     cfg = _cluster_base(raw)
     _reject_lease_spread(cfg, "etcd")
@@ -2605,7 +2647,7 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     if not etcd["endpoints"]:
         raise ConfigError("cluster.etcd.endpoints must list at least one URL")
     for endpoint in etcd["endpoints"]:
-        parsed = urlparse(endpoint)
+        parsed = _safe_urlparse(endpoint, "cluster.etcd.endpoints")
         # Reject credentials embedded in the URL (user:pass@host) FIRST,
         # before the scheme/port check below: they would be logged in cleartext
         # at start() and sent as HTTP Basic auth, bypassing the
@@ -2667,7 +2709,8 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     # and traffic goes in cleartext. That is always a misconfiguration (a
     # forgotten 's' in https://), so refuse it rather than quietly downgrade.
     if any(tls.get(key) for key in ("ca", "cert", "key")) and not any(
-        urlparse(endpoint).scheme == "https" for endpoint in etcd["endpoints"]
+        _safe_urlparse(endpoint, "cluster.etcd.endpoints").scheme == "https"
+        for endpoint in etcd["endpoints"]
     ):
         raise ConfigError(
             "cluster.etcd.tls is configured but no endpoint is https:// , so "
@@ -2701,7 +2744,8 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         insecure = [
             endpoint
             for endpoint in etcd["endpoints"]
-            if urlparse(endpoint).scheme != "https"
+            if _safe_urlparse(endpoint, "cluster.etcd.endpoints").scheme
+            != "https"
         ]
         if insecure:
             raise ConfigError(
@@ -2951,7 +2995,7 @@ def _is_local_listener(addr: str) -> bool:
     routable and must carry authentication (see :func:`_validate_mcp_config`).
     """
     text = addr if "://" in addr else "http://" + addr
-    parsed = urlparse(text)
+    parsed = _safe_urlparse(text, "web.listen")
     if parsed.scheme == "unix":
         return True
     host = (parsed.hostname or "").lower()

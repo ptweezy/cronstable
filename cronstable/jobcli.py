@@ -114,7 +114,20 @@ def _http(
     if query:
         pairs = {k: v for k, v in query.items() if v is not None}
         if pairs:
-            full += "?" + urllib.parse.urlencode(pairs)
+            # POSIX argv is decoded with surrogateescape, so a key sourced
+            # from a filename or an upstream tool's output can hold lone
+            # surrogates; urlencode re-encodes with STRICT utf-8 and raises
+            # UnicodeEncodeError, which no arm below catches -- a traceback
+            # out of a CLI that promises a clean error instead.
+            try:
+                full += "?" + urllib.parse.urlencode(pairs)
+            except UnicodeEncodeError as ex:
+                raise _CliError(
+                    # repr, so the escaped surrogates cannot in turn blow up
+                    # writing this very message to the terminal.
+                    "{!r} is not valid UTF-8, so it cannot be sent to the "
+                    "state endpoint".format(ex.object)
+                ) from ex
     headers = {"Authorization": "Bearer " + token}
     body = None
     if json_body is not None:
