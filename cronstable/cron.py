@@ -1758,7 +1758,10 @@ class Cron:
             return datetime.timezone.utc
         try:
             return ZoneInfo(tz_name)
-        except (ZoneInfoNotFoundError, ValueError, KeyError):
+        except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
+            # ZoneInfo maps its key onto a filesystem path, so an over-long
+            # (ENAMETOOLONG) or otherwise unopenable key surfaces as OSError
+            # rather than ZoneInfoNotFoundError -- still just an unknown name.
             raise ValueError("unknown timezone: {}".format(tz_name)) from None
 
     @staticmethod
