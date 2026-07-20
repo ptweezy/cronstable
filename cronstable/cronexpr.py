@@ -1096,6 +1096,15 @@ class CronTab:
         tz = now.tzinfo
         utc = datetime.timezone.utc
         now_utc = now.astimezone(utc)
+        # No occurrence ever lives past _YEAR_HORIZON (the forward walk stops
+        # there), so a ``now`` beyond it can start the backward scan at the
+        # horizon's edge.  Without this clamp every anchor past the horizon
+        # resolves cleanly but replays an EMPTY forward iterator, and the loop
+        # below would step back exactly one fire instant per pass -- for a
+        # per-minute schedule that is ~1.8s of CPU per year between ``now``
+        # and 2099, i.e. hours of event-loop starvation for a far-future
+        # ``now`` (a schema-valid MCP/web ``at`` argument).
+        civil = min(civil, datetime.datetime(_YEAR_HORIZON + 1, 1, 1))
         anchor = self._prev_civil(civil)
         while anchor is not None:
             resolved = anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)

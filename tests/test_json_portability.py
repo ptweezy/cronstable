@@ -31,6 +31,11 @@ from cronstable import _json
         -(2**63) - 1,  # one below the signed-64 min
         {"n": 2**70},
         {"deep": {"deeper": [float("inf")]}},
+        "\ud800",  # lone high surrogate: stdlib writes it, orjson never can
+        "\udfff",  # lone low surrogate
+        {"value": "a\ud800b"},
+        {"\udc00key": 1},  # surrogate hiding in an object KEY
+        [1, ["x", "\ud9ab"]],
     ],
 )
 def test_ensure_portable_rejects_unportable(bad):
@@ -59,6 +64,7 @@ def test_ensure_portable_rejects_non_string_keys():
         1.5,
         -3.25,
         "a string",
+        "café \U0001f600",  # well-formed non-ASCII incl. an astral pair
         {"k": [1, "two", 3.0, None, True]},
         {"nested": {"a": 1, "b": [False, "x"]}},
         [],
@@ -129,6 +135,11 @@ def test_stdlib_flavour_rejects_unportable_value():
         mod.dumps_bytes({"bad": float("inf")})
     with pytest.raises(mod.UnsupportedValue):
         mod.dumps_bytes(2**64)
+    # a lone surrogate is the string-shaped split: the stdlib would happily
+    # write b'{"value":"\\ud800"}' -- bytes no orjson node can parse or
+    # rewrite -- so the gate must reject it here, before it is persisted.
+    with pytest.raises(mod.UnsupportedValue):
+        mod.dumps_bytes({"value": "\ud800"})
 
 
 def test_stdlib_flavour_trusted_skips_walk_but_allow_nan_still_bites():
