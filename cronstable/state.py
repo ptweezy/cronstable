@@ -248,9 +248,17 @@ def _fs_safe(name: str) -> str:
       joined by ``%.`` -- a marker the natural encoding (``%`` + 2 uppercase
       hex) can never emit;
     * an empty name maps to ``_``.
+
+    The encode uses ``surrogatepass`` so the function is TOTAL, as documented:
+    argv, filenames and ``os.fsdecode`` output are decoded with
+    ``surrogateescape``, so a name sourced from any of them can carry a lone
+    surrogate that a strict encode rejects with a UnicodeEncodeError -- which
+    surfaced as an HTTP 500 out of every jobstate primitive rather than a
+    4xx.  ``surrogatepass`` maps each such code point to its own distinct
+    three-byte sequence, so injectivity is preserved.
     """
     out: List[str] = []
-    for byte in name.encode("utf-8"):
+    for byte in name.encode("utf-8", "surrogatepass"):
         char = chr(byte)
         if char in _FS_SAFE:
             out.append(char)
@@ -260,7 +268,9 @@ def _fs_safe(name: str) -> str:
     if token in _WINDOWS_RESERVED:
         token = "%{:02X}".format(ord(token[0])) + token[1:]
     if len(token) > _FS_SAFE_MAX:
-        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
+        digest = hashlib.sha256(
+            name.encode("utf-8", "surrogatepass")
+        ).hexdigest()[:32]
         token = token[: _FS_SAFE_MAX - 34] + _FS_TRUNCATION_MARKER + digest
     return token
 
@@ -277,7 +287,7 @@ def _fs_safe_fragment(fragment: str) -> str:
     stream's encoded directory name.
     """
     out: List[str] = []
-    for byte in fragment.encode("utf-8"):
+    for byte in fragment.encode("utf-8", "surrogatepass"):
         char = chr(byte)
         if char in _FS_SAFE:
             out.append(char)
@@ -1578,7 +1588,9 @@ class FilesystemStateBackend(StateBackend):
         path = os.path.join(stream_dir, _STREAM_NAME_SIDECAR)
         try:
             with open(path, "rb") as fobj:
-                name = fobj.read().decode("utf-8")
+                # surrogatepass mirrors _fs_safe's encode, so a name carrying
+                # a lone surrogate round-trips instead of being dropped here.
+                name = fobj.read().decode("utf-8", "surrogatepass")
         except (OSError, UnicodeDecodeError):
             return None
         if not name or _fs_safe(name) != token:
@@ -1603,7 +1615,7 @@ class FilesystemStateBackend(StateBackend):
         with contextlib.suppress(OSError):
             self._atomic_write(
                 os.path.join(stream_dir, _STREAM_NAME_SIDECAR),
-                stream.encode("utf-8"),
+                stream.encode("utf-8", "surrogatepass"),
             )
 
     def _list_stream_names_sync(self, prefix: str) -> List[str]:
