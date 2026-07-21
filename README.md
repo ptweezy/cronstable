@@ -2298,8 +2298,7 @@ The [wiki](https://github.com/ptweezy/cronstable/wiki):
 * **Run it**:
   [Installation](https://github.com/ptweezy/cronstable/wiki/Installation) ·
   [Production and Container Deployment](https://github.com/ptweezy/cronstable/wiki/Production-Deployment) ·
-  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows) ·
-  [Migration from yacron](https://github.com/ptweezy/cronstable/wiki/Migration-from-yacron)
+  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows)
 * **Configure it**:
   [Configuration Reference](https://github.com/ptweezy/cronstable/wiki/Configuration-Reference) ·
   [Schedules and Timezones](https://github.com/ptweezy/cronstable/wiki/Schedules-and-Timezones) ·

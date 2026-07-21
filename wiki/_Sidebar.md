@@ -38,5 +38,4 @@
   - [Architecture and Internals](Architecture-and-Internals)
   - [MCP Server Design](MCP-Server-Design)
   - [Contributing and Releasing](Contributing-and-Releasing)
-  - [Migration from yacron](Migration-from-yacron)
   - [Troubleshooting and FAQ](Troubleshooting)
