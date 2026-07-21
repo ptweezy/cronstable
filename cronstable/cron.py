@@ -869,9 +869,9 @@ def _jobs_conditional_response(
         {**job, "scheduled_in": next_fire_iso.get(job["name"])}
         for job in payload
     ]
-    raw = json.dumps(
-        canonical, separators=(",", ":"), default=str
-    ).encode("utf-8")
+    raw = json.dumps(canonical, separators=(",", ":"), default=str).encode(
+        "utf-8"
+    )
     etag = '"' + hashlib.blake2b(raw, digest_size=16).hexdigest() + '"'
     if _etag_matches(if_none_match, etag):
         return etag, None
@@ -3993,14 +3993,18 @@ class Cron:
         next_fire_iso: Dict[str, Optional[str]] = {}
         for name in self.cron_jobs:
             when = self._next_fire.get(name)
-            next_fire_iso[name] = when.isoformat() if when is not None else None
+            next_fire_iso[name] = (
+                when.isoformat() if when is not None else None
+            )
         inm = request.headers.get("If-None-Match")
         if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
             etag, body = await asyncio.get_running_loop().run_in_executor(
                 None, _jobs_conditional_response, payload, next_fire_iso, inm
             )
         else:
-            etag, body = _jobs_conditional_response(payload, next_fire_iso, inm)
+            etag, body = _jobs_conditional_response(
+                payload, next_fire_iso, inm
+            )
         headers = self._web_jobs_headers(etag)
         if body is None:
             return web.Response(status=304, headers=headers)
