@@ -285,6 +285,4 @@ web listeners are not available on Windows; see
 
 See [Command-Line Reference](CLI-Reference) for all flags, and
 [Configuration Reference](Configuration-Reference) for the config schema. For
-Windows-specific behavior, see [Running on Windows](Running-on-Windows). If you
-are coming from the original yacron, see
-[Migration from yacron](Migration-from-yacron).
+Windows-specific behavior, see [Running on Windows](Running-on-Windows).

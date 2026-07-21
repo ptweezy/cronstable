@@ -33,9 +33,7 @@ explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows t
 default location to create and populate is `%APPDATA%\cronstable` rather than
 `/etc/cronstable.d`; see [Running on Windows](Running-on-Windows). Note the error
 text is only emitted for the *default* path; an explicit `-c` pointing at a missing
-file instead surfaces as a `ConfigError` (see below). cronstable's default is
-`/etc/cronstable.d` rather than yacron's `/etc/yacron.d`; if you upgraded from yacron,
-move your config directory. See [Migration from yacron](Migration-from-yacron) and the
+file instead surfaces as a `ConfigError` (see below). See the
 [Command-Line Reference](CLI-Reference).
 
 ### "Configuration error" / a missing or unreadable explicit config file
