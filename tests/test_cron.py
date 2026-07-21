@@ -1277,11 +1277,12 @@ async def test_web_list_jobs():
     cron.web_config = {}
 
     class Req:
-        pass
+        headers: dict = {}
 
     resp = await cron._web_list_jobs(Req())
     data = json.loads(resp.text)
     assert [j["name"] for j in data] == ["alpha", "beta"]
+    assert resp.headers.get("ETag")  # content ETag present for caches
 
     alpha = data[0]
     assert alpha["enabled"] is True
@@ -1296,6 +1297,48 @@ async def test_web_list_jobs():
     assert beta["enabled"] is False
     assert beta["command"] == "echo beta"  # argv list joined for display
     assert beta["scheduled_in"] is None  # disabled -> no next run
+
+
+@pytest.mark.asyncio
+async def test_web_list_jobs_etag_304_and_invalidation():
+    """GET /jobs serves a content ETag, 304s a matching conditional poll,
+    keeps the tag stable while only the countdown moves, and moves it when
+    job state changes."""
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    def req(inm=None):
+        class Req:
+            headers = {} if inm is None else {"If-None-Match": inm}
+
+        return Req()
+
+    first = await cron._web_list_jobs(req())
+    etag = first.headers["ETag"]
+    assert first.status == 200 and etag
+
+    # a second poll with no change re-serves 200 with the SAME tag: the
+    # relative countdown is not part of it (it is derived from the absolute
+    # next-fire), so an idle poll is byte-identical.
+    again = await cron._web_list_jobs(req())
+    assert again.status == 200
+    assert again.headers["ETag"] == etag
+
+    # a conditional poll carrying that tag is told nothing changed.
+    not_modified = await cron._web_list_jobs(req(etag))
+    assert not_modified.status == 304
+    assert not_modified.body in (None, b"")
+    assert not_modified.headers["ETag"] == etag
+
+    # a real state change (advancing a job's next fire) moves the tag, so
+    # the same conditional poll now gets a fresh body instead of a 304.
+    when = cron._next_fire.get("alpha")
+    cron._next_fire["alpha"] = (when or DT(2000, 1, 1, tzinfo=UTC)) + DTD(
+        hours=1
+    )
+    changed = await cron._web_list_jobs(req(etag))
+    assert changed.status == 200
+    assert changed.headers["ETag"] != etag
 
 
 @pytest.mark.asyncio
@@ -1353,7 +1396,7 @@ async def test_web_list_jobs_includes_last_run():
     )
 
     class Req:
-        pass
+        headers: dict = {}
 
     resp = await cron._web_list_jobs(Req())
     data = json.loads(resp.text)
@@ -1660,7 +1703,7 @@ async def test_web_list_jobs_includes_history_and_timezone():
         cron._record_run("alpha", _mk_run(outcome))
 
     class Req:
-        pass
+        headers: dict = {}
 
     resp = await cron._web_list_jobs(Req())
     data = json.loads(resp.text)
