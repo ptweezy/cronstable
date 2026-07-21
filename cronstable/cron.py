@@ -325,6 +325,15 @@ TREND_WINDOWS: Tuple[Tuple[str, float], ...] = (
 # retention (maxRunsPerJob <= 0) an uncapped listing could hold a backend
 # worker slot for the whole scan on every dashboard poll.
 TREND_SCAN_LIMIT = 5000
+# How long a built trends payload is served without re-reading the ledger.
+# A trends drawer polls every few seconds and several clients can watch the
+# same job; this collapses those to one TREND_SCAN_LIMIT-record read per
+# job per window.  Kept short so the age-relative windows barely drift, and
+# a locally finished run busts the cache outright (see _record_run), so the
+# TTL only bounds ledger writes this node did not make (other cluster
+# nodes' runs) -- exactly the (record_count, newest_finished_at) change a
+# poll would otherwise re-read the whole ledger to notice.
+JOB_TRENDS_CACHE_TTL = 5.0
 # requests served without bearer-token auth even when authToken is configured.
 # Only the UI page itself (which carries no data and no secrets) is public; the
 # browser then authenticates every data request with the token the user enters.
@@ -1099,6 +1108,10 @@ class Cron:
         # rows, so the gate cannot rely on it alone. Pruned by _apply_reload
         # like the trackers below, so it must exist before update_config().
         self._last_real_outcome: Dict[str, Tuple[datetime.datetime, str]] = {}
+        # name -> (monotonic deadline, payload): the short-lived trends cache
+        # (see JOB_TRENDS_CACHE_TTL / job_trends_payload). Busted per job by
+        # _record_run, so it never outlives a locally finished run.
+        self._trends_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         # name -> finished_at of the newest row that represents an actual
         # run (anything but a synthetic "skipped"), for the retry ladder's
         # superseded-by-run guards. last_run alone cannot serve them: a
@@ -4431,6 +4444,13 @@ class Cron:
         """
         if name not in self.cron_jobs:
             return None
+        loop = asyncio.get_running_loop()
+        cached = self._trends_cache.get(name)
+        if cached is not None and loop.time() < cached[0]:
+            # a recent poll already read and aggregated this job's ledger;
+            # serve that within the TTL instead of re-scanning up to
+            # TREND_SCAN_LIMIT records again (see JOB_TRENDS_CACHE_TTL).
+            return cached[1]
         recs: Optional[List[Dict[str, Any]]] = None
         backend = self.state_backend
         if backend is not None:
@@ -4461,9 +4481,14 @@ class Cron:
         fallback = (
             list(self.run_history.get(name) or []) if recs is None else None
         )
-        return await asyncio.get_running_loop().run_in_executor(
+        payload = await loop.run_in_executor(
             None, partial(self._job_trends_build, name, recs, fallback)
         )
+        self._trends_cache[name] = (
+            loop.time() + JOB_TRENDS_CACHE_TTL,
+            payload,
+        )
+        return payload
 
     def _job_trends_build(
         self,
@@ -9224,6 +9249,9 @@ class Cron:
         # history (for the dashboard's history/stats view); in-memory only.
         self.last_run[name] = info
         self.run_history[name].append(info)
+        # this run changes the trends aggregate, so drop any cached payload
+        # for the job rather than serve it stale out to the TTL.
+        self._trends_cache.pop(name, None)
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
         self.metrics.job_run_recorded(
