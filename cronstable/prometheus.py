@@ -221,9 +221,13 @@ def _sample_fields(
     name = sample_base + suffix
     if not labels:
         return name, ""
-    block = "{" + ",".join(
-        '{}="{}"'.format(key, esc(val)) for key, val in labels.items()
-    ) + "}"
+    block = (
+        "{"
+        + ",".join(
+            '{}="{}"'.format(key, esc(val)) for key, val in labels.items()
+        )
+        + "}"
+    )
     return name, block
 
 
@@ -657,9 +661,7 @@ class PrometheusMetrics:
     def render(self, cron: "Cron", openmetrics: bool = False) -> str:
         return render_families(self._families(cron), openmetrics)
 
-    def iter_samples(
-        self, cron: "Cron"
-    ) -> Iterator[Tuple[str, str, str]]:
+    def iter_samples(self, cron: "Cron") -> Iterator[Tuple[str, str, str]]:
         """This scrape's samples as ``(name, label_block, value)`` triples,
         built straight from the metric families -- no exposition render and
         no re-parse (see :func:`iter_family_samples`)."""

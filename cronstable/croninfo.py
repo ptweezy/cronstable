@@ -896,9 +896,7 @@ def _lint_dst(
         day = datetime.date.fromordinal(ordinal)
         # the offset changed somewhere in the 24h before `day` 00:00;
         # _dst_finding scans both civil dates the window can touch
-        finding = _dst_finding(
-            tab, timezone, day - datetime.timedelta(days=1)
-        )
+        finding = _dst_finding(tab, timezone, day - datetime.timedelta(days=1))
         if finding is not None:
             findings.append(finding)
             if len(findings) >= 2:
@@ -1374,7 +1372,7 @@ def _fire_cells(
     # schedule that failed :func:`_minute_tab`, so its entries are skipped
     # without re-raising.  The cache is per call: no cross-request state.
     walk_cache: Dict[
-        Tuple[str, datetime.tzinfo],
+        Tuple[str, Optional[datetime.tzinfo]],
         Optional[Tuple[List[Tuple[int, int]], int]],
     ] = {}
     for entry in entries:

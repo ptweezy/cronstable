@@ -886,9 +886,7 @@ class CronTab:
         # monthrange is reached only once the cheaper column checks pass,
         # exactly as when _day_matches sat last in the old `and` chain.
         month_end = calendar.monthrange(entry.year, entry.month)[1]
-        return self._day_matches(
-            entry.year, entry.month, entry.day, month_end
-        )
+        return self._day_matches(entry.year, entry.month, entry.day, month_end)
 
     def _day_matches(
         self, year: int, month: int, day: int, month_end: int

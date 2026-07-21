@@ -3785,7 +3785,10 @@ def _parse_config_dir_file(
     """
     abspath = os.path.abspath(path)
     cached = _DIR_FILE_CACHE.get(abspath)
-    if cached is not None and _dir_file_stamps(cached.sources) == cached.stamps:
+    if (
+        cached is not None
+        and _dir_file_stamps(cached.sources) == cached.stamps
+    ):
         _DIR_FILE_CACHE.move_to_end(abspath)
         return cached.config, cached.sources
     file_sources: set = set()
