@@ -1333,9 +1333,9 @@ async def test_web_list_jobs_etag_304_and_invalidation():
     # a real state change (advancing a job's next fire) moves the tag, so
     # the same conditional poll now gets a fresh body instead of a 304.
     when = cron._next_fire.get("alpha")
-    cron._next_fire["alpha"] = (when or DT(2000, 1, 1, tzinfo=UTC)) + DTD(
-        hours=1
-    )
+    cron._next_fire["alpha"] = (
+        when or DT(2000, 1, 1, tzinfo=UTC)
+    ) + datetime.timedelta(hours=1)
     changed = await cron._web_list_jobs(req(etag))
     assert changed.status == 200
     assert changed.headers["ETag"] != etag
