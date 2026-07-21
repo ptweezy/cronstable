@@ -6393,6 +6393,41 @@ def _mem_run(outcome, finished_at):
 
 
 @pytest.mark.asyncio
+async def test_job_trends_payload_caches_within_ttl_and_busts_on_run():
+    cron = cronstable.cron.Cron(None, config_yaml=_ONLY_IF_LAST_JOB)  # job "s"
+    backend = _RecordBackend(
+        [_run_record(1, "success", DT(2020, 1, 1, 12, 0, 0, tzinfo=UTC))]
+    )
+    cron.state_backend = backend
+
+    first = await cron.job_trends_payload("s")
+    assert first is not None
+    reads = len(backend.reads)
+    assert reads >= 1
+
+    # a second poll inside the TTL is served from cache: no new ledger read,
+    # and the very same payload object comes back.
+    again = await cron.job_trends_payload("s")
+    assert len(backend.reads) == reads
+    assert again is first
+
+    # a locally finished run must bust the cache so the next poll re-reads;
+    # detach the backend across _record_run so its fire-and-forget ledger
+    # persist does not leave a pending task in the test.
+    cron.state_backend = None
+    cron._record_run("s", _mem_run("failure", DT(2020, 1, 1, 12, 5, tzinfo=UTC)))
+    cron.state_backend = backend
+    fresh = await cron.job_trends_payload("s")
+    assert len(backend.reads) > reads
+    assert fresh is not first
+
+    # an unknown job never touches the cache or the backend.
+    reads2 = len(backend.reads)
+    assert await cron.job_trends_payload("nope") is None
+    assert len(backend.reads) == reads2
+
+
+@pytest.mark.asyncio
 async def test_sla_warm_seeds_reference_past_the_in_memory_history_guard(
     monkeypatch,
 ):
