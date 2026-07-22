@@ -2258,7 +2258,8 @@ jobs:
 
 A job's (and reporter's) `command` and `shell` are deliberately left untouched,
 so their `${VAR}` is expanded by the runtime shell against the job's own
-environment, not the daemon's. See
+environment, not the daemon's; the `logging` section is likewise left for
+Python's `logging.config`. See
 [Environment-Variable Interpolation](https://github.com/ptweezy/cronstable/wiki/Environment-Variable-Interpolation)
 for the full rules, including how it affects the [job-set id](#job-set-id).
 

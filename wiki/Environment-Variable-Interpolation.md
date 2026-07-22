@@ -11,7 +11,7 @@ load, including a hot reload.
 **On this page:**
 [Syntax](#syntax) ·
 [What gets expanded](#what-gets-expanded) ·
-[Command and shell fields are skipped](#command-and-shell-fields-are-skipped) ·
+[Skipped fields](#skipped-fields) ·
 [Unset variables](#unset-variables) ·
 [Multi-file config](#multi-file-config) ·
 [Effect on the job-set id](#effect-on-the-job-set-id) ·
@@ -50,9 +50,10 @@ jobs:
 ## What gets expanded
 
 Expansion runs **after** the document is validated against the schema, over the
-parsed values, so it applies to every field the schema accepts as a string, in
-every section (`jobs`, `dags`, `web`, `state`, `cluster`, `mcp`, `logging`,
-`defaults`, `include`). A `${VAR}` may sit anywhere inside such a string.
+parsed values, so it applies to every field the schema accepts as a string in
+the `jobs`, `dags`, `web`, `state`, `cluster`, `mcp`, `defaults`, and `include`
+sections (the `logging` section is skipped, see below). A `${VAR}` may sit
+anywhere inside such a string.
 
 Because it runs post-validation, a numeric key cannot itself be a bare
 `${VAR}`: `smtpPort: ${PORT}` fails schema validation before expansion is ever
@@ -60,10 +61,12 @@ reached, since `${PORT}` is not an integer. Put the variable inside a string
 instead. A listen address carries its port inside a string
 (`"0.0.0.0:${PORT}"`), which is why the port can come from the environment.
 
-## Command and shell fields are skipped
+## Skipped fields
 
-The following are left untouched, so their `${VAR}` reaches the process
-unchanged:
+Some subtrees are left untouched, because their `${...}` is another layer's
+expansion syntax rather than cronstable's.
+
+**Commands and shells** reach the process unchanged:
 
 - a job's `command` and `shell`,
 - a DAG task's `command` and `shell`,
@@ -77,6 +80,15 @@ environment. So `command: echo ${HOME}` prints the home directory of the user
 the job runs as, exactly as under `/bin/sh`, and is never touched at load.
 To use a load-time environment variable inside a command, set it as a job
 `environment` value (which does expand) and reference that from the command.
+
+**The whole `logging` section** is skipped, because it is passed to Python's
+[`logging.config`](Logging-Configuration) verbatim and a `$`-style formatter
+(`style: "$"`) legitimately writes `${asctime}` / `${message}` in its `format`
+string. Interpolating them would treat those as environment variables and fail
+an otherwise valid config to load, so cronstable leaves the section for
+`logging.config`. A log path that needs an environment variable can be supplied
+through the process environment that `logging.config` itself reads, or by
+templating the file outside cronstable.
 
 ## Unset variables
 
