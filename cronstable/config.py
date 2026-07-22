@@ -3403,14 +3403,23 @@ class CronstableConfig:
 # recognised: a lone ``$``, a bare ``$VAR``, or a malformed ``${...}`` is left
 # verbatim, so an existing config that never used the syntax is untouched.
 #
-# Job / DAG-task / shell-reporter ``command`` and ``shell`` values are
-# deliberately skipped (the whole subtree, so a ``report.shell`` block goes
-# untouched too): their ``${VAR}`` belongs to the runtime shell, which expands
-# it against the *job's* environment (env_file, per-job environment, staged
-# secrets) at execution time, not the daemon's.  Because fingerprints hash the
-# post-expansion config, a job set that interpolates env vars gets a different
-# job-set id per environment; that is intended (the configs really do differ).
-_ENV_INTERP_SKIP_KEYS = frozenset({"command", "shell"})
+# A few subtrees are skipped whole, because their ``${...}`` is another layer's
+# expansion syntax rather than ours:
+#
+# * ``command`` / ``shell`` (jobs, DAG tasks, and the shell reporter): their
+#   ``${VAR}`` belongs to the runtime shell, which expands it against the
+#   *job's* environment (env_file, per-job environment, staged secrets) at
+#   execution time, not the daemon's.
+# * ``logging``: the section is handed to Python's ``logging.config``
+#   verbatim, and a ``$``-style formatter (``style: "$"``) legitimately writes
+#   ``${asctime}`` / ``${message}`` in its ``format`` string. Interpolating the
+#   section would treat those as environment variables and fail to load an
+#   otherwise valid config, so the whole subtree is left for logging.config.
+#
+# Because fingerprints hash the post-expansion config, a job set that
+# interpolates env vars gets a different job-set id per environment; that is
+# intended (the configs really do differ).
+_ENV_INTERP_SKIP_KEYS = frozenset({"command", "shell", "logging"})
 
 _ENV_INTERP_RE = re.compile(
     r"""

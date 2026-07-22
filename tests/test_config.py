@@ -2052,3 +2052,87 @@ def test_env_interp_expands_state_path_and_include_path(monkeypatch, tmp_path):
 
 def test_env_interp_empty_config_is_noop(monkeypatch):
     assert config.parse_config_string("", "test.yaml").jobs == []
+
+
+def test_env_interp_skips_logging_section(monkeypatch):
+    # The `logging` section is handed to logging.config.dictConfig verbatim; a
+    # `$`-style formatter legitimately writes ${asctime}/${message} in its
+    # format string, so the whole section must be left untouched (not treated
+    # as unset environment variables, which would fail an otherwise valid
+    # config to load).
+    monkeypatch.delenv("asctime", raising=False)
+    monkeypatch.delenv("message", raising=False)
+    conf = config.parse_config_string(
+        """
+logging:
+  version: 1
+  formatters:
+    tmpl:
+      style: "$"
+      format: "${asctime} ${levelname} ${message}"
+  root:
+    level: INFO
+jobs:
+  - name: j
+    command: c
+    schedule:
+      minute: "*"
+""",
+        "test.yaml",
+    )
+    fmt = conf.logging_config["formatters"]["tmpl"]["format"]
+    assert fmt == "${asctime} ${levelname} ${message}"
+
+
+def test_env_interp_in_defaults_block_inherited(monkeypatch):
+    # A ${VAR} in a `defaults:` value expands and is inherited by jobs; the
+    # `shell` default is skipped like any other shell field.
+    monkeypatch.setenv("PREFIX", "east-")
+    conf = config.parse_config_string(
+        """
+defaults:
+  streamPrefix: ${PREFIX}
+jobs:
+  - name: j
+    command: c
+    schedule:
+      minute: "*"
+""",
+        "test.yaml",
+    )
+    assert conf.jobs[0].streamPrefix == "east-"
+
+
+def test_env_interp_skips_dag_task_command(monkeypatch):
+    monkeypatch.setenv("TID", "load")
+    monkeypatch.delenv("TASK_ARG", raising=False)
+    conf = config.parse_config_string(
+        """
+state:
+  path: /tmp/st
+  jobApi:
+    enabled: true
+dags:
+  - name: d
+    schedule:
+      minute: "*"
+    tasks:
+      - id: t-${TID}
+        command: run ${TASK_ARG}
+""",
+        "test.yaml",
+    )
+    task = conf.dags[0].tasks[0]
+    assert task.id == "t-load"
+    assert task.job_template.command == "run ${TASK_ARG}"
+
+
+def test_env_interp_expanded_value_feeds_section_validator(monkeypatch):
+    # Expansion runs before the section builders, so an interpolated value that
+    # is invalid is rejected by the normal validator (here: an empty state
+    # path), not silently accepted.
+    monkeypatch.setenv("SDIR", "")
+    with pytest.raises(ConfigError, match="state.path is required"):
+        config.parse_config_string(
+            "state:\n  path: ${SDIR}\n", "test.yaml"
+        )
