@@ -358,7 +358,7 @@ WEB_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # allow-listed there.
 WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
 
-# The full set of web scopes -- what the scalar web.authToken (and any scoped
+# The full set of web scopes: what the scalar web.authToken (and any scoped
 # token that lists every scope) grants. `control` and `approve` each imply
 # `view`, expanded by _effective_web_scopes at token-resolution time.
 _WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
@@ -463,7 +463,7 @@ def _required_web_scope(request) -> str:
     to ``control``; a small override table promotes the DAG decision route to
     ``approve`` and the MCP endpoint to ``control``. An unmatched route (a
     request that will 404) has no resource, so it falls back to the method
-    default -- it is still authenticated, it just 404s afterwards.
+    default; it is still authenticated, it just 404s afterwards.
     """
     route = request.match_info.route
     resource = getattr(route, "resource", None)
@@ -484,6 +484,25 @@ class _WebToken(NamedTuple):
     token_bytes: bytes
     scopes: "frozenset[str]"
     label: str
+
+
+def _accepts_json(request: "web.Request") -> bool:
+    """Whether the request's ``Accept`` header names ``application/json``.
+
+    The two dual-format endpoints (``/status``, ``/job-set-id``) default to
+    text and switch to JSON on request. A generated client sends compound
+    headers (``application/json, */*`` or with ``;q=`` parameters), so this
+    parses the media ranges instead of comparing the raw header. Deliberately
+    matches only the EXPLICIT ``application/json`` range: honouring the
+    ``*/*``/``application/*`` wildcards would flip curl's default Accept
+    (``*/*``) from text to JSON and break every existing script that parses
+    the text form.
+    """
+    accept = request.headers.get("Accept", "")
+    for media_range in accept.split(","):
+        if media_range.split(";", 1)[0].strip().lower() == "application/json":
+            return True
+    return False
 
 
 def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
@@ -2114,7 +2133,7 @@ class Cron:
         assert self.web_config is not None
         job_set = self.job_set_id()
         headers = self.web_config.get("headers", None)
-        if request.headers.get("Accept") == "application/json":
+        if _accepts_json(request):
             return _json_response(
                 {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
                 headers=headers,
@@ -2333,7 +2352,7 @@ class Cron:
     async def _web_get_status(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         out = self.status_payload()
-        if request.headers.get("Accept") == "application/json":
+        if _accepts_json(request):
             return _json_response(
                 out, headers=self.web_config.get("headers", None)
             )
@@ -2369,8 +2388,8 @@ class Cron:
     def summary_payload(self) -> Dict[str, Any]:
         """A single batched fleet overview (behind ``GET /summary``).
 
-        One call carries what an at-a-glance client -- a home-screen widget, a
-        status tile -- needs: the fleet's job counts, the soonest upcoming
+        One call carries what an at-a-glance client (a home-screen widget, a
+        status tile) needs: the fleet's job counts, the soonest upcoming
         fire, and this node's identity and cluster role, so it refreshes with
         one request instead of pulling and folding the whole ``/jobs`` array.
         Every count is derived from the same live scheduler state ``/jobs`` and
@@ -2387,7 +2406,8 @@ class Cron:
                 running += 1
             if job.enabled:
                 enabled += 1
-            if self._pause_active(name) is not None:
+            pause = self._pause_active(name)
+            if pause is not None:
                 paused += 1
             last = self.last_run.get(name)
             # "failing" is a last-outcome verdict (matching the dashboard's
@@ -2397,6 +2417,13 @@ class Cron:
             if self._schedule_never_fires(name, job):
                 never_fires += 1
             scheduled_in = self._scheduled_in(name, job, is_running)
+            if scheduled_in is not None and pause is not None:
+                # a fire the pause window covers is skipped at the gate, so
+                # it must not be reported as the fleet's next fire; a fire
+                # past the pause's `until` still counts.
+                fire_at = now + datetime.timedelta(seconds=scheduled_in)
+                if fire_at < pause.until:
+                    scheduled_in = None
             if scheduled_in is not None and (
                 soonest_in is None or scheduled_in < soonest_in
             ):
@@ -4342,8 +4369,8 @@ class Cron:
         """One job's full detail dict (``GET /jobs/{name}``).
 
         The single-job sibling of ``GET /jobs``: the identical per-job shape
-        ``_job_to_dict`` builds, so a client can refresh one job -- a widget, a
-        detail screen -- without pulling and filtering the whole fleet.  The
+        ``_job_to_dict`` builds, so a client (a widget, a detail screen) can
+        refresh one job without pulling and filtering the whole fleet.  The
         detail dict was already exposed to MCP (``cron_get_job``); this puts it
         on REST too.  ``404`` for an unknown job, like the sibling
         ``/jobs/{name}/...`` routes.
@@ -5995,9 +6022,10 @@ class Cron:
     ) -> None:
         """Fire the ``notify:`` reporters for a daemon/orchestration event.
 
-        A fast, synchronous edge callable from any loop -- the cluster
-        role-transition path is sync, the DAG scheduler async: it schedules the
-        reporter fan-out as a tracked fire-and-forget task and returns at once,
+        A fast, synchronous edge callable from any loop (the cluster
+        role-transition path is sync, the DAG scheduler async): it schedules
+        the reporter fan-out as a tracked fire-and-forget task, returning at
+        once,
         so a slow SMTP/webhook reporter never stalls the caller (a scheduling
         pass, a cluster tick, a DAG advance holding its run lease).  A no-op
         when no ``notify:`` block is configured or the event is not on its
@@ -6545,9 +6573,10 @@ class Cron:
 
         The scalar ``web.authToken`` (if set) becomes a single all-scopes
         token; each ``web.authTokens`` entry becomes a scoped token. Returns
-        None when neither is configured (auth stays off -- the sentinel the
-        caller keys on to decide whether to install the auth middleware at
-        all). Fails closed on any configured-but-empty source, exactly like
+        None when neither is configured (auth stays off; this None is the
+        sentinel the caller keys on to decide whether to install the auth
+        middleware at all). Fails closed on any configured-but-empty source,
+        exactly like
         :meth:`_resolve_web_token`, and on two tokens resolving to one secret:
         matching is by secret, so only one entry's scopes could ever apply.
         The likely duplicate is a scoped entry repeating the scalar authToken,
@@ -6623,7 +6652,7 @@ class Cron:
                 presented_bytes = presented.encode("utf-8")
             except UnicodeEncodeError:
                 raise web.HTTPUnauthorized() from None
-            # Match against every configured token in constant time -- no
+            # Match against every configured token in constant time, with no
             # early return, so timing does not reveal which token (if any)
             # matched. A 401 means no token matched; authorization (scope)
             # is a separate, later check.
@@ -6635,7 +6664,7 @@ class Cron:
                 raise web.HTTPUnauthorized()
             # A full-scope token satisfies every route, so skip the per-route
             # scope lookup entirely (this is also what keeps the single-token
-            # path -- and its tests -- behaving exactly as before). A scoped
+            # path, and its tests, behaving exactly as before). A scoped
             # token is checked against the route's required scope: a valid
             # token that lacks it is 403 (Forbidden), distinct from the 401
             # for an unrecognised token.

@@ -16,14 +16,14 @@ issue **scoped, per-device bearer tokens** so a phone or wallboard need not
 carry an all-powerful token; and the whole HTTP control API is now described by
 a CI-checked OpenAPI spec. Every change is useful to existing webhook/ntfy/CLI
 users, not just to API clients. (Rename this `Unreleased` heading to the cut
-version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
+version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
 
 ### Richer report payloads
 
 - **`template_vars` gains `host`, `schedule`, `started_at` and `run_id`**, so a
-  webhook, ntfy, mail or Sentry report can identify the run — which node ran it,
+  webhook, ntfy, mail or Sentry report can identify the run (which node ran it,
   its crontab line (object schedules rendered), the ISO-8601 start instant, and
-  its [durable-ledger](wiki/Durable-State.md) id — without the template digging
+  its [durable-ledger](wiki/Durable-State.md) id) without the template digging
   through `environment`. `started_at`/`run_id` are `None` before a run starts
   and on an `onLate` breach (which describes a run that did not happen); `host`
   and `schedule` are always populated. Existing templates are unaffected.
@@ -33,11 +33,11 @@ version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
 
 ### The global `defaults:` block now covers DAG tasks
 
-- **A DAG task inherits the file's `defaults:` block just as a job does** —
+- **A DAG task inherits the file's `defaults:` block just as a job does**:
   global `shell`, `environment`, `env_file`, capture, `monitorResources`,
   run-scoped `secrets`, and reporter (`onFailure`/`onSuccess`) config now
   reach DAG tasks, with the task's own value winning on any key it sets.
-- **DAG task runs now fire their `onFailure`/`onSuccess` reporters** — set
+- **DAG task runs now fire their `onFailure`/`onSuccess` reporters**, set
   per-task (a new report-only task key; there is no `onFailure.retry` on a
   task, attempts stay graph-driven) or inherited from `defaults:`. Every
   failed attempt reports via `onFailure`; cancelled and replaced instances do
@@ -67,13 +67,13 @@ version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
 ### New REST endpoints
 
 - **`GET /jobs/{name}`** returns one job's detail in the identical shape as an
-  entry of `GET /jobs` — a client can refresh a single job without pulling and
+  entry of `GET /jobs`, so a client can refresh a single job without pulling and
   filtering the whole fleet. (The same detail was already an MCP tool,
   `cron_get_job`; this puts it on REST too.)
 - **`GET /summary`** returns one batched fleet overview for an at-a-glance
   client (a widget, a status tile): fleet job counts (total / enabled /
   disabled / running / paused / failing / never-fires), the soonest upcoming
-  fire, this node's identity, and its compact cluster role — one small poll
+  fire, this node's identity, and its compact cluster role: one small poll
   instead of folding the whole `/jobs` array.
 
 ### OpenAPI specification
@@ -102,7 +102,7 @@ version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
   `401` for an unknown token. New routes get a safe default (a `GET` needs
   `view`, any other method needs `control`), so nothing is ever unguarded by
   omission.
-- **The scalar `web.authToken` is unchanged** — it remains an all-scopes token,
+- **The scalar `web.authToken` is unchanged**: it remains an all-scopes token,
   every configured token is accepted, and both keys compose. Each scoped entry
   resolves its secret from the same `value`/`fromFile`/`fromEnvVar` sources and
   **fails closed** the same way (a configured-but-empty entry refuses to start

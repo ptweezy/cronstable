@@ -503,7 +503,7 @@ Notes:
   DAG *run* reaching `failed`, naming the failed tasks.
 - **Regaining leadership or quorum is not paged.** `leader_change` fires on both
   acquire and lose (differentiated by `is_leader`), but a quorum *recovery* is
-  logged, not notified — the loss is the alert.
+  logged, not notified; the loss is the alert.
 - Notifications are fire-and-forget and never block the scheduler, cluster loop,
   or a DAG advance; a reporter failure is logged and dropped.
 

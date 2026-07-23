@@ -205,3 +205,29 @@ async def test_finished_dag_task_without_reporters_spawns_nothing():
     job = _task_job(cron, retcode=1)
     await cron._handle_finished_dag_task(job)
     assert cron._completion_tasks == set()
+
+
+async def test_launch_failed_task_reports_failure(tmp_path):
+    # a task whose command cannot spawn at all (bad argv[0]) still counts as
+    # a failed attempt: start() latches start_failed, the reaper gives it the
+    # conventional 127, and the onFailure reporter fires like any failure.
+    from cronstable import dag
+
+    from tests.test_state_dag_run import _drive, _make_cron, _teardown
+
+    server = _WebhookServer()
+    async with server as url:
+        cron = await _make_cron(tmp_path, _DAG_WITH_DEFAULTS.format(url=url))
+        try:
+            tmpl = cron.cron_dags["d"].task_templates["t1"]
+            tmpl.command = [str(tmp_path / "no-such-binary")]
+            run_key = await cron._dag.trigger_run("d")
+            body = await _drive(cron, "d", run_key)
+            assert body["state"] == dag.FAILED
+            assert body["tasks"]["t1"]["exitCode"] == 127
+            await cron._drain_completions()
+        finally:
+            await _teardown(cron)
+    assert server.requests, "launch-failed attempt fired no onFailure report"
+    payload = json.loads(server.requests[0]["body"])
+    assert "d.t1" in payload["text"]

@@ -175,9 +175,12 @@ Content-Type: text/plain; charset=utf-8
 Returns the status of every configured job. The response format depends on the
 request's `Accept` header:
 
-- If `Accept` is exactly `application/json`, the response is a JSON array
-  (`application/json`).
-- Otherwise the response is `text/plain`, one job per line.
+- If `Accept` lists `application/json` among its media ranges (compound
+  headers like `application/json, */*` and `;q=` parameters included), the
+  response is a JSON array (`application/json`).
+- Otherwise the response is `text/plain`, one job per line. The `*/*` and
+  `application/*` wildcards keep the text default, so curl's default `Accept`
+  keeps returning the classic text form.
 
 Each job has one of three statuses, determined in this order:
 
@@ -232,8 +235,8 @@ Content-Type: application/json; charset=utf-8
 ### `GET /summary`
 
 One batched, at-a-glance overview of the whole daemon, for a client that wants
-a single small poll instead of pulling and folding the entire `/jobs` array — a
-home-screen widget, a status tile, a wallboard header. Always
+a single small poll instead of pulling and folding the entire `/jobs` array:
+a home-screen widget, a status tile, a wallboard header. Always
 `application/json`.
 
 Every count is derived from the same live scheduler state `/jobs` and `/status`
@@ -245,8 +248,8 @@ read, so the surfaces never disagree.
 | `node_name` | The cluster node name when clustered, else the hostname (the same identity [`GET /node`](#get-node) reports). |
 | `generated_at` | ISO-8601 instant the summary was built. |
 | `jobs` | Fleet counts: `total`, `enabled`, `disabled`, `running` (jobs with a live instance), `paused`, `failing` (jobs whose last finished run failed), and `never_fires` (enabled jobs whose schedule has no future occurrence; see [Schedule Linting](Schedule-Linting)). |
-| `next_fire` | The soonest upcoming scheduled fire across the fleet — `{job, in, at}` where `in` is seconds from now and `at` is the absolute ISO-8601 instant — or `null` when nothing is due (every job disabled, running, `@reboot`, or dead-scheduled). |
-| `dags` | `{total}` — present only when DAGs are configured. |
+| `next_fire` | The soonest upcoming scheduled fire across the fleet, `{job, in, at}` where `in` is seconds from now and `at` is the absolute ISO-8601 instant, or `null` when nothing is due (every job disabled, running, `@reboot`, dead-scheduled, or paused through its next fire; a [paused](#post-jobsnamepause) slot is skipped at the gate, so it is never reported as the next fire). |
+| `dags` | `{total}`; present only when DAGs are configured. |
 | `cluster` | `{enabled: false}` with no `cluster` section; otherwise `{enabled: true, distribution, quorate, is_leader, leader}`, the compact leadership view (full detail is [`GET /cluster`](#get-cluster)). |
 
 ```shell
@@ -806,7 +809,7 @@ $ http get http://127.0.0.1:8080/jobs
 One job's detail, in the **identical** shape as a single entry of
 [`GET /jobs`](#get-jobs) (every field documented in that table, plus the same
 conditional `running_resources` / `retry` / `sla` / `schedule_resolved`
-extras). It lets a client refresh a single job — a detail screen, a widget —
+extras). It lets a client (a detail screen, a widget) refresh a single job
 without pulling and filtering the whole fleet. Returns `404 Not Found` for an
 unknown job, like the other `/jobs/{name}/...` routes. The same detail dict has
 long been available to AI agents as the `cron_get_job` [MCP tool](MCP); this
@@ -1147,8 +1150,10 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 Returns this instance's job-set id: the order-independent fingerprint of every
 job's effective configuration that replicas compare to confirm they hold the
 same set of jobs (see [job-set id](Job-Set-ID)).
-The response is `text/plain` by default; with `Accept: application/json` it is
-a JSON object that also carries the job count.
+The response is `text/plain` by default; when `Accept` lists
+`application/json` among its media ranges it is a JSON object that also
+carries the job count (wildcards keep the text default, as on
+[`GET /status`](#get-status)).
 
 ```shell
 $ http get http://127.0.0.1:8080/job-set-id
@@ -1317,8 +1322,8 @@ $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 ### Scoped tokens (`web.authTokens`)
 
 The scalar `web.authToken` above is an all-scopes token: it can read, control,
-and approve. To hand out a narrower credential — a phone that should never
-carry the god token, a wallboard that only reads, a CI job that only triggers —
+and approve. To hand out a narrower credential (a phone that should never
+carry the god token, a wallboard that only reads, a CI job that only triggers)
 add `web.authTokens`, a list of per-device tokens each carrying a `scopes`
 list and an optional `label`:
 
@@ -1341,7 +1346,7 @@ web:
 ```
 
 Each entry resolves its secret from the same `value`/`fromFile`/`fromEnvVar`
-sources as `authToken`, and fails closed the same way — a configured entry that
+sources as `authToken`, and fails closed the same way: a configured entry that
 resolves to an empty token refuses to start the web API. `authToken` and
 `authTokens` compose: every configured token is accepted, and a request
 authenticates if it matches **any** of them (constant-time compared). Two
@@ -1354,7 +1359,7 @@ There are three scopes:
 
 | Scope | Grants |
 | --- | --- |
-| `view` | Every read-only `GET` — jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, `/metrics`. |
+| `view` | Every read-only `GET`: jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, `/metrics`. |
 | `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP endpoint (`POST /mcp`). |
 | `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
 
@@ -1378,10 +1383,10 @@ config, so the dropped token stops working immediately while the others keep
 their sessions. The `label` is only an identifier for humans and log/error
 messages; matching is by the secret.
 
-> The scalar `authToken` is unchanged and remains an all-scopes token, so
-> existing configs behave exactly as before. These transport scopes are
-> unrelated to the loopback [job-state API](Durable-State)'s `scope` (a
-> key-value isolation boundary) — same word, different feature.
+> The scalar `authToken` is an all-scopes token; `authTokens` only adds
+> narrower credentials beside it. These transport scopes are unrelated to the
+> loopback [job-state API](Durable-State)'s `scope` (a key-value isolation
+> boundary); same word, different feature.
 
 ### Client certificates (mutual TLS)
 

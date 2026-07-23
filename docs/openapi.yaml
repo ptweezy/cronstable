@@ -12,7 +12,7 @@ openapi: 3.0.3
 # (drift: every path+method here must match cronstable.cron.WEB_ROUTES, the
 # table the aiohttp app is built from, in both directions).
 #
-# It documents the *shape* of every endpoint -- its path, method, parameters,
+# It documents the *shape* of every endpoint: its path, method, parameters,
 # auth, and the top-level fields of each response. Rich nested payloads that
 # move quickly with the code (resource series, DAG run documents, cluster
 # views) are typed at the top level and left open (additionalProperties) below
@@ -95,7 +95,9 @@ paths:
       operationId: getJobSetId
       description: >-
         The fingerprint of the configured job set. Returns plain text, or a
-        JSON object when `Accept: application/json`.
+        JSON object when the `Accept` header lists `application/json` among
+        its media ranges (compound headers and `;q=` parameters included;
+        the `*/*` and `application/*` wildcards keep the text default).
       responses:
         "200":
           description: The job-set id.
@@ -117,7 +119,9 @@ paths:
       operationId: getStatus
       description: >-
         Every job's status (running / disabled / scheduled). Returns one line
-        per job as plain text, or a JSON array when `Accept: application/json`.
+        per job as plain text, or a JSON array when the `Accept` header lists
+        `application/json` among its media ranges (compound headers and `;q=`
+        parameters included; wildcards keep the text default).
       responses:
         "200":
           description: Job status rows.
@@ -403,7 +407,10 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/DagRunSummary" }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
+        "404":
+          description: >-
+            No such DAG, or no `state:` store is configured (run documents
+            only exist in a durable store).
 
   /dags/{name}/runs/{run_key}:
     get:
@@ -437,7 +444,10 @@ paths:
             application/json:
               schema: { type: object, additionalProperties: true }
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "404": { $ref: "#/components/responses/NotFound" }
+        "404":
+          description: >-
+            No such DAG or run, or no `state:` store is configured (XCom only
+            exists in a durable store).
 
   /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs:
     get:
@@ -508,10 +518,12 @@ paths:
                 properties:
                   ok: { type: boolean }
                   created: { type: integer }
-        "400": { description: A bad range. }
+        "400":
+          description: >-
+            A bad range or an unknown/unscheduled DAG (every refused backfill
+            is 400 with a `reason`; this route never returns 404).
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "404": { $ref: "#/components/responses/NotFound" }
 
   /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision:
     post:
@@ -847,9 +859,14 @@ paths:
         - {}
       responses:
         "200":
-          description: The metrics exposition.
+          description: >-
+            The metrics exposition: the classic text format by default, or
+            OpenMetrics when the `Accept` header names
+            `application/openmetrics-text`.
           content:
             text/plain:
+              schema: { type: string }
+            application/openmetrics-text:
               schema: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
 

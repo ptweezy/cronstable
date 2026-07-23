@@ -581,6 +581,39 @@ async def test_summary_payload_counts_and_next_fire():
     assert "dags" not in summary
 
 
+async def test_summary_paused_counts_and_next_fire_skips_covered_fire():
+    from cronstable.cron import PauseInfo
+
+    now = datetime.datetime.now(_UTC)
+    cron = _cron(_SUMMARY_JOBS)
+    cron._ensure_seeded(now)
+    # deterministic fire instants: a in ~250s, b in ~400s.
+    cron._next_fire["a"] = now + datetime.timedelta(seconds=250)
+    cron._next_fire["b"] = now + datetime.timedelta(seconds=400)
+
+    def _pause(until_seconds):
+        return PauseInfo(
+            since=now,
+            until=now + datetime.timedelta(seconds=until_seconds),
+            note="",
+            by="t",
+            channel="api",
+        )
+
+    # the pause covers a's fire (300 > 250): that slot is skipped at the
+    # gate, so a must not be reported as the fleet's next fire; b wins.
+    cron._paused["a"] = _pause(300)
+    summary = cron.summary_payload()
+    assert summary["jobs"]["paused"] == 1
+    assert summary["next_fire"]["job"] == "b"
+    # the pause lifts before the fire (100 < 250): the fire happens, so a
+    # still wins while still counting as paused right now.
+    cron._paused["a"] = _pause(100)
+    summary = cron.summary_payload()
+    assert summary["jobs"]["paused"] == 1
+    assert summary["next_fire"]["job"] == "a"
+
+
 async def test_web_get_summary_endpoint_returns_json():
     cron = _cron(_SUMMARY_JOBS)
     resp = await cron._web_get_summary(Req())
