@@ -25,6 +25,7 @@ from typing import (  # noqa
     FrozenSet,
     Iterable,
     List,
+    NamedTuple,
     Optional,
     Set,
     Tuple,
@@ -42,6 +43,7 @@ from aiohttp import web
 import cronstable.version
 from cronstable import _json, platform, tlsutil
 from cronstable.config import (
+    WEB_TOKEN_SCOPES,
     ClusterConfig,
     ConfigError,
     CronstableConfig,
@@ -354,6 +356,63 @@ WEB_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # gating it here too would 403 a browser MCP client the operator explicitly
 # allow-listed there.
 WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
+
+# The full set of web scopes -- what the scalar web.authToken (and any scoped
+# token that lists every scope) grants. `control` and `approve` each imply
+# `view`, expanded by _effective_web_scopes at token-resolution time.
+_WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
+
+# Routes whose required scope differs from the method default (a safe method ->
+# `view`, everything else -> `control`). Keyed by the matched aiohttp
+# resource's canonical path. Anything not listed uses the method default, so a
+# newly added POST route requires `control` automatically instead of slipping
+# through unguarded; a new GET requires only `view`.
+_WEB_SCOPE_OVERRIDES = {
+    # the DAG approval-gate decision is the one action gated by `approve`.
+    "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision": "approve",
+    # /mcp is an action-capable surface (its own readOnly/act config narrows
+    # it further); a scoped token needs `control` to drive it.
+    "/mcp": "control",
+}
+
+
+def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
+    """Expand declared token scopes: ``control`` and ``approve`` imply
+    ``view`` (an action UI must read state first)."""
+    effective = set(scopes)
+    if effective & {"control", "approve"}:
+        effective.add("view")
+    return frozenset(effective)
+
+
+def _required_web_scope(request) -> str:
+    """The scope a request must hold, from its matched route and method.
+
+    Safe methods (GET/HEAD/OPTIONS) default to ``view`` and mutating methods
+    to ``control``; a small override table promotes the DAG decision route to
+    ``approve`` and the MCP endpoint to ``control``. An unmatched route (a
+    request that will 404) has no resource, so it falls back to the method
+    default -- it is still authenticated, it just 404s afterwards.
+    """
+    route = request.match_info.route
+    resource = getattr(route, "resource", None)
+    if resource is not None:
+        override = _WEB_SCOPE_OVERRIDES.get(resource.canonical)
+        if override is not None:
+            return override
+    if request.method in WEB_SAFE_METHODS:
+        return "view"
+    return "control"
+
+
+class _WebToken(NamedTuple):
+    """A resolved web bearer token: its raw bytes (for the constant-time
+    compare), the scopes it grants (view already implied by control/approve),
+    and a human label used to identify and revoke it."""
+
+    token_bytes: bytes
+    scopes: "frozenset[str]"
+    label: str
 
 
 def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
@@ -5100,9 +5159,13 @@ class Cron:
                 middlewares.append(
                     self._make_origin_middleware(frozenset(allowed_origins))
                 )
-            token = self._resolve_web_token(web_config)
-            if token is not None:
-                logger.info("web: requiring bearer-token authentication")
+            token_table = self._resolve_web_tokens(web_config)
+            if token_table is not None:
+                logger.info(
+                    "web: requiring bearer-token authentication (%d token%s)",
+                    len(token_table),
+                    "" if len(token_table) == 1 else "s",
+                )
                 # the UI page is served unauthenticated (it holds no data); the
                 # browser then sends the token on every data request.
                 public = set(WEB_PUBLIC_PATHS) if ui_enabled else set()
@@ -5111,7 +5174,7 @@ class Cron:
                     # send a bearer token; everything else stays gated.
                     public.add("/metrics")
                 middlewares.append(
-                    self._make_auth_middleware(token, frozenset(public))
+                    self._make_auth_middleware(token_table, frozenset(public))
                 )
             app = web.Application(middlewares=middlewares)
             routes = [
@@ -6396,19 +6459,21 @@ class Cron:
             logger.info("state: swept %d orphaned artifact blob(s)", removed)
 
     @staticmethod
-    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
-        auth = web_config.get("authToken")
-        if not auth:
-            return None
-        # authToken is configured: resolve it from exactly one source and fail
-        # closed (ConfigError) if it cannot be resolved to a non-empty secret.
-        # Otherwise a misconfigured source (unset env var, empty/missing file)
-        # would silently leave the web API listening with no authentication.
-        if auth.get("value"):
-            token = str(auth["value"])
-        elif auth.get("fromFile"):
+    def _resolve_web_secret(spec: dict, what: str) -> str:
+        """Resolve one ``{value|fromFile|fromEnvVar}`` bearer secret, failing
+        closed.
+
+        Shared by the scalar ``web.authToken`` and every scoped
+        ``web.authTokens`` entry: a source that is configured but resolves to
+        an empty secret raises :class:`ConfigError` rather than silently
+        leaving the web API (or one device) unauthenticated. ``what`` names
+        the config key for the error message.
+        """
+        if spec.get("value"):
+            token = str(spec["value"])
+        elif spec.get("fromFile"):
             try:
-                with open(auth["fromFile"], "rt") as token_file:
+                with open(spec["fromFile"], "rt") as token_file:
                     token = token_file.read().strip()
             # UnicodeDecodeError alongside OSError: a binary token file
             # raises it from read(), and only ConfigError gets the clean
@@ -6416,24 +6481,67 @@ class Cron:
             # is logged as an internal bug. Mirrors config._resolve_secret.
             except (OSError, UnicodeDecodeError) as ex:
                 raise ConfigError(
-                    "web.authToken.fromFile could not be read: {}".format(ex)
+                    "{}.fromFile could not be read: {}".format(what, ex)
                 ) from ex
-        elif auth.get("fromEnvVar"):
-            token = os.environ.get(auth["fromEnvVar"], "")
+        elif spec.get("fromEnvVar"):
+            token = os.environ.get(spec["fromEnvVar"], "")
         else:
             token = ""
         if not token:
             raise ConfigError(
-                "web.authToken is configured but resolved to an empty token; "
-                "refusing to start the web API without authentication"
+                "{} is configured but resolved to an empty token; refusing "
+                "to start the web API without authentication".format(what)
             )
         return token
 
     @staticmethod
+    def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
+        # The scalar web.authToken: an all-scopes ("god") token, or None when
+        # it is not configured. Kept as its own method so its behaviour (and
+        # tests) are unchanged; _resolve_web_tokens builds on it.
+        auth = web_config.get("authToken")
+        if not auth:
+            return None
+        return Cron._resolve_web_secret(auth, "web.authToken")
+
+    @staticmethod
+    def _resolve_web_tokens(
+        web_config: WebConfig,
+    ) -> "Optional[list[_WebToken]]":
+        """Resolve every configured web bearer token into a lookup table.
+
+        The scalar ``web.authToken`` (if set) becomes a single all-scopes
+        token; each ``web.authTokens`` entry becomes a scoped token. Returns
+        None when neither is configured (auth stays off -- the sentinel the
+        caller keys on to decide whether to install the auth middleware at
+        all). Fails closed on any configured-but-empty source, exactly like
+        :meth:`_resolve_web_token`.
+        """
+        tokens = []  # type: list[_WebToken]
+        scalar = Cron._resolve_web_token(web_config)
+        if scalar is not None:
+            tokens.append(
+                _WebToken(scalar.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
+            )
+        for index, entry in enumerate(web_config.get("authTokens") or []):
+            what = "web.authTokens[{}]".format(index)
+            secret = Cron._resolve_web_secret(entry, what)
+            scopes = _effective_web_scopes(entry.get("scopes") or [])
+            label = entry.get("label") or what
+            tokens.append(_WebToken(secret.encode("utf-8"), scopes, label))
+        return tokens or None
+
+    @staticmethod
     def _make_auth_middleware(
-        token: str, public_paths: "frozenset[str]" = frozenset()
+        tokens, public_paths: "frozenset[str]" = frozenset()
     ):
-        token_bytes = token.encode("utf-8")
+        # Backward-compatible: a bare string is a single all-scopes token, so
+        # existing callers/tests that pass one keep working unchanged.
+        if isinstance(tokens, str):
+            tokens = [
+                _WebToken(tokens.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
+            ]
+        token_table = list(tokens)
 
         @web.middleware
         async def auth_middleware(request, handler):
@@ -6467,8 +6575,31 @@ class Cron:
                 presented_bytes = presented.encode("utf-8")
             except UnicodeEncodeError:
                 raise web.HTTPUnauthorized() from None
-            if not hmac.compare_digest(presented_bytes, token_bytes):
+            # Match against every configured token in constant time -- no
+            # early return, so timing does not reveal which token (if any)
+            # matched. A 401 means no token matched; authorization (scope)
+            # is a separate, later check.
+            matched = None  # type: Optional[_WebToken]
+            for entry in token_table:
+                if hmac.compare_digest(presented_bytes, entry.token_bytes):
+                    matched = entry
+            if matched is None:
                 raise web.HTTPUnauthorized()
+            # A full-scope token satisfies every route, so skip the per-route
+            # scope lookup entirely (this is also what keeps the single-token
+            # path -- and its tests -- behaving exactly as before). A scoped
+            # token is checked against the route's required scope: a valid
+            # token that lacks it is 403 (Forbidden), distinct from the 401
+            # for an unrecognised token.
+            if matched.scopes != _WEB_ALL_SCOPES:
+                required = _required_web_scope(request)
+                if required not in matched.scopes:
+                    raise web.HTTPForbidden(
+                        text=(
+                            "token {!r} lacks the {!r} scope required for "
+                            "this endpoint".format(matched.label, required)
+                        )
+                    )
             return await handler(request)
 
         return auth_middleware
