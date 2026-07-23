@@ -612,3 +612,50 @@ async def test_do_advance_dispatches_approval_waiting_live(
         assert len(captured) == 1
     finally:
         await _teardown(cron)
+
+
+async def test_emit_cluster_role_logs_fires_leader_loss(monkeypatch):
+    captured = []
+
+    async def fake(ctx, report_config):
+        captured.append(ctx)
+
+    monkeypatch.setattr(cronstable.cron, "report_event", fake)
+    cron = _cron(_JOB)
+    cron._notify_config = {"events": None, "report": {}}
+    # this node lost leadership to node-b; still quorate, so the one event
+    # is the loss, with the follower role and the new leader named.
+    cron.cluster_manager = _fake_mgr(
+        quorate=True, leader=False, leader_name="node-b"
+    )
+    cron._was_quorate = True
+    cron._was_leader = True
+    cron._emit_cluster_role_logs()
+    await _drain_notify(cron)
+    assert len(captured) == 1
+    tv = captured[0].template_vars
+    assert tv["event"] == "leader_change"
+    assert tv["is_leader"] is False
+    assert tv["role"] == "follower"
+    assert tv["leader"] == "node-b"
+    assert "lost" in tv["subject"]
+
+
+async def test_emit_cluster_role_logs_quorum_regain_is_silent(monkeypatch):
+    # regaining quorum is recovery: logged, never paged (the loss was the
+    # alert). No event of any kind fires on the regain transition.
+    captured = []
+
+    async def fake(ctx, report_config):
+        captured.append(ctx)
+
+    monkeypatch.setattr(cronstable.cron, "report_event", fake)
+    cron = _cron(_JOB)
+    cron._notify_config = {"events": None, "report": {}}
+    cron.cluster_manager = _fake_mgr(quorate=True, leader=False)
+    cron._was_quorate = False  # was out, now quorate -> a regain transition
+    cron._was_leader = False
+    cron._emit_cluster_role_logs()
+    await _drain_notify(cron)
+    assert captured == []
+    assert cron._was_quorate is True  # the transition itself was recorded

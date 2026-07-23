@@ -496,6 +496,9 @@ dags:
       - id: b
         command: bar
         shell: /bin/sh
+        retries: 2
+        dependsOn:
+          - a
         environment:
           - key: SHARED
             value: from-task
@@ -504,6 +507,13 @@ dags:
     )
     task_a = conf.dags[0].task_templates["a"]
     task_b = conf.dags[0].task_templates["b"]
+    # the DAG-node fields are popped out before the defaults merge, so graph
+    # shape is exactly what the tasks declared, defaults block or not.
+    specs = {t.id: t.spec for t in conf.dags[0].tasks}
+    assert specs["a"].depends_on == ()
+    assert specs["a"].max_attempts == 1  # retries default 0
+    assert specs["b"].depends_on == ("a",)
+    assert specs["b"].max_attempts == 3  # the task's own retries: 2
 
     # inherited from the defaults block
     assert task_a.shell == "/bin/bash"

@@ -1,11 +1,11 @@
 """Scoped web bearer tokens (web.authTokens).
 
 Covers the three layers of the feature:
-  * ``_effective_web_scopes`` / ``_required_web_scope`` -- the scope model.
-  * ``Cron._resolve_web_tokens`` -- config -> token table (fail-closed).
-  * ``Cron._make_auth_middleware`` -- 401 (unrecognised token) vs 403
+  * ``_effective_web_scopes`` / ``_required_web_scope``: the scope model.
+  * ``Cron._resolve_web_tokens``: config -> token table (fail-closed).
+  * ``Cron._make_auth_middleware``: 401 (unrecognised token) vs 403
     (recognised token, insufficient scope), plus the .ics carve-out and the
-    backward-compatible scalar path -- as fast fake-request unit tests and one
+    backward-compatible scalar path, as fast fake-request unit tests and one
     real-aiohttp end-to-end boot.
 
 Mirrors the bearer-auth unit tests in tests/test_ui_endpoints.py (fake request
@@ -408,15 +408,20 @@ jobs:
 async def test_scoped_tokens_end_to_end():
     import aiohttp
 
+    from cronstable.config import _build_mcp_config
+
     cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
     web_config = {
         "listen": ["http://127.0.0.1:0"],
         "authTokens": [
             {"value": "viewtok", "scopes": ["view"], "label": "phone"},
             {"value": "ctltok", "scopes": ["control"], "label": "ci"},
+            {"value": "apprtok", "scopes": ["approve"], "label": "lead"},
         ],
     }
-    await cron.start_stop_web_app(web_config)
+    await cron.start_stop_web_app(
+        web_config, _build_mcp_config({"enabled": True})
+    )
     try:
         port = cron.web_runner.addresses[0][1]
         base = "http://127.0.0.1:{}".format(port)
@@ -443,6 +448,41 @@ async def test_scoped_tokens_end_to_end():
             # control implies view
             async with session.get(
                 base + "/status", headers=_bearer("ctltok")
+            ) as resp:
+                assert resp.status == 200
+            # the /mcp override binds on the real registered route, on every
+            # method: view is refused, control reaches the handler (whose GET
+            # answer is 405: the stateless transport has no SSE stream).
+            async with session.get(
+                base + "/mcp", headers=_bearer("viewtok")
+            ) as resp:
+                assert resp.status == 403
+            async with session.get(
+                base + "/mcp", headers=_bearer("ctltok")
+            ) as resp:
+                assert resp.status == 405
+            # the decision route's `approve` override, on the real route:
+            # approve passes the scope gate and reaches the handler (409, no
+            # such run); control and view are 403 despite outranking approve
+            # elsewhere; approve does not leak into control routes but does
+            # imply view.
+            decision = base + "/dags/d/runs/r/tasks/t/decision"
+            body = {"decision": "approve"}
+            async with session.post(
+                decision, json=body, headers=_bearer("apprtok")
+            ) as resp:
+                assert resp.status == 409
+            for tok in ("ctltok", "viewtok"):
+                async with session.post(
+                    decision, json=body, headers=_bearer(tok)
+                ) as resp:
+                    assert resp.status == 403, tok
+            async with session.post(
+                base + "/jobs/test/start", headers=_bearer("apprtok")
+            ) as resp:
+                assert resp.status == 403
+            async with session.get(
+                base + "/status", headers=_bearer("apprtok")
             ) as resp:
                 assert resp.status == 200
     finally:

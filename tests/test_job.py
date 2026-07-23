@@ -1008,7 +1008,7 @@ async def test_monitor_resources_off_by_default():
 
 
 @pytest.mark.asyncio
-async def test_template_vars_carry_run_context():
+async def test_template_vars_carry_run_context(monkeypatch):
     # a report payload should identify the run: host, schedule, start instant,
     # and the durable-ledger run id (all new alongside the run's outcome).
     conf = cronstable.config.parse_config_string(
@@ -1020,9 +1020,12 @@ async def test_template_vars_carry_run_context():
         "",
     )
     job = cronstable.job.RunningJob(conf.jobs[0], None, run_id="run-xyz")
+    # a sentinel host, so the assertion pins WHERE the value comes from
+    # (comparing against report_hostname()'s own expression proves nothing).
+    monkeypatch.setenv("HOSTNAME", "host-sentinel-1")
     tv = job.template_vars
     # host, schedule and the ledger id are known before the run starts.
-    assert tv["host"] == os.environ.get("HOSTNAME", "")
+    assert tv["host"] == "host-sentinel-1"
     assert tv["schedule"] == "*/5 * * * *"
     assert tv["run_id"] == "run-xyz"
     # nothing has started yet, so there is no start instant.
@@ -1779,6 +1782,9 @@ async def _capture_shell_reporter_env(
 
 @pytest.mark.asyncio
 async def test_report_shell_full_env_contract(monkeypatch):
+    # sentinel host: pins that CRONSTABLE_HOST is sourced from the daemon's
+    # HOSTNAME rather than restating report_hostname()'s own expression.
+    monkeypatch.setenv("HOSTNAME", "host-sentinel-3")
     env = await _capture_shell_reporter_env(
         monkeypatch, stdout="out", stderr="err"
     )
@@ -1799,7 +1805,7 @@ async def test_report_shell_full_env_contract(monkeypatch):
     assert env["CRONSTABLE_MAX_RSS_BYTES"] == ""
     # run context: host is the daemon's, run id and start instant come off the
     # (mocked) run.
-    assert env["CRONSTABLE_HOST"] == os.environ.get("HOSTNAME", "")
+    assert env["CRONSTABLE_HOST"] == "host-sentinel-3"
     assert env["CRONSTABLE_RUN_ID"] == "run-abc123"
     assert env["CRONSTABLE_STARTED_AT"] == "2026-07-22T03:00:00+00:00"
     assert env["CRONSTABLE_FAIL_REASON"] == "boom"
@@ -2846,9 +2852,13 @@ def _breach_ctx(job_config, check="lateAfter"):
     )
 
 
-def test_sla_breach_context_full_template_var_contract():
+def test_sla_breach_context_full_template_var_contract(monkeypatch):
     # the full standard key set with None/False fills, so operator templates
     # written for onFailure render unchanged on onLate, plus the breach vars.
+    # A sentinel host pins where `host` comes from (asserting against
+    # report_hostname()'s own expression would prove nothing). Set before the
+    # context is built: SlaBreachContext captures env at construction.
+    monkeypatch.setenv("HOSTNAME", "host-sentinel-2")
     conf = cronstable.config.parse_config_string(_SLA_MAIL_JOB, "")
     ctx = _breach_ctx(conf.jobs[0])
     tv = ctx.template_vars
@@ -2886,7 +2896,7 @@ def test_sla_breach_context_full_template_var_contract():
     # a breach describes a job that did NOT run: no start instant, no run id.
     assert tv["started_at"] is None
     assert tv["run_id"] is None
-    assert tv["host"] == os.environ.get("HOSTNAME", "")
+    assert tv["host"] == "host-sentinel-2"
     assert tv["schedule"] == "* * * * *"
     assert tv["sla_check"] == "lateAfter"
     assert tv["threshold_seconds"] == 120
@@ -2894,7 +2904,7 @@ def test_sla_breach_context_full_template_var_contract():
     assert tv["last_success_at"] == "2020-01-01T10:00:00+00:00"
     # HOSTNAME rides env so the default sentry fingerprint's
     # {{ environment.HOSTNAME }} line keeps its host dimension.
-    assert tv["environment"]["HOSTNAME"] == os.environ["HOSTNAME"]
+    assert tv["environment"]["HOSTNAME"] == "host-sentinel-2"
     # the explicit run-shaped fills the reporters read directly
     assert ctx.failed is True
     assert ctx.retcode is None

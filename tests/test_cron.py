@@ -1254,6 +1254,39 @@ async def test_web_status_reports_disabled():
     assert data[0]["status"] == "disabled"
 
 
+@pytest.mark.asyncio
+async def test_web_status_and_job_set_id_accept_negotiation():
+    # A generated client sends compound Accept headers ("application/json,
+    # */*", ";q=" parameters); any explicit application/json range selects
+    # JSON. Wildcards deliberately do NOT: curl's default `*/*` must keep
+    # the classic text form every existing script parses.
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
+    cron.web_config = {}
+
+    class Req:
+        def __init__(self, accept=None):
+            self.headers = {} if accept is None else {"Accept": accept}
+
+    for accept in (
+        "application/json",
+        "application/json, */*",
+        "text/html, application/json;q=0.9",
+        "APPLICATION/JSON; charset=utf-8",
+    ):
+        resp = await cron._web_get_status(Req(accept))
+        assert json.loads(resp.text)[0]["status"] == "disabled", accept
+    for accept in (None, "*/*", "application/*", "text/plain"):
+        resp = await cron._web_get_status(Req(accept))
+        assert resp.content_type == "text/plain", accept
+
+    jresp = await cron._web_job_set_id(Req("application/json, */*"))
+    assert "job_set_id" in json.loads(jresp.text)
+    tresp = await cron._web_job_set_id(Req("*/*"))
+    assert tresp.content_type == "text/plain"
+
+
 TWO_JOBS = """
 jobs:
   - name: alpha

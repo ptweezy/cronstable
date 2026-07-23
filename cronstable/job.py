@@ -1559,7 +1559,7 @@ class _NotifyJobShim:
 class NotifyEventContext:
     """Reporting context for a daemon/orchestration event (the ``notify:``
     block): a DAG run failure, an approval gate awaiting a decision, or a
-    leadership / quorum change -- none of which is a job run.
+    leadership / quorum change; none of which is a job run.
 
     Quacks like a :class:`RunningJob` exactly as far as the four reporters read
     one (a minimal :class:`_NotifyJobShim` ``config``, the run-shaped fields

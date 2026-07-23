@@ -77,13 +77,14 @@ shared launch keys; the complete list, with types and defaults, is in the
 [configuration reference](Configuration-Reference#dags). Because a task **is**
 a job invocation, its launch fields inherit the file's
 [`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a
-job does — a global `shell`, `environment`, `monitorResources`, run-scoped
+job does: a global `shell`, `environment`, `monitorResources`, run-scoped
 `secrets`, or reporter block covers DAG tasks too, and the task's own value
 wins on any key it sets. A task's `onFailure` / `onSuccess` reporters (set
 per-task or inherited) fire on each of its runs, every failed attempt
 included; per-task the two hooks accept a `report` block only, since a task's
 retries come from the node's `retries` field, not a job-level
-`onFailure.retry` ladder (an inherited one is ignored for tasks). Only the **launch** fields inherit; the DAG-node
+`onFailure.retry` ladder (an inherited one is ignored for tasks). Only the
+**launch** fields inherit; the DAG-node
 fields that shape the graph (`dependsOn`, `triggerRule`, `retries`,
 `retryDelaySeconds`, `expand`, `onReject`, the poke settings) are never touched
 by a `defaults:` block. The DAG's own schedule frame is separate too: the

@@ -1802,7 +1802,7 @@ class JobConfig:
 # task dict is not pre-merged over a full defaults dict, so absent optionals
 # stay absent).  The launch fields are filled from the assembled job-defaults
 # base (DEFAULT_CONFIG plus any `defaults:` block) when the per-task JobConfig
-# template is built -- see DagTaskConfig.
+# template is built (see DagTaskConfig).
 _DAG_TASK_DEFAULTS: Dict[str, Any] = {
     "type": "task",
     "dependsOn": [],
