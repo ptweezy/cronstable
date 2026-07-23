@@ -11,11 +11,12 @@ A reporting, orchestration-visibility, and API-contract release. Report
 payloads now carry the run's host, schedule, start time and ledger id; a global
 `defaults:` block finally reaches DAG tasks; a new `notify:` block reports on
 DAG failures, approval gates, and leadership changes (not just job runs); the
-REST API gains a single-job and a batched-summary endpoint; and the whole HTTP
-control API is now described by a CI-checked OpenAPI spec. Every change is
-useful to existing webhook/ntfy/CLI users, not just to API clients. (Rename this
-`Unreleased` heading to the cut version at release time — see
-[Contributing](CONTRIBUTING.md#releasing).)
+REST API gains a single-job and a batched-summary endpoint; the web API can now
+issue **scoped, per-device bearer tokens** so a phone or wallboard need not
+carry an all-powerful token; and the whole HTTP control API is now described by
+a CI-checked OpenAPI spec. Every change is useful to existing webhook/ntfy/CLI
+users, not just to API clients. (Rename this `Unreleased` heading to the cut
+version at release time — see [Contributing](CONTRIBUTING.md#releasing).)
 
 ### Richer report payloads
 
@@ -77,6 +78,29 @@ useful to existing webhook/ntfy/CLI users, not just to API clients. (Rename this
   generated client is built from and a brake on accidental breaking changes at
   cronstable's fast release cadence; the [HTTP-API wiki page](wiki/HTTP-API.md)
   remains the field-by-field reference.
+
+### Scoped web bearer tokens (`web.authTokens`)
+
+- **A new `web.authTokens` list issues per-device bearer tokens, each with its
+  own scopes** (`view` / `control` / `approve`), so a phone, a wallboard, or a
+  CI trigger need not carry the all-powerful `web.authToken`. `view` covers
+  every read-only `GET`; `control` covers the mutating `POST`s (start / cancel
+  / pause / resume, DAG trigger / backfill) and `POST /mcp`; `approve` covers
+  only the DAG approval-gate decision. `control` and `approve` each imply
+  `view`. A recognised token that lacks a route's scope is now **`403
+  Forbidden`** (naming the token and the missing scope), distinct from the
+  `401` for an unknown token. New routes get a safe default (a `GET` needs
+  `view`, any other method needs `control`), so nothing is ever unguarded by
+  omission.
+- **The scalar `web.authToken` is unchanged** — it remains an all-scopes token,
+  every configured token is accepted, and both keys compose. Each scoped entry
+  resolves its secret from the same `value`/`fromFile`/`fromEnvVar` sources and
+  **fails closed** the same way (a configured-but-empty entry refuses to start
+  the web API). `mcp.enabled`'s fail-closed gate is satisfied by either key.
+- **Revoke a device** by dropping its entry and reloading; its optional `label`
+  identifies it in logs and 403 bodies. These transport scopes are unrelated to
+  the loopback job-state API's key-value `scope`. See the
+  [HTTP-API wiki page](wiki/HTTP-API.md#scoped-tokens-webauthtokens).
 
 ## 1.2.29 (2026-07-21)
 

@@ -279,11 +279,13 @@ paths:
       tags: [jobs]
       summary: Run a job now
       operationId: startJob
+      x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
         "200": { description: Launched (empty body). }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: The job is disabled. }
 
@@ -292,11 +294,13 @@ paths:
       tags: [jobs]
       summary: Cancel a running job
       operationId: cancelJob
+      x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
         "200": { description: All running instances cancelled (empty body). }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: The job is not running. }
 
@@ -305,6 +309,7 @@ paths:
       tags: [jobs]
       summary: Pause a job's scheduled fires
       operationId: pauseJob
+      x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
       requestBody:
@@ -323,6 +328,7 @@ paths:
                   paused: { $ref: "#/components/schemas/Pause" }
         "400": { description: A malformed or out-of-range pause request. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /jobs/{name}/resume:
@@ -330,6 +336,7 @@ paths:
       tags: [jobs]
       summary: End a job's pause
       operationId: resumeJob
+      x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/JobName"
       requestBody:
@@ -352,6 +359,7 @@ paths:
                     type: object
                     nullable: true
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /dags:
@@ -452,6 +460,7 @@ paths:
       tags: [dags]
       summary: Trigger a manual DAG run
       operationId: triggerDag
+      x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/DagName"
       responses:
@@ -465,6 +474,7 @@ paths:
                   dag: { type: string }
                   runKey: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { description: The run could not be durably recorded. }
 
@@ -473,6 +483,7 @@ paths:
       tags: [dags]
       summary: Backfill a DAG across a range
       operationId: backfillDag
+      x-required-scope: control
       parameters:
         - $ref: "#/components/parameters/DagName"
       requestBody:
@@ -497,6 +508,7 @@ paths:
                   created: { type: integer }
         "400": { description: A bad range. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
   /dags/{name}/runs/{run_key}/tasks/{taskkey}/decision:
@@ -504,6 +516,7 @@ paths:
       tags: [dags]
       summary: Approve or reject an approval gate
       operationId: decideDagTask
+      x-required-scope: approve
       parameters:
         - $ref: "#/components/parameters/DagName"
         - $ref: "#/components/parameters/RunKey"
@@ -522,6 +535,7 @@ paths:
         "200": { description: The decision was recorded. }
         "400": { description: A bad decision value. }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
         "409": { description: The task is not awaiting a decision. }
 
   /cluster:
@@ -810,8 +824,16 @@ components:
       type: http
       scheme: bearer
       description: >-
-        `Authorization: Bearer <token>` when `web.authToken` is set. Compared
-        in constant time; a missing or wrong token is 401.
+        `Authorization: Bearer <token>` when `web.authToken` or one or more
+        `web.authTokens` is set. Compared in constant time; a missing or wrong
+        token is 401. Tokens may be *scoped*: the scalar `web.authToken` grants
+        all scopes, while each `web.authTokens` entry lists some of `view`
+        (every read-only GET), `control` (the mutating POSTs and POST /mcp) and
+        `approve` (the DAG decision route); `control` and `approve` each imply
+        `view`. A recognised token that lacks the scope an operation requires
+        is 403, not 401. The required scope defaults to `view` for GET/HEAD and
+        `control` for other methods; operations that need more carry an
+        `x-required-scope` extension.
     icsToken:
       type: apiKey
       in: query
@@ -867,6 +889,10 @@ components:
   responses:
     Unauthorized:
       description: Missing or invalid bearer token (when `web.authToken` is set).
+    Forbidden:
+      description: >-
+        The bearer token is valid but lacks the scope this operation requires
+        (see `x-required-scope`), or a cross-site `Origin` was refused.
     NotFound:
       description: No such job, DAG, or run.
 

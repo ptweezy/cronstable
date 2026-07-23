@@ -51,7 +51,8 @@ The `web` section is parsed by the strictyaml `CONFIG_SCHEMA` in `cronstable/con
 | `listen` | sequence of strings | (required) | List of URLs to bind. Each is `http://host:port`, `https://host:port`, or `unix:///path`. An empty list disables the server. |
 | `headers` | map of string→string | (none) | Extra HTTP headers added to every `200` success response (all routes, including `/cluster` and `/job-set-id`) and to the 409 conflict body, but not the 404 or 401. |
 | `allowedOrigins` | sequence of strings | `[]` | Extra exact-match browser `Origin`s allowed to call the mutating `POST` endpoints (see [Cross-site request defense](#cross-site-request-defense)). |
-| `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes (see [Authentication](#authentication)). |
+| `authToken` | map (`value`/`fromFile`/`fromEnvVar`) | (none) | When set, requires bearer-token authentication on all routes as an all-scopes token (see [Authentication](#authentication)). |
+| `authTokens` | sequence of maps (`value`/`fromFile`/`fromEnvVar` + `scopes` + optional `label`) | `[]` | Additional per-device scoped bearer tokens (`view`/`control`/`approve`); revoke one by dropping its entry and reloading (see [Scoped tokens](#scoped-tokens-webauthtokens)). |
 | `socketMode` | string (octal) | (none) | File mode applied via `chmod` to `unix://` listen sockets (see [Unix socket permissions](#unix-socket-permissions)). Applies only to `unix://` sockets, so it is irrelevant on Windows (where unix-socket listeners are unsupported and skipped with a warning). |
 | `tls` | map (`cert`/`key`/`clientCa`) | (none) | Certificate and key served by every `https://` listen address, plus an optional CA that makes those listeners require a client certificate (mutual TLS). `cert` and `key` are required together; the block and the `https://` addresses are validated against each other at load. See [Listener TLS](Listener-TLS). |
 | `ui` | bool | `true` | Serve the [Web Dashboard](Web-Dashboard) page at `/` (see [`GET /`](#get--the-dashboard-page)); `ui: false` exposes only the REST endpoints. |
@@ -1308,6 +1309,71 @@ web:
 $ http get http://127.0.0.1:8080/status "Authorization:Bearer s3cr3t"
 $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/status
 ```
+
+### Scoped tokens (`web.authTokens`)
+
+The scalar `web.authToken` above is an all-scopes token: it can read, control,
+and approve. To hand out a narrower credential — a phone that should never
+carry the god token, a wallboard that only reads, a CI job that only triggers —
+add `web.authTokens`, a list of per-device tokens each carrying a `scopes`
+list and an optional `label`:
+
+```yaml
+web:
+  listen:
+    - http://0.0.0.0:8080
+  authToken:                     # optional: the legacy all-scopes token
+    fromEnvVar: CRONSTABLE_WEB_TOKEN
+  authTokens:
+    - label: parker-iphone
+      scopes: [view, control, approve]
+      fromEnvVar: IPHONE_TOKEN
+    - label: wallboard-ipad
+      scopes: [view]
+      fromFile: /run/secrets/wallboard-token
+    - label: ci-trigger
+      scopes: [control]
+      value: "…"
+```
+
+Each entry resolves its secret from the same `value`/`fromFile`/`fromEnvVar`
+sources as `authToken`, and fails closed the same way — a configured entry that
+resolves to an empty token refuses to start the web API. `authToken` and
+`authTokens` compose: every configured token is accepted, and a request
+authenticates if it matches **any** of them (constant-time compared).
+
+There are three scopes:
+
+| Scope | Grants |
+| --- | --- |
+| `view` | Every read-only `GET` — jobs, runs, DAGs, cluster/fleet, schedule intelligence, the state inspector, the SSE log tail, the calendar feeds, `/metrics`. |
+| `control` | The mutating actions: `POST` start / cancel / pause / resume, DAG trigger / backfill, and the MCP endpoint (`POST /mcp`). |
+| `approve` | Only the DAG approval-gate decision (`POST …/decision`). |
+
+`control` and `approve` each **imply** `view` (an action UI has to read state
+first), so a `[control]` token can also hit every `GET`; `approve` does **not**
+imply `control`. The required scope for a route is the safe-method default
+(`GET`/`HEAD`/`OPTIONS` → `view`, everything else → `control`) with two
+promotions: the approval decision needs `approve`, and `/mcp` needs `control`.
+A newly added `POST` route therefore requires `control` automatically rather
+than slipping through unguarded.
+
+The two failure modes are distinct:
+
+- A missing/unrecognised token is **`401 Unauthorized`** (as before).
+- A recognised token that lacks the scope a route needs is **`403 Forbidden`**,
+  with a body naming the token label and the missing scope.
+
+To **revoke** a device, delete its `authTokens` entry and reload
+(`SIGHUP`/`cronstable reload`): the web app is rebuilt against the current
+config, so the dropped token stops working immediately while the others keep
+their sessions. The `label` is only an identifier for humans and log/error
+messages; matching is by the secret.
+
+> The scalar `authToken` is unchanged and remains an all-scopes token, so
+> existing configs behave exactly as before. These transport scopes are
+> unrelated to the loopback [job-state API](Durable-State)'s `scope` (a
+> key-value isolation boundary) — same word, different feature.
 
 ### Client certificates (mutual TLS)
 

@@ -847,6 +847,15 @@ _dag_schema_dict = {
     "tasks": Seq(Map(_dag_task_schema_dict)),
 }
 
+# Bearer-token scopes for the web control API (web.authTokens[].scopes).
+# `view` = every read-only GET; `control` = the mutating POST endpoints
+# (start/cancel/pause/resume/trigger/backfill); `approve` = the DAG
+# approval-gate decision only. Holding `control` or `approve` implies `view`
+# (an action UI must read state first). The scalar web.authToken is an
+# all-scopes ("god") token. Enforcement lives in
+# cronstable.cron.Cron._make_auth_middleware / _required_web_scope.
+WEB_TOKEN_SCOPES = ("view", "control", "approve")
+
 CONFIG_SCHEMA = EmptyDict() | Map(
     {
         Opt("defaults"): Map(_job_defaults_common),
@@ -871,6 +880,26 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("fromFile"): EmptyNone() | Str(),
                         Opt("fromEnvVar"): EmptyNone() | Str(),
                     }
+                ),
+                # additional per-device *scoped* bearer tokens, so a phone or
+                # a wallboard need not carry the all-scopes `authToken` above.
+                # Each entry resolves its secret from the same
+                # value/fromFile/fromEnvVar sources, carries a `scopes` list
+                # (view / control / approve; control and approve imply view)
+                # and an optional `label` used to identify and revoke it (drop
+                # the entry and reload). Written block-style (strictyaml
+                # rejects flow lists). See
+                # cronstable.cron.Cron._resolve_web_tokens.
+                Opt("authTokens"): Seq(
+                    Map(
+                        {
+                            Opt("value"): EmptyNone() | Str(),
+                            Opt("fromFile"): EmptyNone() | Str(),
+                            Opt("fromEnvVar"): EmptyNone() | Str(),
+                            "scopes": Seq(Enum(list(WEB_TOKEN_SCOPES))),
+                            Opt("label"): Str(),
+                        }
+                    )
                 ),
                 # octal permissions to apply to a unix:// listen socket
                 Opt("socketMode"): Str(),
@@ -3397,6 +3426,17 @@ def _is_local_listener(addr: str) -> bool:
         return False
 
 
+def _web_has_any_token(web: dict) -> bool:
+    """Whether the web config declares any bearer token at all.
+
+    True when either the scalar ``web.authToken`` or one or more scoped
+    ``web.authTokens`` entries are present. A bare presence test (like the
+    fail-closed MCP gate needs): it does not resolve the sources, matching
+    the historical ``web.get("authToken")`` truthiness check.
+    """
+    return bool(web.get("authToken") or web.get("authTokens"))
+
+
 def _validate_mcp_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for the MCP server that also need the web section.
 
@@ -3423,7 +3463,7 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
             "mcp.toolsets includes 'act' but mcp.readOnly is true; mutating "
             "tools stay suppressed until readOnly is set false"
         )
-    if mcp.get("allowUnauthenticated") or web.get("authToken"):
+    if mcp.get("allowUnauthenticated") or _web_has_any_token(web):
         return
     # An https listener with web.tls.clientCa authenticates its callers at the
     # transport (CERT_REQUIRED against that CA), which is the same guarantee
@@ -3439,10 +3479,11 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
     ]
     if routable:
         raise ConfigError(
-            "mcp.enabled is set but web.authToken is not, and the web API "
-            "listens on non-loopback address(es) {}: /mcp would be served "
-            "without authentication (with no token the web app installs no "
-            "auth middleware at all). Set web.authToken, restrict web.listen "
+            "mcp.enabled is set but no web.authToken/authTokens is set, and "
+            "the web API listens on non-loopback address(es) {}: /mcp would "
+            "be served without authentication (with no token the web app "
+            "installs no auth middleware at all). Set web.authToken or a "
+            "web.authTokens entry, restrict web.listen "
             "to loopback/unix-socket addresses, set web.tls.clientCa so the "
             "listener authenticates callers by certificate, or set "
             "mcp.allowUnauthenticated: true when the endpoint is protected "

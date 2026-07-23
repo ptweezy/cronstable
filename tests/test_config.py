@@ -1399,6 +1399,49 @@ def test_mcp_act_with_read_only_warns_but_loads(caplog):
 
 
 # ---------------------------------------------------------------------------
+# web.authTokens (scoped bearer tokens)
+# ---------------------------------------------------------------------------
+
+
+def test_web_auth_tokens_parse():
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - label: phone\n"
+        "      scopes:\n        - view\n        - control\n"
+        "      value: secret-tok\n"
+    )
+    conf = parse_config_string(yaml, "")
+    entries = conf.web_config["authTokens"]
+    assert len(entries) == 1
+    assert entries[0]["label"] == "phone"
+    assert entries[0]["scopes"] == ["view", "control"]
+    assert entries[0]["value"] == "secret-tok"
+
+
+def test_web_auth_tokens_reject_unknown_scope():
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - scopes:\n        - bogus\n"
+        "      value: secret-tok\n"
+    )
+    with pytest.raises(ConfigError):
+        parse_config_string(yaml, "")
+
+
+def test_web_auth_tokens_require_scopes():
+    # `scopes` is required on each entry (a scopeless token is meaningless).
+    yaml = (
+        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+        "  authTokens:\n"
+        "    - value: secret-tok\n"
+    )
+    with pytest.raises(ConfigError):
+        parse_config_string(yaml, "")
+
+
+# ---------------------------------------------------------------------------
 # pure helpers
 # ---------------------------------------------------------------------------
 
