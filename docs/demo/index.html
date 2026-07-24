@@ -1883,21 +1883,12 @@
   </div>
 </div>
 
-<!-- token modal -->
-<div class="overlay" id="modalWrap">
-  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
-    <h3 id="modalTitle">Access token required</h3>
-    <p id="modalMsg">This cronstable instance requires a bearer token. It is stored only in this browser tab.</p>
-    <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
-    <div class="modal-actions">
-      <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
-      <button class="btn" id="tokenCancel">Cancel</button>
-      <button class="btn primary" id="tokenSave">Save</button>
-    </div>
-  </div>
-</div>
-
-<!-- pair-a-device modal -->
+<!-- pair-a-device modal. BEFORE the token modal, like settings/help: the
+     overlays share one z-index, so DOM order is paint order, and the
+     token modal must be able to open ON TOP of this dialog (openPair's
+     /whoami fetch is exactly where a stale token 401s). The keyboard
+     layer already ranks the token modal topmost; the markup has to
+     agree or that modal opens invisibly underneath. -->
 <div class="overlay" id="pairWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairMsg">
     <h3 id="pairTitle">Pair a device</h3>
@@ -1909,6 +1900,20 @@
     <div class="modal-actions">
       <button class="btn" id="pairCopy" style="margin-right:auto">Copy</button>
       <button class="btn primary" id="pairClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- token modal -->
+<div class="overlay" id="modalWrap">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle" aria-describedby="modalMsg">
+    <h3 id="modalTitle">Access token required</h3>
+    <p id="modalMsg">This cronstable instance requires a bearer token. It is stored only in this browser tab.</p>
+    <input id="tokenInput" type="password" placeholder="paste token…" autocomplete="off" />
+    <div class="modal-actions">
+      <button class="btn" id="tokenClear" style="margin-right:auto">Clear</button>
+      <button class="btn" id="tokenCancel">Cancel</button>
+      <button class="btn primary" id="tokenSave">Save</button>
     </div>
   </div>
 </div>

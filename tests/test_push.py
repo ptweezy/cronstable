@@ -19,6 +19,7 @@ import base64
 import copy
 import json
 import os
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -393,6 +394,23 @@ async def test_file_store_corrupt_file_refuses_reads_and_writes(tmp_path):
         await store.upsert({"id": "d1"})
     # the corrupt bytes are preserved for hand recovery
     assert path.read_text(encoding="utf-8") == "{not json"
+
+
+async def test_file_store_removing_a_corrupt_file_restores_writes(tmp_path):
+    # The write-refusal message tells the operator to "fix or remove it
+    # first"; following it must actually work. The corrupt flag used to
+    # outlive the removal (only a successful PARSE cleared it, which a
+    # now-missing file can never produce), and the store object lives as
+    # long as the push config is unchanged, so every later write kept
+    # refusing with the same instruction until a daemon restart.
+    path = tmp_path / "devices.json"
+    path.write_text("{not json", encoding="utf-8")
+    store = push.FileDeviceStore(str(path))
+    with pytest.raises(push.PushError):
+        await store.load()
+    os.unlink(path)
+    await store.upsert({"id": "d1", "name": "phone"})
+    assert [d["id"] for d in await store.load()] == ["d1"]
 
 
 async def test_file_store_write_failure_is_push_error(tmp_path):
@@ -778,6 +796,38 @@ async def test_send_report_seals_to_each_device_and_posts_relay(tmp_path):
         # the relay never saw plaintext
         flat = json.dumps(body)
         assert "backup" not in flat and "boom" not in flat
+
+
+@requires_pynacl
+async def test_collapse_id_comes_from_the_persistent_salt(tmp_path):
+    # The relay coalesces the same (job, run) across nodes and restarts
+    # by collapseId, which only holds if every service over one registry
+    # keys ids with the SAME persisted salt. Nothing else pins the
+    # service-to-store salt wiring: with it broken, ids silently fall
+    # back to the per-process _local_salt, every other test stays green
+    # (they check only the id's length), and a fleet re-pages each alert
+    # once per node and per restart.
+    private, public_b64 = _device_keypair()
+    async with _RelayServer() as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+        # a second service over the same registry: a restart, or another
+        # node sharing the devices file
+        twin = _service(
+            push.FileDeviceStore(str(tmp_path / "devices.json")), relay.url
+        )
+        await twin.send_report(_FakeJobCtx(), False, {"enabled": True})
+        first, second = relay.requests
+        assert first["collapseId"] == second["collapseId"]
+        # and the id is exactly the persisted salt keyed over the sealed
+        # payload's identity fields, not any process-local fallback
+        doc = json.loads(
+            (tmp_path / "devices.json").read_text(encoding="utf-8")
+        )
+        opened = _open_sealed(private, first["ciphertext"])
+        assert first["collapseId"] == push.collapse_id(
+            opened, doc["collapseSalt"]
+        )
 
 
 async def test_send_report_with_no_devices_logs_and_returns(tmp_path, caplog):
@@ -1394,6 +1444,30 @@ def test_push_relay_url_must_be_http(url):
         _parse_validated(yaml)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        # scheme-less: urlparse reads the userinfo as the scheme, so the
+        # raw string reaches the bad-scheme raise with the password in it
+        "admin:hunter2@relay.example",
+        # scheme typo: the netloc (credentials and all) survives parsing
+        "htp://admin:hunter2@relay.example/v1/notify",
+    ],
+)
+def test_push_relay_url_error_redacts_credentials(url):
+    # The message is printed at startup and logged by the reload loop on
+    # every reparse until the config is fixed; like every other URL a
+    # ConfigError echoes, it must never carry the secret.
+    yaml = (
+        "push:\n  relay:\n    url: \"{}\"\n"
+        "  devicesFile: /tmp/d.json\n".format(url)
+    )
+    with pytest.raises(ConfigError) as err:
+        _parse_validated(yaml)
+    assert "hunter2" not in str(err.value)
+    assert "***@relay.example" in str(err.value)
+
+
 def test_push_relay_timeout_must_be_positive():
     yaml = """
 push:
@@ -1931,6 +2005,9 @@ async def test_bonjour_register_converge_and_stop(fake_zeroconf):
     assert info.name == "attic-local._cronstable._tcp.local."
     assert info.kwargs["port"] == 8080
     assert info.kwargs["properties"] == {"v": "1.2.30", "scheme": "http"}
+    # the SRV target is a dedicated hostname, never the machine's own
+    # <hostname>.local. (see _server_name)
+    assert info.kwargs["server"] == "attic-local-cronstable.local."
     # unchanged advert: no re-registration
     await advertiser.start_stop(dict(advert))
     assert len(fake_zeroconf.instances) == 1
@@ -1995,6 +2072,129 @@ def test_instance_name_truncates_by_utf8_bytes():
     assert encoded.decode("utf-8") == label  # no torn codepoint
     assert discovery._instance_name("") == "cronstable"
     assert discovery._instance_name("a.b.c") == "a-b-c"
+
+
+def test_server_name_is_distinct_and_ldh_safe():
+    # Never the machine's own <hostname>.local.: avahi/mDNSResponder
+    # already defend that name with the host's full address list, and a
+    # second responder claiming it with one route-derived IPv4 is the
+    # RFC 6762 conflict that can rename the whole machine.
+    assert discovery._server_name("attic") == "attic-cronstable"
+    # an operator display name is a fine instance label but not a
+    # hostname: spaces and friends become hyphens for strict resolvers
+    assert discovery._server_name("Basement Pi") == "Basement-Pi-cronstable"
+    assert discovery._server_name("日本語") == "cronstable"
+    label = discovery._server_name("x" * 200)
+    assert len(label.encode("utf-8")) <= 63
+    assert label.endswith("-cronstable")
+
+
+async def test_bonjour_advert_address_skips_the_probe(
+    fake_zeroconf, monkeypatch
+):
+    # A specific-bind advert carries the listener's own address; the
+    # outbound-route probe (which could name a different interface than
+    # the one the socket lives on) must not run at all.
+    def _no_probe():
+        raise AssertionError("the probe must not run for a specific bind")
+
+    monkeypatch.setattr(discovery, "primary_address", _no_probe)
+    advertiser = discovery.BonjourAdvertiser()
+    await advertiser.start_stop(
+        {
+            "name": "attic",
+            "port": 8443,
+            "properties": {},
+            "address": "192.0.2.9",
+        }
+    )
+    (zc,) = fake_zeroconf.instances
+    (info,) = zc.registered
+    assert info.kwargs["addresses"] == [socket.inet_aton("192.0.2.9")]
+    await advertiser.stop()
+
+
+def _advert_cron(bound) -> Cron:
+    """A Cron with only what _bonjour_advert reads: a 'running' web app
+    and the recorded (scheme, sockname) of its bound TCP listeners."""
+    cron = Cron.__new__(Cron)
+    cron._web_tcp_bound = bound
+    cron.web_runner = object()
+    return cron
+
+
+def test_bonjour_advert_names_one_coherent_listener():
+    # The finding this pins: the advert used to glue the FIRST bound
+    # port to an "https if any listen entry is https" scheme and the
+    # outbound-route IP, so the natural mixed shape below advertised
+    # https at the loopback listener's port on the LAN address, an
+    # endpoint nothing served. Port, scheme and address must all come
+    # from one LAN-reachable listener.
+    cron = _advert_cron(
+        [
+            ("http", ("127.0.0.1", 8080)),
+            ("https", ("0.0.0.0", 8443)),
+        ]
+    )
+    advert = cron._bonjour_advert({"bonjour": True})
+    assert advert is not None
+    assert advert["port"] == 8443
+    assert advert["properties"]["scheme"] == "https"
+    # a wildcard bind carries no address: the advertiser probes at
+    # register time (and re-probes on DHCP changes)
+    assert "address" not in advert
+
+
+def test_bonjour_advert_prefers_https_and_carries_a_specific_bind():
+    cron = _advert_cron(
+        [
+            ("http", ("0.0.0.0", 8080)),
+            ("https", ("192.0.2.7", 8443)),
+        ]
+    )
+    advert = cron._bonjour_advert({"bonjour": True})
+    assert advert is not None
+    assert (advert["port"], advert["properties"]["scheme"]) == (
+        8443,
+        "https",
+    )
+    # bound to one specific IPv4: advertise THAT address, not whatever
+    # interface the outbound-route probe happens to name
+    assert advert["address"] == "192.0.2.7"
+
+
+def test_bonjour_advert_skips_undialable_listeners(caplog):
+    # loopback-only: the old advert sent LAN peers to <LAN-IP>:8080
+    # where nothing (or an unrelated process) listens
+    cron = _advert_cron([("http", ("127.0.0.1", 8080))])
+    assert cron._bonjour_advert({"bonjour": True}) is None
+    assert any("no LAN-reachable" in r.message for r in caplog.records)
+    caplog.clear()
+    # a specific IPv6 bind: the advert's address record is IPv4-only,
+    # so pointing an A record anywhere would name the wrong endpoint
+    cron = _advert_cron([("https", ("fd00::5", 8443, 0, 0))])
+    assert cron._bonjour_advert({"bonjour": True}) is None
+    assert any("IPv4-only" in r.message for r in caplog.records)
+
+
+async def test_web_app_records_bound_tcp_listeners():
+    # the advert's inputs: every successfully bound TCP listener with
+    # its scheme and real (post-`:0`) socket name, recorded at start,
+    # reset on stop
+    cron = _cron()
+    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
+    try:
+        assert [
+            (scheme, sockname[0])
+            for scheme, sockname in cron._web_tcp_bound
+        ] == [("http", "127.0.0.1")]
+        (_, sockname) = cron._web_tcp_bound[0]
+        assert sockname[1] == cron.web_runner.addresses[0][1]
+        # loopback-only: bonjour has nothing a LAN peer could dial
+        assert cron._bonjour_advert({"bonjour": True}) is None
+    finally:
+        await cron.start_stop_web_app(None)
+    assert cron._web_tcp_bound == []
 
 
 async def test_bonjour_real_serviceinfo_accepts_our_construction(
