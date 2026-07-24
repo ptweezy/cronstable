@@ -3429,10 +3429,7 @@ def _validate_web_config(webconf: WebConfig) -> None:
             raise ConfigError(
                 "web.bonjour is enabled but python-zeroconf is not "
                 "installed; install the discovery extra (pip install "
-                '"cronstable[discovery]") or disable web.bonjour. '
-                "The standalone release binaries deliberately ship "
-                "without it (zeroconf is LGPL; see LICENSING.md), so "
-                "web.bonjour needs a pip-based install."
+                '"cronstable[discovery]") or disable web.bonjour'
             )
         tcp_listens = [
             addr

@@ -53,28 +53,49 @@ cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (MIT); th
 root LICENSE preserves yacron's copyright alongside cronstable's, as MIT
 requires.
 
-Runtime dependencies of the core install and of everything frozen into the
-PyInstaller binaries are permissive (MIT / BSD / Apache / PSF / MPL). A CI
-guard ([.github/scripts/check_licenses.py](.github/scripts/check_licenses.py), run by the
+Runtime dependencies of the core install are permissive (MIT / BSD / Apache /
+PSF / MPL). A CI guard
+([.github/scripts/check_licenses.py](.github/scripts/check_licenses.py), run by the
 `licenses` job over the runtime plus every distributable extra) fails the build
 if a strong-copyleft (GPL / AGPL) or non-open source-available (SSPL / BUSL)
 dependency is ever introduced, so the permissive baseline cannot regress by
 accident. This matters because the shipped artifacts (the PyInstaller binaries
 and Docker images) bundle the whole dependency tree.
 
-One deliberate exception, handled by distribution surface:
+One dependency is weak copyleft, bundled deliberately and with its
+obligations met explicitly:
 
-- **python-zeroconf** (the optional `discovery` extra, behind `web.bonjour`) is
-  **LGPL-2.1-or-later**. The LGPL is fine to depend on, but its terms require
-  that a recipient can swap in their own build of the library. That holds for
-  a pip install and for the Docker images (zeroconf sits in `site-packages` as
-  ordinary replaceable files, with its license text alongside in its
-  `dist-info`), so those surfaces include it. A one-file, `-OO`-optimized
-  PyInstaller freeze defeats that replacement right, so **the release binaries
-  deliberately do not bundle zeroconf**: `web.bonjour` in a standalone binary
-  fails closed at config load with a message pointing here. The `licenses` CI
-  job reports zeroconf as weak copyleft (allowed) on every run, keeping the
-  choice visible.
+- **python-zeroconf** (the `discovery` extra, behind `web.bonjour`) is
+  **LGPL-2.1-or-later** and is included, unmodified, in the standalone
+  binaries, the Docker images, and the `discovery` pip extra. The LGPL permits
+  proprietary-or-MIT applications to bundle the library; in exchange the
+  recipient must get the license text, access to the library's source, and a
+  real way to use a modified build of the library. cronstable meets each one:
+
+  - **Notice + license text**: every artifact carries
+    [`cronstable/licenses/THIRD-PARTY-NOTICES.txt`](cronstable/licenses/THIRD-PARTY-NOTICES.txt)
+    (the notice plus the full LGPL-2.1 text) as package data; any binary
+    prints it with `cronstable --third-party-licenses`. Docker and pip
+    installs additionally keep zeroconf's own `COPYING` in its `dist-info`.
+  - **Source access**: each GitHub Release attaches the python-zeroconf
+    source archive next to the binaries; it is also on
+    [PyPI](https://pypi.org/project/zeroconf/) and
+    [GitHub](https://github.com/python-zeroconf/python-zeroconf).
+  - **Relink right**: cronstable is fully open source, and the binaries are
+    produced by a public recipe
+    ([pyinstaller/cronstable.spec](pyinstaller/cronstable.spec) plus the
+    `binaries*` jobs in
+    [.github/workflows/release.yml](.github/workflows/release.yml)). To run
+    the combined work with a modified python-zeroconf, install cronstable
+    from PyPI beside your build of the library (pip installs keep it as
+    ordinary replaceable files), or rebuild the binary from this repository
+    with your modified library in the build environment. Nothing in the MIT
+    license restricts modification or the reverse engineering needed to
+    debug such modifications.
+
+  The `licenses` CI job reports zeroconf as weak copyleft (allowed) on every
+  run, keeping the choice visible; a strong-copyleft dependency would still
+  fail the gate.
 
 ## Trademarks
 
