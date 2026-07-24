@@ -121,13 +121,13 @@ jobs:
       bump: ${{ steps.d.outputs.bump }}
       new: ${{ steps.ver.outputs.new }}
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history + tags: the marker scan walks BEFORE..AFTER and setuptools_scm / tag math resolve
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Decide release
@@ -245,7 +245,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
       # This repository is LF-only (see .gitattributes). Fail fast if any
       # tracked blob ever reaches the index with CRLF or mixed line endings,
       # e.g. one that slipped past `text=auto` normalization by being marked
@@ -258,7 +258,7 @@ jobs:
             echo "$crlf"
             exit 1
           fi
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
       # tox-uv pulls in uv and makes tox provision envs + install deps with it.
       - run: pip install tox tox-uv
       - run: tox -e lint,mypy,bandit,openapi
@@ -275,11 +275,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Install runtime + bundled extras
@@ -314,8 +314,8 @@ jobs:
     # The suite runs in 1-3 min per cell; 20 bounds a hung asyncio test.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
@@ -340,13 +340,13 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Build distributions
@@ -381,13 +381,13 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Build binary
@@ -468,7 +468,7 @@ jobs:
             qemu: true            # no native armv6 on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
@@ -549,7 +549,7 @@ jobs:
             qemu: true
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - if: ${{ matrix.qemu }}
@@ -630,13 +630,13 @@ jobs:
     # The macOS 26 rows are coverage-only: never let them gate a release.
     continue-on-error: ${{ !matrix.ship }}
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Build binary
@@ -752,13 +752,13 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Build binary
@@ -826,7 +826,7 @@ jobs:
             dockerfile: docker/Dockerfile.distroless
             platforms: "linux/amd64,linux/arm64"
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history so setuptools_scm can resolve a version
       - uses: docker/setup-qemu-action@v4.2.0
@@ -867,13 +867,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # full history + tags: the baseline is the latest release tag
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Install current and baseline environments
@@ -1008,7 +1008,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # the full PR commit range must be walkable
       - name: Verify Signed-off-by on every PR commit
@@ -1043,13 +1043,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0  # setuptools_scm needs history to version the core
-      - uses: actions/setup-python@v6.3.0
+      - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
-      - uses: astral-sh/setup-uv@v8.3.2
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
       - name: Build core + pro, prove the boundary, run pro's tests
@@ -1087,7 +1087,7 @@ jobs:
       contents: write   # push the tag and create the GitHub Release
       id-token: write   # PyPI Trusted Publishing (OIDC)
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
 
@@ -1328,7 +1328,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.new }}  # the tag `release` just pushed
           fetch-depth: 0 # full history so setuptools_scm can resolve a version
@@ -1352,7 +1352,7 @@ jobs:
             type=raw,value=latest-debian,enable=${{ matrix.distro == 'debian' }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@v4.5.1
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1360,7 +1360,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: steps.registries.outputs.dockerhub == 'true'
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@v4.5.1
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -1402,7 +1402,7 @@ jobs:
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.0    # for the formula template + render script
+      - uses: actions/checkout@v7.0.1    # for the formula template + render script
 
       - name: Update Homebrew tap formula
         env:
@@ -1552,8 +1552,8 @@ jobs:
       # actions default to GITHUB_TOKEN. Nothing in THIS repo is written.
       contents: write
     steps:
-      - uses: actions/checkout@v7.0.0    # for the wiki/ page sources
-      - uses: actions/checkout@v7.0.0    # the wiki is its own repo; its default branch is always master
+      - uses: actions/checkout@v7.0.1    # for the wiki/ page sources
+      - uses: actions/checkout@v7.0.1    # the wiki is its own repo; its default branch is always master
         with:
           repository: ${{ github.repository }}.wiki
           path: .wiki
