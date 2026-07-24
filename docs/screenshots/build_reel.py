@@ -76,6 +76,8 @@ SEGMENTS = [
     ("fleet", HERO_THEME, 1.6),             # jobs x nodes fleet matrix
     ("wallboard", HERO_THEME, 1.5),         # TV wallboard
     ("incident-timeline", HERO_THEME, 1.5),
+    # the incident's follow-up: pair a phone for E2E-encrypted push alerts
+    ("pair", HERO_THEME, 1.5),
     # accessibility beat (same theme): colour-blind-safe palette, larger UI
     # scale, and the settings that drive the readability / a11y options
     ("a11y-cvd", HERO_THEME, 1.3),

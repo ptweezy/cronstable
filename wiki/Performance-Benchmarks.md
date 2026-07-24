@@ -47,16 +47,18 @@ never gate. On an ordinary commit or pull request the comparison only warns.
 On a release the gate is enforced: the publish jobs require `perf`, so a
 gated regression stops the release before anything ships.
 
-## The release chart
+## The release report
 
 Each GitHub Release carries the comparison against the previous release:
 
-- a diverging bar chart (`perf-chart.svg`) with a row for every compared
-  metric, embedded at the top of the performance section of the release
-  notes;
-- the full metric table in a collapsed details block;
-- `perf-results.json`, the merged raw numbers for that release, attached as
-  an asset.
+- the gate verdict and the full metric table, in the performance section of
+  the release notes;
+- `perf-summary.md` (that same table) and `perf-results.json` (the merged raw
+  numbers for the release), attached as assets.
+
+Every comparison also renders `perf-chart.svg`, a diverging bar chart with a
+row for every compared metric. It ships in the `perf-report` artifact on the
+workflow run, alongside the same two files, and stays there for 30 days.
 
 The first release after the suite was introduced records numbers without a
 comparison; every release after that diffs against the one before it.

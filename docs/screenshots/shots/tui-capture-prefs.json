@@ -1,0 +1,15 @@
+{
+  "ascii": false,
+  "boot": true,
+  "boot_last": 1784861467.8681228,
+  "compact": false,
+  "cvd": "none",
+  "light": false,
+  "poll_ms": 1000,
+  "sound": false,
+  "theme": "carolina",
+  "timestamps": false,
+  "wrap": false,
+  "zen": true,
+  "zen_idle_s": 90
+}

@@ -268,9 +268,12 @@ jobs:
   # copyleft (GPL/AGPL) or non-open source-available (SSPL/BUSL) dependency must
   # never slip in. scripts/check_licenses.py reads the INSTALLED dist metadata
   # (no third-party scanner) and fails on a disallowed license; weak file-scoped
-  # copyleft (LGPL/MPL) is reported but allowed. It installs the runtime plus the
-  # bundled `speedups` extra (uvloop/orjson ship inside the binaries), i.e. the
-  # exact set the artifacts carry. See LICENSING.md.
+  # copyleft (LGPL/MPL) is reported but allowed. It installs the runtime plus
+  # every distributable extra (`speedups`, `push`, and `discovery` all ride in
+  # the binaries and Docker images) so nothing the artifacts can carry escapes
+  # the scan. zeroconf (discovery) is LGPL-2.1: expected in the report, and
+  # shipped with its compliance kit (in-binary notice, Release source archive,
+  # public build recipe). See LICENSING.md.
   licenses:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -282,11 +285,11 @@ jobs:
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.11.29"
-      - name: Install runtime + bundled extras
+      - name: Install runtime + distributable extras
         run: |
           set -euo pipefail
           uv venv --python 3.14
-          uv pip install ".[speedups]"
+          uv pip install ".[speedups,push,discovery]"
       - name: Check dependency licenses
         run: uv run python .github/scripts/check_licenses.py
 
@@ -415,8 +418,30 @@ jobs:
           # build, so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle pynacl (the `push` extra): abi3 wheels cover amd64/arm64,
+          # so on this lane absence means a broken build, never a missing
+          # wheel. Install and verify are HARD failures here: a soft-fail
+          # would let a transient index blip silently ship the advertised
+          # push channel disabled. verify_pynacl.py round-trips a real
+          # sealed box so a miscompiled libsodium also fails the job.
+          uv pip install "pynacl>=1.5"
+          uv run python pyinstaller/verify_pynacl.py
+          # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
+          # Python with optional speedups, so the install works on every
+          # arch and is a HARD failure too. It is LGPL-2.1: the notice
+          # ships inside the binary (--third-party-licenses), the source
+          # archive is attached to the Release, and the public build
+          # recipe is the relink path. See LICENSING.md.
+          uv pip install "zeroconf>=0.132"
+          uv run python -c "import zeroconf, zeroconf.asyncio"
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
+          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
+          # push-plus-bonjour config passes --validate-config only when
+          # both import inside the binary (both fail closed otherwise),
+          # catching an analysis or hiddenimport miss that --version
+          # cannot.
+          dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
           mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -506,8 +531,29 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apk add --no-cache curl && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
+              # Bundle pynacl (the `push` extra): musllinux wheels on amd64/
+              # arm64, else a plain-C source build (bundled libsodium; the
+              # libffi-dev/make toolchain is best-effort here). A build that
+              # fails the sealed-box round-trip is uninstalled, so the binary
+              # never ships a miscompiled libsodium (push fails closed).
+              apk add --no-cache libffi-dev make >/dev/null 2>&1 || true
+              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+              python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
+              # Bundle zeroconf (the `discovery` extra): pure Python with
+              # optional speedups, so a HARD install even under QEMU. It
+              # is LGPL-2.1; the in-binary notice, Release source
+              # archive, and public build recipe are the compliance kit
+              # (see LICENSING.md).
+              pip install "zeroconf>=0.132"
+              python -c "import zeroconf, zeroconf.asyncio"
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: a musl binary on a musl host
+              # Whenever the build env kept pynacl, the frozen binary
+              # must reach it (and zeroconf) too: the push-plus-bonjour
+              # config validates only when both import inside the bundle.
+              if python -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}-musl
             '
       - uses: actions/upload-artifact@v7.0.1
@@ -587,8 +633,28 @@ jobs:
               # when the wheel is missing; the shared script round-trip-verifies
               # it and drops a broken QEMU build -> stdlib json fallback.
               RUST_SETUP="apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
+              # Bundle pynacl (the `push` extra): manylinux wheels on amd64/
+              # arm64, else a plain-C source build (bundled libsodium, no
+              # Rust; libffi-dev is best-effort). verify_pynacl.py drops a
+              # QEMU-miscompiled build so push fails closed, never garbles.
+              apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true
+              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
+              python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
+              # Bundle zeroconf (the `discovery` extra): pure Python with
+              # optional speedups, so a HARD install even under QEMU. It
+              # is LGPL-2.1; the in-binary notice, Release source
+              # archive, and public build recipe are the compliance kit
+              # (see LICENSING.md).
+              pip install "zeroconf>=0.132"
+              python -c "import zeroconf, zeroconf.asyncio"
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
+              # Whenever the build env kept pynacl, the frozen binary
+              # must reach it (and zeroconf) too: the push-plus-bonjour
+              # config validates only when both import inside the bundle.
+              if python -c "import nacl" 2>/dev/null; then
+                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
+              fi
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
             '
       - uses: actions/upload-artifact@v7.0.1
@@ -659,8 +725,22 @@ jobs:
           # the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle pynacl (the `push` extra); macOS ships universal2
+          # wheels, so absence means a broken build. Install and verify
+          # are HARD failures on this lane (a soft-fail would silently
+          # ship the advertised push channel disabled).
+          uv pip install "pynacl>=1.5"
+          uv run python pyinstaller/verify_pynacl.py
+          # Bundle zeroconf (the `discovery` extra): pure Python, wheels
+          # on both arches, HARD failure. LGPL-2.1; in-binary notice +
+          # Release source archive + public build recipe (LICENSING.md).
+          uv pip install "zeroconf>=0.132"
+          uv run python -c "import zeroconf, zeroconf.asyncio"
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
+          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
+          # fail closed at config validation when they cannot import).
+          dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
           # silently producing a mislabelled asset. `file` reports x86_64/arm64.
@@ -777,8 +857,23 @@ jobs:
           # so the binary falls back to stdlib json (cronstable/_json).
           PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
             sh pyinstaller/install_orjson.sh
+          # Bundle pynacl (the `push` extra); Windows ships wheels for
+          # win32/amd64/arm64, so absence means a broken build. Install
+          # and verify are HARD failures on this lane (a soft-fail would
+          # silently ship the advertised push channel disabled).
+          uv pip install "pynacl>=1.5"
+          uv run python pyinstaller/verify_pynacl.py
+          # Bundle zeroconf (the `discovery` extra): pure Python, wheels
+          # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
+          # notice + Release source archive + public build recipe
+          # (LICENSING.md).
+          uv pip install "zeroconf>=0.132"
+          uv run python -c "import zeroconf, zeroconf.asyncio"
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
+          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
+          # fail closed at config validation when they cannot import).
+          ./dist/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
         with:
@@ -985,8 +1080,7 @@ jobs:
               --baseline perf/old.*.json --current perf/new.*.json \
               --baseline-label "$PREV" --current-label "$NEW_VERSION" \
               --md perf/perf-summary.md --svg perf/perf-chart.svg \
-              --merged-out perf/perf-results.json \
-              --img-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${NEW_VERSION}/perf-chart.svg"
+              --merged-out perf/perf-results.json
           fi
       # Upload even when the gate failed, so the report that explains the red
       # X is always available on the run.
@@ -1171,8 +1265,9 @@ jobs:
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
 
-      # The perf gate's output for THIS run: the mini chart, the markdown
-      # summary the notes embed, and the merged raw results for the record.
+      # The perf gate's output for THIS run: the markdown summary the notes
+      # append, the merged raw results for the record, and the chart (kept in
+      # this artifact only, never attached to the Release).
       - name: Download performance report
         uses: actions/download-artifact@v8.0.1
         with:
@@ -1200,15 +1295,35 @@ jobs:
           else
             echo "::warning::No HISTORY.md section for $NEW; release notes will be auto-generated only."
           fi
-          # Append the perf comparison (chart image + gate verdict + full
-          # table) below the curated notes. perf-summary.md already embeds
-          # the perf-chart.svg asset URL for this exact tag; the asset itself
-          # is attached by the Release step below, so the image resolves as
-          # soon as the Release exists.
+          # Append the perf comparison (gate verdict + full table) below the
+          # curated notes. Text only: the perf job passes no --img-url, so the
+          # body embeds no <img> for perf-chart.svg. An image in a release body
+          # is refetched by every render of it (the tag page, the /releases
+          # index, the releases.atom feed release-watching bots poll) because
+          # the counted /releases/download/ hop is Cache-Control: no-cache, and
+          # it cannot even display: GitHub signs asset URLs with
+          # response-content-type=application/octet-stream plus
+          # Content-Disposition: attachment, and browsers do not sniff SVG in
+          # an <img>, so it only ever rendered as its alt text.
           {
             echo ""
             cat perf/perf-summary.md
           } >> release-notes.md
+
+      # LGPL source offer for the bundled python-zeroconf: attach its sdist
+      # (same requirement the binary lanes installed, resolved within this
+      # run) plus the notice file, so the Release page itself provides the
+      # license text and equivalent access to the library source next to
+      # the binaries that bundle it. --no-deps on purpose: only zeroconf is
+      # LGPL; its dependencies are permissive and covered by the licenses
+      # gate. See LICENSING.md.
+      - name: Fetch python-zeroconf source (LGPL source offer)
+        run: |
+          set -euo pipefail
+          mkdir -p third-party
+          python3 -m pip download "zeroconf>=0.132" --no-deps --no-binary :all: -d third-party
+          cp cronstable/licenses/THIRD-PARTY-NOTICES.txt third-party/
+          ls -l third-party
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.2
@@ -1223,13 +1338,20 @@ jobs:
           # Every shipped binary + the single SHA256SUMS, attached in one shot
           # (no later attach step, so nothing ever fights immutable-release
           # protection).
-          # perf-* is the benchmark report (chart + summary + raw results);
-          # the chart may be absent on the very first release (no baseline to
-          # diff against), which the glob tolerates and an explicit filename
-          # would not.
+          # The benchmark report, listed by name rather than as a perf/perf-*
+          # glob so that perf-chart.svg (downloaded into perf/ with the rest of
+          # the perf-report artifact) stays OFF the release: as a release asset
+          # it collected more downloads than every binary combined, because
+          # anything that rendered the notes fetched it. Both files here are
+          # written on every run, including the first release that has no
+          # baseline to diff against. The chart ships in the perf-report
+          # workflow artifact.
           files: |
             SHA256SUMS
-            perf/perf-*
+            perf/perf-summary.md
+            perf/perf-results.json
+            third-party/THIRD-PARTY-NOTICES.txt
+            third-party/zeroconf-*.tar.gz
             dist/*.whl
             dist/*.tar.gz
             binaries/cronstable-linux-amd64
