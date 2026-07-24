@@ -21,7 +21,10 @@ protocol can evolve independently.
 ## Inbound request
 
 The daemon sends one HTTP POST per (alert, device) to `push.relay.url`, with
-a JSON body:
+a JSON body. The POSTs for one alert are issued concurrently, so a relay
+sees a burst of up to one request per paired device (at most 100 connections
+per alert, the client's connector limit); size admission control for that
+shape rather than for a serial stream.
 
 ```json
 {

@@ -456,9 +456,13 @@ cannot read; the companion app decrypts and renders the notification on the
 device. Reporting occurs only when `enabled` is `true`; otherwise the
 reporter returns early. It requires the `push` extra
 (`pip install "cronstable[push]"`) and a daemon-global `push:` section
-naming the relay and the device-registry storage; both requirements are
-enforced at config load. Pairing, storage, size limits, and the trust model
-are documented on [Push Notifications](Push-Notifications).
+naming the relay and the device-registry storage, and it refuses a routable
+web listener with no `web.authToken` (the pairing endpoints would be
+unauthenticated); all of that is enforced at config load. The alert goes to
+every paired device at once, so an unreachable relay costs one
+`push.relay.timeout` in total rather than one per device. Pairing, storage,
+size limits, and the trust model are documented on
+[Push Notifications](Push-Notifications).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |

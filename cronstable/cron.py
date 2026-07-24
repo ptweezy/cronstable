@@ -1676,6 +1676,12 @@ class Cron:
                     await self.start_stop_state(config.state_config)
                     # after the state backend (whose store the device
                     # registry may ride); never raises, logs its own woes.
+                    # That guarantee is load-bearing here, not politeness:
+                    # push sits directly in front of _state_periodic, and
+                    # anything escaping it skipped the durable-state
+                    # manifest and garbage collection for that pass AND
+                    # every later one (the push config never records as
+                    # applied, so the next pass repeats the same failure).
                     await self.start_stop_push(config.push_config)
                     # periodic durable-state chores (manifest, GC): cheap
                     # due-checks that spawn tracked background tasks.
@@ -2666,16 +2672,36 @@ class Cron:
     async def start_stop_push(
         self, push_config: Optional[Dict[str, Any]]
     ) -> None:
-        """Converge the push service onto ``push_config``.
+        """Converge the push service onto ``push_config``, never raising.
 
         Runs every housekeeping pass, right after ``start_stop_state``
         (the registry may ride that store): a no-op while the section is
         unchanged, a rebuild when it changed, a stop when it is gone.
-        Never raises; a service that cannot warm its registry starts
-        anyway and retries on demand (the store may simply not be up
-        yet), while the pairing endpoints report store trouble per
-        request.
+        A service that cannot warm its registry starts anyway and retries
+        on demand (the store may simply not be up yet), while the pairing
+        endpoints report store trouble per request.
+
+        Store trouble is :class:`~cronstable.push.PushError` by contract,
+        and :meth:`_converge_push` absorbs it already, so this wrapper is
+        the belt to that pair of braces: nothing about push is worth the
+        rest of a housekeeping pass, and what used to escape here (one
+        unreadable registry document was enough) silently stopped the
+        durable-state manifest and garbage collection for the life of the
+        process.  ``Exception``, not ``BaseException``: a cancelled pass
+        must still cancel.
         """
+        try:
+            await self._converge_push(push_config)
+        except Exception:
+            logger.exception(
+                "push: could not converge the push service; leaving it as "
+                "it was and continuing the housekeeping pass"
+            )
+
+    async def _converge_push(
+        self, push_config: Optional[Dict[str, Any]]
+    ) -> None:
+        """The convergence itself; see :meth:`start_stop_push`."""
         if push_config == self._applied_push_config and (
             push_config is None
         ) == (self._push_service is None):

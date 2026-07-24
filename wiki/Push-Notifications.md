@@ -85,8 +85,9 @@ and under `notify.report`:
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `relay.url` | str (required) | none | The relay endpoint alerts are POSTed to. Must be an http(s) URL; the daemon never posts ciphertext anywhere the config did not spell out. |
-| `relay.timeout` | float (Opt) | `10` | Total timeout, in seconds, for each relay request. Must be greater than 0. |
+| `relay.timeout` | float (Opt) | `10` | Total timeout, in seconds, for each relay request. Must be greater than 0. Device POSTs go out together, so this is also the worst case a whole fan-out adds to a report, whatever the fleet size. |
 | `devicesFile` | str (Opt) | unset | Path of a local JSON file holding the paired-device registry. Required when no `state:` section is configured; when set, it is used even if a `state:` section exists. |
+| `allowUnauthenticated` | bool (Opt) | `false` | Serve the `/push/devices` pairing endpoints on a routable (non-loopback, non-socket) listener even with no `web.authToken`. Fail-closed default: with no token the web app has no auth middleware at all, so a `push:` section alongside a routable listener raises a `ConfigError` at load. An `https://` listener with `web.tls.clientCa` set is exempt without this flag (mutual TLS authenticates the caller); plain `https://` is not. Set true only when the endpoints are protected by other means (an mTLS-terminating proxy, a network policy). |
 
 ## Pairing devices
 
@@ -167,8 +168,13 @@ are on the [HTTP API page](HTTP-API#get-pushdevices).
 
 ### Pair over a trusted transport, then compare fingerprints
 
-Two things travel during pairing that are worth protecting: the QR payload
-embeds a bearer token, and the pairing POST carries the device public key
+Pairing endpoints sit behind the web API's bearer token whenever one is
+configured, and the daemon refuses to start a `push:` section on a routable
+listener that has none (see [Failure behavior](#failure-behavior)), so an
+ungated pairing endpoint can only exist on loopback or a unix socket. Two
+things still travel during pairing that are worth protecting: the QR
+payload embeds a bearer token, and the pairing POST carries the device
+public key
 that every future alert is sealed to. On a transport an attacker can read
 or rewrite (plaintext HTTP across a shared network), the token can be
 stolen and, worse, the key can be substituted: alerts would then seal to
@@ -199,10 +205,15 @@ The registry has two homes; exactly one is in effect:
   pushes to the same device set. The documents are never swept by state
   garbage collection: a pairing lives until it is explicitly revoked.
 - **`push.devicesFile`** (required on stateless installs): a single local
-  JSON file, written atomically (temp file plus rename) and created with
-  owner-only permissions where the platform honors them. A file that fails
-  to parse refuses writes rather than overwriting possibly recoverable
-  pairings.
+  JSON file, written atomically (a uniquely named temp file plus a rename)
+  and created with owner-only permissions where the platform honors them.
+  A file that fails to parse refuses writes rather than overwriting
+  possibly recoverable pairings, and a temp file left beside it by a write
+  that never finished is swept by a later one. Reads and writes run on a
+  private worker thread, are bounded at 10 seconds, and are serialized
+  process-wide per file path, so a registry on a hung mount degrades
+  pairing (the endpoints answer `503`) without stalling the scheduler or
+  process shutdown.
 
 Both homes also hold the installation's collapse salt: the `collapseSalt`
 key in `devicesFile`, or a `pushmeta` document in the state store. It is
@@ -213,8 +224,10 @@ same alert, and the relay never sees the salt itself.
 The reporting path reads an in-memory mirror of the registry, refreshed at
 most every 60 seconds, so a slow or briefly unavailable store can never
 stall a report fan-out; a pairing made on another node becomes effective
-within that window. The pairing endpoints always read and write the store
-directly.
+within that window. A read that fails is remembered for about 5 seconds,
+so a burst of alerts against an unreachable store costs one attempt
+between them rather than one each. The pairing endpoints always read and
+write the store directly.
 
 ## Size limits and what an alert contains
 
@@ -250,15 +263,26 @@ runtime degradations:
 - a `push:` section with neither a `state:` section nor `devicesFile`
   (the registry needs somewhere durable to live);
 - a `push.relay.url` that is not http(s), or a non-positive
-  `push.relay.timeout`.
+  `push.relay.timeout`;
+- a `push:` section on a daemon whose web API listens on a routable
+  address with no `web.authToken`/`web.authTokens`. Pairing is a mutating
+  endpoint and a token is what installs the auth middleware at all, so
+  without one anything that can reach the listener can pair its own key
+  and keep receiving alerts. Give the web API a token, keep `web.listen`
+  on loopback or a unix socket, set `web.tls.clientCa`, or set
+  `push.allowUnauthenticated: true`.
 
 At runtime, delivery is deliberately non-fatal: a sealing failure or relay
 outage is logged per device and never raised into the reporting path, so a
 relay outage can never look like a reporting crash or affect the other
-reporters. An alert fired with no device paired is dropped with a warning
-naming the pairing endpoint. When the registry store is unreachable, report
-fan-outs fall back to the last-known device set, and the pairing endpoints
-answer `503` per request.
+reporters. The devices are POSTed to concurrently, so an unreachable relay
+delays a report by one `relay.timeout` rather than one per device, and
+therefore does not hold up retry arming or a graceful shutdown by the sum.
+An alert fired with no device paired is dropped with a warning naming the
+pairing endpoint. When the registry store is unavailable, whether
+unreachable or holding a document this build cannot read, report fan-outs
+fall back to the last-known device set and say so, and the pairing
+endpoints answer `503` per request.
 
 ## Relay protocol
 

@@ -1222,6 +1222,11 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 # section the registry rides the durable store instead
                 # (cluster-visible). One of the two must exist.
                 Opt("devicesFile"): EmptyNone() | Str(),
+                # The escape hatch for the fail-closed web-auth gate, the
+                # twin of mcp.allowUnauthenticated: serve the /push/devices
+                # pairing endpoints on a routable listener that has no
+                # web.authToken. See _validate_push_config.
+                Opt("allowUnauthenticated"): Bool(),
             }
         ),
     }
@@ -3528,6 +3533,34 @@ def _web_has_any_token(web: dict) -> bool:
     return bool(web.get("authToken") or web.get("authTokens"))
 
 
+def _open_routable_listeners(web: dict) -> List[str]:
+    """Web listeners a stranger could reach with no credential at all.
+
+    Shared by the ``mcp`` and ``push`` fail-closed gates, which guard
+    different endpoints against the same hazard: cronstable installs its
+    auth middleware only when a token resolves, so with no
+    ``web.authToken``/``web.authTokens`` there is no middleware and every
+    route on every listener answers whoever can connect.  Empty when any
+    token is configured, and empty when every listener is loopback or a
+    unix socket (nothing off-host can reach those).
+
+    An ``https`` listener with ``web.tls.clientCa`` set authenticates its
+    callers at the transport (CERT_REQUIRED against that CA), the same
+    guarantee these gates already accept from an mTLS-terminating proxy,
+    so it does not count as open.  Plain ``https`` does: transport
+    encryption is not caller authentication.
+    """
+    if _web_has_any_token(web):
+        return []
+    mtls = bool((web.get("tls") or {}).get("clientCa"))
+    return [
+        a
+        for a in web.get("listen") or ()
+        if not _is_local_listener(a)
+        and not (mtls and str(a).startswith("https://"))
+    ]
+
+
 def _validate_mcp_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for the MCP server that also need the web section.
 
@@ -3554,20 +3587,9 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
             "mcp.toolsets includes 'act' but mcp.readOnly is true; mutating "
             "tools stay suppressed until readOnly is set false"
         )
-    if mcp.get("allowUnauthenticated") or _web_has_any_token(web):
+    if mcp.get("allowUnauthenticated"):
         return
-    # An https listener with web.tls.clientCa authenticates its callers at the
-    # transport (CERT_REQUIRED against that CA), which is the same guarantee
-    # this gate already accepts from an mTLS-terminating proxy. Plain https
-    # only encrypts, so it stays routable-and-unauthenticated: transport
-    # encryption is not caller authentication.
-    mtls = bool((web.get("tls") or {}).get("clientCa"))
-    routable = [
-        a
-        for a in web["listen"]
-        if not _is_local_listener(a)
-        and not (mtls and str(a).startswith("https://"))
-    ]
+    routable = _open_routable_listeners(web)
     if routable:
         raise ConfigError(
             "mcp.enabled is set but no web.authToken/authTokens is set, and "
@@ -3663,6 +3685,38 @@ def _validate_push_config(config: "CronstableConfig") -> None:
             "configure a `state:` section (shared store, cluster-visible "
             "pairings) or set push.devicesFile (single node)"
         )
+    # The same gate the mcp section gets, on the same evidence and for the
+    # same reason: /push/devices is the other mutating surface the web API
+    # exposes, and without a token there is no auth middleware to gate it.
+    # An open pairing endpoint is worse than an open read endpoint, because
+    # the damage outlives the exposure: a stranger who pairs once keeps
+    # receiving every alert from anywhere, forever, and the only trace is an
+    # extra row in a listing nobody re-reads.
+    #
+    # No web section (or no listener) means no pairing endpoint exists at
+    # all, which is a legitimate shape: on a cluster, one node serves the
+    # dashboard and pairs devices while the others only send to the
+    # registry they share. So gate on the listeners, never on push itself.
+    web = config.web_config
+    if web is not None and not push_conf.get("allowUnauthenticated"):
+        routable = _open_routable_listeners(web)
+        if routable:
+            raise ConfigError(
+                "a `push:` section is configured but no "
+                "web.authToken/authTokens is set, and the web API listens "
+                "on non-loopback address(es) {}: the /push/devices pairing "
+                "endpoints would be served without authentication (with no "
+                "token the web app installs no auth middleware at all), so "
+                "anything that can reach the listener can pair its own key "
+                "and receive every job failure, hostname, exit code and "
+                "captured output tail from then on. Set web.authToken or a "
+                "web.authTokens entry, restrict web.listen to "
+                "loopback/unix-socket addresses, set web.tls.clientCa so "
+                "the listener authenticates callers by certificate, or set "
+                "push.allowUnauthenticated: true when the endpoints are "
+                "protected by other means (an mTLS-terminating proxy, a "
+                "network policy).".format(", ".join(routable))
+            )
 
 
 @dataclass(slots=True)
@@ -4002,6 +4056,7 @@ def _build_push_config(raw: dict) -> Dict[str, Any]:
     return {
         "relay": {"url": url, "timeout": timeout},
         "devicesFile": raw.get("devicesFile") or None,
+        "allowUnauthenticated": bool(raw.get("allowUnauthenticated")),
     }
 
 
