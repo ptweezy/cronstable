@@ -29,8 +29,12 @@ Bonjour requires the `discovery` extra:
 pip install "cronstable[discovery]"
 ```
 
-(The extra is python-zeroconf. The release binaries bundle it best-effort
-per architecture.)
+(The extra is python-zeroconf, which is LGPL-2.1-licensed: the release
+binaries and Docker images bundle it together with its license notice.
+Any binary prints the notice with `cronstable --third-party-licenses`,
+and each GitHub Release attaches the library's source archive; the full
+compliance story is in
+[LICENSING.md](https://github.com/ptweezy/cronstable/blob/main/LICENSING.md).)
 
 The boolean form advertises under the hostname:
 

@@ -12,8 +12,10 @@ block_cipher = None
 # Python DLL ("Invalid access to memory location"). So strip only off Windows.
 STRIP = sys.platform != "win32"
 
-# bundle the single-page web UI (cronstable/web/index.html) so the binary serves
-# it without needing any files on disk
+# bundle the single-page web UI (cronstable/web/index.html) so the binary
+# serves it without needing any files on disk, plus the third-party license
+# notices (cronstable/licenses/*.txt) that `--third-party-licenses` prints:
+# the LGPL notice for bundled zeroconf must travel inside the binary itself.
 datas = collect_data_files("cronstable")
 
 # uvloop and orjson are optional runtime accelerators, each imported behind a
@@ -50,6 +52,18 @@ try:
     hiddenimports.append("nacl.public")
 except ImportError:
     pass
+# zeroconf (the `discovery` extra, behind web.bonjour): same guarded-import
+# pattern as pynacl above. It is LGPL-2.1; bundling is deliberate and paired
+# with the compliance kit (the in-binary notice behind --third-party-licenses,
+# the source archive attached to every GitHub Release, and the public build
+# recipe as the relink path). See LICENSING.md before changing anything here.
+try:
+    import zeroconf  # noqa: F401
+    import zeroconf.asyncio  # noqa: F401
+
+    hiddenimports.extend(["zeroconf", "zeroconf.asyncio"])
+except ImportError:
+    pass
 
 
 # Modules that are never reachable at runtime but that the analysis (or a
@@ -83,12 +97,6 @@ excludes = [
     "lib2to3",
     "ensurepip",
     "pydoc_data",
-    # zeroconf (the `discovery` extra) must never ride into a frozen
-    # binary: it is LGPL-2.1, and a onefile -OO freeze defeats the
-    # LGPL relink/replacement right (see LICENSING.md). The binary CI
-    # lanes do not install it, so this is insurance against a build
-    # environment that happens to have it (e.g. dev deps installed).
-    "zeroconf",
 ]
 
 

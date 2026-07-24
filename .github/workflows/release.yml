@@ -269,11 +269,11 @@ jobs:
   # never slip in. scripts/check_licenses.py reads the INSTALLED dist metadata
   # (no third-party scanner) and fails on a disallowed license; weak file-scoped
   # copyleft (LGPL/MPL) is reported but allowed. It installs the runtime plus
-  # every distributable extra (`speedups` rides in the binaries and Docker,
-  # `push` too, `discovery` in Docker only) so nothing the artifacts or images
-  # can carry escapes the scan. zeroconf (discovery) is LGPL-2.1: expected in
-  # the report, and the reason it stays OUT of the frozen binaries. See
-  # LICENSING.md.
+  # every distributable extra (`speedups`, `push`, and `discovery` all ride in
+  # the binaries and Docker images) so nothing the artifacts can carry escapes
+  # the scan. zeroconf (discovery) is LGPL-2.1: expected in the report, and
+  # shipped with its compliance kit (in-binary notice, Release source archive,
+  # public build recipe). See LICENSING.md.
   licenses:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -426,16 +426,21 @@ jobs:
           # sealed box so a miscompiled libsodium also fails the job.
           uv pip install "pynacl>=1.5"
           uv run python pyinstaller/verify_pynacl.py
-          # zeroconf (the `discovery` extra) is deliberately NOT bundled:
-          # it is LGPL-2.1, and a onefile -OO freeze defeats the LGPL
-          # relink/replacement right. web.bonjour needs a pip-based
-          # install instead; see LICENSING.md.
+          # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
+          # Python with optional speedups, so the install works on every
+          # arch and is a HARD failure too. It is LGPL-2.1: the notice
+          # ships inside the binary (--third-party-licenses), the source
+          # archive is attached to the Release, and the public build
+          # recipe is the relink path. See LICENSING.md.
+          uv pip install "zeroconf>=0.132"
+          uv run python -c "import zeroconf, zeroconf.asyncio"
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
-          # Prove the FROZEN bundle reaches PyNaCl too: a push-enabled
-          # config passes --validate-config only when nacl imports inside
-          # the binary (push fails closed otherwise), catching an analysis
-          # or hiddenimport miss that --version cannot.
+          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
+          # push-plus-bonjour config passes --validate-config only when
+          # both import inside the binary (both fail closed otherwise),
+          # catching an analysis or hiddenimport miss that --version
+          # cannot.
           dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
           mv dist/cronstable "dist/cronstable-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v7.0.1
@@ -534,14 +539,18 @@ jobs:
               apk add --no-cache libffi-dev make >/dev/null 2>&1 || true
               pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
               python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
-              # zeroconf (the `discovery` extra) is deliberately NOT
-              # bundled: LGPL-2.1 in a onefile -OO freeze defeats the
-              # relink right. See LICENSING.md.
+              # Bundle zeroconf (the `discovery` extra): pure Python with
+              # optional speedups, so a HARD install even under QEMU. It
+              # is LGPL-2.1; the in-binary notice, Release source
+              # archive, and public build recipe are the compliance kit
+              # (see LICENSING.md).
+              pip install "zeroconf>=0.132"
+              python -c "import zeroconf, zeroconf.asyncio"
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: a musl binary on a musl host
               # Whenever the build env kept pynacl, the frozen binary
-              # must reach it too: a push-enabled config validates only
-              # when nacl imports inside the bundle.
+              # must reach it (and zeroconf) too: the push-plus-bonjour
+              # config validates only when both import inside the bundle.
               if python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
@@ -631,14 +640,18 @@ jobs:
               apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true
               pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
               python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
-              # zeroconf (the `discovery` extra) is deliberately NOT
-              # bundled: LGPL-2.1 in a onefile -OO freeze defeats the
-              # relink right. See LICENSING.md.
+              # Bundle zeroconf (the `discovery` extra): pure Python with
+              # optional speedups, so a HARD install even under QEMU. It
+              # is LGPL-2.1; the in-binary notice, Release source
+              # archive, and public build recipe are the compliance kit
+              # (see LICENSING.md).
+              pip install "zeroconf>=0.132"
+              python -c "import zeroconf, zeroconf.asyncio"
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
               # Whenever the build env kept pynacl, the frozen binary
-              # must reach it too: a push-enabled config validates only
-              # when nacl imports inside the bundle.
+              # must reach it (and zeroconf) too: the push-plus-bonjour
+              # config validates only when both import inside the bundle.
               if python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
@@ -718,13 +731,15 @@ jobs:
           # ship the advertised push channel disabled).
           uv pip install "pynacl>=1.5"
           uv run python pyinstaller/verify_pynacl.py
-          # zeroconf (the `discovery` extra) is deliberately NOT bundled:
-          # LGPL-2.1 in a onefile -OO freeze defeats the relink right.
-          # See LICENSING.md.
+          # Bundle zeroconf (the `discovery` extra): pure Python, wheels
+          # on both arches, HARD failure. LGPL-2.1; in-binary notice +
+          # Release source archive + public build recipe (LICENSING.md).
+          uv pip install "zeroconf>=0.132"
+          uv run python -c "import zeroconf, zeroconf.asyncio"
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
-          # Prove the FROZEN bundle reaches PyNaCl too (push fails closed
-          # at config validation when nacl cannot import).
+          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
+          # fail closed at config validation when they cannot import).
           dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
           # Assert the binary is the intended native arch: Rosetta would happily
           # run an x86_64 build on the arm64 runner and let the smoke test pass,
@@ -848,13 +863,16 @@ jobs:
           # silently ship the advertised push channel disabled).
           uv pip install "pynacl>=1.5"
           uv run python pyinstaller/verify_pynacl.py
-          # zeroconf (the `discovery` extra) is deliberately NOT bundled:
-          # LGPL-2.1 in a onefile -OO freeze defeats the relink right.
-          # See LICENSING.md.
+          # Bundle zeroconf (the `discovery` extra): pure Python, wheels
+          # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
+          # notice + Release source archive + public build recipe
+          # (LICENSING.md).
+          uv pip install "zeroconf>=0.132"
+          uv run python -c "import zeroconf, zeroconf.asyncio"
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
-          # Prove the FROZEN bundle reaches PyNaCl too (push fails closed
-          # at config validation when nacl cannot import).
+          # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
+          # fail closed at config validation when they cannot import).
           ./dist/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
           mv dist/cronstable.exe "dist/cronstable-windows-${{ matrix.arch }}.exe"
       - uses: actions/upload-artifact@v7.0.1
@@ -1287,6 +1305,21 @@ jobs:
             cat perf/perf-summary.md
           } >> release-notes.md
 
+      # LGPL source offer for the bundled python-zeroconf: attach its sdist
+      # (same requirement the binary lanes installed, resolved within this
+      # run) plus the notice file, so the Release page itself provides the
+      # license text and equivalent access to the library source next to
+      # the binaries that bundle it. --no-deps on purpose: only zeroconf is
+      # LGPL; its dependencies are permissive and covered by the licenses
+      # gate. See LICENSING.md.
+      - name: Fetch python-zeroconf source (LGPL source offer)
+        run: |
+          set -euo pipefail
+          mkdir -p third-party
+          python3 -m pip download "zeroconf>=0.132" --no-deps --no-binary :all: -d third-party
+          cp cronstable/licenses/THIRD-PARTY-NOTICES.txt third-party/
+          ls -l third-party
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.2
         with:
@@ -1307,6 +1340,8 @@ jobs:
           files: |
             SHA256SUMS
             perf/perf-*
+            third-party/THIRD-PARTY-NOTICES.txt
+            third-party/zeroconf-*.tar.gz
             dist/*.whl
             dist/*.tar.gz
             binaries/cronstable-linux-amd64

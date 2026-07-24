@@ -369,6 +369,13 @@ def main_loop(loop):
         "running the same set of jobs",
     )
     parser.add_argument("--version", default=False, action="store_true")
+    parser.add_argument(
+        "--third-party-licenses",
+        default=False,
+        action="store_true",
+        help="print the bundled third-party license notices (the LGPL "
+        "notice for python-zeroconf) and exit",
+    )
     _add_state_subcommands(parser)
     # `lock run NAME [flags] -- CMD...` carries an arbitrary trailing command.
     # argparse cannot capture it portably: nargs=REMAINDER swallows our own
@@ -398,6 +405,20 @@ def main_loop(loop):
 
     if args.version:
         print(cronstable.version.version)
+        sys.exit(0)
+
+    if args.third_party_licenses:
+        # Package data, so the notice travels inside every artifact the
+        # code does (wheel, Docker, the one-file frozen binaries): the
+        # LGPL notice for bundled python-zeroconf must accompany the
+        # binary itself, not just the repository. See LICENSING.md.
+        from importlib.resources import files
+
+        print(
+            files("cronstable")
+            .joinpath("licenses/THIRD-PARTY-NOTICES.txt")
+            .read_text(encoding="utf-8")
+        )
         sys.exit(0)
 
     command = getattr(args, "command", None)
