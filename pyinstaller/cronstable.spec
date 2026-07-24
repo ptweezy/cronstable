@@ -42,14 +42,17 @@ except ImportError:
     pass
 # pynacl (the `push` extra): cronstable/push guards `from nacl.public
 # import ...` in a try/except, the pattern the analysis is most likely
-# to drop. Name the exact module we import so PyInstaller's nacl hook
-# pulls the cffi bindings and the bundled libsodium along with it. The
-# binary lanes verify a real sealed-box round-trip before freezing and
-# a push-enabled --validate-config after, so a miss here fails CI.
+# to drop. Name the exact module we import, AND cffi's `_cffi_backend`
+# extension: nacl's compiled `_sodium` module imports it from generated
+# code the static analysis cannot see, so without the explicit entry the
+# frozen import dies with "No module named '_cffi_backend'" while the
+# libsodium .so sits uselessly in the bundle. The binary lanes verify a
+# real sealed-box round-trip before freezing and a push-enabled
+# --validate-config after, so a miss here fails CI.
 try:
     import nacl.public  # noqa: F401
 
-    hiddenimports.append("nacl.public")
+    hiddenimports.extend(["nacl.public", "_cffi_backend"])
 except ImportError:
     pass
 # zeroconf (the `discovery` extra, behind web.bonjour): same guarded-import
