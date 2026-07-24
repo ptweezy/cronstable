@@ -4044,8 +4044,14 @@ def _build_push_config(raw: dict) -> Dict[str, Any]:
     url = (relay.get("url") or "").strip()
     parsed = _safe_urlparse(url, "push.relay.url")
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        # Redacted, like every other URL echoed into a ConfigError: a
+        # scheme-less `user:pass@host` lands exactly here (urlparse reads
+        # the userinfo as the scheme), and this message is printed at
+        # startup and logged by the reload loop on every reparse.
         raise ConfigError(
-            "push.relay.url must be an http(s) URL, got {!r}".format(url)
+            "push.relay.url must be an http(s) URL, got {!r}".format(
+                _redact_userinfo(url)
+            )
         )
     # `is None`, not `or`: an explicit `timeout: 0` must reach the range
     # check below and be refused, not silently become the default.

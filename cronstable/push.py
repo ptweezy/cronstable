@@ -569,6 +569,13 @@ class FileDeviceStore:
             with open(self.path, "rt", encoding="utf-8") as stream:
                 doc = json.load(stream)
         except FileNotFoundError:
+            # A missing file is a well-defined empty registry, not damage:
+            # clear any stale corrupt flag, or an operator who removed a
+            # bad file (exactly what the write-refusal message tells them
+            # to do) would stay locked out of writes until a daemon
+            # restart, since this store object lives as long as the push
+            # config is unchanged.
+            self._corrupt = None
             return []
         except (OSError, ValueError) as exc:
             self._corrupt = str(exc)

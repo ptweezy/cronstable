@@ -1398,6 +1398,12 @@ class Cron:
         self.retry_state = {}  # type: Dict[str, JobRetryState]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
+        # (scheme, socket name) per successfully bound TCP listener of the
+        # RUNNING web app, in listen order, recorded as each site starts:
+        # the Bonjour advert must name a port, scheme and address that all
+        # belong to one listener, which nothing can reconstruct after the
+        # fact (runner.addresses has no schemes and skips failed binds).
+        self._web_tcp_bound = []  # type: List[Tuple[str, Any]]
         # On-disk fingerprint of the web.tls files as the RUNNING listener
         # loaded them. The SSLContext is built once per (re)start and never
         # reloaded, so an in-place rotation (same paths, new bytes, which is
@@ -5440,6 +5446,7 @@ class Cron:
                 logger.info("web: %s, stopping http server", reason)
                 await self.web_runner.cleanup()
                 self.web_runner = None
+                self._web_tcp_bound = []
                 self._web_tls_signature = None
 
         # Build the listener's TLS context ONCE per (re)start, before anything
@@ -5559,7 +5566,14 @@ class Cron:
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
             socket_mode = web_config.get("socketMode")
+            self._web_tcp_bound = []
             for addr in web_config["listen"]:
+                # How many sockets the runner reported before this site:
+                # whatever `addresses` gains from start() below belongs to
+                # this listen entry, which is the only moment its scheme
+                # and its bound sockets are both in hand (a hostname bind
+                # can add several).
+                bound_before = len(self.web_runner.addresses)
                 try:
                     site = web_site_from_url(
                         self.web_runner, addr, tls_context
@@ -5571,6 +5585,12 @@ class Cron:
                     # update or reporting it as an internal bug.
                     logger.warning("web: could not listen on %s: %s", addr, ex)
                     continue
+                scheme = urlparse(addr).scheme
+                for sockname in self.web_runner.addresses[bound_before:]:
+                    # TCP sites report (host, port[, flowinfo, scope]);
+                    # unix sockets report their path string.
+                    if isinstance(sockname, (tuple, list)):
+                        self._web_tcp_bound.append((scheme, sockname))
                 logger.info("web: started listening on %s", addr)
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
@@ -5609,34 +5629,20 @@ class Cron:
         """The `_cronstable._tcp` advert the current web state calls for.
 
         None whenever there is nothing (or no wish) to advertise: the
-        advert is off, the web app is not running, or no TCP port is
-        bound (unix-socket-only listens; config validation refuses that
-        combination up front, this is the runtime belt to that brace).
+        advert is off, the web app is not running, or no bound listener
+        is dialable from another machine (see
+        :meth:`_advertisable_listener`, which logs why).
         """
         if web_config is None or self.web_runner is None:
             return None
         bonjour = resolve_bonjour_config(web_config)
         if bonjour is None:
             return None
-        port = None
-        for addr in self.web_runner.addresses:
-            # TCP sites report (host, port[, flowinfo, scope]); unix
-            # sockets report their path string.
-            if isinstance(addr, (tuple, list)) and len(addr) >= 2:
-                port = int(addr[1])
-                break
-        if not port:
-            logger.warning(
-                "bonjour: no bound TCP web listener to advertise; "
-                "skipping the advert"
-            )
+        chosen = self._advertisable_listener()
+        if chosen is None:
             return None
-        scheme = (
-            "https"
-            if any(str(a).startswith("https://") for a in web_config["listen"])
-            else "http"
-        )
-        return {
+        scheme, port, address = chosen
+        advert: Dict[str, Any] = {
             "name": bonjour.get("name") or report_hostname(),
             "port": port,
             "properties": {
@@ -5644,6 +5650,62 @@ class Cron:
                 "scheme": scheme,
             },
         }
+        if address is not None:
+            advert["address"] = address
+        return advert
+
+    def _advertisable_listener(
+        self,
+    ) -> Optional[Tuple[str, int, Optional[str]]]:
+        """The one (scheme, port, address) worth advertising, or None.
+
+        All three must describe the SAME listener: the advert exists to
+        be dialed by another machine, and its previous shape glued the
+        first bound port to an "https if any listen entry is https"
+        scheme and the outbound-route IP, which on a mixed listen list
+        (loopback http for local tools, https on the LAN) named an
+        endpoint nothing served.  Selection: the first bound https
+        listener a LAN peer can reach, else the first such http one.
+        A loopback-bound listener is never advertised (its port is
+        unreachable from any other machine), and a listener bound to
+        one specific IPv6 address is skipped because the advert's A
+        record is IPv4-only.
+
+        The address element is the listener's own IP for a specific
+        IPv4 bind (the outbound-route probe could name a different
+        interface than the one the socket lives on) and None for a
+        wildcard bind, where the advertiser probes the primary address.
+        """
+        candidates = []  # type: List[Tuple[str, int, Optional[str]]]
+        skipped_v6 = False
+        for scheme, sockname in self._web_tcp_bound:
+            host, port = str(sockname[0]), int(sockname[1])
+            if host.startswith("127.") or host == "::1":
+                continue
+            if host in ("0.0.0.0", "::"):
+                candidates.append((scheme, port, None))
+            elif ":" in host:
+                skipped_v6 = True
+            else:
+                candidates.append((scheme, port, host))
+        if not candidates:
+            if skipped_v6:
+                logger.warning(
+                    "bonjour: the only LAN-reachable web listeners are "
+                    "bound to specific IPv6 addresses and the advert's "
+                    "address record is IPv4-only; skipping the advert"
+                )
+            else:
+                logger.warning(
+                    "bonjour: no LAN-reachable TCP web listener to "
+                    "advertise (loopback and unix listeners cannot be "
+                    "dialed from another machine); skipping the advert"
+                )
+            return None
+        for candidate in candidates:
+            if candidate[0] == "https":
+                return candidate
+        return candidates[0]
 
     @staticmethod
     def _election_relevant(cluster_config: ClusterConfig) -> Dict[str, Any]:

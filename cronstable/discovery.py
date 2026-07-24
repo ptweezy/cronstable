@@ -16,6 +16,7 @@ must never take down a scheduler.
 
 import asyncio
 import logging
+import re
 import socket
 from typing import Any, Dict, Optional
 
@@ -81,6 +82,35 @@ def _instance_name(name: str) -> str:
     return cleaned or "cronstable"
 
 
+#: Appended to the advert's SRV target hostname so it can never equal the
+#: machine's own ``<hostname>.local.``; see :func:`_server_name`.
+_SERVER_SUFFIX = "-cronstable"
+
+
+def _server_name(name: str) -> str:
+    """The advert's SRV target hostname label, distinct and LDH-safe.
+
+    Deliberately NOT the host's own ``<hostname>.local.``: that name
+    already has an owner on most machines (avahi on Linux desktops and
+    servers, mDNSResponder on macOS), defended as a unique record set
+    with the host's full address list.  A second responder claiming the
+    same name with one route-derived IPv4 is the RFC 6762 section 10.2
+    conflict between non-cooperating responders, and avahi resolves it
+    by renaming the whole machine (``hostname-2.local``), breaking every
+    unrelated ``.local`` consumer.  A dedicated label keeps this
+    daemon's A record in a namespace nothing else defends.
+
+    Unlike the instance label (a user-visible display name, where
+    spaces are fine and common), a hostname must survive strict
+    letters-digits-hyphen resolvers, so everything else becomes a
+    hyphen.  The sanitized result is pure ASCII, so the 63-byte label
+    cap is a plain character slice here.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9-]+", "-", name).strip("-")
+    cleaned = cleaned[: 63 - len(_SERVER_SUFFIX)].rstrip("-")
+    return (cleaned + _SERVER_SUFFIX).lstrip("-")
+
+
 class BonjourAdvertiser:
     """Owns the registered mDNS service across config reloads.
 
@@ -102,9 +132,10 @@ class BonjourAdvertiser:
     async def start_stop(self, advert: Optional[Dict[str, Any]]) -> None:
         """Converge the running advert onto ``advert``.
 
-        ``advert`` is ``{"name", "port", "properties"}`` (built by the
-        caller from the web config) or ``None`` for off.  Never raises:
-        a network/mDNS failure logs and leaves the advert off until the
+        ``advert`` is ``{"name", "port", "properties"}`` plus an
+        optional ``"address"`` (built by the caller from the web config
+        and its bound listeners) or ``None`` for off.  Never raises: a
+        network/mDNS failure logs and leaves the advert off until the
         next config apply retries it.
 
         The convergence signature includes the resolved address, so a
@@ -122,7 +153,11 @@ class BonjourAdvertiser:
                 "bonjour: python-zeroconf is not installed; not advertising"
             )
             return
-        address = await self._resolve_address()
+        # An advert may carry the address to publish (the caller knows it
+        # when the advertised listener is bound to one specific IP; the
+        # outbound-route probe could name a different interface).  Only a
+        # wildcard-bound listener leaves it to the probe.
+        address = advert.get("address") or await self._resolve_address()
         if address is None:
             self._signature = None
             await self._unregister()
@@ -152,7 +187,7 @@ class BonjourAdvertiser:
                 addresses=[socket.inet_aton(address)],
                 port=int(advert["port"]),
                 properties=properties,
-                server="{}.local.".format(instance),
+                server="{}.local.".format(_server_name(advert["name"])),
             )
             zeroconf = AsyncZeroconf()
             await asyncio.wait_for(
