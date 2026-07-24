@@ -12,8 +12,10 @@ block_cipher = None
 # Python DLL ("Invalid access to memory location"). So strip only off Windows.
 STRIP = sys.platform != "win32"
 
-# bundle the single-page web UI (cronstable/web/index.html) so the binary serves
-# it without needing any files on disk
+# bundle the single-page web UI (cronstable/web/index.html) so the binary
+# serves it without needing any files on disk, plus the third-party license
+# notices (cronstable/licenses/*.txt) that `--third-party-licenses` prints:
+# the LGPL notice for bundled zeroconf must travel inside the binary itself.
 datas = collect_data_files("cronstable")
 
 # uvloop and orjson are optional runtime accelerators, each imported behind a
@@ -36,6 +38,33 @@ try:
     import orjson  # noqa: F401
 
     hiddenimports.append("orjson")
+except ImportError:
+    pass
+# pynacl (the `push` extra): cronstable/push guards `from nacl.public
+# import ...` in a try/except, the pattern the analysis is most likely
+# to drop. Name the exact module we import, AND cffi's `_cffi_backend`
+# extension: nacl's compiled `_sodium` module imports it from generated
+# code the static analysis cannot see, so without the explicit entry the
+# frozen import dies with "No module named '_cffi_backend'" while the
+# libsodium .so sits uselessly in the bundle. The binary lanes verify a
+# real sealed-box round-trip before freezing and a push-enabled
+# --validate-config after, so a miss here fails CI.
+try:
+    import nacl.public  # noqa: F401
+
+    hiddenimports.extend(["nacl.public", "_cffi_backend"])
+except ImportError:
+    pass
+# zeroconf (the `discovery` extra, behind web.bonjour): same guarded-import
+# pattern as pynacl above. It is LGPL-2.1; bundling is deliberate and paired
+# with the compliance kit (the in-binary notice behind --third-party-licenses,
+# the source archive attached to every GitHub Release, and the public build
+# recipe as the relink path). See LICENSING.md before changing anything here.
+try:
+    import zeroconf  # noqa: F401
+    import zeroconf.asyncio  # noqa: F401
+
+    hiddenimports.extend(["zeroconf", "zeroconf.asyncio"])
 except ImportError:
     pass
 

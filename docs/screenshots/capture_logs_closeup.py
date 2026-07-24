@@ -26,7 +26,7 @@ def main():
             lambda route: route.fulfill(
                 status=200,
                 content_type="text/plain; charset=utf-8",
-                body="1.2.14",
+                body="1.2.31",
             ),
         )
         ctx.add_init_script(

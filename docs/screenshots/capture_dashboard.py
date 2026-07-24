@@ -21,7 +21,21 @@ ONLY = set(sys.argv[1:])
 
 # clean release-style version for the header (the local build carries a long
 # setuptools-scm dev string; a release install shows a clean one like this)
-VERSION = "1.2.14"
+VERSION = "1.2.31"
+
+# what the pair-a-device shot's QR encodes as the bearer. The grand-tour
+# fleet runs unauthenticated, so the panel is staged: this obviously-fake
+# token is seeded into sessionStorage and /whoami is fulfilled as an
+# all-scopes match so the scoped-token warning line is in frame too.
+DEMO_TOKEN = "demo-2f9c41d8a67e4b21"
+WHOAMI_BODY = json.dumps(
+    {
+        "authenticated": True,
+        "label": "authToken",
+        "scopes": ["approve", "control", "view"],
+        "allScopes": True,
+    }
+)
 
 results = {}
 
@@ -327,6 +341,46 @@ def main():
                 close_overlays(page)
             except Exception as e:
                 results["dashboard-settings"] = f"FAIL {e}"
+                close_overlays(page)
+
+        # ---- pair-a-device panel (QR + the scoped-token warning) ----
+        if wants("dashboard-pair"):
+            try:
+                close_overlays(page)
+                page.route(
+                    "**/whoami",
+                    lambda route: route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=WHOAMI_BODY,
+                    ),
+                )
+                page.evaluate(
+                    "sessionStorage.setItem('cronstable_token',"
+                    f" {json.dumps(DEMO_TOKEN)})"
+                )
+                # the settings row closes the sheet before opening the
+                # panel, so this path is deterministic (the palette's
+                # fuzzy ranking is not)
+                page.click("#settingsBtn")
+                page.wait_for_selector(
+                    "#settingsWrap.open, #settingsWrap.show", timeout=4000
+                )
+                page.click("#openPair")
+                page.wait_for_selector("#pairWrap.open", timeout=4000)
+                page.wait_for_selector("#pairQr svg", timeout=4000)
+                page.wait_for_selector(
+                    "#pairWarn", state="visible", timeout=4000
+                )
+                page.wait_for_timeout(400)
+                shot(page, "dashboard-pair")
+                close_overlays(page)
+                page.unroute("**/whoami")
+                page.evaluate(
+                    "sessionStorage.removeItem('cronstable_token')"
+                )
+            except Exception as e:
+                results["dashboard-pair"] = f"FAIL {e}"
                 close_overlays(page)
 
         # ---- DAG index card ----
