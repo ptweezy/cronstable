@@ -18,6 +18,9 @@ import asyncio
 import base64
 import copy
 import json
+import os
+import threading
+import time
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
@@ -111,6 +114,50 @@ class _RelayServer:
     async def _handle(self, request: web.Request) -> web.Response:
         self.requests.append(await request.json())
         return web.json_response({"ok": True}, status=self.status)
+
+
+class _BarrierRelayServer(_RelayServer):
+    """A relay that answers nobody until ``expected`` POSTs are in flight.
+
+    A sequential fan-out can never satisfy it: the first request would be
+    waiting for a second the daemon has not sent yet, so it would sit
+    there until the client's own relay timeout. That makes this a
+    concurrency assertion with no clock in it.
+    """
+
+    def __init__(self, expected: int) -> None:
+        super().__init__()
+        self.expected = expected
+        self.inflight = 0
+        self.peak = 0
+        self._all_here = asyncio.Event()
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        self.requests.append(await request.json())
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        if self.inflight >= self.expected:
+            self._all_here.set()
+        try:
+            # bounded so a regression fails the assertions below rather
+            # than hanging the suite
+            await asyncio.wait_for(self._all_here.wait(), timeout=10)
+        finally:
+            self.inflight -= 1
+        return web.json_response({"ok": True})
+
+
+class _UndecodableRelayServer(_RelayServer):
+    """A relay whose error body is not the utf-8 its header claims."""
+
+    async def _handle(self, request: web.Request) -> web.Response:
+        self.requests.append(await request.json())
+        return web.Response(
+            body=b"\xff\xfe\xfd",
+            status=500,
+            content_type="text/plain",
+            charset="utf-8",
+        )
 
 
 def _service(store, relay_url="http://127.0.0.1:1/unused") -> push.PushService:
@@ -359,6 +406,173 @@ async def test_file_store_write_failure_is_push_error(tmp_path):
         await store.ensure_salt()
 
 
+async def test_file_store_runs_on_a_private_daemon_thread(tmp_path):
+    # Registry I/O used to ride loop.run_in_executor(None, ...): the same
+    # regression tests/test_state_lifecycle_hardening.py guards state
+    # against. The default pool is shared with the once-a-minute config
+    # reload and its workers are non-daemonic, so an op abandoned on a
+    # wedged mount retired one worker per attempt until the reload had no
+    # thread to run on, and interpreter exit hung joining them.
+    store = push.FileDeviceStore(str(tmp_path / "devices.json"))
+    seen = {}
+    real_read = store._read
+
+    def spy():
+        thread = threading.current_thread()
+        seen["daemon"] = thread.daemon
+        seen["name"] = thread.name
+        return real_read()
+
+    store._read = spy  # type: ignore[method-assign]
+    assert await store.load() == []
+    assert seen["daemon"] is True
+    assert seen["name"].startswith("cronstable-push")
+
+
+async def test_file_store_temp_file_is_unique_and_exclusive(
+    tmp_path, monkeypatch
+):
+    # A fixed ".tmp" opened O_TRUNC is a shared mutable file: two writers
+    # interleave into one buffer and then rename each other's half-written
+    # bytes over the registry, which _read refuses to parse and _write then
+    # refuses to repair. Unique name plus O_EXCL, like state._atomic_write.
+    path = tmp_path / "devices.json"
+    store = push.FileDeviceStore(str(path))
+    seen = []
+    real_open = os.open
+
+    def spy(target, flags, *args, **kwargs):
+        if str(target).startswith(str(path)) and str(target).endswith(".tmp"):
+            seen.append((str(target), flags))
+        return real_open(target, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+    await store.upsert({"id": "d1"})
+    await store.upsert({"id": "d2"})
+    assert len(seen) == 2
+    names = {name for name, _ in seen}
+    assert len(names) == 2  # never twice the same temp file
+    assert str(path) + ".tmp" not in names  # and never the fixed name
+    for _, flags in seen:
+        assert flags & os.O_EXCL  # a collision is an error, not a join
+    # nothing is left behind once the renames are done
+    assert [p.name for p in tmp_path.iterdir()] == ["devices.json"]
+
+
+async def test_file_store_abandoned_op_cannot_interleave(tmp_path):
+    # An op that times out leaves its worker mid read-modify-write while
+    # the loop-side lock is released, so the next op used to run against
+    # the file the abandoned worker was about to overwrite: one of the two
+    # pairings simply vanished. The worker-held fence makes the successor
+    # wait for the file, not for its caller.
+    path = tmp_path / "devices.json"
+    store = push.FileDeviceStore(str(path))
+    entered = threading.Event()
+    release = threading.Event()
+    real_write = store._write
+    writes = []
+
+    def slow_write(devices):
+        writes.append([d["id"] for d in devices])
+        if len(writes) == 1:
+            entered.set()
+            release.wait(timeout=30)  # released below; the bound is a net
+        return real_write(devices)
+
+    store._write = slow_write  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(store.upsert({"id": "d1"}), timeout=0.3)
+    assert entered.is_set()  # the abandoned worker really is mid-write
+    second = asyncio.create_task(store.upsert({"id": "d2"}))
+    await asyncio.sleep(0.3)  # every chance to interleave, if it could
+    release.set()
+    await second
+    # the second write saw the first one's result instead of racing it
+    assert writes == [["d1"], ["d1", "d2"]]
+    assert sorted(d["id"] for d in await store.load()) == ["d1", "d2"]
+
+
+async def test_file_store_sweeps_temps_an_earlier_process_abandoned(
+    tmp_path,
+):
+    # Unique temp names are what keep two writers out of one buffer, but
+    # nothing reuses the one a process killed mid-write leaves behind, so
+    # without a sweep they accrete one per event beside the registry.
+    path = tmp_path / "devices.json"
+    store = push.FileDeviceStore(str(path))
+    orphan = tmp_path / "devices.json.999-deadbeef.tmp"
+    orphan.write_text("half a write", encoding="utf-8")
+    os.utime(orphan, (0, time.time() - push.TMP_MAX_AGE - 60))
+    # a temp from a write still in flight is far too young to touch
+    fresh = tmp_path / "devices.json.998-cafebabe.tmp"
+    fresh.write_text("in flight", encoding="utf-8")
+    # and an unrelated neighbour is never a candidate
+    other = tmp_path / "notes.txt"
+    other.write_text("keep me", encoding="utf-8")
+
+    await store.upsert({"id": "d1"})
+
+    assert not orphan.exists()
+    assert fresh.exists()
+    assert other.exists()
+    assert [d["id"] for d in await store.load()] == ["d1"]
+
+
+async def test_file_store_fence_refuses_rather_than_waiting_forever(
+    tmp_path, monkeypatch
+):
+    # The fence is only ever contended after an earlier op already blew
+    # its own budget, so the successor waits a bounded slice and then
+    # says what is actually wrong instead of burning the rest of its
+    # time on a predecessor that is wedged by definition.
+    monkeypatch.setattr(push, "STORE_LOCK_WAIT", 0.05)
+    store = push.FileDeviceStore(str(tmp_path / "devices.json"))
+    held = threading.Event()
+
+    def hold():
+        store._file_lock.acquire()
+        held.set()
+
+    threading.Thread(target=hold, daemon=True).start()
+    await asyncio.get_running_loop().run_in_executor(None, held.wait, 5)
+    try:
+        with pytest.raises(push.PushError, match="an earlier push devices"):
+            await store.load()
+    finally:
+        store._file_lock.release()
+
+
+async def test_file_store_wraps_an_unexpected_error_as_push_error(tmp_path):
+    # The twin of test_state_store_unreadable_document_is_push_error: the
+    # file store owes callers the same bounded contract for an exception
+    # its read/write paths do not model (the backend refusing to start a
+    # worker thread, say), or one escapee takes the rest of the
+    # housekeeping pass with it.
+    store = push.FileDeviceStore(str(tmp_path / "devices.json"))
+
+    def boom():
+        raise RuntimeError("could not start a worker thread")
+
+    store._read = boom  # type: ignore[method-assign]
+    with pytest.raises(push.PushError, match="RuntimeError"):
+        await store.load()
+
+
+async def test_file_store_fence_is_per_path_not_per_instance(tmp_path):
+    # Cron rebuilds the store on every push-config change, so a fence
+    # owned by the store object would not cover the worker an earlier
+    # instance abandoned. A reload is exactly when someone is most likely
+    # to be poking at a wedged install.
+    path = str(tmp_path / "devices.json")
+    first = push.FileDeviceStore(path)
+    second = push.FileDeviceStore(path)
+    assert first._file_lock is second._file_lock
+    # a different registry file gets its own fence
+    other = push.FileDeviceStore(str(tmp_path / "other.json"))
+    assert other._file_lock is not first._file_lock
+
+
 async def test_file_store_salt_created_once_and_preserved(tmp_path):
     path = tmp_path / "devices.json"
     store = push.FileDeviceStore(str(path))
@@ -446,6 +660,45 @@ async def test_state_store_oserror_is_push_error():
     with pytest.raises(push.PushError):
         await store.remove("d1")
     with pytest.raises(push.PushError):
+        await store.ensure_salt()
+
+
+class _UnreadableDocBackend:
+    """A backend that fails a document read the way the real one does.
+
+    ``cronstable.state`` raises its own private ``_DocumentUnreadable``
+    (a plain Exception, not an OSError) when a document exists but cannot
+    be trusted: corrupt bytes, a torn write, an unknown schema.
+    """
+
+    def _boom(self):
+        from cronstable.state import _DocumentUnreadable
+
+        raise _DocumentUnreadable("unknown-schema-or-not-a-document")
+
+    async def list_documents(self, namespace):
+        self._boom()
+
+    async def mutate_document(self, namespace, key, transform):
+        self._boom()
+
+    async def delete_document(self, namespace, key):
+        self._boom()
+
+
+async def test_state_store_unreadable_document_is_push_error():
+    # The finding: _bounded normalized OSError only, so a corrupt
+    # pushmeta/collapse document escaped the PushError contract, out of
+    # start_stop_push and into the housekeeping pass, which then skipped
+    # the durable-state manifest and GC on that pass and every later one.
+    store = push.StateDeviceStore(lambda: _UnreadableDocBackend())
+    with pytest.raises(push.PushError, match="_DocumentUnreadable"):
+        await store.load()
+    with pytest.raises(push.PushError, match="_DocumentUnreadable"):
+        await store.upsert({"id": "d1"})
+    with pytest.raises(push.PushError, match="_DocumentUnreadable"):
+        await store.remove("d1")
+    with pytest.raises(push.PushError, match="_DocumentUnreadable"):
         await store.ensure_salt()
 
 
@@ -629,6 +882,184 @@ async def test_send_report_degraded_registry_uses_last_known(
     )
 
 
+class _WedgedStore:
+    """A registry store that always fails, counting the attempts."""
+
+    kind = "state"
+
+    def __init__(self, delay: float = 0.05) -> None:
+        self.delay = delay
+        self.loads = 0
+        # None keeps it wedged; a list makes load() succeed with it
+        self.ok = None
+
+    def describe(self) -> str:
+        return "wedged"
+
+    async def load(self):
+        self.loads += 1
+        await asyncio.sleep(self.delay)
+        if self.ok is not None:
+            return list(self.ok)
+        raise push.PushError("the registry store is wedged")
+
+    async def ensure_salt(self):
+        raise push.PushError("the registry store is wedged")
+
+
+async def test_concurrent_refreshes_pay_one_store_trip():
+    # The finding: only a SUCCESSFUL load moved the freshness deadline, so
+    # every queued caller woke to a still-stale mirror and started its own
+    # STORE_OP_TIMEOUT behind the refresh lock. A burst of alerts against a
+    # wedged store multiplied the outage instead of absorbing it, and the
+    # last one left minutes late, on a paging channel.
+    store = _WedgedStore()
+    service = _service(store)
+    outcomes = await asyncio.gather(
+        *(service.refresh() for _ in range(5)), return_exceptions=True
+    )
+    assert store.loads == 1
+    assert sum(isinstance(o, push.PushError) for o in outcomes) == 1
+    assert outcomes.count(None) == 4
+
+
+async def test_refresh_retries_once_the_backoff_window_passes(monkeypatch):
+    # The window is a backoff, not a mute: a store that comes back is
+    # visible again within seconds.
+    monkeypatch.setattr(push, "REGISTRY_RETRY_SECONDS", 0.0)
+    store = _WedgedStore(delay=0.0)
+    service = _service(store)
+    for _ in range(3):
+        with pytest.raises(push.PushError):
+            await service.refresh()
+    assert store.loads == 3
+
+
+async def test_failed_forced_refresh_keeps_a_still_good_mirror_window():
+    # A failed FORCED refresh must not shorten a positive window: the
+    # operator opening the pairing page against a wedged store would
+    # otherwise cut a healthy 60-second mirror down to the retry window
+    # and push the next alert back onto a store already known to be down.
+    store = _WedgedStore(delay=0.0)
+    store.ok = [{"id": "d1", "name": "phone"}]
+    service = _service(store)
+    await service.refresh()  # succeeds, arms the full window
+    assert service.get_device("d1") is not None
+    good_until = service._mirror_fresh_until
+    store.ok = None  # the store wedges
+    with pytest.raises(push.PushError):
+        await service.refresh(force=True)
+    assert service._mirror_fresh_until == good_until
+    # so the reporting path still rides the good mirror, no store trip
+    loads = store.loads
+    await service.refresh()
+    assert store.loads == loads
+
+
+async def test_forced_refresh_ignores_the_backoff_window():
+    store = _WedgedStore(delay=0.0)
+    service = _service(store)
+    with pytest.raises(push.PushError):
+        await service.refresh()
+    # the reporting path now rides the mirror instead of the store
+    await service.refresh()
+    assert store.loads == 1
+    # an operator listing or pairing must still see the store itself
+    with pytest.raises(push.PushError):
+        await service.refresh(force=True)
+    assert store.loads == 2
+
+
+async def test_backed_off_alert_names_the_outage_not_the_pairing_page(
+    caplog,
+):
+    # Skipping the read must not skip the diagnosis. Inside the retry
+    # window the reporting path never touches the store, so an alert that
+    # finds the mirror empty would have reported "no device is paired" and
+    # pointed at the pairing endpoint while the real fault is the store.
+    store = _WedgedStore(delay=0.0)
+    service = _service(store)
+    for _ in range(3):
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+    assert store.loads == 1  # one attempt covered all three alerts
+    messages = [r.getMessage() for r in caplog.records]
+    assert sum("registry is unavailable" in m for m in messages) == 3
+    assert not any("no device is paired" in m for m in messages)
+
+
+async def test_recovered_registry_stops_blaming_the_store(caplog):
+    # The clearing half of _registry_error. Without it the diagnosis
+    # inverts: once a store had failed even once, every later alert with
+    # an empty registry would blame a store that is now perfectly fine,
+    # and nobody would be told to go pair a device.
+    store = _WedgedStore(delay=0.0)
+    service = _service(store)
+    await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+    assert any(
+        "registry is unavailable" in r.getMessage() for r in caplog.records
+    )
+    caplog.clear()
+    store.ok = []  # the store is back, and genuinely holds no pairings
+    await service.refresh(force=True)
+    await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("no device is paired" in m for m in messages)
+    assert not any("registry is unavailable" in m for m in messages)
+
+
+async def _pair_extra(service, index):
+    _, public_b64 = _device_keypair()
+    await service.pair(
+        {
+            "name": "phone-{}".format(index),
+            "platform": "ios",
+            "publicKey": public_b64,
+            "pushToken": "tok-{}".format(index),
+        },
+        "authToken",
+    )
+
+
+@requires_pynacl
+async def test_relay_fanout_is_concurrent(tmp_path):
+    # The finding: one device at a time meant a relay that holds requests
+    # open cost the caller one relay_timeout PER PAIRED DEVICE inside
+    # report_failure, which delays the run's retry arming and stretches the
+    # shutdown drain (unbounded, precisely because every reporter was
+    # assumed to be time-bounded).
+    _, public_b64 = _device_keypair()
+    async with _BarrierRelayServer(expected=4) as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        for index in range(3):
+            await _pair_extra(service, index)
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+        assert len(relay.requests) == 4
+        # the relay held all four open at once, which it could only do
+        # because the daemon sent them without waiting for an answer
+        assert relay.peak == 4
+
+
+@requires_pynacl
+async def test_unexpected_error_stays_one_device_s_problem(tmp_path, caplog):
+    # Concurrency must not weaken the per-device isolation this module
+    # promises. A leg that raises something the send path does not model
+    # (here the relay's error body is not the utf-8 it claims, so reading
+    # it raises UnicodeDecodeError) has to become that device's outcome;
+    # under gather an escapee would cancel the siblings still in flight.
+    _, public_b64 = _device_keypair()
+    async with _UndecodableRelayServer() as relay:
+        service, _ = await _paired_service(tmp_path, relay.url, public_b64)
+        await _pair_extra(service, 0)
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+        assert len(relay.requests) == 2  # neither device was cancelled
+    failures = [
+        r.getMessage() for r in caplog.records if "delivery to device" in
+        r.getMessage()
+    ]
+    assert len(failures) == 2
+    assert all("unexpected UnicodeDecodeError" in m for m in failures)
+
+
 @requires_pynacl
 async def test_send_test_collapse_ids_are_unique(tmp_path):
     _, public_b64 = _device_keypair()
@@ -780,6 +1211,7 @@ def test_push_config_parses_with_state(tmp_path, monkeypatch):
             "timeout": 10.0,
         },
         "devicesFile": None,
+        "allowUnauthenticated": False,
     }
 
 
@@ -829,6 +1261,111 @@ push:
     # devicesFile alone satisfies the storage requirement
     _parse_validated(
         yaml + "  devicesFile: /tmp/devices.json\n")
+
+
+_PUSH_WEB_YAML = """
+push:
+  relay:
+    url: https://relay.example.net/v1/notify
+  devicesFile: /tmp/d.json
+{extra}web:
+  listen:
+    - {listen}
+{weblines}"""
+
+
+def _push_web_yaml(listen, weblines="", extra=""):
+    return _PUSH_WEB_YAML.format(
+        listen=listen, weblines=weblines, extra=extra
+    )
+
+
+def test_push_on_routable_listener_without_token_is_refused(monkeypatch):
+    # The twin of the mcp fail-closed gate, for the other mutating surface:
+    # with no token there is no auth middleware, so POST /push/devices would
+    # let anything that can reach the listener pair its own key and keep
+    # receiving alerts long after it left the network.
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    with pytest.raises(ConfigError, match="without authentication") as exc:
+        _parse_validated(_push_web_yaml("http://0.0.0.0:8080"))
+    assert "/push/devices" in str(exc.value)
+    assert "push.allowUnauthenticated" in str(exc.value)
+
+
+def test_push_on_loopback_without_token_is_allowed(monkeypatch):
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    cfg = _parse_validated(_push_web_yaml("http://127.0.0.1:8080"))
+    assert cfg.push_config["allowUnauthenticated"] is False
+
+
+def test_push_on_routable_listener_with_token_is_allowed(monkeypatch):
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    cfg = _parse_validated(
+        _push_web_yaml(
+            "http://0.0.0.0:8080", "  authToken:\n    value: sekret\n"
+        )
+    )
+    assert cfg.push_config["devicesFile"] == "/tmp/d.json"
+
+
+def test_push_scoped_tokens_satisfy_the_gate(monkeypatch):
+    # scoped web.authTokens (no scalar authToken) still install the auth
+    # middleware, and /push/devices sits behind the view/control scopes.
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    _parse_validated(
+        _push_web_yaml(
+            "http://0.0.0.0:8080",
+            "  authTokens:\n"
+            "    - label: phone\n"
+            "      scopes:\n        - control\n"
+            "      value: s3cret\n",
+        )
+    )
+
+
+def test_push_mtls_listener_satisfies_the_gate(monkeypatch):
+    # web.tls.clientCa authenticates callers at the transport, which is the
+    # same guarantee the gate accepts from an mTLS-terminating proxy.
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    _parse_validated(
+        _push_web_yaml(
+            "https://0.0.0.0:8443",
+            "  tls:\n"
+            "    cert: /etc/c.pem\n"
+            "    key: /etc/k.pem\n"
+            "    clientCa: /etc/ca.pem\n",
+        )
+    )
+    # plain https only encrypts, so it is still refused
+    with pytest.raises(ConfigError, match="without authentication"):
+        _parse_validated(
+            _push_web_yaml(
+                "https://0.0.0.0:8443",
+                "  tls:\n    cert: /etc/c.pem\n    key: /etc/k.pem\n",
+            )
+        )
+
+
+def test_push_allow_unauthenticated_escape_hatch(monkeypatch):
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    cfg = _parse_validated(
+        _push_web_yaml(
+            "http://0.0.0.0:8080", extra="  allowUnauthenticated: true\n"
+        )
+    )
+    assert cfg.push_config["allowUnauthenticated"] is True
+
+
+def test_push_without_a_web_section_needs_no_token(monkeypatch):
+    # A node that only SENDS alerts exposes no pairing endpoint at all: the
+    # cluster shape where one node serves the dashboard and pairs devices
+    # into the registry the others share.
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    _parse_validated(
+        "push:\n"
+        "  relay:\n    url: https://relay.example.net/v1/notify\n"
+        "  devicesFile: /tmp/d.json\n"
+    )
 
 
 def test_push_without_pynacl_is_refused(monkeypatch):
@@ -902,6 +1439,39 @@ def test_config_dir_push_section_in_its_own_file(tmp_path, monkeypatch):
     conf = config.parse_config(str(tmp_path))
     assert conf.push_config is not None
     assert conf.push_config["relay"]["url"].endswith("/v1/notify")
+
+
+def test_config_dir_web_and_push_split_still_hits_the_auth_gate(
+    tmp_path, monkeypatch
+):
+    # The gate reads two sections that may live in different files, which
+    # is why it runs on the assembled config. A dir loop that validated
+    # per file could not see a routable web: in one file and a push: in
+    # another, and would serve open pairing endpoints.
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    (tmp_path / "10-web.yaml").write_text(
+        "web:\n  listen:\n    - http://0.0.0.0:8080\n", encoding="utf-8"
+    )
+    (tmp_path / "20-push.yaml").write_text(
+        "push:\n"
+        "  relay:\n"
+        "    url: https://relay.example.net/v1/notify\n"
+        "  devicesFile: {}\n".format((tmp_path / "devices.json").as_posix()),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="without authentication"):
+        config.parse_config(str(tmp_path))
+    # and the escape hatch reaches it across the same split
+    (tmp_path / "20-push.yaml").write_text(
+        "push:\n"
+        "  relay:\n"
+        "    url: https://relay.example.net/v1/notify\n"
+        "  allowUnauthenticated: true\n"
+        "  devicesFile: {}\n".format((tmp_path / "devices.json").as_posix()),
+        encoding="utf-8",
+    )
+    conf = config.parse_config(str(tmp_path))
+    assert conf.push_config["allowUnauthenticated"] is True
 
 
 def test_config_dir_multiple_push_sections_refused(tmp_path):
@@ -1240,6 +1810,52 @@ async def test_start_stop_push_reload_changed_rebuilds(tmp_path):
     await cron.start_stop_push(changed)
     assert cron._push_service.relay_url == "http://127.0.0.1:1/c"
     await cron.start_stop_push(None)
+
+
+async def test_start_stop_push_absorbs_a_corrupt_registry_document(caplog):
+    # The end of the finding-2 chain: an unreadable pushmeta document
+    # escaped the PushError contract, out of start_stop_push, and into the
+    # housekeeping pass, which skipped everything after it (the durable
+    # state manifest and garbage collection) on that pass and on every
+    # later one, since the push config never records as applied.
+    cron = _cron()
+    cron.state_backend = _UnreadableDocBackend()
+    push_config = {
+        "relay": {"url": "http://127.0.0.1:1/unused", "timeout": 5.0},
+        "devicesFile": None,
+    }
+    await cron.start_stop_push(push_config)
+    # the service is up and retries the store on demand; the daemon does
+    # not lose its housekeeping over one bad file
+    assert cron._push_service is not None
+    assert any(
+        "could not load the device registry" in r.getMessage()
+        for r in caplog.records
+    )
+    # and the convergence RECORDS as applied, so the next housekeeping
+    # pass is a no-op instead of rebuilding and re-failing every minute
+    assert cron._applied_push_config == push_config
+    first = cron._push_service
+    await cron.start_stop_push(dict(push_config))
+    assert cron._push_service is first
+    await cron.start_stop_push(None)
+
+
+async def test_start_stop_push_never_raises(monkeypatch, caplog):
+    # Belt to the _bounded braces: whatever slips through convergence, the
+    # housekeeping pass carries on. Nothing about push is worth the durable
+    # state manifest and GC that run immediately after it.
+    cron = _cron()
+
+    async def boom(_push_config):
+        raise RuntimeError("convergence exploded")
+
+    monkeypatch.setattr(cron, "_converge_push", boom)
+    await cron.start_stop_push({"relay": {"url": "http://x/", "timeout": 1}})
+    assert any(
+        "could not converge the push service" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_start_stop_push_state_store_tracks_backend(tmp_path):

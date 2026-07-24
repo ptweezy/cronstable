@@ -46,8 +46,12 @@ version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
   the alert's identity (name, kind, host) intact.
 - **Push is a new optional extra (`push`, PyNaCl) and fails closed**: a
   `push:` section without PyNaCl installed, `report.push.enabled` anywhere
-  without a `push:` section, and a `push:` section with neither a `state:`
-  section nor `devicesFile` are all `ConfigError`s at parse time. The release
+  without a `push:` section, a `push:` section with neither a `state:`
+  section nor `devicesFile`, and a `push:` section on a daemon whose web API
+  listens on a routable address with no `web.authToken`/`web.authTokens`
+  (the `/push/devices` pairing endpoints would answer anyone who can reach
+  the listener; `push.allowUnauthenticated: true` is the override) are all
+  `ConfigError`s at parse time. The release
   binaries bundle PyNaCl per architecture behind a sealed-box verification
   step (a broken build is dropped); a lane that cannot build it ships without
   the extra, and the config error then says so.
