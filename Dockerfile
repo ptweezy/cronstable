@@ -47,7 +47,15 @@ RUN set -eux; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     python -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 .
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 ".[push,discovery]"
+
+# The push (PyNaCl) and discovery (zeroconf) extras above are part of the
+# image contract: a `push:` or `web.bonjour` section fails closed at config
+# load, so an image missing them would crash-loop with no in-image
+# remediation (pip is stripped from the runtime stage below). Verify with a
+# real sealed-box round-trip (catches a QEMU-miscompiled libsodium on the
+# source-built arches) plus a zeroconf import; a failure fails the build.
+RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import zeroconf, zeroconf.asyncio; print("push and discovery extras verified")'
 
 # Best-effort orjson (the `speedups` extra) to accelerate the durable-state and
 # cluster-gossip JSON paths; cronstable/_json falls back to the stdlib json when it

@@ -100,6 +100,22 @@ def test_version_prints_and_exits(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == cronstable.version.version
 
 
+def test_third_party_licenses_prints_and_exits(monkeypatch, capsys):
+    # The notice is package data so it rides inside every artifact; this
+    # also proves importlib.resources can actually reach it (a rename or
+    # a package-data regression would fail here, long before a frozen
+    # binary ships without its LGPL notice).
+    monkeypatch.setattr(
+        sys, "argv", ["cronstable", "--third-party-licenses"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "python-zeroconf" in out
+    assert "GNU LESSER GENERAL PUBLIC LICENSE" in out
+
+
 def test_trailing_dashdash_without_lock_run_errors(monkeypatch, capsys):
     # `--` before anything other than a `lock run` command is rejected by the
     # hand-rolled split (argparse would already have exited otherwise).
