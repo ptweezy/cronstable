@@ -39,7 +39,7 @@ a JSON body:
 | `v` | int | Protocol version. Always `1`. |
 | `device` | string | The platform push token (APNs device token), exactly as the device registered it at pairing time. Opaque to the daemon; the relay uses it to address the notification. |
 | `ciphertext` | string | The sealed alert, base64. A libsodium sealed box encrypted to the target device's X25519 public key. At most 3000 characters, so the relay's final APNs JSON stays under the 4096-byte APNs cap with headroom for the relay's own envelope. |
-| `collapseId` | string | An opaque coalescing key: 32 lowercase hex characters (a truncated SHA-256 over the alert's identity fields, computed by the daemon). The same alert, reported again or by another node, produces the same id. |
+| `collapseId` | string | An opaque coalescing key: 32 lowercase hex characters (a truncated SHA-256 over the alert's identity fields, keyed with a per-installation secret salt the relay never sees). The same alert, reported again or by any node sharing the installation's device registry, produces the same id; without the salt the id is not invertible even for guessable job names. Test alerts are the exception: each carries a fresh random id so a coalescing relay never swallows one. |
 | `priority` | string | `time-sensitive` or `passive`. The relay maps it to the APNs interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
 | `event` | bool | `true` when the alert is a daemon event (the `notify:` fan-out: DAG failures, approval gates, leadership and quorum changes), `false` for job, SLA, and test alerts. Routing metadata only; the event's content is inside the ciphertext. |
 
@@ -82,10 +82,25 @@ path.
   target device's private key (generated on the phone and never leaving it)
   can open.
 - `collapseId` is a truncated hash of identity fields, not the fields
-  themselves: it lets the relay coalesce identical alerts without learning
-  the job name or run id behind them.
+  themselves, and the hash is keyed with a per-installation salt stored
+  beside the device registry and never sent to the relay. Identity fields
+  are low entropy (on a stateless install they reduce to alert kind plus
+  job name), so an unkeyed hash would let a relay recover job names from a
+  precomputed wordlist; the salt closes that.
 - Sealing uses an ephemeral sender key per message (anonymous-sender sealed
   box), so the daemon holds no long-lived sending secret worth stealing.
+
+## Replay protection
+
+The relay (or anyone who can reach APNs with a captured request) can
+re-deliver an old ciphertext; sealed boxes are anonymous-sender, so the
+payload itself is the only place freshness can live. Every sealed
+plaintext carries `ts`, the UTC instant the daemon built the alert. A
+receiving app MUST treat a payload whose `ts` is older than **10 minutes**
+(a window that absorbs clock skew plus APNs delivery latency) as stale:
+render it as an outdated alert or drop it, never as a live page. Future
+protocol versions may tighten the window; it is part of this contract so
+daemon, relay, and app implementations age payloads identically.
 
 ## Sealed plaintext
 

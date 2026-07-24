@@ -1,0 +1,27 @@
+# Post-freeze smoke config for the release binary lanes.
+#
+# The `push:` section makes config validation import PyNaCl from inside
+# the frozen bundle (config._validate_push_config checks HAVE_PYNACL and
+# refuses to start without it), so
+#
+#   cronstable --validate-config -c pyinstaller/smoke-push.yaml
+#
+# succeeds only when a binary that is supposed to carry the push extra
+# can actually reach nacl at runtime. That catches a PyInstaller
+# analysis or hiddenimport miss that the plain --version smoke test
+# cannot: --version never imports cronstable.push.
+#
+# No file I/O happens at validation, so devicesFile never gets created.
+push:
+  relay:
+    url: https://relay.example.invalid/v1/notify
+  devicesFile: ./push-devices-smoke.json
+jobs:
+  - name: smoke
+    command: "true"
+    schedule: "* * * * *"
+    enabled: false
+    onFailure:
+      report:
+        push:
+          enabled: true

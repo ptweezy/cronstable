@@ -78,6 +78,12 @@ DEVICE_PUBLIC_KEY_BYTES = 32
 #: so a pairing survives until it is explicitly revoked.
 PUSH_DOC_NAMESPACE = "pushdevice"
 
+#: Namespace for push metadata that is not a device (today: the one
+#: ``collapse`` document holding the installation's coalescing salt).
+#: Separate from the device namespace so registry listings and revokes
+#: can never see or delete it.
+PUSH_META_NAMESPACE = "pushmeta"
+
 #: How long the in-memory device mirror is trusted before the next send
 #: or listing re-reads the store (a pairing made on another node sharing
 #: the state store becomes visible within this window).
@@ -125,6 +131,18 @@ def validate_public_key(value: Any) -> str:
                 DEVICE_PUBLIC_KEY_BYTES, len(raw)
             )
         )
+    if HAVE_PYNACL:
+        # 32 bytes is not enough: libsodium refuses to seal to all-zero /
+        # low-order points, and it does so at encrypt time, not at key
+        # construction. Probe a real seal here so an unusable key is a
+        # 400 at pairing instead of a persistent registry record that
+        # fails on every alert until an operator revokes it.
+        try:
+            SealedBox(PublicKey(raw)).encrypt(b"probe")
+        except Exception:
+            raise PushError(
+                "publicKey is not a usable X25519 public key"
+            ) from None
     return base64.b64encode(raw).decode("ascii")
 
 
@@ -171,12 +189,15 @@ def seal_to_device(public_key_b64: str, plaintext: bytes) -> str:
         )
     try:
         raw = base64.b64decode(public_key_b64, validate=True)
-        key = PublicKey(raw)
+        # encrypt stays INSIDE the try: libsodium rejects all-zero /
+        # low-order keys at encrypt time (nacl.exceptions.RuntimeError,
+        # not a PushError), and one bad registry record must surface as
+        # a per-device PushError, never escape a whole-fleet fan-out.
+        sealed = SealedBox(PublicKey(raw)).encrypt(plaintext)
     except Exception as exc:
         raise PushError(
             "device public key is unusable: {}".format(exc)
         ) from None
-    sealed = SealedBox(key).encrypt(plaintext)
     return base64.b64encode(sealed).decode("ascii")
 
 
@@ -287,12 +308,18 @@ def fit_payload(payload: Dict[str, Any]) -> bytes:
     return data
 
 
-def collapse_id(payload: Dict[str, Any]) -> str:
+def collapse_id(payload: Dict[str, Any], salt: str) -> str:
     """An opaque coalescing key for the relay: same alert, same id.
 
-    A hash of the alert's identity fields, so the relay can deduplicate
-    the same (job, run) reported by several nodes without learning the
-    job name or run id.
+    A keyed hash of the alert's identity fields, so the relay can
+    deduplicate the same (job, run) reported by several nodes without
+    learning the job name or run id.  ``salt`` is the per-installation
+    secret kept beside the device registry (see ``ensure_salt`` on the
+    stores): without it the identity fields are low-entropy (on a
+    stateless install ``run_id`` is absent, leaving only kind + name),
+    and a relay could recover job names from a precomputed wordlist.
+    The salt is shared by every node using the registry, so cross-node
+    coalescing still works; it is never sent to the relay.
     """
     ident = {
         key: payload[key]
@@ -309,7 +336,30 @@ def collapse_id(payload: Dict[str, Any]) -> str:
         if payload.get(key) not in (None, "")
     }
     blob = json.dumps(ident, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+    keyed = salt.encode("utf-8") + b"\x00" + blob.encode("utf-8")
+    return hashlib.sha256(keyed).hexdigest()[:32]
+
+
+def key_fingerprint(public_key_b64: Optional[str]) -> Optional[str]:
+    """A short, human-comparable fingerprint of a device public key.
+
+    Pairing happens over whatever transport the operator exposed the
+    web API on; nothing in the protocol proves the key the daemon
+    stored is the key the phone generated.  This fingerprint is shown
+    in the device listing and pairing response so the operator can
+    compare it against the one the companion app displays, closing the
+    key-substitution hole an on-path attacker (plaintext HTTP, hostile
+    LAN) would otherwise have.  SHA-256 over the raw 32 key bytes,
+    first 12 hex chars grouped for reading aloud.
+    """
+    if not public_key_b64:
+        return None
+    try:
+        raw = base64.b64decode(public_key_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    return "-".join(digest[i : i + 4] for i in range(0, 12, 4))
 
 
 def public_device(device: Dict[str, Any]) -> Dict[str, Any]:
@@ -319,7 +369,9 @@ def public_device(device: Dict[str, Any]) -> Dict[str, Any]:
     it is the one field that lets a third party address this device
     through the platform push service, so the listing never echoes it
     whole.  The public key is public by definition and returned intact
-    (the app re-checks it against its own on screen).
+    (the app re-checks it against its own on screen), and its
+    ``fingerprint`` is included for the human comparison step (see
+    :func:`key_fingerprint`).
     """
     token = device.get("pushToken") or ""
     return {
@@ -327,6 +379,7 @@ def public_device(device: Dict[str, Any]) -> Dict[str, Any]:
         "name": device.get("name"),
         "platform": device.get("platform"),
         "publicKey": device.get("publicKey"),
+        "fingerprint": key_fingerprint(device.get("publicKey")),
         "pushToken": "…" + token[-6:] if token else "",
         "createdAt": device.get("createdAt"),
         "createdBy": device.get("createdBy"),
@@ -348,9 +401,30 @@ class FileDeviceStore:
         self.path = path
         self._lock = asyncio.Lock()
         self._corrupt: Optional[str] = None
+        self._salt: Optional[str] = None
 
     def describe(self) -> str:
         return "file:{}".format(self.path)
+
+    async def _run(self, fn: Callable[[], Any], doing: str) -> Any:
+        """One blocking file op, off-loop and bounded.
+
+        The devices file may live on a network mount; the read/write
+        itself runs on an executor thread so a wedged mount can never
+        freeze the event loop, and the wait is capped at
+        :data:`STORE_OP_TIMEOUT` like every other store op (the
+        abandoned thread finishes or dies with the mount; the caller
+        gets a PushError either way).
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, fn), timeout=STORE_OP_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            raise PushError(
+                "timed out {} push devices file {}".format(doing, self.path)
+            ) from None
 
     def _read(self) -> List[Dict[str, Any]]:
         try:
@@ -372,6 +446,9 @@ class FileDeviceStore:
                 )
             )
         self._corrupt = None
+        salt = doc.get("collapseSalt")
+        if isinstance(salt, str) and salt:
+            self._salt = salt
         return [d for d in devices if isinstance(d, dict)]
 
     def _write(self, devices: List[Dict[str, Any]]) -> None:
@@ -382,39 +459,80 @@ class FileDeviceStore:
                 "refusing to overwrite unreadable devices file {} "
                 "({}); fix or remove it first".format(self.path, self._corrupt)
             )
-        doc = {"version": 1, "devices": devices}
+        doc: Dict[str, Any] = {"version": 1, "devices": devices}
+        if self._salt:
+            doc["collapseSalt"] = self._salt
         tmp = self.path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            with os.fdopen(fd, "wt", encoding="utf-8") as stream:
-                json.dump(doc, stream, indent=2, sort_keys=True)
-        except BaseException:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        os.replace(tmp, self.path)
+                with os.fdopen(fd, "wt", encoding="utf-8") as stream:
+                    json.dump(doc, stream, indent=2, sort_keys=True)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            # Same bounded-PushError contract as _read: a missing or
+            # read-only directory must become the 503 the pairing
+            # handlers promise, not an aiohttp 500.
+            raise PushError(
+                "push devices file {} is not writable: {}".format(
+                    self.path, exc
+                )
+            ) from None
 
     async def load(self) -> List[Dict[str, Any]]:
         async with self._lock:
-            return self._read()
+            devices: List[Dict[str, Any]] = await self._run(
+                self._read, "reading"
+            )
+            return devices
 
     async def upsert(self, device: Dict[str, Any]) -> None:
-        async with self._lock:
+        def _do() -> None:
             devices = self._read()
             devices = [d for d in devices if d.get("id") != device.get("id")]
             devices.append(device)
             self._write(devices)
 
-    async def remove(self, device_id: str) -> bool:
         async with self._lock:
+            await self._run(_do, "writing")
+
+    async def remove(self, device_id: str) -> bool:
+        def _do() -> bool:
             devices = self._read()
             kept = [d for d in devices if d.get("id") != device_id]
             if len(kept) == len(devices):
                 return False
             self._write(kept)
             return True
+
+        async with self._lock:
+            removed: bool = await self._run(_do, "writing")
+            return removed
+
+    async def ensure_salt(self) -> str:
+        """The per-installation collapse salt, created on first use.
+
+        Persisted as ``collapseSalt`` beside the devices so every
+        process using this file derives the same coalescing ids (see
+        :func:`collapse_id`); preserved verbatim by every rewrite.
+        """
+
+        def _do() -> str:
+            devices = self._read()
+            if not self._salt:
+                self._salt = secrets.token_hex(16)
+                self._write(devices)
+            return self._salt
+
+        async with self._lock:
+            salt: str = await self._run(_do, "initializing")
+            return salt
 
 
 class StateDeviceStore:
@@ -449,17 +567,31 @@ class StateDeviceStore:
             )
         return backend
 
-    async def load(self) -> List[Dict[str, Any]]:
-        backend = self._backend()
+    async def _bounded(self, operation: str, awaitable: Any) -> Any:
+        """Await one store op under the bounded-PushError contract.
+
+        The state backends surface I/O trouble as raw OSError (an NFS
+        ESTALE, a vanished mount); every caller up to send_report and
+        the pairing handlers expects PushError and nothing else, so
+        both timeouts and I/O errors are normalized here.
+        """
         try:
-            docs = await asyncio.wait_for(
-                backend.list_documents(PUSH_DOC_NAMESPACE),
-                timeout=STORE_OP_TIMEOUT,
-            )
+            return await asyncio.wait_for(awaitable, timeout=STORE_OP_TIMEOUT)
         except asyncio.TimeoutError:
             raise PushError(
-                "timed out listing paired devices from the state store"
+                "timed out {} in the state store".format(operation)
             ) from None
+        except OSError as exc:
+            raise PushError(
+                "{} in the state store failed: {}".format(operation, exc)
+            ) from None
+
+    async def load(self) -> List[Dict[str, Any]]:
+        backend = self._backend()
+        docs = await self._bounded(
+            "listing paired devices",
+            backend.list_documents(PUSH_DOC_NAMESPACE),
+        )
         return [d for d in docs if isinstance(d, dict) and d.get("id")]
 
     async def upsert(self, device: Dict[str, Any]) -> None:
@@ -470,31 +602,46 @@ class StateDeviceStore:
             # torn read, and it runs on the store's worker thread.
             return dict(device), None
 
-        try:
-            await asyncio.wait_for(
-                backend.mutate_document(
-                    PUSH_DOC_NAMESPACE, device["id"], _put
-                ),
-                timeout=STORE_OP_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            raise PushError(
-                "timed out writing the device pairing to the state store"
-            ) from None
+        await self._bounded(
+            "writing the device pairing",
+            backend.mutate_document(PUSH_DOC_NAMESPACE, device["id"], _put),
+        )
 
     async def remove(self, device_id: str) -> bool:
         backend = self._backend()
-        try:
-            return bool(
-                await asyncio.wait_for(
-                    backend.delete_document(PUSH_DOC_NAMESPACE, device_id),
-                    timeout=STORE_OP_TIMEOUT,
-                )
+        return bool(
+            await self._bounded(
+                "revoking the device",
+                backend.delete_document(PUSH_DOC_NAMESPACE, device_id),
             )
-        except asyncio.TimeoutError:
-            raise PushError(
-                "timed out revoking the device in the state store"
-            ) from None
+        )
+
+    async def ensure_salt(self) -> str:
+        """The per-installation collapse salt, created on first use.
+
+        One reserved document in :data:`PUSH_META_NAMESPACE`;
+        ``mutate_document``'s fleet-wide lock makes create-if-absent
+        atomic, so every node sharing the store converges on the same
+        salt (the property cross-node coalescing depends on).
+        """
+        # Lazy import, matching config's treatment of this module: only
+        # state-backed installs pay for cronstable.state here.
+        from cronstable.state import DOC_KEEP
+
+        backend = self._backend()
+        candidate = secrets.token_hex(16)
+
+        def _ensure(current: Optional[Dict[str, Any]]) -> Tuple[Any, str]:
+            existing = (current or {}).get("salt")
+            if isinstance(existing, str) and existing:
+                return DOC_KEEP, existing
+            return {"salt": candidate}, candidate
+
+        mutated: Tuple[Any, str] = await self._bounded(
+            "reading the collapse salt",
+            backend.mutate_document(PUSH_META_NAMESPACE, "collapse", _ensure),
+        )
+        return mutated[1]
 
 
 class PushService:
@@ -523,6 +670,13 @@ class PushService:
         self._devices: Dict[str, Dict[str, Any]] = {}
         self._mirror_fresh_until = 0.0
         self._refresh_lock = asyncio.Lock()
+        # The persistent coalescing salt (see collapse_id), fetched with
+        # the first successful refresh. Until the store yields one, the
+        # process-local fallback keeps ids unpredictable to the relay at
+        # the cost of cross-node/restart coalescing -- the safe side of
+        # that trade.
+        self._collapse_salt: Optional[str] = None
+        self._local_salt = secrets.token_hex(16)
 
     async def start(self) -> None:
         """Warm the device mirror; never fatal (the store may be down)."""
@@ -555,6 +709,17 @@ class PushService:
             self._mirror_fresh_until = (
                 asyncio.get_running_loop().time() + REGISTRY_REFRESH_SECONDS
             )
+            if self._collapse_salt is None:
+                try:
+                    self._collapse_salt = await self.store.ensure_salt()
+                except PushError as exc:
+                    logger.warning(
+                        "push: no persistent collapse salt yet (%s); "
+                        "using a process-local one (alerts still send; "
+                        "cross-node coalescing resumes when the "
+                        "registry store recovers)",
+                        exc,
+                    )
 
     def devices_payload(self) -> List[Dict[str, Any]]:
         devices = sorted(
@@ -655,8 +820,15 @@ class PushService:
             "message": "test alert from cronstable",
             "ts": _utcnow_iso(),
         }
+        # A random collapse id per test: every daemon's test alerts would
+        # otherwise share one id (constant kind/name) and a coalescing
+        # relay would swallow all but the first -- the worst outcome for
+        # the one alert whose entire job is "prove delivery works".
         results = await self._send_payload(
-            payload, priority="time-sensitive", only=device
+            payload,
+            priority="time-sensitive",
+            only=device,
+            collapse=secrets.token_hex(16),
         )
         return results[0]
 
@@ -666,9 +838,12 @@ class PushService:
         *,
         priority: str,
         only: Optional[Dict[str, Any]] = None,
+        collapse: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         plaintext = fit_payload(payload)
-        coalesce = collapse_id(payload)
+        coalesce = collapse or collapse_id(
+            payload, self._collapse_salt or self._local_salt
+        )
         is_event = payload.get("kind") == "event"
         targets = [only] if only else list(self._devices.values())
         results = []

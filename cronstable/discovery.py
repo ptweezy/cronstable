@@ -35,6 +35,10 @@ SERVICE_TYPE = "_cronstable._tcp.local."
 #: and the callers (config apply, shutdown) must never hang on it.
 _MDNS_OP_TIMEOUT = 10.0
 
+#: Bound the address probe: the gethostbyname fallback can hang on a
+#: broken resolver, and it runs every housekeeping pass.
+_ADDR_TIMEOUT = 5.0
+
 
 def primary_address() -> Optional[str]:
     """This host's primary outbound IPv4 address, or ``None``.
@@ -65,9 +69,16 @@ def primary_address() -> Optional[str]:
 
 
 def _instance_name(name: str) -> str:
-    """A safe mDNS instance label: dots would split the service name."""
+    """A safe mDNS instance label: dots would split the service name.
+
+    DNS labels cap at 63 BYTES, not characters; a multibyte (e.g.
+    Japanese) hostname truncated by characters can still exceed the
+    limit and make zeroconf raise ``BadTypeInNameException``.  Truncate
+    the UTF-8 encoding and drop any codepoint the cut tore in half.
+    """
     cleaned = name.replace(".", "-").strip("-")
-    return cleaned[:63] or "cronstable"
+    cleaned = cleaned.encode("utf-8")[:63].decode("utf-8", "ignore")
+    return cleaned or "cronstable"
 
 
 class BonjourAdvertiser:
@@ -95,42 +106,54 @@ class BonjourAdvertiser:
         caller from the web config) or ``None`` for off.  Never raises:
         a network/mDNS failure logs and leaves the advert off until the
         next config apply retries it.
+
+        The convergence signature includes the resolved address, so a
+        DHCP lease change or a Wi-Fi hop re-registers the advert on the
+        next housekeeping pass instead of advertising a dead IP until
+        the daemon restarts.
         """
-        if advert == self._signature and (
-            advert is None or self._info is not None
-        ):
-            return
-        await self._unregister()
-        self._signature = advert
         if advert is None:
+            self._signature = None
+            await self._unregister()
             return
         if not HAVE_ZEROCONF:  # pragma: no cover - config validation gates
+            self._signature = None
             logger.error(
                 "bonjour: python-zeroconf is not installed; not advertising"
             )
             return
-        address = primary_address()
+        address = await self._resolve_address()
         if address is None:
+            self._signature = None
+            await self._unregister()
             logger.warning(
                 "bonjour: could not determine a non-loopback address to "
                 "advertise; skipping the advert until the next reload"
             )
-            self._signature = None
             return
-        instance = _instance_name(advert["name"])
-        properties = {
-            key: str(value)
-            for key, value in (advert.get("properties") or {}).items()
-        }
-        info = ServiceInfo(
-            SERVICE_TYPE,
-            "{}.{}".format(instance, SERVICE_TYPE),
-            addresses=[socket.inet_aton(address)],
-            port=int(advert["port"]),
-            properties=properties,
-            server="{}.local.".format(instance),
-        )
+        signature = dict(advert, address=address)
+        if signature == self._signature and self._info is not None:
+            return
+        await self._unregister()
+        self._signature = signature
+        zeroconf = None
         try:
+            instance = _instance_name(advert["name"])
+            properties = {
+                key: str(value)
+                for key, value in (advert.get("properties") or {}).items()
+            }
+            # ServiceInfo construction stays inside the try: zeroconf
+            # validates the name eagerly (BadTypeInNameException), and
+            # this method's never-raises contract covers that too.
+            info = ServiceInfo(
+                SERVICE_TYPE,
+                "{}.{}".format(instance, SERVICE_TYPE),
+                addresses=[socket.inet_aton(address)],
+                port=int(advert["port"]),
+                properties=properties,
+                server="{}.local.".format(instance),
+            )
             zeroconf = AsyncZeroconf()
             await asyncio.wait_for(
                 zeroconf.async_register_service(info),
@@ -143,6 +166,18 @@ class BonjourAdvertiser:
                 exc,
             )
             self._signature = None
+            if zeroconf is not None:
+                # Close the half-built instance: leaking one per
+                # housekeeping pass exhausts fds within a day.
+                try:
+                    await asyncio.wait_for(
+                        zeroconf.async_close(), timeout=_MDNS_OP_TIMEOUT
+                    )
+                except Exception as close_exc:
+                    logger.warning(
+                        "bonjour: close after failed register failed: %s",
+                        close_exc,
+                    )
             return
         self._zeroconf = zeroconf
         self._info = info
@@ -152,6 +187,23 @@ class BonjourAdvertiser:
             address,
             int(advert["port"]),
         )
+
+    async def _resolve_address(self) -> Optional[str]:
+        """:func:`primary_address` off-loop, bounded.
+
+        The gethostbyname fallback inside it is a blocking resolver
+        call; on a broken DNS setup it can stall for seconds, and this
+        runs every housekeeping pass, so it must never run on the event
+        loop.  A timeout counts as "no address" for this pass.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, primary_address),
+                timeout=_ADDR_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return None
 
     async def _unregister(self) -> None:
         zeroconf, info = self._zeroconf, self._info

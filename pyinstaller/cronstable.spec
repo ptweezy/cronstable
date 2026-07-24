@@ -38,6 +38,18 @@ try:
     hiddenimports.append("orjson")
 except ImportError:
     pass
+# pynacl (the `push` extra): cronstable/push guards `from nacl.public
+# import ...` in a try/except, the pattern the analysis is most likely
+# to drop. Name the exact module we import so PyInstaller's nacl hook
+# pulls the cffi bindings and the bundled libsodium along with it. The
+# binary lanes verify a real sealed-box round-trip before freezing and
+# a push-enabled --validate-config after, so a miss here fails CI.
+try:
+    import nacl.public  # noqa: F401
+
+    hiddenimports.append("nacl.public")
+except ImportError:
+    pass
 
 
 # Modules that are never reachable at runtime but that the analysis (or a
@@ -71,6 +83,12 @@ excludes = [
     "lib2to3",
     "ensurepip",
     "pydoc_data",
+    # zeroconf (the `discovery` extra) must never ride into a frozen
+    # binary: it is LGPL-2.1, and a onefile -OO freeze defeats the
+    # LGPL relink/replacement right (see LICENSING.md). The binary CI
+    # lanes do not install it, so this is insurance against a build
+    # environment that happens to have it (e.g. dev deps installed).
+    "zeroconf",
 ]
 
 
