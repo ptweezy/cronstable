@@ -159,7 +159,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   everything and a **[terminal twin](#terminal-dashboard)**
   (`cronstable tui`) with the same keys
 
-[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
+[![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
 
 > The tour above is a single animated image ([WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp); [GIF fallback](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.gif)). Every frame is a real running fleet; see the [web dashboard](#web-dashboard) section for the annotated stills.
 
@@ -1482,6 +1482,8 @@ ride the durable store and are visible to every node sharing it.)
 
 Pair a device from the dashboard ("Pair a device" in the command palette or
 settings, a QR scan) or with one call:
+
+[![The dashboard's Pair a device panel: a QR code of the connection payload, the same JSON as a copyable string, and a warning that the embedded token holds every scope](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
 
 ```shell
 $ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \

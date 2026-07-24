@@ -100,5 +100,11 @@
   ],
   "settings-a11y-sans": [
     "carolina-light"
+  ],
+  "pair": [
+    "carolina-light"
+  ],
+  "pair-sans": [
+    "carolina-light"
   ]
 }
