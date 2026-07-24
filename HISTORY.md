@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## Unreleased
+## 1.2.31 (2026-07-24)
 
 An alerting-reach release. A fifth reporter delivers end-to-end encrypted push
 alerts to paired devices through a hosted relay that never sees plaintext; a
