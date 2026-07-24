@@ -5568,11 +5568,8 @@ class Cron:
             socket_mode = web_config.get("socketMode")
             self._web_tcp_bound = []
             for addr in web_config["listen"]:
-                # How many sockets the runner reported before this site:
-                # whatever `addresses` gains from start() below belongs to
-                # this listen entry, which is the only moment its scheme
-                # and its bound sockets are both in hand (a hostname bind
-                # can add several).
+                # everything `addresses` gains from start() below belongs
+                # to this entry (see _record_bound_listeners)
                 bound_before = len(self.web_runner.addresses)
                 try:
                     site = web_site_from_url(
@@ -5585,12 +5582,9 @@ class Cron:
                     # update or reporting it as an internal bug.
                     logger.warning("web: could not listen on %s: %s", addr, ex)
                     continue
-                scheme = urlparse(addr).scheme
-                for sockname in self.web_runner.addresses[bound_before:]:
-                    # TCP sites report (host, port[, flowinfo, scope]);
-                    # unix sockets report their path string.
-                    if isinstance(sockname, (tuple, list)):
-                        self._web_tcp_bound.append((scheme, sockname))
+                self._record_bound_listeners(
+                    urlparse(addr).scheme, bound_before
+                )
                 logger.info("web: started listening on %s", addr)
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
@@ -5622,6 +5616,21 @@ class Cron:
         # one even for an ephemeral `:0` listen. Converge is cheap (a
         # signature compare) and never raises.
         await self._bonjour.start_stop(self._bonjour_advert(web_config))
+
+    def _record_bound_listeners(self, scheme: str, bound_before: int) -> None:
+        """File the sockets one just-started site added to the runner.
+
+        Everything ``runner.addresses`` gained past ``bound_before``
+        belongs to that site, and its start is the only moment its
+        scheme and its bound sockets are both in hand (a hostname bind
+        can add several).
+        """
+        assert self.web_runner is not None
+        for sockname in self.web_runner.addresses[bound_before:]:
+            # TCP sites report (host, port[, flowinfo, scope]); unix
+            # sockets report their path string.
+            if isinstance(sockname, (tuple, list)):
+                self._web_tcp_bound.append((scheme, sockname))
 
     def _bonjour_advert(
         self, web_config: Optional[WebConfig]

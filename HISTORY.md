@@ -89,12 +89,16 @@ version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
 
 - **`web.bonjour: true` advertises the web API as a `_cronstable._tcp` mDNS
   service**, so a companion app (or `dns-sd -B _cronstable._tcp`) finds the
-  daemon without a typed URL. The advert carries the instance name (the
-  hostname, or the map form's `name:` override), the actually bound TCP port
-  (correct even for an ephemeral `:0` listen), and TXT records `v` (the
-  daemon version) and `scheme` (`http`/`https`). No secrets are advertised; a
-  discovered client still needs a bearer token to read anything. See the
-  [LAN Discovery wiki page](wiki/LAN-Discovery.md).
+  daemon without a typed URL. The advert names one LAN-reachable listener
+  (the first bound https listen entry another machine can dial, else the
+  first such http one; loopback and unix listeners are never advertised) and
+  carries the instance name (the hostname, or the map form's `name:`
+  override), that listener's actually bound TCP port (correct even for an
+  ephemeral `:0` listen) and scheme, and a TXT record `v` (the daemon
+  version); its SRV target is a dedicated `<name>-cronstable.local.`
+  hostname, never the machine's own `.local` name. No secrets are
+  advertised; a discovered client still needs a bearer token to read
+  anything. See the [LAN Discovery wiki page](wiki/LAN-Discovery.md).
 - **It requires the new `discovery` extra (python-zeroconf) and a TCP
   listener**, both enforced at parse time: `web.bonjour` without the library,
   or with every `web.listen` entry a unix socket, is a `ConfigError`. Unlike
