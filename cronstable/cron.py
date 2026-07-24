@@ -1,5 +1,6 @@
 import asyncio
 import asyncio.subprocess
+import copy
 import datetime
 import hashlib
 import heapq
@@ -41,7 +42,7 @@ import aiohttp
 from aiohttp import web
 
 import cronstable.version
-from cronstable import _json, platform, tlsutil
+from cronstable import _json, discovery, platform, push, tlsutil
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
     ClusterConfig,
@@ -57,6 +58,7 @@ from cronstable.config import (
     cluster_config_warnings,
     parse_config_string,
     parse_config_with_sources,
+    resolve_bonjour_config,
     schedule_object_to_crontab,
 )
 from cronstable.cronexpr import CronTab
@@ -81,6 +83,7 @@ from cronstable.job import (
     SlaBreachContext,
     report_config_enabled,
     report_event,
+    report_hostname,
     report_sla_breach,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
@@ -436,6 +439,18 @@ WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
     ("GET", "/state", "_web_state", None),
     ("GET", "/state/documents", "_web_state_documents", None),
     ("GET", "/state/records", "_web_state_records", None),
+    # bearer-token introspection: which token authenticated me, with
+    # which scopes (drives the dashboard's pairing-QR warning and lets
+    # a companion app show what it may do)
+    ("GET", "/whoami", "_web_whoami", None),
+    # E2E-encrypted push alerts: the paired-device registry. Registered
+    # unconditionally (like the state inspector) so a reload that adds
+    # a `push:` section needs no web-app restart; the handlers answer
+    # 404 until one is configured. See cronstable.push.
+    ("GET", "/push/devices", "_web_push_devices", None),
+    ("POST", "/push/devices", "_web_push_pair", None),
+    ("DELETE", "/push/devices/{id}", "_web_push_revoke", None),
+    ("POST", "/push/devices/{id}/test", "_web_push_test", None),
     # The MCP server rides these same listeners and the auth middleware:
     # /mcp is NEVER in WEB_PUBLIC_PATHS, so it inherits the bearer-token gate
     # (and the `control` scope override above, on every method).
@@ -474,6 +489,13 @@ def _required_web_scope(request) -> str:
     if request.method in WEB_SAFE_METHODS:
         return "view"
     return "control"
+
+
+#: Request-storage key the auth middleware files the matched token under,
+#: so handlers can see who authenticated the caller without re-deriving it
+#: (GET /whoami; the pairing endpoints' createdBy audit field). Absent when
+#: no auth middleware is installed (no token configured).
+WEB_TOKEN_REQUEST_KEY = "cronstable_web_token"
 
 
 class _WebToken(NamedTuple):
@@ -1347,6 +1369,16 @@ class Cron:
         # the classic job-runs-only reporting. Set from config in both the
         # config_yaml (test) path below and in _apply_reload.
         self._notify_config: Optional[Dict[str, Any]] = None
+        # the optional `push:` section's running service (device registry +
+        # relay client) and the config it was built from; managed by
+        # start_stop_push on every housekeeping pass. The service is also
+        # published module-globally (cronstable.push.set_service) so the
+        # stateless reporter singletons can reach it.
+        self._push_service: Optional[push.PushService] = None
+        self._applied_push_config: Optional[Dict[str, Any]] = None
+        # the opt-in Bonjour/mDNS advert; follows the web app's lifecycle
+        # (converged at the tail of start_stop_web_app, stopped on exit).
+        self._bonjour = discovery.BonjourAdvertiser()
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -1366,6 +1398,12 @@ class Cron:
         self.retry_state = {}  # type: Dict[str, JobRetryState]
         self.web_runner = None  # type: Optional[web.AppRunner]
         self.web_config = None  # type: Optional[WebConfig]
+        # (scheme, socket name) per successfully bound TCP listener of the
+        # RUNNING web app, in listen order, recorded as each site starts:
+        # the Bonjour advert must name a port, scheme and address that all
+        # belong to one listener, which nothing can reconstruct after the
+        # fact (runner.addresses has no schemes and skips failed binds).
+        self._web_tcp_bound = []  # type: List[Tuple[str, Any]]
         # On-disk fingerprint of the web.tls files as the RUNNING listener
         # loaded them. The SSLContext is built once per (re)start and never
         # reloaded, so an in-place rotation (same paths, new bytes, which is
@@ -1642,6 +1680,15 @@ class Cron:
                     # the election backend exists first. No-op otherwise.
                     await self.start_stop_observability(config.cluster_config)
                     await self.start_stop_state(config.state_config)
+                    # after the state backend (whose store the device
+                    # registry may ride); never raises, logs its own woes.
+                    # That guarantee is load-bearing here, not politeness:
+                    # push sits directly in front of _state_periodic, and
+                    # anything escaping it skipped the durable-state
+                    # manifest and garbage collection for that pass AND
+                    # every later one (the push config never records as
+                    # applied, so the next pass repeats the same failure).
+                    await self.start_stop_push(config.push_config)
                     # periodic durable-state chores (manifest, GC): cheap
                     # due-checks that spawn tracked background tasks.
                     self._state_periodic()
@@ -1802,6 +1849,8 @@ class Cron:
             self.state_backend = None
 
         await self._node_sampler.stop_history()
+        # the mDNS advert must go before the listener it points at.
+        await self._bonjour.stop()
         if self.web_runner is not None:
             logger.info("Stopping http server")
             await self.web_runner.cleanup()
@@ -2490,6 +2539,209 @@ class Cron:
             self.summary_payload(),
             headers=self.web_config.get("headers", None),
         )
+
+    async def _web_whoami(self, request: web.Request) -> web.Response:
+        """Describe the bearer token that authenticated this request.
+
+        Label and scopes of the matched token (filed by the auth
+        middleware), so the dashboard can warn when its pairing QR would
+        hand a phone the all-scopes token, and a companion app can show
+        what it is allowed to do. With no auth middleware installed
+        there is no token to describe: ``authenticated`` is false and
+        every scope is effectively granted.
+        """
+        assert self.web_config is not None
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        if matched is None:
+            payload: Dict[str, Any] = {
+                "authenticated": False,
+                "label": None,
+                "scopes": sorted(_WEB_ALL_SCOPES),
+                "allScopes": True,
+            }
+        else:
+            payload = {
+                "authenticated": True,
+                "label": matched.label,
+                "scopes": sorted(matched.scopes),
+                "allScopes": matched.scopes == _WEB_ALL_SCOPES,
+            }
+        return _json_response(
+            payload, headers=self.web_config.get("headers", None)
+        )
+
+    def _push_service_required(self) -> "push.PushService":
+        """The running push service, or the 404 the route contract says.
+
+        The /push/devices routes are registered unconditionally (so a
+        reload that adds the section needs no web-app restart); until a
+        `push:` section is applied they answer 404 with a reason.
+        """
+        service = self._push_service
+        if service is None:
+            raise web.HTTPNotFound(
+                text="no `push:` section is configured on this daemon"
+            )
+        return service
+
+    async def _web_push_devices(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        service = self._push_service_required()
+        try:
+            # force=True: a listing is the operator checking their
+            # pairings; it must reflect the store, not a 60s mirror.
+            await service.refresh(force=True)
+        except push.PushError as exc:
+            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+        return _json_response(
+            {"devices": service.devices_payload()},
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def _web_push_pair(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        service = self._push_service_required()
+        try:
+            body = await request.json()
+        except ValueError:
+            raise web.HTTPBadRequest(
+                text="body must be a JSON object"
+            ) from None
+        try:
+            fields = push.validate_pairing(body)
+        except push.PushError as exc:
+            raise web.HTTPBadRequest(text=str(exc)) from None
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        try:
+            record, created = await service.pair(
+                fields, matched.label if matched is not None else None
+            )
+        except push.PushError as exc:
+            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+        logger.info(
+            "push: device %r (%s) %s by %s",
+            record["name"],
+            record["id"],
+            "paired" if created else "re-paired",
+            matched.label if matched is not None else "unauthenticated",
+        )
+        return _json_response(
+            {"device": push.public_device(record), "created": created},
+            status=201 if created else 200,
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def _web_push_revoke(self, request: web.Request) -> web.Response:
+        assert self.web_config is not None
+        service = self._push_service_required()
+        device_id = request.match_info["id"]
+        try:
+            removed = await service.revoke(device_id)
+        except push.PushError as exc:
+            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+        if not removed:
+            raise web.HTTPNotFound(
+                text="no paired device with id {!r}".format(device_id)
+            )
+        logger.info("push: device %s revoked", device_id)
+        return _json_response(
+            {"revoked": device_id},
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def _web_push_test(self, request: web.Request) -> web.Response:
+        """Round-trip one test alert through the relay to one device.
+
+        200 with the relay outcome on success; 502 when sealing or the
+        relay failed (the outcome body says which), so "my phone is
+        silent" is debuggable from the dashboard instead of the logs.
+        """
+        assert self.web_config is not None
+        service = self._push_service_required()
+        device_id = request.match_info["id"]
+        try:
+            await service.refresh(force=True)
+        except push.PushError as exc:
+            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+        device = service.get_device(device_id)
+        if device is None:
+            raise web.HTTPNotFound(
+                text="no paired device with id {!r}".format(device_id)
+            )
+        outcome = await service.send_test(device)
+        return _json_response(
+            outcome,
+            status=502 if outcome.get("error") else 200,
+            headers=self.web_config.get("headers", None),
+        )
+
+    async def start_stop_push(
+        self, push_config: Optional[Dict[str, Any]]
+    ) -> None:
+        """Converge the push service onto ``push_config``, never raising.
+
+        Runs every housekeeping pass, right after ``start_stop_state``
+        (the registry may ride that store): a no-op while the section is
+        unchanged, a rebuild when it changed, a stop when it is gone.
+        A service that cannot warm its registry starts anyway and retries
+        on demand (the store may simply not be up yet), while the pairing
+        endpoints report store trouble per request.
+
+        Store trouble is :class:`~cronstable.push.PushError` by contract,
+        and :meth:`_converge_push` absorbs it already, so this wrapper is
+        the belt to that pair of braces: nothing about push is worth the
+        rest of a housekeeping pass, and what used to escape here (one
+        unreadable registry document was enough) silently stopped the
+        durable-state manifest and garbage collection for the life of the
+        process.  ``Exception``, not ``BaseException``: a cancelled pass
+        must still cancel.
+        """
+        try:
+            await self._converge_push(push_config)
+        except Exception:
+            logger.exception(
+                "push: could not converge the push service; leaving it as "
+                "it was and continuing the housekeeping pass"
+            )
+
+    async def _converge_push(
+        self, push_config: Optional[Dict[str, Any]]
+    ) -> None:
+        """The convergence itself; see :meth:`start_stop_push`."""
+        if push_config == self._applied_push_config and (
+            push_config is None
+        ) == (self._push_service is None):
+            return
+        if push_config is None:
+            if self._push_service is not None:
+                logger.info("push: section removed; stopping the service")
+            self._push_service = None
+            self._applied_push_config = None
+            push.set_service(None)
+            return
+        devices_file = push_config.get("devicesFile")
+        if devices_file:
+            store: Any = push.FileDeviceStore(devices_file)
+        else:
+            # a callable, not a reference: the state backend is torn
+            # down/rebuilt on reload and the store must track it live.
+            store = push.StateDeviceStore(lambda: self.state_backend)
+        service = push.PushService(
+            relay_url=push_config["relay"]["url"],
+            relay_timeout=push_config["relay"]["timeout"],
+            store=store,
+            host=report_hostname(),
+        )
+        await service.start()
+        self._push_service = service
+        # A deep copy, never the caller's dict: the convergence guard
+        # above compares by equality, and holding an alias would make a
+        # config edit that mutates the same dict in place compare equal
+        # to itself forever (the mergedicts/DEFAULT_CONFIG sharing trap)
+        # -- a changed push: section would then never be re-applied.
+        self._applied_push_config = copy.deepcopy(push_config)
+        push.set_service(service)
+        logger.info("push: service running (registry %s)", store.describe())
 
     @staticmethod
     def _zone_from_name(tz_name: Optional[str]) -> datetime.tzinfo:
@@ -5194,6 +5446,7 @@ class Cron:
                 logger.info("web: %s, stopping http server", reason)
                 await self.web_runner.cleanup()
                 self.web_runner = None
+                self._web_tcp_bound = []
                 self._web_tls_signature = None
 
         # Build the listener's TLS context ONCE per (re)start, before anything
@@ -5313,7 +5566,11 @@ class Cron:
             self.web_runner = web.AppRunner(app)
             await self.web_runner.setup()
             socket_mode = web_config.get("socketMode")
+            self._web_tcp_bound = []
             for addr in web_config["listen"]:
+                # everything `addresses` gains from start() below belongs
+                # to this entry (see _record_bound_listeners)
+                bound_before = len(self.web_runner.addresses)
                 try:
                     site = web_site_from_url(
                         self.web_runner, addr, tls_context
@@ -5325,6 +5582,9 @@ class Cron:
                     # update or reporting it as an internal bug.
                     logger.warning("web: could not listen on %s: %s", addr, ex)
                     continue
+                self._record_bound_listeners(
+                    urlparse(addr).scheme, bound_before
+                )
                 logger.info("web: started listening on %s", addr)
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
@@ -5349,6 +5609,112 @@ class Cron:
             )
         else:
             await self._node_sampler.stop_history()
+
+        # The Bonjour advert follows the web app's lifecycle exactly like
+        # the node-history sampler: advertise while (and only while) a TCP
+        # listener is actually bound, so the advertised port is the real
+        # one even for an ephemeral `:0` listen. Converge is cheap (a
+        # signature compare) and never raises.
+        await self._bonjour.start_stop(self._bonjour_advert(web_config))
+
+    def _record_bound_listeners(self, scheme: str, bound_before: int) -> None:
+        """File the sockets one just-started site added to the runner.
+
+        Everything ``runner.addresses`` gained past ``bound_before``
+        belongs to that site, and its start is the only moment its
+        scheme and its bound sockets are both in hand (a hostname bind
+        can add several).
+        """
+        assert self.web_runner is not None
+        for sockname in self.web_runner.addresses[bound_before:]:
+            # TCP sites report (host, port[, flowinfo, scope]); unix
+            # sockets report their path string.
+            if isinstance(sockname, (tuple, list)):
+                self._web_tcp_bound.append((scheme, sockname))
+
+    def _bonjour_advert(
+        self, web_config: Optional[WebConfig]
+    ) -> Optional[Dict[str, Any]]:
+        """The `_cronstable._tcp` advert the current web state calls for.
+
+        None whenever there is nothing (or no wish) to advertise: the
+        advert is off, the web app is not running, or no bound listener
+        is dialable from another machine (see
+        :meth:`_advertisable_listener`, which logs why).
+        """
+        if web_config is None or self.web_runner is None:
+            return None
+        bonjour = resolve_bonjour_config(web_config)
+        if bonjour is None:
+            return None
+        chosen = self._advertisable_listener()
+        if chosen is None:
+            return None
+        scheme, port, address = chosen
+        advert: Dict[str, Any] = {
+            "name": bonjour.get("name") or report_hostname(),
+            "port": port,
+            "properties": {
+                "v": cronstable.version.version,
+                "scheme": scheme,
+            },
+        }
+        if address is not None:
+            advert["address"] = address
+        return advert
+
+    def _advertisable_listener(
+        self,
+    ) -> Optional[Tuple[str, int, Optional[str]]]:
+        """The one (scheme, port, address) worth advertising, or None.
+
+        All three must describe the SAME listener: the advert exists to
+        be dialed by another machine, and its previous shape glued the
+        first bound port to an "https if any listen entry is https"
+        scheme and the outbound-route IP, which on a mixed listen list
+        (loopback http for local tools, https on the LAN) named an
+        endpoint nothing served.  Selection: the first bound https
+        listener a LAN peer can reach, else the first such http one.
+        A loopback-bound listener is never advertised (its port is
+        unreachable from any other machine), and a listener bound to
+        one specific IPv6 address is skipped because the advert's A
+        record is IPv4-only.
+
+        The address element is the listener's own IP for a specific
+        IPv4 bind (the outbound-route probe could name a different
+        interface than the one the socket lives on) and None for a
+        wildcard bind, where the advertiser probes the primary address.
+        """
+        candidates = []  # type: List[Tuple[str, int, Optional[str]]]
+        skipped_v6 = False
+        for scheme, sockname in self._web_tcp_bound:
+            host, port = str(sockname[0]), int(sockname[1])
+            if host.startswith("127.") or host == "::1":
+                continue
+            if host in ("0.0.0.0", "::"):
+                candidates.append((scheme, port, None))
+            elif ":" in host:
+                skipped_v6 = True
+            else:
+                candidates.append((scheme, port, host))
+        if not candidates:
+            if skipped_v6:
+                logger.warning(
+                    "bonjour: the only LAN-reachable web listeners are "
+                    "bound to specific IPv6 addresses and the advert's "
+                    "address record is IPv4-only; skipping the advert"
+                )
+            else:
+                logger.warning(
+                    "bonjour: no LAN-reachable TCP web listener to "
+                    "advertise (loopback and unix listeners cannot be "
+                    "dialed from another machine); skipping the advert"
+                )
+            return None
+        for candidate in candidates:
+            if candidate[0] == "https":
+                return candidate
+        return candidates[0]
 
     @staticmethod
     def _election_relevant(cluster_config: ClusterConfig) -> Dict[str, Any]:
@@ -6677,6 +7043,7 @@ class Cron:
                             "this endpoint".format(matched.label, required)
                         )
                     )
+            request[WEB_TOKEN_REQUEST_KEY] = matched
             return await handler(request)
 
         return auth_middleware

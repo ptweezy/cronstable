@@ -88,9 +88,10 @@ Three refinements keep the gate both tight and honest:
 
 On an ordinary commit the comparison prints warnings only. On a release the
 gate is enforced: the `release` job requires `perf`, so a gated regression
-blocks publishing. The release then embeds the comparison in its notes,
-attaches `perf-chart.svg` (the diff chart), `perf-summary.md` (the full
-table), and `perf-results.json` (the merged raw numbers).
+blocks publishing. The release then appends the comparison to its notes and
+attaches `perf-summary.md` (the full table) and `perf-results.json` (the
+merged raw numbers). `perf-chart.svg` (the diff chart) ships in the run's
+`perf-report` artifact.
 
 To ship an intentional regression, start a pushed commit's subject with
 `[perf:accept]`. The regression is still measured and reported in the

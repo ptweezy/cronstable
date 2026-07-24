@@ -44,7 +44,7 @@ OUT.mkdir(exist_ok=True)
 ONLY = set(sys.argv[1:])
 
 #: clean release-style version for the header chip (matches the web set)
-VERSION = "1.2.14"
+VERSION = "1.2.31"
 
 COLS, LINES = 150, 38
 FRAMES: dict = {}

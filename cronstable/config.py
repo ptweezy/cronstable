@@ -387,6 +387,16 @@ DEFAULT_NOTIFY_WEBHOOK_BODY_TEMPLATE = (
 # default -- see canonical_job's omit-when-default rule.
 DEFAULT_REPORT_SHELL_TIMEOUT = 60
 
+# Named for the same fingerprint reason: the push block post-dates the v1
+# identity scheme, so cronstable.fingerprint omits it from a job's canonical
+# form while it still equals these defaults (an all-default block must not
+# repoint every existing job's digest on upgrade).
+DEFAULT_PUSH_REPORT = {
+    "enabled": False,
+    "priority": "time-sensitive",
+    "includeLogTail": True,
+}
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -433,6 +443,10 @@ _REPORT_DEFAULTS = {
         "body": DEFAULT_WEBHOOK_BODY_TEMPLATE,
         "timeout": 10,
     },
+    # end-to-end encrypted push alerts to paired devices (cronstable.push).
+    # Off by default; the relay endpoint and device registry live in the
+    # daemon-global `push:` section, this block only opts a job/event in.
+    "push": dict(DEFAULT_PUSH_REPORT),
 }
 
 
@@ -633,6 +647,20 @@ _report_schema = Map(
                 Opt("headers"): MapPattern(Str(), Str()),
                 Opt("body"): Str(),
                 Opt("timeout"): Float(),
+            }
+        ),
+        Opt("push"): Map(
+            {
+                # opt this job/event into the E2E encrypted push channel;
+                # the relay and device registry come from the daemon-global
+                # `push:` section (required when this is enabled anywhere).
+                Opt("enabled"): Bool(),
+                # relayed to APNs as the interruption level: time-sensitive
+                # breaks through scheduled summaries, passive does not.
+                Opt("priority"): Enum(["time-sensitive", "passive"]),
+                # carry the last captured output lines inside the sealed
+                # payload (trimmed oldest-first to fit the APNs size cap).
+                Opt("includeLogTail"): Bool(),
             }
         ),
     }
@@ -953,6 +981,20 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("points"): Int(),
                     }
                 ),
+                # opt-in zero-config LAN discovery: advertise the web API as
+                # a `_cronstable._tcp` mDNS/Bonjour service so a companion
+                # app on the same network finds the daemon without a typed
+                # URL. Off by default; needs the `discovery` extra
+                # (python-zeroconf) and at least one TCP listen address.
+                # The map form overrides the advertised instance name.
+                # See cronstable.discovery.
+                Opt("bonjour"): Bool()
+                | Map(
+                    {
+                        Opt("enabled"): Bool(),
+                        Opt("name"): Str(),
+                    }
+                ),
             }
         ),
         # Optional MCP (Model Context Protocol) server: expose jobs, DAGs,
@@ -1159,6 +1201,32 @@ CONFIG_SCHEMA = EmptyDict() | Map(
             {
                 Opt("events"): Seq(Enum(list(NOTIFY_EVENTS))),
                 Opt("report"): _report_schema,
+            }
+        ),
+        # Optional end-to-end encrypted push alerts (cronstable.push): the
+        # daemon-global relay endpoint and paired-device registry the `push`
+        # reporter needs. Turning the reporter on stays per-job/per-event
+        # (`report: push: enabled: true` / `notify.report.push`); this
+        # section only says where alerts go and where pairings are stored.
+        # The relay URL is explicit and required: the daemon never posts
+        # alert ciphertext anywhere the operator did not spell out.
+        Opt("push"): Map(
+            {
+                "relay": Map(
+                    {
+                        "url": Str(),
+                        Opt("timeout"): Float(),
+                    }
+                ),
+                # registry storage for stateless installs; with a `state:`
+                # section the registry rides the durable store instead
+                # (cluster-visible). One of the two must exist.
+                Opt("devicesFile"): EmptyNone() | Str(),
+                # The escape hatch for the fail-closed web-auth gate, the
+                # twin of mcp.allowUnauthenticated: serve the /push/devices
+                # pairing endpoints on a routable listener that has no
+                # web.authToken. See _validate_push_config.
+                Opt("allowUnauthenticated"): Bool(),
             }
         ),
     }
@@ -3357,6 +3425,27 @@ def _validate_web_config(webconf: WebConfig) -> None:
     # First, before the early returns below (no nodeHistory map, no metrics
     # map) skip everything appended after them.
     _validate_web_tls(webconf)
+    if resolve_bonjour_config(webconf) is not None:
+        # Imported here so a config without the advert never pays for
+        # the probe; discovery.py itself imports zeroconf guardedly.
+        from cronstable.discovery import HAVE_ZEROCONF
+
+        if not HAVE_ZEROCONF:
+            raise ConfigError(
+                "web.bonjour is enabled but python-zeroconf is not "
+                "installed; install the discovery extra (pip install "
+                '"cronstable[discovery]") or disable web.bonjour'
+            )
+        tcp_listens = [
+            addr
+            for addr in (webconf.get("listen") or [])
+            if not str(addr).startswith("unix://")
+        ]
+        if not tcp_listens:
+            raise ConfigError(
+                "web.bonjour needs a TCP web listener to advertise, but "
+                "every web.listen entry is a unix socket"
+            )
     history = webconf.get("nodeHistory")
     if isinstance(history, dict):
         interval = history.get("interval")
@@ -3444,6 +3533,34 @@ def _web_has_any_token(web: dict) -> bool:
     return bool(web.get("authToken") or web.get("authTokens"))
 
 
+def _open_routable_listeners(web: dict) -> List[str]:
+    """Web listeners a stranger could reach with no credential at all.
+
+    Shared by the ``mcp`` and ``push`` fail-closed gates, which guard
+    different endpoints against the same hazard: cronstable installs its
+    auth middleware only when a token resolves, so with no
+    ``web.authToken``/``web.authTokens`` there is no middleware and every
+    route on every listener answers whoever can connect.  Empty when any
+    token is configured, and empty when every listener is loopback or a
+    unix socket (nothing off-host can reach those).
+
+    An ``https`` listener with ``web.tls.clientCa`` set authenticates its
+    callers at the transport (CERT_REQUIRED against that CA), the same
+    guarantee these gates already accept from an mTLS-terminating proxy,
+    so it does not count as open.  Plain ``https`` does: transport
+    encryption is not caller authentication.
+    """
+    if _web_has_any_token(web):
+        return []
+    mtls = bool((web.get("tls") or {}).get("clientCa"))
+    return [
+        a
+        for a in web.get("listen") or ()
+        if not _is_local_listener(a)
+        and not (mtls and str(a).startswith("https://"))
+    ]
+
+
 def _validate_mcp_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for the MCP server that also need the web section.
 
@@ -3470,20 +3587,9 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
             "mcp.toolsets includes 'act' but mcp.readOnly is true; mutating "
             "tools stay suppressed until readOnly is set false"
         )
-    if mcp.get("allowUnauthenticated") or _web_has_any_token(web):
+    if mcp.get("allowUnauthenticated"):
         return
-    # An https listener with web.tls.clientCa authenticates its callers at the
-    # transport (CERT_REQUIRED against that CA), which is the same guarantee
-    # this gate already accepts from an mTLS-terminating proxy. Plain https
-    # only encrypts, so it stays routable-and-unauthenticated: transport
-    # encryption is not caller authentication.
-    mtls = bool((web.get("tls") or {}).get("clientCa"))
-    routable = [
-        a
-        for a in web["listen"]
-        if not _is_local_listener(a)
-        and not (mtls and str(a).startswith("https://"))
-    ]
+    routable = _open_routable_listeners(web)
     if routable:
         raise ConfigError(
             "mcp.enabled is set but no web.authToken/authTokens is set, and "
@@ -3497,6 +3603,120 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
             "by other means (an mTLS-terminating proxy, a network "
             "policy).".format(", ".join(routable))
         )
+
+
+def _push_report_users(config: "CronstableConfig") -> List[str]:
+    """Every place the assembled config enables the push reporter.
+
+    Human-readable names ("job backup", "dag etl task load", "notify"),
+    used to point at the offenders when a ``push:`` section is missing.
+    """
+
+    def _uses(holder: Any) -> bool:
+        for action in (
+            "onFailure",
+            "onPermanentFailure",
+            "onSuccess",
+            "onLate",
+        ):
+            block = getattr(holder, action, None)
+            if isinstance(block, dict):
+                push_report = (block.get("report") or {}).get("push") or {}
+                if push_report.get("enabled"):
+                    return True
+        return False
+
+    users = []
+    for job in config.jobs:
+        if _uses(job):
+            users.append("job {}".format(job.name))
+    for dag_config in config.dags:
+        for taskkey, template in dag_config.task_templates.items():
+            if _uses(template):
+                users.append("dag {} task {}".format(dag_config.name, taskkey))
+    notify = config.notify_config
+    if notify is not None:
+        push_report = (notify.get("report") or {}).get("push") or {}
+        if push_report.get("enabled"):
+            users.append("notify")
+    return users
+
+
+def _validate_push_config(config: "CronstableConfig") -> None:
+    """Fail-closed checks for push that need the fully assembled config.
+
+    Runs at the top-level parse (from :func:`_validate_cross_sections`):
+    the ``push:`` section, the ``state:`` section and the jobs enabling
+    the reporter may legitimately live in different config-dir files.
+
+    Everything here refuses to start rather than degrade: push is an
+    alerting channel, and a channel that silently self-disables (a
+    missing library, a registry with nowhere to live, a reporter with
+    no relay) is a missed page at 2 a.m., the one failure mode this
+    feature exists to prevent.
+    """
+    users = _push_report_users(config)
+    push_conf = config.push_config
+    if push_conf is None:
+        if users:
+            raise ConfigError(
+                "report.push.enabled is set ({}) but no `push:` section "
+                "is configured; add one (push.relay.url plus a `state:` "
+                "section or push.devicesFile) or disable the push "
+                "reporter".format(", ".join(sorted(users)))
+            )
+        return
+    # Imported here, not at module top: cronstable.push pulls in aiohttp
+    # and the optional PyNaCl probe, which a bare config parse (e.g.
+    # `--validate-config` in scripts) should not pay for unless a push
+    # section actually exists.
+    from cronstable.push import HAVE_PYNACL
+
+    if not HAVE_PYNACL:
+        raise ConfigError(
+            "a `push:` section is configured but PyNaCl is not installed; "
+            'install the push extra (pip install "cronstable[push]") or '
+            "remove the section. Push alerts fail closed rather than "
+            "silently self-disabling."
+        )
+    if not push_conf.get("devicesFile") and config.state_config is None:
+        raise ConfigError(
+            "push: needs durable storage for its paired-device registry: "
+            "configure a `state:` section (shared store, cluster-visible "
+            "pairings) or set push.devicesFile (single node)"
+        )
+    # The same gate the mcp section gets, on the same evidence and for the
+    # same reason: /push/devices is the other mutating surface the web API
+    # exposes, and without a token there is no auth middleware to gate it.
+    # An open pairing endpoint is worse than an open read endpoint, because
+    # the damage outlives the exposure: a stranger who pairs once keeps
+    # receiving every alert from anywhere, forever, and the only trace is an
+    # extra row in a listing nobody re-reads.
+    #
+    # No web section (or no listener) means no pairing endpoint exists at
+    # all, which is a legitimate shape: on a cluster, one node serves the
+    # dashboard and pairs devices while the others only send to the
+    # registry they share. So gate on the listeners, never on push itself.
+    web = config.web_config
+    if web is not None and not push_conf.get("allowUnauthenticated"):
+        routable = _open_routable_listeners(web)
+        if routable:
+            raise ConfigError(
+                "a `push:` section is configured but no "
+                "web.authToken/authTokens is set, and the web API listens "
+                "on non-loopback address(es) {}: the /push/devices pairing "
+                "endpoints would be served without authentication (with no "
+                "token the web app installs no auth middleware at all), so "
+                "anything that can reach the listener can pair its own key "
+                "and receive every job failure, hostname, exit code and "
+                "captured output tail from then on. Set web.authToken or a "
+                "web.authTokens entry, restrict web.listen to "
+                "loopback/unix-socket addresses, set web.tls.clientCa so "
+                "the listener authenticates callers by certificate, or set "
+                "push.allowUnauthenticated: true when the endpoints are "
+                "protected by other means (an mTLS-terminating proxy, a "
+                "network policy).".format(", ".join(routable))
+            )
 
 
 @dataclass(slots=True)
@@ -3521,6 +3741,10 @@ class CronstableConfig:
     # that fires on DAG failures, approval gates, and leadership/quorum
     # changes. None keeps the classic job-runs-only reporting.
     notify_config: Optional[Dict[str, Any]] = None
+    # Optional end-to-end encrypted push alerts (`push:`): the relay
+    # endpoint + device-registry storage the push reporter needs. None
+    # keeps push off (and refuses report.push.enabled anywhere).
+    push_config: Optional[Dict[str, Any]] = None
 
 
 # Environment-variable interpolation over the validated config document.
@@ -3806,6 +4030,64 @@ def _build_notify_config(raw: dict) -> Dict[str, Any]:
     }
 
 
+def _build_push_config(raw: dict) -> Dict[str, Any]:
+    """Assemble the ``push:`` block: relay endpoint + registry storage.
+
+    Only shape/range checks live here; the cross-section requirements
+    (PyNaCl installed, a ``state:`` section or ``devicesFile`` for the
+    registry, and a ``push:`` block existing wherever ``report.push``
+    is enabled) run once on the fully assembled config in
+    :func:`_validate_push_config`, because the sections involved may
+    live in different config-directory files.
+    """
+    relay = raw.get("relay") or {}
+    url = (relay.get("url") or "").strip()
+    parsed = _safe_urlparse(url, "push.relay.url")
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        # Redacted, like every other URL echoed into a ConfigError: a
+        # scheme-less `user:pass@host` lands exactly here (urlparse reads
+        # the userinfo as the scheme), and this message is printed at
+        # startup and logged by the reload loop on every reparse.
+        raise ConfigError(
+            "push.relay.url must be an http(s) URL, got {!r}".format(
+                _redact_userinfo(url)
+            )
+        )
+    # `is None`, not `or`: an explicit `timeout: 0` must reach the range
+    # check below and be refused, not silently become the default.
+    timeout_raw = relay.get("timeout")
+    timeout = 10.0 if timeout_raw is None else float(timeout_raw)
+    if timeout <= 0:
+        raise ConfigError("push.relay.timeout must be > 0 seconds")
+    return {
+        "relay": {"url": url, "timeout": timeout},
+        "devicesFile": raw.get("devicesFile") or None,
+        "allowUnauthenticated": bool(raw.get("allowUnauthenticated")),
+    }
+
+
+def resolve_bonjour_config(
+    web_config: Optional[WebConfig],
+) -> Optional[Dict[str, Any]]:
+    """Collapse ``web.bonjour``'s bool-or-map forms to one shape.
+
+    Returns ``None`` when the advert is off (absent, ``false``, or the
+    map form with ``enabled: false``), else ``{"name": ...}`` where
+    ``name`` is the operator's instance-name override or ``None`` for
+    the default (the node's hostname).
+    """
+    if web_config is None:
+        return None
+    raw = web_config.get("bonjour")
+    if not raw:
+        return None
+    if isinstance(raw, dict):
+        if not raw.get("enabled", True):
+            return None
+        return {"name": raw.get("name")}
+    return {"name": None}
+
+
 def _config_from_doc(
     doc: dict,
     path: str,
@@ -3836,6 +4118,7 @@ def _config_from_doc(
     notifyconf = (
         _build_notify_config(doc["notify"]) if "notify" in doc else None
     )
+    pushconf = _build_push_config(doc["push"]) if "push" in doc else None
     for include in doc.get("include", ()):
         inc_path = os.path.join(os.path.dirname(path), include)
         # Included jobs arrive already fully constructed, so they carry only
@@ -3872,6 +4155,10 @@ def _config_from_doc(
             if notifyconf:
                 raise ConfigError("multiple notify configs")
             notifyconf = inc_config.notify_config
+        if inc_config.push_config:
+            if pushconf:
+                raise ConfigError("multiple push configs")
+            pushconf = inc_config.push_config
     defaults = mergedicts(DEFAULT_CONFIG, inc_defaults_merged)
     defaults = mergedicts(defaults, doc.get("defaults", {}))
     # One env_file is frequently shared by many jobs in a doc; a per-doc
@@ -3899,6 +4186,7 @@ def _config_from_doc(
         dags=dags,
         mcp_config=mcpconf,
         notify_config=notifyconf,
+        push_config=pushconf,
     )
 
 
@@ -4000,6 +4288,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
                 )
     _validate_dags(config)
     _validate_mcp_config(config)
+    _validate_push_config(config)
 
 
 def _validate_dags(config: CronstableConfig) -> None:
@@ -4214,6 +4503,29 @@ def _parse_config_dir_file(
     return config, frozen
 
 
+def _claim_config_dir_section(
+    kind: str,
+    new_value: Any,
+    current: Any,
+    current_source: Optional[str],
+    path: str,
+) -> Tuple[Any, Optional[str]]:
+    """Adopt one at-most-once section from a config-dir file.
+
+    web/cluster/state/mcp/logging/notify/push may each appear in at most
+    one file of a config directory; a second appearance is refused with
+    an error naming both files.
+    """
+    if new_value is None:
+        return current, current_source
+    if current is not None:
+        raise ConfigError(
+            "Multiple '{}' configurations found: "
+            "first in {}, now in {}".format(kind, current_source, path)
+        )
+    return new_value, path
+
+
 def _parse_config_dir(
     config_arg: str, _sources: Optional[set] = None
 ) -> CronstableConfig:
@@ -4232,6 +4544,8 @@ def _parse_config_dir(
     logging_config_source_fname: Optional[str] = None
     notify_config: Optional[Dict[str, Any]] = None
     notify_config_source_fname: Optional[str] = None
+    push_config: Optional[Dict[str, Any]] = None
+    push_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
     # Sort by name so job order and the "first config found" error messages
     # are deterministic; os.scandir yields entries in arbitrary FS order.
@@ -4258,72 +4572,59 @@ def _parse_config_dir(
             _sources.update(file_sources)
         jobs.extend(config.jobs)
         dags.extend(config.dags)
-        if config.web_config is not None:
-            if web_config is None:
-                web_config = config.web_config
-                web_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'web' configurations found: "
-                    "first in {}, now in {}".format(
-                        web_config_source_fname, direntry.path
-                    )
-                )
-        if config.cluster_config is not None:
-            if cluster_config is None:
-                cluster_config = config.cluster_config
-                cluster_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'cluster' configurations found: "
-                    "first in {}, now in {}".format(
-                        cluster_config_source_fname, direntry.path
-                    )
-                )
-        if config.state_config is not None:
-            if state_config is None:
-                state_config = config.state_config
-                state_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'state' configurations found: "
-                    "first in {}, now in {}".format(
-                        state_config_source_fname, direntry.path
-                    )
-                )
-        if config.mcp_config is not None:
-            if mcp_config is None:
-                mcp_config = config.mcp_config
-                mcp_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'mcp' configurations found: "
-                    "first in {}, now in {}".format(
-                        mcp_config_source_fname, direntry.path
-                    )
-                )
-        if config.logging_config is not None:
-            if logging_config is None:
-                logging_config = config.logging_config
-                logging_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'logging' configurations found: "
-                    "first in {}, now in {}".format(
-                        logging_config_source_fname, direntry.path
-                    )
-                )
-        if config.notify_config is not None:
-            if notify_config is None:
-                notify_config = config.notify_config
-                notify_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'notify' configurations found: "
-                    "first in {}, now in {}".format(
-                        notify_config_source_fname, direntry.path
-                    )
-                )
+        web_config, web_config_source_fname = _claim_config_dir_section(
+            "web",
+            config.web_config,
+            web_config,
+            web_config_source_fname,
+            direntry.path,
+        )
+        cluster_config, cluster_config_source_fname = (
+            _claim_config_dir_section(
+                "cluster",
+                config.cluster_config,
+                cluster_config,
+                cluster_config_source_fname,
+                direntry.path,
+            )
+        )
+        state_config, state_config_source_fname = _claim_config_dir_section(
+            "state",
+            config.state_config,
+            state_config,
+            state_config_source_fname,
+            direntry.path,
+        )
+        mcp_config, mcp_config_source_fname = _claim_config_dir_section(
+            "mcp",
+            config.mcp_config,
+            mcp_config,
+            mcp_config_source_fname,
+            direntry.path,
+        )
+        logging_config, logging_config_source_fname = (
+            _claim_config_dir_section(
+                "logging",
+                config.logging_config,
+                logging_config,
+                logging_config_source_fname,
+                direntry.path,
+            )
+        )
+        notify_config, notify_config_source_fname = _claim_config_dir_section(
+            "notify",
+            config.notify_config,
+            notify_config,
+            notify_config_source_fname,
+            direntry.path,
+        )
+        push_config, push_config_source_fname = _claim_config_dir_section(
+            "push",
+            config.push_config,
+            push_config,
+            push_config_source_fname,
+            direntry.path,
+        )
         job_defaults = JobDefaults(
             mergedicts(job_defaults, config.job_defaults)
         )
@@ -4342,4 +4643,5 @@ def _parse_config_dir(
         dags=dags,
         mcp_config=mcp_config,
         notify_config=notify_config,
+        push_config=push_config,
     )
