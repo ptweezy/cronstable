@@ -11,8 +11,9 @@ paired device's X25519 public key (a libsodium sealed box, X25519 +
 XSalsa20-Poly1305), so only that device's private key, generated on the
 phone and never leaving it, can open the payload. The relay that forwards
 alerts to the platform push service (APNs) sees only a device token, a
-ciphertext, an opaque coalescing hash, a priority, and an event flag, never
-job names, hostnames, or log lines.
+ciphertext, an opaque coalescing hash (keyed with a per-installation salt
+the relay never sees), a priority, and an event flag, never job names,
+hostnames, or log lines.
 
 ## Enabling push
 
@@ -115,6 +116,7 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
         "name": "parker-iphone",
         "platform": "ios",
         "publicKey": "jSNlDu28No2itHnvrs6ajHHuNAxvqgOjmGxHJrMo8yg=",
+        "fingerprint": "8c2f-91ab-04de",
         "pushToken": "…4af1c9",
         "createdAt": "2026-07-23T14:00:00+00:00",
         "createdBy": "parker-iphone"
@@ -123,8 +125,10 @@ $ curl -X POST http://127.0.0.1:8080/push/devices \
 }
 ```
 
-`publicKey` must be base64 decoding to exactly 32 bytes (an X25519 public
-key); `name`, `platform`, and `pushToken` are bounded strings. Validation
+`publicKey` must be base64 decoding to exactly 32 bytes and be a usable
+X25519 public key (an all-zero or low-order key that libsodium refuses to
+seal to is rejected at pairing, not on the first alert); `name`,
+`platform`, and `pushToken` are bounded strings. Validation
 failures are a `400` naming the field. Re-pairing the same public key
 (push tokens rotate; phones get renamed) answers `200` with
 `created: false` and updates `name`/`platform`/`pushToken` in place,
@@ -161,6 +165,29 @@ Revoking the pairing stops future alerts to that device; to also revoke its
 API access, drop its `web.authTokens` entry and reload. Endpoint details
 are on the [HTTP API page](HTTP-API#get-pushdevices).
 
+### Pair over a trusted transport, then compare fingerprints
+
+Two things travel during pairing that are worth protecting: the QR payload
+embeds a bearer token, and the pairing POST carries the device public key
+that every future alert is sealed to. On a transport an attacker can read
+or rewrite (plaintext HTTP across a shared network), the token can be
+stolen and, worse, the key can be substituted: alerts would then seal to
+the attacker's key. So pair over HTTPS
+([`web.tls`](HTTP-API#serving-over-tls-webtls) or a TLS-terminating
+proxy), over loopback (an SSH tunnel to the daemon host), or on a network
+you trust. With [`web.bonjour`](LAN-Discovery) on, the daemon also
+advertises its URL to the local network; the advert carries no secrets,
+but it does make the daemon easier to find, which is one more reason
+pairing belongs on a trusted network.
+
+Key substitution is detectable after the fact, and the check takes ten
+seconds: the pairing response and the device listing carry a
+`fingerprint` (the first 12 hex characters of SHA-256 over the raw key
+bytes, grouped for reading aloud), and the companion app displays the same
+fingerprint for the key it generated. Compare them. If they differ, the
+daemon stored a key that is not your phone's: revoke the device and pair
+again over a trusted transport.
+
 ## Where pairings are stored
 
 The registry has two homes; exactly one is in effect:
@@ -176,6 +203,12 @@ The registry has two homes; exactly one is in effect:
   owner-only permissions where the platform honors them. A file that fails
   to parse refuses writes rather than overwriting possibly recoverable
   pairings.
+
+Both homes also hold the installation's collapse salt: the `collapseSalt`
+key in `devicesFile`, or a `pushmeta` document in the state store. It is
+the secret that keys the coalescing hash sent to the relay, created on
+first use; every node sharing a registry derives the same hash for the
+same alert, and the relay never sees the salt itself.
 
 The reporting path reads an in-memory mirror of the registry, refreshed at
 most every 60 seconds, so a slow or briefly unavailable store can never
@@ -237,9 +270,10 @@ be published; that file is the contract any implementation must satisfy.
 The trust model: the relay is not a trusted party. It receives ciphertext
 and routing metadata only (device token, coalescing hash, priority, event
 flag), owns deduplication, rate limiting, and flap suppression (coalescing
-on the hash without learning what it hashes), and forwards to APNs with
-`mutable-content` set so the app decrypts and renders the notification on
-the device.
+on the hash without learning what it hashes; the hash is keyed with the
+per-installation salt, so it stays opaque even for guessable job names),
+and forwards to APNs with `mutable-content` set so the app decrypts and
+renders the notification on the device.
 
 ## Related pages
 

@@ -6,9 +6,12 @@ fail-closed config validation, the /push/devices and /whoami handlers,
 scope enforcement on the new routes, the start_stop_push lifecycle, and
 the Bonjour advertiser (with a fake zeroconf).
 
-PyNaCl is a dev dependency (wheels on every CI cell), but the module
-still importorskips so a bare `pip install -e .` checkout runs the rest
-of the suite.
+PyNaCl is a dev dependency (wheels on every CI cell), but only the tests
+that actually touch key material skip without it (the ``requires_pynacl``
+marker); the store, config-validation, handler-scope, /whoami, lifecycle
+and Bonjour tests are crypto-free and run on a bare `pip install -e .`
+checkout too. A module-level importorskip here once silently vaporized
+all of them on any cell without the wheel; never reintroduce one.
 """
 
 import asyncio
@@ -35,8 +38,14 @@ from cronstable.job import (
     report_config_enabled,
 )
 
-nacl_public = pytest.importorskip(
-    "nacl.public", reason="pynacl (the push extra) is not installed"
+try:
+    from nacl import public as nacl_public
+except ImportError:  # the push extra is optional even in dev checkouts
+    nacl_public = None
+
+requires_pynacl = pytest.mark.skipif(
+    nacl_public is None,
+    reason="pynacl (the push extra) is not installed",
 )
 
 
@@ -220,25 +229,72 @@ def test_collapse_id_same_run_same_id_different_run_differs():
     a = push.build_payload(_FakeJobCtx(), False, True)
     b = push.build_payload(_FakeJobCtx(), False, True)
     c = push.build_payload(_FakeJobCtx(run_id="run-456"), False, True)
-    assert push.collapse_id(a) == push.collapse_id(b)
-    assert push.collapse_id(a) != push.collapse_id(c)
-    assert len(push.collapse_id(a)) == 32
+    assert push.collapse_id(a, "s1") == push.collapse_id(b, "s1")
+    assert push.collapse_id(a, "s1") != push.collapse_id(c, "s1")
+    assert len(push.collapse_id(a, "s1")) == 32
+
+
+def test_collapse_id_salt_defeats_wordlist_precomputation():
+    # The relay-facing property: without the installation salt the
+    # identity fields are low entropy (kind + name on a stateless
+    # install), so ids must differ salt-to-salt.
+    a = push.build_payload(_FakeJobCtx(run_id=None), False, True)
+    assert push.collapse_id(a, "s1") != push.collapse_id(a, "s2")
 
 
 # ----------------------------------------------------------------- crypto
 
 
+@requires_pynacl
 def test_seal_round_trip():
     private, public_b64 = _device_keypair()
     ciphertext = push.seal_to_device(public_b64, b'{"hello": "world"}')
     assert _open_sealed(private, ciphertext) == {"hello": "world"}
 
 
+@requires_pynacl
 def test_seal_rejects_garbage_key():
     with pytest.raises(push.PushError):
         push.seal_to_device("not base64!!", b"x")
 
 
+@requires_pynacl
+def test_seal_rejects_low_order_key_as_push_error():
+    # An all-zero key is 32 valid bytes but libsodium refuses it at
+    # ENCRYPT time with a raw nacl exception. It must surface as
+    # PushError: anything else escapes _send_payload's per-device catch
+    # and kills the whole fan-out (the one-bad-key-pages-nobody bug).
+    zero_key = base64.b64encode(b"\x00" * 32).decode()
+    with pytest.raises(push.PushError):
+        push.seal_to_device(zero_key, b"x")
+
+
+@requires_pynacl
+def test_validate_pairing_rejects_unusable_key():
+    # The same all-zero key must already be a 400 at pairing, so it can
+    # never become a persistent registry record that fails every alert.
+    zero_key = base64.b64encode(b"\x00" * 32).decode()
+    with pytest.raises(push.PushError):
+        push.validate_pairing(
+            {"name": "p", "platform": "ios", "pushToken": "t",
+             "publicKey": zero_key}
+        )
+
+
+def test_key_fingerprint_format_and_garbage():
+    _hashable = base64.b64encode(b"\x01" * 32).decode()
+    fp = push.key_fingerprint(_hashable)
+    assert fp is not None
+    parts = fp.split("-")
+    assert len(parts) == 3 and all(len(p) == 4 for p in parts)
+    # deterministic, and distinct keys get distinct prints
+    assert fp == push.key_fingerprint(_hashable)
+    assert fp != push.key_fingerprint(base64.b64encode(b"\x02" * 32).decode())
+    assert push.key_fingerprint(None) is None
+    assert push.key_fingerprint("not base64!!") is None
+
+
+@requires_pynacl
 def test_validate_pairing_normalizes_and_rejects():
     _, public_b64 = _device_keypair()
     fields = push.validate_pairing(
@@ -292,23 +348,75 @@ async def test_file_store_corrupt_file_refuses_reads_and_writes(tmp_path):
     assert path.read_text(encoding="utf-8") == "{not json"
 
 
+async def test_file_store_write_failure_is_push_error(tmp_path):
+    # A missing (or read-only) directory is store trouble, and the
+    # bounded contract says store trouble is PushError: the pairing
+    # handler turns that into its documented 503, never an aiohttp 500.
+    store = push.FileDeviceStore(str(tmp_path / "no-such-dir" / "d.json"))
+    with pytest.raises(push.PushError):
+        await store.upsert({"id": "d1"})
+    with pytest.raises(push.PushError):
+        await store.ensure_salt()
+
+
+async def test_file_store_salt_created_once_and_preserved(tmp_path):
+    path = tmp_path / "devices.json"
+    store = push.FileDeviceStore(str(path))
+    salt = await store.ensure_salt()
+    assert salt and salt == await store.ensure_salt()
+    # rewrites preserve it; a fresh store instance reads the same salt
+    await store.upsert({"id": "d1", "name": "phone"})
+    again = push.FileDeviceStore(str(path))
+    assert await again.ensure_salt() == salt
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert doc["collapseSalt"] == salt
+    assert [d["id"] for d in doc["devices"]] == ["d1"]
+
+
 class _FakeStateBackend:
-    """The document slice of the state backend the registry uses."""
+    """The document slice of the state backend the registry uses.
+
+    Documents are keyed (namespace, key) and DOC_KEEP/DOC_DELETE honored,
+    matching the real mutate_document contract the salt path relies on.
+    """
 
     def __init__(self) -> None:
-        self.docs: Dict[str, Dict[str, Any]] = {}
+        self.docs: Dict[Any, Dict[str, Any]] = {}
 
     async def list_documents(self, namespace):
         assert namespace == push.PUSH_DOC_NAMESPACE
-        return list(self.docs.values())
+        return [
+            doc for (ns, _key), doc in self.docs.items() if ns == namespace
+        ]
 
     async def mutate_document(self, namespace, key, transform):
-        new, result = transform(self.docs.get(key))
-        self.docs[key] = new
+        from cronstable.state import DOC_DELETE, DOC_KEEP
+
+        current = self.docs.get((namespace, key))
+        new, result = transform(current)
+        if new is DOC_DELETE:
+            self.docs.pop((namespace, key), None)
+            return None, result
+        if new is DOC_KEEP:
+            return current, result
+        self.docs[(namespace, key)] = new
         return new, result
 
     async def delete_document(self, namespace, key):
-        return self.docs.pop(key, None) is not None
+        return self.docs.pop((namespace, key), None) is not None
+
+
+class _BrokenStateBackend:
+    """A backend whose I/O fails raw, like an NFS ESTALE mid-operation."""
+
+    async def list_documents(self, namespace):
+        raise OSError("stale file handle")
+
+    async def mutate_document(self, namespace, key, transform):
+        raise OSError("stale file handle")
+
+    async def delete_document(self, namespace, key):
+        raise OSError("stale file handle")
 
 
 async def test_state_store_round_trip_and_backend_loss():
@@ -325,9 +433,42 @@ async def test_state_store_round_trip_and_backend_loss():
         await store.upsert({"id": "d2"})
 
 
+async def test_state_store_oserror_is_push_error():
+    # Raw backend I/O errors must be normalized to PushError: send_report
+    # and the handlers catch exactly that, and anything rawer would either
+    # 500 a pairing request or drop an alert that the last-known mirror
+    # could still deliver.
+    store = push.StateDeviceStore(lambda: _BrokenStateBackend())
+    with pytest.raises(push.PushError):
+        await store.load()
+    with pytest.raises(push.PushError):
+        await store.upsert({"id": "d1"})
+    with pytest.raises(push.PushError):
+        await store.remove("d1")
+    with pytest.raises(push.PushError):
+        await store.ensure_salt()
+
+
+async def test_state_store_salt_converges_and_stays_out_of_listings():
+    backend = _FakeStateBackend()
+    a = push.StateDeviceStore(lambda: backend)
+    b = push.StateDeviceStore(lambda: backend)
+    salt = await a.ensure_salt()
+    # a second node sharing the store converges on the same salt (the
+    # property cross-node coalescing depends on)
+    assert await b.ensure_salt() == salt
+    # the salt document is not a device: listings never see it, and a
+    # revoke by its key cannot delete it (different namespace)
+    await a.upsert({"id": "d1", "name": "phone"})
+    assert [d["id"] for d in await a.load()] == ["d1"]
+    assert await a.remove("collapse") is False
+    assert await b.ensure_salt() == salt
+
+
 # ------------------------------------------------------------ PushService
 
 
+@requires_pynacl
 async def test_pair_revoke_and_repair_keeps_identity(tmp_path):
     _, public_b64 = _device_keypair()
     service, record = await _paired_service(tmp_path, "http://x/", public_b64)
@@ -351,10 +492,14 @@ async def test_pair_revoke_and_repair_keeps_identity(tmp_path):
     assert len(listing) == 1
     assert listing[0]["pushToken"].endswith("otated")
     assert listing[0]["pushToken"] != "tok-rotated"  # redacted
+    # the listing carries the key fingerprint for the out-of-band
+    # comparison against what the companion app displays
+    assert listing[0]["fingerprint"] == push.key_fingerprint(public_b64)
     assert await service.revoke(record["id"]) is True
     assert service.devices_payload() == []
 
 
+@requires_pynacl
 async def test_send_report_seals_to_each_device_and_posts_relay(tmp_path):
     private, public_b64 = _device_keypair()
     async with _RelayServer() as relay:
@@ -388,6 +533,7 @@ async def test_send_report_with_no_devices_logs_and_returns(tmp_path, caplog):
     assert any("no device is paired" in r.message for r in caplog.records)
 
 
+@requires_pynacl
 async def test_send_test_reports_relay_failure(tmp_path):
     private, public_b64 = _device_keypair()
     async with _RelayServer(status=429) as relay:
@@ -401,6 +547,7 @@ async def test_send_test_reports_relay_failure(tmp_path):
         assert opened["kind"] == "test"
 
 
+@requires_pynacl
 async def test_send_report_survives_unreachable_relay(tmp_path):
     _, public_b64 = _device_keypair()
     service, _ = await _paired_service(
@@ -408,6 +555,93 @@ async def test_send_report_survives_unreachable_relay(tmp_path):
         tmp_path, "http://127.0.0.1:9/v1/notify", public_b64
     )
     await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+
+
+@requires_pynacl
+async def test_one_bad_registry_key_does_not_break_the_fanout(tmp_path):
+    """The finding-1 regression: a corrupt record must stay per-device.
+
+    An all-zero key pairs nowhere near validate_pairing (it is refused
+    there now), but a registry can still hold one: written by an older
+    build, another tool, or a compromised companion app. Sealing to it
+    raises inside libsodium at encrypt time; that must be one failed
+    device outcome, with every other device still paged.
+    """
+    private, good_b64 = _device_keypair()
+    zero_b64 = base64.b64encode(b"\x00" * 32).decode()
+    path = tmp_path / "devices.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "devices": [
+                    # the bad device first, so the loop must survive it
+                    # to ever reach the good one
+                    {"id": "bad", "name": "evil", "platform": "ios",
+                     "publicKey": zero_b64, "pushToken": "tok-bad"},
+                    {"id": "good", "name": "phone", "platform": "ios",
+                     "publicKey": good_b64, "pushToken": "tok-good"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    async with _RelayServer() as relay:
+        service = _service(push.FileDeviceStore(str(path)), relay.url)
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+        assert [r["device"] for r in relay.requests] == ["tok-good"]
+        opened = _open_sealed(private, relay.requests[0]["ciphertext"])
+        assert opened["name"] == "backup"
+
+
+@requires_pynacl
+async def test_send_report_relay_5xx_is_logged_not_raised(tmp_path, caplog):
+    _, public_b64 = _device_keypair()
+    async with _RelayServer(status=500) as relay:
+        service, record = await _paired_service(
+            tmp_path, relay.url, public_b64
+        )
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+    assert len(relay.requests) == 1
+    assert any(
+        "delivery to device" in r.message and "500" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@requires_pynacl
+async def test_send_report_degraded_registry_uses_last_known(
+    tmp_path, caplog
+):
+    _, public_b64 = _device_keypair()
+    async with _RelayServer() as relay:
+        service, record = await _paired_service(
+            tmp_path, relay.url, public_b64
+        )
+        # the store goes bad after the mirror warmed: corrupt the file
+        # and force the mirror stale so the next send must re-read
+        (tmp_path / "devices.json").write_text("{not json", encoding="utf-8")
+        service._mirror_fresh_until = 0.0
+        await service.send_report(_FakeJobCtx(), False, {"enabled": True})
+        assert len(relay.requests) == 1  # last-known device still paged
+    assert any(
+        "registry unavailable" in r.message for r in caplog.records
+    )
+
+
+@requires_pynacl
+async def test_send_test_collapse_ids_are_unique(tmp_path):
+    _, public_b64 = _device_keypair()
+    async with _RelayServer() as relay:
+        service, record = await _paired_service(
+            tmp_path, relay.url, public_b64
+        )
+        first = await service.send_test(record)
+        second = await service.send_test(record)
+        assert first["status"] == 200 and second["status"] == 200
+    ids = [r["collapseId"] for r in relay.requests]
+    # identical payload identity, yet never coalesced away by the relay
+    assert len(ids) == 2 and ids[0] != ids[1]
 
 
 # ------------------------------------------------------------ PushReporter
@@ -533,7 +767,10 @@ jobs:
 """
 
 
-def test_push_config_parses_with_state(tmp_path):
+def test_push_config_parses_with_state(tmp_path, monkeypatch):
+    # crypto-free wiring test: force the probe on so a bare checkout
+    # without pynacl exercises it too
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
     cfg = _parse_validated(
         _PUSH_STATE_YAML.format(path=(tmp_path / "state").as_posix())
     )
@@ -579,7 +816,8 @@ jobs:
     assert "notify" in str(exc.value)
 
 
-def test_push_needs_state_or_devices_file():
+def test_push_needs_state_or_devices_file(monkeypatch):
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
     yaml = """
 push:
   relay:
@@ -630,6 +868,54 @@ push:
     with pytest.raises(ConfigError) as exc:
         _parse_validated(yaml)
     assert "timeout" in str(exc.value)
+
+
+def test_config_dir_push_section_in_its_own_file(tmp_path, monkeypatch):
+    """The finding-2 regression: config-dir mode must carry push through.
+
+    _validate_push_config's own contract says the push: section and the
+    jobs enabling the reporter may live in different config-dir files;
+    a dir loop that drops push_config turns that into a false "no push:
+    section" refusal (and a push-only dir into silently-404 endpoints).
+    """
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    (tmp_path / "10-jobs.yaml").write_text(
+        "jobs:\n"
+        "  - name: j\n"
+        '    command: "true"\n'
+        '    schedule: "* * * * *"\n'
+        "    onFailure:\n"
+        "      report:\n"
+        "        push:\n"
+        "          enabled: true\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "20-push.yaml").write_text(
+        "push:\n"
+        "  relay:\n"
+        "    url: https://relay.example.net/v1/notify\n"
+        "  devicesFile: {}\n".format(
+            (tmp_path / "devices.json").as_posix()
+        ),
+        encoding="utf-8",
+    )
+    conf = config.parse_config(str(tmp_path))
+    assert conf.push_config is not None
+    assert conf.push_config["relay"]["url"].endswith("/v1/notify")
+
+
+def test_config_dir_multiple_push_sections_refused(tmp_path):
+    body = (
+        "push:\n"
+        "  relay:\n"
+        "    url: https://relay.example.net/v1/notify\n"
+        "  devicesFile: /tmp/d.json\n"
+    )
+    (tmp_path / "10-push.yaml").write_text(body, encoding="utf-8")
+    (tmp_path / "20-push.yaml").write_text(body, encoding="utf-8")
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config(str(tmp_path))
+    assert "Multiple 'push' configurations" in str(exc.value)
 
 
 # ------------------------------------------------------- bonjour config
@@ -742,6 +1028,7 @@ async def test_push_routes_404_without_push_section():
             await call
 
 
+@requires_pynacl
 async def test_pair_list_revoke_via_handlers(tmp_path):
     _, public_b64 = _device_keypair()
     cron = _cron()
@@ -784,6 +1071,21 @@ async def test_pair_rejects_bad_bodies(tmp_path):
         await cron._web_push_pair(_Req(body={"name": "x"}))
 
 
+@requires_pynacl
+async def test_pair_store_write_failure_is_503(tmp_path):
+    # The docstring/openapi contract: store trouble is 503, never a raw
+    # aiohttp 500. A devicesFile in a missing directory is the simplest
+    # real store-trouble a pairing can hit.
+    _, public_b64 = _device_keypair()
+    cron = _cron()
+    cron._push_service = _service(
+        push.FileDeviceStore(str(tmp_path / "no-such-dir" / "d.json"))
+    )
+    with pytest.raises(web.HTTPServiceUnavailable):
+        await cron._web_push_pair(_Req(body=_pair_body(public_b64)))
+
+
+@requires_pynacl
 async def test_push_test_endpoint_round_trip(tmp_path):
     _, public_b64 = _device_keypair()
     async with _RelayServer() as relay:
@@ -916,6 +1218,30 @@ async def test_start_stop_push_builds_and_tears_down(tmp_path):
     assert push.get_service() is None
 
 
+async def test_start_stop_push_reload_changed_rebuilds(tmp_path):
+    cron = _cron()
+    push_config = {
+        "relay": {"url": "http://127.0.0.1:1/a", "timeout": 5.0},
+        "devicesFile": str(tmp_path / "devices.json"),
+    }
+    await cron.start_stop_push(push_config)
+    first = cron._push_service
+    # a changed section rebuilds the service onto the new relay
+    changed = copy.deepcopy(push_config)
+    changed["relay"]["url"] = "http://127.0.0.1:1/b"
+    await cron.start_stop_push(changed)
+    assert cron._push_service is not first
+    assert cron._push_service.relay_url == "http://127.0.0.1:1/b"
+    # the aliasing trap: editing the SAME dict object in place must
+    # still read as a change (the applied snapshot is a deep copy, so
+    # comparing against it detects the mutation; holding an alias would
+    # make this compare equal to itself forever)
+    changed["relay"]["url"] = "http://127.0.0.1:1/c"
+    await cron.start_stop_push(changed)
+    assert cron._push_service.relay_url == "http://127.0.0.1:1/c"
+    await cron.start_stop_push(None)
+
+
 async def test_start_stop_push_state_store_tracks_backend(tmp_path):
     cron = _cron()
     await cron.start_stop_push(
@@ -1014,6 +1340,77 @@ async def test_bonjour_register_failure_logs_and_stays_off(
     await advertiser.start_stop({"name": "n", "port": 1, "properties": {}})
     assert not advertiser.active
     assert any("failed to register" in r.message for r in caplog.records)
+    # The half-built AsyncZeroconf must be closed on the failure path:
+    # this runs every housekeeping minute, and one leaked instance per
+    # pass exhausts file descriptors within a day.
+    (zc,) = fake_zeroconf.instances
+    assert zc.closed
+
+
+async def test_bonjour_reregisters_when_the_address_changes(
+    fake_zeroconf, monkeypatch
+):
+    addresses = iter(["192.0.2.7", "192.0.2.7", "198.51.100.9"])
+    monkeypatch.setattr(
+        discovery, "primary_address", lambda: next(addresses)
+    )
+    advertiser = discovery.BonjourAdvertiser()
+    advert = {"name": "attic", "port": 8080, "properties": {}}
+    await advertiser.start_stop(advert)
+    assert len(fake_zeroconf.instances) == 1
+    # same advert, same address: converged, nothing re-registers
+    await advertiser.start_stop(dict(advert))
+    assert len(fake_zeroconf.instances) == 1
+    # same advert, new DHCP lease: the old advert (with its dead IP) is
+    # torn down and a fresh one registered
+    await advertiser.start_stop(dict(advert))
+    assert len(fake_zeroconf.instances) == 2
+    assert fake_zeroconf.instances[0].closed
+    await advertiser.stop()
+
+
+def test_instance_name_truncates_by_utf8_bytes():
+    # mDNS labels cap at 63 BYTES; three bytes per Japanese codepoint
+    # means a 40-char name is 120 bytes and must shrink without tearing
+    # a codepoint in half.
+    label = discovery._instance_name("日" * 40)
+    encoded = label.encode("utf-8")
+    assert len(encoded) <= 63
+    assert encoded.decode("utf-8") == label  # no torn codepoint
+    assert discovery._instance_name("") == "cronstable"
+    assert discovery._instance_name("a.b.c") == "a-b-c"
+
+
+async def test_bonjour_real_serviceinfo_accepts_our_construction(
+    monkeypatch,
+):
+    """The finding-8 gate: exercise the REAL zeroconf ServiceInfo.
+
+    Every other Bonjour test fakes the library, so a signature or
+    name-validation change in python-zeroconf would otherwise ship with
+    green CI (the optional-dep blind spot). Only AsyncZeroconf is faked
+    here, keeping the network out of the suite; ServiceInfo runs real,
+    with a multibyte name that lands on the 63-byte label edge.
+    """
+    pytest.importorskip(
+        "zeroconf", reason="zeroconf (the discovery extra) is not installed"
+    )
+    monkeypatch.setattr(discovery, "HAVE_ZEROCONF", True)
+    monkeypatch.setattr(discovery, "AsyncZeroconf", _FakeAsyncZeroconf)
+    monkeypatch.setattr(discovery, "primary_address", lambda: "192.0.2.7")
+    advertiser = discovery.BonjourAdvertiser()
+    await advertiser.start_stop(
+        {
+            "name": "日本語ホスト" * 6,
+            "port": 8080,
+            "properties": {"v": "1.2.30", "scheme": "http"},
+        }
+    )
+    assert advertiser.active
+    info = advertiser._info
+    assert info is not None
+    assert info.type == discovery.SERVICE_TYPE
+    await advertiser.stop()
 
 
 async def test_notify_fanout_reaches_push(stub_service):

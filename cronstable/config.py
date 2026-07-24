@@ -3429,7 +3429,10 @@ def _validate_web_config(webconf: WebConfig) -> None:
             raise ConfigError(
                 "web.bonjour is enabled but python-zeroconf is not "
                 "installed; install the discovery extra (pip install "
-                '"cronstable[discovery]") or disable web.bonjour'
+                '"cronstable[discovery]") or disable web.bonjour. '
+                "The standalone release binaries deliberately ship "
+                "without it (zeroconf is LGPL; see LICENSING.md), so "
+                "web.bonjour needs a pip-based install."
             )
         tcp_listens = [
             addr
@@ -4442,6 +4445,29 @@ def _parse_config_dir_file(
     return config, frozen
 
 
+def _claim_config_dir_section(
+    kind: str,
+    new_value: Any,
+    current: Any,
+    current_source: Optional[str],
+    path: str,
+) -> Tuple[Any, Optional[str]]:
+    """Adopt one at-most-once section from a config-dir file.
+
+    web/cluster/state/mcp/logging/notify/push may each appear in at most
+    one file of a config directory; a second appearance is refused with
+    an error naming both files.
+    """
+    if new_value is None:
+        return current, current_source
+    if current is not None:
+        raise ConfigError(
+            "Multiple '{}' configurations found: "
+            "first in {}, now in {}".format(kind, current_source, path)
+        )
+    return new_value, path
+
+
 def _parse_config_dir(
     config_arg: str, _sources: Optional[set] = None
 ) -> CronstableConfig:
@@ -4460,6 +4486,8 @@ def _parse_config_dir(
     logging_config_source_fname: Optional[str] = None
     notify_config: Optional[Dict[str, Any]] = None
     notify_config_source_fname: Optional[str] = None
+    push_config: Optional[Dict[str, Any]] = None
+    push_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
     # Sort by name so job order and the "first config found" error messages
     # are deterministic; os.scandir yields entries in arbitrary FS order.
@@ -4486,72 +4514,59 @@ def _parse_config_dir(
             _sources.update(file_sources)
         jobs.extend(config.jobs)
         dags.extend(config.dags)
-        if config.web_config is not None:
-            if web_config is None:
-                web_config = config.web_config
-                web_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'web' configurations found: "
-                    "first in {}, now in {}".format(
-                        web_config_source_fname, direntry.path
-                    )
-                )
-        if config.cluster_config is not None:
-            if cluster_config is None:
-                cluster_config = config.cluster_config
-                cluster_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'cluster' configurations found: "
-                    "first in {}, now in {}".format(
-                        cluster_config_source_fname, direntry.path
-                    )
-                )
-        if config.state_config is not None:
-            if state_config is None:
-                state_config = config.state_config
-                state_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'state' configurations found: "
-                    "first in {}, now in {}".format(
-                        state_config_source_fname, direntry.path
-                    )
-                )
-        if config.mcp_config is not None:
-            if mcp_config is None:
-                mcp_config = config.mcp_config
-                mcp_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'mcp' configurations found: "
-                    "first in {}, now in {}".format(
-                        mcp_config_source_fname, direntry.path
-                    )
-                )
-        if config.logging_config is not None:
-            if logging_config is None:
-                logging_config = config.logging_config
-                logging_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'logging' configurations found: "
-                    "first in {}, now in {}".format(
-                        logging_config_source_fname, direntry.path
-                    )
-                )
-        if config.notify_config is not None:
-            if notify_config is None:
-                notify_config = config.notify_config
-                notify_config_source_fname = direntry.path
-            else:
-                raise ConfigError(
-                    "Multiple 'notify' configurations found: "
-                    "first in {}, now in {}".format(
-                        notify_config_source_fname, direntry.path
-                    )
-                )
+        web_config, web_config_source_fname = _claim_config_dir_section(
+            "web",
+            config.web_config,
+            web_config,
+            web_config_source_fname,
+            direntry.path,
+        )
+        cluster_config, cluster_config_source_fname = (
+            _claim_config_dir_section(
+                "cluster",
+                config.cluster_config,
+                cluster_config,
+                cluster_config_source_fname,
+                direntry.path,
+            )
+        )
+        state_config, state_config_source_fname = _claim_config_dir_section(
+            "state",
+            config.state_config,
+            state_config,
+            state_config_source_fname,
+            direntry.path,
+        )
+        mcp_config, mcp_config_source_fname = _claim_config_dir_section(
+            "mcp",
+            config.mcp_config,
+            mcp_config,
+            mcp_config_source_fname,
+            direntry.path,
+        )
+        logging_config, logging_config_source_fname = (
+            _claim_config_dir_section(
+                "logging",
+                config.logging_config,
+                logging_config,
+                logging_config_source_fname,
+                direntry.path,
+            )
+        )
+        notify_config, notify_config_source_fname = _claim_config_dir_section(
+            "notify",
+            config.notify_config,
+            notify_config,
+            notify_config_source_fname,
+            direntry.path,
+        )
+        push_config, push_config_source_fname = _claim_config_dir_section(
+            "push",
+            config.push_config,
+            push_config,
+            push_config_source_fname,
+            direntry.path,
+        )
         job_defaults = JobDefaults(
             mergedicts(job_defaults, config.job_defaults)
         )
@@ -4570,4 +4585,5 @@ def _parse_config_dir(
         dags=dags,
         mcp_config=mcp_config,
         notify_config=notify_config,
+        push_config=push_config,
     )

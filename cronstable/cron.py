@@ -1,5 +1,6 @@
 import asyncio
 import asyncio.subprocess
+import copy
 import datetime
 import hashlib
 import heapq
@@ -2701,7 +2702,12 @@ class Cron:
         )
         await service.start()
         self._push_service = service
-        self._applied_push_config = push_config
+        # A deep copy, never the caller's dict: the convergence guard
+        # above compares by equality, and holding an alias would make a
+        # config edit that mutates the same dict in place compare equal
+        # to itself forever (the mergedicts/DEFAULT_CONFIG sharing trap)
+        # -- a changed push: section would then never be re-applied.
+        self._applied_push_config = copy.deepcopy(push_config)
         push.set_service(service)
         logger.info("push: service running (registry %s)", store.describe())
 

@@ -1202,6 +1202,13 @@ components:
         publicKey:
           type: string
           description: The device X25519 public key, base64.
+        fingerprint:
+          type: string
+          nullable: true
+          description: >-
+            Short SHA-256 fingerprint of the raw key bytes (12 hex
+            characters, dash-grouped), for out-of-band comparison against
+            the fingerprint the companion app displays.
         pushToken:
           type: string
           description: Redacted to its trailing characters.

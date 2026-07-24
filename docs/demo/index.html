@@ -1901,7 +1901,7 @@
 <div class="overlay" id="pairWrap">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pairTitle" aria-describedby="pairMsg">
     <h3 id="pairTitle">Pair a device</h3>
-    <p id="pairMsg">Scan with the companion app to link it to this dashboard. The code carries this page's address and your bearer token.</p>
+    <p id="pairMsg">Scan with the companion app to link it to this dashboard. The code carries this page's address and your bearer token, so pair over HTTPS or a trusted network. After pairing, compare the key fingerprint the app shows with the one <code>GET /push/devices</code> reports; a mismatch means the stored key is not your phone's.</p>
     <div class="pair-qr" id="pairQr"></div>
     <div class="pair-hint" id="pairHint" style="display:none"><span>No token is stored in this tab; the payload pairs unauthenticated.</span><button class="ghostbtn mini" id="pairToken">set token</button></div>
     <div class="pair-payload" id="pairPayload"></div>

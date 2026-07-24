@@ -53,12 +53,28 @@ cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (MIT); th
 root LICENSE preserves yacron's copyright alongside cronstable's, as MIT
 requires.
 
-Runtime dependencies are all permissive (MIT / BSD / Apache / PSF / MPL). A CI
+Runtime dependencies of the core install and of everything frozen into the
+PyInstaller binaries are permissive (MIT / BSD / Apache / PSF / MPL). A CI
 guard ([.github/scripts/check_licenses.py](.github/scripts/check_licenses.py), run by the
-`licenses` job) fails the build if a strong-copyleft (GPL / AGPL) or non-open
-source-available (SSPL / BUSL) dependency is ever introduced, so the permissive
-baseline cannot regress by accident. This matters because the shipped artifacts
-(the PyInstaller binaries and Docker images) bundle the whole dependency tree.
+`licenses` job over the runtime plus every distributable extra) fails the build
+if a strong-copyleft (GPL / AGPL) or non-open source-available (SSPL / BUSL)
+dependency is ever introduced, so the permissive baseline cannot regress by
+accident. This matters because the shipped artifacts (the PyInstaller binaries
+and Docker images) bundle the whole dependency tree.
+
+One deliberate exception, handled by distribution surface:
+
+- **python-zeroconf** (the optional `discovery` extra, behind `web.bonjour`) is
+  **LGPL-2.1-or-later**. The LGPL is fine to depend on, but its terms require
+  that a recipient can swap in their own build of the library. That holds for
+  a pip install and for the Docker images (zeroconf sits in `site-packages` as
+  ordinary replaceable files, with its license text alongside in its
+  `dist-info`), so those surfaces include it. A one-file, `-OO`-optimized
+  PyInstaller freeze defeats that replacement right, so **the release binaries
+  deliberately do not bundle zeroconf**: `web.bonjour` in a standalone binary
+  fails closed at config load with a message pointing here. The `licenses` CI
+  job reports zeroconf as weak copyleft (allowed) on every run, keeping the
+  choice visible.
 
 ## Trademarks
 
