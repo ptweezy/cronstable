@@ -98,6 +98,8 @@ token. The panel warns when the token it would embed is the all-scopes one;
 give a phone a scoped
 [`web.authTokens`](HTTP-API#scoped-tokens-webauthtokens) entry instead.
 
+[![The Pair a device panel: a QR code of the connection payload, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
+
 Pairing is also one API call (`control` scope):
 
 ```shell

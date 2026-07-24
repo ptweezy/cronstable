@@ -643,6 +643,18 @@ The settings panel (and the command palette) expose:
 All preferences are remembered in the browser's `localStorage`, so the dashboard
 comes back the way you left it.
 
+### Pair a device
+
+[![The Pair a device panel: a QR code of the connection payload, the payload as a copyable JSON string, and the all-scopes token warning](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-pair.png)
+
+The settings sheet (and the command palette) also open the **Pair a device**
+panel: a QR code of `{v: 1, name, url, token}` plus the same JSON as a
+copyable string, which is how the companion app learns the daemon's address
+and bearer token in one scan. The panel checks the stored token against
+[`GET /whoami`](HTTP-API#get-whoami) and warns when it holds every scope;
+give a phone a scoped `web.authTokens` entry instead. See
+[Push Notifications](Push-Notifications) for the pairing flow this feeds.
+
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
 | [![The dashboard in the amber phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-amber.png) | [![The dashboard in the green phosphor CRT theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-theme-green.png) |
