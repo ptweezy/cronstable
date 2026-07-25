@@ -254,6 +254,14 @@ Ground rules:
 
 - Time only the workload; do setup outside the timed region, and use
   `fixture(name, builder)` for expensive setup shared across repeats.
+- A fixture holding external state that outlives a dropped reference (a
+  subprocess, a session, and above all anything that parks a RUNNING event
+  loop on the harness thread the way Playwright's sync API does) must pass
+  `fixture(name, builder, finalizer=...)`. Fixtures are evicted at group
+  boundaries, and the harness then audits the thread for a leftover running
+  loop: a parked loop hard-fails the run right there, because it would
+  otherwise silently skip every later `asyncio.run()` benchmark on both
+  sides of the comparison (the 1.2.31 release's six dead gates).
 - Scale the workload with `_n(base)` so `--quick` and `--smoke` stay cheap.
 - Import cronstable inside the function and raise `Skip` when an API is
   missing, so the harness still runs against older releases.
