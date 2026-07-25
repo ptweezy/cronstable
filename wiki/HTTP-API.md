@@ -1184,7 +1184,9 @@ returned whole. Requires the `view` scope.
 Like all `/push/...` routes, it answers `404` until a `push:` section is
 configured (the routes are always registered, so a reload that adds the
 section needs no web-app restart), and `503` when the device registry's
-store is unavailable.
+store is unavailable. The `503` body says only that: the store's own
+diagnostic names its absolute path and quotes the underlying OS error, so
+it goes to the daemon log rather than to the caller.
 
 ```shell
 $ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/push/devices
