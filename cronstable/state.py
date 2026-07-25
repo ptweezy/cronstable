@@ -1029,7 +1029,10 @@ class FilesystemStateBackend(StateBackend):
         # append_record's ``prune_keep``): the first such append per stream
         # since boot prunes immediately (trimming any pre-existing
         # overgrowth), then only every _PRUNE_EVERY_APPENDS-th does. Written
-        # from worker threads, hence the lock.
+        # from worker threads, hence the lock.  Keyed by the stream's on-disk
+        # TOKEN, not its logical name, so garbage collection (which sees only
+        # tokens) can drop the entry when it removes the directory; _fs_safe
+        # is injective, so the two keyings are interchangeable otherwise.
         self._prune_countdown: Dict[str, int] = {}
         self._prune_gate_lock = threading.Lock()
         # Derived-cursor memo (see _derive_max_sync): (stream token, field)
@@ -1546,7 +1549,7 @@ class FilesystemStateBackend(StateBackend):
             # load-bearing decisions, e.g. the @reboot launch gate, from
             # whether the append landed).  One gate check drives both prune
             # kinds so the countdown is consumed once.
-            if self._append_prune_due(stream):
+            if self._append_prune_due(token):
                 try:
                     if prune_keep is not None and prune_keep > 0:
                         self._prune_sync(stream, prune_keep)
@@ -1561,19 +1564,33 @@ class FilesystemStateBackend(StateBackend):
                     )
         return rec_id
 
-    def _append_prune_due(self, stream: str) -> bool:
+    def _append_prune_due(self, token: str) -> bool:
         with self._prune_gate_lock:
-            left = self._prune_countdown.get(stream, 0)
+            left = self._prune_countdown.get(token, 0)
             if left <= 0:
                 if len(self._prune_countdown) >= _PRUNE_COUNTDOWN_MAX_STREAMS:
                     # Bound the map (see _PRUNE_COUNTDOWN_MAX_STREAMS). Only
                     # countdowns are lost, so the worst case is one extra
                     # prune per stream on its next append.
                     self._prune_countdown.clear()
-                self._prune_countdown[stream] = _PRUNE_EVERY_APPENDS - 1
+                self._prune_countdown[token] = _PRUNE_EVERY_APPENDS - 1
                 return True
-            self._prune_countdown[stream] = left - 1
+            self._prune_countdown[token] = left - 1
             return False
+
+    def _prune_countdown_forget(self, token: str) -> None:
+        """Drop one stream's append-prune countdown after its dir is gone.
+
+        Without this the map only ever grows: classic crontabs mint
+        ``<file>:<line>`` job names, so editing one line above another
+        renames every stream below it, and a long-uptime daemon accumulates
+        an entry per name it has ever seen.  Garbage collection removing the
+        directory is the point where the name is provably retired, and a
+        name that comes back simply re-seeds at the next append (which then
+        prunes immediately, the same as any first append since boot).
+        """
+        with self._prune_gate_lock:
+            self._prune_countdown.pop(token, None)
 
     def _quarantine(self, path: str, name: str, reason: str) -> None:
         dest = os.path.join(
@@ -2810,6 +2827,7 @@ class FilesystemStateBackend(StateBackend):
             # a wholesale stream wipe: the derive_max memo must not
             # survive it, see _derive_max_invalidate.
             self._derive_max_invalidate(token)
+            self._prune_countdown_forget(token)
         leases_removed = self._gc_leases_sync(
             cutoff, dry_run, ephemeral_lease_prefixes
         )

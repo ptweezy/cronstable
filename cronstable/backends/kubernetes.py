@@ -42,8 +42,9 @@ import ssl
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 from urllib.parse import quote
 
 import aiohttp
@@ -57,6 +58,8 @@ from cronstable.leadership import (
 )
 
 logger = logging.getLogger("cronstable.backends.kubernetes")
+
+_T = TypeVar("_T")
 
 # How far in advance of the computed lease expiry a holder stops calling itself
 # leader, so a node whose clock runs slightly fast self-demotes *before* a peer
@@ -1427,15 +1430,40 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
     """Native ``kubernetes`` client transport (used when the lib is present).
 
     The official client is synchronous, so its short, infrequent Lease calls
-    run in a worker thread via ``asyncio.to_thread``.  Read leases are
-    normalised to the same JSON dict shape the REST transport returns, so the
-    pure planning helpers are transport-agnostic.
+    run in a worker thread.  Read leases are normalised to the same JSON dict
+    shape the REST transport returns, so the pure planning helpers are
+    transport-agnostic.
+
+    The thread is drawn from a DEDICATED two-worker pool, never from
+    ``asyncio.to_thread``'s process-wide default executor.  That executor is
+    ``min(32, cpu_count + 4)`` threads (six on a 2-vCPU container) shared with
+    the config reparse, archive redaction and resource sampling, and it queues
+    without bound: a 10 ms lease read submitted behind six saturating offloads
+    was measured at 1.948 s, 186x its own cost.  A queue in front of a
+    leadership fence is not merely a latency problem.  ``renew_deadline``
+    cancels the awaiting coroutine but not the thread, so a round that lost
+    the race is reported as "apiserver unreachable" and the holder self-demotes
+    (Leader fails closed, PreferLeader double-runs) on a cluster that was
+    perfectly healthy.  Two workers, because a round is at most one read plus
+    one write and they run in sequence: the second worker exists so a round
+    still wedged on a black-holed apiserver (bounded by ``_request_timeout``,
+    see :meth:`observe`) cannot make the NEXT round queue behind it.
     """
 
     def __init__(self, backend: "KubernetesBackend") -> None:
         self.b = backend
         self._api: Any = None
         self._api_client: Any = None
+        self._pool: Optional[ThreadPoolExecutor] = None
+
+    async def _offload(self, fn: Callable[[], _T]) -> _T:
+        """Run one blocking client call on this transport's own pool."""
+        if self._pool is None:
+            self._pool = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="cronstable-k8s-lease"
+            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._pool, fn)
 
     async def setup(self) -> None:
         # The native client's config loading is fully synchronous and can be
@@ -1443,7 +1471,7 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
         # subprocess that may contact a metadata endpoint). start() is awaited
         # inline from the daemon's single run loop, so run it in a worker
         # thread rather than freezing the whole scheduler/web API meanwhile.
-        context_namespace = await asyncio.to_thread(self._setup_sync)
+        context_namespace = await self._offload(self._setup_sync)
         self.b.namespace = self.b._resolve_namespace(context_namespace)
 
     def _setup_sync(self) -> Optional[str]:
@@ -1528,9 +1556,10 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
                     # aborts the call instead of blocking this worker thread
                     # forever: the renew loop's asyncio.wait_for can cancel the
                     # awaiting coroutine but NOT the thread, so without this a
-                    # hung round permanently consumes a to_thread worker and
-                    # eventually starves the whole process's executor (the
-                    # aiohttp transports get this from their ClientTimeout).
+                    # hung round permanently consumes one of the pool's two
+                    # workers and the pool eventually stops serving renews at
+                    # all (the aiohttp transports get this from their
+                    # ClientTimeout).
                     _request_timeout=self.b.renew_deadline,
                 )
             except ApiException as ex:
@@ -1541,7 +1570,7 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
             result: Dict[str, Any] = sanitize(lease)
             return result
 
-        return await asyncio.to_thread(_read)
+        return await self._offload(_read)
 
     async def write(self, body: Dict[str, Any], *, create: bool) -> bool:
         from kubernetes.client.exceptions import ApiException
@@ -1569,9 +1598,23 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
                 raise
             return True
 
-        return await asyncio.to_thread(_write)
+        return await self._offload(_write)
 
     async def close(self) -> None:
-        if self._api_client is not None:
-            await asyncio.to_thread(self._api_client.close)
-            self._api_client = None
+        try:
+            if self._api_client is not None:
+                await self._offload(self._api_client.close)
+                self._api_client = None
+        finally:
+            # In a finally because stop() bounds this close with a deadline:
+            # on the timeout path the coroutine is cancelled here, and a pool
+            # released only on the happy path would leak two threads per
+            # reload that rebuilds the manager.
+            if self._pool is not None:
+                # wait=False for the same reason stop() bounds the close at
+                # all. A wedged apiserver call cannot be cancelled, so joining
+                # its thread would reintroduce exactly the block the deadline
+                # exists to avoid. An idle worker exits on its own; a wedged
+                # one is bounded by the call's own _request_timeout.
+                self._pool.shutdown(wait=False)
+                self._pool = None

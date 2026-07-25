@@ -205,15 +205,27 @@ def _sample_base(family: MetricFamily) -> str:
     return family.name
 
 
-#: Ceiling on a persistent label-block memo before it is dropped whole.
-#: The label universe is a pure function of the job set (job_name crossed
-#: with a fixed static label), so it is bounded but proportional to fleet
-#: size: about 16 blocks per job, i.e. 8k entries at 500 jobs and 32k at
-#: 2000, both of which stay fully warm under this cap.  Past it the memo is
-#: cleared rather than evicted one entry at a time: the alternative is
-#: unbounded RSS on a six-figure fleet (~1.6M entries at 100k jobs), and a
-#: scrape that overflows the cap degrades to today's cold-memo cost, never
-#: worse.
+#: Ceiling on the entries a persistent label-block memo will hold.  The
+#: label universe is a pure function of the job set (job_name crossed with
+#: a fixed static label), so it is bounded but proportional to fleet size:
+#: about 16 blocks per job, i.e. 8k entries at 500 jobs and 32k at 2000,
+#: both of which stay fully warm under this cap.  A cap is needed at all
+#: because the memo outlives the scrape: uncapped it would be ~1.6M
+#: entries of permanent RSS on a six-figure fleet.
+#:
+#: At the cap the memo STOPS ACCEPTING new entries rather than dropping
+#: what it holds.  Clearing it wholesale looked cheaper (one operation, no
+#: eviction bookkeeping) but it thrashes: the pass that overflows destroys
+#: the blocks it just built, refills, overflows again, and ends holding a
+#: fraction of a working set, so the NEXT scrape starts cold too and the
+#: memo stops paying for itself entirely.  Measured at 2000 vs 2100 jobs,
+#: 100 extra jobs cost 22.6ms -> 62.7ms per render (0.45 -> 1.19us per
+#: sample) crossing that edge.  Refusing the overflow instead keeps a
+#: stable warm set: the pass builds blocks in a deterministic order, so
+#: the same prefix is served warm on every scrape and only the tail is
+#: rebuilt, which degrades smoothly with fleet size instead of falling off
+#: a cliff.  Nothing goes stale in the pinned set: a block's key contains
+#: its values, and prune() clears the memo whenever the job set can shrink.
 LABEL_BLOCK_CACHE_MAX = 32768
 
 _LabelBlockCache = Dict[Tuple[Tuple[str, str], ...], str]
@@ -276,9 +288,8 @@ def _make_label_block_builder(
                     )
                     + "}"
                 )
-            if len(memo) >= LABEL_BLOCK_CACHE_MAX:
-                memo.clear()
-            memo[key] = block
+            if len(memo) < LABEL_BLOCK_CACHE_MAX:
+                memo[key] = block
         return block
 
     return block_for

@@ -14,10 +14,15 @@
 # line is a reviewed, deliberate edit, same as budgets.json; [perf:accept]
 # does not excuse a failure here.
 #
+# Ids are kept in sorted order so an addition has one obvious home and a
+# duplicate is visible in review.  Every id bench.py registers belongs here
+# except the four at the bottom, each with the reason it cannot be gated.
+#
 # The in-repo smoke net (tests/test_benchmarks.py) is the companion guard:
 # it fails when a headline metric starts skipping in --smoke, which catches
 # a broken seam before CI does.
 
+cluster.fleet_view_15x400
 cluster.job_owner_2k
 cluster.parse_summaries_6k
 config.interp_2k
@@ -46,6 +51,7 @@ dag.mapped_drain_256
 dag.plan_claim_10k
 fingerprint.job_set_id_10k
 ical.render_500x7d
+job.report_noop_100k
 job.stream_capture_120k
 json.roundtrip_3k
 json.roundtrip_orjson_3k
@@ -55,20 +61,14 @@ mcp.handle_200
 mem.crontab_10k
 mem.gc_pause_100k
 mem.jobconfig_2k
-state.list_records_warm
-state.mutate_document_1k
-webapi.jobs_gzip_500
-webapi.sse_frame_20k
-webui.render_term_5k
-# loop.stall_jobs_500 is deliberately absent while it ships info=True (an
-# info metric never gates, so coverage does not count it). Add it when it
-# is armed after its one observation release.
 mem.rss_daemon_import
 mem.rss_version
 prometheus.render_500
+push.seal_500
 redact.adversarial_10k
 redact.clean_20k
 redact.secrets_5k
+resources.monitor_stop_100
 schedule.cold_build_100k
 schedule.due_pass_100k
 schedule.duplicates_20k
@@ -96,32 +96,39 @@ state.kv_roundtrip_200
 state.lease_renew_200
 state.list_documents_600
 state.list_records_2k
+state.list_records_warm
+state.mutate_document_1k
 statsd.emit_2k
 tui.drawer_paint_5k
 tui.log_restyle_5k
 tui.log_search_20k
 webapi.auth_scope_20k
 webapi.jobs_bytes_500
+webapi.jobs_gzip_500
 webapi.jobs_payload_500
+webapi.sse_frame_20k
 webui.log_count_5k
 webui.render_fleet_15x400
 webui.render_rows_500
-# push.seal_500 is deliberately absent: 1.2.30 (the current baseline) has
-# no cronstable.push, so it cannot compare until a push-capable release
-# becomes the baseline. Add it then.
+webui.render_term_5k
+
+# The four benchmarks deliberately NOT listed above, and why.
 #
-# webui.append_line_5k is deliberately absent for the same reason: it drives
-# the __perf.appendLine hook, which only ships in this release, so the
-# baseline side cannot measure it.
+# startup.python_baseline, loop.stall_jobs_500 and loop.stall_metrics_2000
+# all ship info=True, so bench.py records gate_pct as None and compare.py
+# never counts them as compared (_declared_gate_pct returns None, so
+# _gate_coverage skips the metric before it can land in compared_names).
+# Listing one would fail every run rather than guard anything, however
+# cleanly both sides measure it.  startup.python_baseline is the subprocess
+# tier's own noise floor, the quantity every other startup.* delta is
+# measured AGAINST; the two loop.* gauges report a max scheduling gap,
+# the noisiest shape in the suite, and each is meant to be observed for a
+# release before being armed.  Arm one by dropping info=True in bench.py
+# and adding its id above in the same commit.
 #
-# loop.stall_metrics_2000 is deliberately absent because it ships info=True
-# and therefore never gates at all (same reason loop.stall_jobs_500 is held
-# out). Listing a non-gating metric here would fail every run.
-#
-# cluster.fleet_view_15x400, job.report_noop_100k and resources.monitor_stop_100
-# are pending a baseline check rather than deliberately excluded. Each drives a
-# surface that may postdate the baseline release (ClusterManager.fleet_view and
-# the _job_summaries_provider seam, job.report_config_enabled, and
-# ResourceMonitor._proc/stop respectively). Add each one once a paired run
-# confirms it is COMPARED and not skipped on the baseline side; until then a
-# premature line here would fail CI for a metric that is working correctly.
+# webui.append_line_5k drives the __perf.appendLine hook, which lands in
+# this release.  Run against the 1.2.32 baseline tree it skips with "page
+# lacks the __perf.appendLine hook", so the pairing has nothing to compare.
+# Add it once a release carrying the hook is the baseline.  Its sibling
+# webui.render_term_5k needs no such wait: it drives the page's own
+# 'matches only' checkbox rather than a hook, and it does compare on 1.2.32.

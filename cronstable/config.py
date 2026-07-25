@@ -1583,6 +1583,9 @@ class JobConfig:
         "schedule_findings_json",
         "schedule_resolved_or_none",
         "sla_thresholds",
+        # Memoized job digest, filled on demand by
+        # cronstable.fingerprint.job_digest_cached (never by this class).
+        "_digest",
     )
 
     def __init__(
@@ -1698,6 +1701,15 @@ class JobConfig:
 
         self._validate_numeric_ranges()
 
+        # Empty slot for the memoized job digest, filled at most once per
+        # instance by cronstable.fingerprint.job_digest_cached and never read
+        # here. A reload rebuilds every JobConfig, so the memo cannot outlive
+        # the definition it describes: the ``jobDigest`` stored beside a retry
+        # ladder or an @reboot marker keeps meaning "the job as it was when
+        # this record was written", and job_digest() itself stays a live
+        # function of the attributes (tests/test_fingerprint.py pins that).
+        self._digest: Optional[str] = None
+
         self._precompute_payload_views()
 
     def _precompute_payload_views(self) -> None:
@@ -1733,10 +1745,8 @@ class JobConfig:
         # payload builder just tests for None).
         schedule = self.schedule
         resolved: Optional[str] = None
-        if isinstance(schedule, CronTab):
-            source = str(schedule)
-            if schedule.resolved_source != source:
-                resolved = schedule.resolved_source
+        if isinstance(schedule, CronTab) and schedule.resolved_differs:
+            resolved = schedule.resolved_source
         self.schedule_resolved_or_none = resolved
         # The non-None sla thresholds. A job with no check at all (the vast
         # majority) shares one empty mapping rather than allocating its own
@@ -1747,15 +1757,6 @@ class JobConfig:
             if self.has_sla
             else _NO_SLA_THRESHOLDS
         )
-        # NOTE: there is deliberately no memoized job digest here. It would be
-        # a pure function of this instance in production (JobConfigs are
-        # rebuilt wholesale on reload), but ``jobDigest`` is precisely the
-        # signal the daemon uses to notice that a job's DEFINITION changed
-        # since a retry ladder was armed or an @reboot marker was written
-        # (see Cron._claim_retry_under_lease). A digest that went stale
-        # against an in-place edit would make the scheduler resume an old
-        # ladder against a new command, so job_digest() stays a live function
-        # of the job's attributes and tests/test_fingerprint.py pins that.
 
     def _lint_schedule(
         self, lint_cache: Optional["LintCache"]

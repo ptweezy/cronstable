@@ -1,3 +1,11 @@
+# PEP 563 string annotations, so that the ~100 `web.Request` / `web.Response`
+# signatures below never evaluate at def time. That is what lets aiohttp stay
+# out of this module's import graph (see the _AiohttpDoor block after the
+# imports); without it, importing cronstable.cron would resolve every one of
+# those names and pull the web stack straight back in. Nothing here inspects
+# annotations at runtime, so making them strings costs nothing.
+from __future__ import annotations
+
 import asyncio
 import asyncio.subprocess
 import copy
@@ -37,10 +45,10 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:  # the loopback job-state API is imported lazily at runtime
-    from cronstable.jobapi import JobStateAPI
+    import aiohttp
+    from aiohttp import web
 
-import aiohttp
-from aiohttp import web
+    from cronstable.jobapi import JobStateAPI
 
 import cronstable.version
 from cronstable import _json, discovery, platform, push, statsd, tlsutil
@@ -101,6 +109,50 @@ from cronstable.resources import (
     resolve_node_history_config,
 )
 from cronstable.state import Lease, StateBackend, make_state_backend
+
+
+class _AiohttpDoor:
+    """Stand-in for ``aiohttp`` / ``aiohttp.web`` that imports on first touch.
+
+    aiohttp is 155 ms and 21 MB of RSS, roughly half of what importing this
+    module costs, and every one of its consumers here is optional: the web
+    listener, the cluster gossip client, the push relay. A daemon with none of
+    them configured used to pay for the web stack anyway, and so did every
+    offline caller that merely reaches into this module for a constant or a
+    helper (``cronstable state gc`` and friends go through state_admin, which
+    imports the stream prefixes from here).
+
+    A module-level ``__getattr__`` (PEP 562) cannot do this job: it is
+    consulted for attribute access on the module object from outside, not for
+    the ``LOAD_GLOBAL`` that a ``web.Response(...)`` inside this file compiles
+    to. An instance in the module globals is, so ``web`` and ``aiohttp`` are
+    bound to one of these instead of to the modules themselves.
+
+    The first attribute access rebinds BOTH globals to the real modules, so the
+    proxy is passed exactly once per process: after that ``web.Response`` is an
+    ordinary module attribute lookup with no indirection, which matters because
+    it sits on every request path. ``__slots__`` keeps ``_target`` a real class
+    attribute so looking it up inside ``__getattr__`` cannot recurse.
+    """
+
+    __slots__ = ("_target",)
+
+    def __init__(self, target: str) -> None:
+        self._target = target
+
+    def __getattr__(self, name: str) -> Any:
+        import aiohttp
+        from aiohttp import web
+
+        namespace = globals()
+        namespace["aiohttp"] = aiohttp
+        namespace["web"] = web
+        return getattr(namespace[self._target], name)
+
+
+if not TYPE_CHECKING:
+    aiohttp = _AiohttpDoor("aiohttp")
+    web = _AiohttpDoor("web")
 
 logger = logging.getLogger("cronstable")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
