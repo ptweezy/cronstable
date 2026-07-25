@@ -359,6 +359,32 @@ jobs:
           set -euo pipefail
           uv build                                      # wheel + sdist into dist/
           uvx twine check dist/*.whl dist/*.tar.gz       # twine, run ephemerally
+      # `twine check` validates metadata and renders the long description; it
+      # does NOT look at file size, and neither does the publish action. A 1.2.31
+      # sdist that had grown past PyPI's per-file cap therefore sailed through
+      # every gate and was rejected two hours later, at upload, after the wheel
+      # had already been accepted. Catch it here instead, in seconds.
+      - name: Check artifacts against PyPI's per-file size limit
+        run: |
+          set -euo pipefail
+          # warehouse: MAX_FILESIZE = 100 * ONE_MIB (constants.py). The error
+          # text says "100 MB" but the value is 100 MiB.
+          limit=104857600
+          # Fail well below the cap: a release that squeaks under today is one
+          # screenshot away from failing, and the sdist ships every git-tracked
+          # file (see MANIFEST.in), so it grows with the repo, not the code.
+          warn=94371840
+          status=0
+          for f in dist/*.whl dist/*.tar.gz; do
+            size=$(wc -c < "$f")
+            printf '%10d bytes  %s\n' "$size" "$f"
+            if [ "$size" -ge "$warn" ]; then
+              pct=$(( size * 100 / limit ))
+              echo "::error file=MANIFEST.in::$(basename "$f") is ${size} bytes, ${pct}% of PyPI's ${limit}-byte per-file limit. Prune it (MANIFEST.in) before releasing."
+              status=1
+            fi
+          done
+          exit "$status"
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: dist
