@@ -1006,7 +1006,13 @@ jobs:
   perf:
     needs: version
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A budget, not a licence: the pre-additions suite measured 1609s
+    # (2026-07-24, three consecutive runs within 6s of each other), and the
+    # 2026-07 benchmark additions priced in at CI rates fit under this with
+    # margin. bench.py prints its ten slowest benchmarks (fixtures included)
+    # per run, so growth is triaged from the log before this ceiling fires.
+    # A timeout here is a red X that is NOT a perf regression.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -1026,6 +1032,23 @@ jobs:
           uv venv --python 3.14 .venv-new
           SETUPTOOLS_SCM_PRETEND_VERSION="$NEW_VERSION" \
             uv pip install --python .venv-new/bin/python .
+          # orjson, on BOTH sides (the baseline venv gets it below): the
+          # binaries and Docker images ship the speedups extra, so orjson is
+          # production's default JSON backend, and a perf venv without it
+          # times the stdlib fallback only. Deliberately orjson alone, NOT
+          # the full speedups extra: uvloop would shift every async metric's
+          # baseline and most of the delta would be uvloop's own (waived in
+          # benchmarks/README.md; bench.py records the flag). Not
+          # best-effort: compare.py hard-fails a pairing where the two
+          # sides' orjson state differs, so a one-sided install must fail
+          # loudly here rather than report a backend swap as a code
+          # regression.
+          uv pip install --python .venv-new/bin/python orjson
+          # pynacl: the push.seal_500 metric skips without it, and a
+          # one-sided install is the webui/playwright dead-gate trap all
+          # over again -- so it goes into BOTH venvs (the baseline install
+          # is below), not best-effort.
+          uv pip install --python .venv-new/bin/python pynacl
           # Web-UI benchmarks (webui.*) time renders in a headless Chromium via
           # Playwright. Install it on BOTH sides (the baseline venv is created
           # below): a metric that skips on the baseline is reported with no
@@ -1035,8 +1058,12 @@ jobs:
           # baseline for that reason, but the gate now self-heals as soon as a
           # hooked release becomes the baseline instead of staying dead.
           # Best-effort: on failure the webui.* metrics skip (recorded, never
-          # failed), compare.py flags them as ungated, and the rest of the gate
-          # is unaffected.
+          # failed) and the rest of the gate still runs -- but the webui ids
+          # in benchmarks/expected_gated.txt then fail a RELEASE run's
+          # comparison (ordinary commits warn), because a silently dead gate
+          # is exactly what that file exists to catch. A transient
+          # Playwright/Chromium outage on a release is a rerun, not an edit
+          # to the expected list.
           uv pip install --python .venv-new/bin/python playwright || true
           .venv-new/bin/python -m playwright install --with-deps chromium \
             || echo "::warning::playwright/chromium unavailable; webui.* skip"
@@ -1053,6 +1080,12 @@ jobs:
             uv venv --python 3.14 .venv-old
             SETUPTOOLS_SCM_PRETEND_VERSION="$prev" \
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
+            # The baseline side's orjson: same backend on both sides or
+            # compare.py refuses the pairing (see the current-side install
+            # above). Not best-effort, same reason. pynacl likewise, so
+            # push.seal_500 compares as soon as a push-capable release is
+            # the baseline instead of staying dead.
+            uv pip install --python .venv-old/bin/python orjson pynacl
             # Same Playwright install on the baseline side, so webui.* can
             # actually be compared. The browser download above is cached
             # per-runner, so this only adds the Python package.
@@ -1069,9 +1102,12 @@ jobs:
           set -euo pipefail
           mkdir -p perf
           # Two tiers with their own round counts. The fast in-process metrics
-          # get more rounds: it is cheap, and more rounds tighten the per-metric
-          # noise band that compare.py now gates against, so a real regression
-          # is easier to tell from jitter. The noisier subprocess metrics (cold
+          # get more rounds: it is cheap, it deepens the best-of-rounds
+          # estimate, and it gives compare.py's robust scatter statistic
+          # enough points to work with. (More rounds do NOT tighten the noise
+          # band itself: the band estimates single-round scatter while the
+          # comparison diffs min-of-rounds, so measured bands can even widen
+          # as rounds are added.) The noisier subprocess metrics (cold
           # start, import, peak RSS) get fewer, since each round spawns
           # processes. Old then new within each round interleaves both sides
           # through the same runner weather; compare.py folds every
@@ -1117,14 +1153,28 @@ jobs:
             flags="$flags --accept"
             echo "::notice::[perf:accept] marker found; regressions are reported but do not gate."
           fi
+          # --budgets: absolute ceilings for the headline metrics, on top of
+          # the relative gate (drift across many quick releases compounds
+          # under a green relative gate; the ceiling is what stops it).
+          # --expected-gated: metric ids that must actually compare on both
+          # sides, so a gate that silently died (baseline-side skip) fails
+          # the run instead of being filed as first-release coverage.
+          # Both respect --warn-only (ordinary commits warn); neither is
+          # excused by [perf:accept] -- each has its own reviewed-edit
+          # ritual in benchmarks/.
           if [ -z "$PREV" ]; then
-            .venv-new/bin/python benchmarks/compare.py \
+            # $flags matters here too now: --budgets can gate even without a
+            # baseline to diff against.
+            .venv-new/bin/python benchmarks/compare.py $flags \
               --current perf/new.*.json --current-label "$NEW_VERSION" \
+              --budgets benchmarks/budgets.json \
               --md perf/perf-summary.md --merged-out perf/perf-results.json
           else
             .venv-new/bin/python benchmarks/compare.py $flags \
               --baseline perf/old.*.json --current perf/new.*.json \
               --baseline-label "$PREV" --current-label "$NEW_VERSION" \
+              --budgets benchmarks/budgets.json \
+              --expected-gated benchmarks/expected_gated.txt \
               --md perf/perf-summary.md --svg perf/perf-chart.svg \
               --merged-out perf/perf-results.json
           fi

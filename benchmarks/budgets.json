@@ -1,0 +1,31 @@
+{
+ "schema": 1,
+ "note": [
+  "Absolute ceilings for the headline metrics, enforced by compare.py",
+  "(--budgets) on top of the relative gate.  The relative gate alone cannot",
+  "stop slow drift: it compares HEAD against the latest tag only, and seven",
+  "release hops in five days at the maximum legal 15% each is 2.7x slower",
+  "with a green gate every time.  A breach fails the release even when the",
+  "relative gate passes, and [perf:accept] does not excuse it.",
+  "",
+  "Bump ritual: raising a ceiling is a deliberate, reviewed edit to this",
+  "file, made in the same PR as the change that needs it, with the commit",
+  "message saying why the new ceiling is acceptable.  Update 'observed'",
+  "(the merged best-of-rounds CI value the ceiling was sized against) and",
+  "'set' when you do.  Ceilings sit well above observed values (roughly",
+  "+60%) because ubuntu-latest runners vary run to run; the relative gate",
+  "handles single-release moves, this file only caps the compounding.",
+  "",
+  "Values are the metric's own unit: seconds, except mem.* in MB."
+ ],
+ "budgets": {
+  "startup.import_daemon": {"max": 0.50, "unit": "s", "observed": 0.309, "set": "2026-07-24"},
+  "schedule.cold_build_100k": {"max": 4.0, "unit": "s", "observed": 2.586, "set": "2026-07-24"},
+  "schedule.reseed_100k": {"max": 1.0, "unit": "s", "observed": 0.621, "set": "2026-07-24"},
+  "config.parse_yaml_300": {"max": 0.60, "unit": "s", "observed": 0.381, "set": "2026-07-24"},
+  "mem.rss_daemon_import": {"max": 60.0, "unit": "MB", "observed": 48.5, "set": "2026-07-24"},
+  "state.append_1k": {"max": 1.4, "unit": "s", "observed": 0.880, "set": "2026-07-24"},
+  "tui.log_restyle_5k": {"max": 0.14, "unit": "s", "observed": 0.088, "set": "2026-07-24"},
+  "dag.plan_claim_10k": {"max": 0.09, "unit": "s", "observed": 0.054, "set": "2026-07-24"}
+ }
+}
