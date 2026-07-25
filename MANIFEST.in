@@ -9,4 +9,3 @@ recursive-exclude env *
 
 # Proprietary trees are never shipped in the public MIT sdist (PyPI).
 prune pro
-prune ios
