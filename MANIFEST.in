@@ -9,3 +9,20 @@ recursive-exclude env *
 
 # Proprietary trees are never shipped in the public MIT sdist (PyPI).
 prune pro
+
+# docs/ is the website tree. setuptools_scm's git file finder seeds the sdist
+# with every tracked file before this file is even read, so the ~116 MB of
+# screenshots and diagrams under docs/ rode along and pushed the 1.2.31 sdist
+# past PyPI's 100 MiB per-file limit. Deny the tree and add back only the two
+# files the shipped tests/ tree reads, so future website assets cannot leak in
+# again: docs/openapi.yaml is the API contract tests/test_openapi.py diffs
+# against cronstable.cron.WEB_ROUTES, and docs/demo/index.html is the mirror
+# fixture tests/test_web_demo_mirror.py compares to cronstable/web/index.html.
+prune docs
+include docs/openapi.yaml
+include docs/demo/index.html
+
+# wiki/ and benchmarks/ deliberately stay. Together they are ~1.2 MB, and the
+# shipped test suite reads both: tests/test_tui.py asserts against
+# wiki/Web-Dashboard.md, and tests/test_benchmarks.py runs benchmarks/bench.py
+# and benchmarks/compare.py.
