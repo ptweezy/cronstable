@@ -108,7 +108,7 @@ shifted label, and a repeated fall-back wall time is yielded on its first
 occurrence only, so consumers never see one real instant twice.
 """
 
-import calendar
+import bisect
 import datetime
 import hashlib
 import re
@@ -173,6 +173,29 @@ _YEAR_FLOOR = 1970
 #: Module scope because the probe runs on every aware ``next()``: a shared
 #: immutable timedelta is indistinguishable from a freshly built one.
 _GAP_PROBE = datetime.timedelta(hours=26)
+
+
+#: Days per month, indexed 1-12 (February's non-leap length); index 0 unused.
+_MDAYS = (0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+
+
+def _month_end(year: int, month: int) -> int:
+    """The last day of ``month``, i.e. ``calendar.monthrange(y, m)[1]``.
+
+    Spelled out rather than delegated because this sits in the hottest civil
+    walk (once per candidate month, and once per :meth:`CronTab.test`) and
+    ``calendar.monthrange`` is an order of magnitude dearer than the
+    arithmetic: it validates the month through an ``enum.Month`` lookup, and
+    it computes the month's FIRST WEEKDAY (constructing a ``datetime.date``)
+    as the half of its result pair that no caller here ever reads.  The
+    leap rule is the plain proleptic-Gregorian one that
+    ``calendar.isleap`` applies, inlined for the same reason.  ``month`` is
+    always 1-12 by construction (the parser bounds the month column and
+    every walk keeps it in range), so no validation is owed.
+    """
+    if month == 2 and year % 4 == 0 and (year % 100 != 0 or year % 400 == 0):
+        return 29
+    return _MDAYS[month]
 
 
 def _is_quartz_w(item: str) -> bool:
@@ -664,6 +687,7 @@ class CronTab:
         "_seconds_sorted",
         "_months_sorted",
         "_years_sorted",
+        "_days_plain",
     )
 
     def __init__(self, crontab: str, hash_key: Optional[str] = None) -> None:
@@ -753,6 +777,22 @@ class CronTab:
         self._months_sorted = tuple(sorted(self._months))
         self._years_sorted = (
             tuple(sorted(self._years)) if self._years is not None else None
+        )
+        # Whether BOTH day columns are plain value sets, i.e. no member of
+        # the L / W / # families is present.  When they are, a day matches
+        # iff ``day in self._dom and dow in self._dow``: the unrestricted
+        # spelling of either column has already expanded to that column's
+        # full range, so the both-restricted AND rule needs no special case.
+        # The civil walks can then test a day with two set lookups inline
+        # instead of the _day_matches -> _dom_matches call pair.  That pair
+        # was ~28% of a next() on the profile, since the day loop runs once
+        # per candidate day and a sparse schedule walks most of a month.
+        self._days_plain = not (
+            self._dom_last_offsets
+            or self._dom_nearest
+            or self._dom_last_weekday
+            or self._dow_last
+            or self._dow_nth
         )
 
     # ------------------------------------------------------------------
@@ -883,9 +923,9 @@ class CronTab:
             and (self._years is None or entry.year in self._years)
         ):
             return False
-        # monthrange is reached only once the cheaper column checks pass,
-        # exactly as when _day_matches sat last in the old `and` chain.
-        month_end = calendar.monthrange(entry.year, entry.month)[1]
+        # the month length is reached only once the cheaper column checks
+        # pass, exactly as when _day_matches sat last in the old `and` chain.
+        month_end = _month_end(entry.year, entry.month)
         return self._day_matches(entry.year, entry.month, entry.day, month_end)
 
     def _day_matches(
@@ -893,11 +933,14 @@ class CronTab:
     ) -> bool:
         """The AND of the day-of-month and day-of-week constraints.
 
-        ``month_end`` (``calendar.monthrange(year, month)[1]``) is passed
-        in rather than recomputed: every caller already holds it for the
-        very ``(year, month)`` under test, and this runs per candidate day
-        in the hottest civil walk, so the once-per-day monthrange lookup
-        was pure redundant work on top of an otherwise trivial check.
+        ``month_end`` (:func:`_month_end`) is passed in rather than
+        recomputed: every caller already holds it for the very
+        ``(year, month)`` under test, and this runs per candidate day in the
+        hottest civil walk, so the once-per-day month-length lookup was pure
+        redundant work on top of an otherwise trivial check.
+
+        The civil walks do not call this at all when :attr:`_days_plain`
+        holds; see :meth:`_next_civil`.
         """
         if not self._dom_matches(year, month, day, month_end):
             return False
@@ -1023,12 +1066,13 @@ class CronTab:
                 )
             else:
                 now = datetime.datetime.now()
-        civil = now.replace(tzinfo=None)
         if now.tzinfo is None:
-            target = self._next_civil(civil)
+            # already naive, so it IS its own civil label: stripping a
+            # tzinfo that is not there only bought a copy.
+            target = self._next_civil(now)
             if target is None:
                 return None
-            return (target - civil).total_seconds()
+            return (target - now).total_seconds()
         # Aware: the delay to the next REAL instant, i.e. the first
         # :meth:`occurrences` yield after ``now``.  Each civil match is
         # resolved in the zone (fold=0) and compared through UTC, so a
@@ -1082,21 +1126,76 @@ class CronTab:
                     month = nxt
                 day, tod = 1, None
                 continue
-            month_end = calendar.monthrange(year, month)[1]
-            while day <= month_end:
-                if self._day_matches(year, month, day, month_end):
-                    t = self._first_time(tod)
-                    if t is not None:
-                        return datetime.datetime.combine(
-                            datetime.date(year, month, day), t
-                        )
-                day += 1
-                tod = None
+            month_end = _month_end(year, month)
+            # ``day`` is always a real day of this month here (the first pass
+            # carries ``base``'s own day, every later one is reset to 1), so
+            # the weekday seed below cannot be asked for a date that does not
+            # exist.
+            if self._days_plain:
+                # The hot walk: two set lookups per candidate day, with the
+                # weekday carried forward instead of rebuilt from a fresh
+                # datetime.date, and no per-day method calls at all.  Exactly
+                # the _day_matches test of the general branch (see
+                # _days_plain).
+                dom = self._dom
+                dow_set = self._dow
+                # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
+                dow = (datetime.date(year, month, day).weekday() + 1) % 7
+                while day <= month_end:
+                    if day in dom and dow in dow_set:
+                        found = self._at_first_time(year, month, day, tod)
+                        if found is not None:
+                            return found
+                    day += 1
+                    dow = dow + 1 if dow < 6 else 0
+                    tod = None
+            else:
+                while day <= month_end:
+                    if self._day_matches(year, month, day, month_end):
+                        found = self._at_first_time(year, month, day, tod)
+                        if found is not None:
+                            return found
+                    day += 1
+                    tod = None
             month += 1
             day, tod = 1, None
             if month > 12:
                 year, month = year + 1, 1
         return None
+
+    def _at_first_time(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        tod: Optional[datetime.time],
+    ) -> Optional[datetime.datetime]:
+        """``(year, month, day)`` at its earliest matching time, if any.
+
+        ``None`` when no matching time of day sits at or after ``tod``, i.e.
+        the matched day is already spent and the walk must move on.  Shared
+        by :meth:`_next_civil`'s two day loops so the plain-day fast path
+        and the L/W/# path cannot drift apart.  Called once per next(), on
+        the match, so the extra frame is off the per-candidate-day path.
+        """
+        t = self._first_time(tod)
+        if t is None:
+            return None
+        return datetime.datetime.combine(datetime.date(year, month, day), t)
+
+    def _at_last_time(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        tod: Optional[datetime.time],
+    ) -> Optional[datetime.datetime]:
+        """The backward mirror of :meth:`_at_first_time`, for
+        :meth:`_prev_civil`."""
+        t = self._last_time(tod)
+        if t is None:
+            return None
+        return datetime.datetime.combine(datetime.date(year, month, day), t)
 
     @staticmethod
     def _next_in(ordered: Tuple[int, ...], current: int) -> Optional[int]:
@@ -1109,28 +1208,41 @@ class CronTab:
     def _first_time(
         self, at_or_after: Optional[datetime.time]
     ) -> Optional[datetime.time]:
-        """Earliest matching time of day, at/after ``at_or_after`` if set."""
+        """Earliest matching time of day, at/after ``at_or_after`` if set.
+
+        Each column is located with a binary search rather than scanned:
+        the old nested walk skipped past every non-matching hour and then
+        every non-matching minute one at a time, so a plain ``* * * * *``
+        seeded at 10:30 stepped through ~40 values to find its answer.  The
+        columns are already sorted tuples, so ``bisect`` gets there in a
+        couple of probes.  The fall-throughs preserve the walk's exact
+        order of preference: a spent seconds column moves to the next
+        minute of the SAME hour, and only a spent minutes column moves to
+        the next hour.
+        """
+        hours = self._hours_sorted
+        minutes = self._minutes_sorted
+        seconds = self._seconds_sorted
         if at_or_after is None:
-            return datetime.time(
-                self._hours_sorted[0],
-                self._minutes_sorted[0],
-                self._seconds_sorted[0],
-            )
-        for hour in self._hours_sorted:
-            if hour < at_or_after.hour:
-                continue
-            if hour > at_or_after.hour:
-                return datetime.time(
-                    hour, self._minutes_sorted[0], self._seconds_sorted[0]
-                )
-            for minute in self._minutes_sorted:
-                if minute < at_or_after.minute:
-                    continue
-                if minute > at_or_after.minute:
-                    return datetime.time(hour, minute, self._seconds_sorted[0])
-                for second in self._seconds_sorted:
-                    if second >= at_or_after.second:
-                        return datetime.time(hour, minute, second)
+            return datetime.time(hours[0], minutes[0], seconds[0])
+        hour = at_or_after.hour
+        index = bisect.bisect_left(hours, hour)
+        if index == len(hours):
+            return None
+        if hours[index] > hour:
+            return datetime.time(hours[index], minutes[0], seconds[0])
+        minute = at_or_after.minute
+        m_index = bisect.bisect_left(minutes, minute)
+        if m_index < len(minutes):
+            if minutes[m_index] > minute:
+                return datetime.time(hour, minutes[m_index], seconds[0])
+            s_index = bisect.bisect_left(seconds, at_or_after.second)
+            if s_index < len(seconds):
+                return datetime.time(hour, minute, seconds[s_index])
+            if m_index + 1 < len(minutes):
+                return datetime.time(hour, minutes[m_index + 1], seconds[0])
+        if index + 1 < len(hours):
+            return datetime.time(hours[index + 1], minutes[0], seconds[0])
         return None
 
     # ------------------------------------------------------------------
@@ -1160,12 +1272,12 @@ class CronTab:
                 )
             else:
                 now = datetime.datetime.now()
-        civil = now.replace(tzinfo=None)
         if now.tzinfo is None:
-            target = self._prev_civil(civil)
+            # already naive: see the matching note in next()
+            target = self._prev_civil(now)
             if target is None:
                 return None
-            return (civil - target).total_seconds()
+            return (now - target).total_seconds()
         # Aware: seconds since the last REAL instant, i.e. the final
         # :meth:`occurrences` yield strictly before ``now``.  A backward
         # civil scan alone goes wrong at DST edges: a match inside the
@@ -1186,7 +1298,10 @@ class CronTab:
         # per-minute schedule that is ~1.8s of CPU per year between ``now``
         # and 2099, i.e. hours of event-loop starvation for a far-future
         # ``now`` (a schema-valid MCP/web ``at`` argument).
-        civil = min(civil, datetime.datetime(_YEAR_HORIZON + 1, 1, 1))
+        civil = min(
+            now.replace(tzinfo=None),
+            datetime.datetime(_YEAR_HORIZON + 1, 1, 1),
+        )
         anchor = self._prev_civil(civil)
         while anchor is not None:
             resolved = anchor.replace(tzinfo=tz).astimezone(utc).astimezone(tz)
@@ -1231,18 +1346,32 @@ class CronTab:
                     month = prv
                 day, tod = 31, None
                 continue
-            month_end = calendar.monthrange(year, month)[1]
+            month_end = _month_end(year, month)
             if day > month_end:
                 day = month_end  # clamp the rollback sentinel into the month
-            while day >= 1:
-                if self._day_matches(year, month, day, month_end):
-                    t = self._last_time(tod)
-                    if t is not None:
-                        return datetime.datetime.combine(
-                            datetime.date(year, month, day), t
-                        )
-                day -= 1
-                tod = None
+            # the clamp above leaves ``day`` a real day of this month, so the
+            # weekday seed cannot be asked for a date that does not exist.
+            if self._days_plain:
+                # the backward mirror of _next_civil's fast walk
+                dom = self._dom
+                dow_set = self._dow
+                dow = (datetime.date(year, month, day).weekday() + 1) % 7
+                while day >= 1:
+                    if day in dom and dow in dow_set:
+                        found = self._at_last_time(year, month, day, tod)
+                        if found is not None:
+                            return found
+                    day -= 1
+                    dow = dow - 1 if dow > 0 else 6
+                    tod = None
+            else:
+                while day >= 1:
+                    if self._day_matches(year, month, day, month_end):
+                        found = self._at_last_time(year, month, day, tod)
+                        if found is not None:
+                            return found
+                    day -= 1
+                    tod = None
             month -= 1
             day, tod = 31, None
             if month < 1:
@@ -1260,30 +1389,34 @@ class CronTab:
     def _last_time(
         self, at_or_before: Optional[datetime.time]
     ) -> Optional[datetime.time]:
-        """Latest matching time of day, at/before ``at_or_before`` if set."""
+        """Latest matching time of day, at/before ``at_or_before`` if set.
+
+        The backward mirror of :meth:`_first_time`, binary-searched for the
+        same reason and with the same order of preference reversed.
+        """
+        hours = self._hours_sorted
+        minutes = self._minutes_sorted
+        seconds = self._seconds_sorted
         if at_or_before is None:
-            return datetime.time(
-                self._hours_sorted[-1],
-                self._minutes_sorted[-1],
-                self._seconds_sorted[-1],
-            )
-        for hour in reversed(self._hours_sorted):
-            if hour > at_or_before.hour:
-                continue
-            if hour < at_or_before.hour:
-                return datetime.time(
-                    hour, self._minutes_sorted[-1], self._seconds_sorted[-1]
-                )
-            for minute in reversed(self._minutes_sorted):
-                if minute > at_or_before.minute:
-                    continue
-                if minute < at_or_before.minute:
-                    return datetime.time(
-                        hour, minute, self._seconds_sorted[-1]
-                    )
-                for second in reversed(self._seconds_sorted):
-                    if second <= at_or_before.second:
-                        return datetime.time(hour, minute, second)
+            return datetime.time(hours[-1], minutes[-1], seconds[-1])
+        hour = at_or_before.hour
+        index = bisect.bisect_right(hours, hour) - 1
+        if index < 0:
+            return None
+        if hours[index] < hour:
+            return datetime.time(hours[index], minutes[-1], seconds[-1])
+        minute = at_or_before.minute
+        m_index = bisect.bisect_right(minutes, minute) - 1
+        if m_index >= 0:
+            if minutes[m_index] < minute:
+                return datetime.time(hour, minutes[m_index], seconds[-1])
+            s_index = bisect.bisect_right(seconds, at_or_before.second) - 1
+            if s_index >= 0:
+                return datetime.time(hour, minute, seconds[s_index])
+            if m_index >= 1:
+                return datetime.time(hour, minutes[m_index - 1], seconds[-1])
+        if index >= 1:
+            return datetime.time(hours[index - 1], minutes[-1], seconds[-1])
         return None
 
     # ------------------------------------------------------------------
@@ -1316,7 +1449,10 @@ class CronTab:
             else:
                 start = datetime.datetime.now()
         tz = start.tzinfo
-        civil = start.replace(tzinfo=None)
+        # a naive start already IS its own civil label; the aware branch
+        # overwrites this outright, so stripping the tzinfo up front only
+        # ever bought a copy that was thrown away.
+        civil = start
         if tz is not None:
             # Mirror next()'s aware framing exactly, so the first yield IS
             # start + next(now=start):
