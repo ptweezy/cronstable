@@ -188,47 +188,73 @@ def _sample_base(family: MetricFamily) -> str:
     return family.name
 
 
-def _make_label_escaper() -> Callable[[Any], str]:
-    """A label-value escaper that memoizes each distinct value it sees.
+def _make_label_block_builder() -> Callable[[Dict[str, str]], str]:
+    """A builder for the ``{k="v",...}`` block that memoizes whole blocks.
 
-    One job name recurs across dozens of samples in a scrape (every
-    counter, the histogram's buckets, the gauges), so escaping is done
-    once per distinct value rather than once per occurrence.  The memo is
-    private to the returned closure -- i.e. to one render/iteration pass --
-    so there is no cross-scrape state to invalidate on reload or prune.
+    Escaping alone was memoized before, but the *assembly* (a generator
+    expression, a ``str.join`` and a ``format`` per label) ran again for
+    every sample.  One job's label set recurs across ~9 families in a
+    scrape (each counter, each gauge), so the same block was rebuilt nine
+    times; keying the memo on the label items collapses that to once.  The
+    one- and two-label shapes, which are nearly every sample (``job_name``
+    alone, or with ``le``/``outcome``), skip the generator machinery
+    entirely on a miss and concatenate directly.
+
+    The memo is private to the returned closure, i.e. to one
+    render/iteration pass, so there is no cross-scrape state to invalidate
+    on reload or prune, and a label value that changes between scrapes
+    cannot be served stale.  Label values are always strings here (the
+    families build them that way), so the items tuple is hashable.
     """
-    cache: Dict[str, str] = {}
+    cache: Dict[Tuple[Tuple[str, str], ...], str] = {}
 
-    def esc(val: Any) -> str:
-        text = val if type(val) is str else str(val)
-        cached = cache.get(text)
-        if cached is None:
-            cached = escape_label_value(text)
-            cache[text] = cached
-        return cached
+    def block_for(labels: Dict[str, str]) -> str:
+        key = tuple(labels.items())
+        block = cache.get(key)
+        if block is None:
+            if len(key) == 1:
+                name, val = key[0]
+                block = "{" + name + '="' + escape_label_value(val) + '"}'
+            elif len(key) == 2:
+                (n1, v1), (n2, v2) = key
+                block = (
+                    "{"
+                    + n1
+                    + '="'
+                    + escape_label_value(v1)
+                    + '",'
+                    + n2
+                    + '="'
+                    + escape_label_value(v2)
+                    + '"}'
+                )
+            else:
+                block = (
+                    "{"
+                    + ",".join(
+                        '{}="{}"'.format(name, escape_label_value(val))
+                        for name, val in key
+                    )
+                    + "}"
+                )
+            cache[key] = block
+        return block
 
-    return esc
+    return block_for
 
 
 def _sample_fields(
     sample_base: str,
     suffix: str,
     labels: Dict[str, str],
-    esc: Callable[[Any], str],
+    block_for: Callable[[Dict[str, str]], str],
 ) -> Tuple[str, str]:
     """One sample's ``(name, label_block)`` where ``label_block`` is the
     brace-wrapped ``{k="v",...}`` string, or ``""`` when unlabelled."""
     name = sample_base + suffix
     if not labels:
         return name, ""
-    block = (
-        "{"
-        + ",".join(
-            '{}="{}"'.format(key, esc(val)) for key, val in labels.items()
-        )
-        + "}"
-    )
-    return name, block
+    return name, block_for(labels)
 
 
 def iter_family_samples(
@@ -245,13 +271,13 @@ def iter_family_samples(
     :func:`render_families`, so a name, label or value can never disagree
     between the two.
     """
-    esc = _make_label_escaper()
+    block_for = _make_label_block_builder()
     for family in families:
         if not family.samples:
             continue
         base = _sample_base(family)
         for suffix, labels, value in family.samples:
-            name, block = _sample_fields(base, suffix, labels, esc)
+            name, block = _sample_fields(base, suffix, labels, block_for)
             yield name, block, format_value(value)
 
 
@@ -267,7 +293,7 @@ def render_families(
     the ``# EOF`` terminator.
     """
     out: List[str] = []
-    esc = _make_label_escaper()
+    block_for = _make_label_block_builder()
     for family in families:
         if not family.samples:
             continue
@@ -283,9 +309,16 @@ def render_families(
             )
         )
         out.append("# TYPE {} {}".format(type_name, mtype))
+        # The per-sample line is built inline rather than through
+        # _sample_fields: this is the innermost loop of a scrape (one pass
+        # per sample, tens of thousands of them on a large fleet), and the
+        # helper's call frame plus the (name, block) tuple it allocates
+        # cost more than the two-line body they save.  Formatting stays
+        # identical: same stem, same block builder, same format_value.
+        append = out.append
         for suffix, labels, value in family.samples:
-            name, block = _sample_fields(sample_base, suffix, labels, esc)
-            out.append("{}{} {}".format(name, block, format_value(value)))
+            block = block_for(labels) if labels else ""
+            append(sample_base + suffix + block + " " + format_value(value))
     if openmetrics:
         out.append("# EOF")
     return "\n".join(out) + "\n"
