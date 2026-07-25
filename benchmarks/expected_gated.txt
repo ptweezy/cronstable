@@ -24,7 +24,9 @@ config.interp_2k
 config.jobconfig_3k
 config.parse_crontab_1k
 config.parse_yaml_300
+config.reload_gc_100k
 config.reload_warm_50
+config.reload_warm_include_50
 cronexpr.next_complex
 cronexpr.next_dst_2k
 cronexpr.next_simple
@@ -34,10 +36,12 @@ cronexpr.parse_simple
 cronexpr.test_match_200k
 dag.adopt_scan_500
 dag.advance_quiescent_1k
+dag.advance_quiescent_chain
 dag.build_chain_10k
 dag.build_layered_10k
 dag.finish_fanin_1k
 dag.list_dags_warm
+dag.list_runs_warm
 dag.mapped_drain_256
 dag.plan_claim_10k
 fingerprint.job_set_id_10k
@@ -45,9 +49,17 @@ ical.render_500x7d
 job.stream_capture_120k
 json.roundtrip_3k
 json.roundtrip_orjson_3k
+loop.idle_wake_rate
+loop.stall_completions_500
 mcp.handle_200
 mem.crontab_10k
+mem.gc_pause_100k
 mem.jobconfig_2k
+state.list_records_warm
+state.mutate_document_1k
+webapi.jobs_gzip_500
+webapi.sse_frame_20k
+webui.render_term_5k
 # loop.stall_jobs_500 is deliberately absent while it ships info=True (an
 # info metric never gates, so coverage does not count it). Add it when it
 # is armed after its one observation release.
@@ -97,3 +109,19 @@ webui.render_rows_500
 # push.seal_500 is deliberately absent: 1.2.30 (the current baseline) has
 # no cronstable.push, so it cannot compare until a push-capable release
 # becomes the baseline. Add it then.
+#
+# webui.append_line_5k is deliberately absent for the same reason: it drives
+# the __perf.appendLine hook, which only ships in this release, so the
+# baseline side cannot measure it.
+#
+# loop.stall_metrics_2000 is deliberately absent because it ships info=True
+# and therefore never gates at all (same reason loop.stall_jobs_500 is held
+# out). Listing a non-gating metric here would fail every run.
+#
+# cluster.fleet_view_15x400, job.report_noop_100k and resources.monitor_stop_100
+# are pending a baseline check rather than deliberately excluded. Each drives a
+# surface that may postdate the baseline release (ClusterManager.fleet_view and
+# the _job_summaries_provider seam, job.report_config_enabled, and
+# ResourceMonitor._proc/stop respectively). Add each one once a paired run
+# confirms it is COMPARED and not skipped on the baseline side; until then a
+# premature line here would fail CI for a metric that is working correctly.

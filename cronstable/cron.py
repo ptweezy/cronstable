@@ -1014,6 +1014,12 @@ def _index_gzip() -> bytes:
     :func:`_index_document` so that function's ``(bytes, ETag)`` contract is
     unchanged and a deployment whose clients never send ``Accept-Encoding:
     gzip`` never pays the compression at all.
+
+    NOTE the cache chain is three deep: ``load_index_html`` (the decode),
+    ``_index_document`` (the encode plus ETag) and this (the compression).
+    They are independent lru_caches, so a test that swaps the page out must
+    clear ALL THREE to change what GET / actually serves; clearing only
+    ``load_index_html`` leaves both the served bytes and this gzip stale.
     """
     return _gzip_body(_index_document()[0])
 
