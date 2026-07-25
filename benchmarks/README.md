@@ -67,7 +67,10 @@ two sides' round-to-round scatter combined in quadrature. So microsecond
 jitter on a sub-millisecond metric can never gate, and neither can a metric's
 own run-to-run wobble; a change that clears the raw limit but sits inside the
 noise band is reported (not silently dropped) but does not fail the release.
-More in-process rounds exist precisely to tighten that noise-band estimate.
+More in-process rounds deepen the best-of-rounds estimate and give the robust
+scatter statistic enough points to work with; they do not tighten the noise
+band itself (the band estimates single-round scatter, while the comparison
+diffs min-of-rounds, so measured bands can even widen as rounds are added).
 
 Three refinements keep the gate both tight and honest:
 
@@ -96,7 +99,103 @@ merged raw numbers). `perf-chart.svg` (the diff chart) ships in the run's
 To ship an intentional regression, start a pushed commit's subject with
 `[perf:accept]`. The regression is still measured and reported in the
 release notes, but it does not gate. Only subject lines are scanned, same as
-the `[release]` marker.
+the `[release]` marker. `[perf:accept]` excuses RELATIVE regressions only:
+an absolute-budget breach or a gate-integrity failure (below) each has its
+own ritual, a reviewed edit to the corresponding checked-in file.
+
+## Beyond the relative gate
+
+Four properties of the comparator itself, each added after the 2026-07
+audits found the relative gate alone could not deliver them:
+
+- **Absolute budgets** (`budgets.json`, `compare.py --budgets`). The
+  relative gate diffs HEAD against the latest tag only, so a slow drift
+  across many quick releases compounds under a green gate (seven release
+  hops in five days at a legal 15% each is 2.7x). A handful of headline
+  metrics carry absolute ceilings; a breach fails the run even when the
+  relative gate passes. Raising a ceiling is a deliberate edit to
+  `budgets.json`, made in the same PR as the change that needs it.
+- **Gate integrity** (`expected_gated.txt`, `compare.py --expected-gated`).
+  A metric whose BASELINE side skips is filed as first-release coverage and
+  warned about by nothing, so a gate that died because a private seam
+  drifted was silently ungated forever. The checked-in list names every
+  metric that must actually be compared; a listed metric that was not is an
+  integrity failure. The companion net is `tests/test_benchmarks.py`'s
+  never-skip list, which catches a drifted seam in the ordinary test run.
+- **The effective gate column.** The percentage and absolute-floor tests
+  are ANDed, so a metric whose value sits near its floor really gates at
+  `100*floor/value`, however tight its declared `gate_pct` reads. The floor
+  is deliberate harness policy (jitter on a tiny metric must never gate);
+  what was missing was anything REPORTING when it binds. The comparison
+  table's "Gate (eff.)" column and a job-log notice now name every
+  floor-bound metric, so an undersized workload is visible and fixable
+  instead of silently ungated.
+- **Comparability.** The two sides must agree on python version, platform,
+  run mode, and the optional-backend state (orjson, uvloop). A pairing that
+  differs is refused outright (exit 2, never a verdict): a one-sided
+  backend would report a backend swap as a large code regression, or mask a
+  real one. The CI perf job installs orjson into BOTH venvs -- production's
+  default backend in the binaries and Docker images -- and deliberately NOT
+  uvloop (see the waivers below).
+
+`bench.py` also stamps per-benchmark wall clock (fixtures included) into
+every result row and prints its ten slowest benchmarks per run, so the CI
+job's timeout ceiling is triaged from the log rather than by bisecting a
+timed-out release.
+
+## Waivers: what is deliberately not measured
+
+Naming an absence makes it a decision instead of an oversight. A future
+reader counting metrics against modules should not assume these were
+missed:
+
+- **uvloop.** Every shipped Linux binary and Docker image prefers uvloop;
+  the whole suite runs on stock asyncio. A full uvloop lane would double
+  the perf job and most of any delta would be uvloop's own. Waived;
+  `bench.py` records a `uvloop` flag in every result document so the
+  absence stays visible, and comparability (above) refuses a mixed pair.
+- **Windows and macOS.** The Linux-only pipeline never times the
+  platform-divergent paths. A measured `--quick` Windows lane was refuted
+  as a dead gate (34 of 38 metrics floor-bound at that scale) and the
+  full-scale shape does not fit any timeout. The one real correctness risk
+  found there -- the halved directory-barrier count -- is a COUNT
+  invariant and is gated by `tests/test_perf_invariants.py` on every
+  platform instead.
+- **The artifact users actually run.** Startup/RSS metrics time a CPython
+  venv; every distributed artifact is a PyInstaller onefile binary or a
+  Docker image. A binary startup metric would need the build job's
+  artifact and break the perf job's independence; the SIZE half is not a
+  perf metric at all and belongs as a byte ceiling in the binary job.
+- **Tail latency.** The suite measures best-of-rounds throughput and peak
+  memory; the user-visible failure for a cron daemon is a scheduler stall,
+  which is a tail. A p99 over 5 rounds is not statistically supportable,
+  so the general case is waived -- and `loop.stall_jobs_500` (a MAX
+  scheduling-gap gauge, `info` for its first release, then armed) covers
+  the one stall class that has actually shipped, five separate times.
+- **Leadership backends and operator CLIs** (`state_admin`, `jobcli`,
+  `mcpcli`, `discovery`, `tlsutil`). Run by hand once, or one-shot startup
+  paths; their pure per-call functions are microsecond-scale. Tests, not
+  metrics.
+- **The report/notify delivery pipeline.** A reporter metric would be ~95%
+  jinja2/stdlib/socket and would break the no-network rule; the one owned
+  risk (a multi-MB capture rendered into a report body) is a bounds
+  question for a test.
+- **resources.py's per-tick process-table walk.** It walks the REAL
+  machine's process table, so a timing gate can only measure the runner.
+  The invariant that matters -- one table snapshot per sample batch,
+  however many runs are monitored -- is a count, gated by
+  `tests/test_perf_invariants.py`.
+- **Per-line SSE live-tail fan-out.** `job.stream_capture_40k` deliberately
+  disables the passthrough mirror and excludes the `on_line` live-tail leg,
+  so per-line x per-client delivery on the shared loop stays untimed (a
+  zero-subscriber LiveLogBuffer variant could close this later).
+
+The rule those waivers keep applying: **a COUNT or ORDERING invariant gets
+a test, never a metric.** Five benchmark candidates from the 2026-07 audits
+(fsync barriers, the once-per-batch process-table walk, 413-before-fetch,
+the per-run durable-write count, artifact prune residency) are exactly that
+and live in `tests/test_perf_invariants.py`, where they gate in both
+directions, on every platform, in milliseconds.
 
 ## Terminal and web UI benchmarks
 
@@ -169,8 +268,20 @@ Ground rules:
   never diffs a new workload against a stored old number), but bump the metric
   id anyway so the name keeps meaning one fixed workload across releases and a
   release-notes trend is never silently redefined. `cronexpr.test_match_200k`,
-  `schedule.duplicates_20k` and `dag.plan_claim_10k` are such rescales: the id
-  suffix carries the new scale, and the old ids drop out.
+  `schedule.duplicates_20k`, `dag.plan_claim_10k` and
+  `schedule.pressure_20k_48h` are such rescales: the id suffix carries the
+  new scale, and the old ids drop out.
+- A metric need not be a duration: `webapi.jobs_bytes_500` gates the SIZE
+  of a response body (`unit="KB"`; remember the floor is then in KB), and
+  `loop.stall_jobs_500` gates a worst-case scheduling GAP. What matters is
+  that the value is deterministic and the regression it guards moves it.
+- If what you are guarding is a COUNT or an ORDERING (fsyncs per append,
+  calls per batch, a check that must precede a fetch), stop: write a test
+  in `tests/test_perf_invariants.py` instead. See the waivers above.
+- When a benchmark lands, add it to `tests/test_benchmarks.py`'s never-skip
+  list (mandatory when it leans on any private seam) and, once it is known
+  to compare against the current baseline release, to
+  `benchmarks/expected_gated.txt`.
 
 The suite's own smoke test is `tests/test_benchmarks.py`; it fails if a
 headline benchmark starts skipping, so a refactor that breaks a measured API

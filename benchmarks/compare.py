@@ -75,6 +75,8 @@ _MIN_ROUNDS_FOR_NOISE = 2
 def _fmt(value, unit):
     if unit == "MB":
         return "%.2f MB" % value
+    if unit == "KB":
+        return "%.2f KB" % value
     if value < 0.001:
         return "%.1f us" % (value * 1e6)
     if value < 1.0:
@@ -88,6 +90,108 @@ def _load(paths):
         with open(path, "r", encoding="utf-8") as f:
             docs.append(json.load(f))
     return docs
+
+
+# A paired comparison is only meaningful when every result document was
+# produced under the same conditions.  These are the doc-level fields that
+# change what a metric measures rather than how the code performs: a
+# different interpreter, platform, run mode, or optional-backend state
+# (orjson swaps the whole JSON hot path, uvloop the event loop) on one side
+# turns a backend difference into a fake code regression.  bench.py stamps
+# all of them into every result document.
+_COMPARABILITY_KEYS = ("mode", "python", "platform", "orjson", "uvloop")
+
+
+def _comparability_failures(baseline_docs, current_docs):
+    """Fields from _COMPARABILITY_KEYS that differ across the result docs.
+
+    Every document of both sides must agree on every key; the first document
+    is the reference.  Returns human-readable mismatch strings (empty when
+    comparable).  Missing keys compare as None on both sides, so documents
+    from an older bench.py (which did not stamp them) stay comparable with
+    each other.
+    """
+    ref = None
+    ref_src = None
+    failures = []
+    for side, docs in (("baseline", baseline_docs), ("current", current_docs)):
+        for doc in docs:
+            sig = {key: doc.get(key) for key in _COMPARABILITY_KEYS}
+            if ref is None:
+                ref, ref_src = sig, side
+                continue
+            diffs = [k for k in _COMPARABILITY_KEYS if sig[k] != ref[k]]
+            if diffs:
+                failures.append(
+                    "%s-side document disagrees with the first %s-side "
+                    "document on %s"
+                    % (
+                        side,
+                        ref_src,
+                        ", ".join(
+                            "%s (%r vs %r)" % (k, sig[k], ref[k])
+                            for k in diffs
+                        ),
+                    )
+                )
+    return failures
+
+
+def _load_budgets(path):
+    """The absolute-ceiling document (benchmarks/budgets.json).
+
+    Relative gating against the previous release cannot stop slow multi-hop
+    drift: a metric taking the maximum legal regression on each of several
+    quick releases compounds with a green gate every time.  The checked-in
+    budget file pins an absolute ceiling for a handful of headline metrics;
+    raising one is a deliberate, reviewed edit to that file, never a
+    side-effect of accepting a relative regression.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    return doc.get("budgets", {})
+
+
+def _budget_failures(budgets, current):
+    """Budget breaches, and budgeted metrics this run did not measure."""
+    breaches = []
+    unmeasured = []
+    for name in sorted(budgets):
+        spec = budgets[name]
+        entry = current.get(name)
+        if entry is None or entry.get("skipped"):
+            unmeasured.append(name)
+            continue
+        if entry["value"] > spec["max"]:
+            breaches.append(
+                "%s measured %s, over its absolute budget of %s (raising "
+                "the budget is a deliberate edit to benchmarks/budgets.json)"
+                % (
+                    name,
+                    _fmt(entry["value"], entry.get("unit", "s")),
+                    _fmt(spec["max"], spec.get("unit", "s")),
+                )
+            )
+    return breaches, unmeasured
+
+
+def _load_expected_gated(path):
+    """Metric ids that must be compared (measured on BOTH sides) every run.
+
+    A gate whose baseline side skips is silently ungated forever: the
+    comparator files it under first-release 'new' coverage, which is never
+    warned about, so a gate that died because a private seam drifted is
+    indistinguishable from a metric added this release.  This checked-in
+    list makes the coverage claim falsifiable: a listed metric that was not
+    compared is an integrity failure, not a footnote.
+    """
+    names = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                names.append(line)
+    return names
 
 
 def _merge(docs):
@@ -296,7 +400,13 @@ def _gate_coverage(baseline, current):
     pass over the whole one.  Only metrics that declare a ``gate_pct`` are
     counted; an ``info``-only metric skipping is not lost coverage.
     """
-    coverage = {"compared": 0, "both": [], "dropped": [], "new": []}
+    coverage = {
+        "compared": 0,
+        "compared_names": [],
+        "both": [],
+        "dropped": [],
+        "new": [],
+    }
     for name in sorted(set(baseline) | set(current)):
         if _declared_gate_pct(baseline, current, name) is None:
             continue
@@ -305,6 +415,7 @@ def _gate_coverage(baseline, current):
         base_ok = base is not None and not base.get("skipped")
         if cur_ok and base_ok:
             coverage["compared"] += 1
+            coverage["compared_names"].append(name)
         elif not cur_ok and not base_ok:
             coverage["both"].append(name)
         elif not cur_ok:
@@ -357,11 +468,23 @@ def _compare(baseline, current):
         # The floor is brought onto the same scale as the values: comparing
         # an adjusted delta against the raw-scale constant is what made the
         # small-own-share startup metrics ungateable.
+        floor_used = _adjusted_floor(cur, adj_cur)
+        # The gate a metric actually delivers, not the one it declares: the
+        # percentage and absolute tests are ANDed, so on a metric whose value
+        # sits near (or under) its floor the floor binds and the real
+        # sensitivity is 100*floor/value, however tight gate_pct reads.  The
+        # floor itself is deliberate harness policy (jitter on a tiny metric
+        # must never gate); what was missing is anything REPORTING when it
+        # binds, which is how a third of the suite ran undersized against the
+        # harness's own 50ms+ sizing rule with nobody able to see it.
+        effective_pct = gate_pct
+        if gate_pct is not None and adj_base > 0:
+            effective_pct = max(gate_pct, 100.0 * floor_used / adj_base)
         over_gate = (
             delta is not None
             and gate_pct is not None
             and delta > gate_pct
-            and (adj_cur - adj_base) > _adjusted_floor(cur, adj_cur)
+            and (adj_cur - adj_base) > floor_used
         )
         if over_gate and significant:
             gated = True
@@ -385,6 +508,7 @@ def _compare(baseline, current):
                 "delta_pct": delta,
                 "noise_pct": noise * 100 if noise is not None else None,
                 "significant": significant,
+                "effective_pct": effective_pct,
                 # a change that cleared the raw gate but not the noise band:
                 # reported, but explicitly not gated.
                 "suppressed": over_gate and not significant,
@@ -392,6 +516,26 @@ def _compare(baseline, current):
             }
         )
     return rows, violations, coverage
+
+
+def _floor_bound(rows, slack=1.05):
+    """Compared rows whose effective gate exceeds their declared one.
+
+    ``slack`` ignores hair-width excesses: a metric 5% over its declared
+    percentage is measurement dust, not an undersized workload.
+    """
+    out = []
+    for row in rows:
+        declared = row["entry"].get("gate_pct")
+        effective = row.get("effective_pct")
+        if (
+            declared is not None
+            and effective is not None
+            and effective > declared * slack
+        ):
+            out.append(row)
+    out.sort(key=lambda r: -(r["effective_pct"] / r["entry"]["gate_pct"]))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +751,10 @@ def build_svg(rows, base_label, cur_label):
 # ---------------------------------------------------------------------------
 
 
+def _pct(value):
+    return "%.4g%%" % value
+
+
 def build_md(
     rows,
     violations,
@@ -618,6 +766,8 @@ def build_md(
     img_url=None,
     accept=False,
     coverage=None,
+    budget_breaches=None,
+    expected_missing=None,
 ):
     lines = ["### Performance vs %s" % (base_label or "(no baseline)")]
     lines.append("")
@@ -665,6 +815,22 @@ def build_md(
                     "**Gate: passed.** No metric exceeded its regression "
                     "limit."
                 )
+        if budget_breaches:
+            lines.append("")
+            lines.append(
+                "**Absolute budget: FAILED** (`benchmarks/budgets.json`; "
+                "raising a ceiling is a deliberate, reviewed edit to that "
+                "file):"
+            )
+            lines.extend("- %s" % b for b in budget_breaches)
+        if expected_missing:
+            lines.append("")
+            lines.append(
+                "**Gate integrity: FAILED.** Metrics listed in "
+                "`benchmarks/expected_gated.txt` that this run did not "
+                "compare (a dead gate, not a pass): %s."
+                % ", ".join(expected_missing)
+            )
         lines.append("")
         lines.append(
             "Both versions ran interleaved on one runner; time metrics "
@@ -701,10 +867,10 @@ def build_md(
         )
         lines.append("")
         lines.append(
-            "| Benchmark | %s | %s | Change | Noise +- |"
+            "| Benchmark | %s | %s | Change | Noise +- | Gate (eff.) |"
             % (base_label, cur_label)
         )
-        lines.append("|---|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|")
         for row in comparable:
             entry = row["entry"]
             if row["gated"]:
@@ -715,8 +881,24 @@ def build_md(
                 mark = ""
             noise = row.get("noise_pct")
             noise_cell = "%.1f%%" % noise if noise is not None else "n/a"
+            declared = entry.get("gate_pct")
+            effective = row.get("effective_pct")
+            # The gate the metric DELIVERS: gate_pct where the percentage
+            # binds, 100*floor/value where the absolute floor does.  A
+            # floor-bound cell names both numbers so an undersized workload
+            # is visible in the release table rather than only in the
+            # harness's source.
+            if declared is None:
+                gate_cell = "info"
+            elif effective is not None and effective > declared * 1.05:
+                gate_cell = "**%s** (declared %s)" % (
+                    _pct(effective),
+                    _pct(declared),
+                )
+            else:
+                gate_cell = _pct(declared)
             lines.append(
-                "| %s | %s | %s | %+.1f%%%s | %s |"
+                "| %s | %s | %s | %+.1f%%%s | %s | %s |"
                 % (
                     row["name"],
                     _fmt(row["base_value"], entry["unit"]),
@@ -724,6 +906,7 @@ def build_md(
                     row["delta_pct"],
                     mark,
                     noise_cell,
+                    gate_cell,
                 )
             )
         lines.append("")
@@ -793,6 +976,18 @@ def main(argv=None):
         action="store_true",
         help="acknowledge regressions ([perf:accept]): report but pass",
     )
+    parser.add_argument(
+        "--budgets",
+        help="benchmarks/budgets.json: absolute ceilings for headline "
+        "metrics; a breach fails even when the relative gate passes, and "
+        "[perf:accept] does not excuse it (the ritual is editing the file)",
+    )
+    parser.add_argument(
+        "--expected-gated",
+        help="benchmarks/expected_gated.txt: metric ids that must be "
+        "compared on both sides; a listed metric that was not compared is "
+        "an integrity failure, not [perf:accept]-able",
+    )
     args = parser.parse_args(argv)
 
     current_docs = _load(args.current)
@@ -803,6 +998,7 @@ def main(argv=None):
 
     baseline_missing = not args.baseline
     baseline = {}
+    baseline_docs = []
     base_label = args.baseline_label
     if not baseline_missing:
         baseline_docs = _load(args.baseline)
@@ -811,7 +1007,30 @@ def main(argv=None):
             "cronstable_version", "baseline"
         )
 
+    # An incomparable pair is a broken measurement, not a pass or a fail:
+    # refuse to render a verdict from it at all (exit 2, even under
+    # --warn-only).  A best-effort install that lands on one side only would
+    # otherwise report a backend swap as a large code regression, or mask a
+    # real one.
+    incomparable = _comparability_failures(baseline_docs, current_docs)
+    if incomparable:
+        for failure in incomparable:
+            print("::error::perf compare: sides not comparable: %s" % failure)
+        return 2
+
     rows, violations, coverage = _compare(baseline, current)
+
+    budget_breaches, budget_unmeasured = [], []
+    if args.budgets:
+        budget_breaches, budget_unmeasured = _budget_failures(
+            _load_budgets(args.budgets), current
+        )
+
+    expected_missing = []
+    if args.expected_gated and not baseline_missing:
+        expected = _load_expected_gated(args.expected_gated)
+        compared_names = set(coverage["compared_names"])
+        expected_missing = [n for n in expected if n not in compared_names]
 
     if args.merged_out:
         merged_doc = dict(current_docs[0])
@@ -839,6 +1058,8 @@ def main(argv=None):
                     img_url=args.img_url,
                     accept=args.accept,
                     coverage=coverage,
+                    budget_breaches=budget_breaches,
+                    expected_missing=expected_missing,
                 )
             )
 
@@ -847,6 +1068,28 @@ def main(argv=None):
         "compared %d metrics (%s vs %s): %d gate violation(s)"
         % (comparable, cur_label, base_label or "no baseline", len(violations))
     )
+    # Run-level sizing feedback, printed with the run summary (before any
+    # verdict lines): which metrics' declared gate_pct is fiction because
+    # the absolute floor binds instead.
+    floor_bound = _floor_bound(rows)
+    if floor_bound:
+        print(
+            "::notice::perf sizing: %d metric(s) are floor-bound (the "
+            "absolute floor, not gate_pct, is the real sensitivity -- the "
+            "workload is undersized against the harness's 50ms+ rule): %s"
+            % (
+                len(floor_bound),
+                ", ".join(
+                    "%s (eff. %.4g%% vs %.4g%% declared)"
+                    % (
+                        r["name"],
+                        r["effective_pct"],
+                        r["entry"]["gate_pct"],
+                    )
+                    for r in floor_bound
+                ),
+            )
+        )
     # Visible in the job log too, not only the rendered report: a metric that
     # declared a gate but was not compared produces no violation, so silence
     # here reads as coverage. "new" is expected for a benchmark added this
@@ -862,8 +1105,51 @@ def main(argv=None):
             print("::warning::perf gate: %s" % violation)
         else:
             print("::error::perf gate: %s" % violation)
+    # A regression that cleared its raw limit but sat inside the noise band
+    # is deliberately not gated -- but it must reach the job log, not only
+    # the rendered report: a +18% move printing as "0 gate violation(s)"
+    # with no other output reads as a clean pass.
+    for row in rows:
+        if row.get("suppressed"):
+            print(
+                "::warning::perf gate: %s regressed %+.1f%% (over its "
+                "%.4g%% limit) but within the noise band (+-%.1f%%); "
+                "reported, not gated"
+                % (
+                    row["name"],
+                    row["delta_pct"],
+                    row["entry"].get("gate_pct") or 0.0,
+                    row.get("noise_pct") or 0.0,
+                )
+            )
+    for name in budget_unmeasured:
+        print(
+            "::warning::perf budget: %s has an absolute budget but was not "
+            "measured this run" % name
+        )
+    for breach in budget_breaches:
+        if args.warn_only:
+            print("::warning::perf budget: %s" % breach)
+        else:
+            print("::error::perf budget: %s" % breach)
+    for name in expected_missing:
+        if args.warn_only:
+            print(
+                "::warning::perf gate integrity: %s is in expected_gated.txt "
+                "but was not compared this run (dead gate)" % name
+            )
+        else:
+            print(
+                "::error::perf gate integrity: %s is in expected_gated.txt "
+                "but was not compared this run (dead gate)" % name
+            )
 
-    if violations and not args.warn_only and not args.accept:
+    # --accept excuses relative regressions only.  A budget breach or a dead
+    # gate is not a perf trade-off a commit subject can acknowledge; each has
+    # its own ritual (a reviewed edit to budgets.json / expected_gated.txt).
+    failed = bool(violations and not args.accept)
+    failed = failed or bool(budget_breaches) or bool(expected_missing)
+    if failed and not args.warn_only:
         return 1
     return 0
 
