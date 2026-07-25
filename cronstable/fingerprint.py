@@ -400,6 +400,28 @@ def job_digest(job: JobConfig, memo: Optional[SharedNodeMemo] = None) -> str:
     ).hexdigest()
 
 
+def job_digest_cached(job: JobConfig) -> str:
+    """:func:`job_digest` memoized on the JobConfig itself.
+
+    The daemon asks for the same job's digest several times per run (the run
+    record, the retry ladder, the @reboot marker) and the answer is a pure
+    function of a config the parser already froze: nothing outside
+    :mod:`cronstable.config` assigns JobConfig attributes, and a reload
+    rebuilds every JobConfig rather than editing the live ones, so the first
+    answer stays the right one for as long as the instance exists.
+
+    Use this only for parser-built jobs.  :func:`job_digest` stays the live
+    function of a job's current attributes and is what a caller that edits a
+    JobConfig in place (tests do) must keep using, since the memo here would
+    hand such a caller the pre-edit digest.
+    """
+    digest = job._digest
+    if digest is None:
+        digest = job_digest(job)
+        job._digest = digest
+    return digest
+
+
 def job_set_id(jobs: Iterable[JobConfig]) -> str:
     """Compute the order-independent fingerprint of a set of jobs.
 

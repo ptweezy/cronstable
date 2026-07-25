@@ -774,6 +774,7 @@ class CronTab:
         "_dom_sorted",
         "_dow_free",
         "_days_plain",
+        "_resolved_differs",
     )
 
     def __init__(self, crontab: str, hash_key: Optional[str] = None) -> None:
@@ -903,6 +904,11 @@ class CronTab:
             or self._dow_last
             or self._dow_nth
         )
+        # Whether this tab has anything to say beyond str(self).  Every
+        # schedule payload asks (to decide whether to emit a "resolved"
+        # field) and the answer is fixed at parse time, so it is settled
+        # here instead of re-derived per request from the two source texts.
+        self._resolved_differs = self._resolved != self._source
 
     # ------------------------------------------------------------------
     # Introspection
@@ -924,6 +930,17 @@ class CronTab:
         the ``H`` original.
         """
         return self._resolved
+
+    @property
+    def resolved_differs(self) -> bool:
+        """Whether :attr:`resolved_source` says more than ``str(self)``.
+
+        True only for an expression that actually carried an ``H`` item, so
+        a payload builder can gate the extra "resolved" field on one
+        precomputed flag rather than comparing the two texts (and rebuilding
+        ``str(self)``) on every request.
+        """
+        return self._resolved_differs
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CronTab):

@@ -22,8 +22,6 @@ from typing import (
     Tuple,
 )
 
-import aiohttp
-
 from cronstable import platform, push
 from cronstable.config import JobConfig, schedule_object_to_crontab
 from cronstable.resources import ResourceMonitor, ResourceUsage
@@ -888,6 +886,15 @@ class WebhookReporter(Reporter):
 
         headers = {"Content-Type": webhook["contentType"]}
         headers.update(webhook["headers"])
+
+        # aiohttp is imported here, not at module top: this module is on the
+        # daemon's unconditional import graph (cron -> dagrun -> job), and
+        # aiohttp is ~155 ms and ~21 MB of RSS. The webhook reporter is the
+        # only thing in this file that wants it, so a daemon whose jobs never
+        # report over HTTP -- and every offline path that merely imports the
+        # module -- pays none of it. By the time control reaches here the
+        # reporter is already committed to making the call.
+        import aiohttp
 
         timeout = aiohttp.ClientTimeout(total=webhook["timeout"])
         async with aiohttp.ClientSession(timeout=timeout) as session:

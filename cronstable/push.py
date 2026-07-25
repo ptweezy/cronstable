@@ -44,9 +44,16 @@ import os
 import secrets
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-import aiohttp
+if TYPE_CHECKING:
+    # aiohttp is the relay client, and nothing else here touches it.  Importing
+    # it at module scope taxed every daemon start (cron.py imports this module
+    # unconditionally) with ~155 ms and ~21 MB of RSS for a reporter that only
+    # a paired deployment ever uses, so the real import lives at the two send
+    # sites and this block exists only to resolve the ClientSession annotation
+    # under the type checker.
+    import aiohttp
 
 try:
     # Probed, not imported: cron.py imports this module unconditionally, so
@@ -1176,6 +1183,9 @@ class PushService:
         )
         is_event = payload.get("kind") == "event"
         targets = [only] if only else list(self._devices.values())
+
+        import aiohttp
+
         timeout = aiohttp.ClientTimeout(total=self.relay_timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # All devices at once, not one after another.  The POSTs are
@@ -1231,7 +1241,7 @@ class PushService:
 
     async def _send_to_device(
         self,
-        session: aiohttp.ClientSession,
+        session: "aiohttp.ClientSession",
         device: Dict[str, Any],
         plaintext: bytes,
         coalesce: str,
@@ -1239,6 +1249,12 @@ class PushService:
         is_event: bool,
     ) -> Dict[str, Any]:
         """Seal and POST one alert; the outcome, never an exception."""
+        # Re-imported per call rather than shared from the caller: past the
+        # first send this is a sys.modules hit, which is nothing next to the
+        # HTTPS POST below, and it keeps the except clause's ClientError
+        # resolvable without a module-scope aiohttp.
+        import aiohttp
+
         outcome: Dict[str, Any] = {
             "device": device.get("id"),
             "status": None,
