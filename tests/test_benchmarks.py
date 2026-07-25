@@ -89,11 +89,11 @@ def test_bench_smoke_produces_results(tmp_path):
         "config.reload_warm_50",
         "config.interp_2k",
         "prometheus.render_500",
-        "statsd.emit_500",
+        "statsd.emit_2k",
         "webapi.jobs_payload_500",
         "webapi.auth_scope_20k",
         "mcp.handle_200",
-        "job.stream_capture_40k",
+        "job.stream_capture_120k",
         "json.roundtrip_3k",
         # 2026-07 additions, round 2 (bench-additions-2.md)
         "state.fanout_gather_100",

@@ -18,32 +18,51 @@
 # it fails when a headline metric starts skipping in --smoke, which catches
 # a broken seam before CI does.
 
+cluster.job_owner_2k
+cluster.parse_summaries_6k
+config.interp_2k
 config.jobconfig_3k
 config.parse_crontab_1k
 config.parse_yaml_300
+config.reload_warm_50
 cronexpr.next_complex
+cronexpr.next_dst_2k
 cronexpr.next_simple
 cronexpr.occurrences_1k
 cronexpr.parse_complex
 cronexpr.parse_simple
 cronexpr.test_match_200k
+dag.adopt_scan_500
+dag.advance_quiescent_1k
 dag.build_chain_10k
 dag.build_layered_10k
 dag.finish_fanin_1k
 dag.list_dags_warm
+dag.mapped_drain_256
 dag.plan_claim_10k
 fingerprint.job_set_id_10k
 ical.render_500x7d
+job.stream_capture_120k
 json.roundtrip_3k
+json.roundtrip_orjson_3k
+mcp.handle_200
 mem.crontab_10k
 mem.jobconfig_2k
+# loop.stall_jobs_500 is deliberately absent while it ships info=True (an
+# info metric never gates, so coverage does not count it). Add it when it
+# is armed after its one observation release.
 mem.rss_daemon_import
 mem.rss_version
+prometheus.render_500
+redact.adversarial_10k
 redact.clean_20k
 redact.secrets_5k
 schedule.cold_build_100k
+schedule.due_pass_100k
 schedule.duplicates_20k
+schedule.lint_250_zoned
 schedule.next_fires_2k
+schedule.pressure_20k_48h
 schedule.reseed_100k
 schedule.suggest_slot_5k
 startup.import_config
@@ -55,13 +74,26 @@ startup.version
 state.append_1k
 state.artifact_get_newest
 state.artifact_list_churn
+state.boot_rehydrate_populated
 state.depends_on_past_gate
 state.derive_max_cold
 state.derive_max_warm
+state.fanout_gather_100
+state.gc_sweep_2k_streams
 state.kv_roundtrip_200
+state.lease_renew_200
+state.list_documents_600
 state.list_records_2k
+statsd.emit_2k
+tui.drawer_paint_5k
 tui.log_restyle_5k
 tui.log_search_20k
+webapi.auth_scope_20k
+webapi.jobs_bytes_500
+webapi.jobs_payload_500
 webui.log_count_5k
 webui.render_fleet_15x400
 webui.render_rows_500
+# push.seal_500 is deliberately absent: 1.2.30 (the current baseline) has
+# no cronstable.push, so it cannot compare until a push-capable release
+# becomes the baseline. Add it then.

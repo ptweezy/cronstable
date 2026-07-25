@@ -1044,6 +1044,11 @@ jobs:
           # loudly here rather than report a backend swap as a code
           # regression.
           uv pip install --python .venv-new/bin/python orjson
+          # pynacl: the push.seal_500 metric skips without it, and a
+          # one-sided install is the webui/playwright dead-gate trap all
+          # over again -- so it goes into BOTH venvs (the baseline install
+          # is below), not best-effort.
+          uv pip install --python .venv-new/bin/python pynacl
           # Web-UI benchmarks (webui.*) time renders in a headless Chromium via
           # Playwright. Install it on BOTH sides (the baseline venv is created
           # below): a metric that skips on the baseline is reported with no
@@ -1077,8 +1082,10 @@ jobs:
               uv pip install --python .venv-old/bin/python /tmp/perf-baseline
             # The baseline side's orjson: same backend on both sides or
             # compare.py refuses the pairing (see the current-side install
-            # above). Not best-effort, same reason.
-            uv pip install --python .venv-old/bin/python orjson
+            # above). Not best-effort, same reason. pynacl likewise, so
+            # push.seal_500 compares as soon as a push-capable release is
+            # the baseline instead of staying dead.
+            uv pip install --python .venv-old/bin/python orjson pynacl
             # Same Playwright install on the baseline side, so webui.* can
             # actually be compared. The browser download above is cached
             # per-runner, so this only adds the Python package.
