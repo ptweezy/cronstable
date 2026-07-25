@@ -115,6 +115,137 @@ def test_bench_only_filter(tmp_path):
     assert names and all(n.startswith("redact.") for n in names)
 
 
+def _load_bench():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_bench_mod", BENCH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_evict_fixtures_runs_finalizers_and_audits_loop_hygiene():
+    # Regression net for the 1.2.31 webui/Playwright incident: a fixture that
+    # parks a RUNNING event loop on the harness thread (Playwright's sync API
+    # does this between calls) made every later asyncio.run() benchmark skip
+    # on BOTH sides of the CI pairing, which the release run then failed as
+    # six dead gates. Group eviction is the boundary where the thread must be
+    # clean again: fixture finalizers run there, and a parked loop left
+    # behind is a hard error naming the offending group, never a silent
+    # downstream skip. The park is simulated with asyncio's own thread-local
+    # setter because that is precisely the state the sync Playwright session
+    # leaves behind between calls.
+    import asyncio
+
+    bench = _load_bench()
+    loop = asyncio.new_event_loop()
+    try:
+        # A loop-parking fixture WITH a finalizer (the fixed _web_page
+        # shape): eviction runs the finalizer, the audit passes, the cache
+        # clears.
+        released = []
+
+        def park():
+            asyncio.events._set_running_loop(loop)
+            return "session"
+
+        def release(value):
+            assert value == "session"
+            asyncio.events._set_running_loop(None)
+            released.append(True)
+
+        assert bench.fixture("parked", park, finalizer=release) == "session"
+        bench._evict_fixtures("webui")
+        assert released == [True]
+        assert bench._FIX == {} and bench._FIX_FINAL == {}
+
+        # The same fixture WITHOUT a finalizer: the audit fails loudly and
+        # names the group, while the innocent later groups never run.
+        bench.fixture("parked", park)
+        with pytest.raises(SystemExit, match="webui"):
+            bench._evict_fixtures("webui")
+    finally:
+        asyncio.events._set_running_loop(None)
+        loop.close()
+
+    # The exact downstream call the incident broke must work again once the
+    # audit passes.
+    asyncio.run(asyncio.sleep(0))
+
+
+def test_main_audits_every_group_boundary_including_the_last():
+    # The companion to the unit test above: that one pins _evict_fixtures'
+    # behavior, this one pins that main() actually CALLS it -- at the boundary
+    # between groups and again after the final group. Without this, deleting
+    # either call site reinstates the 1.2.31 incident with a fully green test
+    # suite, since no other test runs a loop-parking fixture through main().
+    import asyncio
+
+    bench = _load_bench()
+    loop = asyncio.new_event_loop()
+
+    def park():
+        asyncio.events._set_running_loop(loop)
+        return "session"
+
+    def release(value):
+        asyncio.events._set_running_loop(None)
+
+    try:
+        # Two synthetic groups; the first parks a loop with NO finalizer, so
+        # the boundary audit must stop the suite and name that group.
+        @bench.bench("zzpoison.leaky", "zzpoison", repeats=(1, 1, 1))
+        def _leaky():
+            bench.fixture("leaky_session", park)
+            return 0.001
+
+        @bench.bench("zzafter.downstream", "zzafter", repeats=(1, 1, 1))
+        def _downstream():
+            asyncio.run(asyncio.sleep(0))  # what the incident silently broke
+            return 0.001
+
+        with pytest.raises(SystemExit, match="zzpoison"):
+            bench.main(
+                ["--smoke", "--no-stabilize", "--only", "zzpoison", "--only",
+                 "zzafter"]
+            )
+        asyncio.events._set_running_loop(None)
+
+        # The final-group boundary is audited too: run ONLY the leaky group,
+        # so the sole eviction is the post-loop one.
+        with pytest.raises(SystemExit, match="zzpoison"):
+            bench.main(["--smoke", "--no-stabilize", "--only", "zzpoison"])
+        asyncio.events._set_running_loop(None)
+
+        # Positive control: the same fixture WITH a finalizer runs clean and
+        # the downstream asyncio.run() benchmark measures instead of skipping.
+        bench._BENCHMARKS[:] = [
+            s for s in bench._BENCHMARKS
+            if not s["name"].startswith(("zzpoison.", "zzafter."))
+        ]
+
+        @bench.bench("zzpoison.tidy", "zzpoison", repeats=(1, 1, 1))
+        def _tidy():
+            bench.fixture("tidy_session", park, finalizer=release)
+            return 0.001
+
+        @bench.bench("zzafter.downstream", "zzafter", repeats=(1, 1, 1))
+        def _downstream_ok():
+            asyncio.run(asyncio.sleep(0))
+            return 0.001
+
+        assert (
+            bench.main(
+                ["--smoke", "--no-stabilize", "--only", "zzpoison", "--only",
+                 "zzafter"]
+            )
+            == 0
+        )
+    finally:
+        asyncio.events._set_running_loop(None)
+        loop.close()
+
+
 def _entry(name, value, gate_pct=25.0, gate_floor=0.010, unit="s"):
     return {
         "name": name,
