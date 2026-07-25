@@ -18,6 +18,7 @@ import asyncio
 import base64
 import copy
 import json
+import logging
 import os
 import socket
 import threading
@@ -1727,6 +1728,38 @@ async def test_pair_store_write_failure_is_503(tmp_path):
     )
     with pytest.raises(web.HTTPServiceUnavailable):
         await cron._web_push_pair(_Req(body=_pair_body(public_b64)))
+
+
+@requires_pynacl
+async def test_store_trouble_503_keeps_the_store_detail_in_the_log(
+    tmp_path, caplog
+):
+    # The 503 body is the fact, not the store's own words: those name the
+    # registry's absolute path and quote the OSError/JSON error, and the
+    # listing route needs only a `view` scope. One corrupt file reaches
+    # every handler, because all four touch the store before answering.
+    _, public_b64 = _device_keypair()
+    path = tmp_path / "d.json"
+    path.write_text("{not json", encoding="utf-8")
+    cron = _cron()
+    cron._push_service = _service(push.FileDeviceStore(str(path)))
+    calls = (
+        (cron._web_push_devices, _Req()),
+        (cron._web_push_pair, _Req(body=_pair_body(public_b64))),
+        (cron._web_push_revoke, _Req(match={"id": "x"})),
+        (cron._web_push_test, _Req(match={"id": "x"})),
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        for handler, request in calls:
+            with pytest.raises(web.HTTPServiceUnavailable) as raised:
+                await handler(request)
+            body = raised.value.text or ""
+            assert str(tmp_path) not in body
+            assert "unreadable" not in body
+            assert "the reason is in the cronstable log" in body
+    leaked = [r for r in caplog.records if str(path) in r.getMessage()]
+    assert len(leaked) == len(calls)
+    assert all(r.levelno == logging.WARNING for r in leaked)
 
 
 @requires_pynacl
