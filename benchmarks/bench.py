@@ -4982,6 +4982,16 @@ def bench_cluster_job_owner():
     """
     mgr = _cluster_manager_50()
     n = _n(2000)
+    # Roll the peer table's mutation generation so this repeat measures a COLD
+    # ownership pass. The fixture is cached across the warm-up and every
+    # repeat, and ownership is now memoized per view-mutation generation, so
+    # without this every repeat after the first would time 2000 dict hits
+    # (~0.08 ms) instead of the rendezvous hashing this metric exists to
+    # watch. Any PeerState field write bumps the counter (see
+    # PeerState.__setattr__), and it is done BEFORE t0 so the invalidation
+    # itself is not part of the measurement.
+    some_host = next(iter(mgr.view.peers))
+    mgr.view.peers[some_host].last_seen = _NOW
     t0 = time.perf_counter()
     for i in range(n):
         name = "job%05d" % i
