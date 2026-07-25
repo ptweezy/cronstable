@@ -44,6 +44,7 @@ from collections import Counter
 from typing import (
     Any,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     NamedTuple,
@@ -642,6 +643,11 @@ def lint_schedule(
     if now is None:
         now = datetime.datetime.now(timezone or datetime.timezone.utc)
     findings: List[Finding] = []
+    # NOT `!= text`: on the re-parsing branch above, `text` is the caller's
+    # RAW expression, which differs from the canonical `str(tab)` whenever the
+    # author used non-single-space separators ("0  0 * * *"). Comparing
+    # against `text` there would report a spurious "hashed-slot" finding for
+    # a schedule that contains no H item at all.
     if tab.resolved_source != str(tab):
         findings.append(
             Finding(
@@ -966,6 +972,27 @@ def _zone_transitions_in_range(
     return out
 
 
+@functools.lru_cache(maxsize=4096)
+def _affected_hours(timezone: datetime.tzinfo, ordinal: int) -> FrozenSet[int]:
+    """Hours of the civil date ``ordinal`` that a transition disturbs.
+
+    The 48-probe scan (24 hours, on the hour and the half hour, for the
+    zones that transition at :30) depends only on the zone and the date,
+    never on the schedule being linted, so it is memoized on the same key
+    discipline as :func:`_zone_transition_ordinals`: every zoned job in a
+    parse shares one scan of a given transition date instead of repeating
+    it per job.
+    """
+    day = datetime.date.fromordinal(ordinal)
+    affected: Set[int] = set()
+    for hour in range(24):
+        for minute in (0, 30):
+            civil = datetime.datetime.combine(day, datetime.time(hour, minute))
+            if _classify(timezone, civil) is not None:
+                affected.add(hour)
+    return frozenset(affected)
+
+
 def _dst_finding(
     tab: CronTab, timezone: datetime.tzinfo, first_day: datetime.date
 ) -> Optional[Finding]:
@@ -974,20 +1001,16 @@ def _dst_finding(
     the anomalous window (or the day fields exclude the date)."""
     second = min(tab.seconds)
     zone_name = str(timezone)
+    minutes = sorted(tab.minutes)
     for offset in (0, 1):
         day = first_day + datetime.timedelta(days=offset)
-        # cheap pre-pass: which hours are anomalous at all on this date
-        # (probed on the half hour too, for zones with :30 transitions)
-        affected: Set[int] = set()
-        for hour in range(24):
-            for minute in (0, 30):
-                civil = datetime.datetime.combine(
-                    day, datetime.time(hour, minute)
-                )
-                if _classify(timezone, civil) is not None:
-                    affected.add(hour)
+        ordinal = day.toordinal()
+        try:
+            affected = _affected_hours(timezone, ordinal)
+        except TypeError:  # unhashable tzinfo: skip the cache, still correct
+            affected = _affected_hours.__wrapped__(timezone, ordinal)
         for hour in sorted(affected & tab.hours):
-            for minute in sorted(tab.minutes):
+            for minute in minutes:
                 civil = datetime.datetime.combine(
                     day, datetime.time(hour, minute, second)
                 )
@@ -1312,6 +1335,11 @@ class ScheduleEntry(NamedTuple):
 #: hundreds of jobs share one cell.
 _NAME_CAP = 10
 
+#: what a fire walk actually depends on: the resolved schedule text and
+#: the resolved zone.  Everything else about an entry (its name above
+#: all) only decides which bucket the walk's result lands in.
+_WalkKey = Tuple[str, Optional[datetime.tzinfo]]
+
 
 def _minute_tab(tab: CronTab) -> Tuple[CronTab, int]:
     """A minute-granular twin of ``tab``, plus its fires per minute.
@@ -1342,6 +1370,7 @@ def _fire_cells(
     start: datetime.datetime,
     hours: int,
     tz: datetime.tzinfo,
+    names: bool = True,
 ) -> Tuple[
     List[List[int]],
     Dict[Tuple[int, int], List[str]],
@@ -1356,6 +1385,11 @@ def _fire_cells(
     :meth:`CronTab.occurrences`, so DST behaviour matches the scheduler:
     on a fall-back day both real fires of a repeated wall time land in
     (and truthfully double-count at) the same cell.
+
+    ``names=False`` returns the grid alone, with an empty ``cell_jobs``
+    and empty per-minute sets, for the callers that read only the grid
+    (:func:`suggest_slot`): the per-cell name bookkeeping is most of the
+    work and none of their answer.
     """
     end = start + datetime.timedelta(hours=hours)
     local_tz = _local_tzinfo()
@@ -1366,23 +1400,28 @@ def _fire_cells(
     # A fleet duplicates schedules heavily (the whole reason this heatmap
     # exists), and the occurrence walk depends only on the schedule and the
     # zone -- never the job name.  So walk each distinct (resolved_source,
-    # zone) ONCE into a list of civil (hour, minute) labels and replay that
-    # per entry, turning an O(jobs x fires) enumeration into O(distinct
-    # schedules x fires) + O(jobs x fires) cheap replay.  ``None`` marks a
-    # schedule that failed :func:`_minute_tab`, so its entries are skipped
-    # without re-raising.  The cache is per call: no cross-request state.
-    walk_cache: Dict[
-        Tuple[str, Optional[datetime.tzinfo]],
-        Optional[Tuple[List[Tuple[int, int]], int]],
-    ] = {}
+    # zone) ONCE into a list of civil (hour, minute) labels, and then GROUP
+    # the replay too: every entry sharing a walk contributes the same fire
+    # to the same cell, so one pass adding `weight * members` per fire is
+    # exact, order-independent and O(distinct schedules x fires) where the
+    # per-entry replay was O(jobs x fires).  ``unwalkable`` marks a schedule
+    # that failed :func:`_minute_tab`, so its entries are skipped without
+    # re-raising.  Everything here is per call: no cross-request state.
+    walk_cache: Dict[_WalkKey, Tuple[List[Tuple[int, int]], int]] = {}
+    unwalkable: Set[_WalkKey] = set()
+    members: Dict[_WalkKey, List[str]] = {}
+    keys: List[_WalkKey] = []
     for entry in entries:
         zone = entry.timezone or local_tz
         key = (entry.tab.resolved_source, zone)
+        keys.append(key)  # kept aligned with ``entries``, skips included
         if key not in walk_cache:
+            if key in unwalkable:  # pragma: no cover - defensive
+                continue
             try:
                 mtab, weight = _minute_tab(entry.tab)
             except (ValueError, KeyError):  # pragma: no cover - defensive
-                walk_cache[key] = None
+                unwalkable.add(key)
                 continue
             cells: List[Tuple[int, int]] = []
             walked = 0
@@ -1393,17 +1432,66 @@ def _fire_cells(
                 label = when.astimezone(tz)
                 cells.append((label.hour, label.minute))
             walk_cache[key] = (cells, weight)
-        cached = walk_cache[key]
-        if cached is None:
-            continue
-        cells, weight = cached
+        group = members.get(key)
+        if group is None:
+            members[key] = [entry.name]
+        else:
+            group.append(entry.name)
+    for key, group in members.items():
+        cells, weight = walk_cache[key]
+        share = weight * len(group)
         for hour, minute in cells:
-            grid[hour][minute] += weight
-            minute_jobs[minute].add(entry.name)
-            names = cell_jobs.setdefault((hour, minute), [])
-            if len(names) < _NAME_CAP and entry.name not in names:
-                names.append(entry.name)
+            grid[hour][minute] += share
+        if names:
+            for minute in {minute for _hour, minute in cells}:
+                minute_jobs[minute].update(group)
+    if names:
+        _fill_cell_jobs(entries, keys, walk_cache, cell_jobs)
     return grid, cell_jobs, minute_jobs
+
+
+def _fill_cell_jobs(
+    entries: Sequence[ScheduleEntry],
+    keys: Sequence[_WalkKey],
+    walk_cache: Dict[_WalkKey, Tuple[List[Tuple[int, int]], int]],
+    cell_jobs: Dict[Tuple[int, int], List[str]],
+) -> None:
+    """Fill the per-cell name samples, in the caller's entry order.
+
+    Unlike the grid and the per-minute sets, this one cannot be grouped
+    by schedule: each list is insertion-ordered and truncated at
+    ``_NAME_CAP``, so replaying a whole group at a time would reorder the
+    sample of any cell two DIFFERENT schedules share, which is exactly
+    the "who collides here" answer the panel shows.  The pass stays per
+    entry over each schedule's DISTINCT cells, and drops those cells as
+    they fill: once every cell a schedule touches is capped, its
+    remaining entries cannot change any list and are skipped outright,
+    which is what keeps a fleet of per-minute jobs from paying 1440
+    lookups per entry.
+    """
+    pending = {
+        key: list(dict.fromkeys(cells))
+        for key, (cells, _weight) in walk_cache.items()
+    }
+    for entry, key in zip(entries, keys, strict=True):
+        remaining = pending.get(key)
+        if not remaining:
+            continue
+        name = entry.name
+        keep = None  # rebuilt only once a cell of this schedule fills up
+        for index, cell in enumerate(remaining):
+            at_cell = cell_jobs.setdefault(cell, [])
+            if len(at_cell) < _NAME_CAP:
+                if name not in at_cell:
+                    at_cell.append(name)
+                if len(at_cell) < _NAME_CAP:
+                    if keep is not None:
+                        keep.append(cell)
+                    continue
+            if keep is None:
+                keep = remaining[:index]
+        if keep is not None:
+            pending[key] = keep
 
 
 def schedule_pressure(
@@ -1478,26 +1566,36 @@ def _tz_label(timezone: Optional[datetime.tzinfo]) -> str:
     return str(timezone) if timezone is not None else "local"
 
 
-def _semantic_key(tab: CronTab) -> Tuple[Any, ...]:
-    """A hashable stand-in for the engine's semantic ``==``.
+def _semantic_key(tab: CronTab, tz_label: str) -> Tuple[Any, ...]:
+    """A hashable stand-in for the engine's semantic ``==``, per zone.
 
     Two CronTabs are equal exactly when every parsed field set matches
-    (see :meth:`CronTab.__eq__`); this tuple lists the same sets, so
-    grouping by it groups by "fires on the identical instants".
+    (see :meth:`CronTab.__eq__`); this tuple lists the same twelve fields
+    in the same order, so grouping by it groups by "fires on the
+    identical instants".  The zone label rides along in the one tuple
+    rather than being concatenated by the caller, because two identical
+    schedules in different zones never fire together anyway.
+
+    The fields are read off the slots, the way ``__eq__`` compares them,
+    rather than through the twelve property accessors that hand the same
+    objects back: at fleet scale those are twelve Python calls per entry.
+    A renamed slot fails loudly here (and in every duplicate-schedule
+    test) rather than drifting.
     """
     return (
-        tab.seconds,
-        tab.minutes,
-        tab.hours,
-        tab.days_of_month,
-        tab.last_day_offsets,
-        tab.nearest_weekday_days,
-        tab.last_weekday_of_month,
-        tab.months,
-        tab.days_of_week,
-        tab.last_days_of_week,
-        tab.nth_days_of_week,
-        tab.years,
+        tab._seconds,
+        tab._minutes,
+        tab._hours,
+        tab._dom,
+        tab._dom_last_offsets,
+        tab._dom_nearest,
+        tab._dom_last_weekday,
+        tab._months,
+        tab._dow,
+        tab._dow_last,
+        tab._dow_nth,
+        tab._years,
+        tz_label,
     )
 
 
@@ -1516,7 +1614,7 @@ def duplicate_schedules(
     """
     groups: Dict[Tuple[Any, ...], List[ScheduleEntry]] = {}
     for entry in entries:
-        key = _semantic_key(entry.tab) + (_tz_label(entry.timezone),)
+        key = _semantic_key(entry.tab, _tz_label(entry.timezone))
         groups.setdefault(key, []).append(entry)
     out: List[Dict[str, Any]] = []
     for members in groups.values():
@@ -1573,7 +1671,11 @@ def suggest_slot(
     if start is None:
         start = datetime.datetime.now(datetime.timezone.utc)
     if grid is None:
-        grid, _cells, _minute_jobs = _fire_cells(entries, start, 24, zone)
+        # only the grid is scored below, so the walk skips the per-cell
+        # and per-minute name bookkeeping entirely
+        grid, _cells, _minute_jobs = _fire_cells(
+            entries, start, 24, zone, names=False
+        )
     if period == "hourly":
         loads = [
             sum(grid[hour][minute] for hour in range(24))

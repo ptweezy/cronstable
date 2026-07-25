@@ -873,6 +873,190 @@ def bench_config_interp():
     return dt
 
 
+def _include_part(f, per_file, seq):
+    """One included jobs file; ``seq`` varies the bytes so a rewrite is a
+    real cache MISS under content hashing."""
+    lines = ["jobs:"]
+    for i in range(per_file):
+        lines.append("  - name: inc%djob%03d" % (f, i))
+        lines.append("    command: echo inc%dj%03d-v%d" % (f, i, seq))
+        lines.append('    schedule: "%d %d * * *"' % (i % 60, (i * 7) % 24))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _reload_include_dir():
+    """An entry file that ``include:``s three ~17-job files, parsed once so
+    the per-file cache is warm for every unchanged member of the tree."""
+
+    def build():
+        try:
+            from cronstable.config import parse_config_with_sources
+        except ImportError as exc:
+            raise Skip(
+                "parse_config_with_sources unavailable: %r" % exc
+            ) from None
+        path = os.path.join(_tmpdir(), "reload-include")
+        os.makedirs(path, exist_ok=True)
+        per_file = max(2, _n(50) // 3)
+        for f in range(3):
+            with open(
+                os.path.join(path, "part-%d.yaml" % f), "w", encoding="utf-8"
+            ) as handle:
+                handle.write(_include_part(f, per_file, 0))
+        entry = os.path.join(path, "entry.yaml")
+        with open(entry, "w", encoding="utf-8") as handle:
+            handle.write(
+                "include:\n"
+                + "".join("  - part-%d.yaml\n" % f for f in range(3))
+            )
+        try:
+            config, _sources = parse_config_with_sources(entry)
+        except Exception as exc:
+            raise Skip("include tree failed to parse: %r" % exc) from None
+        if len(config.jobs) != per_file * 3:
+            raise RuntimeError(
+                "include tree yielded %d jobs, expected %d"
+                % (len(config.jobs), per_file * 3)
+            )
+        return entry, per_file
+
+    return fixture("reload_include_50", build)
+
+
+@bench(
+    "config.reload_warm_include_50",
+    "config",
+    detail="8 operator edits + warm reparses of an include: tree, 50 jobs",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+)
+def bench_config_reload_warm_include():
+    """The reload cache over an ``include:`` tree, the other config layout.
+
+    config.reload_warm_50 builds a config DIRECTORY, where the entry is a
+    directory listing and each sibling is parsed on its own.  An include
+    tree is a different code path: one entry file drives a recursive
+    parse_config_file walk, with cycle detection, a transitive source set
+    and a per-file defaults merge per level.  A cache keyed only on the
+    entry (or a signature that stops at the entry's own stat) reparses the
+    whole tree on every pass here and stays invisible to the directory
+    metric.  One of the three parts is rewritten with new bytes per timed
+    edit, so the other two must come from the cache or nothing is being
+    measured.
+    """
+    try:
+        from cronstable.config import parse_config_with_sources
+    except ImportError as exc:
+        raise Skip("parse_config_with_sources unavailable: %r" % exc) from None
+    entry, per_file = _reload_include_dir()
+    target = os.path.join(os.path.dirname(entry), "part-0.yaml")
+    # eight, where the directory twin uses four: one warm include reparse is
+    # roughly half a directory reparse, so four measured under the harness's
+    # 50ms rule and would have shipped floor-bound
+    edits = 8
+    variants = [_include_part(0, per_file, seq) for seq in range(1, edits + 1)]
+    t0 = time.perf_counter()
+    for text in variants:
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        config, _sources = parse_config_with_sources(entry)
+    dt = time.perf_counter() - t0
+    if len(config.jobs) != per_file * 3:
+        raise RuntimeError(
+            "warm include reload parsed %d jobs, expected %d"
+            % (len(config.jobs), per_file * 3)
+        )
+    return dt
+
+
+def _gc_job_map(n):
+    """``{name: JobConfig}`` at fleet scale: the graph a reload retains.
+
+    The daemon's largest long-lived structure by tracked-object count, which
+    is what a full collection actually walks (bytes are irrelevant to the
+    collector).  Built through the public JobConfig/mergedicts pair, so a
+    version lacking either records as a skip.
+    """
+    try:
+        from cronstable.config import DEFAULT_CONFIG, JobConfig, mergedicts
+    except ImportError as exc:
+        raise Skip("cronstable.config API unavailable: %r" % exc) from None
+    jobs = {}
+    for i in range(n):
+        name = "job%06d" % i
+        jobs[name] = JobConfig(
+            mergedicts(
+                DEFAULT_CONFIG,
+                {
+                    "name": name,
+                    "command": "echo %d" % i,
+                    "schedule": "%d %d * * *" % (i % 60, (i * 7) % 24),
+                },
+            )
+        )
+    return jobs
+
+
+@bench(
+    "config.reload_gc_100k",
+    "config",
+    detail="rebuild + swap a 100k-job set with the COLLECTOR LIVE",
+    repeats=(2, 1, 1),
+    gate_pct=25.0,
+    compare="median",
+)
+def bench_config_reload_gc():
+    """The one timed region in the suite that runs with GC enabled.
+
+    _run_one collects and then DISABLES the collector around every warm-up
+    and every measured repetition, which is the right call for a
+    microbenchmark, and is why no other metric here (nor any absolute
+    ceiling in budgets.json) has ever included a millisecond of collector
+    time.  The blindness is scale-dependent: at the sizes the other fixtures
+    use, GC-on and GC-off agree within noise.  It is the RETAINED
+    fleet-scale graph that changes the arithmetic, and that shape is
+    precisely what a changed reload executes: the old job set stays reachable
+    while the replacement is built, so every allocation-triggered collection
+    walks both.
+
+    compare='median', not the usual 'min': a full collection lands on some
+    repetitions and not others, so 'min' would select the repetition that
+    happened to dodge it and reinstate exactly the blindness this metric
+    exists to remove.  The collector's enabled state is restored afterwards
+    whatever the harness had set.
+
+    Two repetitions, not the usual three: one rebuild of a 100k-job set is
+    the most expensive timed region in the suite (measured 1.0s of work
+    carrying 3.4s of collector time), and the CI bill is per round per side.
+    Cutting a repetition costs nothing here, since the five CI rounds
+    already give compare.py its noise band.  Cutting the SCALE would not be
+    free: the pause is steeply superlinear (measured 6 / 13 / 77 / 371 ms at
+    20k / 40k / 60k / 100k resident jobs), so a smaller fixture measures a
+    different phenomenon rather than a cheaper one.
+    """
+    n = _n(100000)
+    resident = fixture("gc_job_map_100k", lambda: [_gc_job_map(n)])
+    was_enabled = gc.isenabled()
+    gc.enable()
+    try:
+        t0 = time.perf_counter()
+        fresh = _gc_job_map(n)
+        old = resident[0]
+        resident[0] = fresh
+        del old
+        dt = time.perf_counter() - t0
+    finally:
+        if not was_enabled:
+            gc.disable()
+    if len(resident[0]) != n:
+        raise RuntimeError(
+            "rebuilt job set holds %d entries, expected %d"
+            % (len(resident[0]), n)
+        )
+    return dt
+
+
 # ---------------------------------------------------------------------------
 # schedule: seeding and analyzing the fleet schedule, 100k jobs.
 # ---------------------------------------------------------------------------
@@ -1680,6 +1864,140 @@ def bench_dag_advance_quiescent():
 
 
 @bench(
+    "dag.advance_quiescent_chain",
+    "dag",
+    detail="40 quiescent advances of a 1k-task CHAIN mid-flight",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_dag_advance_quiescent_chain():
+    """The same steady-state advance over a DEPENDENT graph.
+
+    dag.advance_quiescent_1k builds 1000 tasks with no depends_on at all,
+    which is the one topology whose readiness check is a constant: an empty
+    dependency list short-circuits before any upstream state is consulted.
+    Every real orchestration DAG is the other shape, and there the per-pass
+    cost is driven by the dependency walk, resolved once per pending task
+    per pass, every pass, for the whole life of the run.  A chain is that
+    walk's worst realistic case and its fan-in twin (the last task of a
+    chain is a 1-wide fan-in resolved 1000 times).
+
+    The run is parked mid-flight: the first half finished, one task running
+    under a live pid, the rest blocked behind it.  Nothing can become ready,
+    so a pass that reconciles or launches anything means the fixture (or the
+    planner) broke and the region timed the wrong shape.  Unlike the
+    dependency-free twin this does NOT assert the document is byte-identical
+    afterwards: whether a mixed-state graph takes the keep path is the
+    planner's business, and pinning it here would make the metric fail on a
+    legitimate change instead of measuring it.
+    """
+    import asyncio
+
+    dag = _dag_module()
+    if not hasattr(dag, "reconcile_and_plan"):
+        raise Skip("dag.reconcile_and_plan not present")
+    try:
+        from cronstable.state import DOC_KEEP
+    except ImportError as exc:
+        raise Skip("state DOC_KEEP sentinel unavailable: %r" % exc) from None
+    n = _n(1000, floor=4)
+    now = 1700000000.0
+    ns = dag.DAG_RUN_NS_PREFIX + "chain"
+    run_key = "r"
+    passes = 40
+    tasks = [dag.TaskSpec(id="t0")]
+    for i in range(1, n):
+        tasks.append(
+            dag.TaskSpec(id="t%d" % i, depends_on=("t%d" % (i - 1),))
+        )
+    spec = dag.DagSpec.build("chain", tasks)
+    running_at = n // 2
+
+    def _inflight_body():
+        body = dag.new_run_body(
+            dag="chain",
+            run_key=run_key,
+            run_id="rid",
+            logical_date=None,
+            kind="scheduled",
+            now=now,
+            spec=spec,
+        )
+        for i, task in enumerate(tasks):
+            entry = body["tasks"][task.id]
+            if i < running_at:
+                entry["state"] = "success"
+                entry["attempt"] = 1
+                entry["startedAt"] = now
+                entry["finishedAt"] = now + 1.0
+                entry["exitCode"] = 0
+            elif i == running_at:
+                entry["state"] = "running"
+                entry["proc"] = "bench-proc"
+                entry["pid"] = 4242
+                entry["attempt"] = 1
+                entry["startedAt"] = now
+        return body
+
+    def _wrap_keep(transform):
+        def wrapped(cur):
+            new_body, result = transform(cur)
+            if not isinstance(new_body, dict):
+                return DOC_KEEP, result
+            return new_body, result
+
+        return wrapped
+
+    async def run():
+        path = tempfile.mkdtemp(prefix="dagchain-", dir=_tmpdir())
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            body = _inflight_body()
+            await backend.mutate_document(
+                ns, run_key, lambda cur, b=body: (b, None)
+            )
+            results = []
+            t0 = time.perf_counter()
+            for _ in range(passes):
+                transform = _wrap_keep(
+                    dag.reconcile_and_plan(
+                        spec,
+                        now + 60.0,
+                        "bench-proc",
+                        "bench-host",
+                        lambda pid: True,
+                    )
+                )
+                _, result = await backend.mutate_document(
+                    ns, run_key, transform
+                )
+                results.append(result)
+            dt = time.perf_counter() - t0
+        finally:
+            await backend.stop()
+            shutil.rmtree(path, ignore_errors=True)
+        for result in results:
+            reconciled = getattr(result, "reconciled", 0)
+            advance = getattr(result, "advance", None)
+            launches = advance is not None and getattr(
+                advance, "launches", []
+            )
+            if reconciled or launches:
+                raise RuntimeError(
+                    "chain advance was not quiescent (%r); the metric would "
+                    "time the wrong shape" % (result,)
+                )
+        return dt
+
+    try:
+        return asyncio.run(run())
+    except TypeError as exc:
+        raise Skip("reconcile_and_plan signature changed: %r" % exc) from None
+
+
+@bench(
     "dag.adopt_scan_500",
     "dag",
     detail="8 warm keys-only adoption scans over 500 runs (50 foreign)",
@@ -1954,6 +2272,79 @@ def bench_dag_list_dags_warm():
     return asyncio.run(run())
 
 
+@bench(
+    "dag.list_runs_warm",
+    "dag",
+    detail="60 GET /dags/{name}/runs over a dag with 50 terminal runs",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_dag_list_runs_warm():
+    """The run-list poll behind the dashboard's DAG runs tab.
+
+    dag.list_dags_warm measures the ROLLUP, which lists keys and consults a
+    per-key terminal cache; list_runs is the sibling that gets no such help.
+    It reads every run document's body on every call, sorts them all, and
+    then returns the newest `limit`, so the read grows with retention
+    while the answer does not, and the dashboard asks again on every poll
+    for as long as the tab is open.  A terminal run is immutable, which is
+    what makes the rollup's cache correct and is exactly the property this
+    path does not exploit yet.
+
+    Driven through the scheduler's own list_runs (the handler adds routing
+    and a JSON encode measured elsewhere), and the row count is asserted so
+    a namespace that failed to seed cannot time an empty scan.
+    """
+    import asyncio
+
+    Cron = _cron_cls()
+    path = _seeded_dag_runs()
+    runs = _n(50)
+    cfg = "state:\n  path: %s\n%s" % (
+        path.replace("\\", "/"),
+        _BENCH_DAG_YAML,
+    )
+
+    async def run():
+        try:
+            cron = Cron(None, config_yaml=cfg)
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+        backend = _state_backend(path)
+        await backend.start()
+        cron.state_backend = backend
+        cron._state_configured = True
+        dagsched = getattr(cron, "_dag", None)
+        if dagsched is None or not hasattr(dagsched, "list_runs"):
+            await _teardown_cron(cron)
+            raise Skip("cron._dag.list_runs not present")
+        try:
+            try:
+                rows = await dagsched.list_runs("benchdag", limit=25)
+            except TypeError as exc:
+                raise Skip(
+                    "list_runs signature changed: %r" % exc
+                ) from None
+            if not rows:
+                raise RuntimeError(
+                    "list_runs returned %r for a namespace seeded with %d "
+                    "runs" % (rows, runs)
+                )
+            # 60 polls: a minute of an open runs tab, and one call measures
+            # far under the harness's 50ms rule (the metric would gate at an
+            # effective ~230% against its declared 25%)
+            t0 = time.perf_counter()
+            for _ in range(60):
+                await dagsched.list_runs("benchdag", limit=25)
+            dt = time.perf_counter() - t0
+        finally:
+            await _teardown_cron(cron)
+        return dt
+
+    return asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # state: the durable filesystem backend (async, real disk I/O).
 # ---------------------------------------------------------------------------
@@ -2098,6 +2489,138 @@ def bench_list_records():
         return dt
 
     return asyncio.run(run())
+
+
+@bench(
+    "state.list_records_warm",
+    "state",
+    detail="20 repeat list_records over an UNCHANGED 2k-record stream",
+    repeats=(3, 2, 1),
+    gate_floor=0.010,
+)
+def bench_list_records_warm():
+    """Repeat reads of a stream nothing has written to.
+
+    state.list_records_2k reads each record exactly once, so it cannot
+    distinguish "the read is fast" from "the read happens every time".  The
+    daemon's readers are the opposite shape: the retry claim scan, the
+    depends-on-past gate, the run-history and artifact views and the state
+    inspector all re-read the same streams on a poll cadence, and between
+    two polls the file on disk is usually byte-identical.  A stat- or
+    generation-keyed short circuit would collapse this metric and leave the
+    cold one untouched; without it the two are the same number times
+    twenty, which is exactly the fact worth pinning.
+
+    Deliberately re-read through ONE backend instance: a per-call backend
+    would defeat any in-process memo before it could be measured.
+    """
+    import asyncio
+
+    path, seeded = _state_dir_with_records()
+    n = _n(20, floor=2)
+
+    async def run():
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            first = await backend.list_records("runs")
+            if len(first) != seeded:
+                raise RuntimeError(
+                    "seeded stream holds %d records, expected %d"
+                    % (len(first), seeded)
+                )
+            t0 = time.perf_counter()
+            for _ in range(n):
+                await backend.list_records("runs")
+            dt = time.perf_counter() - t0
+        finally:
+            await backend.stop()
+        return dt
+
+    return asyncio.run(run())
+
+
+@bench(
+    "state.mutate_document_1k",
+    "state",
+    detail="100 read-modify-writes of a 1k-entry durable document",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.050,
+)
+def bench_state_mutate_document():
+    """The durable document RMW, the state backend's other write shape.
+
+    state.append_1k covers the record stream: an append is a short line onto
+    the end of a file.  A document write is the opposite: read the WHOLE
+    body, run the transform, re-serialize the whole body, write it
+    atomically.  It is what every DAG run, every job kv namespace, the
+    manifest and the counter snapshot use.  The cost is superlinear in
+    document size and paid per mutation, so the entry count matters as much
+    as the call count; 1k entries is a mapped fan-out or a busy job's kv
+    namespace.  dag.advance_quiescent_1k measures the shape that DOES NOT
+    write (the keep path); this one measures the shape that does.
+
+    The mutated field is a counter, not a growing list, so every pass writes
+    the same number of bytes and the repeats are comparable.  The final
+    counter value is asserted, so a transform whose result was discarded
+    cannot time a no-op.
+    """
+    import asyncio
+
+    entries = _n(1000, floor=10)
+    passes = _n(100, floor=2)
+    path = tempfile.mkdtemp(prefix="mutdoc-", dir=_tmpdir())
+
+    def _seed(cur):
+        body = {
+            "kind": "bench",
+            "counter": 0,
+            "entries": {
+                "e%05d" % i: {
+                    "state": "success" if i % 3 else "running",
+                    "attempt": i % 4,
+                    "startedAt": 1700000000.0 + i,
+                    "note": "entry %d of the bench document" % i,
+                }
+                for i in range(entries)
+            },
+        }
+        return body, None
+
+    def _bump(cur):
+        if not isinstance(cur, dict):
+            raise RuntimeError("document vanished mid-benchmark")
+        body = dict(cur)
+        body["counter"] = body.get("counter", 0) + 1
+        return body, body["counter"]
+
+    async def run():
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            await backend.mutate_document("benchdoc", "d", _seed)
+            t0 = time.perf_counter()
+            for _ in range(passes):
+                _body, counter = await backend.mutate_document(
+                    "benchdoc", "d", _bump
+                )
+            dt = time.perf_counter() - t0
+        finally:
+            await backend.stop()
+        if counter != passes:
+            raise RuntimeError(
+                "document counter reached %r after %d mutations; the "
+                "region did not write" % (counter, passes)
+            )
+        return dt
+
+    try:
+        return asyncio.run(run())
+    except TypeError as exc:
+        raise Skip("mutate_document signature changed: %r" % exc) from None
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @bench(
@@ -3465,6 +3988,16 @@ def bench_web_render_fleet():
     gate_floor=0.002,
 )
 def bench_web_log_count():
+    """The match-count upkeep beside the log view.
+
+    Deliberately narrow, and retained rather than retargeted: it is the one
+    metric that can see the incremental match-count fold (appendLine keeps
+    state.log.matchCount in step per line, so only a query CHANGE rescans),
+    and it costs a fraction of a millisecond by design.  The expensive
+    function next to it, the full DOM rebuild in renderTerm that the same
+    query change also triggers, is measured by webui.render_term_5k; the
+    pair is what a "search keystroke" actually costs.
+    """
     if _MODE == "smoke":
         raise Skip("webui metrics do not run in smoke mode")
     page = _web_page()
@@ -3473,6 +4006,124 @@ def bench_web_log_count():
         "__perf.seedLog(%d, 'worker')" % _n(5000),
         "__perf.updateLogCount()",
     )
+
+
+@bench(
+    "webui.render_term_5k",
+    "webui",
+    detail="renderTerm full log rebuild, 5k lines with a search (Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.002,
+)
+def bench_web_render_term():
+    """The log view's full rebuild: one <span> tree per buffered line.
+
+    Every search keystroke (debounced), every ansi/timestamp/regex toggle
+    and every stream (re)attach runs this over the whole retained buffer,
+    and at the shipped 5000-line cap it is the single most expensive
+    function in the dashboard, two orders of magnitude above the
+    updateLogCount call that sits next to it and that webui.log_count_5k
+    measures.
+
+    Driven through the page's OWN listener rather than a __perf hook: the
+    'matches only' toggle calls renderTerm bare (no pref write, no query
+    change, both directions build every line), so the metric works against
+    any release that has the checkbox.  A hook-only drive would measure
+    nothing on the baseline side of a paired run and gate nothing.  The
+    render is asserted to have produced line nodes so a listener that
+    stopped being wired cannot time an event dispatch.
+    """
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    setup = (
+        "__perf.seedLog(%d, 'worker');"
+        " const _only = document.getElementById('optOnly');"
+        " if (!_only) throw new Error('no optOnly toggle');" % _n(5000)
+    )
+    op = (
+        "_only.checked = !_only.checked;"
+        " _only.dispatchEvent(new Event('change'))"
+    )
+    value = _web_time(page, setup, op, batch=2, batches=8)
+    rendered = page.evaluate(
+        "() => document.querySelectorAll('#term .ln').length"
+    )
+    if not rendered:
+        raise RuntimeError(
+            "renderTerm produced no line nodes; the toggle is no longer "
+            "wired to it and the region timed an event dispatch"
+        )
+    return value
+
+
+@bench(
+    "webui.append_line_5k",
+    "webui",
+    detail="appendLine per streamed line into a full 5k buffer (Chromium)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    # microseconds per line by design, so the webui group's 2ms floor (sized
+    # for whole-view rebuilds) would leave this gating only on a ~300x move.
+    # 2us is the batch-mean's own jitter band, which is what a floor is for.
+    gate_floor=0.000002,
+)
+def bench_web_append_line():
+    """The per-streamed-line browser cost, paid once per line per viewer.
+
+    A chatty job emits thousands of lines a minute and each one runs
+    appendLine: a scrollHeight/scrollTop read (a forced layout against the
+    whole buffer), the O(1) ring trim, one node build, and the incremental
+    match-count fold.  Nothing else in the suite measures it; the server
+    side of the same line is webapi.sse_frame_20k.
+
+    Needs a ``__perf.appendLine`` hook, because appendLine lives inside the
+    page's module closure and no DOM event reaches it (its only callers are
+    the SSE readers, which need a backend).  A release without the hook
+    records as skipped, never failed, exactly like the ?perf=1 gate itself.
+    Both hook shapes are driven: the index form the page ships and the
+    (stream, text) form, chosen from the function's own arity so a paired
+    run cannot end up timing two different calls.
+
+    The batch is large deliberately.  Chromium clamps performance.now() to
+    ~100us and a fixed append is well under that, so a small batch reads as
+    a flat zero, which is how a metric silently stops measuring.
+    """
+    if _MODE == "smoke":
+        raise Skip("webui metrics do not run in smoke mode")
+    page = _web_page()
+    arity = page.evaluate(
+        "() => (typeof __perf.appendLine === 'function')"
+        " ? __perf.appendLine.length : -1"
+    )
+    if arity < 0:
+        raise Skip("page lacks the __perf.appendLine hook")
+    op = (
+        "__perf.appendLine('stdout', 'worker ' + (_i++) + ' ok')"
+        if arity >= 2
+        else "__perf.appendLine(_i++)"
+    )
+    n = _n(5000)
+    # seed to the shipped cap first, so every timed append also pays the
+    # ring trim and the layout read against a FULL buffer
+    value = _web_time(
+        page,
+        "let _i = 0; __perf.seedLog(%d, 'worker');"
+        " if (__perf.renderTerm) __perf.renderTerm()" % n,
+        op,
+        batch=100,
+        batches=6,
+    )
+    rendered = page.evaluate(
+        "() => document.querySelectorAll('#term .ln').length"
+    )
+    if not rendered:
+        raise RuntimeError(
+            "the buffer holds no line nodes after the appends; the hook "
+            "did not reach appendLine"
+        )
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -3604,6 +4255,347 @@ def bench_loop_stall_jobs():
     return asyncio.run(run())
 
 
+def _idle_loop_config():
+    """A small config FILE on disk, so the idle loop's per-pass reload takes
+    the real stat-fingerprint path instead of the config_arg-is-None
+    shortcut."""
+
+    def build():
+        path = os.path.join(_tmpdir(), "idle-loop")
+        os.makedirs(path, exist_ok=True)
+        entry = os.path.join(path, "cronstable.yaml")
+        lines = ["jobs:"]
+        for i in range(20):
+            lines.append("  - name: idle%02d" % i)
+            lines.append("    command: 'true'")
+            lines.append('    schedule: "%d 4 * * *"' % (i % 60))
+        lines.append("")
+        with open(entry, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+        return entry
+
+    return fixture("idle_loop_config", build)
+
+
+@bench(
+    "loop.idle_wake_rate",
+    "loop",
+    detail="500 idle Cron.run() iterations (full housekeeping pass each)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_loop_idle_wake():
+    """The cost of ONE idle pass of the forever loop, which nothing else in
+    the suite touches: no benchmark runs Cron.run() at all.
+
+    Every other loop-adjacent metric measures a subsystem in isolation
+    (_spawn_due_jobs, a handler, a gossip absorb).  What determines whether
+    a daemon idles at 0% or pins a core is the pass ITSELF: the reload
+    stat fingerprint, the four idempotent start_stop_* calls, the pause/SLA
+    and durable-state periodics, _service_slots and the DAG service probe,
+    multiplied by however often the sleep computation lets it run.  A wake
+    hint that returns zero turns that pass into a spin, and the damage is
+    exactly (pass cost x wake rate); this metric owns the first factor.
+
+    The loop is spun through the seam its own docstring nominates: the
+    module-level next_sleep_interval, which _sleep_interval calls for the
+    housekeeping cap and which "a test can still patch to spin the loop
+    fast".  Patching it (rather than the bound _sleep_interval) leaves the
+    real floor/min arithmetic in the timed path.  The launch seam is checked
+    positively and then neutered before the loop starts, so a rename cannot
+    quietly turn this into a process-spawning benchmark, and the iteration
+    count is asserted afterwards so a pass that exited early cannot time a
+    no-op.
+    """
+    import asyncio
+
+    Cron = _cron_cls()
+    try:
+        from cronstable import cron as cron_mod
+    except ImportError as exc:
+        raise Skip("cronstable.cron unavailable: %r" % exc) from None
+    real_sleep = getattr(cron_mod, "next_sleep_interval", None)
+    if real_sleep is None:
+        raise Skip("cron.next_sleep_interval seam not present")
+    for attr in ("run", "_sleep_interval", "signal_shutdown"):
+        if not hasattr(Cron, attr):
+            raise Skip("Cron lacks %s" % attr)
+    seam = Cron.__dict__.get("_launch_plan")
+    import inspect
+
+    if seam is None or not inspect.iscoroutinefunction(seam):
+        raise Skip(
+            "Cron._launch_plan seam absent or not async; refusing to run "
+            "(an un-neutered idle loop could spawn real processes)"
+        )
+    entry = _idle_loop_config()
+    passes = _n(500, floor=5)
+    state = {"n": 0, "t0": 0.0, "t1": 0.0}
+
+    async def run():
+        try:
+            cron = Cron(entry)
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+
+        async def _capture(plan):
+            state["launched"] = True
+
+        cron._launch_plan = _capture
+
+        def _spin(subminute=False):
+            # counted at the END of each pass: the first call closes the
+            # start-up pass (fixtures, seeding, catch-up) and opens the
+            # measured window, the last closes it and stops the loop.
+            state["n"] += 1
+            if state["n"] == 1:
+                state["t0"] = time.perf_counter()
+            elif state["n"] > passes or (
+                # hard stop: a seam that stops being called must not hang CI
+                time.perf_counter() - state["t0"] > 30.0
+            ):
+                if not state["t1"]:
+                    state["t1"] = time.perf_counter()
+                # signal_shutdown, not a bare _stop_event.set(): the reaper
+                # parks on _jobs_running with no job running, and only the
+                # public signal wakes it, so the shutdown drain would hang.
+                cron.signal_shutdown()
+            return 0.0
+
+        cron_mod.next_sleep_interval = _spin
+        try:
+            # Belt to the in-seam brace: if _sleep_interval stops consulting
+            # the module function at all, _spin never runs, the loop sleeps
+            # out its real minute and this would hang the suite rather than
+            # record a drifted seam.
+            await asyncio.wait_for(cron.run(), timeout=120.0)
+        except asyncio.TimeoutError:
+            raise Skip(
+                "the idle loop did not reach %d passes in 120s; the "
+                "next_sleep_interval seam no longer drives it" % passes
+            ) from None
+        finally:
+            cron_mod.next_sleep_interval = real_sleep
+            await _teardown_cron(cron)
+        return state["t1"] - state["t0"]
+
+    dt = asyncio.run(run())
+    if state["n"] <= passes:
+        raise RuntimeError(
+            "the idle loop ran %d of the expected %d passes; the spin seam "
+            "did not hold and the region timed the wrong work"
+            % (state["n"] - 1, passes)
+        )
+    if state.get("launched"):
+        raise RuntimeError("an idle pass launched a job; the fixture is due")
+    return dt
+
+
+@bench(
+    "loop.stall_metrics_2000",
+    "loop",
+    detail="max event-loop scheduling gap under 4 /metrics scrapes, 2k jobs",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.003,
+    info=True,
+)
+def bench_loop_stall_metrics():
+    """MAX event-loop scheduling gap while /metrics is scraped.
+
+    /metrics is the largest synchronous handler with no executor offload:
+    the whole exposition (every family, every job, every histogram
+    bucket) is rendered inline on the scheduler's loop, once every 15-60s
+    forever, and the render is O(jobs x families x buckets).
+    prometheus.render_500 measures the render's DURATION, which is blind to
+    where it runs; this measures what the scheduler feels while it happens,
+    the same gauge loop.stall_jobs_500 provides for the offloaded /jobs
+    handler.  Two thousand jobs, because the gap only becomes legible past
+    the point where the render exceeds a heartbeat tick.
+
+    One scrape is served untimed first (the label-block and escape memos
+    warm on it).  info=True to observe CI variance before arming, exactly
+    as loop.stall_jobs_500 did; Windows-local runs are blind (15ms timer
+    granularity).
+    """
+    import asyncio
+
+    def build():
+        cron = _seeded_web_cron(_n(2000))
+        metrics = getattr(cron, "metrics", None)
+        if metrics is None or not hasattr(metrics, "job_run_recorded"):
+            raise Skip("PrometheusMetrics accumulators not present")
+        try:
+            for i, name in enumerate(cron.cron_jobs):
+                metrics.job_run_recorded(name, "success", 1.5 + (i % 20))
+                if i % 7 == 0:
+                    metrics.job_run_recorded(name, "failure", 0.5)
+        except TypeError as exc:
+            raise Skip(
+                "job_run_recorded signature changed: %r" % exc
+            ) from None
+        return cron
+
+    cron = fixture("metrics_cron_2000", build)
+    if not hasattr(cron, "_web_metrics"):
+        raise Skip("Cron._web_metrics not present")
+
+    async def run():
+        await cron._web_metrics(_mocked_get("/metrics"))  # warm the memos
+        stop = False
+        max_gap = 0.0
+
+        async def heartbeat():
+            nonlocal max_gap
+            loop = asyncio.get_running_loop()
+            last = loop.time()
+            while not stop:
+                await asyncio.sleep(0.001)
+                now_t = loop.time()
+                gap = now_t - last - 0.001
+                if gap > max_gap:
+                    max_gap = gap
+                last = now_t
+
+        beat = asyncio.create_task(heartbeat())
+        await asyncio.sleep(0)  # let the heartbeat take its first timestamp
+        for _ in range(4):
+            resp = await cron._web_metrics(_mocked_get("/metrics"))
+            await asyncio.sleep(0)
+        stop = True
+        await beat
+        if not resp.body:
+            raise RuntimeError("/metrics returned an empty exposition")
+        return max_gap
+
+    return asyncio.run(run())
+
+
+class _BenchFinishedJob:
+    """A completion the reaper can wait on, with no process behind it.
+
+    Quacks like a RunningJob exactly as far as _wait_for_running_jobs reads
+    one: hashable identity, an awaitable wait(), and a config carrying the
+    name its error path would log.  _handle_finished_job is neutered
+    separately (it is the whole record/report/retry pipeline, measured by
+    other metrics), so the timed region is the reaper's own bookkeeping.
+    """
+
+    class _Config:
+        def __init__(self, name):
+            self.name = name
+
+    def __init__(self, name):
+        self.config = self._Config(name)
+        self._done = None
+
+    def arm(self):
+        import asyncio
+
+        self._done = asyncio.get_running_loop().create_future()
+
+    def finish(self):
+        if not self._done.done():
+            self._done.set_result(None)
+
+    async def wait(self):
+        await self._done
+
+
+@bench(
+    "loop.stall_completions_500",
+    "loop",
+    detail="reaper drain of 500 completions, one at a time (500 running)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.005,
+)
+def bench_loop_stall_completions():
+    """The reaper's per-completion wait-set rebuild at fleet scale.
+
+    _wait_for_running_jobs re-enters asyncio.wait over the WHOLE running set
+    on every batch, so a fleet finishing its jobs one at a time pays
+    O(running) waiter registrations per completion, quadratic in the
+    number of concurrently running jobs, on the scheduler's own loop.
+    Nothing else measures the reaper: every job metric times one run's
+    pipeline, and the completions here are deliberately resolved ONE at a
+    time because a simultaneous burst is handled in a single batch and would
+    time the shape the quadratic does not have.
+
+    _handle_finished_job is checked positively and then neutered: it is the
+    durable-record / report / retry pipeline, which has its own metrics and
+    would otherwise dominate (and would need a state backend to be
+    meaningful).  What is left is exactly the reaper's own bookkeeping.
+    """
+    import asyncio
+    import inspect
+
+    Cron = _cron_cls()
+    if not hasattr(Cron, "_wait_for_running_jobs"):
+        raise Skip("Cron._wait_for_running_jobs not present")
+    handler = Cron.__dict__.get("_handle_finished_job")
+    if handler is None or not inspect.iscoroutinefunction(handler):
+        raise Skip(
+            "Cron._handle_finished_job seam absent or not async; refusing "
+            "to run (the un-neutered reaper would take the durable path)"
+        )
+    n = _n(500, floor=5)
+
+    async def run():
+        try:
+            cron = Cron(
+                None,
+                config_yaml="jobs:\n  - name: seed\n    command: 'x'\n"
+                "    schedule: '0 0 * * *'\n",
+            )
+        except TypeError as exc:
+            raise Skip("Cron signature changed: %r" % exc) from None
+        handled = []
+
+        async def _neutered(job):
+            handled.append(job)
+
+        cron._handle_finished_job = _neutered
+        jobs = [_BenchFinishedJob("bench%04d" % i) for i in range(n)]
+        for job in jobs:
+            job.arm()
+            cron.running_jobs[job.config.name].append(job)
+        cron._jobs_running.set()
+        reaper = asyncio.create_task(cron._wait_for_running_jobs())
+        await asyncio.sleep(0)
+        t0 = time.perf_counter()
+        for job in jobs:
+            job.finish()
+            cron.running_jobs.pop(job.config.name, None)
+            # two turns: one for the reaper to observe the completion, one
+            # for it to rebuild its wait set before the next finish
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        # bounded: a wedged reaper must record as a broken benchmark, not
+        # spin the loop until the CI job times out
+        for _ in range(10 * n + 1000):
+            if len(handled) >= n:
+                break
+            await asyncio.sleep(0)
+        dt = time.perf_counter() - t0
+        cron._stop_event.set()
+        cron._jobs_running.set()
+        try:
+            await asyncio.wait_for(reaper, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            reaper.cancel()
+        await _teardown_cron(cron)
+        if len(handled) != n:
+            raise RuntimeError(
+                "the reaper handled %d of %d completions; the region timed "
+                "the wrong work" % (len(handled), n)
+            )
+        return dt
+
+    return asyncio.run(run())
+
+
 @bench(
     "webapi.jobs_payload_500",
     "webapi",
@@ -3676,6 +4668,150 @@ def bench_webapi_jobs_bytes():
         if not body or len(body) < 2:
             raise RuntimeError("GET /jobs returned an empty body")
         return len(body) / 1024.0
+
+    return asyncio.run(run())
+
+
+@bench(
+    "webapi.jobs_gzip_500",
+    "webapi",
+    detail="GET /jobs body size after gzip, 500 jobs with history",
+    unit="KB",
+    repeats=(3, 2, 1),
+    compare="median",
+    gate_floor=0.5,
+)
+def bench_webapi_jobs_gzip():
+    """The same body as webapi.jobs_bytes_500, over the wire.
+
+    The raw byte count answers "how much did the payload grow"; this one
+    answers "how much of that reaches the client", and the two move
+    independently.  A new per-job field whose value repeats across the fleet
+    (a constant, an enum, another copy of a label already present) is nearly
+    free once compressed, while a field carrying per-job entropy (an id, a
+    timestamp, a hash) costs its full weight on every poll of every client
+    forever, and only this metric can tell those two apart.  It is also
+    the number a response-compression change would move, in either
+    direction.
+
+    Compression is done here rather than read off the response: the daemon
+    does not compress today, so reading a Content-Encoding would make the
+    metric a permanent no-op.  Level 6 is zlib's default and what every
+    server default (aiohttp, nginx) lands on.
+    """
+    import asyncio
+    import gzip
+
+    cron = fixture(
+        "webapi_cron_500",
+        lambda: _seeded_web_cron(_n(500), history_every=5),
+    )
+    if not hasattr(cron, "_web_list_jobs"):
+        raise Skip("Cron._web_list_jobs not present")
+
+    async def run():
+        resp = await cron._web_list_jobs(_mocked_get("/jobs"))
+        body = resp.body
+        if not body or len(body) < 2:
+            raise RuntimeError("GET /jobs returned an empty body")
+        # mtime=0: the gzip header otherwise carries a timestamp, which
+        # would make the byte count differ run to run.
+        packed = gzip.compress(bytes(body), compresslevel=6, mtime=0)
+        return len(packed) / 1024.0
+
+    return asyncio.run(run())
+
+
+class _NullStreamResponse:
+    """A StreamResponse that swallows what is written to it.
+
+    The SSE framing metric is about the per-line CPU the daemon spends
+    before the bytes reach the socket; a real transport would add a
+    scheduler-dependent write cost and make the number a network
+    measurement.  ``write`` still returns an awaitable, so the framing
+    coroutine takes exactly the path it takes in production.
+    """
+
+    def __init__(self):
+        self.written = 0
+
+    async def write(self, data):
+        self.written += len(data)
+
+
+@bench(
+    "webapi.sse_frame_20k",
+    "webapi",
+    detail="SSE line framing, 4 subscribers x 20k lines",
+    repeats=(3, 2, 1),
+    # ~40ms of genuinely per-line work: the 10ms default floor would set the
+    # real sensitivity at ~25% against a declared 15%.  Same call as
+    # dag.finish_fanin_1k and tui.drawer_paint_5k, and cheaper than inflating
+    # the subscriber count past anything a real tail sees.
+    gate_floor=0.005,
+)
+def bench_webapi_sse_frame():
+    """The live log tail's per-line, per-subscriber cost.
+
+    Every captured output line of every tailed run is JSON-encoded, decoded
+    back to str, concatenated into an ``event: line`` frame and re-encoded,
+    once per attached dashboard.  job.stream_capture_120k measures the
+    capture leg and stops at the ring buffer; the SSE leg past it was
+    called out as an accepted residual in benchmarks/README.md and has had
+    no metric since.  It runs on the scheduler's loop, so its cost is paid
+    by every job waiting to fire while somebody watches a chatty run.
+
+    The line mix is the capture fixture's: mostly ASCII, a wide-glyph line
+    every sixteenth, so the encoder's ASCII fast path is exercised without
+    being the only thing measured.  The written byte count is asserted so a
+    framing function that quietly stopped writing cannot time a no-op.
+
+    Four subscribers, not one: the cost is per line PER attached client, so
+    a fan-out is the honest shape, and one pass of 20k lines measures under
+    the harness's 50ms rule on CI (which would leave the metric floor-bound
+    at an effective ~50% against its declared 15%).
+    """
+    import asyncio
+
+    try:
+        from cronstable.cron import _sse_send_line
+    except ImportError as exc:
+        raise Skip("cron._sse_send_line unavailable: %r" % exc) from None
+    n = _n(20000)
+    lines = fixture(
+        "sse_lines_20k",
+        lambda: [
+            (
+                "wide 进度 %d%% done\n" % (i % 100)
+                if i % 16 == 15
+                else "2026-07-18 12:00:%02d INFO worker %d processed batch\n"
+                % (i % 60, i)
+            )
+            for i in range(n)
+        ],
+    )
+
+    subscribers = 4
+
+    async def run():
+        resp = _NullStreamResponse()
+        try:
+            await _sse_send_line(resp, "stdout", lines[0])
+        except TypeError as exc:
+            raise Skip("_sse_send_line signature changed: %r" % exc) from None
+        resp.written = 0
+        t0 = time.perf_counter()
+        for _ in range(subscribers):
+            for i, line in enumerate(lines):
+                stream = "stderr" if i % 5 == 0 else "stdout"
+                await _sse_send_line(resp, stream, line)
+        dt = time.perf_counter() - t0
+        if resp.written < n * subscribers * 20:
+            raise RuntimeError(
+                "SSE framing wrote %d bytes for %d lines; the region did "
+                "not frame the stream" % (resp.written, n * subscribers)
+            )
+        return dt
 
     return asyncio.run(run())
 
@@ -3913,6 +5049,144 @@ def bench_cluster_parse_summaries():
             parsed = _parse_job_summaries(block)
             if parsed is None:
                 raise RuntimeError("gossip block failed to parse at all")
+    return time.perf_counter() - t0
+
+
+def _fleet_summary_block(jobs, salt):
+    """One node's advertised per-job summary block."""
+    block = {}
+    for j in range(jobs):
+        block["job%05d" % j] = {
+            "running": (j + salt) % 7 == 0,
+            "enabled": (j + salt) % 11 != 0,
+            "scheduled_in": float((j * 13 + salt) % 3600),
+            "last": {
+                "outcome": "success" if (j + salt) % 5 else "failure",
+                "finished_at": "2026-07-01T10:%02d:%02d+00:00"
+                % (j // 60 % 60, j % 60),
+                "duration": 1.5 + (j % 20),
+                "exit_code": 0 if (j + salt) % 5 else 1,
+            },
+        }
+    return block
+
+
+@bench(
+    "cluster.fleet_view_15x400",
+    "cluster",
+    detail="60 fleet_view merges over 15 nodes x 400 absorbed summaries",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+)
+def bench_cluster_fleet_view():
+    """The GET /fleet merge, which nothing measured before.
+
+    cluster.parse_summaries_6k covers ABSORPTION: validating a peer's
+    gossiped block once per poll round.  This is the other half: every
+    dashboard poll of the fleet view walks each peer's stored snapshot and
+    re-derives every advertised countdown from the snapshot's true age
+    (_aged_job_summaries copies each entry rather than mutating the stored
+    one, so the work is per job per node per poll and no cache can be
+    smuggled in without noticing).  At the marketed 15x400 fleet that is
+    6000 dict copies per poll, on the scheduler's loop, at whatever rate
+    the open dashboards ask.
+
+    A dedicated 15-node manager, NOT the 50-member ownership fixture: this
+    one carries absorbed summaries, and sharing would make both metrics
+    order-dependent.  Wall-clock ageing is bounded by construction (the
+    snapshots are stamped at the suite's fixed _NOW, so `elapsed` is a
+    large constant and every countdown clamps at 0) which keeps the timed
+    work identical run to run.
+    """
+    try:
+        from cronstable import cluster as cluster_mod
+    except ImportError as exc:
+        raise Skip("cronstable.cluster unavailable: %r" % exc) from None
+    for attr in ("ClusterManager", "SCHEME_VERSION"):
+        if not hasattr(cluster_mod, attr):
+            raise Skip("cronstable.cluster lacks %s" % attr)
+    nodes = 15
+    jobs = _n(400)
+
+    def build():
+        ca = os.path.join(_CERT_DIR, "bench-ca.pem")
+        cert = os.path.join(_CERT_DIR, "bench-node.pem")
+        key = os.path.join(_CERT_DIR, "bench-node-key.pem")
+        if not (
+            os.path.exists(ca) and os.path.exists(cert) and os.path.exists(key)
+        ):
+            raise Skip("benchmarks/certs fixtures missing")
+        names = ["fnode-%02d" % i for i in range(nodes)]
+        hosts = [
+            "fnode-%02d.bench.internal:29999" % i for i in range(1, nodes)
+        ]
+        config = {
+            "nodeName": names[0],
+            "peers": [{"host": host} for host in hosts],
+            "driftAfter": 3,
+            "distribution": "spread",
+            "electLeader": True,
+            # fleet_view reads the poll cadence (it publishes it, and scales
+            # the node-stats staleness window by it); the ownership fixture
+            # never touches it, which is why only this one sets it
+            "interval": 5,
+            "tls": {"ca": ca, "cert": cert, "key": key},
+        }
+        try:
+            mgr = cluster_mod.ClusterManager(config, lambda: "bench-jobset")
+        except (TypeError, KeyError) as exc:
+            raise Skip(
+                "ClusterManager construction changed: %r" % exc
+            ) from None
+        # our own advertised block: the self leg of the merge is real work
+        # too, and without a provider it is an empty-dict early return
+        if not hasattr(mgr, "_job_summaries_provider"):
+            raise Skip("cluster job-summary provider seam not present")
+        own = _fleet_summary_block(jobs, 0)
+        mgr._job_summaries_provider = lambda: own
+        try:
+            for i, host in enumerate(hosts, start=1):
+                mgr.view.record_success(
+                    host,
+                    peer_name=names[i],
+                    peer_id="bench-jobset",
+                    peer_scheme=cluster_mod.SCHEME_VERSION,
+                    my_id="bench-jobset",
+                    now=_NOW,
+                    my_name=names[0],
+                    peer_instance="finst-%02d" % i,
+                    my_instance=mgr.instance_id,
+                    peer_members=[(names[0], mgr.instance_id, True)],
+                    peer_size=nodes,
+                    peer_distribution="spread",
+                    peer_elect_leader=True,
+                    peer_reports_members=True,
+                    peer_job_summaries=_fleet_summary_block(jobs, i),
+                    peer_job_summaries_at=_NOW,
+                )
+        except TypeError as exc:
+            raise Skip(
+                "cluster observation API changed: %r" % exc
+            ) from None
+        return mgr
+
+    mgr = fixture("cluster_fleet_mgr_15", build)
+    if not hasattr(mgr, "fleet_view"):
+        raise Skip("ClusterManager.fleet_view not present")
+    try:
+        probe = mgr.fleet_view()
+    except TypeError as exc:
+        raise Skip("fleet_view signature changed: %r" % exc) from None
+    seen = sum(1 for node in probe["nodes"] if node.get("jobs"))
+    if seen != nodes:
+        raise RuntimeError(
+            "fleet_view merged %d of %d nodes' summaries; the fixture did "
+            "not absorb and the region would time a walk over nothing"
+            % (seen, nodes)
+        )
+    t0 = time.perf_counter()
+    for _ in range(60):
+        mgr.fleet_view()
     return time.perf_counter() - t0
 
 
@@ -4180,6 +5454,162 @@ def bench_job_stream_capture():
     return asyncio.run(run())
 
 
+@bench(
+    "job.report_noop_100k",
+    "job",
+    detail="report_success x100k with NO reporter configured (the default)",
+    repeats=(3, 2, 1),
+    gate_floor=0.005,
+)
+def bench_job_report_noop():
+    """What a job completion pays for reporting when nothing is configured.
+
+    The default config enables no reporter at all, so this is the path
+    essentially every completion in every deployment takes, and today it
+    still logs a line and gathers across all five reporters, spawning a Task
+    per reporter, before each of them looks at its own config and returns.
+    A mapped DAG fan-out finishing hundreds of instances at once pays it
+    hundreds of times in one reaper batch; the shipped
+    report_config_enabled probe exists precisely because that mattered on
+    the DAG path, and this metric is what makes the same cost visible on the
+    ordinary one.
+
+    A RunningJob is constructed but never started (no process, no streams),
+    which is exactly the state a completion handler holds when it reports.
+    The reporters are asserted to be all-disabled first: with one
+    accidentally live, the region would time an SMTP or HTTP attempt
+    instead.
+    """
+    import asyncio
+
+    try:
+        from cronstable.config import DEFAULT_CONFIG, JobConfig, mergedicts
+    except ImportError as exc:
+        raise Skip("cronstable.config API unavailable: %r" % exc) from None
+    try:
+        from cronstable.job import RunningJob, report_config_enabled
+    except ImportError as exc:
+        raise Skip(
+            "cronstable.job reporting API unavailable: %r" % exc
+        ) from None
+    # 100k, not the 20k this was specced at: with the disabled-reporter probe
+    # in place a completion costs well under a microsecond, and 20k measured
+    # far under the harness's 50ms rule (an effective ~110% gate against a
+    # declared 15%).  The id carries the scale, per benchmarks/README.md.
+    n = _n(100000)
+
+    def build():
+        config = JobConfig(
+            mergedicts(
+                DEFAULT_CONFIG,
+                {
+                    "name": "bench-report",
+                    "command": "true",
+                    "schedule": "0 4 * * *",
+                },
+            )
+        )
+        try:
+            job = RunningJob(config, None)
+        except TypeError as exc:
+            raise Skip("RunningJob signature changed: %r" % exc) from None
+        return job
+
+    job = fixture("report_noop_job", build)
+    if not hasattr(job, "report_success"):
+        raise Skip("RunningJob.report_success not present")
+    try:
+        if report_config_enabled(job.config.onSuccess["report"]):
+            raise RuntimeError(
+                "the default onSuccess.report has a live reporter; the "
+                "region would time real delivery"
+            )
+    except (KeyError, TypeError) as exc:
+        raise Skip("report config shape changed: %r" % exc) from None
+
+    async def run():
+        await job.report_success()  # warm
+        t0 = time.perf_counter()
+        for _ in range(n):
+            await job.report_success()
+        return time.perf_counter() - t0
+
+    return asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# resources: the per-run CPU/memory accounting that monitorResources turns on.
+# Nothing here samples on a timer; the metric is the per-completion final
+# reading, which is the only part every monitored run pays exactly once.
+# ---------------------------------------------------------------------------
+
+
+@bench(
+    "resources.monitor_stop_100",
+    "resources",
+    detail="100 ResourceMonitor.stop() final readings (process-table walk)",
+    repeats=(3, 2, 1),
+    gate_pct=25.0,
+    gate_floor=0.020,
+)
+def bench_resources_monitor_stop():
+    """The per-completion process-table walk.
+
+    Every monitored run's stop() takes one last opportunistic reading, and
+    without the shared ticker's snapshot to derive from, that reading walks
+    the WHOLE process table (psutil's children() call is a full ppid map on
+    every platform).  A batch of runs finishing together therefore pays K
+    independent full-table scans, the exact cost the shared ticker was
+    built to remove from the periodic path, still present on the final one.
+    The walk is threaded, so it does not block the loop; what it does cost
+    is a worker-thread hop plus a table scan per completion, and no metric
+    saw either.
+
+    The monitor is attached to THIS process rather than started against a
+    child: start() would register with the loop's shared ticker and its
+    background sampling would land inside the timed region non
+    deterministically, and the pid under observation does not change the
+    shape (the scan is whole-table either way).  Skips without psutil.
+    """
+    import asyncio
+
+    try:
+        from cronstable.resources import ResourceMonitor
+    except ImportError as exc:
+        raise Skip("cronstable.resources unavailable: %r" % exc) from None
+    try:
+        import psutil
+    except ImportError as exc:
+        raise Skip("psutil not installed: %r" % exc) from None
+    n = _n(100, floor=2)
+
+    async def run():
+        try:
+            probe = ResourceMonitor(os.getpid(), job_name="bench")
+        except TypeError as exc:
+            raise Skip("ResourceMonitor signature changed: %r" % exc) from None
+        if not hasattr(probe, "_proc") or not hasattr(probe, "stop"):
+            raise Skip("ResourceMonitor internals not present")
+        monitors = []
+        for _ in range(n + 1):
+            monitor = ResourceMonitor(os.getpid(), job_name="bench")
+            # attached WITHOUT start(): see the docstring
+            monitor._proc = psutil.Process(os.getpid())
+            monitors.append(monitor)
+        await monitors[0].stop()  # warm psutil's caches
+        if monitors[0]._samples == 0:
+            raise RuntimeError(
+                "the final reading sampled nothing; the region would time "
+                "an early return, not a table walk"
+            )
+        t0 = time.perf_counter()
+        for monitor in monitors[1:]:
+            await monitor.stop()
+        return time.perf_counter() - t0
+
+    return asyncio.run(run())
+
+
 # ---------------------------------------------------------------------------
 # push: the E2E-encrypted alert path (PyNaCl; skips without the push extra,
 # so CI must install pynacl into BOTH perf venvs or this is a dead gate --
@@ -4290,6 +5720,44 @@ def bench_mem_crontab():
         tracemalloc.stop()
     del tabs
     return (after - before) / 1048576.0
+
+
+@bench(
+    "mem.gc_pause_100k",
+    "memory",
+    detail="one full gc.collect(2) with a 100k-job set resident",
+    gate_pct=25.0,
+    gate_floor=0.005,
+    compare="median",
+    repeats=(3, 2, 1),
+)
+def bench_mem_gc_pause():
+    """The steady-state stop-the-world pause at the marketed fleet scale.
+
+    The collector walks tracked CONTAINERS, not bytes, so this is the one
+    memory metric that moves on object COUNT: a change that halves a job
+    set's footprint while doubling the number of dicts and tuples it holds
+    reads as a win on mem.crontab_10k / mem.jobconfig_2k and as a
+    regression here.  It is also the only metric anywhere that measures the
+    collector itself, which every other timed region in the suite runs with
+    disabled (see config.reload_gc_100k).
+
+    The harness already ran a full collect immediately before this call, so
+    the pass measured here frees nothing: it is the pure traversal of a
+    resident fleet, which is exactly the pause a live daemon pays on its
+    event loop every time gen 2 comes due.  gc.collect() is explicit and
+    runs whether or not the collector is enabled, so the harness's
+    gc.disable() is left alone here.
+    """
+    n = _n(100000)
+    jobs = fixture("gc_pause_job_map_100k", lambda: _gc_job_map(n))
+    if len(jobs) != n:
+        raise RuntimeError(
+            "resident job set holds %d entries, expected %d" % (len(jobs), n)
+        )
+    t0 = time.perf_counter()
+    gc.collect(2)
+    return time.perf_counter() - t0
 
 
 @bench(

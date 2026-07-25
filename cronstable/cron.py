@@ -2,6 +2,7 @@ import asyncio
 import asyncio.subprocess
 import copy
 import datetime
+import gc
 import hashlib
 import heapq
 import hmac
@@ -14,7 +15,7 @@ import socket
 import ssl
 import zlib
 from collections import OrderedDict, defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from typing import (  # noqa
     TYPE_CHECKING,
@@ -42,7 +43,7 @@ import aiohttp
 from aiohttp import web
 
 import cronstable.version
-from cronstable import _json, discovery, platform, push, tlsutil
+from cronstable import _json, discovery, platform, push, statsd, tlsutil
 from cronstable.config import (
     WEB_TOKEN_SCOPES,
     ClusterConfig,
@@ -103,6 +104,22 @@ from cronstable.state import Lease, StateBackend, make_state_backend
 
 logger = logging.getLogger("cronstable")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
+# Floor applied to a SUBSYSTEM's wake hint before it shortens the main loop's
+# sleep (see Cron._sleep_interval). A near-zero hint is not "wake now" but
+# "there is work whose completion I cannot predict", and without a floor the
+# loop would sleep zero seconds and re-run the entire housekeeping block
+# (config stat fingerprint, cluster/web/state/push upkeep, the SLA walk, a
+# store-read refresh) tens of thousands of times a second for as long as that
+# work takes. This is the generic backstop of last resort for EVERY
+# subsystem, and it is what protects the window between a subsystem deciding
+# to spawn such a pass and that pass actually starting. A subsystem that can
+# name its own settling time parks that instead: DagScheduler no longer parks
+# 0.0 anywhere, it parks now + dagrun.ADVANCE_POLL_FLOOR (0.2 s) and floors
+# in-flight refs to the same value. The two compose -- the specific floor
+# where the subsystem knows better, this one everywhere else. Flooring costs
+# at most this much extra latency on a sub-minute DAG poke, and only the fire
+# path (a real due instant, not a hint) may drive the sleep below it.
+MIN_TICK_SLEEP = 0.02
 # The furthest back the scheduler will retroactively service a job after a slow
 # pass or a forward clock jump (see Cron._advance): if a job's soonest missed
 # fire is no more than this behind, every missed occurrence in the window is
@@ -240,6 +257,18 @@ MANIFEST_HOSTS_CAP = 2000
 # start), and how often the GC pass runs. Loop-clock gated, per process.
 STATE_MANIFEST_INTERVAL = 21600.0
 STATE_GC_INTERVAL = 86400.0
+# How often the two per-housekeeping store sweeps (the paused/ stream refresh
+# and the foreign-retry-ladder claim scan) may actually hit the store. Both
+# are single-flight on their task handle, but single-flight alone only stops
+# them OVERLAPPING: each re-spawns the instant the previous one completes, so
+# an extra housekeeping pass (a DAG wake, an early wake) turns them into a
+# store-read storm rather than the once-a-minute cadence their docstrings
+# promise. Loop-clock gated, per process, exactly like the manifest and GC
+# intervals above; a fresh backend generation re-anchors both to zero. Just
+# under a minute so a housekeeping pass landing a hair early still sweeps,
+# instead of deferring to the pass after and halving the cadence.
+PAUSE_REFRESH_INTERVAL = 55.0
+RETRY_CLAIM_INTERVAL = 55.0
 # Upper bound on one GC pass. Generous (a huge store sweeps many files on a
 # worker thread), but finite: an unbounded await on a wedged mount would
 # leave the single-flight _gc_task pending forever and silently disable
@@ -659,12 +688,21 @@ class JobRunInfo:
     # why a synthetic "skipped" row exists ("paused"); None for real runs.
     # Defaulted for the same construction-site reason as resource_usage.
     skip_reason: Optional[str] = None
+    # Elapsed seconds, derived once at construction rather than recomputed per
+    # read. It used to be a property, and the payload builders read it several
+    # times per run per poll: the inline history block alone re-subtracted
+    # two datetimes for twenty runs per job, and _run_stats reads it four more
+    # times per run per trend window. Both operands are set at construction
+    # and nothing reassigns either, so the value cannot go stale. init=False
+    # keeps every existing construction site valid; compare=False keeps
+    # equality over the recorded fields alone.
+    duration: Optional[float] = field(default=None, init=False, compare=False)
 
-    @property
-    def duration(self) -> Optional[float]:
-        if self.started_at is None:
-            return None
-        return (self.finished_at - self.started_at).total_seconds()
+    def __post_init__(self) -> None:
+        if self.started_at is not None:
+            self.duration = (
+                self.finished_at - self.started_at
+            ).total_seconds()
 
     def to_dict(self, *, include_series: bool = False) -> Dict[str, Any]:
         """JSON-serializable summary (everything except the output stream).
@@ -682,6 +720,8 @@ class JobRunInfo:
         move, while ``finished_at`` stays unfiltered for the catch-up
         watermark, which intentionally advances over pause-skipped slots.
         """
+        # one isoformat for the two keys that carry the same instant
+        finished = self.finished_at.isoformat()
         data: Dict[str, Any] = {
             "outcome": self.outcome,
             "exit_code": self.exit_code,
@@ -690,7 +730,7 @@ class JobRunInfo:
                 if self.started_at is not None
                 else None
             ),
-            "finished_at": self.finished_at.isoformat(),
+            "finished_at": finished,
             "duration": self.duration,
             "fail_reason": self.fail_reason,
             "skip_reason": self.skip_reason,
@@ -704,7 +744,7 @@ class JobRunInfo:
             ),
         }
         if self.outcome != "skipped":
-            data["ranAt"] = self.finished_at.isoformat()
+            data["ranAt"] = finished
         return data
 
 
@@ -949,6 +989,21 @@ def load_index_html() -> str:
             return fobj.read()
 
 
+@lru_cache(maxsize=1)
+def _index_document() -> Tuple[bytes, str]:
+    """The dashboard as ``(utf-8 bytes, ETag)``, built once.
+
+    ``load_index_html`` caches the DECODE, but aiohttp's ``text=`` argument
+    re-encodes on every response construction, so each page load re-ran
+    ``str.encode`` over 573 KB (0.27 ms and a fresh 573 KB allocation) on the
+    scheduler's loop for bytes that are fixed for the life of the process.
+    The tag is fixed for the same reason: the document is static package
+    data with no per-request or per-viewer content.
+    """
+    raw = load_index_html().encode("utf-8")
+    return raw, '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
+
+
 def schedule_str(job: JobConfig) -> str:
     """Human-readable schedule for the web UI (the original config form)."""
     unparsed = job.schedule_unparsed
@@ -979,10 +1034,23 @@ def _json_response(
     response is transient (never a durable, cross-fleet record), so a
     non-finite float or other non-portable value falls back to the stdlib and
     never 500s the endpoint -- exactly as :func:`cronstable.mcp._dumps` does.
+
+    That same transience is why the encode is ``trusted``: the portability
+    walk it skips exists to keep bytes that are round-tripped through
+    ``loads`` (durable records, leases, documents) comparable across a fleet,
+    and it costs 13x the serialization it guards on a real payload.  What is
+    given up is the walk's ``MAX_DEPTH`` ceiling and, on the orjson flavour, a
+    non-finite float becoming ``null`` instead of taking the fallback, which
+    is if anything an improvement, since the stdlib fallback emits a bare
+    ``NaN`` token that a browser's ``JSON.parse`` rejects.  Everything else
+    (an out-of-window integer, a non-string key) still surfaces from
+    ``orjson.dumps`` itself and still falls back; the stdlib flavour keeps
+    ``allow_nan=False`` and raises a bare ``ValueError``, which is why the
+    except clause is wider than ``UnsupportedValue``.
     """
     try:
-        body = _json.dumps_bytes(payload)
-    except _json.UnsupportedValue:
+        body = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
     return web.Response(
         body=body,
@@ -997,6 +1065,30 @@ def _json_response(
 #: thread hop costs more than the encode; above it a large fleet's encode
 #: must not stall the scheduling loop.
 _JOBS_SERIALIZE_OFFLOAD_MIN = 200
+
+#: Config-source count at or above which the once-a-minute stat fingerprint
+#: (:meth:`Cron._config_signature`) is taken on the default executor instead
+#: of inline.  One ``os.stat`` is ~14 us on local disk but 1-2 ms on the
+#: NFS/EFS/S3-Files mounts the state backend documents as targets, and a
+#: config DIRECTORY plus its ``include:`` tree and ``env_file`` targets is
+#: exactly the layout that grows the count, so the probe that guards the
+#: carefully-offloaded reparse is itself the unoffloaded part.  Below the
+#: threshold (the single-file default) the thread hop costs more than the
+#: stats, so it stays inline.
+_CONFIG_SIGNATURE_OFFLOAD_MIN = 16
+
+#: Resident job count at or above which a reload pauses the garbage collector
+#: for the reparse.  See :meth:`Cron._quiet_gc_for_reparse`.
+_GC_QUIET_RELOAD_MIN = 5000
+
+#: Resident job count at or above which ``GET /metrics`` renders the
+#: exposition text on the default executor instead of inline.  The family
+#: build must stay on the loop (it reads live scheduler state), but the
+#: render over that immutable snapshot is pure CPU: ~6.7 ms at 500 jobs and
+#: ~31 ms at 2000, all of it blocking every other handler and the tick.
+#: Below the threshold the render is far cheaper than a thread hop, so a
+#: small deployment's scrape stays inline.
+_METRICS_OFFLOAD_MIN_JOBS = 250
 
 
 def _etag_matches(header: Optional[str], etag: str) -> bool:
@@ -1020,11 +1112,53 @@ def _etag_matches(header: Optional[str], etag: str) -> bool:
     return False
 
 
+def _accepts_gzip(header: Optional[str]) -> bool:
+    """Whether a client's ``Accept-Encoding`` positively allows gzip.
+
+    A bare substring test would also match ``gzip;q=0``, which is the wire
+    spelling for "explicitly NOT gzip".
+    """
+    if not header:
+        return False
+    for part in header.split(","):
+        name, _, params = part.strip().lower().partition(";")
+        if name.strip() != "gzip":
+            continue
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip() == "q":
+                try:
+                    return float(value.strip()) > 0.0
+                except ValueError:
+                    return True
+        return True
+    return False
+
+
+#: Body size at or above which a gzip-capable client gets a compressed
+#: response.  Below it the framing overhead is most of the payload.
+_GZIP_MIN_BYTES = 1024
+
+
+def _gzip_body(body: bytes) -> bytes:
+    """``body`` as a gzip stream, level 1.
+
+    Level 1, not 6: the /jobs payload is the same thirty keys repeated per
+    job, so level 1 already reaches ~5% of the original in 0.12 ms (less
+    than the ETag digest sitting next to it) while level 6 costs 2.5x the
+    CPU for another 2 points.  ``wbits=31`` wraps the deflate stream in a
+    gzip container, so this needs no import beyond zlib.
+    """
+    packer = zlib.compressobj(1, zlib.DEFLATED, 31)
+    return packer.compress(body) + packer.flush()
+
+
 def _jobs_conditional_response(
     payload: List[Dict[str, Any]],
-    next_fire_iso: Dict[str, Optional[str]],
+    next_fire: Dict[str, datetime.datetime],
     if_none_match: Optional[str],
-) -> Tuple[str, Optional[bytes]]:
+    gzip_ok: bool = False,
+) -> Tuple[str, Optional[bytes], bool]:
     """The ETag for a ``/jobs`` payload and, unless the client already has
     it, the serialized body.
 
@@ -1037,31 +1171,78 @@ def _jobs_conditional_response(
     poll it holds, so a 304 that keeps the old body stays correct).  Pure
     and free of scheduler state, so it can run on an executor for a large
     fleet without a cross-thread read of ``self``.
+
+    ``next_fire`` carries raw aware datetimes; how they render into the
+    hashed bytes does not matter, only that the rendering is deterministic
+    and injective, so this dumps them through the fast encoder rather than
+    stringifying every one of them on the loop thread first.
+
+    Both the dump and the digest deliberately differ from the durable-record
+    rules.  ``trusted=True`` skips the portability walk, which costs 13x the
+    encode it guards and exists for bytes that are round-tripped through
+    ``loads``; and SHA-256 replaces BLAKE2b because CPython's blake2b is the
+    portable C reference implementation while sha256 reaches OpenSSL's
+    SHA-NI.  An ETag is an opaque per-response validator: two nodes (or two
+    builds) disagreeing on one degrades a 304 into a 200, never into a wrong
+    answer, unlike the job-set fingerprint and the cluster peer ETag that
+    :mod:`cronstable._json`'s stdlib-only rule is written about.
+
+    With ``gzip_ok`` a large body is returned gzipped and the third element
+    of the result says so; the caller sets ``Content-Encoding`` and the
+    mandatory ``Vary``.  The compression rides this call rather than the
+    handler so it lands inside the same executor hop the encode already
+    uses, and zlib releases the GIL.  The body carries no per-request secret
+    (the bearer token is a request header, never a response field), so the
+    BREACH/CRIME class of compression side channel has nothing to leak here.
     """
     canonical = [
-        {**job, "scheduled_in": next_fire_iso.get(job["name"])}
-        for job in payload
+        {**job, "scheduled_in": next_fire.get(job["name"])} for job in payload
     ]
-    raw = json.dumps(canonical, separators=(",", ":"), default=str).encode(
-        "utf-8"
-    )
-    etag = '"' + hashlib.blake2b(raw, digest_size=16).hexdigest() + '"'
-    if _etag_matches(if_none_match, etag):
-        return etag, None
     try:
-        body = _json.dumps_bytes(payload)
-    except _json.UnsupportedValue:
+        raw = _json.dumps_bytes(canonical, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        # The stdlib flavour of dumps_bytes has no `default` hook and cannot
+        # render a datetime at all, so a no-orjson install always lands here;
+        # so does any payload value orjson refuses. Same bytes-for-bytes
+        # determinism, just slower, which is all the tag needs.
+        raw = json.dumps(canonical, separators=(",", ":"), default=str).encode(
+            "utf-8"
+        )
+    etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
+    if _etag_matches(if_none_match, etag):
+        return etag, None, False
+    try:
+        body = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
-    return etag, body
+    if gzip_ok and len(body) >= _GZIP_MIN_BYTES:
+        return etag, _gzip_body(body), True
+    return etag, body, False
+
+
+def _sse_frame(stream_name: str, line: str) -> bytes:
+    """One ``event: line`` SSE frame, built in bytes throughout.
+
+    ``dumps_bytes`` already returns UTF-8, so decoding it only to concatenate
+    two ASCII literals and encode the result back was two transcodes of the
+    same data per line per subscriber.  ``trusted=True`` is sound here by
+    construction rather than by vouching for the job's output: both values
+    are ``str``, and the portability walk only ever rejects non-finite
+    floats.
+    """
+    return (
+        b"event: line\ndata: "
+        + _json.dumps_bytes(
+            {"stream": stream_name, "line": line.rstrip("\n")}, trusted=True
+        )
+        + b"\n\n"
+    )
 
 
 async def _sse_send_line(
     resp: web.StreamResponse, stream_name: str, line: str
 ) -> None:
-    payload = _json.dumps_bytes(
-        {"stream": stream_name, "line": line.rstrip("\n")}
-    ).decode("utf-8")
-    await resp.write(("event: line\ndata: " + payload + "\n\n").encode())
+    await resp.write(_sse_frame(stream_name, line))
 
 
 def naturaltime(seconds: float) -> str:
@@ -1249,6 +1430,15 @@ class Cron:
         # only short-circuits early if a second-level job happens to sit
         # near the front of the job set.
         self._needs_subminute_cache = None  # type: Optional[bool]
+        # Memoized name -> config position, same lifecycle again. The fire
+        # pass needs the due names in CONFIG order and used to recover it by
+        # walking every job in cron_jobs; the index exists so a pass is
+        # O(due), and rebuilding the order per pass threw that away.
+        self._job_pos_cache = None  # type: Optional[Dict[str, int]]
+        # Memoized "does any job carry an sla block", same lifecycle. The
+        # once-a-minute SLA pass walks the whole job set to answer it, in the
+        # overwhelmingly common case where the feature is unused.
+        self._any_sla_cache = None  # type: Optional[bool]
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
@@ -1388,6 +1578,27 @@ class Cron:
         # the opt-in Bonjour/mDNS advert; follows the web app's lifecycle
         # (converged at the tail of start_stop_web_app, stopped on exit).
         self._bonjour = discovery.BonjourAdvertiser()
+        # cluster-wide concurrency slots (concurrencyScope: cluster): the
+        # TTL lease each slot-gated job holds while it runs here, the renew
+        # task keeping it alive, a per-job asyncio.Lock serializing
+        # claim/release (an unserialized release racing the next claim
+        # could revoke the fresh claim's lease -- same-holder re-acquire
+        # keeps the fence, so a stale release still matches), and the
+        # single-flight Replace pursuit tasks waiting out a foreign holder.
+        # Declared ABOVE the config load below because _apply_reload's prune
+        # block reads all five, and the constructor's own first load goes
+        # through it.
+        self._slot_leases: Dict[str, Lease] = {}
+        self._slot_renewers: Dict[str, asyncio.Task] = {}
+        self._slot_locks: Dict[str, asyncio.Lock] = {}
+        self._slot_pursuits: Dict[str, asyncio.Task] = {}
+        # count of live users of each job's slot: every successful claim
+        # (one per launched instance) increments, every finished instance
+        # of a cluster-scoped job decrements; the lease is released only at
+        # zero. A plain running_jobs emptiness check would race the window
+        # between a claim succeeding and its RunningJob being registered
+        # (the subprocess spawn awaits in between).
+        self._slot_refs: Dict[str, int] = {}
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -1401,6 +1612,8 @@ class Cron:
             self._notify_config = config.notify_config
             self._job_set_id_cache = None
             self._needs_subminute_cache = None
+            self._job_pos_cache = None
+            self._any_sla_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
         self._stop_event = asyncio.Event()
@@ -1523,6 +1736,13 @@ class Cron:
         # loop-clock instants the next manifest write / GC pass are due.
         self._manifest_next = 0.0
         self._gc_next = 0.0
+        # loop-clock instants the next paused/ refresh and foreign-retry claim
+        # scan are due (see PAUSE_REFRESH_INTERVAL). Single-flight on the task
+        # handles below is not a cadence: without these both re-spawn as fast
+        # as the store can answer once housekeeping runs more than once a
+        # minute.
+        self._pause_refresh_next = 0.0
+        self._retry_claim_next = 0.0
         # the in-flight GC pass, if any (single-flight; a slow store must
         # not stack passes).
         self._gc_task: Optional[asyncio.Task] = None
@@ -1591,24 +1811,6 @@ class Cron:
         # section reload rebuilds the backend (new id) while runs from this
         # process are still live.
         self._proc_token = os.urandom(6).hex()
-        # cluster-wide concurrency slots (concurrencyScope: cluster): the
-        # TTL lease each slot-gated job holds while it runs here, the renew
-        # task keeping it alive, a per-job asyncio.Lock serializing
-        # claim/release (an unserialized release racing the next claim
-        # could revoke the fresh claim's lease -- same-holder re-acquire
-        # keeps the fence, so a stale release still matches), and the
-        # single-flight Replace pursuit tasks waiting out a foreign holder.
-        self._slot_leases: Dict[str, Lease] = {}
-        self._slot_renewers: Dict[str, asyncio.Task] = {}
-        self._slot_locks: Dict[str, asyncio.Lock] = {}
-        self._slot_pursuits: Dict[str, asyncio.Task] = {}
-        # count of live users of each job's slot: every successful claim
-        # (one per launched instance) increments, every finished instance
-        # of a cluster-scoped job decrements; the lease is released only at
-        # zero. A plain running_jobs emptiness check would race the window
-        # between a claim succeeding and its RunningJob being registered
-        # (the subprocess spawn awaits in between).
-        self._slot_refs: Dict[str, int] = {}
         # effective state.slotTtlSeconds while a state section is configured
         self._slot_ttl = 30.0
         # lock-fidelity latch for the slot gate: None until probed, then
@@ -1864,6 +2066,10 @@ class Cron:
         if self.web_runner is not None:
             logger.info("Stopping http server")
             await self.web_runner.cleanup()
+        # Close the pooled statsd UDP endpoints for this loop. They are
+        # otherwise reclaimed only when the loop is garbage collected, which
+        # emits a ResourceWarning on teardown. Safe to call more than once.
+        statsd.close_endpoints()
 
     def _cancel_coordination_tasks(self) -> None:
         """Cancel the Replace pursuits, retry claim scan and pause refresh.
@@ -1931,6 +2137,49 @@ class Cron:
                 parts.append(("\0dir", None))
         return tuple(parts)
 
+    def _quiet_gc_for_reparse(self) -> bool:
+        """Whether this reload should run with the collector paused.
+
+        A reparse is a pure allocation phase, and rebuilding a large job set
+        while the previous one is still resident promotes every new survivor
+        at once, which is what keeps the collector busy through the whole
+        rebuild.  Measured on a real 3000-job reparse with 3000 jobs still
+        resident: 12,492 automatic collections costing 1.51 s, 11.5% of the
+        wall time, worst single pause 26.4 ms on 3.10 (3.14's incremental
+        collector is gentler: 7.0% and 12.1 ms).  The wall-clock saving is
+        modest (1.08x on 3.10, 1.02x on 3.14, both at 3000 jobs) because
+        strictyaml dominates; the point is the pauses.  They hold the GIL, so
+        they stall the event loop through a reload whose parse this module
+        went to the trouble of offloading precisely so it would not.
+
+        Gated on the resident job count because ``gc.disable()`` is
+        process-global: it is paused across an await, so every other coroutine
+        allocates uncollected cycles for the duration, and the duration is a
+        worker-thread file read that a wedged mount can stretch.  A fleet-scale
+        job set is where the pauses are worth that exposure; at a few hundred
+        jobs the difference is inside the noise, so the common deployment never
+        touches the collector at all.
+        """
+        return len(self.cron_jobs) >= _GC_QUIET_RELOAD_MIN
+
+    async def _current_config_signature(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> tuple:
+        """:meth:`_config_signature` of the live sources, off the loop when it
+        is big enough to be worth a thread hop.
+
+        The stat probe is a pure function of a frozenset of paths returning an
+        immutable tuple, so a worker thread touches nothing shared.  See
+        :data:`_CONFIG_SIGNATURE_OFFLOAD_MIN` for why the small case stays
+        inline.
+        """
+        sources = self._config_sources
+        if len(sources) < _CONFIG_SIGNATURE_OFFLOAD_MIN:
+            return self._config_signature(sources)
+        return await loop.run_in_executor(
+            None, self._config_signature, sources
+        )
+
     def _record_config(
         self, config: CronstableConfig, sources: FrozenSet[str]
     ) -> None:
@@ -1993,12 +2242,15 @@ class Cron:
         """
         if self.config_arg is None:
             return self._empty_config()
+        loop = asyncio.get_running_loop()
         if self._last_config is not None and (
-            self._config_signature(self._config_sources) == self._config_sig
+            await self._current_config_signature(loop) == self._config_sig
         ):
             logger.debug("config unchanged on disk; skipping reparse")
             return self._last_config
-        loop = asyncio.get_running_loop()
+        collecting = gc.isenabled() and self._quiet_gc_for_reparse()
+        if collecting:
+            gc.disable()
         try:
             config, sources = await loop.run_in_executor(
                 None, parse_config_with_sources, self.config_arg
@@ -2010,6 +2262,9 @@ class Cron:
             # record the failure here, back on the loop thread.
             self.metrics.config_parse(False)
             raise
+        finally:
+            if collecting:
+                gc.enable()
         result = self._apply_reload(config)
         self._record_config(config, sources)
         return result
@@ -2033,12 +2288,14 @@ class Cron:
         # swap in the reloaded notify block (read live by _dispatch_notify), so
         # a reload that adds/edits/removes `notify:` takes effect at once.
         self._notify_config = config.notify_config
-        # The job set changed: drop the memoized fingerprint and sub-minute
-        # flag so the next job_set_id() / _needs_subminute() recomputes once.
-        # A failed parse raises before this point, so a bad reload never
-        # stales either cache.
+        # The job set changed: drop the memoized fingerprint, sub-minute flag,
+        # config-order index and any-SLA flag so the next caller recomputes
+        # once.  A failed parse raises before this point, so a bad reload never
+        # stales any of them.
         self._job_set_id_cache = None
         self._needs_subminute_cache = None
+        self._job_pos_cache = None
+        self._any_sla_cache = None
         # Drop metric series for jobs removed from the config, so a renamed
         # job does not leave a stale twin behind forever. A removed job with
         # an instance still running keeps its accumulator until the run
@@ -2078,6 +2335,25 @@ class Cron:
             name: rec
             for name, rec in self._pause_pending_writes.items()
             if name in keep
+        }
+        # The concurrency-slot mutex map (_slot_mutex mints an entry per name
+        # and nothing ever dropped one) leaks the same way. Pruning it is
+        # narrower than the maps above, because handing a second Lock out for
+        # a slot somebody still holds would defeat the mutual exclusion it
+        # exists for: forget a name only when nothing can still take its
+        # mutex, meaning no config entry, no live instance, no refcount,
+        # lease, renewer or pursuit, and no holder or waiter right now.
+        slot_live = (
+            keep
+            | set(self._slot_refs)
+            | set(self._slot_leases)
+            | set(self._slot_renewers)
+            | set(self._slot_pursuits)
+        )
+        self._slot_locks = {
+            name: lock
+            for name, lock in self._slot_locks.items()
+            if name in slot_live or lock.locked()
         }
         self._last_real_outcome = {
             name: outcome
@@ -2341,7 +2617,24 @@ class Cron:
         assert self.web_config is not None
         accept = request.headers.get("Accept", "")
         openmetrics = "application/openmetrics-text" in accept
-        body = self.metrics.render(self, openmetrics=openmetrics)
+        # The family build reads live scheduler state, so it stays on the
+        # loop; the render is pure over that freshly-built list, so a large
+        # job set does it on the executor (see _METRICS_OFFLOAD_MIN_JOBS),
+        # like the calendar builder.
+        families = self.metrics.families(self)
+        if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+            body = await asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    self.metrics.render_prepared,
+                    families,
+                    openmetrics=openmetrics,
+                ),
+            )
+        else:
+            body = self.metrics.render_prepared(
+                families, openmetrics=openmetrics
+            )
         headers = {}  # type: Dict[str, str]
         custom = self.web_config.get("headers", None)
         if custom:
@@ -3725,7 +4018,11 @@ class Cron:
         if self.state_backend is None:
             return
         self._replay_pending_pause_writes()
-        if self._pause_refresh_task is None or self._pause_refresh_task.done():
+        loop_now = asyncio.get_running_loop().time()
+        if loop_now >= self._pause_refresh_next and (
+            self._pause_refresh_task is None or self._pause_refresh_task.done()
+        ):
+            self._pause_refresh_next = loop_now + PAUSE_REFRESH_INTERVAL
             self._pause_refresh_task = self._track_state_write(
                 self._refresh_pauses_from_store()
             )
@@ -3888,6 +4185,15 @@ class Cron:
         a restart a still-breached check re-fires once; that is the
         documented trade-off.
         """
+        if not self._any_sla() and not self._sla_state:
+            # Nothing declares an sla and nothing is latched, so every job
+            # below would take the has_sla arm, whose only action
+            # (_sla_clear_latches) is itself a no-op on an empty latch map.
+            # Skipping the walk is exactly equivalent and saves 7-11 ms of
+            # loop-blocking work per minute at fleet scale. The reload that
+            # adds an sla block clears _any_sla_cache, so the first pass after
+            # it walks again.
+            return
         now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
             if not job.has_sla:
@@ -4318,10 +4624,17 @@ class Cron:
 
     async def _web_index(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
+        raw, etag = _index_document()
+        headers = self._security_headers()
+        # a validator a cache or proxy can revalidate against; stable for the
+        # life of the process, since the document is package data.
+        headers["ETag"] = etag
+        headers["Cache-Control"] = "no-cache"
         return web.Response(
-            text=load_index_html(),
+            body=raw,
             content_type="text/html",
-            headers=self._security_headers(),
+            charset="utf-8",
+            headers=headers,
         )
 
     def _scheduled_in(
@@ -4570,8 +4883,12 @@ class Cron:
         # breach detail (since = when the monitor latched it; observed is
         # re-measured at payload time so the dashboards show a moving
         # number, not the minute-old latch snapshot).
-        thresholds = {k: v for k, v in job.sla.items() if v is not None}
-        if thresholds:
+        # has_sla is precomputed on the JobConfig and is true exactly when the
+        # comprehension below would be non-empty, so gating on it keeps the
+        # dict allocation off the overwhelming majority of jobs, which carry
+        # an all-None sla block.
+        if job.has_sla:
+            thresholds = {k: v for k, v in job.sla.items() if v is not None}
             observations = self._sla_observations(
                 name, job, get_now(datetime.timezone.utc)
             )
@@ -4664,24 +4981,38 @@ class Cron:
         # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
         # put while the countdown ticks and moves the instant a fire lands.
         payload = self.jobs_payload()
-        next_fire_iso: Dict[str, Optional[str]] = {}
-        for name in self.cron_jobs:
-            when = self._next_fire.get(name)
-            next_fire_iso[name] = (
-                when.isoformat() if when is not None else None
-            )
+        # A plain snapshot of the index, NOT a per-job isoformat sweep: the
+        # instants change at most once per job per fire, while this ran once
+        # per job per poll on the loop thread (0.30 ms at 500 jobs). The
+        # canonical dump renders them itself, inside the executor. Snapshotted
+        # rather than passed by reference so the docstring's "free of
+        # scheduler state" promise still holds for the executor branch.
+        next_fire = dict(self._next_fire)
         inm = request.headers.get("If-None-Match")
+        gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
         if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
-            etag, body = await asyncio.get_running_loop().run_in_executor(
-                None, _jobs_conditional_response, payload, next_fire_iso, inm
+            loop = asyncio.get_running_loop()
+            etag, body, packed = await loop.run_in_executor(
+                None,
+                _jobs_conditional_response,
+                payload,
+                next_fire,
+                inm,
+                gzip_ok,
             )
         else:
-            etag, body = _jobs_conditional_response(
-                payload, next_fire_iso, inm
+            etag, body, packed = _jobs_conditional_response(
+                payload, next_fire, inm, gzip_ok
             )
         headers = self._web_jobs_headers(etag)
+        # on EVERY representation, compressed or not: a shared cache that
+        # missed this would hand a gzipped body to a client that cannot read
+        # one.
+        headers["Vary"] = "Accept-Encoding"
         if body is None:
             return web.Response(status=304, headers=headers)
+        if packed:
+            headers["Content-Encoding"] = "gzip"
         return web.Response(
             body=body,
             status=200,
@@ -5302,8 +5633,16 @@ class Cron:
         # published after — together, no duplicates and no gaps.
         queue = output.subscribe()
         try:
-            for stream_name, line in list(output.lines):
-                await _sse_send_line(resp, stream_name, line)
+            # One write for the whole retained buffer, not one per line: a tab
+            # opening on a chatty job replays up to LIVE_LOG_LIMIT lines, and
+            # each awaited write is a coroutine step plus a transport write
+            # (and potentially its own small TCP segment).
+            replay = b"".join(
+                _sse_frame(stream_name, line)
+                for stream_name, line in list(output.lines)
+            )
+            if replay:
+                await resp.write(replay)
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=15)
@@ -6292,6 +6631,11 @@ class Cron:
             # gcGraceSeconds is what protects young state, not a delay here.
             self._manifest_next = 0.0
             self._gc_next = 0.0
+            # ...and re-anchor the two store sweeps so a store that just came
+            # up (or was swapped) converges on the next housekeeping pass
+            # rather than waiting out the interval the dead one started.
+            self._pause_refresh_next = 0.0
+            self._retry_claim_next = 0.0
             # land any pause/resume taken while the store was down BEFORE
             # the rehydrate below re-reads the paused/ streams, so it cannot
             # revert those jobs to the records they supersede.
@@ -6517,11 +6861,16 @@ class Cron:
             self._gc_task = self._track_state_write(
                 self._collect_state_garbage()
             )
-        if self._retry_resume_active() and (
-            self._retry_claim_task is None or self._retry_claim_task.done()
+        if (
+            now >= self._retry_claim_next
+            and self._retry_resume_active()
+            and (
+                self._retry_claim_task is None or self._retry_claim_task.done()
+            )
         ):
             # cross-node retry resume: scan for claimable foreign ladders
             # about once a minute (the housekeeping cadence).
+            self._retry_claim_next = now + RETRY_CLAIM_INTERVAL
             self._retry_claim_task = self._track_state_write(
                 self._retry_claim_scan()
             )
@@ -7250,6 +7599,35 @@ class Cron:
             self._needs_subminute_cache = cached
         return cached
 
+    def _job_pos(self) -> Dict[str, int]:
+        """Job name -> its position in the loaded config.
+
+        Memoized on :attr:`_job_pos_cache`, on exactly the lifecycle of
+        :meth:`_needs_subminute`'s cache: ``cron_jobs`` is only ever
+        reassigned wholesale, never mutated in place, and every one of those
+        sites clears this too.  :meth:`_spawn_due_jobs` needs config order for
+        the launch plan and nothing else, so this replaces a full walk of the
+        job set per firing pass with one dict lookup per DUE job.
+        """
+        cached = self._job_pos_cache
+        if cached is None:
+            cached = {name: i for i, name in enumerate(self.cron_jobs)}
+            self._job_pos_cache = cached
+        return cached
+
+    def _any_sla(self) -> bool:
+        """Whether any loaded job carries an ``sla`` block.
+
+        Memoized alongside :meth:`_job_pos`.  Lets the once-a-minute SLA pass
+        skip a walk of the whole job set in the common case where nothing
+        declares an SLA at all.
+        """
+        cached = self._any_sla_cache
+        if cached is None:
+            cached = any(job.has_sla for job in self.cron_jobs.values())
+            self._any_sla_cache = cached
+        return cached
+
     # ---- next-fire index ------------------------------------------------
     #
     # Instead of testing every job against the clock on every tick, each
@@ -7340,8 +7718,17 @@ class Cron:
         by the resolved timezone and has no further effect on the fire instants
         (:meth:`_compute_next_fire` reads an aware frame, so ``default_utc`` is
         inert), so comparing it would only cause spurious reseeds.
+
+        The identity short-circuit on the timezone is not a micro-optimisation
+        for its own sake: ZoneInfo interns its instances and the resolved zone
+        of a job with no explicit one is the interned ``timezone.utc``, so the
+        two sides are usually the SAME object and the pair of ``str()``
+        allocations this pays for per job is pure waste on a reload sweep that
+        runs on the loop thread.
         """
-        return a.schedule == b.schedule and str(a.timezone) == str(b.timezone)
+        return a.schedule == b.schedule and (
+            a.timezone is b.timezone or str(a.timezone) == str(b.timezone)
+        )
 
     def _refresh_schedule(
         self, now: datetime.datetime, old_jobs: Dict[str, JobConfig]
@@ -7378,6 +7765,20 @@ class Cron:
             and self._same_schedule(old, self.cron_jobs[name])
         }
         self._ensure_seeded(now)
+        # Compact the heap when the drops and reseeds above have left more
+        # stale tuples than live ones. Stale entries are otherwise discarded
+        # only when they reach the TOP, so one belonging to a daily or yearly
+        # schedule survives that whole horizon; a config regenerated often
+        # enough (classic crontabs remint <file>:<line> names on every line
+        # inserted above them) accumulates them across reloads. Rebuilding by
+        # heapify is cheaper than the pushes that caused the bloat (3.4 ms
+        # against 6.5 ms at 100k entries), so the gate can afford to be
+        # generous.
+        if len(self._fire_heap) > 2 * len(self._next_fire):
+            self._fire_heap = [
+                (when, name) for name, when in self._next_fire.items()
+            ]
+            heapq.heapify(self._fire_heap)
 
     def _peek_soonest_fire(self) -> Optional[datetime.datetime]:
         """The soonest valid next-fire instant, or ``None`` if nothing is
@@ -7403,10 +7804,14 @@ class Cron:
         housekeeping = next_sleep_interval(False)
         # wake sooner when a DAG sensor poke, task retry, or scheduled
         # run is due, so sub-minute poke/retry schedules are honoured instead
-        # of waiting for the once-a-minute housekeeping boundary.
+        # of waiting for the once-a-minute housekeeping boundary.  Floored at
+        # MIN_TICK_SLEEP: an already-due hint stays due until the pass that
+        # owns it rewrites the entry, so an unfloored hint spins the loop (and
+        # the whole housekeeping block with it) for that pass's entire
+        # duration rather than waking it once.
         dag_wake = self._dag.next_wake_delay()
         if dag_wake is not None:
-            housekeeping = min(housekeeping, max(0.0, dag_wake))
+            housekeeping = min(housekeeping, max(MIN_TICK_SLEEP, dag_wake))
         soonest = self._peek_soonest_fire()
         if soonest is None:
             return housekeeping
@@ -8273,16 +8678,24 @@ class Cron:
         slot (with bounded catch-up) BEFORE any launch awaits, so the index is
         already current if the launches yield.
         """
-        due = set(self._due_names(now))
+        due = self._due_names(now)
         if not due:
             return
         # Build the launch plan in config order. Each due job contributes its
         # list of fire slots (usually one; more only when a slow pass or a
         # forward clock jump missed whole occurrences within CATCHUP_LIMIT).
+        # Order comes from the memoized position index rather than a walk of
+        # the whole job set: the next-fire index above already made the pass
+        # O(due), and re-deriving config order by scanning every job put that
+        # back (measured 2.8-5.8 ms of loop-blocking work per firing pass at
+        # 100k jobs).  A name the index still holds but the config no longer
+        # does is skipped, exactly as the membership test used to.
+        pos = self._job_pos()
+        ordered = [name for name in due if name in pos]
+        ordered.sort(key=pos.__getitem__)
         plan = []  # type: List[Tuple[JobConfig, List[datetime.datetime]]]
-        for name, job in self.cron_jobs.items():
-            if name not in due:
-                continue
+        for name in ordered:
+            job = self.cron_jobs[name]
             fires, new_next = self._advance(job, self._next_fire[name], now)
             if new_next is not None:
                 self._set_next_fire(name, new_next)
@@ -12157,7 +12570,33 @@ class Cron:
         """
         if not self._retry_resume_active():
             return
-        for name, job in list(self.cron_jobs.items()):
+        # Enumerate first, read second, the shape _refresh_pauses_from_store
+        # already uses. Walking cron_jobs and reading each name's stream cost
+        # one store round trip per retry-configured job per minute, forever,
+        # on every HA node, when almost every one of those streams does not
+        # exist: a missing-stream read is 0.224 ms against 0.258 ms for the
+        # whole enumeration. A failure to enumerate degrades to "not this
+        # pass", exactly as each per-job read already does; with no backend at
+        # all there is nothing to enumerate and each candidate falls out at
+        # _maybe_claim_retry's own guard for free.
+        backend = self.state_backend
+        if backend is None:
+            names = list(self.cron_jobs)
+        else:
+            try:
+                streams = await asyncio.wait_for(
+                    backend.list_stream_names(RETRY_STREAM_PREFIX),
+                    timeout=STATE_OP_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - not this pass
+                return
+            names = [stream[len(RETRY_STREAM_PREFIX) :] for stream in streams]
+        for name in names:
+            job = self.cron_jobs.get(name)
+            if job is None:
+                continue  # a removed job's stream; GC's business
             try:
                 await self._maybe_claim_retry(name, job)
             except asyncio.CancelledError:

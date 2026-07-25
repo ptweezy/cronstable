@@ -44,7 +44,6 @@ from strictyaml.ruamel.error import YAMLError
 from cronstable import crontabs, dag, platform
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import Finding, lint_schedule
-from cronstable.resources import MONITOR_HISTORY_DEFAULT, SAMPLE_INTERVAL
 
 logger = logging.getLogger("cronstable.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
@@ -561,6 +560,45 @@ _late_report["mail"]["body"] = DEFAULT_LATE_BODY_TEMPLATE
 _late_report["webhook"]["body"] = DEFAULT_LATE_WEBHOOK_BODY_TEMPLATE
 _late_report["sentry"]["fingerprint"] = ["cronstable", "sla", "{{ name }}"]
 del _late_report
+
+
+def _onlate_names_a_destination(on_late: Dict[str, Any]) -> bool:
+    """Whether an ``onLate`` block would actually report anything.
+
+    A reporter left at its all-None defaults is not "configured": only an
+    onLate that would really fire demands an ``sla`` block to fire about.
+    """
+    report = on_late.get("report") or {}
+    sentry_dsn = (report.get("sentry") or {}).get("dsn") or {}
+    mail = report.get("mail") or {}
+    shell = report.get("shell") or {}
+    webhook_url = (report.get("webhook") or {}).get("url") or {}
+    secret_keys = ("value", "fromFile", "fromEnvVar")
+    return (
+        any(sentry_dsn.get(k) is not None for k in secret_keys)
+        or mail.get("to") is not None
+        or mail.get("from") is not None
+        or shell.get("command") is not None
+        or any(webhook_url.get(k) is not None for k in secret_keys)
+    )
+
+
+#: The stock ``onLate`` block.  ``mergedicts`` merges copy-on-write, so a job
+#: that never wrote an ``onLate`` still points at this very object, which lets
+#: JobConfig._validate_numeric_ranges settle the "onLate requires sla" check
+#: with one identity test instead of walking four nested report chains for
+#: every job in the fleet.  The shortcut is only sound while the stock block
+#: names no destination, so that is checked here rather than assumed -- a
+#: plain `if`, not an `assert`, because the release binary runs under -OO.
+_DEFAULT_ONLATE = DEFAULT_CONFIG["onLate"]
+if _onlate_names_a_destination(  # pragma: no cover - dev invariant
+    _DEFAULT_ONLATE
+):
+    raise RuntimeError(
+        "config: DEFAULT_CONFIG['onLate'] now names a report destination, "
+        "so the identity shortcut in _validate_numeric_ranges would skip "
+        "the 'onLate requires sla' check for every job"
+    )
 
 # The `notify:` report block merges over these event-shaped defaults, exactly
 # as onLate merges over the overdue templates.  Kept wholly separate from
@@ -1233,6 +1271,50 @@ CONFIG_SCHEMA = EmptyDict() | Map(
 )
 
 
+_MONITOR_SAMPLING_DEFAULTS: Optional[Tuple[float, int]] = None
+
+
+def _monitor_sampling_defaults() -> Tuple[float, int]:
+    """``(interval, history)`` defaults for the monitorResources block.
+
+    ``cronstable.resources`` owns those two literals, and reading them at
+    import time was the only reason this module depended on it -- which drags
+    asyncio and psutil (~35 ms, ~2 MB) into every process that merely imports
+    the config module: cronstable.state, .leadership, .cluster, and the tui
+    and mcp clients.  Resource monitoring is opt-in per job, so the cost is
+    deferred to the first job actually built, and the constants keep their
+    single definition rather than being copied here.
+    """
+    global _MONITOR_SAMPLING_DEFAULTS
+    if _MONITOR_SAMPLING_DEFAULTS is None:
+        from cronstable.resources import (
+            MONITOR_HISTORY_DEFAULT,
+            SAMPLE_INTERVAL,
+        )
+
+        _MONITOR_SAMPLING_DEFAULTS = (SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
+    return _MONITOR_SAMPLING_DEFAULTS
+
+
+def __getattr__(name: str) -> Union[float, int]:
+    """Serve the two resources constants without importing them eagerly.
+
+    The removed ``from cronstable.resources import ...`` also re-exported
+    ``SAMPLE_INTERVAL`` and ``MONITOR_HISTORY_DEFAULT`` as attributes of this
+    module, and callers read them that way.  PEP 562 keeps that spelling
+    working while the import itself stays deferred.  The return annotation is
+    deliberately narrow rather than ``Any``, so a typo'd attribute on this
+    module still fails to type-check where its value is used.
+    """
+    if name == "SAMPLE_INTERVAL":
+        return _monitor_sampling_defaults()[0]
+    if name == "MONITOR_HISTORY_DEFAULT":
+        return _monitor_sampling_defaults()[1]
+    raise AttributeError(
+        "module {!r} has no attribute {!r}".format(__name__, name)
+    )
+
+
 def _normalize_monitor_resources(raw: Any) -> Tuple[bool, float, int]:
     """Collapse ``monitorResources``'s bool-or-map forms to one shape.
 
@@ -1241,13 +1323,14 @@ def _normalize_monitor_resources(raw: Any) -> Tuple[bool, float, int]:
     turns monitoring on), the bool form takes the sampling defaults.  Range
     checks live with the other numeric checks in ``_validate_numeric_ranges``.
     """
+    interval, history = _monitor_sampling_defaults()
     if isinstance(raw, dict):
         return (
             bool(raw.get("enabled", True)),
-            float(raw.get("interval", SAMPLE_INTERVAL)),
-            int(raw.get("history", MONITOR_HISTORY_DEFAULT)),
+            float(raw.get("interval", interval)),
+            int(raw.get("history", history)),
         )
-    return (bool(raw), SAMPLE_INTERVAL, MONITOR_HISTORY_DEFAULT)
+    return (bool(raw), interval, history)
 
 
 def _merge_lists(key: str, base: list, override: list) -> list:
@@ -1421,6 +1504,12 @@ def schedule_has_seconds(
     return False
 
 
+#: Per-parse memo for :meth:`JobConfig._lint_schedule`, keyed by
+#: ``(source text, H-resolved text, resolved zone)``.  Created by
+#: :func:`_config_from_doc` and dropped when that parse returns.
+LintCache = Dict[Tuple[str, str, Optional[datetime.tzinfo]], List[Finding]]
+
+
 class JobConfig:
     # One JobConfig exists per configured job for the life of the process (and
     # is rebuilt on every reload), so trimming its per-instance __dict__ with
@@ -1478,18 +1567,27 @@ class JobConfig:
         "uid",
         "gid",
         "username",
+        # Precomputed payload fragments (see _precompute_payload_views).
+        "schedule_display",
+        "command_display",
+        "schedule_findings_json",
+        "schedule_resolved_or_none",
+        "sla_thresholds",
+        "_digest",
     )
 
     def __init__(
         self,
         config: dict,
         env_cache: Optional[Dict[str, Dict[str, str]]] = None,
+        lint_cache: Optional["LintCache"] = None,
     ) -> None:
         self.name = config["name"]  # type: str
         self.command = config["command"]  # type: Union[str, List[str]]
         self.schedule_unparsed = config.pop("schedule")
         self.schedule: Union[CronTab, str] = self._parse_schedule(
-            self.schedule_unparsed
+            self.schedule_unparsed,
+            config.pop(crontabs.PARSED_SCHEDULE_KEY, None),
         )
         # True when the schedule pins specific seconds; the scheduler then
         # ticks per-second for this job instead of per-minute
@@ -1545,11 +1643,7 @@ class JobConfig:
         # dead schedule stays a WARNING rather than an error: a fixed past
         # year is also the working idiom for parking a job, and failing the
         # whole config load over it would turn an upgrade into an outage.
-        self.schedule_findings: List[Finding] = (
-            lint_schedule(timezone=self.timezone, tab=self.schedule)
-            if isinstance(self.schedule, CronTab)
-            else []
-        )
+        self.schedule_findings: List[Finding] = self._lint_schedule(lint_cache)
         for finding in self.schedule_findings:
             logger.log(
                 logging.WARNING
@@ -1595,10 +1689,51 @@ class JobConfig:
 
         self._validate_numeric_ranges()
 
-    def _parse_schedule(self, schedule_unparsed) -> Union[CronTab, str]:
+    def _lint_schedule(
+        self, lint_cache: Optional["LintCache"]
+    ) -> List[Finding]:
+        """Advisory findings for this job's schedule.
+
+        ``lint_cache`` is a per-parse memo: a fleet has far fewer distinct
+        schedule shapes than jobs, and the lint is the single largest term in
+        building a JobConfig (a full ``next()`` probe, a step analysis and,
+        for a zoned job, a year of DST transitions).
+
+        The key is the source text AND the H-resolved text: those two differ
+        only for an ``H`` schedule, and keying on the resolved text alone
+        would let ``H * * * *`` hashed to ``22 * * * *`` collide with a
+        literal ``22 * * * *`` and hand the literal job a hashed-slot note it
+        must not have.  The cache is per parse, never process-lifetime,
+        because never-fires and the DST findings are answers about *now*.
+        """
+        tab = self.schedule
+        if not isinstance(tab, CronTab):
+            return []
+        if lint_cache is None:
+            return lint_schedule(timezone=self.timezone, tab=tab)
+        key = (str(tab), tab.resolved_source, self.timezone)
+        findings = lint_cache.get(key)
+        if findings is None:
+            findings = lint_schedule(timezone=self.timezone, tab=tab)
+            lint_cache[key] = findings
+        # a copy, so every job keeps owning its own list exactly as before
+        return list(findings)
+
+    def _parse_schedule(
+        self, schedule_unparsed, prebuilt: Optional[CronTab] = None
+    ) -> Union[CronTab, str]:
+        """Resolve the ``schedule:`` value to a CronTab (or ``@reboot``).
+
+        ``prebuilt`` is the CronTab the classic-crontab front end already
+        parsed from this very ``(expression, job name)`` pair; see
+        :data:`cronstable.crontabs.PARSED_SCHEDULE_KEY`.  Nothing else can
+        supply one: the YAML schema's key space is closed.
+        """
         if isinstance(schedule_unparsed, str):
             if schedule_unparsed == "@reboot":
                 return schedule_unparsed
+            if isinstance(prebuilt, CronTab):
+                return prebuilt
             return self._crontab(schedule_unparsed)
         if isinstance(schedule_unparsed, dict):
             tab = schedule_object_to_crontab(schedule_unparsed)
@@ -1767,103 +1902,90 @@ class JobConfig:
                     )
                 )
 
+    def _reject(self, message: str) -> "ConfigError":
+        """Build (never raise) the job-scoped ConfigError for a failed check.
+
+        Returning it keeps every ``raise self._reject(...)`` below a single
+        statement, so the message is still built only when the check fails.
+        """
+        return ConfigError("Job {}: {}".format(self.name, message))
+
     def _validate_numeric_ranges(self) -> None:
         # strictyaml only enforces the type (Int/Float); fail fast on values
         # that would otherwise produce obscure runtime behavior instead of a
-        # clear configuration error.
-        def require(condition: bool, message: str) -> None:
-            if not condition:
-                raise ConfigError("Job {}: {}".format(self.name, message))
-
-        require(self.saveLimit >= 0, "saveLimit must be >= 0")
-        require(self.maxLineLength > 0, "maxLineLength must be > 0")
-        require(self.killTimeout >= 0, "killTimeout must be >= 0")
+        # clear configuration error.  Written as plain `if ... raise` rather
+        # than through a helper: this runs once per job on every load and
+        # reload, and a closure plus ~16 calls is most of its cost.
+        if self.saveLimit < 0:
+            raise self._reject("saveLimit must be >= 0")
+        if self.maxLineLength <= 0:
+            raise self._reject("maxLineLength must be > 0")
+        if self.killTimeout < 0:
+            raise self._reject("killTimeout must be >= 0")
         # sampling walks the whole process table each tick, so a sub-100ms
         # cadence is a busy-loop footgun; the history cap bounds what one run
         # can add to a durable ledger record (0 = summary only, no series).
-        require(
-            self.monitorResourcesInterval >= 0.1,
-            "monitorResources.interval must be >= 0.1 (seconds)",
-        )
-        require(
-            0 <= self.monitorResourcesHistory <= 2000,
-            "monitorResources.history must be between 0 and 2000 (points)",
-        )
+        if self.monitorResourcesInterval < 0.1:
+            raise self._reject(
+                "monitorResources.interval must be >= 0.1 (seconds)"
+            )
+        if not 0 <= self.monitorResourcesHistory <= 2000:
+            raise self._reject(
+                "monitorResources.history must be between 0 and 2000 (points)"
+            )
         # Allow places no bound on concurrent instances, so widening its
         # scope to the cluster gates nothing -- a safety option that
         # silently does nothing is worse than an error the operator sees
         # once at load time.
-        require(
-            not (
-                self.concurrencyScope == "cluster"
-                and self.concurrencyPolicy == "Allow"
-            ),
-            "concurrencyScope: cluster has no effect with "
-            "concurrencyPolicy: Allow (the default); set Forbid or "
-            "Replace, or drop concurrencyScope",
-        )
-        require(
-            self.catchupJitterSeconds >= 0,
-            "catchupJitterSeconds must be >= 0",
-        )
-        if self.startingDeadlineSeconds is not None:
-            require(
-                self.startingDeadlineSeconds > 0,
-                "startingDeadlineSeconds must be > 0 when set",
+        if (
+            self.concurrencyScope == "cluster"
+            and self.concurrencyPolicy == "Allow"
+        ):
+            raise self._reject(
+                "concurrencyScope: cluster has no effect with "
+                "concurrencyPolicy: Allow (the default); set Forbid or "
+                "Replace, or drop concurrencyScope"
             )
-        if self.executionTimeout is not None:
-            require(
-                self.executionTimeout > 0,
-                "executionTimeout must be > 0 when set",
-            )
+        if self.catchupJitterSeconds < 0:
+            raise self._reject("catchupJitterSeconds must be >= 0")
+        if (
+            self.startingDeadlineSeconds is not None
+            and self.startingDeadlineSeconds <= 0
+        ):
+            raise self._reject("startingDeadlineSeconds must be > 0 when set")
+        if self.executionTimeout is not None and self.executionTimeout <= 0:
+            raise self._reject("executionTimeout must be > 0 when set")
         for key in (
             "maxTimeSinceSuccessSeconds",
             "lateAfterSeconds",
             "maxRuntimeSeconds",
         ):
-            if self.sla.get(key) is not None:
-                require(
-                    self.sla[key] > 0,
-                    "sla.{} must be > 0 when set".format(key),
-                )
-        if all(v is None for v in self.sla.values()):
-            # a reporter left at its all-None defaults is not "configured";
-            # only an onLate that would actually fire demands an sla block.
-            report = self.onLate.get("report") or {}
-            sentry_dsn = (report.get("sentry") or {}).get("dsn") or {}
-            mail = report.get("mail") or {}
-            shell = report.get("shell") or {}
-            webhook_url = (report.get("webhook") or {}).get("url") or {}
-            secret_keys = ("value", "fromFile", "fromEnvVar")
-            require(
-                not (
-                    any(sentry_dsn.get(k) is not None for k in secret_keys)
-                    or mail.get("to") is not None
-                    or mail.get("from") is not None
-                    or shell.get("command") is not None
-                    or any(webhook_url.get(k) is not None for k in secret_keys)
-                ),
-                "onLate requires sla",
-            )
+            value = self.sla.get(key)
+            if value is not None and value <= 0:
+                raise self._reject("sla.{} must be > 0 when set".format(key))
+        # The identity test comes first because it is the common case and it
+        # settles the question outright: a job that never wrote an `onLate`
+        # block still points at the (inert) default one, checked at import.
+        if self.onLate is not _DEFAULT_ONLATE and all(
+            v is None for v in self.sla.values()
+        ):
+            if _onlate_names_a_destination(self.onLate):
+                raise self._reject("onLate requires sla")
         retry = self.onFailure.get("retry")
         if retry is not None:
             # -1 is the documented sentinel for "retry forever".
-            require(
-                retry["maximumRetries"] >= -1,
-                "onFailure.retry.maximumRetries must be >= -1",
-            )
-            require(
-                retry["initialDelay"] >= 0,
-                "onFailure.retry.initialDelay must be >= 0",
-            )
-            require(
-                retry["maximumDelay"] > 0,
-                "onFailure.retry.maximumDelay must be > 0",
-            )
-            require(
-                retry["backoffMultiplier"] > 0,
-                "onFailure.retry.backoffMultiplier must be > 0",
-            )
+            if retry["maximumRetries"] < -1:
+                raise self._reject(
+                    "onFailure.retry.maximumRetries must be >= -1"
+                )
+            if retry["initialDelay"] < 0:
+                raise self._reject("onFailure.retry.initialDelay must be >= 0")
+            if retry["maximumDelay"] <= 0:
+                raise self._reject("onFailure.retry.maximumDelay must be > 0")
+            if retry["backoffMultiplier"] <= 0:
+                raise self._reject(
+                    "onFailure.retry.backoffMultiplier must be > 0"
+                )
 
 
 # Defaults for the DAG-node fields strictyaml leaves absent (unlike jobs, a
@@ -4125,7 +4247,7 @@ def _config_from_doc(
         # their own file's defaults; a top-level ``defaults`` block does NOT
         # retro-apply to them. Only the included files' defaults are merged
         # here, and they affect this file's inline jobs.
-        inc_config = parse_config_file(inc_path, _seen, _sources)
+        inc_config = _parse_included_file(inc_path, _seen, _sources)
         inc_defaults_merged = mergedicts(
             inc_defaults_merged, inc_config.job_defaults
         )
@@ -4164,9 +4286,14 @@ def _config_from_doc(
     # One env_file is frequently shared by many jobs in a doc; a per-doc
     # cache reads and parses each such file once instead of once per job.
     env_cache: Dict[str, Dict[str, str]] = {}
+    # Likewise for the advisory schedule lint, which a fleet's jobs repeat far
+    # more often than they repeat env_files (see JobConfig._lint_schedule).
+    lint_cache: LintCache = {}
     for config_job in doc.get("jobs", []):
         job_dict = mergedicts(defaults, config_job)
-        jobs.append(JobConfig(job_dict, env_cache=env_cache))
+        jobs.append(
+            JobConfig(job_dict, env_cache=env_cache, lint_cache=lint_cache)
+        )
     # A DAG task is a job invocation, so its launch fields inherit the same
     # `defaults:` base a regular job does (global reporters, environment,
     # shell, capture, secrets, monitorResources, timeouts).  The DAG-node
@@ -4404,22 +4531,29 @@ def parse_config_with_sources(
 
 
 class _CachedDirFile(NamedTuple):
-    """A remembered per-file parse for the config-dir per-file cache.
+    """A remembered per-file parse for the per-file parse cache.
 
     ``sources`` is every on-disk file the file's parse read (itself, its
     transitive ``include``s, and the ``env_file`` of each job and DAG task
     it defines); ``sig`` is the sorted ``(abspath, content_digest)``
     fingerprint of exactly those, and ``config`` is the parsed result to
     hand back untouched when they are all still byte-for-byte current.
+
+    ``included`` is the narrower set the include-cycle guard reasons about:
+    the config files the parse actually walked, without the env_files (which
+    are read, never parsed, so they are not part of any cycle).  Serving a
+    cached parse has to leave the caller's cycle scope holding exactly what
+    a real parse would have added to it.
     """
 
     sources: FrozenSet[str]
+    included: FrozenSet[str]
     sig: Tuple[Tuple[str, Optional[str]], ...]
     config: CronstableConfig
 
 
-#: Per-file config-dir parse cache.  A one-line edit to one file in a
-#: config directory reopens the scheduler's whole-config reparse
+#: Per-file parse cache.  A one-line edit to one file of a config directory
+#: (or of an ``include:`` tree) reopens the scheduler's whole-config reparse
 #: (cronstable.cron._config_signature), which then rebuilds EVERY file's
 #: JobConfigs even though only one changed.  Keyed by absolute path and
 #: validated by hashing each source's CONTENT, this hands back the
@@ -4461,27 +4595,40 @@ def _dir_file_content_sig(
     return tuple(parts)
 
 
-def _parse_config_dir_file(
-    path: str,
-) -> Tuple[CronstableConfig, FrozenSet[str]]:
-    """Parse one config-dir entry, reusing an unchanged prior parse.
+def _parse_file_cached(
+    path: str, _seen: Optional[set] = None
+) -> Tuple[CronstableConfig, FrozenSet[str], FrozenSet[str]]:
+    """Parse one config file, reusing an unchanged prior parse.
 
-    Returns ``(config, sources)`` where ``sources`` is every file the
-    parse depended on (the entry, its includes, and its jobs'/tasks'
-    env_files) so the caller can fold it into the dir-level source set the
-    scheduler stat-watches.  ConfigError/OSError propagate unchanged (and
-    nothing is cached) so the dir loop records them exactly as before.
+    Returns ``(config, sources, included)``: ``sources`` is every file the
+    parse depended on (the file, its includes, and its jobs'/tasks'
+    env_files) so the caller can fold it into the source set the scheduler
+    stat-watches, and ``included`` is the config files alone, for the
+    caller's include-cycle scope.  ConfigError/OSError propagate unchanged
+    (and nothing is cached) so callers record them exactly as before.
+
+    ``_seen`` is the caller's cycle scope, when it has one.  It is passed
+    straight into the real parse, so a file that includes its way back to an
+    ancestor still raises there; a cache hit instead folds the remembered
+    ``included`` set into it, and is declined outright when the two overlap,
+    because that overlap IS the cycle and the uncached path words the error.
     """
     abspath = os.path.abspath(path)
     cached = _DIR_FILE_CACHE.get(abspath)
     if (
         cached is not None
+        and (_seen is None or _seen.isdisjoint(cached.included))
         and _dir_file_content_sig(cached.sources) == cached.sig
     ):
         _DIR_FILE_CACHE.move_to_end(abspath)
-        return cached.config, cached.sources
+        if _seen is not None:
+            _seen.update(cached.included)
+        return cached.config, cached.sources, cached.included
     file_sources: set = set()
-    config = parse_config_file(path, _sources=file_sources)
+    seen: set = set() if _seen is None else _seen
+    before = frozenset(seen)
+    config = parse_config_file(path, seen, file_sources)
+    file_included = frozenset(seen) - before
     # env_files are read at parse time (JobConfig._merge_env_file / DAG task
     # templates), so a change to one must invalidate the cached parse too --
     # fold them into the fingerprint exactly as parse_config_with_sources
@@ -4495,12 +4642,29 @@ def _parse_config_dir_file(
                 file_sources.add(os.path.abspath(template.env_file))
     frozen = frozenset(file_sources)
     _DIR_FILE_CACHE[abspath] = _CachedDirFile(
-        frozen, _dir_file_content_sig(frozen), config
+        frozen, file_included, _dir_file_content_sig(frozen), config
     )
     _DIR_FILE_CACHE.move_to_end(abspath)
     while len(_DIR_FILE_CACHE) > _DIR_FILE_CACHE_MAX:
         _DIR_FILE_CACHE.popitem(last=False)
-    return config, frozen
+    return config, frozen, file_included
+
+
+def _parse_included_file(
+    path: str, _seen: Optional[set], _sources: Optional[set]
+) -> CronstableConfig:
+    """Parse one ``include:`` target, reusing an unchanged prior parse.
+
+    The include branch used to call :func:`parse_config_file` directly, so
+    editing one file of an include tree re-ran strictyaml over every file the
+    tree reaches, and strictyaml is ~95% of a parse.  Routing it through the
+    same content-hash cache the config-directory loader uses reduces that to
+    reparsing the file that actually changed.
+    """
+    config, sources, _ = _parse_file_cached(path, _seen)
+    if _sources is not None:
+        _sources.update(sources)
+    return config
 
 
 def _claim_config_dir_section(
@@ -4561,7 +4725,7 @@ def _parse_config_dir(
         ):
             continue
         try:
-            config, file_sources = _parse_config_dir_file(direntry.path)
+            config, file_sources, _ = _parse_file_cached(direntry.path)
         except ConfigError as err:
             config_errors[direntry.path] = str(err)
             continue

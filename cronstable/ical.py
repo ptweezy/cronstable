@@ -82,9 +82,13 @@ def _fold(line: str) -> str:
     octets; the fold point backs up over UTF-8 continuation bytes rather
     than cutting inside a multi-byte character.
     """
-    data = line.encode("utf-8")
-    if len(data) <= 75:
+    # for an ASCII line the character count IS the octet count, and
+    # ``isascii`` is a flag read: a real feed is short ASCII throughout,
+    # so this measures every line without encoding one to throw it away
+    octets = len(line) if line.isascii() else len(line.encode("utf-8"))
+    if octets <= 75:
         return line
+    data = line.encode("utf-8")
     chunks: List[str] = []
     limit = 75
     while data:
@@ -195,7 +199,17 @@ def render_calendar(
                 truncated = True
                 break
             count += 1
-            stamp = fire_utc.strftime("%Y%m%dT%H%M%SZ")
+            # the same text strftime("%Y%m%dT%H%M%SZ") produces, at a
+            # third of the cost, once per event in the feed; the engine's
+            # horizon is inside the four-digit years %04d covers
+            stamp = "%04d%02d%02dT%02d%02d%02dZ" % (
+                fire_utc.year,
+                fire_utc.month,
+                fire_utc.day,
+                fire_utc.hour,
+                fire_utc.minute,
+                fire_utc.second,
+            )
             lines.extend(
                 [
                     "BEGIN:VEVENT",
@@ -218,4 +232,4 @@ def render_calendar(
                 "X-CRONSTABLE-TRUNCATED;CAP={}:{}".format(per_job_cap, summary)
             )
     lines.append("END:VCALENDAR")
-    return _CRLF.join(_fold(line) for line in lines) + _CRLF
+    return _CRLF.join([_fold(line) for line in lines]) + _CRLF

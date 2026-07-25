@@ -133,16 +133,33 @@ def escape_help(text: str, openmetrics: bool = False) -> str:
     return escaped
 
 
+#: The exact-integer range of a float, as floats so the bounds test below is
+#: a plain float comparison.  Values outside it (and every non-finite one)
+#: take the slow tail of :func:`format_value`.
+_EXACT_INT_MIN = -9007199254740992.0  # -2**53
+_EXACT_INT_MAX = 9007199254740992.0  # 2**53
+
+
 def format_value(value: Union[int, float]) -> str:
+    # Almost every sample is a small integral float (MetricFamily.add coerces
+    # with float()), so lead with the bounds test that case needs anyway:
+    # one comparison pair and ONE int() replace isinf + isnan + an int() for
+    # the equality test + a second int() for the string.  Both non-finite
+    # values fail the strict comparisons (NaN compares false against
+    # everything), so they fall through to the tail unchanged, and +/-2**53
+    # exactly are excluded here just as `abs(value) < 2**53` excluded them.
+    if _EXACT_INT_MIN < value < _EXACT_INT_MAX:
+        integral = int(value)
+        # ints (and integral floats within exact-float range) render without
+        # a decimal point; everything else uses repr, the shortest
+        # round-tripping form, so timestamps keep full precision.
+        if integral == value:
+            return str(integral)
+        return repr(float(value))
     if math.isinf(value):
         return "+Inf" if value > 0 else "-Inf"
     if math.isnan(value):
         return "NaN"
-    # ints (and integral floats within exact-float range) render without a
-    # decimal point; everything else uses repr, the shortest round-tripping
-    # form, so timestamps keep full precision.
-    if value == int(value) and abs(value) < 2**53:
-        return str(int(value))
     return repr(float(value))
 
 
@@ -188,7 +205,23 @@ def _sample_base(family: MetricFamily) -> str:
     return family.name
 
 
-def _make_label_block_builder() -> Callable[[Dict[str, str]], str]:
+#: Ceiling on a persistent label-block memo before it is dropped whole.
+#: The label universe is a pure function of the job set (job_name crossed
+#: with a fixed static label), so it is bounded but proportional to fleet
+#: size: about 16 blocks per job, i.e. 8k entries at 500 jobs and 32k at
+#: 2000, both of which stay fully warm under this cap.  Past it the memo is
+#: cleared rather than evicted one entry at a time: the alternative is
+#: unbounded RSS on a six-figure fleet (~1.6M entries at 100k jobs), and a
+#: scrape that overflows the cap degrades to today's cold-memo cost, never
+#: worse.
+LABEL_BLOCK_CACHE_MAX = 32768
+
+_LabelBlockCache = Dict[Tuple[Tuple[str, str], ...], str]
+
+
+def _make_label_block_builder(
+    cache: Optional[_LabelBlockCache] = None,
+) -> Callable[[Dict[str, str]], str]:
     """A builder for the ``{k="v",...}`` block that memoizes whole blocks.
 
     Escaping alone was memoized before, but the *assembly* (a generator
@@ -200,17 +233,23 @@ def _make_label_block_builder() -> Callable[[Dict[str, str]], str]:
     alone, or with ``le``/``outcome``), skip the generator machinery
     entirely on a miss and concatenate directly.
 
-    The memo is private to the returned closure, i.e. to one
-    render/iteration pass, so there is no cross-scrape state to invalidate
-    on reload or prune, and a label value that changes between scrapes
-    cannot be served stale.  Label values are always strings here (the
-    families build them that way), so the items tuple is hashable.
+    ``cache`` lets the caller supply a memo that OUTLIVES the pass, which
+    :class:`PrometheusMetrics` does, so a scrape does not re-escape and
+    re-assemble every block from cold every 15 to 60 seconds.  A stale hit
+    is impossible by construction: the key is the label items tuple, so
+    every value is part of its own key and a changed value is a different
+    key, never a hit on the old block.  Only growth needs managing, hence
+    the cap above and the clears in :meth:`PrometheusMetrics.prune` and
+    :meth:`PrometheusMetrics.set_duration_buckets`.  Without a ``cache``
+    the memo is private to the returned closure, i.e. to one pass.  Label
+    values are always strings here (the families build them that way), so
+    the items tuple is hashable.
     """
-    cache: Dict[Tuple[Tuple[str, str], ...], str] = {}
+    memo: _LabelBlockCache = {} if cache is None else cache
 
     def block_for(labels: Dict[str, str]) -> str:
         key = tuple(labels.items())
-        block = cache.get(key)
+        block = memo.get(key)
         if block is None:
             if len(key) == 1:
                 name, val = key[0]
@@ -237,7 +276,9 @@ def _make_label_block_builder() -> Callable[[Dict[str, str]], str]:
                     )
                     + "}"
                 )
-            cache[key] = block
+            if len(memo) >= LABEL_BLOCK_CACHE_MAX:
+                memo.clear()
+            memo[key] = block
         return block
 
     return block_for
@@ -259,6 +300,7 @@ def _sample_fields(
 
 def iter_family_samples(
     families: Iterable[MetricFamily],
+    label_cache: Optional[_LabelBlockCache] = None,
 ) -> Iterator[Tuple[str, str, str]]:
     """Yield ``(sample_name, label_block, value)`` for every sample.
 
@@ -270,8 +312,12 @@ def iter_family_samples(
     re-parsing it line by line.  Formatting is shared with
     :func:`render_families`, so a name, label or value can never disagree
     between the two.
+
+    ``label_cache`` is the caller's cross-pass label-block memo (see
+    :func:`_make_label_block_builder`); without one the memo is per pass
+    and starts cold.
     """
-    block_for = _make_label_block_builder()
+    block_for = _make_label_block_builder(label_cache)
     for family in families:
         if not family.samples:
             continue
@@ -282,7 +328,9 @@ def iter_family_samples(
 
 
 def render_families(
-    families: Iterable[MetricFamily], openmetrics: bool = False
+    families: Iterable[MetricFamily],
+    openmetrics: bool = False,
+    label_cache: Optional[_LabelBlockCache] = None,
 ) -> str:
     """Render metric families as exposition text.
 
@@ -291,9 +339,13 @@ def render_families(
     ``info`` type, while the text format names the full sample name and
     downgrades info metrics to gauges. OpenMetrics additionally requires
     the ``# EOF`` terminator.
+
+    ``label_cache`` is the caller's cross-pass label-block memo (see
+    :func:`_make_label_block_builder`); without one the memo is per render
+    and every block is re-escaped and re-assembled from cold.
     """
     out: List[str] = []
-    block_for = _make_label_block_builder()
+    block_for = _make_label_block_builder(label_cache)
     for family in families:
         if not family.samples:
             continue
@@ -450,6 +502,14 @@ class PrometheusMetrics:
         # durable-state writes that failed and were dropped, by kind
         # (run-record, checkpoint, retry, reboot-marker, counters, manifest)
         self._state_dropped: Dict[str, int] = {}
+        # Whole {k="v",...} label blocks, kept ACROSS scrapes: the label
+        # universe is a pure function of the job set and a fixed set of
+        # static labels, so a scrape that rebuilds it from cold re-escapes
+        # and re-concatenates every block for nothing. Cleared wholesale
+        # wherever that universe can change (prune, set_duration_buckets)
+        # and capped at LABEL_BLOCK_CACHE_MAX so it cannot grow into
+        # permanent RSS on a six-figure fleet.
+        self._label_blocks: _LabelBlockCache = {}
 
     # -- configuration ----------------------------------------------------
 
@@ -459,6 +519,8 @@ class PrometheusMetrics:
             return
         self._buckets = new
         self._bucket_bound_strs = tuple(_bucket_bound(b) for b in new)
+        # the "le" blocks memoized against the old bounds are dead weight now
+        self._label_blocks.clear()
         # Bucket bounds changed: past observations cannot be re-binned, so
         # every job's histogram restarts from zero -- an ordinary counter
         # reset to Prometheus. The run/outcome counters are unaffected.
@@ -473,6 +535,11 @@ class PrometheusMetrics:
         for name in list(self._jobs):
             if name not in keep:
                 del self._jobs[name]
+        # Unconditionally, not only when a job actually went away: the memo
+        # is keyed on label items, not on job name, so there is nothing to
+        # delete selectively, and a reload is the one moment the label
+        # universe can shrink. The next scrape rebuilds what it still needs.
+        self._label_blocks.clear()
 
     def _job(self, name: str) -> _JobMetrics:
         job = self._jobs.get(name)
@@ -692,13 +759,37 @@ class PrometheusMetrics:
     # -- rendering ---------------------------------------------------------
 
     def render(self, cron: "Cron", openmetrics: bool = False) -> str:
-        return render_families(self._families(cron), openmetrics)
+        return self.render_prepared(self.families(cron), openmetrics)
+
+    def families(self, cron: "Cron") -> List[MetricFamily]:
+        """This scrape's metric families, read from live scheduler state.
+
+        Phase one of the two-phase render.  It reads ``cron``'s mutable
+        attributes (cron_jobs, running_jobs, _next_fire, last_run, the job
+        set id and the cluster manager), so it MUST run on the event loop.
+        The list it returns is freshly built and referenced by nobody else,
+        which is what makes phase two safe to hand to a worker thread.
+        """
+        return self._families(cron)
+
+    def render_prepared(
+        self, families: List[MetricFamily], openmetrics: bool = False
+    ) -> str:
+        """Render families produced by :meth:`families` into exposition text.
+
+        Phase two of the two-phase render.  It is pure over ``families`` and
+        touches no scheduler state, so a caller holding a list straight from
+        :meth:`families` may run this in an executor.  The label-block memo
+        it threads through is a plain dict used as a pure-function cache, so
+        a worker thread populating it races only to write equal values.
+        """
+        return render_families(families, openmetrics, self._label_blocks)
 
     def iter_samples(self, cron: "Cron") -> Iterator[Tuple[str, str, str]]:
         """This scrape's samples as ``(name, label_block, value)`` triples,
         built straight from the metric families -- no exposition render and
         no re-parse (see :func:`iter_family_samples`)."""
-        return iter_family_samples(self._families(cron))
+        return iter_family_samples(self._families(cron), self._label_blocks)
 
     def _families(self, cron: "Cron") -> List[MetricFamily]:
         families = self._daemon_families(cron)
