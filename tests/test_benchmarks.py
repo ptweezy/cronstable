@@ -37,6 +37,14 @@ def test_bench_smoke_produces_results(tmp_path):
     doc = json.loads(out.read_text(encoding="utf-8"))
     assert doc["schema"] == 1
     assert doc["mode"] == "smoke"
+    # Provenance the comparison depends on: the optional-backend flags
+    # (compare.py hard-fails a pairing whose sides disagree on them) and the
+    # per-benchmark wall clock (how the CI timeout ceiling gets triaged).
+    assert isinstance(doc["orjson"], bool)
+    assert isinstance(doc["uvloop"], bool)
+    for r in doc["results"]:
+        assert r.get("elapsed_seconds", -1.0) >= 0.0, r["name"]
+    assert "slowest benchmarks" in proc.stdout
     results = {r["name"]: r for r in doc["results"]}
     ran = [r for r in results.values() if not r["skipped"]]
     # The suite is exhaustive; even smoke mode must exercise the bulk of it.
@@ -46,10 +54,15 @@ def test_bench_smoke_produces_results(tmp_path):
     )
     for r in ran:
         assert r["value"] >= 0.0
-        assert r["unit"] in ("s", "MB")
+        assert r["unit"] in ("s", "MB", "KB")
     # The headline metrics must never silently skip -- including the terminal
     # UI and the branch-win backend metrics (the web UI ones legitimately skip
-    # in smoke, since they would launch a browser).
+    # in smoke, since they would launch a browser).  Every 2026-07 addition
+    # that leans on a private seam is in this net BY REQUIREMENT (see
+    # benchmarks/expected_gated.txt): this test is what catches a drifted
+    # seam in the ordinary test run instead of at release time.  Not listed:
+    # json.roundtrip_orjson_3k (skips wherever the optional orjson is not
+    # installed, e.g. the tox envs) and the webui.* browser metrics.
     for name in (
         "startup.version",
         "schedule.cold_build_100k",
@@ -60,6 +73,35 @@ def test_bench_smoke_produces_results(tmp_path):
         "dag.finish_fanin_1k",
         "dag.list_dags_warm",
         "tui.log_restyle_5k",
+        # 2026-07 additions, round 1 (bench-additions.md)
+        "loop.stall_jobs_500",
+        "cronexpr.next_dst_2k",
+        "redact.adversarial_10k",
+        "schedule.due_pass_100k",
+        "schedule.lint_250_zoned",
+        "state.lease_renew_200",
+        "state.gc_sweep_2k_streams",
+        "dag.mapped_drain_256",
+        "dag.adopt_scan_500",
+        "dag.advance_quiescent_1k",
+        "cluster.job_owner_2k",
+        "cluster.parse_summaries_6k",
+        "config.reload_warm_50",
+        "config.interp_2k",
+        "prometheus.render_500",
+        "statsd.emit_500",
+        "webapi.jobs_payload_500",
+        "webapi.auth_scope_20k",
+        "mcp.handle_200",
+        "job.stream_capture_40k",
+        "json.roundtrip_3k",
+        # 2026-07 additions, round 2 (bench-additions-2.md)
+        "state.fanout_gather_100",
+        "state.boot_rehydrate_populated",
+        "state.list_documents_600",
+        "tui.drawer_paint_5k",
+        "webapi.jobs_bytes_500",
+        "schedule.pressure_20k_48h",
     ):
         assert not results[name]["skipped"], results[name]
 
@@ -615,3 +657,291 @@ def test_compare_without_baseline_records_first_release(tmp_path):
     text = md.read_text(encoding="utf-8")
     assert "No previous release baseline" in text
     assert "startup.version" in text
+
+
+def _budgets(path, budgets):
+    path.write_text(
+        json.dumps({"schema": 1, "budgets": budgets}), encoding="utf-8"
+    )
+    return str(path)
+
+
+def test_budget_breach_fails_and_accept_does_not_excuse_it(tmp_path):
+    # The relative gate is HEAD vs latest tag only, so a slow multi-release
+    # drift ships with a green gate every hop; the absolute budget is the only
+    # thing that stops it. Identical sides here: the relative gate passes,
+    # the ceiling still fails the run.
+    entries = [_entry("schedule.cold_build_100k", 4.5)]
+    base = _write(tmp_path / "base.json", _doc(entries))
+    cur = _write(tmp_path / "cur.json", _doc(entries, version="1.1.0"))
+    budgets = _budgets(
+        tmp_path / "budgets.json",
+        {"schedule.cold_build_100k": {"max": 4.0, "unit": "s"}},
+    )
+    md = tmp_path / "out.md"
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base,
+            "--current",
+            cur,
+            "--budgets",
+            budgets,
+            "--md",
+            str(md),
+        ]
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "::error::perf budget:" in proc.stdout
+    assert "absolute budget" in proc.stdout
+    assert "Absolute budget: FAILED" in md.read_text(encoding="utf-8")
+
+    # [perf:accept] acknowledges a relative regression; the ceiling has its
+    # own ritual (a reviewed edit to budgets.json) and stays failed.
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base,
+            "--current",
+            cur,
+            "--budgets",
+            budgets,
+            "--accept",
+        ]
+    )
+    assert proc.returncode == 1, proc.stdout
+
+    # --warn-only (ordinary commits) downgrades it like everything else.
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base,
+            "--current",
+            cur,
+            "--budgets",
+            budgets,
+            "--warn-only",
+        ]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "::warning::perf budget:" in proc.stdout
+
+    # Under the ceiling: silent pass.
+    ok = _budgets(
+        tmp_path / "ok.json",
+        {"schedule.cold_build_100k": {"max": 5.0, "unit": "s"}},
+    )
+    proc = _run(
+        [COMPARE, "--baseline", base, "--current", cur, "--budgets", ok]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "perf budget" not in proc.stdout
+
+
+def test_budgeted_metric_not_measured_warns_but_does_not_fail(tmp_path):
+    # A skipped/absent budgeted metric is lost COVERAGE, which is
+    # expected_gated.txt's job to fail on; the budget check only warns so the
+    # same loss is not reported as two different failures.
+    entries = [_entry("startup.version", 0.1)]
+    base = _write(tmp_path / "base.json", _doc(entries))
+    cur = _write(tmp_path / "cur.json", _doc(entries, version="1.1.0"))
+    budgets = _budgets(
+        tmp_path / "budgets.json", {"tui.log_restyle_5k": {"max": 0.14}}
+    )
+    proc = _run(
+        [COMPARE, "--baseline", base, "--current", cur, "--budgets", budgets]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "::warning::perf budget:" in proc.stdout
+    assert "not measured" in proc.stdout
+
+
+def test_expected_gated_dead_gate_fails(tmp_path):
+    # A metric whose BASELINE side skips lands in coverage['new'], which is
+    # never warned about (it looks like a metric added this release), so a
+    # gate that died because a private seam drifted was silently ungated
+    # forever. The checked-in expected list makes that an integrity failure.
+    base = _write(
+        tmp_path / "base.json",
+        _doc([_entry("startup.version", 0.1), _skipped("tui.drawer")]),
+    )
+    cur = _write(
+        tmp_path / "cur.json",
+        _doc(
+            [_entry("startup.version", 0.1), _entry("tui.drawer", 0.09)],
+            version="1.1.0",
+        ),
+    )
+    expected = tmp_path / "expected.txt"
+    expected.write_text(
+        "# comment\nstartup.version\ntui.drawer\n", encoding="utf-8"
+    )
+    md = tmp_path / "out.md"
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base,
+            "--current",
+            cur,
+            "--expected-gated",
+            str(expected),
+            "--md",
+            str(md),
+        ]
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "::error::perf gate integrity:" in proc.stdout
+    assert "tui.drawer" in proc.stdout
+    assert "startup.version" not in proc.stdout.split("integrity")[-1]
+    assert "Gate integrity: FAILED" in md.read_text(encoding="utf-8")
+
+    # not [perf:accept]-able; --warn-only still downgrades.
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base,
+            "--current",
+            cur,
+            "--expected-gated",
+            str(expected),
+            "--accept",
+        ]
+    )
+    assert proc.returncode == 1, proc.stdout
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base,
+            "--current",
+            cur,
+            "--expected-gated",
+            str(expected),
+            "--warn-only",
+        ]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "::warning::perf gate integrity:" in proc.stdout
+
+    # Fully compared: clean pass, and no baseline means no check at all (a
+    # first release has nothing to compare against).
+    base_ok = _write(
+        tmp_path / "base_ok.json",
+        _doc([_entry("startup.version", 0.1), _entry("tui.drawer", 0.09)]),
+    )
+    proc = _run(
+        [
+            COMPARE,
+            "--baseline",
+            base_ok,
+            "--current",
+            cur,
+            "--expected-gated",
+            str(expected),
+        ]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "integrity" not in proc.stdout
+    proc = _run(
+        [COMPARE, "--current", cur, "--expected-gated", str(expected)]
+    )
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_incomparable_sides_refuse_to_gate(tmp_path):
+    # A one-sided backend (orjson here) turns a backend swap into a fake code
+    # regression, or masks a real one; the pairing is invalid either way, so
+    # the comparison refuses a verdict entirely -- exit 2 even under
+    # --warn-only, never a pass or a fail.
+    base_doc = _doc([_entry("json.roundtrip_3k", 0.7)])
+    base_doc["orjson"] = False
+    cur_doc = _doc([_entry("json.roundtrip_3k", 0.4)], version="1.1.0")
+    cur_doc["orjson"] = True
+    base = _write(tmp_path / "base.json", base_doc)
+    cur = _write(tmp_path / "cur.json", cur_doc)
+    for flags in ([], ["--warn-only"]):
+        proc = _run([COMPARE, "--baseline", base, "--current", cur] + flags)
+        assert proc.returncode == 2, (flags, proc.stdout)
+        assert "not comparable" in proc.stdout
+        assert "orjson" in proc.stdout
+    # Mixed run modes WITHIN one side are just as invalid.
+    cur_quick = _doc([_entry("json.roundtrip_3k", 0.1)], version="1.1.0")
+    cur_quick["orjson"] = True
+    cur_quick["mode"] = "quick"
+    cur2 = _write(tmp_path / "cur2.json", cur_quick)
+    proc = _run([COMPARE, "--baseline", base, "--current", cur, cur2])
+    assert proc.returncode == 2, proc.stdout
+
+
+def test_effective_gate_percentage_is_reported(tmp_path):
+    # compare.py ANDs the percentage gate with the absolute floor, so a
+    # metric whose value sits near its floor really gates at
+    # 100*floor/value, however tight gate_pct reads. That is deliberate
+    # harness policy (the floor is the anti-jitter rule); what was missing
+    # is anything REPORTING when it binds. The 2ms value against a 10ms
+    # floor here gates at an effective 500%, not its declared 15%.
+    base = _write(
+        tmp_path / "base.json",
+        _doc(
+            [
+                _entry("micro.floor_bound", 0.002, gate_pct=15.0),
+                _entry("big.well_sized", 1.0, gate_pct=15.0),
+            ]
+        ),
+    )
+    cur = _write(
+        tmp_path / "cur.json",
+        _doc(
+            [
+                _entry("micro.floor_bound", 0.002, gate_pct=15.0),
+                _entry("big.well_sized", 1.0, gate_pct=15.0),
+            ],
+            version="1.1.0",
+        ),
+    )
+    md = tmp_path / "out.md"
+    proc = _run(
+        [COMPARE, "--baseline", base, "--current", cur, "--md", str(md)]
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "::notice::perf sizing:" in proc.stdout
+    assert "micro.floor_bound" in proc.stdout
+    assert "eff. 500%" in proc.stdout
+    assert "big.well_sized" not in proc.stdout  # not floor-bound: no notice
+    text = md.read_text(encoding="utf-8")
+    assert "Gate (eff.)" in text
+    assert "**500%** (declared 15%)" in text
+
+
+def test_suppressed_regression_reaches_the_job_log(tmp_path):
+    # A move over the raw limit but inside the noise band deliberately does
+    # not gate -- but it must not vanish into a bare "0 gate violation(s)"
+    # line either. Craft one: +21% delta on a 15% gate with round scatter
+    # wide enough that 2 noise bands exceed it.
+    def rounds(path, name, values, version="1.0.0"):
+        docs = [
+            _write(
+                tmp_path / ("%s%d.json" % (path, i)),
+                _doc([_entry(name, v, gate_pct=15.0)], version=version),
+            )
+            for i, v in enumerate(values)
+        ]
+        return docs
+
+    base_files = rounds("b", "state.wobbly", [1.00, 1.30, 0.70])
+    cur_files = rounds("c", "state.wobbly", [0.85, 1.15, 1.45], "1.1.0")
+    proc = _run(
+        [COMPARE, "--baseline"]
+        + base_files
+        + ["--current"]
+        + cur_files
+    )
+    assert proc.returncode == 0, proc.stdout
+    assert "0 gate violation(s)" in proc.stdout
+    assert "::warning::perf gate: state.wobbly" in proc.stdout
+    assert "reported, not gated" in proc.stdout
