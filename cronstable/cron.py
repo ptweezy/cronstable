@@ -82,7 +82,7 @@ from cronstable.croninfo import (
     why_no_run,
 )
 from cronstable.dagrun import DagScheduler
-from cronstable.fingerprint import job_digest, job_set_id
+from cronstable.fingerprint import job_digest_cached, job_set_id
 from cronstable.ical import CalendarEntry, render_calendar
 from cronstable.job import (
     JobOutputStream,
@@ -3311,7 +3311,7 @@ class Cron:
                 ],
             }
         )
-        if tab.resolved_source != str(tab):
+        if tab.resolved_differs:
             payload["resolved"] = tab.resolved_source
         return payload
 
@@ -3445,7 +3445,7 @@ class Cron:
                 "at_in_zone": aware.isoformat(),
             }
         )
-        if tab.resolved_source != str(tab):
+        if tab.resolved_differs:
             payload["resolved"] = tab.resolved_source
         payload.update(why_no_run(tab, civil, timezone=zone))
         next_fire = next(iter(tab.occurrences(aware)), None)
@@ -8915,7 +8915,7 @@ class Cron:
             if rec.get("host") != self._state_host:
                 continue
             # newest marker from this host decides; older ones are moot.
-            if rec.get("jobDigest") != job_digest(job):
+            if rec.get("jobDigest") != job_digest_cached(job):
                 return False
             return self._same_boot(rec)
         return False
@@ -8985,7 +8985,7 @@ class Cron:
             "host": self._state_host,
             "bootId": platform.os_boot_id(),
             "bootTime": platform.os_boot_time(),
-            "jobDigest": job_digest(job),
+            "jobDigest": job_digest_cached(job),
             "at": get_now(datetime.timezone.utc).isoformat(),
         }
         stream = self._reboot_stream(job.name)
@@ -10341,7 +10341,7 @@ class Cron:
             "proc": self._proc_token,
             "pid": pid,
             "startedAt": get_now(datetime.timezone.utc).isoformat(),
-            "jobDigest": job_digest(job),
+            "jobDigest": job_digest_cached(job),
         }
         stream = self._inflight_stream(job.name)
         try:
@@ -11368,9 +11368,8 @@ class Cron:
         ):
             self._persist_retry_settled(name, "invalid-record")
             return None
-        if not retry["maximumRetries"] or rec.get("jobDigest") != job_digest(
-            job
-        ):
+        rec_digest = rec.get("jobDigest")
+        if not retry["maximumRetries"] or rec_digest != job_digest_cached(job):
             # retries disabled since arming, or any behaviour-affecting
             # field changed: the old ladder must not run the new definition
             # (nor lurk until a later config revert).
@@ -12118,7 +12117,7 @@ class Cron:
             "kind": "pending",
             "attempt": attempt,
             "notBefore": not_before.isoformat(),
-            "jobDigest": job_digest(job),
+            "jobDigest": job_digest_cached(job),
             # the arming node: on a shared store another node's boot must
             # neither re-arm this ladder (its owner is alive) nor settle it.
             "host": self._state_host,
@@ -12868,7 +12867,7 @@ class Cron:
             "kind": "pending",
             "attempt": attempt,
             "notBefore": not_before.isoformat(),
-            "jobDigest": job_digest(job),
+            "jobDigest": job_digest_cached(job),
             "host": self._state_host,
             "at": get_now(datetime.timezone.utc).isoformat(),
             "claimedFrom": rec.get("host") or rec.get("fromHost"),
@@ -12924,7 +12923,7 @@ class Cron:
             or not_before is None
         ):
             return None
-        if rec.get("jobDigest") != job_digest(job):
+        if rec.get("jobDigest") != job_digest_cached(job):
             return None
         retry = job.onFailure["retry"]
         maximum = retry["maximumRetries"]
@@ -13049,7 +13048,7 @@ class Cron:
                     "kind": "handoff",
                     "attempt": retry_num,
                     "notBefore": now.isoformat(),
-                    "jobDigest": job_digest(job),
+                    "jobDigest": job_digest_cached(job),
                     "fromHost": self._state_host,
                     "at": now.isoformat(),
                     "armedAt": (

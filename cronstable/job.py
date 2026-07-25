@@ -891,8 +891,8 @@ class WebhookReporter(Reporter):
         # daemon's unconditional import graph (cron -> dagrun -> job), and
         # aiohttp is ~155 ms and ~21 MB of RSS. The webhook reporter is the
         # only thing in this file that wants it, so a daemon whose jobs never
-        # report over HTTP -- and every offline path that merely imports the
-        # module -- pays none of it. By the time control reaches here the
+        # report over HTTP pays none of it, and neither does an offline path
+        # that merely imports the module. By the time control reaches here the
         # reporter is already committed to making the call.
         import aiohttp
 

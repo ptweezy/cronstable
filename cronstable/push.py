@@ -1184,6 +1184,9 @@ class PushService:
         is_event = payload.get("kind") == "event"
         targets = [only] if only else list(self._devices.values())
 
+        # Past the module-scope guard (see the TYPE_CHECKING block at the top):
+        # this is the first of the two places that actually talk to the relay,
+        # and reaching it means an alert is already being sent.
         import aiohttp
 
         timeout = aiohttp.ClientTimeout(total=self.relay_timeout)
