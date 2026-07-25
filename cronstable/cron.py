@@ -1240,6 +1240,15 @@ class Cron:
         # lazily, cached here, and invalidated (set None) at every point
         # cron_jobs is reassigned.
         self._job_set_id_cache = None  # type: Optional[str]
+        # Memoized _needs_subminute answer, on the same lifecycle as the
+        # fingerprint above: a pure function of cron_jobs, invalidated
+        # wherever cron_jobs is reassigned. run() consults it on EVERY loop
+        # iteration to decide whether housekeeping is due, and a sub-minute
+        # job makes that once a second, so the underlying scan was O(all
+        # jobs) per second, worst-cased exactly when it hurts most: `any()`
+        # only short-circuits early if a second-level job happens to sit
+        # near the front of the job set.
+        self._needs_subminute_cache = None  # type: Optional[bool]
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
@@ -1391,6 +1400,7 @@ class Cron:
             self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
             self._notify_config = config.notify_config
             self._job_set_id_cache = None
+            self._needs_subminute_cache = None
 
         self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
         self._stop_event = asyncio.Event()
@@ -2023,10 +2033,12 @@ class Cron:
         # swap in the reloaded notify block (read live by _dispatch_notify), so
         # a reload that adds/edits/removes `notify:` takes effect at once.
         self._notify_config = config.notify_config
-        # The job set changed: drop the memoized fingerprint so the next
-        # job_set_id() recomputes it once. A failed parse raises before this
-        # point, so a bad reload never stales the cache.
+        # The job set changed: drop the memoized fingerprint and sub-minute
+        # flag so the next job_set_id() / _needs_subminute() recomputes once.
+        # A failed parse raises before this point, so a bad reload never
+        # stales either cache.
         self._job_set_id_cache = None
+        self._needs_subminute_cache = None
         # Drop metric series for jobs removed from the config, so a renamed
         # job does not leave a stale twin behind forever. A removed job with
         # an instance still running keeps its accumulator until the run
@@ -2356,6 +2368,8 @@ class Cron:
         # as Any; the in-house engine types it Optional[float], so spell out
         # the mixed-shape rows explicitly.
         out: List[Dict[str, Any]] = []
+        # one clock read for the whole pass; see _scheduled_in's `now`
+        now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
             running = self.running_jobs.get(name, None)
             if running:
@@ -2382,7 +2396,7 @@ class Cron:
             else:
                 crontab = job.schedule  # type: Union[CronTab, str]
                 scheduled_in = (
-                    self._scheduled_in(name, job, False)
+                    self._scheduled_in(name, job, False, now)
                     if isinstance(crontab, CronTab)
                     else str(crontab)
                 )
@@ -2465,7 +2479,7 @@ class Cron:
                 failing += 1
             if self._schedule_never_fires(name, job):
                 never_fires += 1
-            scheduled_in = self._scheduled_in(name, job, is_running)
+            scheduled_in = self._scheduled_in(name, job, is_running, now)
             if scheduled_in is not None and pause is not None:
                 # a fire the pause window covers is skipped at the gate, so
                 # it must not be reported as the fleet's next fire; a fire
@@ -4311,7 +4325,11 @@ class Cron:
         )
 
     def _scheduled_in(
-        self, name: str, job: JobConfig, running: bool
+        self,
+        name: str,
+        job: JobConfig,
+        running: bool,
+        now: Optional[datetime.datetime] = None,
     ) -> Optional[float]:
         """Seconds until the job's next scheduled run.
 
@@ -4324,6 +4342,14 @@ class Cron:
         gossiped fleet summary.  The engine search survives only as the
         fallback for the startup window before the loop's first pass
         seeds the index.
+
+        ``now`` (aware UTC) lets a caller looping over the whole job set
+        read the clock ONCE for the pass instead of once per job: the
+        payload builders each ran a fresh ``datetime.now`` per job, which
+        on a large fleet is thousands of redundant clock reads per
+        request.  Passing it also makes the resulting snapshot internally
+        consistent, every countdown measured from the same instant rather
+        than from instants drifting apart across the loop.
         """
         if not job.enabled or running:
             return None
@@ -4334,7 +4360,8 @@ class Cron:
         if when is not None:
             # clamped at zero: a job due this very instant reads as
             # marginally past until the pass advances it beyond its slot
-            now = get_now(datetime.timezone.utc)
+            if now is None:
+                now = get_now(datetime.timezone.utc)
             return max(0.0, (when - now).total_seconds())
         if name in self._dead_schedules:
             # no future occurrence; the engine's answer would be None too,
@@ -4382,13 +4409,15 @@ class Cron:
         API.
         """
         out: Dict[str, Any] = {}
+        # one clock read for the whole pass; see _scheduled_in's `now`
+        now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
             running = bool(self.running_jobs.get(name))
             last = self.last_run.get(name)
             out[name] = {
                 "running": running,
                 "enabled": job.enabled,
-                "scheduled_in": self._scheduled_in(name, job, running),
+                "scheduled_in": self._scheduled_in(name, job, running, now),
                 "last": (
                     None
                     if last is None
@@ -4402,11 +4431,18 @@ class Cron:
             }
         return out
 
-    def _job_to_dict(self, name: str, job: JobConfig) -> Dict[str, Any]:
+    def _job_to_dict(
+        self,
+        name: str,
+        job: JobConfig,
+        now: Optional[datetime.datetime] = None,
+    ) -> Dict[str, Any]:
         running = self.running_jobs.get(name) or []
         # next scheduled run, in seconds; None when not applicable (disabled,
-        # currently running, or a one-off @reboot schedule).
-        scheduled_in = self._scheduled_in(name, job, bool(running))
+        # currently running, or a one-off @reboot schedule).  ``now`` is the
+        # caller's pass instant when it is looping the job set; see
+        # _scheduled_in.
+        scheduled_in = self._scheduled_in(name, job, bool(running), now)
         # a dead schedule's None means NEVER, which the dashboards must be
         # able to tell apart from the running/disabled Nones above.  For a
         # job that is not running, _scheduled_in above already answered
@@ -4605,8 +4641,10 @@ class Cron:
 
     def jobs_payload(self) -> List[Dict[str, Any]]:
         """Full per-job dicts for ``GET /jobs`` and MCP ``cron_list_jobs``."""
+        # one clock read for the whole pass; see _scheduled_in's `now`
+        now = get_now(datetime.timezone.utc)
         return [
-            self._job_to_dict(name, job)
+            self._job_to_dict(name, job, now)
             for name, job in self.cron_jobs.items()
         ]
 
@@ -7194,10 +7232,23 @@ class Cron:
         rereading and reparsing the config on every wake would be pointless
         IO/CPU, so housekeeping still runs at most once per wall-clock minute.
         Only enabled jobs count: a disabled second-level job never runs.
+
+        Memoized on :attr:`_needs_subminute_cache`: :meth:`run` asks once per
+        loop iteration, which a second-level job makes once a SECOND, while
+        the answer is a pure function of the job set and so can only change
+        on a reload (``enabled`` and ``has_seconds`` are both fixed at
+        JobConfig construction and nothing mutates a live one).  Every site
+        that reassigns ``cron_jobs`` clears the cache.
         """
-        return any(
-            job.has_seconds for job in self.cron_jobs.values() if job.enabled
-        )
+        cached = self._needs_subminute_cache
+        if cached is None:
+            cached = any(
+                job.has_seconds
+                for job in self.cron_jobs.values()
+                if job.enabled
+            )
+            self._needs_subminute_cache = cached
+        return cached
 
     # ---- next-fire index ------------------------------------------------
     #

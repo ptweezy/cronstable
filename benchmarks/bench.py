@@ -88,6 +88,7 @@ class Skip(Exception):
 
 _BENCHMARKS = []
 _FIX = {}
+_FIX_FINAL = {}
 _SESSION_TMP = None
 _SRC_FALLBACK = None
 
@@ -126,11 +127,59 @@ def _tmpdir() -> str:
     return _SESSION_TMP
 
 
-def fixture(name, builder):
-    """Build-once shared setup, excluded from every timed region."""
+def fixture(name, builder, finalizer=None):
+    """Build-once shared setup, excluded from every timed region.
+
+    ``finalizer`` is called with the built value when the harness evicts the
+    group's fixtures (group boundary and end of suite).  It is for fixtures
+    that hold external state a plain drop-the-reference eviction cannot
+    release: the Playwright fixture parks a RUNNING event loop on the harness
+    thread between sync-API calls, and only its finalizer (pw.stop()) frees
+    the thread for the asyncio.run() benchmarks in later groups.  Finalizers
+    must be idempotent: the atexit safety net may call them again.
+    """
     if name not in _FIX:
         _FIX[name] = builder()
+        if finalizer is not None:
+            _FIX_FINAL[name] = finalizer
     return _FIX[name]
+
+
+def _evict_fixtures(group):
+    """Finalize and drop every cached fixture, then audit loop hygiene.
+
+    Groups are the eviction boundary (see the caller in main()), so this is
+    also where the harness thread must be clean again.  A fixture that parks
+    a running event loop and lacks a finalizer would otherwise silently skip
+    every later asyncio.run() benchmark, on BOTH sides of the paired CI
+    comparison, which a release run then fails as dead gates (the 1.2.31
+    webui/Playwright incident).  Failing here instead names the offending
+    group while the innocent downstream benchmarks are still unharmed.
+    """
+    import asyncio
+
+    for name, fin in _FIX_FINAL.items():
+        try:
+            fin(_FIX[name])
+        except Exception as exc:
+            print(
+                "note: fixture %r finalizer failed: %r" % (name, exc),
+                file=sys.stderr,
+            )
+    _FIX_FINAL.clear()
+    _FIX.clear()
+    gc.collect()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    raise SystemExit(
+        "fixture hygiene: group %r left an event loop running on the "
+        "harness thread after eviction; every benchmark calling "
+        "asyncio.run() after this group would silently skip. Give the "
+        "offending fixture a finalizer that shuts the loop down (see "
+        "_web_page)." % group
+    )
 
 
 def bench(
@@ -3277,7 +3326,13 @@ def bench_tui_drawer_paint():
 def _web_page():
     """Launch headless Chromium once and load the hooked dashboard page.
 
-    Cached for the whole webui group (torn down at interpreter exit); a missing
+    Cached for the webui group and shut down by its fixture finalizer at the
+    group boundary: Playwright's sync API parks a RUNNING asyncio loop on the
+    calling thread between calls, so leaving the session open (the pre-1.2.31
+    "torn down at interpreter exit" design) made every later asyncio.run()
+    benchmark skip on both sides of the CI pairing, a dead-gate failure on
+    release runs.  For the same reason every early exit here (failed launch,
+    hookless page) stops the session before raising Skip; a missing
     dependency, a failed launch, or a hookless page each raise Skip so the
     metrics record as skipped, never failed.
     """
@@ -3297,20 +3352,48 @@ def _web_page():
             raise Skip("cronstable.web unavailable: %r" % exc) from None
         if not os.path.exists(page_path):
             raise Skip("web/index.html not found next to cronstable.web")
+        pw = None
+        browser = None
+        done = []
+
+        def close():
+            # Idempotent: called by the fixture finalizer at the group
+            # boundary, and again by the atexit net if the suite dies first.
+            if done:
+                return
+            done.append(True)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if pw is not None:
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
+
         try:
             pw = sync_playwright().start()
             browser = pw.chromium.launch()
+            page = browser.new_page()
+            page.goto("file://" + page_path.replace("\\", "/") + "?perf=1")
+            page.wait_for_timeout(300)
+            if not page.evaluate("() => !!(window.__perf)"):
+                raise Skip(
+                    "page lacks the ?perf=1 __perf hook (older release)"
+                )
+        except Skip:
+            close()
+            raise
         except Exception as exc:
-            raise Skip("chromium launch failed: %r" % exc) from None
-        atexit.register(lambda: (browser.close(), pw.stop()))
-        page = browser.new_page()
-        page.goto("file://" + page_path.replace("\\", "/") + "?perf=1")
-        page.wait_for_timeout(300)
-        if not page.evaluate("() => !!(window.__perf)"):
-            raise Skip("page lacks the ?perf=1 __perf hook (older release)")
-        return page
+            close()
+            raise Skip("chromium launch/page load failed: %r" % exc) from None
+        atexit.register(close)
+        return page, close
 
-    return fixture("web_page", build)
+    page, _close = fixture("web_page", build, finalizer=lambda pair: pair[1]())
+    return page
 
 
 def _web_time(page, setup_js, op_js, batch=10, batches=12):
@@ -4549,10 +4632,11 @@ def main(argv=None):
         # a group; without this the cache held the UNION of every group's
         # fixtures resident for the whole suite. Benchmarks are registered
         # grouped, so a group change is a safe eviction boundary (a fixture a
-        # later group still needs is simply rebuilt, untimed).
+        # later group still needs is simply rebuilt, untimed).  Eviction runs
+        # finalizers and audits the harness thread for a parked event loop;
+        # see _evict_fixtures.
         if prev_group is not None and spec["group"] != prev_group:
-            _FIX.clear()
-            gc.collect()
+            _evict_fixtures(prev_group)
         prev_group = spec["group"]
         result = _run_one(spec)
         results.append(result)
@@ -4561,6 +4645,10 @@ def main(argv=None):
         else:
             line = _fmt(result["value"], result["unit"])
         print("%-28s %s" % (result["name"], line), flush=True)
+    # The last group's fixtures get the same finalize-and-audit pass; without
+    # this a leak in the final group would only surface once it stopped being
+    # final.
+    _evict_fixtures(prev_group)
 
     # The job's timeout ceiling is a budget; this is the itemized bill.  The
     # top of the list is where CI seconds actually go (fixtures included),

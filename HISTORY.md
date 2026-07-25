@@ -5,18 +5,25 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## 1.2.31 (2026-07-24)
+## 1.2.31 (2026-07-25)
 
-An alerting-reach release. A fifth reporter delivers end-to-end encrypted push
-alerts to paired devices through a hosted relay that never sees plaintext; a
-device-pairing API and a dashboard QR panel manage those pairings; a new
-`GET /whoami` tells any client what its bearer token may do; and an opt-in
-Bonjour/mDNS advert lets a companion app on the same network find the daemon
-without a typed URL. Both capabilities are optional extras (`push`,
-`discovery`) and both fail closed at config load: a config that asks for
-either on an install without the library refuses to start instead of silently
-not alerting or not advertising. (Rename this `Unreleased` heading to the cut
-version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
+An alerting-reach release, with a round of hot-path tuning alongside it. A
+fifth reporter delivers end-to-end encrypted push alerts to paired devices
+through a hosted relay that never sees plaintext; a device-pairing API and a
+dashboard QR panel manage those pairings; a new `GET /whoami` tells any client
+what its bearer token may do; and an opt-in Bonjour/mDNS advert lets a
+companion app on the same network find the daemon without a typed URL. Both
+capabilities are optional extras (`push`, `discovery`) and both fail closed at
+config load: a config that asks for either on an install without the library
+refuses to start instead of silently not alerting or not advertising.
+
+A full CPU-efficiency review then took the remaining cost out of the cron
+engine, the Prometheus scrape and the run loop's per-tick bookkeeping. Every
+figure in those sections is from an A/B benchmark of this release against the
+previous one on the same machine, and every change is output-identical:
+the engine's answers are pinned by the golden vectors plus a 104,244-case
+differential against the previous implementation, and a scrape renders
+byte-for-byte the same exposition text.
 
 ### End-to-end encrypted push alerts (the `push` reporter)
 
@@ -105,6 +112,73 @@ version at release time; see [Contributing](CONTRIBUTING.md#releasing).)
   push, a *runtime* mDNS failure only logs and leaves the advert off until
   the next config apply: discovery is a convenience and must never take down
   a scheduler.
+
+### The cron engine tests fewer candidates per search
+
+- **The day walk stops calling a method per candidate day.** Both day columns
+  are plain value sets in all but the L / W / `#` schedules, and the
+  unrestricted spelling of either column has already expanded to that
+  column's full range, so the both-restricted AND rule needs no special case:
+  such a schedule now tests a day with two set lookups inline, carrying the
+  weekday forward instead of building a fresh `datetime.date` for it. The
+  `_day_matches` / `_dom_matches` call pair it replaces was about 28% of a
+  `next()` on the profile, because the loop runs once per candidate day and a
+  sparse schedule (`0 0 29 2 *`) walks most of a month to find its answer.
+  Schedules that do use the L / W / `#` families take the old path unchanged.
+- **The month length is computed, not looked up.** `calendar.monthrange`
+  validates its argument through an `enum.Month` lookup and computes the
+  month's first weekday, the half of its result pair this engine never reads;
+  the arithmetic that replaces it measured about 12x cheaper, and it runs
+  once per candidate month and once per `test()`.
+- **The time-of-day columns are binary-searched.** Locating the first
+  matching hour, minute and second used to scan the sorted columns one value
+  at a time, so a plain `* * * * *` seeded at 10:30 stepped through roughly
+  40 values; `bisect` gets there in a couple of probes.
+- **A per-call copy is gone from every search entry point.** `next`, `prev`
+  and `occurrences` each opened by stripping a tzinfo to get a naive civil
+  label, which for an already-naive argument only bought a copy of it; the
+  aware paths of `next` and `occurrences` then overwrote that label with a
+  properly seeded one without ever reading it.
+- Together: `next()` over 20k plain tabs is 37% faster, `test()` over 200k
+  matches 38%, occurrence enumeration 36%, `next()` over complex tabs 18%,
+  and zoned `next()` across real DST transitions 15%. The scheduler inherits
+  it: reseeding a 100k-job index is 39% faster, a cold 100k-job build 12%,
+  and a due-fire pass 16%. The iCal feed (17%) and the schedule preview
+  endpoints (21%) ride the same searches.
+
+### Prometheus scrapes build each label block once
+
+- **A sample's `{k="v",...}` block is memoized for the pass.** One job's
+  label set recurs across about nine families in a scrape (each counter,
+  each gauge), and the block was reassembled from a generator expression, a
+  `str.join` and a `format` per label every single time; only the escaping
+  was cached. Keying the memo on the label items collapses that to one
+  assembly per distinct label set, and the one- and two-label shapes that
+  are nearly every sample skip the generator machinery entirely on a miss.
+  The memo lives and dies with the one render pass, so nothing is served
+  stale across scrapes.
+- **The per-sample line is built inline** in the renderer instead of through
+  a helper whose call frame and `(name, block)` tuple cost more than the two
+  lines they saved. Rendering a 500-job scrape is 29% faster; on a 3,000-job
+  fleet the exposition step measured 85ms before and 71ms now, for the same
+  72,006 samples and byte-identical output.
+
+### The run loop and the payload builders stop repeating themselves
+
+- **The sub-minute check is memoized.** `run()` asks whether any enabled job
+  fires at second granularity on *every* loop iteration, which a second-level
+  job makes once a second, and the underlying scan is O(all jobs). It was
+  worst-cased exactly where it hurts most, since the scan only short-circuits
+  early when a second-level job happens to sit near the front of the job set.
+  The answer can only change on a reload, so it now rides the same cache
+  lifecycle as the job-set fingerprint and is cleared wherever the job set is
+  swapped.
+- **`/jobs`, `/status`, `/summary` and the gossiped fleet summaries read the
+  clock once per request** instead of once per job. Besides the redundant
+  work at fleet scale, this makes each snapshot internally consistent: every
+  countdown is now measured from one instant rather than from instants
+  drifting apart across the loop. The `/jobs` payload for 500 jobs is 8%
+  faster, and the MCP tool dispatch that shares these builders 24%.
 
 ## 1.2.30 (2026-07-23)
 
