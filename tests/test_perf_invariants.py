@@ -1,0 +1,292 @@
+"""Count and ordering invariants extracted from the benchmark-suite reviews.
+
+Five separate benchmark candidates across the 2026-07 investigations turned
+out to be COUNT or ORDERING invariants, not timings: the fsync barrier
+protocol, the once-per-batch process-table walk, the 413-before-fetch
+artifact contract, the per-run durable-write count, and artifact prune
+residency.  A perf gate is the wrong tool for those -- it measures a proxy
+(elapsed time) that is platform-dependent, noisy, and blind in one
+direction -- while a test gates the invariant itself in BOTH directions, on
+every platform, on every matrix Python, in milliseconds.  This file is
+those five tests; benchmarks/README.md's waiver section points here.
+"""
+
+import asyncio
+import os
+
+import pytest
+
+import cronstable.state as state_mod
+from cronstable import jobstate
+from cronstable.cron import Cron
+from cronstable.jobstate import JobStateError
+from cronstable.state import FilesystemStateBackend
+
+from tests.test_state import _drain_state_writes, _state_cfg
+
+
+def _backend(path):
+    return FilesystemStateBackend(
+        {"path": str(path), "topology": "single-node", "deploymentId": None},
+        lambda: "test-jobset",
+    )
+
+
+# --- 1. the fsync barrier protocol ----------------------------------------
+#
+# Each appended record must be made durable by exactly one file fsync AND
+# exactly one directory barrier (the rename's directory entry needs its own
+# flush, or a power loss can drop a perfectly-fsynced file).  Counting the
+# BARRIER CALL rather than its platform implementation makes the test equal
+# on POSIX (where the barrier is an os.fsync of the directory) and Windows
+# (FlushFileBuffers via ctypes, where an os.fsync count is blind to a lost
+# directory barrier -- the dangerous direction).  Exact equality gates both
+# ways: a dropped barrier AND a superlinear re-sync regression.
+
+
+async def test_append_pays_one_file_fsync_and_one_dir_barrier(
+    tmp_path, monkeypatch
+):
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        # create the stream first: the first append also pays the durable
+        # mkdir of the stream directory, which is its own (once-only) cost,
+        # not part of the steady-state protocol under test.
+        await backend.append_record("runs", {"seq": -1})
+
+        file_fsyncs = []
+        dir_barriers = []
+        real_fsync = os.fsync
+
+        def counting_fsync(fd):
+            file_fsyncs.append(fd)
+            return real_fsync(fd)
+
+        def counting_barrier(path):
+            dir_barriers.append(path)
+            # deliberately not called through: the count IS the contract,
+            # and skipping the real flush keeps the test fast on slow disks.
+
+        monkeypatch.setattr(os, "fsync", counting_fsync)
+        monkeypatch.setattr(state_mod, "fsync_directory", counting_barrier)
+
+        n = 25
+        for i in range(n):
+            await backend.append_record("runs", {"seq": i})
+
+        assert len(file_fsyncs) == n, (
+            "each append must fsync its record file exactly once"
+        )
+        assert len(dir_barriers) == n, (
+            "each append must flush its directory entry exactly once; a "
+            "lost barrier means a crash can silently drop durable records"
+        )
+    finally:
+        monkeypatch.undo()
+        await backend.stop()
+
+
+# --- 2. one process-table walk per sample batch ---------------------------
+#
+# K concurrently monitored runs must cost ONE table snapshot per due tick,
+# not K: the shared ticker indexes psutil's _ppid_map once and every due
+# monitor folds its own tree from that index.
+
+
+def test_sample_batch_walks_the_process_table_once(monkeypatch):
+    psutil = pytest.importorskip("psutil")
+    from cronstable import resources
+
+    walks = []
+    real_map = psutil._ppid_map
+
+    def counting_map():
+        walks.append(1)
+        return real_map()
+
+    monkeypatch.setattr(psutil, "_ppid_map", counting_map)
+
+    class _StubMonitor:
+        def __init__(self):
+            self.samples = []
+
+        def _sample(self, index):
+            self.samples.append(index)
+
+    for k in (1, 5, 12):
+        walks.clear()
+        monitors = [_StubMonitor() for _ in range(k)]
+        resources._SharedSampleTicker._sample_batch(monitors)
+        assert len(walks) == 1, (
+            "a batch of %d monitors walked the table %d times; the shared "
+            "ticker must snapshot once per due tick regardless of K"
+            % (k, len(walks))
+        )
+        for monitor in monitors:
+            assert len(monitor.samples) == 1
+
+
+# --- 3. 413 before fetch --------------------------------------------------
+#
+# An artifact over the caller's byte budget must be refused from its RECORD
+# metadata, before the payload blob is ever fetched, so an oversized
+# artifact can never enter daemon memory on the read path.
+
+
+async def test_oversized_artifact_413s_before_the_blob_is_fetched(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        payload = b"x" * 4096
+        await jobstate.artifact_put(backend, "scope", "big", payload)
+
+        fetches = []
+        real_get_blob = backend.get_blob
+
+        async def spying_get_blob(digest):
+            fetches.append(digest)
+            return await real_get_blob(digest)
+
+        backend.get_blob = spying_get_blob  # type: ignore[method-assign]
+
+        with pytest.raises(JobStateError) as err:
+            await jobstate.artifact_get(
+                backend, "scope", "big", max_bytes=1024
+            )
+        assert err.value.status == 413
+        assert fetches == [], (
+            "the oversized artifact's blob was fetched before the 413; the "
+            "cap must be enforced from the record's stored size"
+        )
+
+        # the healthy direction: under budget, exactly one blob fetch.
+        result = await jobstate.artifact_get(
+            backend, "scope", "big", max_bytes=65536
+        )
+        assert result is not None and result[1] == payload
+        assert len(fetches) == 1
+    finally:
+        await backend.stop()
+
+
+# --- 4. the per-run durable-write count -----------------------------------
+#
+# One completed scheduled run writes a FIXED set of durable records: the
+# inflight open, the finished-run ledger record, the inflight close, plus
+# (for the FIRST persist in any COUNTER_SNAPSHOT_INTERVAL window) one
+# durable counter snapshot.  A regression that adds per-run writes (they
+# compound per job per fire, forever) or drops one (a close left open reads
+# as a phantom interrupted run on the next boot) changes the count.  The
+# open must precede the close within the inflight stream; cross-stream
+# ordering rides worker-lane scheduling and is deliberately not pinned.
+
+
+_RUN_JOB = """
+jobs:
+  - name: j
+    command: ls
+    schedule: "0 0 * * *"
+"""
+
+
+async def test_one_run_writes_open_record_close_and_nothing_else(tmp_path):
+    cron = Cron(None, config_yaml=_RUN_JOB)
+    cfg = _state_cfg(
+        "state:\n  path: %s\n  jobApi:\n    enabled: false\n" % tmp_path
+    )
+    await cron.start_stop_state(cfg)
+    assert cron.state_backend is not None
+    try:
+        backend = cron.state_backend
+        events = []
+        real_append = backend.append_record
+
+        async def spying_append(stream, data, **kwargs):
+            events.append((stream, data.get("kind") or data.get("outcome")))
+            return await real_append(stream, data, **kwargs)
+
+        backend.append_record = spying_append  # type: ignore[method-assign]
+
+        # the reaper's own two steps, driven directly (the run loop's
+        # _wait_for_running_jobs does exactly this per finished job)
+        await cron.launch_scheduled_job(cron.cron_jobs["j"])
+        running = cron.running_jobs["j"][0]
+        await running.wait()
+        await cron._handle_finished_job(running)
+        await _drain_state_writes(cron)
+
+        inflight = [kind for stream, kind in events if stream == "inflight/j"]
+        runs = [kind for stream, kind in events if stream == "runs/j"]
+        counters = [
+            stream for stream, _kind in events if stream.startswith("counters/")
+        ]
+        assert inflight == ["open", "closed"], (
+            "the inflight stream must see exactly open then closed; got %r"
+            % (events,)
+        )
+        assert runs == ["success"], (
+            "exactly one ledger record per run; got %r" % (events,)
+        )
+        assert len(counters) == 1, (
+            "the first persist in a snapshot window carries exactly one "
+            "durable counter snapshot; got %r" % (events,)
+        )
+        assert len(events) == 4, (
+            "a completed run wrote %d durable records, expected exactly 4 "
+            "(open, ledger, close, counter snapshot); every extra write "
+            "here compounds per job per fire forever: %r"
+            % (len(events), events)
+        )
+    finally:
+        await _drain_state_writes(cron)
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+# --- 5. artifact prune residency ------------------------------------------
+#
+# Publishing under a name supersedes the previous version, and the stream
+# must stay bounded by the DISTINCT-NAME count (plus the documented
+# amortisation slack), never by the publish count -- while the newest
+# version of every name must survive pruning intact.
+
+
+async def test_artifact_stream_residency_is_bounded_by_distinct_names(
+    tmp_path,
+):
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        names = 4
+        puts = 60
+        for i in range(puts):
+            await jobstate.artifact_put(
+                backend,
+                "scope",
+                "report-%d" % (i % names),
+                ("payload-%d" % i).encode(),
+            )
+        stream = jobstate.ARTIFACT_STREAM_PREFIX + "scope"
+        records = await backend.list_records(stream)
+        slack = getattr(state_mod, "_PRUNE_EVERY_APPENDS", 8) - 1
+        assert len(records) <= names + slack, (
+            "%d publishes over %d names left %d records resident; the "
+            "prune-by-name bound broke and the store grows with publish "
+            "count" % (puts, names, len(records))
+        )
+        # over-pruning is the other direction: every name's NEWEST version
+        # must read back intact.
+        listing = await jobstate.artifact_list(backend, "scope")
+        assert sorted(rec["name"] for rec in listing) == [
+            "report-%d" % i for i in range(names)
+        ]
+        for i in range(names):
+            result = await jobstate.artifact_get(
+                backend, "scope", "report-%d" % i
+            )
+            assert result is not None
+            last_version = puts - names + i
+            assert result[1] == ("payload-%d" % last_version).encode()
+    finally:
+        await backend.stop()
