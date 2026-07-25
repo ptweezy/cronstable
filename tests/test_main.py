@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -105,9 +106,7 @@ def test_third_party_licenses_prints_and_exits(monkeypatch, capsys):
     # also proves importlib.resources can actually reach it (a rename or
     # a package-data regression would fail here, long before a frozen
     # binary ships without its LGPL notice).
-    monkeypatch.setattr(
-        sys, "argv", ["cronstable", "--third-party-licenses"]
-    )
+    monkeypatch.setattr(sys, "argv", ["cronstable", "--third-party-licenses"])
     with pytest.raises(SystemExit) as exc:
         main.main_loop(_loop())
     assert exc.value.code == 0
@@ -276,14 +275,71 @@ def test_validate_config_exits_0(monkeypatch, caplog):
             pass
 
     monkeypatch.setattr("cronstable.cron.Cron", FakeCron)
-    monkeypatch.setattr(
-        sys, "argv", ["cronstable", "-c", "config.yaml", "-v"]
-    )
+    monkeypatch.setattr(sys, "argv", ["cronstable", "-c", "config.yaml", "-v"])
     with caplog.at_level(logging.INFO, logger="cronstable"):
         with pytest.raises(SystemExit) as exc:
             main.main_loop(_loop())
     assert exc.value.code == 0
     assert "Configuration is valid." in caplog.text
+
+
+def test_main_loop_builds_and_closes_its_own_loop(monkeypatch):
+    # No loop passed (how main() calls it now): one is built for the daemon
+    # branch and closed again, so every branch that exits earlier -- --version,
+    # --third-party-licenses, the job-facing thin clients -- never builds one
+    # and never imports asyncio at all.
+    built = []
+
+    class RunCron:
+        def __init__(self, config):
+            pass
+
+        async def run(self):
+            pass
+
+        def signal_shutdown(self):
+            pass
+
+    def fake_new_event_loop():
+        loop = asyncio.new_event_loop()
+        built.append(loop)
+        return loop
+
+    monkeypatch.setattr("cronstable.cron.Cron", RunCron)
+    monkeypatch.setattr(main, "_new_event_loop", fake_new_event_loop)
+    monkeypatch.setattr(sys, "argv", ["cronstable", "-c", "config.yaml"])
+    main.main_loop()
+    assert len(built) == 1
+    assert built[0].is_closed()
+
+
+def test_version_never_builds_an_event_loop(monkeypatch):
+    # The pairing check for the above: an early-exit branch must not reach
+    # _new_event_loop, which is where `import asyncio` now lives.
+    def boom():  # pragma: no cover - the assertion is that it is not called
+        raise AssertionError("--version must not build an event loop")
+
+    monkeypatch.setattr(main, "_new_event_loop", boom)
+    monkeypatch.setattr(sys, "argv", ["cronstable", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop()
+    assert exc.value.code == 0
+
+
+def test_daemon_executor_is_sized_and_named():
+    # The shared default pool carries the config reparse, the leadership lease
+    # round-trip and every per-completion offload, so a 1-2 vCPU container must
+    # not be left at CPython's cpu_count-derived 5-6 slots.
+    assert 8 <= main.executor_workers() <= 32
+    loop = asyncio.new_event_loop()
+    try:
+        main._install_default_executor(loop)
+        name = loop.run_until_complete(
+            loop.run_in_executor(None, lambda: threading.current_thread().name)
+        )
+    finally:
+        loop.close()
+    assert name.startswith(main.EXECUTOR_THREAD_PREFIX)
 
 
 def test_run_and_shutdown_wiring(monkeypatch):

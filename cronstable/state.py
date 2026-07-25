@@ -54,6 +54,7 @@ import hashlib
 import logging
 import math
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass
@@ -147,6 +148,28 @@ LEASE_CALL_SLOTS = 8
 # invisible to readers (listings are limit-bounded/newest-first, derived
 # cursors are monotonic maxima) and reclaimed by the next due prune.
 _PRUNE_EVERY_APPENDS = 8
+
+# Bound on the per-stream append countdown map (see _append_prune_due).  The
+# map gains one small entry per DISTINCT stream name and nothing ever removes
+# them, so a daemon whose stream names are unbounded (per-run log streams, a
+# job set churned by reloads) would grow it forever.  When the cap is reached
+# the map is cleared wholesale rather than evicted one key at a time: the
+# value is only a countdown, so losing it costs at most one extra prune pass
+# on the next append to each affected stream, which is the safe direction.
+_PRUNE_COUNTDOWN_MAX_STREAMS = 4096
+
+# Bounds on the per-backend record CONTENT cache (see
+# FilesystemStateBackend._read_record).  A record file is immutable and its
+# name is unique forever, so path -> bytes never goes stale and the only
+# question is how much to keep.  Entry count and total bytes are both capped
+# so a store of millions of records cannot turn a read-mostly daemon into a
+# memory hog, and a single oversized body (an archived-output record can
+# carry a whole log tail) is not cached at all rather than evicting a
+# thousand useful small ones.  The defaults hold a couple of full run
+# ledgers, which is what the repeat-read paths actually touch.
+_RECORD_CACHE_MAX_ENTRIES = 2048
+_RECORD_CACHE_MAX_BYTES = 4 * 1024 * 1024
+_RECORD_CACHE_MAX_ITEM_BYTES = 16 * 1024
 
 # Sentinels a :meth:`StateBackend.mutate_document` transform returns *in place
 # of* a new document body: leave the document exactly as it was (KEEP), or
@@ -846,6 +869,91 @@ class StateBackend(abc.ABC):
         }
 
 
+class _StateWorker:
+    """A persistent *daemon* thread that runs one state op at a time.
+
+    The unit the pool below hands work to.  Its whole reason to exist is that
+    creating an OS thread (stack, TLS, interpreter thread state, scheduler
+    enqueue) costs far more than the handoff of a callable to a thread already
+    parked on a queue -- and :meth:`FilesystemStateBackend._call` used to pay
+    that per op.
+
+    The worker returns itself to the idle pool only *after* the op it was
+    handed has fully returned, which is what preserves the abandonability the
+    old thread-per-call design bought: a worker wedged in an uninterruptible
+    syscall on a dead mount is never in the pool, so it is never handed
+    another op, and the next submit spawns a replacement instead of queueing
+    behind it.
+    """
+
+    __slots__ = ("_box",)
+
+    def __init__(self) -> None:
+        self._box: "queue.SimpleQueue[Callable[[], None]]" = (
+            queue.SimpleQueue()
+        )
+        # daemon: see _call's docstring.  A parked worker is blocked in the
+        # queue, not in a syscall, so it can never delay interpreter exit.
+        threading.Thread(
+            target=self._serve, daemon=True, name="cronstable-state"
+        ).start()
+
+    def submit(self, job: Callable[[], None]) -> None:
+        """Hand ``job`` to this (idle) worker.  Never blocks."""
+        self._box.put(job)
+
+    def _serve(self) -> None:
+        while True:
+            job = self._box.get()
+            try:
+                job()
+            finally:
+                # Drop the closure before parking: it holds this op's
+                # arguments and its result, which would otherwise stay
+                # reachable for as long as the worker sits idle.  An
+                # exception escaping the job propagates and ends this
+                # thread without parking it, so a worker is never reused
+                # after misbehaving.
+                job = None  # type: ignore[assignment]
+            if not _park_state_worker(self):
+                return
+
+
+# Idle state workers, parked between ops.  Process-wide rather than
+# per-backend because a parked worker holds no backend state at all: one
+# shared set means a process that builds many short-lived backends (the CLI,
+# the test suite) reuses a handful of threads instead of parking a fresh one
+# per backend.  How many can be BUSY at once is still bounded per backend, by
+# the two lanes' semaphores in _call.
+_IDLE_WORKERS: List[_StateWorker] = []
+_IDLE_WORKERS_LOCK = threading.Lock()
+
+# Cap on parked workers: the two lanes' slot caps, i.e. the most one backend
+# can ever have busy at once.  A worker finishing into a full pool exits
+# instead of parking, so the resident thread count stays bounded however many
+# backends a process builds.
+_MAX_IDLE_WORKERS = BULK_CALL_SLOTS + LEASE_CALL_SLOTS
+
+
+def _park_state_worker(worker: _StateWorker) -> bool:
+    """Return ``worker`` to the idle pool; ``False`` if it should exit."""
+    with _IDLE_WORKERS_LOCK:
+        if len(_IDLE_WORKERS) >= _MAX_IDLE_WORKERS:
+            return False
+        _IDLE_WORKERS.append(worker)
+        return True
+
+
+def _take_state_worker() -> _StateWorker:
+    """An idle worker, or a fresh one when none is parked."""
+    with _IDLE_WORKERS_LOCK:
+        if _IDLE_WORKERS:
+            # LIFO: reuse the most recently parked worker, whose stack and
+            # thread-local allocator arena are the warmest.
+            return _IDLE_WORKERS.pop()
+    return _StateWorker()
+
+
 class FilesystemStateBackend(StateBackend):
     """A durable state backend over any POSIX filesystem.
 
@@ -941,6 +1049,14 @@ class FilesystemStateBackend(StateBackend):
         self._derive_memo: Dict[Tuple[str, str], Tuple[str, Any]] = {}
         self._derive_wipe_gen: Dict[str, int] = {}
         self._derive_memo_lock = threading.Lock()
+        # Record content cache (see _read_record): absolute record path to the
+        # raw bytes of a record that already read back valid.  Insertion
+        # order is the LRU order.  Read and written from worker threads,
+        # hence the lock; the byte total is a running sum, which is why the
+        # plain-dict atomicity under the GIL is not enough on its own.
+        self._record_cache: Dict[str, bytes] = {}
+        self._record_cache_bytes = 0
+        self._record_cache_lock = threading.Lock()
 
     # --- paths -----------------------------------------------------------
 
@@ -1016,10 +1132,16 @@ class FilesystemStateBackend(StateBackend):
         non-daemonic and joined at interpreter exit, so one worker wedged in
         an uninterruptible NFS syscall (the classic dead-server hard mount)
         would hang process shutdown forever -- exactly what the bounded
-        shutdown flush promises cannot happen.  A daemon thread per call keeps
-        a hung store abandonable: callers can time out (``asyncio.wait_for``)
-        and exit; the OS reclaims the stuck thread.  State ops are low-rate
-        (a handful per finished run), so thread-per-call is cheap.
+        shutdown flush promises cannot happen.  Daemon threads keep a hung
+        store abandonable: callers can time out (``asyncio.wait_for``) and
+        exit; the OS reclaims the stuck thread.
+
+        The daemon threads are POOLED (:class:`_StateWorker`) rather than
+        created per call, which was ~130 us of pure dispatch on every state
+        op -- several times the store work itself on a read from a warm page
+        cache.  Abandonability is unchanged: a worker rejoins the pool only
+        once its op returns, so a wedged one is never handed more work and
+        the next op spawns a replacement.
 
         ``op`` labels the call in the self-observability stats: count, error
         count, and seconds of store time (measured around ``fn`` itself on
@@ -1103,11 +1225,9 @@ class FilesystemStateBackend(StateBackend):
                 pass
 
         try:
-            threading.Thread(
-                target=_runner, daemon=True, name="cronstable-state"
-            ).start()
+            _take_state_worker().submit(_runner)
         except BaseException:
-            slots.release()  # the thread never ran; nobody else will free it
+            slots.release()  # the op never ran; nobody else will free it
             self._exit_inflight(is_lease)
             raise
         return cast(_T, await future)
@@ -1445,6 +1565,11 @@ class FilesystemStateBackend(StateBackend):
         with self._prune_gate_lock:
             left = self._prune_countdown.get(stream, 0)
             if left <= 0:
+                if len(self._prune_countdown) >= _PRUNE_COUNTDOWN_MAX_STREAMS:
+                    # Bound the map (see _PRUNE_COUNTDOWN_MAX_STREAMS). Only
+                    # countdowns are lost, so the worst case is one extra
+                    # prune per stream on its next append.
+                    self._prune_countdown.clear()
                 self._prune_countdown[stream] = _PRUNE_EVERY_APPENDS - 1
                 return True
             self._prune_countdown[stream] = left - 1
@@ -1472,50 +1597,83 @@ class FilesystemStateBackend(StateBackend):
             # never let cleanup of a poison record raise into a read.
             pass
 
+    def _record_cache_get(self, path: str) -> Optional[bytes]:
+        with self._record_cache_lock:
+            raw = self._record_cache.get(path)
+            if raw is not None:
+                # move to the fresh end: a dict iterates in insertion order,
+                # which is the LRU order the eviction below evicts from.
+                del self._record_cache[path]
+                self._record_cache[path] = raw
+            return raw
+
+    def _record_cache_put(self, path: str, raw: bytes) -> None:
+        if len(raw) > _RECORD_CACHE_MAX_ITEM_BYTES:
+            return
+        with self._record_cache_lock:
+            if path in self._record_cache:
+                return  # another worker read the same record concurrently
+            self._record_cache[path] = raw
+            self._record_cache_bytes += len(raw)
+            while (
+                len(self._record_cache) > _RECORD_CACHE_MAX_ENTRIES
+                or self._record_cache_bytes > _RECORD_CACHE_MAX_BYTES
+            ):
+                oldest = next(iter(self._record_cache))
+                self._record_cache_bytes -= len(self._record_cache.pop(oldest))
+
     def _read_record(
         self, stream_dir: str, name: str, *, strict: bool = False
     ) -> Optional[Dict[str, Any]]:
+        """One record's ``data`` body, or ``None`` if it is not readable.
+
+        Best-effort reads (``strict=False``) are served from an in-memory
+        cache of record bytes, which is sound only because of the store's
+        central invariant: a record file is written once to a name that is
+        unique forever (write epoch + per-process instance + seq) and
+        thereafter only read or deleted, so ``path -> bytes`` can never go
+        stale and there is nothing to invalidate.  Only a body that read back
+        VALID is cached -- never a miss, an I/O error, a quarantine or an
+        unrecognised ``schemaVersion`` -- which also leaves
+        ``migrate_schema``'s in-place rewrite (the one sanctioned exception
+        to records-are-never-rewritten, and only ever of records this build
+        cannot read) invisible to it.  Each read still parses its own body,
+        so callers keep getting a private dict to mutate.
+
+        A ``strict`` read does not touch the cache in either direction.  Its
+        whole contract is that a record it cannot read RIGHT NOW must fail
+        the caller closed rather than be quietly resolved to something else
+        -- an environment failing is exactly what it exists to surface -- so
+        it always goes to the store, and never substitutes a body it happens
+        to remember.
+        """
         path = os.path.join(stream_dir, name)
+        raw = None if strict else self._record_cache_get(path)
+        cached = raw is not None
+        if raw is None:
+            try:
+                with open(path, "rb") as fobj:
+                    raw = fobj.read()
+            except FileNotFoundError:
+                # raced away (pruned/quarantined) between listdir and open.
+                return None
+            except OSError as ex:
+                self._log_unreadable_record(name, ex)
+                if strict:
+                    # A derived-watermark/cursor read MUST fail closed on an
+                    # environmental error: silently dropping this record would
+                    # let derive_max return the max over the surviving subset
+                    # -- a value strictly BELOW the true max -- and the
+                    # catch-up caller would replay an occurrence that already
+                    # ran.  Propagate so the caller treats the watermark as
+                    # UNKNOWN (defer/retry), never as a lower value.  (A
+                    # content-bad record is still skipped even here: it is
+                    # unrecoverable, and failing closed on it forever would
+                    # wedge the watermark.)
+                    raise
+                return None
         try:
-            with open(path, "rb") as fobj:
-                obj = _json.loads(fobj.read())
-        except FileNotFoundError:
-            # raced away (pruned/quarantined) between listdir and open: skip.
-            return None
-        except OSError as ex:
-            # An I/O error is the ENVIRONMENT failing (an NFS blip, an AV
-            # scanner's transient hold), not the record: skip it for this
-            # read but leave it in place.  Quarantining here would eject
-            # perfectly valid history -- and regress the derived watermark --
-            # on every store hiccup.
-            hint = ""
-            if isinstance(ex, PermissionError):
-                # data files are deliberately 0o600 (they carry job output):
-                # a persistent EACCES here usually means two nodes run as
-                # DIFFERENT users against one shared store, which silently
-                # hides half the history -- worth a pointed hint.
-                hint = (
-                    " (records are created 0o600: every node sharing this "
-                    "store must run as the same user)"
-                )
-            logger.warning(
-                "state: cannot read record %s (%s); leaving it in place%s",
-                name,
-                ex,
-                hint,
-            )
-            if strict:
-                # A derived-watermark/cursor read MUST fail closed on an
-                # environmental error: silently dropping this record would
-                # let derive_max return the max over the surviving subset --
-                # a value strictly BELOW the true max -- and the catch-up
-                # caller would replay an occurrence that already ran.
-                # Propagate so the caller treats the watermark as UNKNOWN
-                # (defer/retry), never as a lower value.  (A content-bad
-                # record is still skipped even here: it is unrecoverable, and
-                # failing closed on it forever would wedge the watermark.)
-                raise
-            return None
+            obj = _json.loads(raw)
         except Exception:  # noqa: BLE001 - any content-driven parse failure
             # The CONTENT is bad: invalid/truncated JSON (ValueError), or a
             # hostile shape like >1000-deep nesting (RecursionError).  This
@@ -1557,8 +1715,37 @@ class FilesystemStateBackend(StateBackend):
                     )
                 )
             return None
+        if not cached and not strict:
+            self._record_cache_put(path, raw)
         data: Dict[str, Any] = obj["data"]
         return data
+
+    @staticmethod
+    def _log_unreadable_record(name: str, ex: OSError) -> None:
+        """Report a record the ENVIRONMENT would not hand over just now.
+
+        An I/O error is the environment failing (an NFS blip, an AV
+        scanner's transient hold), not the record: it is skipped for this
+        read but left in place.  Quarantining here would eject perfectly
+        valid history -- and regress the derived watermark -- on every store
+        hiccup.
+        """
+        hint = ""
+        if isinstance(ex, PermissionError):
+            # data files are deliberately 0o600 (they carry job output):
+            # a persistent EACCES here usually means two nodes run as
+            # DIFFERENT users against one shared store, which silently
+            # hides half the history -- worth a pointed hint.
+            hint = (
+                " (records are created 0o600: every node sharing this "
+                "store must run as the same user)"
+            )
+        logger.warning(
+            "state: cannot read record %s (%s); leaving it in place%s",
+            name,
+            ex,
+            hint,
+        )
 
     async def list_records(
         self,

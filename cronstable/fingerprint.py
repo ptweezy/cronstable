@@ -43,7 +43,16 @@ which HA replicas are.
 
 import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Union
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 from cronstable.config import (
     DEFAULT_PUSH_REPORT,
@@ -61,6 +70,44 @@ SCHEME_VERSION = "v1"
 # never embeds secret material.  The surrounding structure (whether a secret
 # is set, and via value/fromFile/fromEnvVar) is still part of the identity.
 _SECRET_PLACEHOLDER = "<redacted>"
+
+# A memo entry keeps its source node alive alongside the derived value: the
+# key is id(source), and a freed source would let CPython hand the same id to
+# an unrelated object.
+_Hook = Dict[str, Any]
+_RedactTable = Dict[int, Tuple[_Hook, _Hook]]
+_NormalizeTable = Dict[int, Tuple[Any, Any]]
+
+
+class SharedNodeMemo(NamedTuple):
+    """Per-call memo over config subtrees many jobs share by identity.
+
+    ``config.mergedicts`` merges copy-on-write, so a job that does not
+    override a hook block ends up pointing at the very same dict every other
+    non-overriding job (and ``DEFAULT_CONFIG``) points at.  Those three hook
+    blocks are ~90% of a job's canonical payload, and without a memo
+    :func:`_redact_action` hands :func:`_normalize_numbers` a fresh copy per
+    job, so the shared subtree is re-walked once per job.
+
+    Both tables are needed together: a fresh redaction defeats the normalize
+    memo, and memoizing only the redaction still re-walks its result, so
+    either one alone measures as a regression.
+
+    Only :func:`_redact_action` ever *writes* ``normalized``, and only for a
+    block it just shared.  :func:`_normalize_numbers` reads it and stores
+    nothing, so a job's own one-off containers (its identity dict, its
+    command, its environment list) are walked and dropped exactly as before
+    rather than being pinned for the length of the call.  That keeps both
+    tables bounded by the number of *distinct* hook blocks in the fleet,
+    which is normally three, instead of by the number of jobs.
+    """
+
+    redacted: _RedactTable
+    normalized: _NormalizeTable
+
+
+def _new_memo() -> SharedNodeMemo:
+    return SharedNodeMemo({}, {})
 
 
 def _schedule_repr(job: JobConfig) -> str:
@@ -185,20 +232,37 @@ def _omit_default_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
     return report
 
 
-def _redact_action(action: Dict[str, Any]) -> Dict[str, Any]:
+def _redact_action(
+    action: Dict[str, Any], memo: Optional[SharedNodeMemo] = None
+) -> Dict[str, Any]:
     """Copy an on{Failure,PermanentFailure,Success} block, redacting secrets.
 
     Preserves everything else (e.g. the ``retry`` policy under ``onFailure``).
+
+    With a ``memo`` (see :class:`SharedNodeMemo`) the copy is made once per
+    distinct source block rather than once per job, and its normalization is
+    recorded at the same time so every job that inherits the block shares
+    both.  Returning a shared result is safe for the same reason the
+    copy-on-write redaction is: everything downstream only reads.
     """
+    if memo is not None:
+        hit = memo.redacted.get(id(action))
+        if hit is not None:
+            return hit[1]
     out = dict(action)
     if "report" in out and isinstance(out["report"], dict):
         out["report"] = _omit_default_report_fields(
             _redact_report(out["report"])
         )
+    if memo is not None:
+        memo.redacted[id(action)] = (action, out)
+        memo.normalized[id(out)] = (out, _normalize_numbers(out))
     return out
 
 
-def canonical_job(job: JobConfig) -> Dict[str, Any]:
+def canonical_job(
+    job: JobConfig, memo: Optional[SharedNodeMemo] = None
+) -> Dict[str, Any]:
     """Build the canonical, host-independent identity dict for one job.
 
     Includes every behavior-affecting field of the effective config.  The
@@ -213,6 +277,10 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
     :func:`job_digest`.  Omit-when-default keeps every pre-existing config's
     digest byte-identical without a scheme bump; a job that actually sets
     the new field gets (correctly) a new identity.
+
+    ``memo`` is an optional per-call :class:`SharedNodeMemo`.  Passing one
+    changes nothing about the identity that comes out, only how much of the
+    work is repeated across the jobs of one set.
     """
     out = {
         "name": job.name,
@@ -245,9 +313,9 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
         # what runs or when (see cronstable.config.JobConfig.__init__).
         "onlyIfLastSucceeded": job.onlyIfLastSucceeded,
         "failsWhen": job.failsWhen,
-        "onFailure": _redact_action(job.onFailure),
-        "onPermanentFailure": _redact_action(job.onPermanentFailure),
-        "onSuccess": _redact_action(job.onSuccess),
+        "onFailure": _redact_action(job.onFailure, memo),
+        "onPermanentFailure": _redact_action(job.onPermanentFailure, memo),
+        "onSuccess": _redact_action(job.onSuccess, memo),
         # Only the SET of variable NAMES is identity, never the values: env
         # values are a common place to carry secrets (and the id is logged and
         # served), and a per-host value (e.g. from env_file, read at parse
@@ -272,7 +340,9 @@ def canonical_job(job: JobConfig) -> Dict[str, Any]:
     return out
 
 
-def _normalize_numbers(obj: Any) -> Any:
+def _normalize_numbers(
+    obj: Any, memo: Optional[_NormalizeTable] = None
+) -> Any:
     """Collapse the int/float distinction by value, recursively.
 
     A whole-number float (``30.0``) canonicalizes to the same int (``30``) it
@@ -283,34 +353,51 @@ def _normalize_numbers(obj: Any) -> Any:
     breaking the inline-vs-defaults guarantee.  ``bool`` is left untouched (it
     is an ``int`` subclass but must stay ``true``/``false`` in JSON), and a
     fractional float (``0.5``) is preserved.
+
+    A ``memo`` (the ``normalized`` table of a :class:`SharedNodeMemo`)
+    short-circuits a subtree that has already been normalized under a
+    different job.  The result is a pure function of the node, so serving a
+    remembered one is byte-identical; the table is keyed by identity, never
+    equality, so nothing that merely *looks* alike is ever collapsed.
     """
     if isinstance(obj, bool):
         return obj
     if isinstance(obj, float) and obj.is_integer():
         return int(obj)
     if isinstance(obj, dict):
-        return {k: _normalize_numbers(v) for k, v in obj.items()}
+        if memo is not None:
+            hit = memo.get(id(obj))
+            if hit is not None:
+                return hit[1]
+        return {k: _normalize_numbers(v, memo) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_normalize_numbers(v) for v in obj]
+        return [_normalize_numbers(v, memo) for v in obj]
     return obj
 
 
-def _canonical_bytes(obj: Any) -> bytes:
+def _canonical_bytes(obj: Any, memo: Optional[SharedNodeMemo] = None) -> bytes:
     # sort_keys for order-independence; ensure_ascii so the byte output is
     # pure-ASCII and identical regardless of locale/encoding; compact
     # separators so there is exactly one serialization; _normalize_numbers so
     # int and float spellings of the same value cannot diverge.
+    table = memo.normalized if memo is not None else None
     return json.dumps(
-        _normalize_numbers(obj),
+        _normalize_numbers(obj, table),
         sort_keys=True,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("ascii")
 
 
-def job_digest(job: JobConfig) -> str:
-    """Hex SHA-256 of a single job's canonical identity."""
-    return hashlib.sha256(_canonical_bytes(canonical_job(job))).hexdigest()
+def job_digest(job: JobConfig, memo: Optional[SharedNodeMemo] = None) -> str:
+    """Hex SHA-256 of a single job's canonical identity.
+
+    ``memo``, when given, is a per-call :class:`SharedNodeMemo` shared with
+    the other jobs of the same set; it never changes the digest.
+    """
+    return hashlib.sha256(
+        _canonical_bytes(canonical_job(job, memo), memo)
+    ).hexdigest()
 
 
 def job_set_id(jobs: Iterable[JobConfig]) -> str:
@@ -320,7 +407,13 @@ def job_set_id(jobs: Iterable[JobConfig]) -> str:
     sorted (neutralizing order) and hashed together; an empty job set yields a
     stable, well-defined ID.
     """
-    digests = sorted(job_digest(job) for job in jobs)
+    # One memo for the whole set: the hook blocks are ~90% of a job's payload
+    # and most jobs inherit them from the same DEFAULT_CONFIG objects, so this
+    # is where the sharing pays.  It also pins every source node it keys on
+    # for its own lifetime, which is what makes the id() keys sound even if a
+    # caller feeds a generator that owns the only reference to each job.
+    memo = _new_memo()
+    digests = sorted(job_digest(job, memo) for job in jobs)
     combined = SCHEME_VERSION + "\n" + "\n".join(digests)
     final = hashlib.sha256(combined.encode("ascii")).hexdigest()
     return "{}:{}".format(SCHEME_VERSION, final)

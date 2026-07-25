@@ -20,7 +20,8 @@ needs
 the ``grp``/``pwd`` databases), but is likewise gated on :data:`IS_WINDOWS`.
 """
 
-import asyncio
+from __future__ import annotations
+
 import contextlib
 import errno
 import logging
@@ -28,7 +29,25 @@ import os
 import signal
 import sys
 import time
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Union,
+)
+
+# asyncio is imported lazily (inside _taskkill_tree, the one function that
+# reaches for it at runtime) and only for typing here: this module is what
+# ``cronstable`` the entry point imports for DEFAULT_CONFIG_PATH, so every
+# `cronstable --version` and every job-spawned `cronstable state get` used to
+# pay ~50ms and several MB of RSS for an event-loop package it never touches.
+# The annotations below are strings thanks to the __future__ import above.
+if TYPE_CHECKING:
+    import asyncio
 
 # Platform-specific file-locking primitive, imported behind a ``sys.platform``
 # guard so each OS pulls in only the module it has (``fcntl`` is Unix-only,
@@ -175,6 +194,8 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
 
 async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover - Windows-only
     """Kill ``pid`` and its process tree via ``taskkill /F /T``."""
+    import asyncio
+
     try:
         proc = await asyncio.create_subprocess_exec(
             "taskkill",

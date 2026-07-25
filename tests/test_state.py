@@ -748,6 +748,108 @@ async def test_malformed_record_shape_is_still_quarantined(tmp_path):
     assert any(n.startswith("00001-bad.json") for n in os.listdir(quarantine))
 
 
+# --- record content cache -------------------------------------------------
+
+
+async def test_record_content_cache_serves_repeat_reads(
+    tmp_path, monkeypatch
+):
+    # A record file is immutable and its name unique forever, so a second
+    # read of the same record must not open the file again.  Each read still
+    # hands back its OWN parsed body: callers mutate what they get back, and
+    # a shared dict would let one caller's edit rewrite history for the next.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"i": 1})
+    first = await backend.list_records("s")
+    assert first == [{"i": 1}]
+
+    opened = []
+    real_open = open
+
+    def counting_open(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    # shadow the module's open, the seam the other read tests patch too.
+    monkeypatch.setattr(state, "open", counting_open, raising=False)
+    second = await backend.list_records("s")
+    monkeypatch.undo()
+    assert second == [{"i": 1}]
+    assert opened == []  # served from memory, no second open
+    assert second[0] is not first[0]
+    second[0]["i"] = 99
+    assert (await backend.list_records("s")) == [{"i": 1}]
+
+
+async def test_record_content_cache_is_bounded(tmp_path, monkeypatch):
+    # Both bounds hold: an oversized body is never cached at all (one
+    # archived-output record must not evict a thousand useful small ones),
+    # and the cache evicts least-recently-read once it is full.
+    monkeypatch.setattr(state, "_RECORD_CACHE_MAX_ITEM_BYTES", 200)
+    monkeypatch.setattr(state, "_RECORD_CACHE_MAX_ENTRIES", 3)
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("big", {"blob": "x" * 400})
+    await backend.list_records("big")
+    assert backend._record_cache == {}
+
+    for i in range(5):
+        await backend.append_record("small", {"i": i})
+    await backend.list_records("small")
+    assert len(backend._record_cache) == 3
+    assert backend._record_cache_bytes == sum(
+        len(v) for v in backend._record_cache.values()
+    )
+    # the surviving entries are the newest read (the scan runs oldest first)
+    assert await backend.list_records("small") == [
+        {"i": i} for i in range(5)
+    ]
+
+
+async def test_record_content_cache_is_bypassed_by_strict_reads(
+    tmp_path, monkeypatch
+):
+    # strict is the fail-closed reader (derived watermarks, the mapped
+    # fan-out): a record it cannot read RIGHT NOW must fail the caller
+    # closed, never be resolved from a body this process happens to
+    # remember, so it reads the store in both directions.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("s", {"ts": 5})
+    assert await backend.derive_max("s", "ts") == 5
+    assert backend._record_cache == {}  # a strict read caches nothing
+
+    assert await backend.list_records("s") == [{"ts": 5}]  # this one does
+    assert backend._record_cache
+
+    def boom_open(path, *args, **kwargs):
+        raise PermissionError(13, "transient hold", str(path))
+
+    monkeypatch.setattr(state, "open", boom_open, raising=False)
+    assert await backend.list_records("s") == [{"ts": 5}]  # cache, no I/O
+    with pytest.raises(PermissionError):
+        await backend.list_records("s", strict=True)
+
+
+async def test_record_content_cache_never_holds_an_invalid_record(tmp_path):
+    # Only a body that read back VALID is cached, so a record this build
+    # cannot interpret keeps failing closed on every later read instead of
+    # being remembered as readable.
+    from cronstable.state import _DocumentUnreadable
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    stream_dir = backend._stream_dir("s")
+    os.makedirs(stream_dir, exist_ok=True)
+    with open(os.path.join(stream_dir, "00001-new.json"), "w") as fobj:
+        json.dump({"schemaVersion": "v99", "data": {"finished_at": "x"}}, fobj)
+    assert await backend.list_records("s") == []
+    assert backend._record_cache == {}
+    with pytest.raises(_DocumentUnreadable):
+        await backend.derive_max("s", "finished_at")
+
+
 # --- lease primitive ------------------------------------------------------
 
 
@@ -3050,6 +3152,34 @@ def test_mount_entry_skips_malformed_short_lines(monkeypatch):
     assert state._mount_entry("/anything") == ("rootfs", "rw")
 
 
+async def test_call_never_reuses_a_worker_still_stuck_in_an_op(tmp_path):
+    # What thread-per-call used to buy, the pool must keep: a worker wedged
+    # in an uninterruptible syscall on a dead mount is never handed another
+    # op.  A worker rejoins the idle pool only once its op RETURNS, so the
+    # next op runs on a different thread instead of queueing behind the
+    # wedged one forever.
+    backend = _backend(tmp_path)
+    await backend.start()
+    gate = threading.Event()
+    idents = []
+
+    def wedge():
+        idents.append(threading.get_ident())
+        gate.wait(timeout=30.0)
+
+    wedged = asyncio.create_task(backend._call("wedge", wedge))
+    try:
+        assert await _wait_until(lambda: len(idents) == 1)
+        got = await asyncio.wait_for(
+            backend._call("after", threading.get_ident), timeout=5.0
+        )
+        assert got != idents[0]
+    finally:
+        gate.set()
+        await wedged
+    await backend.stop()
+
+
 async def test_call_releases_slot_when_thread_spawn_fails(tmp_path):
     # If the per-call worker thread cannot even be started, the worker slot
     # it reserved is released (never leaked) and the failure propagates.
@@ -3065,11 +3195,22 @@ async def test_call_releases_slot_when_thread_spawn_fails(tmp_path):
 
     original = state.threading.Thread
     state.threading.Thread = _BoomThread
+    # Empty the idle worker pool for the duration: with a parked worker
+    # available _call hands the op straight to it and never reaches a thread
+    # spawn at all, which is the whole point of the pool -- the failure this
+    # test is about is the one on the path that DOES have to spawn.  The
+    # parked workers are put back afterwards (they are still parked, waiting
+    # on their queue, so nothing else can be holding them).
+    with state._IDLE_WORKERS_LOCK:
+        parked = list(state._IDLE_WORKERS)
+        state._IDLE_WORKERS.clear()
     try:
         with pytest.raises(RuntimeError, match="cannot spawn"):
             await backend.derive_max("runs/j", "ts")
     finally:
         state.threading.Thread = original
+        with state._IDLE_WORKERS_LOCK:
+            state._IDLE_WORKERS.extend(parked)
 
     # the slot was returned: a normal op still completes afterwards.
     assert await backend.derive_max("runs/j", "ts") is None
