@@ -4792,8 +4792,11 @@ class Cron:
         result = {
             "name": name,
             "enabled": job.enabled,
-            "schedule": schedule_str(job),
-            "command": command_str(job.command),
+            # precomputed on the JobConfig at build time (see
+            # JobConfig._precompute_payload_views): these are pure functions
+            # of the config and were previously re-derived per job per poll.
+            "schedule": job.schedule_display,
+            "command": job.command_display,
             "captureStdout": job.captureStdout,
             "captureStderr": job.captureStderr,
             # the schedule's reference frame, so the dashboard can compute and
@@ -4813,9 +4816,7 @@ class Cron:
             "never_fires": never_fires,
             # advisory lint from config load (see JobConfig), so the
             # dashboards can badge footguns without re-deriving them
-            "schedule_findings": [
-                finding._asdict() for finding in job.schedule_findings
-            ],
+            "schedule_findings": job.schedule_findings_json,
             "last_run": last_run,
             "history": recent,
             # the active pause window, or null. Always present (unlike the
@@ -4828,14 +4829,14 @@ class Cron:
                 else None
             ),
         }  # type: Dict[str, Any]
-        if isinstance(
-            job.schedule, CronTab
-        ) and job.schedule.resolved_source != str(job.schedule):
+        if job.schedule_resolved_or_none is not None:
             # the H hash form: also ship the plain-dialect spelling it
             # resolved to, so the dashboards display the H the user wrote
             # while their client-side engines (which know no H) compute
-            # previews from this. Omitted for every other schedule.
-            result["schedule_resolved"] = job.schedule.resolved_source
+            # previews from this. Omitted for every other schedule, which is
+            # why the precomputed attribute is None-or-string rather than a
+            # bool plus a lookup.
+            result["schedule_resolved"] = job.schedule_resolved_or_none
         # live CPU/memory of the currently-running instances (monitorResources
         # jobs only). Summed across instances so a job running N copies shows
         # its aggregate footprint; omitted entirely when nothing is monitored

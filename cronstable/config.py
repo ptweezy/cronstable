@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import sys
+import types
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from typing import (
@@ -15,6 +16,7 @@ from typing import (
     Dict,
     FrozenSet,
     List,
+    Mapping,
     NamedTuple,
     NewType,
     Optional,
@@ -1509,6 +1511,14 @@ def schedule_has_seconds(
 #: :func:`_config_from_doc` and dropped when that parse returns.
 LintCache = Dict[Tuple[str, str, Optional[datetime.tzinfo]], List[Finding]]
 
+#: Shared empty threshold mapping for every job that configures no SLA check,
+#: which is the overwhelming majority.  A fresh per-job dict would add one
+#: object per job to steady-state memory for a value that is always empty and
+#: never written; a read-only proxy makes the sharing safe by construction, so
+#: a consumer that tried to edit its "own" thresholds fails loudly here rather
+#: than silently corrupting every other job's.
+_NO_SLA_THRESHOLDS: Mapping[str, Any] = types.MappingProxyType({})
+
 
 class JobConfig:
     # One JobConfig exists per configured job for the life of the process (and
@@ -1573,7 +1583,6 @@ class JobConfig:
         "schedule_findings_json",
         "schedule_resolved_or_none",
         "sla_thresholds",
-        "_digest",
     )
 
     def __init__(
@@ -1688,6 +1697,64 @@ class JobConfig:
         self._resolve_user_group(config)
 
         self._validate_numeric_ranges()
+
+        self._precompute_payload_views()
+
+    def _precompute_payload_views(self) -> None:
+        """Derive the per-job fragments the /jobs payload rebuilds each poll.
+
+        Every value here is a pure function of attributes already set on this
+        instance and none of them is mutated afterwards, so they are computed
+        once at build time instead of once per job per poll.  JobConfigs are
+        rebuilt wholesale on reload (``_apply_reload`` reassigns cron_jobs
+        rather than editing the objects in it), so there is no invalidation
+        hook to keep in step.
+
+        The shared values are READ-ONLY to consumers: ``schedule_findings_json``
+        and ``sla_thresholds`` are handed straight into the response payload,
+        which is serialized and discarded, never edited.
+        """
+        unparsed = self.schedule_unparsed
+        self.schedule_display: str = (
+            unparsed
+            if isinstance(unparsed, str)
+            else schedule_object_to_crontab(unparsed)
+        )
+        command = self.command
+        self.command_display: str = (
+            command if isinstance(command, str) else " ".join(command)
+        )
+        self.schedule_findings_json: List[Dict[str, Any]] = [
+            finding._asdict() for finding in self.schedule_findings
+        ]
+        # The plain-dialect spelling an ``H`` schedule resolved to, or None for
+        # every other schedule (which is the overwhelming majority, so the
+        # payload builder just tests for None).
+        schedule = self.schedule
+        resolved: Optional[str] = None
+        if isinstance(schedule, CronTab):
+            source = str(schedule)
+            if schedule.resolved_source != source:
+                resolved = schedule.resolved_source
+        self.schedule_resolved_or_none = resolved
+        # The non-None sla thresholds. A job with no check at all (the vast
+        # majority) shares one empty mapping rather than allocating its own
+        # dict: at fleet scale a fresh per-job dict here is ~100k dicts of
+        # pure overhead. It is empty and never written, so sharing is safe.
+        self.sla_thresholds: Mapping[str, Any] = (
+            {k: v for k, v in self.sla.items() if v is not None}
+            if self.has_sla
+            else _NO_SLA_THRESHOLDS
+        )
+        # NOTE: there is deliberately no memoized job digest here. It would be
+        # a pure function of this instance in production (JobConfigs are
+        # rebuilt wholesale on reload), but ``jobDigest`` is precisely the
+        # signal the daemon uses to notice that a job's DEFINITION changed
+        # since a retry ladder was armed or an @reboot marker was written
+        # (see Cron._claim_retry_under_lease). A digest that went stale
+        # against an in-place edit would make the scheduler resume an old
+        # ladder against a new command, so job_digest() stays a live function
+        # of the job's attributes and tests/test_fingerprint.py pins that.
 
     def _lint_schedule(
         self, lint_cache: Optional["LintCache"]
