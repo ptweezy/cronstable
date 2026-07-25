@@ -42,11 +42,16 @@ clipping. To refresh them after a UI change:
    script serves the working tree itself, unhooks the page's own animation
    loop, and steps the mark's cart/double-pendulum simulation frame-by-frame
    at an exact 50 fps, so the recording is deterministic, true-speed physics.
-   The choreography — theme-hop glitches that knock the mark, one full
-   signal-loss collapse with a verified catch on reconnect, and a calm
-   settle so the loop seam is invisible — is seed-searched headlessly
-   through the page's own sim before anything is captured. Needs Pillow
-   alongside playwright:
+   Unlike the live page there are no ambient gusts: between events the mark
+   stands dead still, and the only disturbances are the theme-hop glitches,
+   each of which knocks the pendulum with a random direction and magnitude
+   (one hop cuts the signal outright for a full collapse and a verified
+   catch on reconnect; the final state settles sub-pixel onto frame 0, so
+   the loop seam is invisible). Still stretches are encoded as long frame
+   *durations* rather than frames, which is how the 3-minute loop stays
+   about the size of the old 40-second one. The whole choreography is
+   seed-searched headlessly through the page's own sim before anything is
+   captured. Needs Pillow alongside playwright:
 
    ```shell
    python docs/screenshots/capture_logo_gif.py
