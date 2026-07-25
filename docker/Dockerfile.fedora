@@ -23,11 +23,19 @@ COPY . .
 # dep lacking a wheel for the target arch. The toolchain stays in this builder
 # stage. git is pulled in only for a plain local build (empty VERSION), where
 # setuptools_scm reads the version from .git.
+# diffutils belongs to that toolchain rather than being an extra: the Fedora
+# base ships without cmp/diff, and libsodium's autotools suite -- which PyNaCl
+# runs from its sdist on the archs with no wheel -- needs them. Without it the
+# kdf_hkdf case reports a harness-level ERROR (not a FAIL: the driver itself
+# cannot run, so 79 tests pass and one errors), `make check` exits non-zero,
+# and the whole pynacl wheel build fails. That is what broke the 1.2.31 s390x
+# build. The UBI base in Dockerfile.rhel already carries diffutils, which is
+# why that variant source-builds the same sdist on s390x and passes.
 # retry() re-runs a network step (package install, pip download) a few times
 # with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    pkgs="python3 python3-pip python3-devel gcc make libffi-devel"; \
+    pkgs="python3 python3-pip python3-devel gcc make libffi-devel diffutils"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
     retry dnf --setopt=retries=10 install -y $pkgs; \
     dnf clean all; \
