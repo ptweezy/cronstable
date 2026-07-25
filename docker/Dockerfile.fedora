@@ -23,23 +23,28 @@ COPY . .
 # dep lacking a wheel for the target arch. The toolchain stays in this builder
 # stage. git is pulled in only for a plain local build (empty VERSION), where
 # setuptools_scm reads the version from .git.
-# diffutils belongs to that toolchain rather than being an extra: the Fedora
-# base ships without cmp/diff, and libsodium's autotools suite -- which PyNaCl
-# runs from its sdist on the archs with no wheel -- needs them. Without it the
-# kdf_hkdf case reports a harness-level ERROR (not a FAIL: the driver itself
-# cannot run, so 79 tests pass and one errors), `make check` exits non-zero,
-# and the whole pynacl wheel build fails. That is what broke the 1.2.31 s390x
-# build. The UBI base in Dockerfile.rhel already carries diffutils, which is
-# why that variant source-builds the same sdist on s390x and passes.
+# libsodium-devel + SODIUM_INSTALL=system: on the archs with no PyNaCl wheel
+# (ppc64le/s390x) pip builds PyNaCl from its sdist, and with SODIUM_INSTALL
+# unset that build compiles the BUNDLED libsodium and runs its whole autotools
+# test suite under QEMU emulation (tens of minutes per arch), and the suite
+# itself is what failed the 1.2.31 release (kdf_hkdf reported a harness-level
+# ERROR under this base's GCC 15 toolchain, on s390x and ppc64le, so `make
+# check` exited non-zero and the wheel build died on every retry).
+# SODIUM_INSTALL=system makes PyNaCl skip the bundled build entirely and link
+# Fedora's own libsodium (1.0.22, comfortably past PyNaCl 1.6.x's 1.0.19
+# floor), which the distro compiled and tested on real hardware. The sealed-
+# box self-test below still proves the pairing works under emulation. On
+# amd64/arm64 PyNaCl installs as a wheel and the variable is inert.
 # retry() re-runs a network step (package install, pip download) a few times
 # with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    pkgs="python3 python3-pip python3-devel gcc make libffi-devel diffutils"; \
+    pkgs="python3 python3-pip python3-devel gcc make libffi-devel libsodium-devel"; \
     if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
     retry dnf --setopt=retries=10 install -y $pkgs; \
     dnf clean all; \
     if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    export SODIUM_INSTALL=system; \
     python3 -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 ".[push,discovery]"
@@ -48,10 +53,9 @@ RUN set -eux; \
 # image contract: a `push:` or `web.bonjour` section fails closed at config
 # load, so an image missing them would crash-loop with no in-image
 # remediation (pip is stripped from the runtime stage below). PyNaCl has
-# wheels on amd64/arm64 and source-builds its bundled libsodium on
-# ppc64le/s390x (hence make + libffi-devel in the toolchain). Verify with a
-# real sealed-box round-trip plus a zeroconf import; a failure fails the
-# build.
+# wheels on amd64/arm64 and source-builds against the system libsodium on
+# ppc64le/s390x (see SODIUM_INSTALL above). Verify with a real sealed-box
+# round-trip plus a zeroconf import; a failure fails the build.
 RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import zeroconf, zeroconf.asyncio; print("push and discovery extras verified")'
 
 # Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
@@ -97,9 +101,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 # The venv references the system interpreter at /usr/bin/python3; both stages
 # are fedora:${FEDORA_VERSION}, so it is present and the version matches.
+# libsodium: the runtime half of the builder's SODIUM_INSTALL=system pairing.
+# On ppc64le/s390x PyNaCl's extension links the system library instead of a
+# bundled copy, so the shared object must exist here too; on amd64/arm64 the
+# wheel carries its own and the package is a few hundred idle kilobytes.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    retry dnf --setopt=retries=10 install -y python3; \
+    retry dnf --setopt=retries=10 install -y python3 libsodium; \
     dnf clean all
 
 COPY --from=builder /opt/venv /opt/venv
