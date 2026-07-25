@@ -23,7 +23,6 @@ cronstable is planned to grow.
 | --- | --- | --- |
 | `/` core (`cronstable/`, docs, tests, CI, packaging, ...) | MIT | See [LICENSE](LICENSE). |
 | `pro/` | Proprietary | cronstable Pro (the `cronstable-pro` package). See [pro/LICENSE](pro/LICENSE). Not open source. |
-| `ios/` | Proprietary | The native iOS app. See [ios/LICENSE](ios/LICENSE). Not open source. |
 
 As more proprietary components are added, each gets its own `LICENSE` file under
 the same rule, and a row here. Proprietary directories are pruned from the public
