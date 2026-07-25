@@ -505,11 +505,14 @@ jobs:
       # registry-1.docker.io took the s390x row down mid-release), and pulling
       # here keeps the retry off the build below: that one runs for up to an
       # hour under QEMU and must never be repeated for a registry blip.
+      # pull_base adds registry failover on top of the retries: the
+      # 2026-07-25 Hub outage outlived five attempts, so a same-digest
+      # mirror (ECR Public, then mirror.gcr.io) now backstops the pull.
       - name: Pull the Alpine build image
         run: |
           set -euo pipefail
           . .github/scripts/retry.sh
-          retry 5 docker pull --platform ${{ matrix.platform }} python:3.14-alpine
+          pull_base python:3.14-alpine ${{ matrix.platform }}
       - name: Build binary (Alpine/musl)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -619,13 +622,14 @@ jobs:
           fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.2.0
-      # Same retried pull as binaries-musl: the registry blip that fails a
-      # release is a pull, and the build it precedes is far too slow to retry.
+      # Same retried, mirror-backstopped pull as binaries-musl: the registry
+      # blip that fails a release is a pull, and the build it precedes is far
+      # too slow to retry.
       - name: Pull the Debian build image
         run: |
           set -euo pipefail
           . .github/scripts/retry.sh
-          retry 5 docker pull --platform ${{ matrix.platform }} python:3.14-slim
+          pull_base python:3.14-slim ${{ matrix.platform }}
       - name: Build binary (Debian/glibc container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
