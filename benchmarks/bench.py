@@ -36,6 +36,7 @@ with --tier so CI can give each its own round count.
 
 import argparse
 import atexit
+import base64
 import gc
 import json
 import os
@@ -808,8 +809,12 @@ def bench_config_interp():
         return {"jobs": jobs}
 
     doc = fixture("interp_doc_2k", build)
+    # three passes: one walk of the 2k-job doc measures under the harness's
+    # 50ms floor on CI, which would leave the metric floor-bound (the exact
+    # defect the effective-gate column exists to flag)
     t0 = time.perf_counter()
-    out = interp(doc, "bench-config")
+    for _ in range(3):
+        out = interp(doc, "bench-config")
     dt = time.perf_counter() - t0
     probe = out["jobs"][0]["environment"]["SET_0"]
     if probe != "value-0/path-0":
@@ -1493,7 +1498,7 @@ def bench_dag_mapped_drain():
 @bench(
     "dag.advance_quiescent_1k",
     "dag",
-    detail="20 quiescent advances of a 1k-task in-flight run document",
+    detail="40 quiescent advances of a 1k-task in-flight run document",
     repeats=(3, 2, 1),
     gate_pct=25.0,
     gate_floor=0.005,
@@ -1525,7 +1530,7 @@ def bench_dag_advance_quiescent():
     now = 1700000000.0
     ns = dag.DAG_RUN_NS_PREFIX + "quiet"
     run_key = "r"
-    passes = 20
+    passes = 40  # 20 measured under the 50ms rule on Linux
     tasks = [dag.TaskSpec(id="t%d" % i) for i in range(n)]
     spec = dag.DagSpec.build("quiet", tasks)
 
@@ -1655,9 +1660,75 @@ def bench_dag_adopt_scan():
     foreign = max(1, total // 10)
     runs_terminal = total - foreign
     passes = 8
+    ns = dag.DAG_RUN_NS_PREFIX + "benchdag"
+
+    def _seeded_adopt_store():
+        """The 500-run store, built ONCE per process: the timed scans never
+        mutate it (foreign leases hold, nothing adopts), so per-repeat
+        seeding would be pure fixture waste.  Documents and lease files are
+        independent, so seeding gathers in chunks."""
+
+        def build():
+            path = os.path.join(_tmpdir(), "dag-adopt")
+            os.makedirs(path, exist_ok=True)
+
+            def _body(i, active):
+                key = "r%05d" % i
+                return {
+                    "dag": "benchdag",
+                    "runKey": key,
+                    "runId": "id%d" % i,
+                    "state": "running" if active else "success",
+                    "kind": "scheduled",
+                    "createdAt": 1700000000.0 + i,
+                    "updatedAt": 1700000000.0 + i,
+                    "tasks": {},
+                    "mapped": {},
+                }
+
+            async def seed():
+                backend = _state_backend(path)
+                await backend.start()
+                try:
+                    for base in range(0, total, 64):
+                        await asyncio.gather(
+                            *(
+                                backend.mutate_document(
+                                    ns,
+                                    "r%05d" % i,
+                                    lambda cur, b=_body(
+                                        i, i < foreign
+                                    ): (b, None),
+                                )
+                                for i in range(base, min(base + 64, total))
+                            )
+                        )
+                    leases = await asyncio.gather(
+                        *(
+                            backend.acquire_lease(
+                                dag.DAG_LEASE_PREFIX
+                                + "benchdag/r%05d" % i,
+                                "foreign-node",
+                                10.0**9,
+                            )
+                            for i in range(foreign)
+                        )
+                    )
+                    if any(lease is None for lease in leases):
+                        raise RuntimeError(
+                            "could not seed the foreign leases"
+                        )
+                finally:
+                    await backend.stop()
+
+            asyncio.run(seed())
+            return path
+
+        return fixture("adopt_store_500", build)
+
+    path = _seeded_adopt_store()
 
     async def run():
-        path = tempfile.mkdtemp(prefix="dagadopt-", dir=_tmpdir())
         cfg = "state:\n  path: %s\n%s" % (
             path.replace("\\", "/"),
             _BENCH_DAG_YAML,
@@ -1676,35 +1747,7 @@ def bench_dag_adopt_scan():
         await backend.start()
         cron.state_backend = backend
         cron._state_configured = True
-        ns = dag.DAG_RUN_NS_PREFIX + "benchdag"
         try:
-            for i in range(total):
-                key = "r%05d" % i
-                active = i < foreign
-                body = {
-                    "dag": "benchdag",
-                    "runKey": key,
-                    "runId": "id%d" % i,
-                    "state": "running" if active else "success",
-                    "kind": "scheduled",
-                    "createdAt": 1700000000.0 + i,
-                    "updatedAt": 1700000000.0 + i,
-                    "tasks": {},
-                    "mapped": {},
-                }
-                await backend.mutate_document(
-                    ns, key, lambda cur, b=body: (b, None)
-                )
-                if active:
-                    lease = await backend.acquire_lease(
-                        dag.DAG_LEASE_PREFIX + "benchdag/" + key,
-                        "foreign-node",
-                        10.0**9,
-                    )
-                    if lease is None:
-                        raise RuntimeError(
-                            "could not seed foreign lease for %s" % key
-                        )
             # untimed full pass: warm the terminal-key cache
             await dagsched._adopt_one_dag(
                 backend, "benchdag", dagcfg, full=True
@@ -1733,8 +1776,9 @@ def bench_dag_adopt_scan():
                     % (None if known is None else len(known), runs_terminal)
                 )
         finally:
+            # the store is a shared per-process fixture; only the Cron and
+            # its backend binding are per-repeat
             await _teardown_cron(cron)
-            shutil.rmtree(path, ignore_errors=True)
         return dt
 
     try:
@@ -2208,58 +2252,69 @@ def _boot_populated_store():
         jobs = max(2, _n(_BOOT_JOBS))
         host = socket.gethostname() or "localhost"
 
+        async def seed_job(backend, i):
+            # WITHIN one stream the appends stay sequential: record order is
+            # the filename sort (a wall-clock read per worker thread), so
+            # parallel appends to one stream could land inverted and put the
+            # buried open/pending record on top.  Across JOBS the streams
+            # are independent, so jobs seed concurrently.
+            name = "bootjob%03d" % i
+            run_stream = Cron._run_stream(name)
+            for r in range(_BOOT_RECORDS):
+                await backend.append_record(
+                    run_stream,
+                    {
+                        "outcome": ("success" if (i + r) % 5 else "failure"),
+                        "exit_code": 0 if (i + r) % 5 else 1,
+                        "started_at": (
+                            "2026-07-01T09:%02d:%02d+00:00"
+                            % (r // 60, r % 60)
+                        ),
+                        "finished_at": (
+                            "2026-07-01T10:%02d:%02d+00:00"
+                            % (r // 60, r % 60)
+                        ),
+                        "duration": 12.5,
+                        "fail_reason": None,
+                    },
+                )
+            inflight = Cron._inflight_stream(name)
+            await backend.append_record(
+                inflight,
+                {
+                    "kind": "open",
+                    "host": host,
+                    "proc": "dead-proc-token",
+                    "pid": 2**22 + i,  # far past any live pid
+                },
+            )
+            await backend.append_record(
+                inflight, {"kind": "closed", "host": host}
+            )
+            retries = Cron._retry_stream(name)
+            await backend.append_record(
+                retries,
+                {
+                    "kind": "pending",
+                    "attempt": 1,
+                    "deadline": 1700000000.0,
+                    "host": host,
+                },
+            )
+            await backend.append_record(
+                retries, {"kind": "settled", "outcome": "success"}
+            )
+
         async def seed():
             backend = _state_backend(path)
             await backend.start()
             try:
-                for i in range(jobs):
-                    name = "bootjob%03d" % i
-                    run_stream = Cron._run_stream(name)
-                    for r in range(_BOOT_RECORDS):
-                        await backend.append_record(
-                            run_stream,
-                            {
-                                "outcome": (
-                                    "success" if (i + r) % 5 else "failure"
-                                ),
-                                "exit_code": 0 if (i + r) % 5 else 1,
-                                "started_at": (
-                                    "2026-07-01T09:%02d:%02d+00:00"
-                                    % (r // 60, r % 60)
-                                ),
-                                "finished_at": (
-                                    "2026-07-01T10:%02d:%02d+00:00"
-                                    % (r // 60, r % 60)
-                                ),
-                                "duration": 12.5,
-                                "fail_reason": None,
-                            },
+                for base in range(0, jobs, 16):
+                    await asyncio.gather(
+                        *(
+                            seed_job(backend, i)
+                            for i in range(base, min(base + 16, jobs))
                         )
-                    inflight = Cron._inflight_stream(name)
-                    await backend.append_record(
-                        inflight,
-                        {
-                            "kind": "open",
-                            "host": host,
-                            "proc": "dead-proc-token",
-                            "pid": 2**22 + i,  # far past any live pid
-                        },
-                    )
-                    await backend.append_record(
-                        inflight, {"kind": "closed", "host": host}
-                    )
-                    retries = Cron._retry_stream(name)
-                    await backend.append_record(
-                        retries,
-                        {
-                            "kind": "pending",
-                            "attempt": 1,
-                            "deadline": 1700000000.0,
-                            "host": host,
-                        },
-                    )
-                    await backend.append_record(
-                        retries, {"kind": "settled", "outcome": "success"}
                     )
             finally:
                 await backend.stop()
@@ -2507,8 +2562,15 @@ def bench_state_gc_sweep():
         await backend.start()
         try:
             try:
+                # two passes: one sweep of 2k streams measures under the
+                # harness's 50ms rule on CI, and the fixture is built so a
+                # pass is idempotent (nothing deletable), so a second pass
+                # is byte-for-byte the same work
                 t0 = time.perf_counter()
                 result = await backend.collect_garbage(
+                    keep=keep, grace=10.0**7
+                )
+                result2 = await backend.collect_garbage(
                     keep=keep, grace=10.0**7
                 )
                 dt = time.perf_counter() - t0
@@ -2518,7 +2580,9 @@ def bench_state_gc_sweep():
                 ) from None
         finally:
             await backend.stop()
-        removed = result.get("removed_streams")
+        removed = list(result.get("removed_streams") or ()) + list(
+            result2.get("removed_streams") or ()
+        )
         if removed:
             raise RuntimeError(
                 "GC deleted %r; the fixture must stay idempotent (fresh "
@@ -3835,9 +3899,9 @@ def bench_prometheus_render():
 
 
 @bench(
-    "statsd.emit_500",
+    "statsd.emit_2k",
     "statsd",
-    detail="send_to_statsd x500 over loopback UDP (unread receiver)",
+    detail="send_to_statsd x2k over loopback UDP (unread receiver)",
     repeats=(3, 2, 1),
     gate_pct=25.0,
 )
@@ -3850,7 +3914,8 @@ def bench_statsd_emit():
     sanctioned bend of the no-network rule: loopback UDP to a socket that
     is bound but never read, which kills ICMP port-unreachable
     nondeterminism.  Functional tests check wire format only, so cost has
-    no other guard.
+    no other guard.  (Scaled to 2k sends: 500 measured under the harness's
+    50ms rule on Linux and would have shipped floor-bound.)
     """
     import asyncio
     import socket
@@ -3859,7 +3924,7 @@ def bench_statsd_emit():
         from cronstable.statsd import send_to_statsd
     except ImportError as exc:
         raise Skip("cronstable.statsd unavailable: %r" % exc) from None
-    n = _n(500)
+    n = _n(2000)
     receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         receiver.bind(("127.0.0.1", 0))
@@ -3963,9 +4028,9 @@ def bench_mcp_handle():
 
 
 @bench(
-    "job.stream_capture_40k",
+    "job.stream_capture_120k",
     "job",
-    detail="per-line capture pipeline over a 40k-line stream",
+    detail="per-line capture pipeline over a 120k-line stream",
     repeats=(3, 2, 1),
 )
 def bench_job_stream_capture():
@@ -3978,7 +4043,9 @@ def bench_job_stream_capture():
     so the region is the capture leg alone; the on_line live-tail leg is a
     known accepted residual (see the SSE gap note in benchmarks/README.md).
     The discard count is asserted so a fixture that fed nothing cannot
-    time an instant EOF.
+    time an instant EOF.  Scaled from the originally-specced 40k, which
+    measured under the harness's 50ms rule on Linux; 120k is also the
+    scale a future passthrough twin would share (the round-2 note).
     """
     import asyncio
 
@@ -3986,11 +4053,11 @@ def bench_job_stream_capture():
         from cronstable.job import StreamReader
     except ImportError as exc:
         raise Skip("cronstable.job unavailable: %r" % exc) from None
-    n = _n(40000)
+    n = _n(120000)
     # scaled with the mode so the ring always evicts (full: the production
     # default of 1000 retained lines) and the discard assertion holds in
     # --quick/--smoke too
-    save_limit = max(2, n // 40)
+    save_limit = max(2, n // 120)
 
     def build():
         lines = []
@@ -4028,6 +4095,88 @@ def bench_job_stream_capture():
         return dt
 
     return asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# push: the E2E-encrypted alert path (PyNaCl; skips without the push extra,
+# so CI must install pynacl into BOTH perf venvs or this is a dead gate --
+# the documented webui/playwright trap).
+# ---------------------------------------------------------------------------
+
+
+class _PushCtx:
+    """A failure-kind reporter context, duck-typed like the real ones."""
+
+    def __init__(self, template_vars):
+        self.template_vars = template_vars
+
+
+@bench(
+    "push.seal_500",
+    "push",
+    detail="build + fit + seal 500 failure alerts to a device key",
+    repeats=(3, 2, 1),
+)
+def bench_push_seal():
+    """The per-device per-event sealing cost, which bursts exactly during
+    incidents (every failure fans out to every paired device).
+
+    The fixture event is a FAILURE ctx with an oversized stderr tail (60
+    lines x 120 chars, well over MAX_PLAINTEXT_BYTES), so fit_payload's
+    iterative trim loop -- the same iterative-trim class as the fixed
+    env-interpolation quadratic -- actually executes; a tail-less event
+    times ~90% pinned libsodium C that cronstable code cannot regress.
+    Skips (never fails) when PyNaCl is absent; not in the never-skip net
+    for the same reason as the orjson twin (optional dependency).
+    """
+    try:
+        from cronstable import push as push_mod
+    except ImportError as exc:
+        raise Skip("cronstable.push unavailable: %r" % exc) from None
+    if not getattr(push_mod, "HAVE_PYNACL", False):
+        raise Skip("PyNaCl not installed (push extra)")
+    for attr in ("build_payload", "fit_payload", "seal_to_device"):
+        if not hasattr(push_mod, attr):
+            raise Skip("cronstable.push lacks %s" % attr)
+    from nacl.public import PrivateKey
+
+    n = _n(500)
+    public_key = base64.b64encode(
+        bytes(PrivateKey.generate().public_key)
+    ).decode("ascii")
+    stderr_tail = "\n".join(
+        "line %03d " % i + "x" * 110 for i in range(60)
+    )
+    ctx = _PushCtx(
+        {
+            "name": "bench-job",
+            "host": "bench-host",
+            "run_id": "r-000123",
+            "schedule": "*/5 * * * *",
+            "started_at": "2026-07-01T10:00:00+00:00",
+            "exit_code": 1,
+            "fail_reason": "exited with status 1",
+            "stderr": stderr_tail,
+        }
+    )
+    try:
+        probe = push_mod.build_payload(ctx, False, True)
+        fitted = push_mod.fit_payload(probe)
+    except TypeError as exc:
+        raise Skip("push payload signature changed: %r" % exc) from None
+    if len(fitted) > push_mod.MAX_PLAINTEXT_BYTES:
+        raise RuntimeError("fit_payload left the plaintext over the cap")
+    if len(probe.get("log_tail") or ()) >= 60:
+        raise RuntimeError(
+            "the oversized tail was not trimmed; the region is not "
+            "exercising the fit loop"
+        )
+    t0 = time.perf_counter()
+    for _ in range(n):
+        payload = push_mod.build_payload(ctx, False, True)
+        data = push_mod.fit_payload(payload)
+        push_mod.seal_to_device(public_key, data)
+    return time.perf_counter() - t0
 
 
 # ---------------------------------------------------------------------------
