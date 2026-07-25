@@ -2584,6 +2584,34 @@ class Cron:
             )
         return service
 
+    @staticmethod
+    def _push_store_unavailable(
+        exc: "push.PushError", doing: str
+    ) -> web.HTTPException:
+        """The 503 for registry-store trouble, detail kept to the log.
+
+        Store-trouble ``PushError`` messages are written for an operator
+        reading the daemon log, not for whoever holds a token at the far
+        end of the socket: they name the devices registry's absolute
+        path and quote the underlying OSError or state-backend text
+        verbatim, and deliberately so -- :meth:`push.FileDeviceStore._read`
+        and :meth:`push.StateDeviceStore._bounded`, the latter folding in
+        the exception type precisely because a backend's bare string is
+        unactionable on its own.  Returning that text as the response
+        body published this daemon's filesystem layout to every caller of
+        the pairing routes, and the listing needs only a ``view`` scope.
+        So the detail goes where it was written to go, and the caller
+        gets the fact -- the store is unreachable, the request did not
+        happen -- which is all ``docs/openapi.yaml`` ever promised for a
+        503.  The same move as :meth:`_timezone_error`: build the body
+        from what the caller already knows, never from the exception.
+        """
+        logger.warning("push: %s failed: %s", doing, exc)
+        return web.HTTPServiceUnavailable(
+            text="the device registry's store is unavailable; "
+            "the reason is in the cronstable log"
+        )
+
     async def _web_push_devices(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         service = self._push_service_required()
@@ -2592,7 +2620,9 @@ class Cron:
             # pairings; it must reflect the store, not a 60s mirror.
             await service.refresh(force=True)
         except push.PushError as exc:
-            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+            raise self._push_store_unavailable(
+                exc, "listing paired devices"
+            ) from None
         return _json_response(
             {"devices": service.devices_payload()},
             headers=self.web_config.get("headers", None),
@@ -2610,6 +2640,12 @@ class Cron:
         try:
             fields = push.validate_pairing(body)
         except push.PushError as exc:
+            # Safe to echo, unlike the store's PushErrors either side of
+            # it: validate_pairing raises only statically authored
+            # sentences about the caller's own body (missing or over-long
+            # field, bad base64, wrong key length) -- no path, no errno,
+            # no library text.  Its one brush with PyNaCl re-raises a
+            # fixed string, so nacl's own wording cannot escape here.
             raise web.HTTPBadRequest(text=str(exc)) from None
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
@@ -2617,7 +2653,9 @@ class Cron:
                 fields, matched.label if matched is not None else None
             )
         except push.PushError as exc:
-            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+            raise self._push_store_unavailable(
+                exc, "pairing a device"
+            ) from None
         logger.info(
             "push: device %r (%s) %s by %s",
             record["name"],
@@ -2638,7 +2676,9 @@ class Cron:
         try:
             removed = await service.revoke(device_id)
         except push.PushError as exc:
-            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+            raise self._push_store_unavailable(
+                exc, "revoking a device"
+            ) from None
         if not removed:
             raise web.HTTPNotFound(
                 text="no paired device with id {!r}".format(device_id)
@@ -2662,7 +2702,9 @@ class Cron:
         try:
             await service.refresh(force=True)
         except push.PushError as exc:
-            raise web.HTTPServiceUnavailable(text=str(exc)) from None
+            raise self._push_store_unavailable(
+                exc, "refreshing the registry for a test alert"
+            ) from None
         device = service.get_device(device_id)
         if device is None:
             raise web.HTTPNotFound(
