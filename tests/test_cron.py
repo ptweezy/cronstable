@@ -1931,7 +1931,9 @@ async def test_web_index_served():
     cron.web_config = {}
 
     class Req:
-        pass
+        # a real web.Request always carries headers; _web_index reads
+        # If-None-Match and Accept-Encoding off them.
+        headers: dict = {}
 
     resp = await cron._web_index(Req())
     assert resp.content_type == "text/html"
@@ -1945,7 +1947,9 @@ async def test_web_index_sets_security_headers():
     cron.web_config = {}
 
     class Req:
-        pass
+        # a real web.Request always carries headers; _web_index reads
+        # If-None-Match and Accept-Encoding off them.
+        headers: dict = {}
 
     resp = await cron._web_index(Req())
     csp = resp.headers["Content-Security-Policy"]
@@ -1967,11 +1971,69 @@ async def test_web_index_security_headers_overridable():
     cron.web_config = {"headers": {"X-Frame-Options": "SAMEORIGIN"}}
 
     class Req:
-        pass
+        # a real web.Request always carries headers; _web_index reads
+        # If-None-Match and Accept-Encoding off them.
+        headers: dict = {}
 
     resp = await cron._web_index(Req())
     assert resp.headers["X-Frame-Options"] == "SAMEORIGIN"  # operator override
     assert resp.headers["X-Content-Type-Options"] == "nosniff"  # default kept
+
+
+@pytest.mark.asyncio
+async def test_web_index_revalidates_with_304():
+    # the dashboard is static package data, so a client that echoes the ETag
+    # gets an empty 304 instead of another ~573 KB body.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    _raw, etag = cronstable.cron._index_document()
+
+    class Req:
+        headers = {"If-None-Match": etag}
+
+    resp = await cron._web_index(Req())
+    assert resp.status == 304
+    assert resp.headers["ETag"] == etag
+    assert not resp.body
+
+    # a stale/absent validator still gets the full document
+    class ColdReq:
+        headers = {"If-None-Match": '"stale"'}
+
+    full = await cron._web_index(ColdReq())
+    assert full.status == 200
+    assert full.body
+
+
+@pytest.mark.asyncio
+async def test_web_index_serves_gzip_when_accepted():
+    # precompressed once for the life of the process; the compressed body must
+    # decode back to exactly the identity body.
+    import gzip as _gzip
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    raw, _etag = cronstable.cron._index_document()
+
+    class Req:
+        headers = {"Accept-Encoding": "gzip, deflate"}
+
+    resp = await cron._web_index(Req())
+    assert resp.status == 200
+    assert resp.headers["Content-Encoding"] == "gzip"
+    assert resp.headers["Vary"] == "Accept-Encoding"
+    assert _gzip.decompress(resp.body) == raw
+    assert len(resp.body) < len(raw)
+
+    # a client that does not accept gzip still gets the identity body, and the
+    # response still advertises that it varies on the header.
+    class PlainReq:
+        headers: dict = {}
+
+    plain = await cron._web_index(PlainReq())
+    assert "Content-Encoding" not in plain.headers
+    assert plain.headers["Vary"] == "Accept-Encoding"
+    assert plain.body == raw
 
 
 @pytest.mark.asyncio

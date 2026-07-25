@@ -1710,9 +1710,10 @@ class JobConfig:
         rather than editing the objects in it), so there is no invalidation
         hook to keep in step.
 
-        The shared values are READ-ONLY to consumers: ``schedule_findings_json``
-        and ``sla_thresholds`` are handed straight into the response payload,
-        which is serialized and discarded, never edited.
+        The shared values are READ-ONLY to consumers:
+        ``schedule_findings_json`` and ``sla_thresholds`` are handed straight
+        into the response payload, which is serialized and discarded, never
+        edited.
         """
         unparsed = self.schedule_unparsed
         self.schedule_display: str = (
