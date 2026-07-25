@@ -1004,6 +1004,20 @@ def _index_document() -> Tuple[bytes, str]:
     return raw, '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
 
 
+@lru_cache(maxsize=1)
+def _index_gzip() -> bytes:
+    """The dashboard pre-compressed once, for clients that accept gzip.
+
+    The document is static package data, so the compression is done a single
+    time for the life of the process rather than per page load: ~573 KB of
+    HTML becomes ~159 KB on the wire.  Kept separate from
+    :func:`_index_document` so that function's ``(bytes, ETag)`` contract is
+    unchanged and a deployment whose clients never send ``Accept-Encoding:
+    gzip`` never pays the compression at all.
+    """
+    return _gzip_body(_index_document()[0])
+
+
 def schedule_str(job: JobConfig) -> str:
     """Human-readable schedule for the web UI (the original config form)."""
     unparsed = job.schedule_unparsed
@@ -4630,8 +4644,21 @@ class Cron:
         # life of the process, since the document is package data.
         headers["ETag"] = etag
         headers["Cache-Control"] = "no-cache"
+        # the body varies with Accept-Encoding, so a shared cache must key on
+        # it. Set after the operator's header merge (like GET /jobs) because
+        # this is a correctness requirement, not a preference.
+        headers["Vary"] = "Accept-Encoding"
+        if request.headers.get("If-None-Match") == etag:
+            # the document is immutable for the process lifetime, so a repeat
+            # load revalidates into an empty 304 instead of resending 573 KB.
+            return web.Response(status=304, headers=headers)
+        if _accepts_gzip(request.headers.get("Accept-Encoding")):
+            headers["Content-Encoding"] = "gzip"
+            body = _index_gzip()
+        else:
+            body = raw
         return web.Response(
-            body=raw,
+            body=body,
             content_type="text/html",
             charset="utf-8",
             headers=headers,
@@ -4889,7 +4916,10 @@ class Cron:
         # dict allocation off the overwhelming majority of jobs, which carry
         # an all-None sla block.
         if job.has_sla:
-            thresholds = {k: v for k, v in job.sla.items() if v is not None}
+            # precomputed on the JobConfig; a real dict here (the shared
+            # read-only empty sentinel is only ever the value for a job with
+            # no check, which this branch excludes).
+            thresholds = job.sla_thresholds
             observations = self._sla_observations(
                 name, job, get_now(datetime.timezone.utc)
             )
