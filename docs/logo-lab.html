@@ -734,7 +734,7 @@
               const room = 1 / (1 + 40 * this.s[0] * this.s[0]);
               const ease = this.catchT >= 0 ? Math.min(1, (this.t - this.catchT) / 1.5) : 1;
               const swell = n.breeze * n.breeze;
-              const wind = 0.1 * (0.25 + 1.05 * swell / (1 + swell)) * n.flutter * room * ease;
+              const wind = 0.125 * (0.25 + 1.05 * swell / (1 + swell)) * n.flutter * room * ease;
               this.s[3] += wind * dt;
               this.s[5] += 0.6 * wind * dt;
             }
