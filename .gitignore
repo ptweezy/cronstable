@@ -68,3 +68,7 @@ target/
 
 # Local-only changelog tooling
 /scripts/*
+
+# Local env files (the demo instance keeps its Cloudflare Tunnel
+# token here; anyone holding it can publish through the tunnel).
+.env

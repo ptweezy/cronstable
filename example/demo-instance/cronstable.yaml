@@ -15,7 +15,8 @@
 #     would need control of a relay topic; the app's demo mode renders its
 #     own sample alerts locally.
 #
-# Bring-up: docker-compose.yml next to this file; TLS fronting: Caddyfile.
+# Bring-up: docker-compose.yml next to this file, which also runs the
+# Cloudflare Tunnel that publishes this daemon and terminates TLS.
 
 defaults:
   shell: /bin/bash

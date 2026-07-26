@@ -1,9 +1,0 @@
-# TLS front for the demo instance. Caddy fetches and renews the
-# certificate itself; point demo.cronstable.com's DNS at this host first.
-demo.cronstable.com {
-	reverse_proxy 127.0.0.1:8080
-	# The instance is read-only by scope, but belt-and-braces: nothing
-	# state-changing has any business arriving from the public internet.
-	@mutating method PUT PATCH DELETE
-	respond @mutating 405
-}
