@@ -1442,3 +1442,111 @@ async def test_node_sampler_history_run_skips_none_snapshot(monkeypatch):
     except asyncio.CancelledError:
         pass
     assert list(sampler._history) == []  # nothing recorded from a None snap
+
+# ---- stop(): reusing the ticker's snapshot for the final reading -----------
+
+
+class _CountingProc(_FakeProc):
+    """A _FakeProc that records how often the full-table walk was asked for."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.children_calls = 0
+
+    def children(self, recursive=False):
+        self.children_calls += 1
+        return super().children(recursive=recursive)
+
+
+def _snapshot_ticker(monitor, index, age=0.0):
+    """A ticker holding ``index``, taken ``age`` seconds ago, with ``monitor``
+    registered against a live task (the shape unregister() reacts to)."""
+    ticker = resources._SharedSampleTicker()
+    ticker._index = index
+    ticker._index_at = asyncio.get_running_loop().time() - age
+    ticker._due[monitor] = 0.0
+    ticker._task = asyncio.create_task(asyncio.sleep(60))
+    monitor._ticker = ticker
+    return ticker
+
+
+def _snapshot_monitor(pid=1234, interval=1.0):
+    monitor = ResourceMonitor(pid, job_name="j", interval=interval)
+    monitor._proc = _CountingProc(pid, 100.0, user=1.0, system=0.5, rss=4096)
+    return monitor
+
+
+async def test_recent_index_none_before_any_tick():
+    # nothing sampled yet, so there is no snapshot to stand in for a walk.
+    ticker = resources._SharedSampleTicker()
+    assert ticker.recent_index(1.0) is None
+
+
+async def test_recent_index_expires_with_age():
+    ticker = resources._SharedSampleTicker()
+    ticker._index = {1: [2]}
+    ticker._index_at = asyncio.get_running_loop().time()
+    assert ticker.recent_index(60.0) == {1: [2]}
+    ticker._index_at -= 120.0  # older than the monitor's interval
+    assert ticker.recent_index(60.0) is None
+
+
+async def test_ticker_run_retains_the_batch_snapshot(monkeypatch):
+    # the index the batch built is kept on the ticker so a monitor stopping
+    # before the next tick can fold its final reading against it.
+    monkeypatch.setattr(resources, "_ppid_index", lambda: {7: [8]})
+    ticker = resources._SharedSampleTicker()
+
+    def on_sample(mon, index):
+        ticker._due.pop(mon, None)
+
+    ticker._due = {_TickMon(0.01, on_sample): 0.0}
+    await asyncio.wait_for(ticker._run(), timeout=5)
+    assert ticker._index == {7: [8]}
+
+
+async def test_stop_folds_the_final_reading_from_the_ticker_snapshot():
+    # the finding itself: stop() must not force a fresh
+    # children(recursive=True) walk of the whole process table when the
+    # ticker already holds a snapshot young enough to derive the tree from.
+    monitor = _snapshot_monitor()
+    _snapshot_ticker(monitor, {1234: []})
+    await monitor.stop()
+    assert monitor._proc.children_calls == 0  # no full-table walk requested
+    assert monitor._samples == 1  # and a real reading still landed
+
+
+async def test_stop_falls_back_to_a_walk_when_the_snapshot_is_stale():
+    # a snapshot older than the monitor's own interval is no stand-in for a
+    # fresh one, so the final reading pays for the walk rather than folding a
+    # tree that may no longer resemble the job's.
+    monitor = _snapshot_monitor(interval=0.5)
+    _snapshot_ticker(monitor, {1234: []}, age=30.0)
+    await monitor.stop()
+    assert monitor._proc.children_calls == 1
+    assert monitor._samples == 1
+
+
+async def test_stop_takes_the_snapshot_before_unregistering():
+    # unregister() drops the index when the LAST monitor leaves, so reading it
+    # afterwards would always miss on a single-job daemon.
+    monitor = _snapshot_monitor()
+    ticker = _snapshot_ticker(monitor, {1234: []})
+    await monitor.stop()
+    assert ticker._index is None  # the last monitor left, snapshot dropped
+    assert monitor._proc.children_calls == 0  # but this stop still folded it
+
+
+async def test_stop_final_reading_counts_the_whole_snapshot_tree(monkeypatch):
+    # semantics of the final sample are preserved: members reached through the
+    # shared snapshot are read FRESH, so their CPU/RSS still land in the
+    # returned usage. Only the tree membership comes from the snapshot.
+    monitor = _snapshot_monitor()
+    child = _FakeProc(5678, 200.0, user=2.0, system=1.0, rss=8192)
+    _patch_process_table(monkeypatch, {5678: child})
+    _snapshot_ticker(monitor, {1234: [5678]})
+    usage = await monitor.stop()
+    assert usage is not None
+    assert usage.cpu_user_seconds == pytest.approx(3.0)  # 1.0 root + 2.0 child
+    assert usage.cpu_system_seconds == pytest.approx(1.5)  # 0.5 + 1.0
+    assert usage.max_rss_bytes == 4096 + 8192

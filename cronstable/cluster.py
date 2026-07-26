@@ -350,6 +350,16 @@ NODE_STATS_HEADER = "X-Cronstable-Node-Stats"
 # padding the value.
 MAX_NODE_STATS_HEADER_LEN = 1024
 
+# Cap on the per-generation rendezvous-owner memo each spread ownership method
+# keeps (see ClusterManager._spread_owner_set). The keys are configured job
+# names, so the natural bound is the job set; the cap only stops a caller that
+# asks about unbounded distinct names from growing a dict that lives until the
+# next view change. At the cap the memo simply stops accepting new entries and
+# the extra names pay the plain rendezvous hash, exactly as before the memo.
+# 100k matches the largest fleet the scheduler is documented for, where the
+# dict is a few MB rebuilt once per gossip round.
+MAX_MEMOIZED_JOB_OWNERS = 100_000
+
 
 def _parse_members(
     raw: Any,
@@ -528,6 +538,13 @@ def _aged_job_summaries(
     the next poll ships a full body with the real successor value.  Entries
     are copied, never mutated, so the stored snapshot stays pristine for the
     next derivation.
+
+    The countdown is read with ``.get`` and tested only for ``None``, not
+    type-checked: every stored block came through :func:`_parse_job_summaries`,
+    which coerces ``scheduled_in`` through :func:`_finite_number` (a float or
+    ``None``, bools rejected).  Keeping ``.get`` rather than a bare subscript
+    is what lets this stay a plain helper over any mapping instead of a second
+    place that has to know that invariant.
     """
     if jobs is None or taken_at is None:
         return jobs
@@ -537,10 +554,11 @@ def _aged_job_summaries(
     aged: Dict[str, Dict[str, Any]] = {}
     for name, entry in jobs.items():
         scheduled = entry.get("scheduled_in")
-        if isinstance(scheduled, (int, float)) and not isinstance(
-            scheduled, bool
-        ):
-            entry = dict(entry, scheduled_in=max(0.0, scheduled - elapsed))
+        if scheduled is not None:
+            remaining = scheduled - elapsed
+            entry = dict(
+                entry, scheduled_in=remaining if remaining > 0.0 else 0.0
+            )
         aged[name] = entry
     return aged
 
@@ -740,16 +758,26 @@ def _hrw_owner_bytes(
     ``job_name`` once here and reusing the cached ``member_bytes`` removes the
     O(members) node-name re-encoding (and the O(jobs) member-list rebuild) that
     ``max(members, key=_hrw_score(job, .))`` repeats for every job.
+
+    Two further per-member costs are avoided without moving a single bit of
+    the result.  sha256 is a streaming hash, so absorbing the job prefix ONCE
+    into a seed state and cloning it per member is identical to hashing the
+    concatenation, and it drops both the fresh concatenated bytes object and
+    the re-absorption of the prefix.  And the digest prefixes being compared
+    are all EXACTLY 8 bytes, where lexicographic ``bytes`` ordering is
+    big-endian unsigned integer ordering by definition, so ordering the raw
+    slices reproduces :func:`_hrw_score`'s ``int.from_bytes`` order (and its
+    name tie-break) with no int to build.
     """
-    job_prefix = job_name.encode("utf-8") + b"\x00"
+    seed = hashlib.sha256(job_name.encode("utf-8") + b"\x00")
+    first = seed.copy()
+    first.update(member_bytes[0])
     best_name = members[0]
-    best_score = int.from_bytes(
-        hashlib.sha256(job_prefix + member_bytes[0]).digest()[:8], "big"
-    )
+    best_score = first.digest()[:8]
     for name, name_bytes in zip(members[1:], member_bytes[1:], strict=True):
-        score = int.from_bytes(
-            hashlib.sha256(job_prefix + name_bytes).digest()[:8], "big"
-        )
+        digest = seed.copy()
+        digest.update(name_bytes)
+        score = digest.digest()[:8]
         if (score, name) > (best_score, best_name):
             best_score, best_name = score, name
     return best_name
@@ -1390,7 +1418,11 @@ def _memoized_derived(
     treat a returned list as frozen. Every current call site does: results
     are only iterated, sorted, splatted into fresh lists, or wrapped in
     set()/min()/max() (audited per site), and the elect_* helpers likewise
-    build their own candidate lists. Nested memoized calls (for example
+    build their own candidate lists. The one deliberate exception is the
+    owner memo the two spread-ownership derivations hand back (see
+    _spread_owner_set): it is a dict callers FILL, and it rides in the cache
+    exactly so the generation roll that changes the member set drops the
+    memoized owners with it. Nested memoized calls (for example
     _eligible_candidates calling _agreeing_peers) are safe: the derivations
     perform no writes, and the manager runs on a single event loop, so the
     key cannot move mid-computation.
@@ -1512,11 +1544,14 @@ class ClusterManager(LeadershipBackend):
         # _memoized_derived / _derived_state_key.
         self._derived_cache: Dict[str, Any] = {}
         self._derived_cache_key: Optional["tuple"] = None
-        # The last (state key, monotonic build time, payload, etag) built by
-        # _handle_peer, re-served to pollers while the key still matches and
-        # the PEER_RESPONSE_CACHE_TTL clock bound holds; see _handle_peer.
+        # The last (state key, monotonic build time, etag, body bytes) built
+        # by _handle_peer, re-served to pollers while the key still matches
+        # and the PEER_RESPONSE_CACHE_TTL clock bound holds; see _handle_peer.
+        # The encoded body is cached rather than the payload dict because the
+        # dict is frozen for the entry's life and nothing downstream reads it
+        # back; only the bytes are ever served.
         self._peer_response_cache: Optional[
-            "tuple[Any, float, Dict[str, Any], str]"
+            "tuple[Any, float, str, bytes]"
         ] = None
 
     def _derived_state_key(self) -> "tuple":
@@ -1788,6 +1823,13 @@ class ClusterManager(LeadershipBackend):
         # be mutated per request; nothing below writes into it
         # (json_response only serialises it), and the per-request live data
         # (the node-stats reading) rides a response header, never the body.
+        # Because it is frozen for the life of the entry, its SERIALISATION is
+        # equally reusable, so the body bytes are built with the pair and
+        # cached alongside instead of re-encoding ~70KB of identical document
+        # per served 200. (The gzip below deliberately stays per-response: it
+        # branches on the client's Accept-Encoding, and hand-serving
+        # pre-compressed bytes would mean owning Content-Encoding,
+        # Content-Length and Vary here.)
         now_mono = time.monotonic()
         state_key = (
             self._derived_state_key(),
@@ -1813,7 +1855,7 @@ class ClusterManager(LeadershipBackend):
             and cached[0] == state_key
             and now_mono - cached[1] <= PEER_RESPONSE_CACHE_TTL
         ):
-            payload, etag = cached[2], cached[3]
+            etag, body_bytes = cached[2], cached[3]
         else:
             payload = self._peer_payload()
             now_epoch = datetime.datetime.now(
@@ -1829,7 +1871,17 @@ class ClusterManager(LeadershipBackend):
                     payload["job_summaries"], now_epoch
                 ),
             )
-            self._peer_response_cache = (state_key, now_mono, payload, etag)
+            # Serialize with the orjson-accelerated encoder (compact, and
+            # several times faster than aiohttp's default json.dumps). The
+            # ETag above is a hash of a canonical projection of the payload
+            # (see _peer_etag), NOT of these body bytes, so the encoder choice
+            # cannot affect 304 matching; peers parse the body back through
+            # _json.loads.
+            try:
+                body_bytes = _json.dumps_bytes(payload)
+            except _json.UnsupportedValue:
+                body_bytes = json.dumps(payload).encode("utf-8")
+            self._peer_response_cache = (state_key, now_mono, etag, body_bytes)
         headers = {"ETag": etag}
         # The node-stats sidecar: a live reading (when sharing) travels as a
         # compact-JSON response header rather than in the body, so it never
@@ -1851,15 +1903,6 @@ class ClusterManager(LeadershipBackend):
         # slightly-wasteful degradation).
         if request.headers.get("If-None-Match") == etag:
             return web.Response(status=304, headers=headers)
-        # Serialize the body with the orjson-accelerated encoder (compact, and
-        # several times faster than aiohttp's default json.dumps). The ETag
-        # above is a hash of a canonical projection of the payload (see
-        # _peer_etag), NOT of these body bytes, so the encoder change cannot
-        # affect 304 matching; peers parse the body back through _json.loads.
-        try:
-            body_bytes = _json.dumps_bytes(payload)
-        except _json.UnsupportedValue:
-            body_bytes = json.dumps(payload).encode("utf-8")
         resp = web.Response(
             body=body_bytes, headers=headers, content_type="application/json"
         )
@@ -2619,8 +2662,30 @@ class ClusterManager(LeadershipBackend):
         return jobs
 
     def reboot_ran(self, job_name: str) -> bool:
-        """Whether ``job_name`` already ran in the cluster (this config)."""
-        return job_name in self.advertised_ran_jobs()
+        """Whether ``job_name`` already ran in the cluster (this config).
+
+        Asks the same question :meth:`advertised_ran_jobs` answers, under the
+        identical gates, but as a membership test that stops at the first hit
+        instead of materialising the whole union: it is asked once per pending
+        @reboot one-shot on every wakeup until the cluster resolves them, and
+        the union it used to build (up to MAX_ADVERTISED_REBOOT_JOBS names per
+        AGREED peer) was allocated and thrown away for every single name.
+        """
+        my_id = self.get_job_set_id()
+        if (
+            self._ran_jobs_job_set_id in (None, my_id)
+            and job_name in self._ran_reboot_jobs
+        ):
+            return True
+        for peer in self.view.peers.values():
+            if (
+                peer.status == STATUS_AGREED
+                and peer.job_set_id == my_id
+                and peer.ran_reboot_jobs
+                and job_name in peer.ran_reboot_jobs
+            ):
+                return True
+        return False
 
     async def mark_reboot_ran(self, job_name: str) -> None:
         """Record that we ran ``job_name`` as owner, and eagerly tell peers.
@@ -3480,17 +3545,24 @@ class ClusterManager(LeadershipBackend):
         converging skip rather than a permanent zero-run behind a sub-quorum
         node (see :meth:`_unconfirmed_contenders`).
         """
-        quorate, members, member_bytes = self._spread_owner_set()
+        quorate, members, member_bytes, owners = self._spread_owner_set()
         if not quorate:
             return None
-        return _hrw_owner_bytes(job_name, members, member_bytes)
+        owner = owners.get(job_name)
+        if owner is None:
+            owner = _hrw_owner_bytes(job_name, members, member_bytes)
+            if len(owners) < MAX_MEMOIZED_JOB_OWNERS:
+                owners[job_name] = owner
+        return owner
 
     @_memoized_derived
-    def _spread_owner_set(self) -> "Tuple[bool, List[str], List[bytes]]":
-        """``(quorate, members, member_name_bytes)`` for spread ownership.
+    def _spread_owner_set(
+        self,
+    ) -> "Tuple[bool, List[str], List[bytes], Dict[str, str]]":
+        """``(quorate, members, member_name_bytes, owner_memo)`` for spread.
 
-        All three are job-INDEPENDENT: the quorum gate is over the mutual live
-        set, and the rendezvous members are this node plus the
+        The first three are job-INDEPENDENT: the quorum gate is over the mutual
+        live set, and the rendezvous members are this node plus the
         confirmed-quorate candidates and quorate-vouched contenders -- exactly
         the arguments :func:`elect_job_owner` derives, but derived ONCE per
         generation here instead of rebuilt per job.  :meth:`job_owner` then
@@ -3499,6 +3571,24 @@ class ClusterManager(LeadershipBackend):
         re-encodes to O(P) once plus J*P hashes.  Equivalent to the old inline:
         ``quorate`` is ``len([self] + agreeing) >= quorum_size(cluster_size)``
         and ``members`` is ``[self, *eligible, *unconfirmed]``.
+
+        The fourth is the *only* mutable value in the derived cache: an
+        initially empty ``{job_name: owner}`` memo :meth:`job_owner` fills in
+        as it answers, so a repeated question (``GET /jobs`` re-renders the
+        owner column of every configured job every few seconds, against a
+        member set that moves at most once per poll ``interval``) costs a dict
+        lookup rather than another O(members) sha256 sweep.  It rides in here
+        rather than in a field of its own precisely so it can only be reached
+        THROUGH the memo wrapper: the generation roll that swaps the member set
+        also drops this dict in the same ``_derived_cache.clear()``, so an
+        entry can never outlive the membership it was computed from.  Serving a
+        stale owner would not be a cosmetic dashboard error; for a ``Leader``
+        job it is a double-run or a zero-run.
+
+        :meth:`available_job_owner` hashes over a DIFFERENT member set (see
+        :meth:`_available_owner_members`), so it keeps its own memo there; one
+        shared ``{name: owner}`` dict would let whichever method asked first
+        answer for the other.
         """
         live_count = 1 + len(self._agreeing_peer_names())
         quorate = live_count >= quorum_size(self.cluster_size())
@@ -3508,7 +3598,7 @@ class ClusterManager(LeadershipBackend):
             *self._unconfirmed_contenders(),
         ]
         member_bytes = [name.encode("utf-8") for name in members]
-        return quorate, members, member_bytes
+        return quorate, members, member_bytes, {}
 
     def is_job_owner(self, job_name: str) -> bool:
         """Whether this node owns ``job_name`` (quorate rendezvous winner).
@@ -3562,12 +3652,19 @@ class ClusterManager(LeadershipBackend):
         (no double-run), while the absent quorum gate guarantees the winner
         still runs (no zero-run); see :meth:`_available_contenders`.
         """
-        members, member_bytes = self._available_owner_members()
-        return _hrw_owner_bytes(job_name, members, member_bytes)
+        members, member_bytes, owners = self._available_owner_members()
+        owner = owners.get(job_name)
+        if owner is None:
+            owner = _hrw_owner_bytes(job_name, members, member_bytes)
+            if len(owners) < MAX_MEMOIZED_JOB_OWNERS:
+                owners[job_name] = owner
+        return owner
 
     @_memoized_derived
-    def _available_owner_members(self) -> "Tuple[List[str], List[bytes]]":
-        """``(members, member_name_bytes)`` for never-skip spread ownership.
+    def _available_owner_members(
+        self,
+    ) -> "Tuple[List[str], List[bytes], Dict[str, str]]":
+        """``(members, member_name_bytes, owner_memo)`` for never-skip spread.
 
         The job-independent rendezvous set of :meth:`available_job_owner`
         (``[self, *agreeing, *available_contenders]``), derived once per
@@ -3577,13 +3674,21 @@ class ClusterManager(LeadershipBackend):
         via :meth:`_cedes_to_lower_instance`) recomputes the election over a
         DIFFERENT (per-twin) member set, so it keeps using the un-memoized
         module helper.
+
+        The memo is this method's OWN (see :meth:`_spread_owner_set` for what
+        it is and why it lives in the derived cache): the member set here has
+        no quorum gate and folds raw two-way edges, so it answers differently
+        from :meth:`job_owner` for the same name.  Today a name only ever
+        reaches one of the two (a job is routed by its ``clusterPolicy``), but
+        that is an implicit invariant, not something a shared cache may rest
+        on.
         """
         members = [
             self.node_name,
             *self._agreeing_peer_names(),
             *self._available_contenders(),
         ]
-        return members, [name.encode("utf-8") for name in members]
+        return members, [name.encode("utf-8") for name in members], {}
 
     def is_available_job_owner(self, job_name: str) -> bool:
         """Whether this node owns ``job_name`` in its reachable set.

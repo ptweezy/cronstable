@@ -37,21 +37,36 @@ import binascii
 import contextlib
 import datetime
 import hashlib
+import importlib.util
 import json
 import logging
 import os
 import secrets
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-import aiohttp
+if TYPE_CHECKING:
+    # aiohttp is the relay client, and nothing else here touches it.  Importing
+    # it at module scope taxed every daemon start (cron.py imports this module
+    # unconditionally) with ~155 ms and ~21 MB of RSS for a reporter that only
+    # a paired deployment ever uses, so the real import lives at the two send
+    # sites and this block exists only to resolve the ClientSession annotation
+    # under the type checker.
+    import aiohttp
 
 try:
-    from nacl.public import PublicKey, SealedBox
-
-    HAVE_PYNACL = True
-except ImportError:  # pragma: no cover - exercised on the no-push baseline
+    # Probed, not imported: cron.py imports this module unconditionally, so
+    # every daemon start paid ~10 ms and ~1 MB of RSS pulling nacl.bindings
+    # and the cffi _sodium extension in for a reporter almost nobody
+    # configures.  find_spec is not free either (a dotted name makes
+    # importlib import the parent package to read its __path__) but it is
+    # an order of magnitude cheaper.  It answers "is it findable", not
+    # "does it import", so the real import lives at the two use sites,
+    # inside the try that already turns a broken PyNaCl into a PushError
+    # rather than an ImportError escaping a never-raises contract.
+    HAVE_PYNACL = importlib.util.find_spec("nacl.public") is not None
+except (ImportError, ValueError):  # pragma: no cover - no-push baseline
     HAVE_PYNACL = False
 
 logger = logging.getLogger("cronstable")
@@ -136,6 +151,26 @@ class PushError(Exception):
     """A push operation failed (bad device material, store trouble)."""
 
 
+def _sealed_box(raw: bytes) -> Any:
+    """A libsodium sealed box over a raw 32-byte X25519 public key.
+
+    The one place PyNaCl is actually imported (see :data:`HAVE_PYNACL`).
+    A library that is findable but not importable (the half-installed
+    case the PyInstaller spec calls out: libsodium present and
+    ``_cffi_backend`` missing) becomes a :class:`PushError` here, so it
+    still reaches an operator as a 400 or a logged alert failure instead
+    of an ImportError out of a documented never-raises path.
+    """
+    try:
+        from nacl.public import PublicKey, SealedBox
+    except ImportError as exc:
+        raise PushError(
+            "PyNaCl is installed but cannot be imported ({}); reinstall "
+            'the push extra (pip install "cronstable[push]")'.format(exc)
+        ) from None
+    return SealedBox(PublicKey(raw))
+
+
 def _utcnow_iso() -> str:
     return (
         datetime.datetime.now(datetime.timezone.utc)
@@ -169,7 +204,9 @@ def validate_public_key(value: Any) -> str:
         # 400 at pairing instead of a persistent registry record that
         # fails on every alert until an operator revokes it.
         try:
-            SealedBox(PublicKey(raw)).encrypt(b"probe")
+            _sealed_box(raw).encrypt(b"probe")
+        except PushError:
+            raise  # a broken PyNaCl, not a broken key: keep its wording
         except Exception:
             raise PushError(
                 "publicKey is not a usable X25519 public key"
@@ -224,7 +261,9 @@ def seal_to_device(public_key_b64: str, plaintext: bytes) -> str:
         # low-order keys at encrypt time (nacl.exceptions.RuntimeError,
         # not a PushError), and one bad registry record must surface as
         # a per-device PushError, never escape a whole-fleet fan-out.
-        sealed = SealedBox(PublicKey(raw)).encrypt(plaintext)
+        sealed = _sealed_box(raw).encrypt(plaintext)
+    except PushError:
+        raise  # a broken PyNaCl, not a broken key: keep its wording
     except Exception as exc:
         raise PushError(
             "device public key is unusable: {}".format(exc)
@@ -304,6 +343,51 @@ def build_payload(
     return payload
 
 
+def _trim_log_tail(payload: Dict[str, Any], tail: List[str]) -> bytes:
+    """Drop the FEWEST oldest log-tail lines that fit the cap; re-encode.
+
+    The encoded size falls monotonically as lines are dropped, so the
+    minimal drop count can be bisected instead of walked: with the shipped
+    LOG_TAIL_MAX_LINES of 40 that is 6 full ``json.dumps`` + encode passes
+    over the whole payload rather than one per dropped line, for a
+    byte-identical result.  When even an empty tail does not fit, the tail
+    is left dropped and the caller moves on to the free-text fields,
+    exactly as the line-at-a-time loop did.
+    """
+    original = list(tail)
+    total = len(original)
+
+    def drop(count: int) -> bytes:
+        # Same list object, so the key keeps its position in the encoded
+        # object; the key itself goes only when nothing is left, which is
+        # what frees the last few bytes.
+        if count >= total:
+            payload.pop("log_tail", None)
+        else:
+            tail[:] = original[count:]
+        return _encode(payload)
+
+    lo, hi = 1, total  # 0 is the caller's already-measured non-fit
+    fitted: Optional[bytes] = None
+    applied = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        probe = drop(mid)
+        applied = mid
+        if len(probe) <= MAX_PLAINTEXT_BYTES:
+            fitted = probe
+            hi = mid - 1
+        else:
+            lo = mid + 1
+    if fitted is None:
+        return drop(total)
+    # lo is now the minimal fitting drop count; the last probe may have
+    # been the failing one just below it, so re-apply when it was.
+    if applied != lo:
+        return drop(lo)
+    return fitted
+
+
 def fit_payload(payload: Dict[str, Any]) -> bytes:
     """Shrink ``payload`` in place until it seals under the APNs cap.
 
@@ -316,25 +400,23 @@ def fit_payload(payload: Dict[str, Any]) -> bytes:
     while len(data) > MAX_PLAINTEXT_BYTES:
         tail = payload.get("log_tail")
         if tail:
-            del tail[0]
-            if not tail:
-                del payload["log_tail"]
+            data = _trim_log_tail(payload, tail)
+            continue
+        for field in ("message", "fail_reason", "subject"):
+            value = payload.get(field)
+            if isinstance(value, str) and len(value) > 64:
+                payload[field] = value[: max(64, len(value) // 2)]
+                break
         else:
-            for field in ("message", "fail_reason", "subject"):
-                value = payload.get(field)
-                if isinstance(value, str) and len(value) > 64:
-                    payload[field] = value[: max(64, len(value) // 2)]
+            # Nothing long is left; the residual overage can only come
+            # from many short fields, so drop the optional context ones
+            # until the identity core fits.
+            for field in ("schedule", "started_at", "run_id"):
+                if field in payload:
+                    del payload[field]
                     break
-            else:
-                # Nothing long is left; the residual overage can only
-                # come from many short fields, so drop the optional
-                # context ones until the identity core fits.
-                for field in ("schedule", "started_at", "run_id"):
-                    if field in payload:
-                        del payload[field]
-                        break
-                else:  # pragma: no cover - identity core is tiny
-                    break
+            else:  # pragma: no cover - identity core is tiny
+                break
         data = _encode(payload)
     return data
 
@@ -1101,6 +1183,12 @@ class PushService:
         )
         is_event = payload.get("kind") == "event"
         targets = [only] if only else list(self._devices.values())
+
+        # Past the module-scope guard (see the TYPE_CHECKING block at the top):
+        # this is the first of the two places that actually talk to the relay,
+        # and reaching it means an alert is already being sent.
+        import aiohttp
+
         timeout = aiohttp.ClientTimeout(total=self.relay_timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # All devices at once, not one after another.  The POSTs are
@@ -1156,7 +1244,7 @@ class PushService:
 
     async def _send_to_device(
         self,
-        session: aiohttp.ClientSession,
+        session: "aiohttp.ClientSession",
         device: Dict[str, Any],
         plaintext: bytes,
         coalesce: str,
@@ -1164,6 +1252,12 @@ class PushService:
         is_event: bool,
     ) -> Dict[str, Any]:
         """Seal and POST one alert; the outcome, never an exception."""
+        # Re-imported per call rather than shared from the caller: past the
+        # first send this is a sys.modules hit, which is nothing next to the
+        # HTTPS POST below, and it keeps the except clause's ClientError
+        # resolvable without a module-scope aiohttp.
+        import aiohttp
+
         outcome: Dict[str, Any] = {
             "device": device.get("id"),
             "status": None,

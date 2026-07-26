@@ -356,6 +356,24 @@ class _SharedSampleTicker:
         self._due: Dict["ResourceMonitor", float] = {}
         self._task: Optional[asyncio.Task] = None
         self._wake = asyncio.Event()
+        # The latest table snapshot and the loop-clock instant it was
+        # taken, so a monitor stopping between ticks can fold its final
+        # reading against it rather than walking the table again (see
+        # ResourceMonitor.stop).
+        self._index: Optional[Dict[int, List[int]]] = None
+        self._index_at = 0.0
+
+    def recent_index(self, max_age: float) -> Optional[Dict[int, List[int]]]:
+        """The last table snapshot, if it is younger than ``max_age``.
+
+        ``None`` when there is none yet, when the walk failed, or when it
+        is too old to stand in for a fresh one.
+        """
+        if self._index is None:
+            return None
+        if asyncio.get_running_loop().time() - self._index_at > max_age:
+            return None
+        return self._index
 
     def register(self, monitor: "ResourceMonitor") -> None:
         self._due[monitor] = 0.0
@@ -374,6 +392,10 @@ class _SharedSampleTicker:
             # reading, exactly as with the old cancelled per-monitor tasks.
             self._task.cancel()
             self._task = None
+            # Nothing is sampling any more, so the snapshot can only get
+            # staler; drop it rather than hold a whole process table for
+            # however long it is until the next run registers.
+            self._index = None
         else:
             self._wake.set()
 
@@ -384,7 +406,10 @@ class _SharedSampleTicker:
                 now = loop.time()
                 due = [m for m, at in self._due.items() if at <= now]
                 if due:
-                    await asyncio.to_thread(self._sample_batch, due)
+                    index = await asyncio.to_thread(self._sample_batch, due)
+                    # dated at the instant the batch STARTED, not when it
+                    # finished: recent_index judges age from this.
+                    self._index, self._index_at = index, now
                     now = loop.time()
                     for monitor in due:
                         if monitor in self._due:
@@ -407,11 +432,16 @@ class _SharedSampleTicker:
             )
 
     @staticmethod
-    def _sample_batch(monitors: List["ResourceMonitor"]) -> None:
-        # Worker thread. One table snapshot; each monitor folds its own tree.
+    def _sample_batch(
+        monitors: List["ResourceMonitor"],
+    ) -> Optional[Dict[int, List[int]]]:
+        # Worker thread. One table snapshot; each monitor folds its own
+        # tree. The snapshot is returned so the caller can retain it for
+        # monitors that stop before the next tick.
         index = _ppid_index()
         for monitor in monitors:
             monitor._sample(index)
+        return index
 
 
 #: one ticker per event loop; weak keys so a torn-down loop drops its entry.
@@ -687,7 +717,19 @@ class ResourceMonitor:
         Idempotent: a second call (or a call after a monitor that never
         attached) returns the same result without error.
         """
+        index = None
         if self._ticker is not None:
+            # Take the ticker's latest table snapshot BEFORE unregistering
+            # (the last monitor to leave drops it).  Without one, _sample
+            # falls back to psutil's children(recursive=True), which walks
+            # the WHOLE process table (one Toolhelp snapshot on Windows,
+            # one open+read of /proc/<pid>/stat per pid on Linux) once
+            # per monitored run that finishes, which is exactly the K-walk
+            # cost this ticker exists to collapse.  The snapshot is
+            # accepted up to one sample interval old: a member that joined
+            # the tree since is missed, the same blind spot the periodic
+            # samples already carry between ticks.
+            index = self._ticker.recent_index(self._interval)
             self._ticker.unregister(self)
             self._ticker = None
         # One last opportunistic read: on a cancel/replace path the child may
@@ -695,7 +737,7 @@ class ResourceMonitor:
         # still-live members are summed into the totals by _sample itself).
         # Threaded like the periodic samples, to keep the process-table walk
         # off the loop.
-        await asyncio.to_thread(self._sample)
+        await asyncio.to_thread(self._sample, index)
         if self._samples == 0:
             return None
         return ResourceUsage(
