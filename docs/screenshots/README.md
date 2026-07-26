@@ -42,7 +42,7 @@ clipping. To refresh them after a UI change:
    script serves the working tree itself, unhooks the page's own animation
    loop, and steps the mark's cart/double-pendulum simulation frame-by-frame
    at an exact 50 fps, so the recording is deterministic, true-speed physics.
-   Unlike the live page there are no ambient gusts: between events the mark
+   Unlike the live page there is no ambient breeze: between events the mark
    stands dead still, and the only disturbances are the theme-hop glitches,
    each of which knocks the pendulum with a random direction and magnitude
    (one hop cuts the signal outright for a full collapse and a verified
@@ -126,6 +126,10 @@ re-run — it writes straight to `docs/img/`.
 
 Notes:
 
+* `shots/` and `reel/` are untracked scratch output (gitignored): raw captures
+  land there for review, and only the keepers copied over `docs/img/` are
+  committed. Everything in them is regenerable by the scripts above, so there
+  is nothing to preserve.
 * The scripts intercept `GET /version` and substitute the next release number
   so the header doesn't show a long `setuptools-scm` dev string.
 * Prefer capturing at a "quiet minute" of the grand tour's deterministic

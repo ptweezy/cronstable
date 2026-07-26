@@ -420,7 +420,6 @@
      inside the header's padding band. without JS the span just prints its l. */
   .brand .mark svg { display: block; filter: drop-shadow(0 0 5px var(--glow)); }
   .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
-  .brand .tag { font-size: 11px; color: var(--fg-faint); cursor: default; }
   .brand .tm { font-size: 9px; color: var(--fg-faint); margin-left: -6px; transform: translateY(-4px); cursor: default; user-select: none; }
   /* header text can't be selected, so these copy their value on click instead */
   .brand .ver { font-size: 10.5px; color: var(--fg-faint); cursor: pointer; }
@@ -1477,7 +1476,6 @@
 <header>
   <div class="brand">
     <h1 class="glow" id="brandName" title="the cronstable logo, the l is self-balancing double pendulum">cronstab<span class="mark" id="mark">l</span>e</h1><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span>
-    <span class="tag">// job scheduler</span>
     <span class="ver" id="ver"></span>
     <span class="ver" id="jobset" title=""></span>
   </div>
@@ -2888,7 +2886,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
  *  nonlinear cart/double-pendulum dynamics (RK4 at 240 Hz) and balances
  *  itself with an LQR controller whose gains are computed at page load
  *  from a numerical linearization (discrete Riccati iteration). While the
- *  daemon is live it stands upright, riding out little gusts; lose the
+ *  daemon is live it stands upright, swaying in a little breeze; lose the
  *  signal and the motor cuts — it collapses and swings, pumping energy
  *  (dE/dt = -a*G exactly) but held just short of the top. When the signal
  *  returns, a receding-horizon cross-entropy planner threads the swing
@@ -3056,7 +3054,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
         limpDuration: 0.55,
         disconnectedEnergyFrac: 0.94,  // strive, never top out, while offline
         seed: 1,
-        gusts: true,
+        breeze: true,
       }, opts || {});
       // track bounds (m, relative to the balance point x = 0). trackMin/
       // trackMax params make the track asymmetric — the wordmark mount
@@ -3080,7 +3078,7 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
       this.cem = null;
       this.lastVerify = -1;
       this.onMode = null;
-      this.noise = { gustT: 3 + 4 * this.rand(), gust: 0, gustEnd: 0 };
+      this.noise = { breeze: 0, flutter: 0 };
     }
     setConnected(c) {
       c = !!c;
@@ -3309,15 +3307,30 @@ try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
             this._toMode(this.connected ? "swing" : "limp");
           } else {
             a = this._lqrAccel(z, this._balanceAuthority());
-            if (this.opts.gusts) {
-              const n = this.noise;
-              if (this.t > n.gustT) {
-                n.gust = (this.rand() - 0.5) * 0.55;  // a whisper: the standing l should sway, not lurch
-                n.gustEnd = this.t + 0.25;
-                n.gustT = this.t + 2.5 + 5 * this.rand();
-              }
-              if (this.t < n.gustEnd) this.s[3] += n.gust * dt * 6;
-              a = clamp(a + (this.rand() - 0.5) * 0.5, -p.aMaxBalance, p.aMaxBalance);
+            if (this.opts.breeze) {
+              // a varying little breeze instead of random gusts. The push
+              // itself is a fast Ornstein-Uhlenbeck flutter (0.8 s memory,
+              // zero mean, so there is never a sustained lean for the cart
+              // to walk away under); its strength is breathed by a slow
+              // envelope (9 s memory, squared then saturated so a swell
+              // has a hard ceiling) that swells, lulls, and leaves real
+              // near-still spells. The noise gains are sigma*sqrt(12) for
+              // uniform increments, holding each process near unit
+              // variance, so `wind` reads directly in rad/s^2 on the
+              // shoulder; the elbow takes a lighter share of the load.
+              const n = this.noise, rt = Math.sqrt(dt);
+              n.breeze += (-n.breeze / 9) * dt + 1.63 * rt * (this.rand() - 0.5);
+              n.flutter += (-n.flutter / 0.8) * dt + 5.48 * rt * (this.rand() - 0.5);
+              // room fades the wind if the cart strays from the l's cell
+              // (the track has only ~0.48 m of run-out on the "e" side);
+              // ease brings it back in after a catch, while the mark still
+              // balances on reduced authority (_balanceAuthority).
+              const room = 1 / (1 + 40 * this.s[0] * this.s[0]);
+              const ease = this.catchT >= 0 ? Math.min(1, (this.t - this.catchT) / 1.5) : 1;
+              const swell = n.breeze * n.breeze;
+              const wind = 0.1 * (0.25 + 1.05 * swell / (1 + swell)) * n.flutter * room * ease;
+              this.s[3] += wind * dt;
+              this.s[5] += 0.6 * wind * dt;
             }
           }
         } else if (this.mode === "limp") {
@@ -10921,7 +10934,7 @@ var qrcode = function() {
     // the wordmark's l is a live self-balancing double pendulum (see the logo
     // engine script above the main script), scaled to the glyph and balanced
     // over its cell — the controller's equilibrium IS the l's position. while
-    // the daemon is live it stands as the letter, riding out little gusts;
+    // the daemon is live it stands as the letter, swaying in a little breeze;
     // losing the signal cuts its motor, so the l collapses out of the word
     // and keeps swinging; on reconnect the cart swings it back upright and
     // the balance controller catches it — the word heals. reduced-motion

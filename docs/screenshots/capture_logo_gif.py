@@ -8,8 +8,8 @@ and the replay is true-speed physics, not an approximation of it.
 
 The loop tells the product story with the real controller, not keyframes:
 
-  * the l stands balanced and DEAD STILL: the ambient gusts of the live page
-    are switched off, so between events the LQR pins the glyph at exact
+  * the l stands balanced and DEAD STILL: the ambient breeze of the live page
+    is switched off, so between events the LQR pins the glyph at exact
     upright and nothing moves at all;
   * the only disturbances are the theme hops: each one lands as before (the
     ink SWITCHES clean to the next theme and holds while the glyph splits
@@ -71,8 +71,11 @@ PORT = 8123
 
 FRAME_MS = 20         # 50 fps: the ~20ms GIF decoder floor, and an exact sim dt
 FRAMES = 9000         # 180.0 s loop (stillness is frame-free, see docstring)
-PAD = 12              # css px around the brand box (glow + swing overflow)
-SCALE = 2             # device pixels per css px, matches the PNG set
+PAD = 8               # css px around the brand box (the glow tails; the swing
+                      # itself never leaves the '#mark svg' rect the clip spans)
+SCALE = 3             # device pixels per css px. The README shows the loop at
+                      # its intrinsic size, so this IS the zoom: 3 renders the
+                      # wordmark half again larger than the dashboard PNGs' 2.
 
 # WebP is the primary (24-bit colour -> no 256-palette banding on the glow or
 # the glitch's saturated ghosts); the GIF is a 256-colour twin for clients that
@@ -107,8 +110,8 @@ SEARCH_CHUNK = 8               # seeds per in-page batch (progress + early exit)
 # A frame is only frozen (duration-extended, not screenshotted) once the sim
 # is balanced, the swing trail has fully drained, and the state has stayed
 # under these bounds for FREEZE_HOLD consecutive frames. At the mount's scale
-# (~112 device px/m, ~0.6 m reach) the bounds keep any residual motion, and
-# therefore the freeze cut itself and the loop seam, under ~0.3 device px.
+# (~168 device px/m, ~0.6 m reach) the bounds keep any residual motion, and
+# therefore the freeze cut itself and the loop seam, under ~0.5 device px.
 FREEZE_CALM = 0.004   # |th1| + |th2| + 0.3*(|w1| + |w2|), wrapped rad
 FREEZE_X = 0.0015     # cart offset from the l's cell (m)
 FREEZE_XD = 0.008     # cart speed (m/s)
@@ -149,8 +152,8 @@ VARIANTS = [
 ]
 
 # brand-box ink tokens, lifted verbatim from index.html. Setting these inline on
-# <html> outranks the `html[data-theme=...]` rules, so the mark + wordmark + tag
-# + glow all flick to the target palette without disturbing the background.
+# <html> outranks the `html[data-theme=...]` rules, so the mark + wordmark +
+# glow all flick to the target palette without disturbing the background.
 # --pending inks the bobs while the mark is down/recovering, --border2 the rail:
 # both are part of the pendulum's dress and must hop with the rest of the ink.
 INK_KEYS = ("--fg", "--fg-dim", "--fg-faint", "--accent", "--glow",
@@ -235,14 +238,14 @@ INIT_HOOK = (
 
 # Unhook the page's animation (its rAF loop + anything that could restart it)
 # and rebuild the sim on the chosen seed: connected, balanced, exactly upright —
-# frame 0 of the loop. gusts:false is the whole point of the choreography: the
-# live page's ambient wobble is off, so the only disturbances are the pokes.
+# frame 0 of the loop. breeze:false is the whole point of the choreography: the
+# live page's ambient sway is off, so the only disturbances are the pokes.
 JS_SETUP = """(seed) => {
   const L = window.__pendLogo;
   L.sync = () => {};                       // kickMark() etc. may not restart us
   if (L._raf) cancelAnimationFrame(L._raf);
   L._raf = 0;
-  L.sim = new window.CronstableLogo.Sim(L.sim.p, { seed, gusts: false });
+  L.sim = new window.CronstableLogo.Sim(L.sim.p, { seed, breeze: false });
   // defensive: railMax is pinned off above, but if the dynamic gate is ever
   // re-enabled here, a pre-setup disconnect must not freeze it extended
   const gt = L._gate;
@@ -261,7 +264,7 @@ JS_SEARCH = """([frames, eventsBySeed, seeds, gate]) => {
   const out = [];
   for (const seed of seeds) {
     const events = eventsBySeed[seed];
-    const sim = new window.CronstableLogo.Sim(params, { seed, gusts: false });
+    const sim = new window.CronstableLogo.Sim(params, { seed, breeze: false });
     let catchAt = -1, fellEarly = false, clamped = false, lost = false;
     for (let k = 0; k < frames; k++) {
       const ev = events[k];
@@ -307,7 +310,7 @@ JS_DRIVE = """([ev, ink, dtMs]) => new Promise((res) => {
 # A frozen stretch: the screen holds the previous frame while the physics
 # steps on underneath, render-free, in one round trip. No event ever lands
 # inside one of these spans (the capture always stops at the next event
-# frame), and a calm balanced sim with gusts off cannot wake itself up.
+# frame), and a calm balanced sim with the breeze off cannot wake itself up.
 JS_RUN = """([n, dtMs]) => {
   const L = window.__pendLogo, dt = dtMs / 1000;
   for (let i = 0; i < n; i++) L.sim.step(dt);
@@ -382,8 +385,14 @@ def new_page(browser, theme):
     page.wait_for_selector("#mark svg")
     page.evaluate("document.fonts.ready")  # settle glyph/wordmark metrics
     # pin the CRT flicker (a 100 ms opacity dip every 3.2 s) at its 97%-of-the-
-    # time state so frozen stretches and re-runs are deterministic
-    page.add_style_tag(content="#crt { animation: none !important; }")
+    # time state so frozen stretches and re-runs are deterministic. The header's
+    # bottom border would cross the frame as a stray horizontal line (the clip
+    # pads below the mark's swing box, past the header's edge), so it is dropped
+    # and the header's own background is extended down over the padding band.
+    page.add_style_tag(content=
+        "#crt { animation: none !important; }"
+        "header { border-bottom: none !important;"
+        f" padding-bottom: {2 * PAD}px !important; }}")
     return ctx, page
 
 
@@ -431,7 +440,7 @@ def capture(browser, base, theme, stops, seed):
     ctx, page = new_page(browser, theme)
     page.evaluate(JS_SETUP, seed)
     box = page.evaluate("""() => {
-      const rs = ['#mark svg', '#brandName', '.brand .tag']
+      const rs = ['#mark svg', '#brandName']
         .map((s) => document.querySelector(s).getBoundingClientRect());
       const x = Math.min(...rs.map((r) => r.left));
       const y = Math.min(...rs.map((r) => r.top));
