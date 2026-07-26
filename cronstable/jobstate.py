@@ -141,7 +141,12 @@ def _check_size(kind: str, value: Any, max_bytes: int) -> None:
     """
     try:
         _json.ensure_portable(_as_stored(value))
-        encoded = _json.dumps_bytes(value)
+        # trusted: the line above just proved this exact value portable, at a
+        # nesting depth two levels DEEPER than the bare value the size is
+        # measured on, so the verdict is strictly tighter than the one
+        # dumps_bytes would reach on its own.  Without the flag the same walk
+        # runs a second time here, for bytes only ``len()`` is read from.
+        encoded = _json.dumps_bytes(value, trusted=True)
     except _json.UnsupportedValue as ex:
         raise JobStateError(
             "{} is not portable across the fleet: {}".format(kind, ex)

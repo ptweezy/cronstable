@@ -25,7 +25,7 @@ stays stable and backend-independent whether or not a given host has orjson.
 import json as _stdlib
 import math
 import re
-from typing import Any, Union, cast
+from typing import Any, Iterable, Union, cast
 
 try:
     import orjson
@@ -101,6 +101,19 @@ _DIGIT_RUN_TR = bytes.maketrans(
     bytes((0x30 if 0x30 <= c <= 0x39 else 0x20) for c in range(256)),
 )
 _RUN19 = b"0" * 19
+
+# Leaf classes the walks below skip *recursing into*, tested by exact class
+# identity so a str/int subclass still takes the full dispatch.  These are
+# conservative fast paths inside the container loops, never a second copy of
+# the rule set: a class is listed only where every instance of it is
+# unconditionally accepted, so skipping cannot change a verdict, only save a
+# call frame plus its isinstance chain.  The walks visit every node of a
+# document, and a real payload is overwhelmingly these leaves -- the frames
+# were most of the gate's cost.
+_NONE_TYPE = type(None)
+#: :func:`_ensure_finite` checks non-finite floats and depth alone, so every
+#: one of these is a no-op for it (``bool`` included: it is an ``int``).
+_FINITE_LEAF = frozenset({str, int, bool, _NONE_TYPE})
 
 
 def _checked_parse_int(text: str) -> int:
@@ -188,13 +201,15 @@ def _ensure_finite(obj: Any, _depth: int = 0) -> None:
             raise _depth_error(_depth)
         _next = _depth + 1
         for value in obj.values():
-            _ensure_finite(value, _next)
+            if value.__class__ not in _FINITE_LEAF:
+                _ensure_finite(value, _next)
     elif isinstance(obj, (list, tuple)):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
         _next = _depth + 1
         for value in obj:
-            _ensure_finite(value, _next)
+            if value.__class__ not in _FINITE_LEAF:
+                _ensure_finite(value, _next)
 
 
 def ensure_portable(obj: Any, _depth: int = 0) -> None:
@@ -242,29 +257,64 @@ def ensure_portable(obj: Any, _depth: int = 0) -> None:
     elif isinstance(obj, dict):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
-        _next = _depth + 1
-        for key, value in obj.items():
-            if not isinstance(key, str):
-                raise UnsupportedValue(
-                    "non-string object key {!r} is not portable across the "
-                    "fleet (orjson rejects it, the stdlib coerces it)".format(
-                        key
-                    )
-                )
-            # The str branch above, inlined: a proven-str can reach nothing
-            # else (no depth guard applies to it), and recursing per KEY as
-            # well as per value doubled the node count of the whole walk.
-            if not key.isascii():
-                match = _SURROGATES.search(key)
-                if match is not None:
-                    raise _surrogate_error(match.group())
-            ensure_portable(value, _next)
+        _portable_items(obj, _depth + 1)
     elif isinstance(obj, (list, tuple)):
         if _depth >= MAX_DEPTH:
             raise _depth_error(_depth)
-        _next = _depth + 1
-        for value in obj:
-            ensure_portable(value, _next)
+        _portable_values(obj, _depth + 1)
+
+
+def _portable_items(obj: Any, _depth: int) -> None:
+    """:func:`ensure_portable`'s dict branch, in the order it always ran.
+
+    The per-value test is deliberately ONE-SIDED: it decides only that a
+    value is DEFINITELY portable (an ASCII str, an in-window int, a bool,
+    None) and skips the call; anything it cannot clear -- a float, a
+    container, a subclass, a value that fails the cheap test -- goes to
+    :func:`ensure_portable`, so every actual verdict and error message still
+    comes from that one dispatch.  It is spelled out here and in
+    :func:`_portable_values` rather than factored into a shared callee
+    because a call per value is the cost being removed.
+    """
+    for key, value in obj.items():
+        if not isinstance(key, str):
+            raise UnsupportedValue(
+                "non-string object key {!r} is not portable across the "
+                "fleet (orjson rejects it, the stdlib coerces it)".format(key)
+            )
+        # The str branch of the dispatch, inlined: a proven-str can reach
+        # nothing else (no depth guard applies to it), and recursing per KEY
+        # as well as per value doubled the node count of the whole walk.
+        if not key.isascii():
+            match = _SURROGATES.search(key)
+            if match is not None:
+                raise _surrogate_error(match.group())
+        cls = value.__class__
+        if cls is str:
+            if not value.isascii():
+                ensure_portable(value, _depth)
+        elif cls is int:
+            if value < _INT_MIN or value > _INT_MAX:
+                ensure_portable(value, _depth)
+        elif cls is not bool and cls is not _NONE_TYPE:
+            ensure_portable(value, _depth)
+
+
+def _portable_values(values: Iterable[Any], _depth: int) -> None:
+    """:func:`ensure_portable`'s list/tuple branch.
+
+    Same one-sided leaf test as :func:`_portable_items`; see its docstring.
+    """
+    for value in values:
+        cls = value.__class__
+        if cls is str:
+            if not value.isascii():
+                ensure_portable(value, _depth)
+        elif cls is int:
+            if value < _INT_MIN or value > _INT_MAX:
+                ensure_portable(value, _depth)
+        elif cls is not bool and cls is not _NONE_TYPE:
+            ensure_portable(value, _depth)
 
 
 if orjson is not None:
