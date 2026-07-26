@@ -71,8 +71,7 @@ PORT = 8123
 
 FRAME_MS = 20         # 50 fps: the ~20ms GIF decoder floor, and an exact sim dt
 FRAMES = 9000         # 180.0 s loop (stillness is frame-free, see docstring)
-PAD = 8               # css px around the brand box (the glow tails; the swing
-                      # itself never leaves the '#mark svg' rect the clip spans)
+PAD = 9               # css px around the wordmark (glow tails + swing room)
 SCALE = 3             # device pixels per css px. The README shows the loop at
                       # its intrinsic size, so this IS the zoom: 3 renders the
                       # wordmark half again larger than the dashboard PNGs' 2.
@@ -439,14 +438,21 @@ def pick_seed(page):
 def capture(browser, base, theme, stops, seed):
     ctx, page = new_page(browser, theme)
     page.evaluate(JS_SETUP, seed)
+    # Horizontally the clip spans the wordmark AND the mark's svg (the rail's
+    # run-out). Vertically it hugs the wordmark alone, padded the same on both
+    # sides, so the resting lockup sits dead-centre in the frame: the svg box
+    # reserves more below-rail swing room than the choreography ever uses
+    # (scanning every captured frame puts the deepest swing ink ~6 css px
+    # under the baseline, inside the wordmark's PAD band), and letting the
+    # empty remainder into the frame reads as the logo riding high.
     box = page.evaluate("""() => {
       const rs = ['#mark svg', '#brandName']
         .map((s) => document.querySelector(s).getBoundingClientRect());
       const x = Math.min(...rs.map((r) => r.left));
-      const y = Math.min(...rs.map((r) => r.top));
-      return { x, y,
+      const b = rs[1];
+      return { x, y: b.top,
                width: Math.max(...rs.map((r) => r.right)) - x,
-               height: Math.max(...rs.map((r) => r.bottom)) - y };
+               height: b.height };
     }""")
     clip = {
         "x": max(0, box["x"] - PAD),
