@@ -113,7 +113,9 @@ import datetime
 import hashlib
 import re
 from typing import (
+    Dict,
     FrozenSet,
+    Iterable,
     Iterator,
     List,
     Mapping,
@@ -173,6 +175,13 @@ _YEAR_FLOOR = 1970
 #: Module scope because the probe runs on every aware ``next()``: a shared
 #: immutable timedelta is indistinguishable from a freshly built one.
 _GAP_PROBE = datetime.timedelta(hours=26)
+
+#: The one-second step :meth:`CronTab._next_civil` and
+#: :meth:`CronTab._prev_civil` take off ``now``, hoisted for the same reason
+#: as :data:`_GAP_PROBE`: the constructor costs about three times the rest of
+#: that line and it runs once per next(), once per prev() and once per
+#: occurrences() yield.
+_ONE_SECOND = datetime.timedelta(seconds=1)
 
 
 #: Days per month, indexed 1-12 (February's non-leap length); index 0 unused.
@@ -414,7 +423,7 @@ def _resolve(token: str, spec: _FieldSpec, item: str) -> int:
     return value
 
 
-def _parse_item(item: str, spec: _FieldSpec) -> Iterator[int]:
+def _parse_item(item: str, spec: _FieldSpec) -> Iterable[int]:
     """Expand one comma-separated item (``*``, ``a``, ``a-b``, with ``/n``).
 
     Mirrors the old library's validation exactly: a step must be positive,
@@ -422,6 +431,11 @@ def _parse_item(item: str, spec: _FieldSpec) -> Iterator[int]:
     inside the field's range (so ``*/12`` in the 1-12 month field or
     ``50-59/15`` in the minute field are rejected); a reversed range is an
     error, except that a day-of-week range ending in 0 wraps to 7.
+
+    Returns a concrete ``range`` (or a one-tuple) rather than yielding:
+    every caller drains the result straight into ``set.update``, which then
+    consumes it entirely in C.  As a generator this cost one Python frame
+    resumption per value, i.e. 134 of them for a bare ``* * * * *``.
     """
     label, lo, hi, step_end, _names = spec
     head, slash, step_text = item.partition("/")
@@ -463,8 +477,7 @@ def _parse_item(item: str, spec: _FieldSpec) -> Iterator[int]:
     else:
         start = _resolve(head, spec, item)
         if not slash:
-            yield start
-            return
+            return (start,)
         end = step_end
         if start > end:
             raise ValueError(
@@ -476,11 +489,69 @@ def _parse_item(item: str, spec: _FieldSpec) -> Iterator[int]:
                 label, step, start, lo, hi
             )
         )
-    yield from range(start, end + 1, step)
+    return range(start, end + 1, step)
+
+
+_DomParse = Tuple[FrozenSet[int], FrozenSet[int], FrozenSet[int], bool]
+_DowParse = Tuple[FrozenSet[int], FrozenSet[int], FrozenSet[Tuple[int, int]]]
+
+#: A time of day as the three numbers a datetime constructor wants.
+_HMS = Tuple[int, int, int]
+
+#: How many distinct field texts each interning cache below keeps.  A fleet
+#: has a tiny number of distinct FIELD texts even when whole expressions all
+#: differ (100k generated schedules produce ~80 of them), so the cap is only
+#: ever reached by pathological churn.  It still has to exist: without it a
+#: config whose field text changes on every reload would grow the caches
+#: without bound, where today the frozensets are freed with the JobConfigs
+#: that held them.  Past the cap parsing simply falls back to building fresh
+#: values, i.e. to what it did before.
+_FIELD_CACHE_MAX = 4096
+
+#: Parsed field values, interned per ``(field label, text)``.  Every value a
+#: field parser returns is immutable and every consumer is read-only (the
+#: engine does membership tests, the properties hand the frozensets out as
+#: ground truth), so one CronTab's minute set is indistinguishable from
+#: another's for the same text.  A fleet nonetheless allocated and RETAINED
+#: one private copy per job, and CPython over-allocates set tables enough
+#: that five field containers came to ~5 KB per parsed expression.
+#:
+#: No lock: a reload parses on a worker thread, and the worst a racing
+#: writer can do is store an equal value twice or overshoot the cap by the
+#: number of threads in flight.
+_PLAIN_CACHE: Dict[Tuple[str, str], FrozenSet[int]] = {}
+_DOM_CACHE: Dict[str, _DomParse] = {}
+_DOW_CACHE: Dict[str, _DowParse] = {}
+
+#: The sorted tuples the time-of-day and month/year searches bisect, keyed on
+#: the (interned, hash-caching) frozenset they were built from.
+_SORTED_CACHE: Dict[FrozenSet[int], Tuple[int, ...]] = {}
+
+#: Shared empties for the L / W / # families, which almost no expression
+#: uses: CPython has no empty-frozenset singleton (``frozenset() is
+#: frozenset()`` is False), so every CronTab used to carry four private
+#: 216-byte empty sets.
+_NO_INTS: FrozenSet[int] = frozenset()
+_NO_NTH: FrozenSet[Tuple[int, int]] = frozenset()
+
+
+def _sorted_tuple(values: FrozenSet[int]) -> Tuple[int, ...]:
+    """``tuple(sorted(values))``, shared across every tab with that set."""
+    shared = _SORTED_CACHE.get(values)
+    if shared is not None:
+        return shared
+    shared = tuple(sorted(values))
+    if len(_SORTED_CACHE) < _FIELD_CACHE_MAX:
+        _SORTED_CACHE[values] = shared
+    return shared
 
 
 def _parse_plain(text: str, spec: _FieldSpec) -> FrozenSet[int]:
     """A field with no ``L`` forms (second/minute/hour/month/year)."""
+    key = (spec[0], text)
+    cached = _PLAIN_CACHE.get(key)
+    if cached is not None:
+        return cached
     values: Set[int] = set()
     for item in text.split(","):
         if item.startswith("l"):
@@ -489,12 +560,15 @@ def _parse_plain(text: str, spec: _FieldSpec) -> FrozenSet[int]:
                 "fields, not {}".format(spec[0])
             )
         values.update(_parse_item(item, spec))
-    return frozenset(values)
+    # the store sits after every raise, so a rejected field is re-rejected
+    # with the same message rather than served from the cache
+    result = frozenset(values)
+    if len(_PLAIN_CACHE) < _FIELD_CACHE_MAX:
+        _PLAIN_CACHE[key] = result
+    return result
 
 
-def _parse_dom(
-    text: str,
-) -> Tuple[FrozenSet[int], FrozenSet[int], FrozenSet[int], bool]:
+def _parse_dom(text: str) -> _DomParse:
     """Day-of-month: plain values plus the ``L`` and ``W`` families.
 
     Returns ``(values, last_offsets, nearest, last_weekday)``: explicit
@@ -503,6 +577,9 @@ def _parse_dom(
     nearest each), and whether ``LW`` (the month's last weekday) was
     given.
     """
+    cached = _DOM_CACHE.get(text)
+    if cached is not None:
+        return cached
     values: Set[int] = set()
     last_offsets: Set[int] = set()
     nearest: Set[int] = set()
@@ -550,17 +627,18 @@ def _parse_dom(
             nearest.add(day)
         else:
             values.update(_parse_item(item, _DOM))
-    return (
+    result: _DomParse = (
         frozenset(values),
-        frozenset(last_offsets),
-        frozenset(nearest),
+        frozenset(last_offsets) if last_offsets else _NO_INTS,
+        frozenset(nearest) if nearest else _NO_INTS,
         last_weekday,
     )
+    if len(_DOM_CACHE) < _FIELD_CACHE_MAX:
+        _DOM_CACHE[text] = result
+    return result
 
 
-def _parse_dow(
-    text: str,
-) -> Tuple[FrozenSet[int], FrozenSet[int], FrozenSet[Tuple[int, int]]]:
+def _parse_dow(text: str) -> _DowParse:
     """Day-of-week: plain values, ``L``-prefixed items and ``#`` items.
 
     Returns ``(values, last, nth)``: the first two as before, plus the
@@ -569,6 +647,9 @@ def _parse_dow(
     (Sunday) is stored as 0; matching then never needs the 0/7
     equivalence.
     """
+    cached = _DOW_CACHE.get(text)
+    if cached is not None:
+        return cached
     values: Set[int] = set()
     last: Set[int] = set()
     nth: Set[Tuple[int, int]] = set()
@@ -628,11 +709,14 @@ def _parse_dow(
             nth.add((day % 7, ordinal))
         else:
             values.update(_parse_item(item, _DOW))
-    return (
+    result: _DowParse = (
         frozenset(v % 7 for v in values),
-        frozenset(v % 7 for v in last),
-        frozenset(nth),
+        frozenset(v % 7 for v in last) if last else _NO_INTS,
+        frozenset(nth) if nth else _NO_NTH,
     )
+    if len(_DOW_CACHE) < _FIELD_CACHE_MAX:
+        _DOW_CACHE[text] = result
+    return result
 
 
 def _shift_to_weekday(
@@ -687,14 +771,29 @@ class CronTab:
         "_seconds_sorted",
         "_months_sorted",
         "_years_sorted",
+        "_dom_sorted",
+        "_dow_free",
         "_days_plain",
+        "_resolved_differs",
     )
 
     def __init__(self, crontab: str, hash_key: Optional[str] = None) -> None:
         self._source = " ".join(crontab.split())
         self._resolved = self._source
         fields = crontab.lower().split()
-        display: Optional[List[str]] = self._source.split()
+        # An expression with no H anywhere has nothing to expand, and the
+        # expansion is not cheap: it splits every column on commas and
+        # lowercases every item, on top of the two lowerings the parse
+        # already does.  ``display is None`` is already the downstream
+        # spelling of "nothing to resolve" (the macro branch sets it), and
+        # ``self._resolved`` already equals the normalized source, so the
+        # gated path is byte-identical.  Deliberately conservative: any 'h'
+        # at all (``thu``, ``@hourly``) still takes the old path, so no
+        # spelling of H can slip past.
+        has_hash = "h" in crontab or "H" in crontab
+        display: Optional[List[str]] = (
+            self._source.split() if has_hash else None
+        )
         if len(fields) == 1 and fields[0] in _MACROS:
             self._source = fields[0]
             self._resolved = fields[0]
@@ -771,13 +870,24 @@ class CronTab:
             if hint is not None:
                 raise ValueError("{} ({})".format(err, hint)) from None
             raise
-        self._seconds_sorted = tuple(sorted(self._seconds))
-        self._minutes_sorted = tuple(sorted(self._minutes))
-        self._hours_sorted = tuple(sorted(self._hours))
-        self._months_sorted = tuple(sorted(self._months))
+        # Pooled on the field sets they come from, so two tabs with the same
+        # hour column share one tuple instead of holding a private copy each.
+        self._seconds_sorted = _sorted_tuple(self._seconds)
+        self._minutes_sorted = _sorted_tuple(self._minutes)
+        self._hours_sorted = _sorted_tuple(self._hours)
+        self._months_sorted = _sorted_tuple(self._months)
+        self._dom_sorted = _sorted_tuple(self._dom)
+        # An empty tuple (not None) for an absent year column: the walks
+        # already gate every use on ``self._years``, and the singleton keeps
+        # the successor lookup's argument one plain type.
         self._years_sorted = (
-            tuple(sorted(self._years)) if self._years is not None else None
+            _sorted_tuple(self._years) if self._years is not None else ()
         )
+        # Whether the day-of-week column constrains anything.  All seven
+        # values means the second half of the plain-day test is a tautology,
+        # which lets _next_civil bisect straight through the day-of-month
+        # list instead of stepping one calendar day at a time.
+        self._dow_free = len(self._dow) == 7
         # Whether BOTH day columns are plain value sets, i.e. no member of
         # the L / W / # families is present.  When they are, a day matches
         # iff ``day in self._dom and dow in self._dow``: the unrestricted
@@ -794,6 +904,11 @@ class CronTab:
             or self._dow_last
             or self._dow_nth
         )
+        # Whether this tab has anything to say beyond str(self).  Every
+        # schedule payload asks (to decide whether to emit a "resolved"
+        # field) and the answer is fixed at parse time, so it is settled
+        # here instead of re-derived per request from the two source texts.
+        self._resolved_differs = self._resolved != self._source
 
     # ------------------------------------------------------------------
     # Introspection
@@ -816,9 +931,30 @@ class CronTab:
         """
         return self._resolved
 
+    @property
+    def resolved_differs(self) -> bool:
+        """Whether :attr:`resolved_source` says more than ``str(self)``.
+
+        True only for an expression that actually carried an ``H`` item, so
+        a payload builder can gate the extra "resolved" field on one
+        precomputed flag rather than comparing the two texts (and rebuilding
+        ``str(self)``) on every request.
+        """
+        return self._resolved_differs
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, CronTab):
             return False
+        if self is other:
+            return True
+        # ``_resolved`` is derived purely from the source text, and the twelve
+        # field sets below are parsed from that same text, so equal resolved
+        # sources imply equal fields.  The converse does not hold (``*/5 * * *
+        # *`` and ``0-59/5 * * * *`` parse to identical fields from different
+        # text), which is why a mismatch falls through to the full comparison
+        # rather than returning False.
+        if self._resolved == other._resolved:
+            return True
         return (
             self._seconds == other._seconds
             and self._minutes == other._minutes
@@ -1009,23 +1145,15 @@ class CronTab:
         real instant is not in the future, so over-generation costs a few
         wasted iterations, never a wrong answer.
 
-        The probe spans :data:`_GAP_PROBE`.  Outside the brief
-        post-transition window the fast path is a single extra offset
-        probe, and for a FIXED-offset zone not even that: a
+        The probe spans :data:`_GAP_PROBE`, so outside the brief
+        post-transition window the cost is one extra offset lookup.  Only
+        a zone that can actually change offset ever gets here: a
         :class:`datetime.timezone` carries one immutable offset by
-        construction, so ``off_now <= off_then`` is a theorem and the
-        whole probe is provably a no-op.  Skipping it there is an exact
-        elimination, not an approximation, and it matters because the
-        overwhelmingly common aware call (a UTC ``now``) paid for the
-        full probe on every invocation.  ``type(...) is`` rather than
-        ``isinstance`` only to keep the theorem's precondition literal:
-        CPython refuses to subclass :class:`datetime.timezone` at all
-        ("not an acceptable base type"), so the two spellings cannot
-        actually differ here.
+        construction, which makes ``off_now <= off_then`` a theorem and the
+        whole probe provably a no-op, and both callers now take that
+        theorem further and skip the entire UTC round trip.
         """
         civil = now.replace(tzinfo=None)
-        if type(now.tzinfo) is datetime.timezone:
-            return civil
         try:
             earlier = (now_utc - _GAP_PROBE).astimezone(now.tzinfo)
         except (OverflowError, OSError):  # pragma: no cover - datetime.min
@@ -1073,6 +1201,27 @@ class CronTab:
             if target is None:
                 return None
             return (target - now).total_seconds()
+        if type(now.tzinfo) is datetime.timezone:
+            # A fixed offset makes the whole UTC round trip below an
+            # identity: the one immutable offset cancels in the comparison
+            # AND in the subtraction, and _next_civil already answers
+            # strictly after its seed, so the guard always passes and the
+            # retry loop provably runs once.  That is the theorem
+            # _gap_rewound_seed states, taken one step further, and it is
+            # worth taking: this is the DEFAULT aware call, since a job
+            # without an explicit timezone is re-armed against
+            # ``after.astimezone()``, which is exactly a datetime.timezone,
+            # and it was paying four datetimes and two zone conversions per
+            # fire for an answer the civil walk already had.
+            # ``type(...) is`` rather than ``isinstance`` keeps the
+            # theorem's precondition literal; CPython refuses to subclass
+            # datetime.timezone ("not an acceptable base type"), so the two
+            # spellings cannot actually differ here.
+            civil = now.replace(tzinfo=None)
+            target = self._next_civil(civil)
+            if target is None:
+                return None
+            return (target - civil).total_seconds()
         # Aware: the delay to the next REAL instant, i.e. the first
         # :meth:`occurrences` yield after ``now``.  Each civil match is
         # resolved in the zone (fold=0) and compared through UTC, so a
@@ -1107,21 +1256,27 @@ class CronTab:
         self, civil: datetime.datetime
     ) -> Optional[datetime.datetime]:
         """Smallest whole-second civil instant strictly after ``civil``."""
-        base = civil.replace(microsecond=0) + datetime.timedelta(seconds=1)
+        base = civil.replace(microsecond=0) + _ONE_SECOND
         year, month, day = base.year, base.month, base.day
         tod: Optional[datetime.time] = base.time()
+        years = self._years
+        # hoisted: both are instance-constant, and re-reading them through
+        # the descriptor on every pass of the walk bought nothing
+        years_sorted = self._years_sorted
+        months_sorted = self._months_sorted
         while year <= _YEAR_HORIZON:
-            years_sorted = self._years_sorted
-            if years_sorted is not None and year not in years_sorted:
+            # membership against the frozenset, not the sorted tuple beside
+            # it: a 1970-2099 column made this a scan of up to 130 ints
+            if years is not None and year not in years:
                 next_year = self._next_in(years_sorted, year)
                 if next_year is None:
                     return None
                 year, month, day, tod = next_year, 1, 1, None
                 continue
             if month not in self._months:
-                nxt = self._next_in(self._months_sorted, month)
+                nxt = self._next_in(months_sorted, month)
                 if nxt is None:
-                    year, month = year + 1, self._months_sorted[0]
+                    year, month = year + 1, months_sorted[0]
                 else:
                     month = nxt
                 day, tod = 1, None
@@ -1132,23 +1287,9 @@ class CronTab:
             # the weekday seed below cannot be asked for a date that does not
             # exist.
             if self._days_plain:
-                # The hot walk: two set lookups per candidate day, with the
-                # weekday carried forward instead of rebuilt from a fresh
-                # datetime.date, and no per-day method calls at all.  Exactly
-                # the _day_matches test of the general branch (see
-                # _days_plain).
-                dom = self._dom
-                dow_set = self._dow
-                # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
-                dow = (datetime.date(year, month, day).weekday() + 1) % 7
-                while day <= month_end:
-                    if day in dom and dow in dow_set:
-                        found = self._at_first_time(year, month, day, tod)
-                        if found is not None:
-                            return found
-                    day += 1
-                    dow = dow + 1 if dow < 6 else 0
-                    tod = None
+                found = self._next_plain_day(year, month, day, month_end, tod)
+                if found is not None:
+                    return found
             else:
                 while day <= month_end:
                     if self._day_matches(year, month, day, month_end):
@@ -1161,6 +1302,61 @@ class CronTab:
             day, tod = 1, None
             if month > 12:
                 year, month = year + 1, 1
+        return None
+
+    def _next_plain_day(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        month_end: int,
+        tod: Optional[datetime.time],
+    ) -> Optional[datetime.datetime]:
+        """Forward day scan for a tab whose day columns are plain sets.
+
+        ``None`` when this month holds no matching day at or after ``day``
+        (with a matching time of day), so the caller moves to the next
+        month.  ``tod`` is the time-of-day floor and applies to ``day``
+        ALONE: every later day of the month starts from midnight, so it is
+        dropped the moment the scan steps off the seed.
+        """
+        if self._dow_free:
+            # Day-of-week unrestricted, so ``dow in self._dow`` is a
+            # tautology and only the day-of-month list constrains the day:
+            # jump to each listed day instead of testing every calendar day
+            # between here and the answer.  A '1,15 * *' schedule walked up
+            # to 18 days (plus a datetime.date to seed the weekday) for what
+            # is one bisect.
+            dom_sorted = self._dom_sorted
+            index = bisect.bisect_left(dom_sorted, day)
+            seed_day = day
+            while index < len(dom_sorted):
+                day = dom_sorted[index]
+                if day > month_end:
+                    return None
+                found = self._at_first_time(
+                    year, month, day, tod if day == seed_day else None
+                )
+                if found is not None:
+                    return found
+                index += 1
+            return None
+        # Two set lookups per candidate day, with the weekday carried
+        # forward instead of rebuilt from a fresh datetime.date, and no
+        # per-day method calls at all.  Exactly the _day_matches test of
+        # _next_civil's general branch (see _days_plain).
+        dom = self._dom
+        dow_set = self._dow
+        # Python weekday(): Mon=0..Sun=6 -> cron: Sun=0..Sat=6.
+        dow = (datetime.date(year, month, day).weekday() + 1) % 7
+        while day <= month_end:
+            if day in dom and dow in dow_set:
+                found = self._at_first_time(year, month, day, tod)
+                if found is not None:
+                    return found
+            day += 1
+            dow = dow + 1 if dow < 6 else 0
+            tod = None
         return None
 
     def _at_first_time(
@@ -1178,10 +1374,10 @@ class CronTab:
         and the L/W/# path cannot drift apart.  Called once per next(), on
         the match, so the extra frame is off the per-candidate-day path.
         """
-        t = self._first_time(tod)
-        if t is None:
+        hms = self._first_time(tod)
+        if hms is None:
             return None
-        return datetime.datetime.combine(datetime.date(year, month, day), t)
+        return datetime.datetime(year, month, day, hms[0], hms[1], hms[2])
 
     def _at_last_time(
         self,
@@ -1192,10 +1388,10 @@ class CronTab:
     ) -> Optional[datetime.datetime]:
         """The backward mirror of :meth:`_at_first_time`, for
         :meth:`_prev_civil`."""
-        t = self._last_time(tod)
-        if t is None:
+        hms = self._last_time(tod)
+        if hms is None:
             return None
-        return datetime.datetime.combine(datetime.date(year, month, day), t)
+        return datetime.datetime(year, month, day, hms[0], hms[1], hms[2])
 
     @staticmethod
     def _next_in(ordered: Tuple[int, ...], current: int) -> Optional[int]:
@@ -1207,7 +1403,7 @@ class CronTab:
 
     def _first_time(
         self, at_or_after: Optional[datetime.time]
-    ) -> Optional[datetime.time]:
+    ) -> Optional[_HMS]:
         """Earliest matching time of day, at/after ``at_or_after`` if set.
 
         Each column is located with a binary search rather than scanned:
@@ -1219,30 +1415,37 @@ class CronTab:
         order of preference: a spent seconds column moves to the next
         minute of the SAME hour, and only a spent minutes column moves to
         the next hour.
+
+        A plain ``(hour, minute, second)`` rather than a
+        :class:`datetime.time`: the only consumer is
+        :meth:`_at_first_time`, which feeds the three numbers straight into
+        a datetime constructor, and building a time only to have
+        ``datetime.combine`` take it apart again cost two allocations per
+        answer for nothing.
         """
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
         if at_or_after is None:
-            return datetime.time(hours[0], minutes[0], seconds[0])
+            return (hours[0], minutes[0], seconds[0])
         hour = at_or_after.hour
         index = bisect.bisect_left(hours, hour)
         if index == len(hours):
             return None
         if hours[index] > hour:
-            return datetime.time(hours[index], minutes[0], seconds[0])
+            return (hours[index], minutes[0], seconds[0])
         minute = at_or_after.minute
         m_index = bisect.bisect_left(minutes, minute)
         if m_index < len(minutes):
             if minutes[m_index] > minute:
-                return datetime.time(hour, minutes[m_index], seconds[0])
+                return (hour, minutes[m_index], seconds[0])
             s_index = bisect.bisect_left(seconds, at_or_after.second)
             if s_index < len(seconds):
-                return datetime.time(hour, minute, seconds[s_index])
+                return (hour, minute, seconds[s_index])
             if m_index + 1 < len(minutes):
-                return datetime.time(hour, minutes[m_index + 1], seconds[0])
+                return (hour, minutes[m_index + 1], seconds[0])
         if index + 1 < len(hours):
-            return datetime.time(hours[index + 1], minutes[0], seconds[0])
+            return (hours[index + 1], minutes[0], seconds[0])
         return None
 
     # ------------------------------------------------------------------
@@ -1327,21 +1530,23 @@ class CronTab:
         if civil.microsecond:
             base = civil.replace(microsecond=0)
         else:
-            base = civil - datetime.timedelta(seconds=1)
+            base = civil - _ONE_SECOND
         year, month, day = base.year, base.month, base.day
         tod: Optional[datetime.time] = base.time()
+        years = self._years
+        years_sorted = self._years_sorted
+        months_sorted = self._months_sorted
         while year >= _YEAR_FLOOR:
-            years_sorted = self._years_sorted
-            if years_sorted is not None and year not in years_sorted:
+            if years is not None and year not in years:
                 prev_year = self._prev_in(years_sorted, year)
                 if prev_year is None:
                     return None
                 year, month, day, tod = prev_year, 12, 31, None
                 continue
             if month not in self._months:
-                prv = self._prev_in(self._months_sorted, month)
+                prv = self._prev_in(months_sorted, month)
                 if prv is None:
-                    year, month = year - 1, self._months_sorted[-1]
+                    year, month = year - 1, months_sorted[-1]
                 else:
                     month = prv
                 day, tod = 31, None
@@ -1352,18 +1557,9 @@ class CronTab:
             # the clamp above leaves ``day`` a real day of this month, so the
             # weekday seed cannot be asked for a date that does not exist.
             if self._days_plain:
-                # the backward mirror of _next_civil's fast walk
-                dom = self._dom
-                dow_set = self._dow
-                dow = (datetime.date(year, month, day).weekday() + 1) % 7
-                while day >= 1:
-                    if day in dom and dow in dow_set:
-                        found = self._at_last_time(year, month, day, tod)
-                        if found is not None:
-                            return found
-                    day -= 1
-                    dow = dow - 1 if dow > 0 else 6
-                    tod = None
+                found = self._prev_plain_day(year, month, day, tod)
+                if found is not None:
+                    return found
             else:
                 while day >= 1:
                     if self._day_matches(year, month, day, month_end):
@@ -1378,6 +1574,45 @@ class CronTab:
                 year, month = year - 1, 12
         return None
 
+    def _prev_plain_day(
+        self,
+        year: int,
+        month: int,
+        day: int,
+        tod: Optional[datetime.time],
+    ) -> Optional[datetime.datetime]:
+        """The backward mirror of :meth:`_next_plain_day`.
+
+        ``day`` is already clamped into the month by the caller, so no
+        ``month_end`` is owed here: every candidate the scan considers is at
+        or below it.
+        """
+        if self._dow_free:
+            dom_sorted = self._dom_sorted
+            index = bisect.bisect_right(dom_sorted, day) - 1
+            seed_day = day
+            while index >= 0:
+                day = dom_sorted[index]
+                found = self._at_last_time(
+                    year, month, day, tod if day == seed_day else None
+                )
+                if found is not None:
+                    return found
+                index -= 1
+            return None
+        dom = self._dom
+        dow_set = self._dow
+        dow = (datetime.date(year, month, day).weekday() + 1) % 7
+        while day >= 1:
+            if day in dom and dow in dow_set:
+                found = self._at_last_time(year, month, day, tod)
+                if found is not None:
+                    return found
+            day -= 1
+            dow = dow - 1 if dow > 0 else 6
+            tod = None
+        return None
+
     @staticmethod
     def _prev_in(ordered: Tuple[int, ...], current: int) -> Optional[int]:
         """Last element of ``ordered`` less than ``current``."""
@@ -1388,35 +1623,36 @@ class CronTab:
 
     def _last_time(
         self, at_or_before: Optional[datetime.time]
-    ) -> Optional[datetime.time]:
+    ) -> Optional[_HMS]:
         """Latest matching time of day, at/before ``at_or_before`` if set.
 
         The backward mirror of :meth:`_first_time`, binary-searched for the
-        same reason and with the same order of preference reversed.
+        same reason, with the same order of preference reversed and the same
+        ``(hour, minute, second)`` return.
         """
         hours = self._hours_sorted
         minutes = self._minutes_sorted
         seconds = self._seconds_sorted
         if at_or_before is None:
-            return datetime.time(hours[-1], minutes[-1], seconds[-1])
+            return (hours[-1], minutes[-1], seconds[-1])
         hour = at_or_before.hour
         index = bisect.bisect_right(hours, hour) - 1
         if index < 0:
             return None
         if hours[index] < hour:
-            return datetime.time(hours[index], minutes[-1], seconds[-1])
+            return (hours[index], minutes[-1], seconds[-1])
         minute = at_or_before.minute
         m_index = bisect.bisect_right(minutes, minute) - 1
         if m_index >= 0:
             if minutes[m_index] < minute:
-                return datetime.time(hour, minutes[m_index], seconds[-1])
+                return (hour, minutes[m_index], seconds[-1])
             s_index = bisect.bisect_right(seconds, at_or_before.second) - 1
             if s_index >= 0:
-                return datetime.time(hour, minute, seconds[s_index])
+                return (hour, minute, seconds[s_index])
             if m_index >= 1:
-                return datetime.time(hour, minutes[m_index - 1], seconds[-1])
+                return (hour, minutes[m_index - 1], seconds[-1])
         if index >= 1:
-            return datetime.time(hours[index - 1], minutes[-1], seconds[-1])
+            return (hours[index - 1], minutes[-1], seconds[-1])
         return None
 
     # ------------------------------------------------------------------
@@ -1453,6 +1689,20 @@ class CronTab:
         # overwrites this outright, so stripping the tzinfo up front only
         # ever bought a copy that was thrown away.
         civil = start
+        if type(tz) is datetime.timezone:
+            # Fixed offset: the same theorem next() exploits.  The offset
+            # cancels, so every candidate resolves to its own label and none
+            # can land at or before ``start``: there is no gap to rewind
+            # over, no fold to honour and no instant to re-render.  This is
+            # the zone the previews, the calendar render and croninfo's
+            # local-time cells all iterate in.
+            civil = start.replace(tzinfo=None)
+            while True:
+                target = self._next_civil(civil)
+                if target is None:
+                    return
+                yield target.replace(tzinfo=tz)
+                civil = target
         if tz is not None:
             # Mirror next()'s aware framing exactly, so the first yield IS
             # start + next(now=start):

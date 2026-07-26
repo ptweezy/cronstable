@@ -95,6 +95,8 @@ EXPANDED = "expanded"
 TERMINAL_STATES = frozenset({SUCCESS, FAILED, SKIPPED, UPSTREAM_FAILED})
 #: terminal states that count as a *success* for a downstream ``all_success``.
 SUCCESS_STATES = frozenset({SUCCESS})
+#: terminal states that make a downstream ``all_success`` dependency fail.
+FAILURE_STATES = frozenset({FAILED, UPSTREAM_FAILED})
 
 TASK = "task"
 SENSOR = "sensor"
@@ -163,11 +165,18 @@ class TaskSpec:
 
 @dataclass(frozen=True)
 class DagSpec:
-    """A whole DAG, normalised: ordered tasks plus an id index."""
+    """A whole DAG, normalised: ordered tasks, an id index, the mapped subset.
+
+    ``mapped_tasks`` is the ``expand``-carrying subset, precomputed here
+    because :func:`tasks_awaiting_expansion` runs on every advance and the
+    overwhelmingly common DAG has none: the check becomes O(1) instead of a
+    full spec walk per pass.
+    """
 
     name: str
     tasks: Tuple[TaskSpec, ...]
     by_id: Dict[str, TaskSpec] = field(default_factory=dict)
+    mapped_tasks: Tuple[TaskSpec, ...] = ()
 
     @staticmethod
     def build(name: str, tasks: List[TaskSpec]) -> "DagSpec":
@@ -175,6 +184,7 @@ class DagSpec:
             name=name,
             tasks=tuple(tasks),
             by_id={t.id: t for t in tasks},
+            mapped_tasks=tuple(t for t in tasks if t.expand is not None),
         )
 
 
@@ -266,16 +276,24 @@ def _check_acyclic(spec: DagSpec) -> None:
     # false cycle verdict on an acyclic graph).
     deps = {t.id: set(t.depends_on) for t in spec.tasks}
     indeg = {t.id: len(deps[t.id]) for t in spec.tasks}
+    # Reverse adjacency, built from the SAME deduped map: popping a node then
+    # rescanning every task for it made the walk O(V^2) set tests (a 10k-task
+    # chain took seconds of the config load).  validate_graph has already
+    # rejected unknown deps, self-deps and duplicate ids above, so every dep
+    # here names a real node and the edge set is identical either way.
+    dependents: Dict[str, List[str]] = {}
+    for tid, d in deps.items():
+        for dep in d:
+            dependents.setdefault(dep, []).append(tid)
     ready = [tid for tid, d in indeg.items() if d == 0]
     ordered = 0
     while ready:
         tid = ready.pop()
         ordered += 1
-        for task in spec.tasks:
-            if tid in deps[task.id]:
-                indeg[task.id] -= 1
-                if indeg[task.id] == 0:
-                    ready.append(task.id)
+        for down in dependents.get(tid, ()):
+            indeg[down] -= 1
+            if indeg[down] == 0:
+                ready.append(down)
     if ordered != len(spec.tasks):
         cyclic = sorted(tid for tid, d in indeg.items() if d > 0)
         raise DagValidationError(
@@ -316,7 +334,10 @@ def task_display_key(task_id: str, map_index: Optional[int]) -> str:
     """The per-instance key: ``id`` or ``id#<map_index>`` for a mapped run."""
     if map_index is None:
         return task_id
-    return "{}#{}".format(task_id, map_index)
+    # concatenation, not format(): this is called once per instance of a
+    # fan-out that can hold MAX_MAPPED_ITEMS entries, and the format machinery
+    # is ~2x the cost for a two-field key with no format spec.
+    return task_id + "#" + str(map_index)
 
 
 # --------------------------------------------------------------------------
@@ -463,15 +484,25 @@ def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
     if not items:
         return SUCCESS
     tasks = body["tasks"]
-    states = [
-        tasks.get(task_display_key(task_id, i), {}).get("state", PENDING)
-        for i in range(len(items))
-    ]
-    if not all(s in TERMINAL_STATES for s in states):
-        return RUNNING  # fan-in barrier: not every instance is terminal yet
-    if any(s in (FAILED, UPSTREAM_FAILED) for s in states):
+    # One pass with an early exit, not a materialised states list plus three
+    # scans: while a fan-out is in flight the FIRST instance is usually
+    # non-terminal, so building the other MAX_MAPPED_ITEMS-1 keys and lookups
+    # only to discard them is the bulk of this function's cost.
+    failed = False
+    skipped = False
+    prefix = task_id + "#"
+    for i in range(len(items)):
+        entry = tasks.get(prefix + str(i))
+        state = PENDING if entry is None else entry.get("state", PENDING)
+        if state not in TERMINAL_STATES:
+            return RUNNING  # fan-in barrier: not every instance is terminal
+        if state in FAILURE_STATES:
+            failed = True
+        elif state == SKIPPED:
+            skipped = True
+    if failed:
         return UPSTREAM_FAILED
-    if any(s == SKIPPED for s in states):
+    if skipped:
         return SKIPPED
     return SUCCESS
 
@@ -491,6 +522,11 @@ def _deps_verdict(spec: DagSpec, body: Dict[str, Any], task: TaskSpec) -> str:
     an upstream failed (``all_success``); ``skip`` -- an upstream was skipped
     (``all_success``).  ``all_done`` only ever returns ready or wait.
     """
+    if not task.depends_on:
+        # a root task is ready under either trigger rule (no upstream can be
+        # non-terminal, failed or skipped); this is the common shape in a wide
+        # DAG and it skips the whole reduction below.
+        return "ready"
     tasks = body.get("tasks", {})
     # A dependency with NO entry in this run document was added to the DAG by a
     # config reload AFTER the run was created (creation materialises every
@@ -498,17 +534,26 @@ def _deps_verdict(spec: DagSpec, body: Dict[str, Any], task: TaskSpec) -> str:
     # the dependent -- an ``effective_state`` of PENDING would leave the
     # dependent, and the whole run, waiting forever.  Mirrors the same
     # "not materialised -> skip" rule in :func:`_maybe_terminalise`.
-    ups = [
-        effective_state(spec, body, d) for d in task.depends_on if d in tasks
-    ]
-    if not all(s in TERMINAL_STATES for s in ups):
-        return "wait"
+    failed = False
+    skipped = False
+    for dep in task.depends_on:
+        if dep not in tasks:
+            continue
+        state = effective_state(spec, body, dep)
+        if state not in TERMINAL_STATES:
+            # one non-terminal upstream settles it: the remaining reductions
+            # (each an O(instances) walk for a mapped upstream) are dead work.
+            return "wait"
+        if state in FAILURE_STATES:
+            failed = True
+        elif state == SKIPPED:
+            skipped = True
     if task.trigger_rule == ALL_DONE:
         return "ready"
     # all_success
-    if any(s in (FAILED, UPSTREAM_FAILED) for s in ups):
+    if failed:
         return "fail"
-    if any(s == SKIPPED for s in ups):
+    if skipped:
         return "skip"
     return "ready"
 
@@ -530,12 +575,13 @@ def tasks_awaiting_expansion(
     expansion.
     """
     out: List[Tuple[str, str, str]] = []
+    if not spec.mapped_tasks:
+        return out  # nothing in this DAG can expand: no candidates to walk
     if is_terminal_run(body):
         return out
-    for task in spec.tasks:
-        if task.expand is None:
-            continue
-        if task.id in body.get("mapped", {}):
+    for task in spec.mapped_tasks:
+        exp = task.expand
+        if exp is None or task.id in body.get("mapped", {}):
             continue
         entry = body.get("tasks", {}).get(task.id)
         if entry is not None and entry.get("state") != PENDING:
@@ -543,8 +589,8 @@ def tasks_awaiting_expansion(
             # failed/skipped, or the fan-out failed the item cap): re-reading
             # its XCom every pass would be wasted work forever.
             continue
-        if effective_state(spec, body, task.expand.from_task) == SUCCESS:
-            out.append((task.id, task.expand.from_task, task.expand.key))
+        if effective_state(spec, body, exp.from_task) == SUCCESS:
+            out.append((task.id, exp.from_task, exp.key))
     return out
 
 
@@ -1002,28 +1048,38 @@ def _maybe_terminalise(spec, body, now, result) -> None:
     # added to the DAG *after* this run was created (a config reload): it is
     # not part of this run, so it is skipped rather than blocking the run from
     # ever terminalising.
-    states = []
+    # One non-terminal state is the whole answer, so return on it rather than
+    # collecting every state first: the walk it cuts short is O(spec tasks +
+    # mapped instances), and the very first entry of a run still in flight is
+    # usually the one that proves it.  ``failed`` accumulates inline for the
+    # run-state verdict, which is only consulted once every state is terminal.
+    tasks = body["tasks"]
+    mapped_all = body.get("mapped", {})
+    failed = False
     for task in spec.tasks:
-        if task.expand is not None and task.id not in body.get("mapped", {}):
-            if task.id not in body["tasks"]:
+        if task.expand is None or task.id not in mapped_all:
+            entry = tasks.get(task.id)
+            if entry is None:
                 continue  # task added post-creation: not part of this run
-            st = body["tasks"][task.id].get("state", PENDING)
+            st = entry.get("state", PENDING)
             if st not in TERMINAL_STATES:
                 return  # still pending / awaiting expansion
-            states.append(st)
+            if st in FAILURE_STATES:
+                failed = True
             continue
-        for taskkey, _mi, _it in _instances_of(spec, body, task):
-            entry = body["tasks"].get(taskkey)
+        mapped = mapped_all.get(task.id)
+        items = mapped.get("items", []) if mapped is not None else []
+        prefix = task.id + "#"
+        for i in range(len(items)):
+            entry = tasks.get(prefix + str(i))
             if entry is None:
                 continue  # spec task not materialised in this run: skip it
-            states.append(entry.get("state"))
-    if not all(s in TERMINAL_STATES for s in states):
-        return
-    run_state = (
-        FAILED
-        if any(s in (FAILED, UPSTREAM_FAILED) for s in states)
-        else SUCCESS
-    )
+            st = entry.get("state")
+            if st not in TERMINAL_STATES:
+                return
+            if st in FAILURE_STATES:
+                failed = True
+    run_state = FAILED if failed else SUCCESS
     if body.get("state") != run_state:
         body["state"] = run_state
         result.changed = True
@@ -1170,7 +1226,21 @@ def _entry_quiescence(
         except (TypeError, ValueError):
             return _Q_ACT
         return _q_blocked(body, task, taskkey, entry)
-    # PENDING (claimable or propagatable), or a state this build does not
+    if state == PENDING and task.expand is None:
+        # A pending PLAIN task whose upstreams are not all terminal is inert
+        # this pass exactly like an in-flight one: _advance_task returns on a
+        # "wait" verdict without touching it, reconcile skips non-RUNNING
+        # entries, and terminalisation only reads it.  This is the shape a
+        # chain (or a fan-in sink) spends its whole life in, so without it the
+        # pre-scan never fires for any DAG that has a downstream task.  The
+        # verdict cannot go stale mid-pass: a quiescent verdict requires NO
+        # entry to be _Q_ACT, and every mutation path short-circuits on the
+        # BLOCKED/INERT shapes, so no upstream state this reads can change.
+        # A mapped placeholder is deliberately excluded: expansion and
+        # _propagate_placeholder can both move it while its deps still "wait".
+        if _deps_verdict(spec, body, task) == "wait":
+            return _q_blocked(body, task, taskkey, entry)
+    # PENDING and claimable/propagatable, or a state this build does not
     # recognise.
     return _Q_ACT
 

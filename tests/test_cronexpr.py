@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from cronstable import cronexpr
 from cronstable.cronexpr import CronTab
 
 UTC = datetime.timezone.utc
@@ -782,8 +783,8 @@ def test_prev_picks_earlier_minute_in_the_same_hour():
 def test_last_time_earlier_hour_and_second_branches():
     ct = CronTab("0,30 8,12 * * * *")
     # target hour 10 has no matching hour; the latest hour below it (8) is
-    # returned at its own last minute/second.
-    assert ct._last_time(datetime.time(10, 5, 0)) == datetime.time(8, 30, 0)
+    # returned at its own last minute/second, as an (h, m, s) triple.
+    assert ct._last_time(datetime.time(10, 5, 0)) == (8, 30, 0)
 
 
 # prev(): now omitted, and the aware DST-gap anchor walk
@@ -960,3 +961,72 @@ def test_next_first_occurrence_prev_agree_across_dst_edges(expr, fold):
                 now=(want + datetime.timedelta(seconds=1)).astimezone(ny)
             )
             assert ago == 1.0, (expr, now, ago)
+
+
+# The two plain-day walks: bisected day-of-month when the day-of-week
+# column is unrestricted, weekday-carrying scan when it is not.
+
+
+def test_prev_plain_walk_steps_back_over_a_restricted_weekday():
+    # A restricted day-of-week column keeps _prev_civil on the scanning
+    # walk (no bisect), and Sunday the 19th forces it to step back two
+    # calendar days to Friday the 17th.
+    ct = CronTab("0 9 * * 1-5")
+    got = ct._prev_civil(datetime.datetime(2026, 7, 19, 10, 0))
+    assert got == datetime.datetime(2026, 7, 17, 9, 0)
+    # ... and from Saturday the 1st the whole of August is spent, so the
+    # scan exhausts the month and the walk falls back into July.
+    got = ct._prev_civil(datetime.datetime(2026, 8, 1, 8, 0))
+    assert got == datetime.datetime(2026, 7, 31, 9, 0)
+
+
+def test_next_plain_walk_steps_forward_over_a_restricted_weekday():
+    # the forward mirror: Saturday the 18th walks to Monday the 20th, and
+    # a spent month rolls into the next one.
+    ct = CronTab("0 9 * * 1-5")
+    assert ct._next_civil(
+        datetime.datetime(2026, 7, 18, 10, 0)
+    ) == datetime.datetime(2026, 7, 20, 9, 0)
+    assert ct._next_civil(
+        datetime.datetime(2026, 8, 30, 10, 0)
+    ) == datetime.datetime(2026, 8, 31, 9, 0)
+
+
+def test_field_caches_are_bounded_and_keep_parsing(monkeypatch):
+    # The interning caches must never grow without bound: past the cap a
+    # parse still answers, it just stops sharing.  Pinned because an
+    # unbounded cache would be strictly worse than no cache at all for a
+    # config whose field text churns on every reload.
+    monkeypatch.setattr(cronexpr, "_FIELD_CACHE_MAX", 0)
+    for cache in (
+        cronexpr._PLAIN_CACHE,
+        cronexpr._DOM_CACHE,
+        cronexpr._DOW_CACHE,
+        cronexpr._SORTED_CACHE,
+    ):
+        cache.clear()
+    a = CronTab("7 3 5 2 1")
+    b = CronTab("7 3 5 2 1")
+    assert a == b
+    assert a.minutes == frozenset({7}) and a.days_of_week == frozenset({1})
+    assert a.next(now=datetime.datetime(2026, 1, 1), default_utc=True) == (
+        b.next(now=datetime.datetime(2026, 1, 1), default_utc=True)
+    )
+    assert not cronexpr._PLAIN_CACHE
+    assert not cronexpr._DOM_CACHE
+    assert not cronexpr._DOW_CACHE
+    assert not cronexpr._SORTED_CACHE
+
+
+def test_field_cache_shares_values_between_tabs():
+    a = CronTab("*/5 8-18 1,15 * *")
+    b = CronTab("*/5 8-18 1,15 * *")
+    # identity, not just equality: this is the whole point of the cache
+    assert a.minutes is b.minutes
+    assert a.hours is b.hours
+    assert a.days_of_month is b.days_of_month
+    assert a._minutes_sorted is b._minutes_sorted
+    # an invalid field is never cached, so it keeps failing the same way
+    for _ in range(2):
+        with pytest.raises(ValueError, match="minute value 61"):
+            CronTab("61 * * * *")

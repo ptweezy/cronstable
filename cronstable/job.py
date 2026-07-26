@@ -22,8 +22,6 @@ from typing import (
     Tuple,
 )
 
-import aiohttp
-
 from cronstable import platform, push
 from cronstable.config import JobConfig, schedule_object_to_crontab
 from cronstable.resources import ResourceMonitor, ResourceUsage
@@ -41,10 +39,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger("cronstable")
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=256)
 def _compiled_template(source: str) -> "jinja2.Template":
-    # Template source strings come from config and are constant for the life
-    # of the process; compile each distinct one once and reuse it. jinja2 is
+    # Template source strings come from config. They are NOT constant for the
+    # life of the process: a config reload can edit a template, and each
+    # distinct source text then becomes a new entry. The cache is therefore
+    # bounded rather than unbounded, so a daemon that runs for months across
+    # many reloads cannot accumulate compiled templates without limit; 256 is
+    # far above any realistic live template count, so the steady state is
+    # still one compile per distinct template. jinja2 is
     # imported here (not at module top) so a daemon whose jobs never render a
     # report template never pays its import cost; the lru_cache means the
     # import statement is only reached on the first distinct template anyway.
@@ -245,6 +248,19 @@ class JobOutputStream:
             self._offer(queue, None)
 
 
+#: Bytes pulled from a job's pipe per read.  ``StreamReader.read`` returns
+#: as soon as ANY data is buffered, so a bigger chunk never delays a live
+#: tail; it only lets a chatty job's output be split in C, dozens of lines
+#: at a time, instead of running asyncio's Python-level ``readuntil``
+#: machinery (a find, a slice, a delete, a resume check and a coroutine
+#: frame) once per line.
+_READ_CHUNK = 65536
+
+#: Fallback line cap for a StreamReader built without one, matching the
+#: ``maxLineLength`` default in cronstable.config.
+DEFAULT_MAX_LINE_LENGTH = 16 * 1024 * 1024
+
+
 class StreamReader:
     def __init__(
         self,
@@ -254,6 +270,7 @@ class StreamReader:
         stream_prefix: str,
         save_limit: int,
         on_line: Optional[Callable[[str, str], None]] = None,
+        max_line_length: Optional[int] = None,
     ) -> None:
         self.save_top: List[str] = []
         self.save_bottom: Deque[str] = deque()
@@ -261,6 +278,18 @@ class StreamReader:
         self.save_limit = save_limit
         self.stream_name = stream_name
         self.stream_prefix = stream_prefix
+        # Longest line kept, in BYTES before decoding.  Reading in chunks
+        # means asyncio's own StreamReader limit no longer bounds a line
+        # (that bound came from readuntil, which _read no longer calls), so
+        # the cap is enforced by hand below.  Defaulting to the stream's
+        # own limit leaves the cap exactly where it was for a caller that
+        # passes none; the daemon passes maxLineLength explicitly, which is
+        # the same number it hands the subprocess pipe.
+        if max_line_length is None:
+            max_line_length = getattr(
+                stream, "_limit", DEFAULT_MAX_LINE_LENGTH
+            )
+        self.max_line_length = max_line_length
         # called with (stream_name, line) for each line read, so a live viewer
         # (the web UI) can tail output as the job produces it.
         self.on_line = on_line
@@ -318,45 +347,111 @@ class StreamReader:
             asyncio.get_running_loop().call_soon(self._flush_emit_buffer)
 
     async def _read(self, stream):
+        """Drain ``stream`` to EOF, splitting it into lines.
+
+        Reads in chunks and splits in C rather than awaiting
+        ``StreamReader.readline`` per line: readline is a Python wrapper
+        around ``readuntil``, whose find/slice/delete/resume bookkeeping and
+        coroutine frame cost several times the decode they surround, once
+        per output line, on the event-loop thread.
+
+        Two things readuntil supplied for free are re-implemented here,
+        because this loop reads job-controlled bytes:
+
+        * the ``maxLineLength`` cap.  A complete line longer than the cap
+          is dropped, and an unterminated run past the cap is dropped as it
+          accumulates, both with the warning the ``ValueError`` branch used
+          to log.  Whatever follows a drop is then read as an ordinary
+          line, exactly as the cleared readuntil buffer left it; how much
+          of an over-long line that surviving remainder holds depends on
+          where the read boundary fell, as it always did (readuntil
+          measured against pipe delivery, this measures against the chunk),
+          and it is capped either way.
+        * the unterminated tail at EOF.  A stream whose last line has no
+          newline still yields that line, as readline's final non-empty
+          return did.
+
+        Splitting on ``b"\\n"`` cannot cut a UTF-8 code point in half (no
+        continuation byte is 0x0A) and only complete lines are decoded, so
+        a multi-byte character straddling a chunk boundary rides in the
+        carry-over tail and decodes intact.
+        """
         prefix = self.stream_prefix.format(
             job_name=self.job_name, stream_name=self.stream_name
         )
         limit_top = self.save_limit // 2
         limit_bottom = self.save_limit - limit_top
         passthrough = self.stream_name in ("stdout", "stderr")
+        cap = self.max_line_length
+        on_line = self.on_line
+        save_limit = self.save_limit
+        save_top = self.save_top
+        save_bottom = self.save_bottom
+        discarded = self.discarded_lines
+        # Bytes after the last newline seen: not a line until the next
+        # chunk (or EOF) terminates it.
+        tail = b""
         while True:
-            try:
-                # errors="replace" so a job emitting non-UTF-8 bytes does not
-                # crash the reader task with UnicodeDecodeError.
-                line = (await stream.readline()).decode(
-                    "utf-8", errors="replace"
-                )
-            except ValueError:
-                logger.warning(
-                    "job %s: ignored a very long line", self.job_name
-                )
-                continue
-            if not line:
+            chunk = await stream.read(_READ_CHUNK)
+            if chunk:
+                if tail:
+                    chunk = tail + chunk
+                parts = chunk.split(b"\n")
+                tail = parts.pop()
+                if len(chunk) > cap:
+                    # A segment can never be longer than the buffer it was
+                    # cut from, so the per-line cap check is only reachable
+                    # once the buffer itself has passed the cap: one
+                    # comparison per chunk instead of one per line.
+                    parts = [p for p in parts if not self._too_long(p, cap)]
+                # errors="replace" so a job emitting non-UTF-8 bytes does
+                # not crash the reader task with UnicodeDecodeError.
+                lines = [
+                    raw.decode("utf-8", errors="replace") + "\n"
+                    for raw in parts
+                ]
+            elif tail and not self._too_long(tail, cap):
+                lines = [tail.decode("utf-8", errors="replace")]
+            else:
+                lines = []
+            for line in lines:
+                if on_line is not None:
+                    on_line(self.stream_name, line)
+                if passthrough:
+                    self._queue_emit(prefix + line)
+                if save_limit > 0:
+                    if len(save_top) < limit_top:
+                        save_top.append(line)
+                    else:
+                        # deque(maxlen) would evict silently; track discards
+                        # explicitly to preserve the "N lines discarded"
+                        # count.
+                        if len(save_bottom) == limit_bottom:
+                            save_bottom.popleft()
+                            discarded += 1
+                        save_bottom.append(line)
+                else:
+                    discarded += 1
+            # Published before the next await, so a reader cancelled by
+            # join()'s timeout still reports the count it had reached.
+            self.discarded_lines = discarded
+            if not chunk:
                 # EOF: push out whatever the last drain accumulated (the
                 # already-scheduled callback then finds an empty buffer).
                 self._flush_emit_buffer()
                 return
-            if self.on_line is not None:
-                self.on_line(self.stream_name, line)
-            if passthrough:
-                self._queue_emit(prefix + line)
-            if self.save_limit > 0:
-                if len(self.save_top) < limit_top:
-                    self.save_top.append(line)
-                else:
-                    # deque(maxlen) would evict silently; track discards
-                    # explicitly to preserve the "N lines discarded" count.
-                    if len(self.save_bottom) == limit_bottom:
-                        self.save_bottom.popleft()
-                        self.discarded_lines += 1
-                    self.save_bottom.append(line)
-            else:
-                self.discarded_lines += 1
+            if self._too_long(tail, cap):
+                # An unterminated run past the cap. Drop what has piled up
+                # and keep reading: the readuntil limit cleared its buffer
+                # and carried on in exactly the same way.
+                tail = b""
+
+    def _too_long(self, raw: bytes, cap: int) -> bool:
+        """Whether ``raw`` breaks the line cap, warning once when it does."""
+        if len(raw) <= cap:
+            return False
+        logger.warning("job %s: ignored a very long line", self.job_name)
+        return True
 
     async def join(self, timeout: Optional[float] = None) -> Tuple[str, int]:
         """Drain to end-of-file; return ``(output, discarded_lines)``.
@@ -792,6 +887,15 @@ class WebhookReporter(Reporter):
         headers = {"Content-Type": webhook["contentType"]}
         headers.update(webhook["headers"])
 
+        # aiohttp is imported here, not at module top: this module is on the
+        # daemon's unconditional import graph (cron -> dagrun -> job), and
+        # aiohttp is ~155 ms and ~21 MB of RSS. The webhook reporter is the
+        # only thing in this file that wants it, so a daemon whose jobs never
+        # report over HTTP pays none of it, and neither does an offline path
+        # that merely imports the module. By the time control reaches here the
+        # reporter is already committed to making the call.
+        import aiohttp
+
         timeout = aiohttp.ClientTimeout(total=webhook["timeout"])
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.request(
@@ -1160,6 +1264,7 @@ class RunningJob:
                 self.config.streamPrefix,
                 self.config.saveLimit,
                 on_line=self.output.publish,
+                max_line_length=self.config.maxLineLength,
             )
         if self.config.captureStdout:
             assert self.proc.stdout is not None
@@ -1170,6 +1275,7 @@ class RunningJob:
                 self.config.streamPrefix,
                 self.config.saveLimit,
                 on_line=self.output.publish,
+                max_line_length=self.config.maxLineLength,
             )
 
     def live_resources(self) -> Optional[Dict[str, Any]]:
@@ -1389,21 +1495,38 @@ class RunningJob:
                     pass
         await self._on_stop()
 
+    # The three completion hooks below probe report_config_enabled before
+    # doing anything, the same guard the DAG-task reaper already uses (see
+    # Cron._maybe_report_dag_task). The default config configures no
+    # reporter at all, so without it every completed run paid five
+    # coroutine frames, five Tasks and at least two loop iterations before
+    # each reporter reached its own disabled early-return, plus an INFO
+    # record announcing reporting that was never going to happen. The log
+    # line sits behind the probe for that reason: it is only true when a
+    # reporter will actually fire.
+
     async def report_failure(self):
+        report_config = self.config.onFailure["report"]
+        if not report_config_enabled(report_config):
+            return
         logger.info("Cron job %s: reporting failure", self.config.name)
-        await self._report_common(self.config.onFailure["report"], False)
+        await self._report_common(report_config, False)
 
     async def report_permanent_failure(self):
+        report_config = self.config.onPermanentFailure["report"]
+        if not report_config_enabled(report_config):
+            return
         logger.info(
             "Cron job %s: reporting permanent failure", self.config.name
         )
-        await self._report_common(
-            self.config.onPermanentFailure["report"], False
-        )
+        await self._report_common(report_config, False)
 
     async def report_success(self):
+        report_config = self.config.onSuccess["report"]
+        if not report_config_enabled(report_config):
+            return
         logger.info("Cron job %s: reporting success", self.config.name)
-        await self._report_common(self.config.onSuccess["report"], True)
+        await self._report_common(report_config, True)
 
     async def _report_common(self, report_config: dict, success: bool) -> None:
         results = await asyncio.gather(

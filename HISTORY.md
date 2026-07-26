@@ -5,6 +5,172 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.33 (2026-07-25)
+
+A performance-audit release, the follow-up to 1.2.32's engine pass. That
+release took the hot frames a profiler shows; this one takes the distributed
+costs only end-to-end measurement shows, across the durable state store, the
+run loop's between-fires bookkeeping, the web and metrics endpoints, config
+parsing, the cluster paths, and both UIs. It adds no configuration surface.
+Where a rewrite touches observable output, the old and new paths were pinned
+against each other during review: the cron-expression work by a 3,000-case
+differential against 1.2.32's engine (the golden vectors are untouched),
+redaction byte-for-byte over a hostile corpus, and the Prometheus value
+formatter over 9,000 fuzz cases. The benchmark gate that will hold these wins
+grows from 8 to 24 armed metrics, and the audit surfaced and fixed a
+long-standing Windows locking race (see Fixes).
+
+### The state store pools its worker threads
+
+- **Blocking store calls dispatch to pooled daemon threads** instead of
+  spawning a thread per operation, which cost about 130 microseconds of pure
+  dispatch per call, several times the store work itself on a read from a
+  warm page cache. Abandonability is unchanged: a worker rejoins the pool
+  only once its operation returns, so one wedged in a dead-mount syscall is
+  never handed more work and the next call spawns a replacement.
+- **Lease and coordination traffic gets its own lane**: a dedicated slot
+  pool, and an exemption from the write rate limiter, so a burst of bulk
+  record writes (or bulk workers wedged on a hung mount) can never queue a
+  lease renew past its TTL and expire a live holder's fence.
+- **Re-reads of unchanged record files are served from a validated
+  in-memory cache**, capped by entry count and total bytes. Entries are
+  admitted only after full schema validation, every hit hands the caller a
+  private copy, and strict reads bypass the cache in both directions.
+- **Documents a caller has already validated can be dumped as trusted**,
+  skipping the portability pre-walk; the dump's own failure path re-walks
+  and raises the same `UnsupportedValue` it always did.
+- **Per-operation store statistics** (count, errors, seconds, measured on
+  the worker thread around the store work itself) accumulate per label and
+  surface through the backend's stats.
+
+### The run loop does less between fires
+
+- **The due-fire heap tolerates stale entries** and compacts in one pass
+  only when they outnumber live jobs, instead of rebuilding eagerly.
+- **Pause refresh and cross-node retry-claim scans run on their own
+  intervals**, re-anchored when the state backend generation changes,
+  rather than riding every housekeeping tick; the claim scan enumerates the
+  store's retry streams once instead of probing one stream per configured
+  job.
+- **Reload reparse runs with the garbage collector held**: the parse's
+  temporary object storm no longer triggers collections over the live job
+  set mid-reload, and the config signature that decides whether anything
+  changed is computed off the event loop. Two new gated metrics
+  (`config.reload_gc_100k`, `mem.gc_pause_100k`) watch exactly this.
+- **`ResourceMonitor.stop()` reuses the ticker's last process-tree
+  snapshot** for the final sample instead of a fresh table walk; per-member
+  readings are taken live, and members spawned inside the final interval
+  are absent from that sample, the same blind spot the periodic samples
+  already carry.
+
+### Web responses render off-loop and revalidate
+
+- **`GET /` and `GET /jobs` answer with a strong validator and gzip**: a
+  repeat dashboard load revalidates into an empty 304 instead of resending
+  the document, and clients that accept gzip get the compressed body.
+- **`GET /metrics` renders in two phases**, snapshotting the metric
+  families and building the exposition text on the executor; the per-label
+  block memo introduced in 1.2.32 now persists across scrapes (label values
+  are part of its key, so it can never serve a stale block).
+- **JSON responses are written from pre-encoded bytes**: the Content-Type
+  is bare `application/json` (bodies are UTF-8) and non-ASCII values are
+  sent raw rather than `\uXXXX`-escaped.
+- **SSE log-tail replay is one write** of the retained buffer instead of a
+  write per retained line, and per-line frames are encoded through the same
+  trusted-dump fast path.
+- **statsd endpoints are opened once and reused** (refreshed after 60
+  seconds, never cached on a failed open, queued bytes bounded) instead of
+  an open-send-close per emit.
+
+### The dashboard and the TUI redraw only what changed
+
+- **The jobs table diffs per-row signatures** and rebuilds exactly the rows
+  whose rendered inputs moved; countdown cells keep ticking client-side.
+  The pendulum logo's LQR gain seed is computed once per parameter set and
+  cached.
+- **The TUI's line clipping and padding take an ASCII fast path**, SGR
+  color runs dispatch on a single token scan, heat-strip and ANSI-scrub
+  results are cached with pruning, wrapped-log windows are sliced by
+  arithmetic instead of wrapping the whole buffer, and the log search
+  carries its match state incrementally across appends instead of
+  rescanning the tail.
+
+### Config parses less and remembers job identity
+
+- **Included files ride the content-hash parse cache** that already served
+  config directories, so an unchanged include is not reparsed; cycle and
+  overlap detection are unchanged.
+- **A crontab parsed once is carried through the defaults merge** instead
+  of being reparsed per job, schedule lint results are cached per parse,
+  and a job whose `onLate` block is the untouched default settles that
+  validation with one identity test.
+- **Job digests share a per-reload memo** for the config blocks jobs share
+  (the digest bytes are unchanged, so persisted fingerprints and the golden
+  are unaffected), and SLA payload views are precomputed at parse time.
+- **The cron-expression engine got a further pass** over its search
+  internals and its equality check (resolved-text comparison first), pinned
+  by the differential above; parse error messages are unchanged.
+
+### Cluster and backend paths stop re-deriving
+
+- **Rendezvous-hash ownership streams its candidate bytes** and memoizes
+  answers against the peer-state mutation generation, the gossiped fleet
+  summary body is cached as bytes and replayed for 304 responses, and
+  `@reboot` advertising reuses the same gates as the membership test.
+- **The etcd campaign tries a plain linearizable range read first** and
+  falls to the create-if-absent transaction only when the key is empty; the
+  Kubernetes backend gets its own client pool. Lease fencing semantics are
+  unchanged in both.
+- **Redaction pre-screens each line with a casefolded gate** for the secret
+  keywords before running the full pattern pass; import-time checks pin the
+  gate letters to the keyword set, and output is byte-identical to 1.2.32.
+
+### Startup and the thin clients
+
+- **The daemon no longer imports PyNaCl to learn it exists**: the startup
+  probe asks importlib for the module spec (the real import cost about 10
+  ms and 1 MB of RSS on every start, for a reporter most installs never
+  configure). The import happens at the first sealed-box use; a PyNaCl
+  installation that is findable but broken now surfaces there, as a
+  per-send `PushError`, instead of at config load.
+- **`--validate-config` and `--job-set-id` answer without building a
+  scheduler**, and the `jobcli` / `mcp` / `tui` entry stubs register their
+  flags without importing asyncio or the daemon; a parity suite asserts the
+  stubs match the real registrations flag for flag.
+- **The push log-tail trim bisects** to the drop count instead of removing
+  one line at a time (verified equivalent over 400 randomized payloads).
+
+### The benchmark gate doubles its coverage
+
+- **16 more metrics are release-gated** (state mutation, reload GC, idle
+  wake rate, SSE fan-out, resource-monitor stop, DAG advance, cluster
+  ownership, web UI render and append, push sealing among them), bringing
+  the expected-gated ledger to 24; `push.seal_500` arms now that the
+  baseline release ships the module.
+- **Five new absolute ceilings wait in a `proposed` block** (not read by
+  the comparer) until one release publishes a CI-observed value to size
+  them against; the local measurements recorded there (for example
+  `state.mutate_document_1k` at 1.161 s, `webui.render_term_5k` at 69 ms)
+  exist to make that later sizing auditable.
+- **About 790 lines of new tests pin the rewrites**: the worker pool's
+  wedge and spawn-failure paths, record-cache isolation, the Prometheus
+  two-phase seam, resource-monitor sampling, CLI stub parity, and fast
+  path versus slow path agreement in the portable JSON codec.
+
+### Fixes
+
+- **Two schedulers sharing a Windows state directory could crash a claim
+  pass on first contact with a fresh lock file.** The lock bootstrap
+  (msvcrt needs a byte present before it can lock one) raced: both sides
+  could observe the empty file, and the loser's own bootstrap write then
+  landed on the winner's just-locked byte range, which Windows rejects, so
+  a `PermissionError` escaped the lease acquire instead of the loser
+  waiting its turn. Present since the durable store's lock files were
+  introduced; this release's pooled lease dispatch made rivals arrive
+  close enough together to hit it. The loser now falls through and
+  contends on the lock; two regression tests cover the simulated loss and
+  the real byte-range collision.
+
 ## 1.2.32 (2026-07-25)
 
 An alerting-reach release, with a round of hot-path tuning alongside it. A
