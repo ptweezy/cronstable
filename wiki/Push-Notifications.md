@@ -34,10 +34,18 @@ go and where device pairings are stored:
 ```yaml
 push:
   relay:
-    url: https://relay.example.net/v1/notify
+    url: https://relay.cronstable.com/
     timeout: 10
   devicesFile: /var/lib/cronstable/devices.json
 ```
+
+`https://relay.cronstable.com/` is the hosted relay; its full source is
+published at
+[ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay)
+(MIT), including its delivery policy (per-device coalescing, flap
+suppression, rate limits) and self-hosting instructions. Because alerts
+are sealed before they leave the daemon, pointing at the hosted relay
+trusts it with routing metadata only — never content.
 
 `devicesFile` is only needed on a stateless install; with a
 [`state:`](Durable-State) section the registry rides the durable store

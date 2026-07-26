@@ -1,0 +1,47 @@
+# The public read-only demo instance (see cronstable.yaml and README.md).
+#
+#   docker compose -f example/demo-instance/docker-compose.yml up -d --build
+#
+# The container listens on loopback only; put the reverse proxy in the
+# Caddyfile next to this file (or any TLS terminator) in front of it.
+
+services:
+  cronstable-demo:
+    build:
+      context: ../..
+    container_name: cronstable-demo
+    environment:
+      # The view-scoped demo credential. Public BY DESIGN (it ships in the
+      # companion app); override to rotate, then update the app config.
+      CRONSTABLE_DEMO_VIEW_TOKEN: ${CRONSTABLE_DEMO_VIEW_TOKEN:-cronstable-public-demo-view}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro
+      - demo-state:/var/lib/cronstable/state
+    restart: unless-stopped
+    # Demo jobs are pure shell noise; keep the blast radius tiny anyway.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import os, urllib.request
+          req = urllib.request.Request(
+              "http://127.0.0.1:8080/summary",
+              headers={"Authorization": "Bearer " + os.environ["CRONSTABLE_DEMO_VIEW_TOKEN"]},
+          )
+          urllib.request.urlopen(req, timeout=5)
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  demo-state:
