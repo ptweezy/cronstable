@@ -86,6 +86,67 @@ def test_bool_is_not_treated_as_out_of_range_int():
     assert _json.loads(_json.dumps_bytes({"flag": True})) == {"flag": True}
 
 
+class _StrSubclass(str):
+    pass
+
+
+class _IntSubclass(int):
+    pass
+
+
+class _FloatSubclass(float):
+    pass
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        False,
+        0,
+        7,
+        2**64 - 1,
+        2**64,  # one past the window: must be rejected wherever it sits
+        -(2**63) - 1,
+        1.5,
+        float("nan"),
+        float("inf"),
+        "",
+        "ascii",
+        "café",
+        "\ud800",  # lone surrogate: rejected wherever it sits
+        _StrSubclass("café"),
+        _StrSubclass("\ud800"),  # a str SUBCLASS must not be waved through
+        _IntSubclass(3),
+        _IntSubclass(2**70),
+        _FloatSubclass(1.5),
+        _FloatSubclass("nan"),
+        [1, "x"],
+        {"k": float("nan")},
+    ],
+)
+def test_gate_verdict_is_the_same_at_every_position(value):
+    # Both walks fast-path the leaf classes they provably always accept
+    # INSIDE their container loops, which is a second place a verdict could
+    # be decided.  A value must therefore get the identical accept/reject
+    # bare, as a dict value and as a list element -- otherwise the fast path
+    # has drifted from the rule set it is only allowed to short-circuit.
+    def verdict(gate, obj):
+        try:
+            gate(obj)
+        except _json.UnsupportedValue:
+            return "reject"
+        return "accept"
+
+    for gate in (_json.ensure_portable, _json._ensure_finite):
+        bare = verdict(gate, value)
+        assert verdict(gate, {"a": value}) == bare
+        assert verdict(gate, [value]) == bare
+        assert verdict(gate, (value,)) == bare
+        assert verdict(gate, {"a": {"b": [value]}}) == bare
+
+
 # ---------------------------------------------------------------------------
 # The stdlib (no-orjson) flavour of the seam + the orjson re-raise arm.
 # ---------------------------------------------------------------------------

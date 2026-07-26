@@ -638,6 +638,20 @@
   .btn:hover:not(:disabled) { background: var(--hover); border-color: var(--border2); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
   .btn svg { width: 12px; height: 12px; }
+  /* Row action glyphs as CSS masks rather than inline <svg>. Every job row
+     carries two of them, so at 500 rows a full table rebuild parsed 1000 SVG
+     elements (~88 KB of the markup) through Blink's SVG element factory,
+     which is materially more expensive than the HTML one. currentColor keeps
+     the per-button hue, both themes and the CVD remap working for free, and a
+     browser without mask support just shows the button's text label. */
+  .btn .ic {
+    width: 12px; height: 12px; flex: none; background-color: currentColor;
+    -webkit-mask: center / contain no-repeat var(--ic);
+    mask: center / contain no-repeat var(--ic);
+  }
+  .btn .ic.play { --ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5v14l11-7z'/%3E%3C/svg%3E"); }
+  .btn .ic.stop { --ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='6' y='6' width='12' height='12' rx='1'/%3E%3C/svg%3E"); }
+  .btn .ic.pause { --ic: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M7 5h4v14H7zM13 5h4v14h-4z'/%3E%3C/svg%3E"); }
   .btn.run { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, var(--border)); }
   .btn.cancel { color: var(--fail); border-color: color-mix(in srgb, var(--fail) 30%, var(--border)); }
   .btn.pause, .btn.resume { color: var(--paused); border-color: color-mix(in srgb, var(--paused) 30%, var(--border)); }
@@ -1333,13 +1347,27 @@
     color: var(--fail); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
   body.fx .wb-incident { text-shadow: 0 0 8px color-mix(in srgb, var(--fail) 60%, transparent); }
   .wb-incident.ackd { color: var(--pending); }
-  .wb-tile.st-fail.escalate { animation: tilebreathe 1.6s ease-in-out infinite; }
-  @keyframes tilebreathe {
-    0%, 100% { box-shadow: 0 0 8px color-mix(in srgb, var(--fail) 25%, transparent); }
-    50% { box-shadow: 0 0 22px color-mix(in srgb, var(--fail) 65%, transparent); border-color: var(--fail); }
+  /* The alarm breathes on the compositor, not on the main thread. Blur radius
+     is a paint property: interpolating it re-rasterizes a Gaussian around
+     every failing tile on every frame of an animation that runs for as long
+     as the incident does, and the wallboard's usual host is a low-power HDMI
+     stick (measured at 20 tiles: +60 ms of style recalc and +125 ms of task
+     time per 5 s). So the glow is painted once at full strength on a
+     pseudo-element and only its opacity animates. overflow:clip with a margin
+     the width of the blur replaces the tile's overflow:hidden, which would
+     otherwise clip the glow away entirely; content stays bounded. Every
+     browser that can render color-mix (used for the glow's own colour, and
+     throughout this sheet) supports overflow-clip-margin. */
+  .wb-tile.st-fail.escalate { position: relative; overflow: clip; overflow-clip-margin: 26px; }
+  .wb-tile.st-fail.escalate::after {
+    content: ""; position: absolute; inset: -2px; border-radius: inherit; pointer-events: none;
+    border: 2px solid var(--fail);
+    box-shadow: 0 0 22px color-mix(in srgb, var(--fail) 65%, transparent);
+    animation: tilebreathe 1.6s ease-in-out infinite;
   }
-  @media (prefers-reduced-motion: reduce) { .wb-tile.st-fail.escalate { animation: none; } #wbAlarm { transition: none; } }
-  body.reduce-motion .wb-tile.st-fail.escalate { animation: none; }
+  @keyframes tilebreathe { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .wb-tile.st-fail.escalate::after { display: none; } #wbAlarm { transition: none; } }
+  body.reduce-motion .wb-tile.st-fail.escalate::after { display: none; }
   body.reduce-motion #wbAlarm { transition: none; }
 
   /* ==================================================================
@@ -2056,7 +2084,13 @@
   };
 
   // ---- dynamics: M(q) qdd = b, solved 2x2 per evaluation ----
-  function deriv(p, s, a) {
+  // derivInto writes into a caller-owned vector. A planning frame runs 8960
+  // rk4 steps and each one used to allocate eight fresh 6-element arrays, so
+  // the integrator alone churned ~4 M arrays/second during a recovery; the
+  // scratch buffers below cut that to one per step (the returned state, which
+  // callers keep). Every operation is the same double arithmetic in the same
+  // order, so the trajectory is bit-identical.
+  function derivInto(p, s, a, out) {
     const xd = s[1], th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
     const s1 = Math.sin(th1), c1 = Math.cos(th1);
     const s2 = Math.sin(th2), c2 = Math.cos(th2);
@@ -2070,17 +2104,28 @@
     const b1 = -p.m2 * p.L1 * p.L2 * w2 * w2 * sD + p.g * M * p.L1 * s1 - M * p.L1 * c1 * a + Q1;
     const b2 = p.m2 * p.L1 * p.L2 * w1 * w1 * sD + p.g * p.m2 * p.L2 * s2 - p.m2 * p.L2 * c2 * a + Q2;
     const det = M11 * M22 - M12 * M12;
-    return [xd, a, w1, (M22 * b1 - M12 * b2) / det, w2, (M11 * b2 - M12 * b1) / det];
+    out[0] = xd; out[1] = a; out[2] = w1;
+    out[3] = (M22 * b1 - M12 * b2) / det;
+    out[4] = w2;
+    out[5] = (M11 * b2 - M12 * b1) / det;
+    return out;
   }
+  // allocating twin, for the handful of linearization probes in computeLQR
+  const deriv = (p, s, a) => derivInto(p, s, a, new Array(6));
+  const _k1 = new Float64Array(6), _k2 = new Float64Array(6);
+  const _k3 = new Float64Array(6), _k4 = new Float64Array(6);
+  const _sMid = new Float64Array(6);
   function rk4(p, s, a, dt) {
-    const k1 = deriv(p, s, a);
-    const s2 = s.map((v, i) => v + 0.5 * dt * k1[i]);
-    const k2 = deriv(p, s2, a);
-    const s3 = s.map((v, i) => v + 0.5 * dt * k2[i]);
-    const k3 = deriv(p, s3, a);
-    const s4 = s.map((v, i) => v + dt * k3[i]);
-    const k4 = deriv(p, s4, a);
-    return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+    derivInto(p, s, a, _k1);
+    for (let i = 0; i < 6; i++) _sMid[i] = s[i] + 0.5 * dt * _k1[i];
+    derivInto(p, _sMid, a, _k2);
+    for (let i = 0; i < 6; i++) _sMid[i] = s[i] + 0.5 * dt * _k2[i];
+    derivInto(p, _sMid, a, _k3);
+    for (let i = 0; i < 6; i++) _sMid[i] = s[i] + dt * _k3[i];
+    derivInto(p, _sMid, a, _k4);
+    const out = new Array(6);
+    for (let i = 0; i < 6; i++) out[i] = s[i] + (dt / 6) * (_k1[i] + 2 * _k2[i] + 2 * _k3[i] + _k4[i]);
+    return out;
   }
   // pendulum energy in the cart frame; upright = eUp
   function energy(p, s) {
@@ -2163,6 +2208,37 @@
     return { K, P };
   }
 
+  // computeLQR reads exactly the seven dynamics parameters deriv reads, and
+  // takes ~6500 iterations of 6x6 matrix algebra (~30 ms, measured) to reach
+  // them. Every mount of the shipped wordmark has the same physics, so that
+  // was ~30 ms of blocking script on the critical path to first paint for an
+  // answer that never changes: the default DP's gains are seeded below, and
+  // any other parameter set is solved once and kept (docs/logo-lab.html and
+  // docs/comparison.html build several sims from one set).
+  //
+  // Keyed on the exact parameter string, so editing DP misses the seed and
+  // falls back to the solver instead of flying stale gains. K and P are read
+  // only after construction (_lqrAccel, _vCost), so sims can share them.
+  const lqrKey = (p) => [p.g, p.L1, p.L2, p.m1, p.m2, p.d1, p.d2].join("|");
+  const LQR_CACHE = new Map([["9.81|0.34|0.26|0.14|0.09|0.005|0.002", {
+    K: [5.556371740320117, 11.397213225555143, -274.7382625940304,
+        -8.892561917718053, 357.79380628190506, 43.699138936449486],
+    P: [
+      [4102.394061876565, 3403.3068673379175, -5126.758442369487, 1039.3114482356623, 16980.81586321461, 2372.023278149255],
+      [3403.3068673379175, 5770.684968269181, -11355.417120138944, 1719.9502990877688, 32280.640406622548, 4466.22709047167],
+      [-5126.758442369487, -11355.417120138944, 194942.64902431052, 1897.4647951004993, -293403.1021144789, -36614.65971869856],
+      [1039.3114482356623, 1719.9502990877688, 1897.4647951004993, 769.2702917944772, 3450.5683239105483, 598.9046117665653],
+      [16980.81586321461, 32280.640406622548, -293403.1021144789, 3450.5683239105483, 529535.3713706646, 66204.51980950462],
+      [2372.023278149255, 4466.22709047167, -36614.65971869856, 598.9046117665653, 66204.51980950462, 8461.20622167257],
+    ],
+  }]]);
+  function lqrGains(p) {
+    const key = lqrKey(p);
+    let hit = LQR_CACHE.get(key);
+    if (!hit) { hit = computeLQR(p); LQR_CACHE.set(key, hit); }
+    return hit;
+  }
+
   // ---- simulator + supervisor: balance -> limp -> swing -> balance ----
   class PendulumSim {
     constructor(params, opts) {
@@ -2181,7 +2257,7 @@
       this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
       this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
       this.rand = mulberry32(this.opts.seed);
-      const lq = computeLQR(this.p);
+      const lq = lqrGains(this.p);
       this.K = lq.K; this.P = lq.P;
       this.s = [0, 0, 0, 0, 0, 0];
       this.mode = "balance";
@@ -5253,6 +5329,8 @@ var qrcode = function() {
     clusterSpread: false,      // distribution: spread is active (drives the Owner column)
     palette: { open: false, items: [], cur: 0 },
     lastRowSig: null,          // signature of the last rendered table (skip redundant rebuilds)
+    rowNodes: new Map(),       // job name -> its live <tr>            (keyed row diff)
+    rowSigs: new Map(),        // job name -> the signature that <tr> was built from
     focusStack: [],            // saved focus per open overlay/drawer (restore on close)
     // audible cues + standing alarm
     prevFin: {},               // name -> finished_at last seen (cue poll-diff)
@@ -5270,7 +5348,7 @@ var qrcode = function() {
     fleet: { data: null, failOnly: false, lastSig: null },    // fleet view: last /fleet payload + failing-only filter (+ dirty-check signature)
     // merged multi-tail console: tailed job names, per-job stream state,
     // per-job identity colors, and the merged line buffer
-    tail: { open: false, jobs: [], streams: {}, colors: {}, lines: [], total: 0 },
+    tail: { open: false, jobs: [], streams: {}, colors: {}, lines: [], total: 0, matchCount: 0, matchSig: null },
     clusterLine: null,         // last cluster summary string (wallboard footer)
     booting: false,            // BIOS boot self-test is on screen (swallows keys)
     // --- add-on features ---
@@ -6013,11 +6091,17 @@ var qrcode = function() {
     });
     const dir = state.sortDir;
     const key = state.sort;
+    // Decorate once for the Last-run sort: lastTs parses an ISO-8601 string,
+    // and calling it from inside the comparator is ~9000 Date parses for 500
+    // jobs when 500 answers are needed. WeakMap so a job object dropped by the
+    // next poll takes its key with it.
+    const tsKey = key === "last" ? new WeakMap() : null;
+    if (tsKey) for (const j of v) tsKey.set(j, lastTs(j));
     v.sort((a, b) => {
       let r = 0;
       if (key === "name") r = a.name.localeCompare(b.name);
       else if (key === "status") r = STATUS_ORDER[health(a).key] - STATUS_ORDER[health(b).key];
-      else if (key === "last") r = (lastTs(a) - lastTs(b));
+      else if (key === "last") r = (tsKey.get(a) - tsKey.get(b));
       else if (key === "next" || key === "nextat") r = ((a.scheduled_in == null ? Infinity : a.scheduled_in) - (b.scheduled_in == null ? Infinity : b.scheduled_in));
       else if (key === "duration") r = ((a.last_run && a.last_run.duration) || 0) - ((b.last_run && b.last_run.duration) || 0);
       else if (key === "owner") r = ownerSortKey(a).localeCompare(ownerSortKey(b));
@@ -6054,97 +6138,164 @@ var qrcode = function() {
     // keep selection valid
     if (state.selected && !jobs.some((j) => j.name === state.selected)) state.selected = null;
 
-    // Skip the full innerHTML rebuild when nothing structural changed since the
-    // last render — the per-second tick() keeps the relative-time cells current.
-    // This preserves text selection / hover across idle polls (and avoids churn).
-    const sig = JSON.stringify({
-      f: state.filter, s: state.statusFilter, so: state.sort, sd: state.sortDir,
-      sel: state.selected, dr: state.drawerJob,
-      // owner column visibility + this node's name (for the self highlight)
-      ow: showOwner, cn: state.clusterNode,
-      j: jobs.map((j) => [
-        j.name, j.enabled, j.running,
-        // the absolute fire minute — stable between polls (the countdown ticks
-        // client-side) but changes exactly when the target run changes, which
-        // re-renders the "next at" cell (it has no per-second tick).
-        j.scheduled_in == null ? "-" : Math.round((Date.now() / 1000 + nextRunSeconds(j)) / 60),
-        // schedule + reference frame render as cells, and a config reload can
-        // change either without touching any run-derived field.
-        j.schedule, tzCell(j),
-        j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
-        j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
-        (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
-        // ownership can change between polls (a node joins/leaves); track it so
-        // the row re-renders. "in" check distinguishes absent from a null owner.
-        // The policy rides along even when an owner is present — a reload can
-        // flip it independently and it renders as its own cell now.
-        ("clusterOwner" in j ? "o:" + (j.clusterOwner || "") : "") + "|" + (j.clusterPolicy || ""),
-        // ledger anomaly marker (only meaningful while the ledger is on)
-        state.ledger.on && ledgerFlag(j.name) ? "slow" : "",
-        // HA chips: armed retry (attempt + next-fire), cluster slot, @reboot
-        // pending. The countdowns tick client-side; these change only when the
-        // underlying HA state does, so they re-render the row exactly then.
-        j.retry ? j.retry.attempt + ":" + (j.retry.nextRetryAt || "") : "",
-        j.slot ? (j.slot.held ? "h" : "w") + ":" + j.slot.refs : "",
-        j.rebootPending ? "rb" : "",
-        // runtime pause + SLA state: the status cell, chips, the pause/resume
-        // action button and the "next" cells all render from these.
-        j.paused ? "p:" + (j.paused.until || "") + ":" + (j.paused.note || "") + ":" + (j.paused.by || "") : "",
-        j.sla ? j.sla.state : "",
-      ]),
-    });
-    if (sig === state.lastRowSig) return;
-    state.lastRowSig = sig;
-
-    tbody.innerHTML = jobs.map((job) => {
-      const h = health(job);
-      const lr = job.last_run;
-      let last = '<span class="faint">never</span>';
-      if (lr) {
-        const code = lr.exit_code;
-        const exit = code == null ? "" : '<span class="exit ' + (code === 0 ? "zero" : "nonzero") + '">exit ' + esc(code) + "</span>";
-        last = '<span class="nowrap" data-ago="' + escAttr(lr.finished_at) + '">' + fmtAgo(lr.finished_at) + "</span>" + exit;
+    // Two signatures, and neither one is decoration.
+    //
+    // `gsig` covers the state that reaches EVERY row's markup, so a change in
+    // it invalidates the whole table; `rowSig` covers one job. A poll on a
+    // 500-job fleet typically moves a handful of rows, and rebuilding the
+    // other 495 costs ~9 ms of innerHTML parse (18k nodes, 680 KB of string)
+    // for no visible change — and takes text selection, hover and focus with
+    // it. So the wholesale rebuild is reserved for the first paint and for a
+    // gsig change, and the steady state reconciles per row below.
+    const gsig = JSON.stringify({ ow: showOwner, cn: state.clusterNode });
+    const sigs = jobs.map(rowSig);
+    if (gsig !== state.lastRowSig) {
+      state.lastRowSig = gsig;
+      tbody.innerHTML = jobs.map(rowHtml).join("");
+      state.rowNodes = new Map();
+      state.rowSigs = new Map();
+      let tr = tbody.firstElementChild;
+      for (let i = 0; i < jobs.length && tr; i++, tr = tr.nextElementSibling) {
+        state.rowNodes.set(jobs[i].name, tr);
+        state.rowSigs.set(jobs[i].name, sigs[i]);
       }
-      const nsec = nextRunSeconds(job);
-      const next = (job.running || !job.enabled || job.paused)
-        ? '<span class="faint">—</span>'
-        : '<span class="nowrap" data-next="' + escAttr(job.name) + '">' + fmtIn(nsec) + "</span>";
-      const atMs = nsec == null ? null : Date.now() + nsec * 1000;
-      const nextAt = (job.running || !job.enabled || job.paused || atMs == null)
-        ? '<span class="faint">—</span>'
-        : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
-      const rowCls = (state.drawerJob === job.name ? " active" : "") + (state.selected === job.name ? " sel" : "");
-      const runBtn = job.running
-        ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>Stop</button>'
-        : '<button class="btn run" data-run="' + escAttr(job.name) + '"' + (job.enabled ? "" : ' disabled title="job is disabled"') +
-          '><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Run</button>';
-      const pauseBtn = job.paused
-        ? '<button class="btn resume" data-resume="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>Resume</button>'
-        : '<button class="btn pause" data-pause="' + escAttr(job.name) + '"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>Pause</button>';
-      return (
-        '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
-          '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + haChips(job) + "</td>" +
-          '<td><div class="jobname">' + esc(job.name) + "</div>" +
-              '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
-          '<td class="col-owner">' + ownerCell(job) + "</td>" +
-          '<td class="col-policy">' + policyCell(job) + "</td>" +
-          '<td class="col-sched"><span class="chip" title="' + escAttr(describeCron(job.schedule)) + '">' + esc(job.schedule) + "</span></td>" +
-          '<td class="col-tz muted nowrap">' + tzCell(job) + "</td>" +
-          '<td class="col-last">' + last + "</td>" +
-          '<td class="col-dur muted nowrap">' + (lr ? fmtDuration(lr.duration) : "—") + "</td>" +
-          '<td class="col-next muted nowrap">' + next + "</td>" +
-          '<td class="col-nextat muted nowrap">' + nextAt + "</td>" +
-          '<td class="col-rate">' + rateCell(job) + "</td>" +
-          '<td class="col-trend">' + sparkline(job) + "</td>" +
-          '<td><div class="actions">' + runBtn + pauseBtn +
-            '<button class="btn" data-logs="' + escAttr(job.name) + '">Logs</button>' +
-          "</div></td>" +
-        "</tr>"
-      );
-    }).join("");
+      updateSortArrows();
+      return;
+    }
+    diffRows(tbody, jobs, sigs);
     updateSortArrows();
   }
+  // Reconcile the tbody against `jobs` in order, keyed by job name: rows whose
+  // signature is unchanged are left in the DOM untouched, changed ones are
+  // swapped one <tr> at a time (~0.015 ms each), and the rest are moved,
+  // inserted or dropped. Order changes are cheap because the sort key is
+  // usually "name": the cursor walks straight down the existing rows.
+  function diffRows(tbody, jobs, sigs) {
+    const nodes = state.rowNodes, sigMap = state.rowSigs;
+    let cursor = tbody.firstElementChild;
+    for (let i = 0; i < jobs.length; i++) {
+      const name = jobs[i].name;
+      let tr = nodes.get(name);
+      if (!tr || sigMap.get(name) !== sigs[i]) {
+        const fresh = buildRow(rowHtml(jobs[i]));
+        if (tr && tr.parentNode === tbody) {
+          if (cursor === tr) cursor = tr.nextElementSibling;
+          tbody.replaceChild(fresh, tr);
+        }
+        tr = fresh;
+        nodes.set(name, tr); sigMap.set(name, sigs[i]);
+      }
+      if (cursor === tr) cursor = tr.nextElementSibling;
+      else tbody.insertBefore(tr, cursor);
+    }
+    // whatever the cursor never reached belongs to jobs the filter dropped
+    while (cursor) {
+      const next = cursor.nextElementSibling, gone = cursor.getAttribute("data-job");
+      nodes.delete(gone); sigMap.delete(gone);
+      tbody.removeChild(cursor);
+      cursor = next;
+    }
+  }
+  // One <tr> out of one row's markup. A <template> parses table fragments in
+  // their own insertion mode, so the <tr> survives instead of being dropped
+  // the way a plain <div>.innerHTML would drop it.
+  const _rowTpl = document.createElement("template");
+  function buildRow(html) {
+    _rowTpl.innerHTML = html;
+    return _rowTpl.content.firstElementChild;
+  }
+  // Everything rowHtml renders from, as one string per job. JSON.stringify
+  // rather than a join so a separator can never collide with a job-supplied
+  // name, command or schedule.
+  function rowSig(j) {
+    return JSON.stringify([
+      j.name, j.enabled, j.running,
+      // the absolute fire minute — stable between polls (the countdown ticks
+      // client-side) but changes exactly when the target run changes, which
+      // re-renders the "next at" cell (it has no per-second tick).
+      j.scheduled_in == null ? "-" : Math.round((Date.now() / 1000 + nextRunSeconds(j)) / 60),
+      // schedule + reference frame render as cells, and a config reload can
+      // change either without touching any run-derived field.
+      j.schedule, tzCell(j),
+      j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
+      j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
+      (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
+      // ownership can change between polls (a node joins/leaves); track it so
+      // the row re-renders. "in" check distinguishes absent from a null owner.
+      // The policy rides along even when an owner is present — a reload can
+      // flip it independently and it renders as its own cell now.
+      ("clusterOwner" in j ? "o:" + (j.clusterOwner || "") : "") + "|" + (j.clusterPolicy || ""),
+      // ledger anomaly marker (only meaningful while the ledger is on)
+      state.ledger.on && ledgerFlag(j.name) ? "slow" : "",
+      // HA chips: armed retry (attempt + next-fire), cluster slot, @reboot
+      // pending. The countdowns tick client-side; these change only when the
+      // underlying HA state does, so they re-render the row exactly then.
+      j.retry ? j.retry.attempt + ":" + (j.retry.nextRetryAt || "") : "",
+      j.slot ? (j.slot.held ? "h" : "w") + ":" + j.slot.refs : "",
+      j.rebootPending ? "rb" : "",
+      // runtime pause + SLA state: the status cell, chips, the pause/resume
+      // action button and the "next" cells all render from these.
+      j.paused ? "p:" + (j.paused.until || "") + ":" + (j.paused.note || "") + ":" + (j.paused.by || "") : "",
+      j.sla ? j.sla.state : "",
+      // drawer/keyboard-cursor highlight: per row now, so opening the drawer
+      // repaints two rows instead of the fleet.
+      state.drawerJob === j.name, state.selected === j.name,
+    ]);
+  }
+  function rowHtml(job) {
+    const h = health(job);
+    const lr = job.last_run;
+    let last = '<span class="faint">never</span>';
+    if (lr) {
+      const code = lr.exit_code;
+      const exit = code == null ? "" : '<span class="exit ' + (code === 0 ? "zero" : "nonzero") + '">exit ' + esc(code) + "</span>";
+      last = '<span class="nowrap" data-ago="' + escAttr(lr.finished_at) + '">' + fmtAgo(lr.finished_at) + "</span>" + exit;
+    }
+    const nsec = nextRunSeconds(job);
+    const next = (job.running || !job.enabled || job.paused)
+      ? '<span class="faint">—</span>'
+      : '<span class="nowrap" data-next="' + escAttr(job.name) + '">' + fmtIn(nsec) + "</span>";
+    const atMs = nsec == null ? null : Date.now() + nsec * 1000;
+    const nextAt = (job.running || !job.enabled || job.paused || atMs == null)
+      ? '<span class="faint">—</span>'
+      : '<span class="nowrap" title="' + escAttr(fmtAtTitle(atMs)) + '">' + fmtAt(atMs) + "</span>";
+    const rowCls = (state.drawerJob === job.name ? " active" : "") + (state.selected === job.name ? " sel" : "");
+    const runBtn = job.running
+      ? '<button class="btn cancel" data-cancel="' + escAttr(job.name) + '"><i class="ic stop"></i>Stop</button>'
+      : '<button class="btn run" data-run="' + escAttr(job.name) + '"' + (job.enabled ? "" : ' disabled title="job is disabled"') +
+        '><i class="ic play"></i>Run</button>';
+    const pauseBtn = job.paused
+      ? '<button class="btn resume" data-resume="' + escAttr(job.name) + '"><i class="ic play"></i>Resume</button>'
+      : '<button class="btn pause" data-pause="' + escAttr(job.name) + '"><i class="ic pause"></i>Pause</button>';
+    return (
+      '<tr data-job="' + escAttr(job.name) + '" class="' + rowCls.trim() + '">' +
+        '<td><span class="st ' + h.key + '"><span class="glyph">' + GLYPH[h.key] + '</span><span class="label">' + h.label + "</span></span>" + slowChip(job) + haChips(job) + "</td>" +
+        '<td><div class="jobname">' + esc(job.name) + "</div>" +
+            '<div class="jobcmd" title="' + escAttr(job.command) + '">' + esc(job.command) + "</div></td>" +
+        '<td class="col-owner">' + ownerCell(job) + "</td>" +
+        '<td class="col-policy">' + policyCell(job) + "</td>" +
+        '<td class="col-sched"><span class="chip" title="' + escAttr(describeCron(job.schedule)) + '">' + esc(job.schedule) + "</span></td>" +
+        '<td class="col-tz muted nowrap">' + tzCell(job) + "</td>" +
+        '<td class="col-last">' + last + "</td>" +
+        '<td class="col-dur muted nowrap">' + (lr ? fmtDuration(lr.duration) : "—") + "</td>" +
+        '<td class="col-next muted nowrap">' + next + "</td>" +
+        '<td class="col-nextat muted nowrap">' + nextAt + "</td>" +
+        '<td class="col-rate">' + rateCell(job) + "</td>" +
+        '<td class="col-trend">' + sparkline(job) + "</td>" +
+        '<td><div class="actions">' + runBtn + pauseBtn +
+          '<button class="btn" data-logs="' + escAttr(job.name) + '">Logs</button>' +
+        "</div></td>" +
+      "</tr>"
+    );
+  }
+  let sortArrowSig = null;
   function updateSortArrows() {
+    // renderRows now reconciles on every poll instead of early-returning, and
+    // the arrows move only when the sort does: without this gate the header's
+    // innerHTML rewrites would be the costliest thing left in an idle poll.
+    const sig = state.sort + ":" + state.sortDir;
+    if (sig === sortArrowSig) return;
+    sortArrowSig = sig;
     document.querySelectorAll("thead th[data-sort]").forEach((th) => {
       const base = th.getAttribute("data-sort");
       const lbl = th.textContent.replace(/[ ↑↓]+$/, "");
@@ -6597,6 +6748,7 @@ var qrcode = function() {
     wb.setAttribute("aria-hidden", on ? "false" : "true");
     document.body.classList.toggle("tv", on);
     $("tvBtn").classList.toggle("on", on);
+    kickMark();          // the header is display:none under body.tv: park the pendulum
     setHashTv(on);
     if (on) {
       renderWallboard();   // paints AND runs the signal tick: banner correct at entry, not a tick later
@@ -8199,18 +8351,21 @@ var qrcode = function() {
     if (q.text) return plain.toLowerCase().includes(q.text);
     return true;
   }
-  function buildLineNode(item, q) {
-    const node = el("span", "ln " + (item.kind || item.stream || ""));
-    if (q && (q.text || q.re) && !item.kind) {
-      if (!lineMatches(item.text, q)) { if ($("optOnly").checked) node.style.display = "none"; }
-    }
+  // One buffered line as markup. Markup rather than a built element so
+  // renderTerm can parse the whole buffer in one go instead of constructing
+  // 5000 elements and running 5000 separate innerHTML parses (measured -13%
+  // of a 5000-line rebuild with a search active; the rest of that rebuild is
+  // laying out 5000 block lines, which only virtualization would remove).
+  function lineHtml(item, q) {
+    const hide = q && (q.text || q.re) && !item.kind &&
+      !lineMatches(item.text, q) && $("optOnly").checked;
     // absolute line number (monotonic, survives ring-buffer trimming)
     let inner = '<span class="gut">' + (item.n || 0) + "</span>";
     if (prefs.ts && item.ts) inner += '<span class="ts">' + fmtClock(item.ts) + "</span>";
     if (item.kind === "sys") inner += esc(item.text);
     else inner += lineContentHtml(item.text, item.kind ? null : q);
-    node.innerHTML = inner;
-    return node;
+    return '<span class="ln ' + escAttr(item.kind || item.stream || "") + '"' +
+      (hide ? ' style="display:none"' : "") + ">" + inner + "</span>";
   }
   function fmtClock(ms) { const d = new Date(ms); return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds()); }
 
@@ -8219,19 +8374,58 @@ var qrcode = function() {
     const q = logQuery();
     state.log.curMatch = -1;            // re-render invalidates any current-match marker
     t.classList.toggle("nowrap", !prefs.wrap);
-    t.innerHTML = "";
+    // the buffer the "reader scrolled away" bit was about no longer exists
+    follower(t).at = true;
     if (!state.log.lines.length) { t.innerHTML = '<span class="term-empty">no output</span>'; updateLogCount(); return; }
-    const frag = document.createDocumentFragment();
-    state.log.lines.forEach((item) => frag.appendChild(buildLineNode(item, q)));
-    t.appendChild(frag);
+    t.innerHTML = state.log.lines.map((item) => lineHtml(item, q)).join("");
     if (prefs.follow) t.scrollTop = t.scrollHeight;
     updateLogCount();
   }
+  // ---- follow-to-bottom, without measuring the buffer once per line ----
+  //
+  // Reading scrollHeight/scrollTop/clientHeight in an append path forces a
+  // synchronous layout of the whole buffered block, so appending ONE line
+  // costs O(buffer): 0.05 ms at 50 buffered lines, 2.5 ms at the 5000-line
+  // cap, i.e. seconds of main thread to fill a terminal once. Nothing in the
+  // append path needs that number. The only thing that can move the scroll
+  // position is a scroll, so the "user has scrolled away" bit is kept by a
+  // passive scroll listener instead, and the pin is coalesced into one write
+  // per animation frame however many lines arrived. The ordering works out:
+  // the rendering steps dispatch scroll events BEFORE animation-frame
+  // callbacks, so a scroll the user just made is seen before that frame's pin.
+  const followers = new WeakMap();
+  function follower(t) {
+    let f = followers.get(t);
+    if (!f) {
+      f = { at: true, pending: false };
+      followers.set(t, f);
+      t.addEventListener("scroll", () => {
+        f.at = t.scrollHeight - t.scrollTop - t.clientHeight < 50;
+      }, { passive: true });
+    }
+    return f;
+  }
+  // Pin `t` to the bottom at the end of this frame. `force` pins even when the
+  // reader has scrolled away, matching the old "sys lines always win" rule.
+  function followBottom(t, enabled, force) {
+    const f = follower(t);
+    if (!enabled || f.pending || (!f.at && !force)) return;
+    f.pending = true;
+    requestAnimationFrame(() => {
+      f.pending = false;
+      t.scrollTop = t.scrollHeight;
+      f.at = true;
+    });
+  }
+  // renderTerm's placeholder is always the only child, so this stands in for a
+  // querySelector that walked the whole buffer to find it was not there.
+  function dropEmptyNode(t) {
+    const first = t.firstElementChild;
+    if (first && first.classList.contains("term-empty")) t.innerHTML = "";
+  }
   function appendLine(stream, text, kind) {
     const t = termEl();
-    const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 50;
-    const emptyNode = t.querySelector(".term-empty");
-    if (emptyNode) t.innerHTML = "";
+    dropEmptyNode(t);
     const item = { stream, text, kind, ts: Date.now(), n: ++state.log.total };
     state.log.lines.push(item);
     let trimmed = null;
@@ -8242,8 +8436,8 @@ var qrcode = function() {
       if (first) first.remove();
     }
     const q = logQuery();
-    t.appendChild(buildLineNode(item, q));
-    if (prefs.follow && (atBottom || kind === "sys")) t.scrollTop = t.scrollHeight;
+    t.insertAdjacentHTML("beforeend", lineHtml(item, q));
+    followBottom(t, prefs.follow, kind === "sys");
     // Incremental match-count upkeep: while the cached count is valid for the
     // current query (renderTerm/query-change resets matchSig, forcing a full
     // recount there), fold in only the one appended line and any one trimmed
@@ -8389,45 +8583,55 @@ var qrcode = function() {
     const q = $("tailSearch").value;
     return q ? { text: q.toLowerCase(), raw: q } : null;
   }
+  // stable identity for a tail query, the plain-text twin of logQuerySig
+  function tailQuerySig(q) { return q && q.text ? "t:" + q.text : null; }
   function tailColor(name) {
     const c = state.tail.colors;
     if (!c[name]) c[name] = TAIL_COLORS[Object.keys(c).length % TAIL_COLORS.length];
     return c[name];
   }
-  function buildTailNode(item, q) {
-    const node = el("span", "ln " + (item.kind || item.stream || ""));
+  function tailLineHtml(item, q) {
     let inner = '<span class="gut">' + (item.n || 0) + "</span>";
     if (prefs.ts && item.ts) inner += '<span class="ts">' + fmtClock(item.ts) + "</span>";
     inner += '<span class="tj" data-job="' + escAttr(item.job) + '" style="color:' + item.color +
       '" title="open ' + escAttr(item.job) + '">' + esc(item.job) + "</span>";
     if (item.kind === "sys") inner += esc(item.text);
     else inner += lineContentHtml(item.text, q, prefs.ansi);
-    node.innerHTML = inner;
-    return node;
+    return '<span class="ln ' + escAttr(item.kind || item.stream || "") + '">' + inner + "</span>";
   }
   function appendTailLine(job, stream, text, kind) {
     if (!state.tail.open) return;
     const t = tailTermEl();
-    const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 50;
-    const emptyNode = t.querySelector(".term-empty");
-    if (emptyNode) t.innerHTML = "";
+    dropEmptyNode(t);
     const item = { job, color: tailColor(job), stream, text, kind, ts: Date.now(), n: ++state.tail.total };
     state.tail.lines.push(item);
+    let trimmed = null;
     if (state.tail.lines.length > MAX_LOG_LINES) {
-      state.tail.lines.shift();
+      trimmed = state.tail.lines.shift();
       const first = t.firstElementChild;
       if (first) first.remove();
     }
-    t.appendChild(buildTailNode(item, tailQuery()));
-    if ($("tailFollow").checked && (atBottom || kind === "sys")) t.scrollTop = t.scrollHeight;
+    const q = tailQuery();
+    t.insertAdjacentHTML("beforeend", tailLineHtml(item, q));
+    followBottom(t, $("tailFollow").checked, kind === "sys");
     renderTailMeta();
+    // Same incremental match count the single-job path keeps (see appendLine):
+    // the tail console is the chattiest surface in the app, and a full rescan
+    // per line would be O(lines * buffer) with a search active.
+    if (state.tail.matchSig !== null && state.tail.matchSig === tailQuerySig(q)) {
+      if (!item.kind && lineMatches(item.text, q)) state.tail.matchCount++;
+      if (trimmed && !trimmed.kind && lineMatches(trimmed.text, q)) state.tail.matchCount--;
+    }
     updateTailCount();
   }
   function renderTailTerm() {
     const t = tailTermEl();
     const q = tailQuery();
     t.classList.toggle("nowrap", !prefs.wrap);
-    t.innerHTML = "";
+    follower(t).at = true;
+    // the buffer may have been replaced wholesale (a fresh console, a clear),
+    // so the cached count cannot be carried across
+    state.tail.matchSig = null;
     if (!state.tail.lines.length) {
       t.innerHTML = '<span class="term-empty">' + (state.tail.jobs.length
         ? "waiting for output…"
@@ -8435,17 +8639,23 @@ var qrcode = function() {
       updateTailCount();
       return;
     }
-    const frag = document.createDocumentFragment();
-    state.tail.lines.forEach((item) => frag.appendChild(buildTailNode(item, q)));
-    t.appendChild(frag);
+    t.innerHTML = state.tail.lines.map((item) => tailLineHtml(item, q)).join("");
     if ($("tailFollow").checked) t.scrollTop = t.scrollHeight;
     updateTailCount();
   }
   function updateTailCount() {
     const q = tailQuery(), c = $("tailCount");
-    if (!q) { c.textContent = ""; return; }
-    let n = 0;
-    for (const it of state.tail.lines) if (!it.kind && lineMatches(it.text, q)) n++;
+    if (!q) { c.textContent = ""; state.tail.matchSig = null; return; }
+    const sig = tailQuerySig(q);
+    // Full rescan only when the query changed; appendTailLine keeps the count
+    // current for an unchanged one.
+    if (state.tail.matchSig !== sig) {
+      let n = 0;
+      for (const it of state.tail.lines) if (!it.kind && lineMatches(it.text, q)) n++;
+      state.tail.matchCount = n;
+      state.tail.matchSig = sig;
+    }
+    const n = state.tail.matchCount;
     c.textContent = n + (n === 1 ? " match" : " matches");
   }
   function renderTailMeta() {
@@ -10060,7 +10270,11 @@ var qrcode = function() {
     // shows a still pose (the l when live, hanging when not).
     const pendLogo = CronstableLogo.mountGlyph($("mark"), {
       connected: () => !!state.connected,
-      reducedMotion: reduceMotion,
+      // body.tv hides the whole header, so on a wallboard the mark is
+      // simulated and re-drawn into a subtree that is never painted -- for
+      // the entire life of a 24/7 session. Park it there: the engine's park
+      // path stops the rAF loop cleanly and setWallboard kicks a re-read.
+      reducedMotion: () => reduceMotion() || state.wallboard,
     });
     kickMark = () => pendLogo.sync();   // setConnected()/setMotion() call this
     // the cursor is weather: sweeping the pointer anywhere across the header
@@ -10728,41 +10942,55 @@ var qrcode = function() {
       state.ledger.count++;
       add.push(row);
     }
-    if (add.length) { ledgerPut(add); ledgerAnalyze(); refreshLedgerStat(); }
+    if (add.length) { ledgerPut(add); ledgerAnalyze(add.map((r) => r.job)); refreshLedgerStat(); }
   }
   function median(xs) {
     if (!xs.length) return null;
     const s = xs.slice().sort((a, b) => a - b), m = s.length >> 1;
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
   }
-  // Robust per-job baselines: median + MAD of SUCCESSFUL run durations.
-  function ledgerAnalyze() {
-    const stats = {};
-    for (const name in state.ledger.runs) {
-      const arr = state.ledger.runs[name];
-      const durs = [];
-      for (const r of arr) if (r.o === "success" && r.d != null) durs.push(r.d);
-      const st = { n: arr.length, samples: durs.length, slow: false, ratio: null, regressed: false, median: null };
-      if (durs.length >= LEDGER_MIN) {
-        const med = median(durs);
-        const mad = median(durs.map((d) => Math.abs(d - med))) || 0;
-        st.median = med;
-        let latest = null;
-        for (let i = arr.length - 1; i >= 0; i--) if (arr[i].d != null && arr[i].o !== "cancelled") { latest = arr[i]; break; }
-        if (latest && med > 0) {
-          st.ratio = latest.d / med;
-          if (latest.o === "success" && latest.d > med + LEDGER_SLOW_K * mad && latest.d > med * 1.5) st.slow = true;
-        }
+  // Robust per-job baseline: median + MAD of SUCCESSFUL run durations.
+  function ledgerStat(arr) {
+    const durs = [];
+    for (const r of arr) if (r.o === "success" && r.d != null) durs.push(r.d);
+    const st = { n: arr.length, samples: durs.length, slow: false, ratio: null, regressed: false, median: null };
+    if (durs.length >= LEDGER_MIN) {
+      const med = median(durs);
+      const mad = median(durs.map((d) => Math.abs(d - med))) || 0;
+      st.median = med;
+      let latest = null;
+      for (let i = arr.length - 1; i >= 0; i--) if (arr[i].d != null && arr[i].o !== "cancelled") { latest = arr[i]; break; }
+      if (latest && med > 0) {
+        st.ratio = latest.d / med;
+        if (latest.o === "success" && latest.d > med + LEDGER_SLOW_K * mad && latest.d > med * 1.5) st.slow = true;
       }
-      const last = arr[arr.length - 1];
-      if (last && last.o === "failure") {
-        let streak = 0;
-        for (let i = arr.length - 2; i >= 0 && arr[i].o === "success"; i--) streak++;
-        if (streak >= LEDGER_MIN) st.regressed = true;
-      }
-      stats[name] = st;
     }
-    state.ledger.stats = stats;
+    const last = arr[arr.length - 1];
+    if (last && last.o === "failure") {
+      let streak = 0;
+      for (let i = arr.length - 2; i >= 0 && arr[i].o === "success"; i--) streak++;
+      if (streak >= LEDGER_MIN) st.regressed = true;
+    }
+    return st;
+  }
+  // `names` limits the pass to the jobs a poll actually moved. Every consumer
+  // reads stats[name], so merging a partial update into the existing map is
+  // identical to rebuilding it -- and rebuilding it meant re-medianing every
+  // job's whole 600-run window whenever any one job finished (50 ms at 500
+  // jobs). Omit `names` to rebuild: enable, load and purge replace the runs.
+  function ledgerAnalyze(names) {
+    if (!names) {
+      const stats = {};
+      for (const name in state.ledger.runs) stats[name] = ledgerStat(state.ledger.runs[name]);
+      state.ledger.stats = stats;
+      return;
+    }
+    const stats = state.ledger.stats;
+    for (const name of names) {
+      const arr = state.ledger.runs[name];
+      if (arr) stats[name] = ledgerStat(arr);
+      else delete stats[name];
+    }
   }
   // synchronous accessor used by the row renderer + its signature
   function ledgerFlag(name) {
@@ -11613,12 +11841,25 @@ var qrcode = function() {
       history: [],
     });
     window.__perf = {
+      // the app state object itself, so a differential harness can drive a
+      // render from a scripted fleet and diff the DOM against the wholesale
+      // rebuild (the keyed row diff below is checked exactly that way)
+      state() { return state; },
       seedJobs(n) {
         const jobs = Array.from({ length: n }, (_, i) => _pjob(i));
         state.jobs = jobs; state.byName = {};
         jobs.forEach((j) => { state.byName[j.name] = j; });
       },
       renderRows() { state.lastRowSig = null; renderRows(); },
+      // the steady-state poll: the signature survives, so only the rows whose
+      // per-row signature moved are rebuilt. touchJob advances exactly one
+      // job's last run, which is what a poll on a real fleet looks like.
+      renderRowsDiff() { renderRows(); },
+      touchJob(i) {
+        const j = state.jobs[i % state.jobs.length];
+        j.last_run.finished_at = new Date(Date.now() - (i % 4096) * 1000).toISOString();
+        j.last_run.duration = 1.2 + (i % 97) / 100;
+      },
       seedFleet(nodes, per) {
         const ns = Array.from({ length: nodes }, (_, k) => ({
           node_name: "node" + k, self: k === 0, status: "live",
@@ -11644,6 +11885,27 @@ var qrcode = function() {
         state.log.matchSig = null;
       },
       updateLogCount() { state.log.matchSig = null; updateLogCount(); },
+      // the log drawer's two per-buffer costs: the full node rebuild a search
+      // keystroke triggers, and the single streamed line that used to force a
+      // whole-buffer layout on its way in.
+      renderTerm() { renderTerm(); },
+      appendLine(i) { appendLine("stdout", "\x1b[32mINFO\x1b[0m worker " + i + " ok", null); },
+      // run ledger: n jobs x per synthetic finished runs, then the analysis
+      // pass. names=null re-medians the whole fleet, an array only those jobs.
+      seedLedger(n, per) {
+        state.ledger.on = true; state.ledger.ready = true;
+        state.ledger.runs = {}; state.ledger.stats = {}; state.ledger.count = 0;
+        for (let k = 0; k < n; k++) {
+          const rows = [];
+          for (let i = 0; i < per; i++) {
+            rows.push({ id: "job" + k + "|" + i, job: "job" + k, iso: "", fin: i,
+              o: i % 11 === 0 ? "failure" : "success", x: 0, d: 1 + ((i * 7919) % 500) / 100, r: null });
+          }
+          state.ledger.runs["job" + k] = rows;
+          state.ledger.count += per;
+        }
+      },
+      ledgerAnalyze(names) { ledgerAnalyze(names); },
       tick() { tick(); },
     };
   }

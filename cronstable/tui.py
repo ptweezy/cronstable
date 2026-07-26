@@ -46,6 +46,8 @@ import contextlib
 import datetime
 import functools
 import hashlib
+import heapq
+import itertools
 import json
 import logging
 import os
@@ -315,6 +317,12 @@ def parse_iso(value: Any) -> Optional[float]:
 
     Mirrors the daemon's own tolerant parser: the payloads cronstable emits
     are always aware UTC, but the TUI must not crash on a foreign record.
+
+    Deliberately not memoised: a module-level stamp cache measured 7x on a
+    2,000-job board but 30% *slower* on a 100k one, where the distinct
+    stamps per frame outrun any cap and every lookup is a miss.  Callers
+    that re-parse the same payload every frame cache per payload instead
+    (see :meth:`AppOverlays._heat_runs`).
     """
     if not isinstance(value, str) or not value:
         return None
@@ -356,6 +364,18 @@ OUTCOME_COLOR = {
     "cancelled": "off",
     "unknown": "pending",
     "skipped": "off",
+}
+
+#: Heatmap bucket precedence. "skipped" seeds the bucket and ranks below
+#: "ok": an hour that only ever held slots back for a pause must not shade
+#: green, but one real success in it outranks any number of holds.  An
+#: empty bucket paints a blank shade, so its seed never shows.
+HEAT_RANK = {
+    "skipped": 0,
+    "ok": 1,
+    "unknown": 2,
+    "cancelled": 3,
+    "fail": 4,
 }
 
 
@@ -917,23 +937,58 @@ def char_width(ch: str) -> int:
     return 1
 
 
+#: Per-character width memo.  A frame's real character domain is a few
+#: dozen glyphs (● ✕ ▶ ⏸ │ — · ↻ and the box drawing), so the memo is warm
+#: after the first paint; it is capped and reset wholesale because log
+#: lines arrive from job stdout, which makes the key set job-controlled.
+_CHAR_W: Dict[str, int] = {}
+_CHAR_W_MAX = 4096
+_char_w_get = _CHAR_W.get
+
+
+def _char_width_memo(ch: str) -> int:
+    """Width of ``ch``, stored for the next frame (the memo-miss half of
+    the inlined lookup in :func:`text_width` and :func:`cut_to_width`)."""
+    w = char_width(ch)
+    if len(_CHAR_W) >= _CHAR_W_MAX:
+        _CHAR_W.clear()
+    _CHAR_W[ch] = w
+    return w
+
+
 def text_width(text: str) -> int:
-    if "\x1b" not in text and text.isascii():
+    if "\x1b" in text:
+        text = _ANSI_RE.sub("", text)
+    if text.isascii():
         # ASCII with no escapes: every character is one cell (C0 controls
         # included; char_width reports 1 for them too), so the width IS
-        # the length.
+        # the length.  A styled ASCII cell lands here too, once the SGR
+        # is gone.
         return len(text)
-    return sum(char_width(ch) for ch in strip_ansi(text))
+    total = 0
+    for ch in text:
+        w = _char_w_get(ch)
+        total += w if w is not None else _char_width_memo(ch)
+    return total
 
 
-def truncate(text: str, width: int, ellipsis: str = "…") -> str:
+#: the default ellipsis is one cell wide; re-deriving that through
+#: text_width's non-ASCII path once per truncate() call is pure overhead
+_ELLIPSIS = "…"
+
+
+def truncate(text: str, width: int, ellipsis: str = _ELLIPSIS) -> str:
     """Cut plain text to ``width`` display cells (ellipsis included)."""
     if width <= 0:
         return ""
+    if ellipsis == _ELLIPSIS and "\x1b" not in text and text.isascii():
+        # escape-free ASCII with the one-cell default ellipsis: nothing to
+        # scrub and every character is one cell, so the cut is a slice.
+        return text if len(text) <= width else text[: width - 1] + _ELLIPSIS
     text = scrub_non_sgr(text)
     if text_width(text) <= width:
         return text
-    ell_w = text_width(ellipsis)
+    ell_w = 1 if ellipsis == _ELLIPSIS else text_width(ellipsis)
     out: List[str] = []
     used = 0
     for ch in text:
@@ -947,6 +1002,14 @@ def truncate(text: str, width: int, ellipsis: str = "…") -> str:
 
 def pad_to(text: str, width: int) -> str:
     """Pad (or truncate) plain text to exactly ``width`` cells."""
+    if "\x1b" not in text and text.isascii():
+        # the common cell: a job name, a command, a clock.  One cell per
+        # character means the pad and the overflow cut are both slices,
+        # instead of two scrubs and three width passes through truncate.
+        n = len(text)
+        if n <= width:
+            return text + " " * (width - n)
+        return text[: width - 1] + _ELLIPSIS if width > 0 else ""
     text = scrub_non_sgr(text)
     w = text_width(text)
     if w > width:
@@ -1015,6 +1078,11 @@ _LOG_BASE = [
 ]
 _SGR_TOKEN_RE = re.compile(r"\x1b\[([0-9;]*)m")
 
+#: bound in the row-cutting loop, which runs these once per escape of every
+#: painted row of every frame
+_sgr_match = _SGR_TOKEN_RE.match
+_ansi_match = _ANSI_RE.match
+
 
 def rewrite_sgr(line: str, theme: Theme) -> str:
     """Translate a log line's SGR colours into theme colours.
@@ -1024,6 +1092,10 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
     dropped: the TUI owns the background).  All non-SGR escapes are
     stripped.
     """
+    if "\x1b" not in line:
+        # every _ANSI_RE alternative is anchored on an ESC, so the sub is
+        # a guaranteed identity here; most job output carries no SGR.
+        return line
 
     def replace(match: "re.Match[str]") -> str:
         out: List[str] = []
@@ -1104,6 +1176,32 @@ def spark_cells(
         )
         cells.append((_SPARK_BARS[idx], outcome_color(run.get("outcome"))))
     return cells
+
+
+def colour_runs(cells: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Merge neighbouring cells that share a colour key into ``(text,
+    key)`` runs.
+
+    A ten-bar spark whose history is all green is one span, not ten: the
+    per-cell form emits a full SGR pair per bar, and those bytes are then
+    re-walked by :func:`cut_to_width` and written to the terminal on every
+    row the differ decides has changed.  Painted output is unchanged
+    because the style spans re-assert the same ink either way.
+    """
+    runs: List[Tuple[str, str]] = []
+    parts: List[str] = []
+    key = ""
+    for ch, ck in cells:
+        if parts and ck == key:
+            parts.append(ch)
+            continue
+        if parts:
+            runs.append(("".join(parts), key))
+        parts = [ch]
+        key = ck
+    if parts:
+        runs.append(("".join(parts), key))
+    return runs
 
 
 # ===================================================================
@@ -1798,6 +1896,13 @@ class LogTail:
         self.path = path
         self.label = label
         self.lines: List[Tuple[str, str, float]] = []  # (stream, line, t)
+        #: entries the MAX_LINES cap has trimmed off the head.  A reader
+        #: that remembers this alongside ``lines``' identity can tell
+        #: "the buffer only grew" from "the buffer shifted under me",
+        #: which is what lets the log search scan the new tail instead of
+        #: the whole buffer.  A wholesale reset replaces ``lines`` with a
+        #: new object, so identity alone catches that case.
+        self.dropped = 0
         self.ended: Optional[str] = None  # end reason ("" = plain end)
         self.error: Optional[str] = None
         self.follow = True
@@ -1812,6 +1917,13 @@ class LogTail:
         if self._task is not None:
             self._task.cancel()
             self._task = None
+
+    def _trim(self) -> None:
+        """Hold the buffer at MAX_LINES, counting what leaves the head."""
+        excess = len(self.lines) - self.MAX_LINES
+        if excess > 0:
+            del self.lines[:excess]
+            self.dropped += excess
 
     def _last_block(self) -> List[Tuple[str, str]]:
         """The ``(stream, line)`` pairs of the newest run on screen:
@@ -1872,8 +1984,7 @@ class LogTail:
                             self.lines.extend(staged)  # diverged: new run
                             staged = None
                         self.lines.append(entry)
-                        if len(self.lines) > self.MAX_LINES:
-                            del self.lines[: -self.MAX_LINES]
+                        self._trim()
                         self._on_change()
                     elif event == "end":
                         self.ended = str(payload.get("reason") or "")
@@ -1901,8 +2012,7 @@ class LogTail:
                                         time.time(),
                                     )
                                 )
-                            if len(self.lines) > self.MAX_LINES:
-                                del self.lines[: -self.MAX_LINES]
+                            self._trim()
                             self._on_change()
             except asyncio.CancelledError:
                 raise
@@ -1949,13 +2059,27 @@ def cut_to_width(row: str, width: int) -> str:
         # every escape sequence starts with ESC, so only attempt the (fairly
         # expensive) regex match there instead of at every character.
         if ch == "\x1b":
-            match = _ANSI_RE.match(row, idx)
-            if match:
-                if _SGR_TOKEN_RE.fullmatch(match.group(0)):
-                    out.append(match.group(0))
+            # almost every escape in a painted row is one of the painter's
+            # own SGR tokens, so try that pattern first: a hit is the whole
+            # decision, where the general pass costs a second regex and a
+            # group() copy to reach the same answer.  The two patterns agree
+            # on the end offset (_ANSI_RE's CSI branch stops its [0-?]* run
+            # at the same 'm' that closes the SGR token), so a row cuts
+            # byte for byte the same either way.
+            match = _sgr_match(row, idx)
+            if match is not None:
+                out.append(match.group(0))
+                idx = match.end()
+                continue
+            match = _ansi_match(row, idx)
+            if match is not None:
                 idx = max(match.end(), idx + 1)
                 continue
-        w = char_width(ch)
+        if " " <= ch <= "~":
+            w = 1
+        else:
+            memo = _char_w_get(ch)
+            w = _char_width_memo(ch) if memo is None else memo
         if used + w > width:
             break
         out.append(ch)
@@ -1964,6 +2088,17 @@ def cut_to_width(row: str, width: int) -> str:
     out.append(" " * (width - used))
     out.append(RESET)
     return "".join(out)
+
+
+def drawer_widths(cols: int) -> Tuple[int, int]:
+    """``(drawer width, left gutter width)`` for the right-hand aside.
+
+    Shared by the compositor and by the caller that renders the base
+    table cut to the gutter, so the two cannot disagree about where the
+    border sits.
+    """
+    drawer_w = max(46, min(90, (cols * 3) // 5))
+    return (drawer_w, cols - drawer_w)
 
 
 def overlay_center(
@@ -2266,6 +2401,10 @@ class App:
 
         # ---- cards ----
         self.heat_data: Dict[str, List[Dict[str, Any]]] = {}
+        # per heatmap row: (the run list it was built from, its parsed
+        # (epoch, outcome key) pairs).  Keyed by identity of the payload
+        # _load_heat swaps in, so it stays the size of heat_data itself.
+        self._heat_parsed: Dict[str, Tuple[Any, List[Tuple[float, str]]]] = {}
         self.heat_loaded = 0.0
         # schedule pressure: computed LOCALLY from the /jobs snapshot via
         # croninfo (the same analyzers the daemon serves), so the panel
@@ -2299,10 +2438,20 @@ class App:
         # plain).  rewrite_sgr inks with the current theme, so the memo
         # is valid for one theme only; _retheme() clears it.
         self._ansi_cache: Dict[str, Tuple[str, str]] = {}
+        # wrapped-row counts per line, valid for one content width (a
+        # resize or a timestamp toggle changes it and clears the memo)
+        self._wrap_rows_cache: Dict[str, int] = {}
+        self._wrap_width = -1
         # last inputs of _log_search_recompute, so a repaint with an
         # unchanged needle and buffer skips the full rescan
         self._log_search_state: Optional[
             Tuple[str, Optional["LogTail"], int, Any]
+        ] = None
+        # what the last scan actually covered: (needle, tail, the buffer
+        # list itself, LogTail.dropped at the time, entries scanned, the
+        # last entry scanned).  _log_search_carry resumes from it.
+        self._log_search_scan: Optional[
+            Tuple[str, "LogTail", List[Tuple[str, str, float]], int, int, Any]
         ] = None
         self.toasts: List[Tuple[str, str, float]] = []
         self.dirty = True
@@ -2334,10 +2483,23 @@ class App:
         cached = self._ansi_cache.get(line)
         if cached is None:
             if len(self._ansi_cache) >= self.ANSI_CACHE_MAX:
-                self._ansi_cache.clear()
+                self._trim_ansi_cache()
             cached = (rewrite_sgr(line, self.theme), strip_ansi(line))
             self._ansi_cache[line] = cached
         return cached
+
+    def _trim_ansi_cache(self) -> None:
+        """Drop the oldest quarter of the ANSI memo.
+
+        Clearing the whole memo also threw away the entries for the lines
+        still on screen, so an overflow cost a full re-ink of the visible
+        window (and, in wrap mode, of the whole buffer).  Dict order is
+        arrival order, so the quarter dropped is the oldest arrivals.
+        """
+        cache = self._ansi_cache
+        drop = max(1, len(cache) // 4)
+        for line in list(itertools.islice(cache, drop)):
+            del cache[line]
 
     def toast(self, kind: str, message: str) -> None:
         # toasts embed job names and server error strings; flatten and
@@ -4202,13 +4364,27 @@ class AppKeys(AppPalette):
             prev = self.log_matches[
                 min(self.log_match_idx, len(self.log_matches) - 1)
             ]
-        self.log_matches = []
+        carried, start = (
+            ([], 0) if reset else self._log_search_carry(needle, tail)
+        )
+        self._log_search_scan = None
+        self.log_matches = carried
         self.log_match_idx = 0
         if not needle or tail is None:
             return
-        for idx, (_, line, _) in enumerate(tail.lines):
-            if needle in strip_ansi(line).lower():
+        lines = tail.lines
+        for idx in range(start, len(lines)):
+            if needle in strip_ansi(lines[idx][1]).lower():
                 self.log_matches.append(idx)
+        scanned = len(lines)
+        self._log_search_scan = (
+            needle,
+            tail,
+            lines,
+            tail.dropped,
+            scanned,
+            lines[scanned - 1] if scanned else None,
+        )
         if prev is not None and self.log_matches:
             for pos, line_idx in enumerate(self.log_matches):
                 if line_idx >= prev:
@@ -4216,6 +4392,44 @@ class AppKeys(AppPalette):
                     break
             else:
                 self.log_match_idx = len(self.log_matches) - 1
+
+    def _log_search_carry(
+        self, needle: str, tail: Optional["LogTail"]
+    ) -> Tuple[List[int], int]:
+        """Matches already known for this needle, and where to resume.
+
+        A live tail invalidates the whole-buffer memo above on every
+        appended line, so without this the search re-strips and re-lowers
+        all 5,000 buffered lines to find the matches in the one that is
+        new.  The buffer only ever grows at the tail and shrinks at the
+        head, so the earlier matches stay valid, shifted down by whatever
+        ``LogTail._trim`` took off the front.
+
+        Everything else falls back to a full rescan: a different needle
+        or tail, a buffer replaced wholesale (caught by identity), or a
+        head that moved without the counter (caught by re-checking that
+        the last entry scanned is still the same object).
+        """
+        scan = self._log_search_scan
+        if scan is None or not needle or tail is None:
+            return ([], 0)
+        was_needle, was_tail, was_lines, was_dropped, scanned, sentinel = scan
+        if (
+            was_needle != needle
+            or was_tail is not tail
+            or was_lines is not tail.lines
+            or tail.dropped < was_dropped
+        ):
+            return ([], 0)
+        shift = tail.dropped - was_dropped
+        start = scanned - shift
+        if start < 0 or start > len(tail.lines):
+            return ([], 0)
+        if start and tail.lines[start - 1] is not sentinel:
+            return ([], 0)
+        if not shift:  # nothing left the head: the indices still stand
+            return (self.log_matches, start)
+        return ([m - shift for m in self.log_matches if m >= shift], start)
 
     def _log_search_jump(self, step: int) -> None:
         self._log_search_recompute()
@@ -4318,6 +4532,34 @@ class AppKeys(AppPalette):
         self.panel_scroll = 0
 
 
+#: The zen field's dot, ink and cell width, per breath state.  The width
+#: is what advances the row cursor, so it is carried beside the glyph
+#: rather than re-measured per placed dot.
+_ZEN_SOON = ("●", "ok", char_width("●"))
+_ZEN_BREATH_IN = ("∙", "dim", char_width("∙"))
+_ZEN_BREATH_OUT = ("·", "dim", char_width("·"))
+
+#: Dot placement per job name.  The digest is a pure function of the name,
+#: so an entry can never go stale; the memo is only capped (and reset
+#: wholesale) so a long-lived session that churns job names stays bounded.
+_ZEN_SEEDS: Dict[str, Tuple[int, int]] = {}
+_ZEN_SEEDS_MAX = 20000
+
+
+def _zen_seed(name: str) -> Tuple[int, int]:
+    """``(row byte, column byte)`` of ``name``'s md5, memoised."""
+    seed = _ZEN_SEEDS.get(name)
+    if seed is None:
+        digest = hashlib.md5(
+            name.encode("utf-8"), usedforsecurity=False
+        ).digest()
+        seed = (digest[0], digest[1])
+        if len(_ZEN_SEEDS) >= _ZEN_SEEDS_MAX:
+            _ZEN_SEEDS.clear()
+        _ZEN_SEEDS[name] = seed
+    return seed
+
+
 # ===================================================================
 #  the application: rendering, part 1 (base screen + wallboard)
 # ===================================================================
@@ -4334,30 +4576,53 @@ class AppRender(AppKeys):
                 else self.render_wallboard(paint, cols, lines)
             )
         else:
-            rows = self.render_base(paint, cols, lines)
             top = self.top_overlay()
             if top in ("drawer", "dag"):
+                # the compositor clips the table to the left gutter, so
+                # lay it out for cols but cut each row once, there: the
+                # rows used to be walked at cols and walked again a
+                # moment later at the gutter
+                rows = self.render_base(
+                    paint, cols, lines, drawer_widths(cols)[1] - 1
+                )
                 rows = self._compose_drawer(paint, rows, cols, lines, top)
-            elif top is not None:
-                panel = self.render_overlay(paint, top, cols, lines)
-                fill = self.theme.bg("bg") + DIM_SGR
-                rows = overlay_center(rows, panel, cols, lines, fill)
+            else:
+                rows = self.render_base(paint, cols, lines)
+                if top is not None:
+                    panel = self.render_overlay(paint, top, cols, lines)
+                    fill = self.theme.bg("bg") + DIM_SGR
+                    rows = overlay_center(rows, panel, cols, lines, fill)
             rows = self._compose_toasts(paint, rows, cols, lines)
         self.term.paint(rows, self.theme.bg("bg"))
 
     # ---------------------------------------------------------------
-    def render_base(self, paint: Painter, cols: int, lines: int) -> List[str]:
-        rows = [self.render_header(paint, cols)]
-        rows.append(self.render_toolbar(paint, cols))
+    def render_base(
+        self,
+        paint: Painter,
+        cols: int,
+        lines: int,
+        cut: Optional[int] = None,
+    ) -> List[str]:
+        """The default screen's rows, laid out for ``cols``.
+
+        ``cut`` narrows the width each row is finally cut to without
+        touching the layout (:meth:`_columns` still picks the ``cols``
+        column set), so the drawer gets rows already clipped to its left
+        gutter rather than full-width rows it has to walk again.
+        """
+        header = self.render_header(paint, cols)
+        rows = [header if cut is None else cut_to_width(header, cut)]
+        rows.append(self.render_toolbar(paint, cols, cut))
         if self.verdict is not None:
-            rows.append(self.render_verdict_bar(paint, cols))
+            rows.append(self.render_verdict_bar(paint, cols, cut))
         body_top = len(rows) + 1  # + column headers
         body_rows = max(1, lines - body_top - 1)
-        rows.extend(self.render_table(paint, cols, body_rows))
+        rows.extend(self.render_table(paint, cols, body_rows, cut))
+        blank = paint.row() if cut is None else cut_to_width(paint.row(), cut)
         while len(rows) < lines - 1:
-            rows.append(paint.row())
+            rows.append(blank)
         rows = rows[: lines - 1]
-        rows.append(self.render_footer(paint, cols))
+        rows.append(self.render_footer(paint, cols, cut))
         return rows
 
     def render_header(self, paint: Painter, cols: int) -> str:
@@ -4394,7 +4659,9 @@ class AppRender(AppKeys):
         gap = cols - text_width(left_text) - text_width(right_text)
         return paint.row(left_text, paint.style(" " * max(1, gap)), right_text)
 
-    def render_toolbar(self, paint: Painter, cols: int) -> str:
+    def render_toolbar(
+        self, paint: Painter, cols: int, cut: Optional[int] = None
+    ) -> str:
         filter_active = self.focus == "filter"
         filt = self.inputs["filter"]
         box = "/" + (filt if filt else ("…" if not filter_active else ""))
@@ -4434,7 +4701,10 @@ class AppRender(AppKeys):
         )
         counts: Dict[str, int] = {}
         for job in self.jobs:
-            counts[health(job)[0]] = counts.get(health(job)[0], 0) + 1
+            # health() is a multi-branch walk of the payload; calling it
+            # twice to produce one count doubled the toolbar's whole cost
+            key = health(job)[0]
+            counts[key] = counts.get(key, 0) + 1
         spans.append(paint.style("   %d jobs " % len(self.jobs), "fg"))
         for key, color in (("run", "run"), ("fail", "fail"), ("ok", "ok")):
             if counts.get(key):
@@ -4448,9 +4718,11 @@ class AppRender(AppKeys):
                         color,
                     )
                 )
-        return cut_to_width(paint.row(*spans), cols)
+        return cut_to_width(paint.row(*spans), cols if cut is None else cut)
 
-    def render_verdict_bar(self, paint: Painter, cols: int) -> str:
+    def render_verdict_bar(
+        self, paint: Painter, cols: int, cut: Optional[int] = None
+    ) -> str:
         v = self.verdict or {}
         color = "fail" if v.get("sev") == "crit" else "warn"
         text = " %s %s — %s" % (
@@ -4463,22 +4735,37 @@ class AppRender(AppKeys):
         text += "   (i timeline)"
         return cut_to_width(
             paint.style(pad_to(text, cols), "bright", bg=color, bold=True),
-            cols,
+            cols if cut is None else cut,
         )
 
     # ---- the jobs table ---------------------------------------------
+    def _column_flags(self) -> Tuple[bool, bool, bool, bool]:
+        """``(spread, monitored, overdue, paused)`` for the layout.
+
+        One walk, not four: every frame asks the job list the same four
+        questions, and the walk stops as soon as they are all yes.  The
+        OVERDUE badge and the "⏸ til HH:MM" cell want a wider column, but
+        only as a bonus paid out of leftover slack: neither is allowed to
+        price a whole droppable column off the board.
+        """
+        spread = monitored = overdue = paused = False
+        for job in self.jobs:
+            if not spread and "clusterOwner" in job:
+                spread = True
+            if not monitored and job.get("running_resources") is not None:
+                monitored = True
+            if not overdue and sla_overdue(job):
+                overdue = True
+            if not paused and job.get("paused"):
+                paused = True
+            if spread and monitored and overdue and paused:
+                break
+        return (spread, monitored, overdue, paused)
+
     def _columns(self, cols: int) -> List[Tuple[str, int]]:
         """(column, width) picks that fit ``cols``, widest board first."""
         compact = bool(self.prefs["compact"])
-        spread = any("clusterOwner" in j for j in self.jobs)
-        monitored = any(
-            j.get("running_resources") is not None for j in self.jobs
-        )
-        # the OVERDUE badge / the "⏸ til HH:MM" cell want a wider column,
-        # but only as a bonus paid out of leftover slack below: neither is
-        # allowed to price a whole droppable column off the board
-        overdue = any(sla_overdue(j) for j in self.jobs)
-        paused = any(j.get("paused") for j in self.jobs)
+        spread, monitored, overdue, paused = self._column_flags()
         layout: List[Tuple[str, int]] = [
             ("status", 11),
             ("name", 24),
@@ -4532,7 +4819,11 @@ class AppRender(AppKeys):
         return layout
 
     def render_table(
-        self, paint: Painter, cols: int, body_rows: int
+        self,
+        paint: Painter,
+        cols: int,
+        body_rows: int,
+        cut: Optional[int] = None,
     ) -> List[str]:
         layout = self._columns(cols)
         titles = {
@@ -4548,7 +4839,8 @@ class AppRender(AppKeys):
             "cmd": "command",
         }
         header = " ".join(pad_to(titles[c], w) for c, w in layout)
-        rows = [paint.style(pad_to(" " + header, cols), "dim", bold=True)]
+        head = paint.style(pad_to(" " + header, cols), "dim", bold=True)
+        rows = [head if cut is None else cut_to_width(head, cut)]
         view = self.view
         self.table_offset = scroll_window(
             len(view), body_rows, self.sel, self.table_offset
@@ -4557,7 +4849,7 @@ class AppRender(AppKeys):
         for offset, job in enumerate(visible):
             idx = self.table_offset + offset
             rows.append(
-                self._job_row(paint, job, layout, cols, idx == self.sel)
+                self._job_row(paint, job, layout, cols, idx == self.sel, cut)
             )
         if not view:
             hint = (
@@ -4569,7 +4861,8 @@ class AppRender(AppKeys):
                     else "no jobs configured"
                 )
             )
-            rows.append(paint.style("   " + hint, "dim"))
+            note = paint.style("   " + hint, "dim")
+            rows.append(note if cut is None else cut_to_width(note, cut))
         return rows
 
     def _job_row(
@@ -4579,6 +4872,7 @@ class AppRender(AppKeys):
         layout: List[Tuple[str, int]],
         cols: int,
         selected: bool,
+        cut: Optional[int] = None,
     ) -> str:
         key, label = health(job)
         ascii_mode = bool(self.prefs["ascii"])
@@ -4682,9 +4976,9 @@ class AppRender(AppKeys):
                 )
             elif col == "spark":
                 spark = "".join(
-                    paint.style(ch, ck, bg=bg)
-                    for ch, ck in spark_cells(
-                        job.get("history") or [], width - 1
+                    paint.style(text, ck, bg=bg)
+                    for text, ck in colour_runs(
+                        spark_cells(job.get("history") or [], width - 1)
                     )
                 )
                 pad_w = width - min(width - 1, len(job.get("history") or []))
@@ -4723,16 +5017,19 @@ class AppRender(AppKeys):
             "▎" if selected else " ", "accent", bg=bg, bold=True
         )
         row = marker + (paint.style(" ", "fg", bg=bg).join(cells))
-        return cut_to_width(paint.row(row), cols)
+        return cut_to_width(paint.row(row), cols if cut is None else cut)
 
-    def render_footer(self, paint: Painter, cols: int) -> str:
+    def render_footer(
+        self, paint: Painter, cols: int, cut: Optional[int] = None
+    ) -> str:
         hints = (
             "j/k move · enter open · r run · x cancel · p pause · c copy · "
             "/ filter · g refresh · t theme · i incident · w wallboard · "
             "ctrl+k palette · ? help · q quit"
         )
         return cut_to_width(
-            paint.style(" " + pad_to(hints, cols - 1), "dim"), cols
+            paint.style(" " + pad_to(hints, cols - 1), "dim"),
+            cols if cut is None else cut,
         )
 
     # ---- toasts ------------------------------------------------------
@@ -4760,10 +5057,14 @@ class AppRender(AppKeys):
         self, paint: Painter, cols: int, lines: int
     ) -> List[str]:
         ascii_mode = bool(self.prefs["ascii"])
-        jobs = sorted(
-            self.jobs,
-            key=lambda j: (WB_ORDER.get(health(j)[0], 9), j.get("name", "")),
-        )
+        # health() drives the tile order, the tile ink AND the footer
+        # counts, so it is walked once per job per frame: the sort key,
+        # the per-tile lookup and the doubled footer count together used
+        # to call it three times per job plus once per painted tile.
+        keyed = [(health(job)[0], job) for job in self.jobs]
+        counts: Dict[str, int] = {}
+        for key, _job in keyed:
+            counts[key] = counts.get(key, 0) + 1
         stale = self.stale()
         rows: List[str] = []
         if self.verdict is not None:
@@ -4778,18 +5079,23 @@ class AppRender(AppKeys):
                     bold=True,
                 )
             )
-        tile_w = max(20, min(30, cols // max(1, min(len(jobs), 4))))
+        tile_w = max(20, min(30, cols // max(1, min(len(keyed), 4))))
         per_row = max(1, cols // (tile_w + 1))
         tile_rows = 3
         grid_top = len(rows) + 1
         avail = lines - grid_top - 1
         max_tiles = max(per_row, per_row * max(1, avail // (tile_rows + 1)))
-        shown = jobs[:max_tiles]
+        # only max_tiles tiles are ever painted, so the tail of a big fleet
+        # never needs ordering; nsmallest is sorted()[:n], ties included.
+        shown = heapq.nsmallest(
+            max_tiles,
+            keyed,
+            key=lambda kj: (WB_ORDER.get(kj[0], 9), kj[1].get("name", "")),
+        )
         for chunk_start in range(0, len(shown), per_row):
             chunk = shown[chunk_start : chunk_start + per_row]
             lines3: List[List[str]] = [[], [], []]
-            for job in chunk:
-                key, _label = health(job)
+            for key, job in chunk:
                 color = {
                     "ok": "ok",
                     "fail": "fail",
@@ -4845,9 +5151,9 @@ class AppRender(AppKeys):
                     )
                 )
                 spark_row = "  " + "".join(
-                    paint.style(ch, "dim" if dim_all else ck)
-                    for ch, ck in spark_cells(
-                        job.get("history") or [], tile_w - 4
+                    paint.style(text, "dim" if dim_all else ck)
+                    for text, ck in colour_runs(
+                        spark_cells(job.get("history") or [], tile_w - 4)
                     )
                 )
                 pad_cells = (
@@ -4860,9 +5166,6 @@ class AppRender(AppKeys):
         while len(rows) < lines - 1:
             rows.append(paint.row())
         rows = rows[: lines - 1]
-        counts: Dict[str, int] = {}
-        for job in self.jobs:
-            counts[health(job)[0]] = counts.get(health(job)[0], 0) + 1
         foot = " %d jobs · %d fail · %d run · %d ok" % (
             len(self.jobs),
             counts.get("fail", 0),
@@ -4889,28 +5192,29 @@ class AppRender(AppKeys):
         """The calm all-clear field: one breathing dot per job, pulsing
         on its real next fire, a terminal read of the web screensaver."""
         rows = [paint.row() for _ in range(lines)]
+        # cells already filled, per row.  Measuring the accumulating styled
+        # row instead made the field quadratic in the job count, on the one
+        # screen the TUI paints unattended for hours.
+        used = [text_width(paint.row())] * lines
         now = time.monotonic()
+        phase = (now % 4) / 4  # frame-constant; the dots share one breath
+        row_span = max(1, lines - 3)
+        col_span = max(1, cols - 3)
         for job in self.jobs:
-            name = str(job.get("name", ""))
-            digest = hashlib.md5(
-                name.encode("utf-8"), usedforsecurity=False
-            ).digest()
-            row_idx = 1 + digest[0] % max(1, lines - 3)
-            col_idx = 1 + digest[1] % max(1, cols - 3)
+            seed = _zen_seed(str(job.get("name", "")))
+            row_idx = 1 + seed[0] % row_span
+            col_idx = 1 + seed[1] % col_span
             nxt = self.next_run_seconds(job)
-            phase = (now % 4) / 4
             if nxt is not None and nxt < 30:
-                dot, color = "●", "ok"
+                dot, color, dot_w = _ZEN_SOON
             elif phase < 0.5:
-                dot, color = "∙", "dim"
+                dot, color, dot_w = _ZEN_BREATH_IN
             else:
-                dot, color = "·", "dim"
-            row = rows[row_idx]
-            pad_needed = col_idx - text_width(row)
+                dot, color, dot_w = _ZEN_BREATH_OUT
+            pad_needed = col_idx - used[row_idx]
             if pad_needed >= 0:
-                rows[row_idx] = (
-                    row + " " * pad_needed + paint.style(dot, color)
-                )
+                rows[row_idx] += " " * pad_needed + paint.style(dot, color)
+                used[row_idx] = col_idx + dot_w
         label = "all clear · %s" % utc_clock()
         rows[lines - 2] = paint.style(pad_to(label.center(cols), cols), "dim")
         return rows
@@ -5636,31 +5940,25 @@ class AppOverlays(AppRender):
             )
             return panel_frame(paint, "fleet", body, width, "esc close")
         nodes = [n for n in data.get("nodes", []) if isinstance(n, dict)]
+        # one walk of the node x job matrix answers all three questions the
+        # header and the filter ask of it: which job names exist, which are
+        # failing somewhere, and how many cells are running.  Walking it
+        # per question re-read every cell three times, and four under the
+        # failing-only filter.
         names: Set[str] = set()
+        failed: Set[str] = set()
+        running_cells = 0
         for node in nodes:
-            names.update((node.get("jobs") or {}).keys())
-        rows = sorted(names)
-
-        def failing(job_name: str) -> bool:
-            for node in nodes:
-                cell = (node.get("jobs") or {}).get(job_name)
-                if (
-                    cell
-                    and not cell.get("running")
-                    and (cell.get("last") or {}).get("outcome") == "failure"
-                ):
-                    return True
-            return False
-
-        fail_count = sum(1 for r in rows if failing(r))
-        if self.fleet_fail_only:
-            rows = [r for r in rows if failing(r)]
-        running_cells = sum(
-            1
-            for node in nodes
-            for cell in (node.get("jobs") or {}).values()
-            if cell.get("running")
-        )
+            for job_name, cell in (node.get("jobs") or {}).items():
+                names.add(job_name)
+                if not cell:
+                    continue
+                if cell.get("running"):
+                    running_cells += 1
+                elif (cell.get("last") or {}).get("outcome") == "failure":
+                    failed.add(job_name)
+        fail_count = len(failed)
+        rows = sorted(failed) if self.fleet_fail_only else sorted(names)
         summary = " %d nodes · %d jobs · %d running" % (
             len(nodes),
             len(names),
@@ -5746,6 +6044,38 @@ class AppOverlays(AppRender):
         )
 
     # ---- activity heatmap -------------------------------------------
+    def _heat_runs(self, name: str) -> List[Tuple[float, str]]:
+        """``(finish epoch, outcome key)`` for one heatmap row, cached.
+
+        The punchcard refetches at most once a minute (``_load_heat``) but
+        repaints at least once a second, and the parse of a run's
+        ``finished_at`` is a string replace, a datetime build and a
+        ``.timestamp()`` per run per frame.  The cache is keyed on the run
+        list object ``_load_heat`` swaps in, so it is exactly as large as
+        the payload it mirrors and cannot outlive it.
+        """
+        runs = self.heat_data.get(name) or []
+        cached = self._heat_parsed.get(name)
+        if cached is not None and cached[0] is runs:
+            return cached[1]
+        if len(self._heat_parsed) > len(self.heat_data):
+            # names only ever arrive in heat_data, but a wholesale replace
+            # (a fresh app state, a test fixture) can orphan entries
+            self._heat_parsed = {
+                key: value
+                for key, value in self._heat_parsed.items()
+                if key in self.heat_data
+            }
+        parsed: List[Tuple[float, str]] = []
+        for run in runs:
+            epoch = parse_iso(run.get("finished_at"))
+            if epoch is not None:
+                parsed.append(
+                    (epoch, outcome_key(str(run.get("outcome", ""))))
+                )
+        self._heat_parsed[name] = (runs, parsed)
+        return parsed
+
     def render_heat(self, paint: Painter, cols: int, lines: int) -> List[str]:
         width = min(96, cols - 4)
         buckets = 24
@@ -5764,38 +6094,26 @@ class AppOverlays(AppRender):
             0, min(self.panel_scroll, max(0, len(names) - visible))
         )
         for name in names[self.panel_scroll : self.panel_scroll + visible]:
-            runs = self.heat_data.get(name, [])
-            # "skipped" seeds the bucket and ranks below "ok": an hour that
-            # only ever held slots back for a pause must not shade green,
-            # but one real success in it outranks any number of holds. An
-            # empty bucket paints a blank shade, so its seed never shows.
-            rank = {
-                "skipped": 0,
-                "ok": 1,
-                "unknown": 2,
-                "cancelled": 3,
-                "fail": 4,
-            }
             cells: List[Tuple[int, str]] = [
                 (0, "skipped") for _ in range(buckets)
             ]
-            for run in runs:
-                t = parse_iso(run.get("finished_at"))
-                if t is None:
-                    continue
-                age_h = (now - t) / 3600
+            for epoch, key in self._heat_runs(name):
+                age_h = (now - epoch) / 3600
                 if age_h >= buckets:
                     continue
                 idx = buckets - 1 - int(age_h)
                 count, worst = cells[idx]
-                key = outcome_key(str(run.get("outcome", "")))
-                if rank[key] >= rank[worst]:
+                if HEAT_RANK[key] >= HEAT_RANK[worst]:
                     worst = key
                 cells[idx] = (count + 1, worst)
             spans = [paint.style(pad_to(" " + truncate(name, 22), 24), "fg")]
-            for count, worst in cells:
-                shade = shades[min(len(shades) - 1, count)]
-                spans.append(paint.style(shade, OUTCOME_COLOR[worst]))
+            for text, worst in colour_runs(
+                [
+                    (shades[min(len(shades) - 1, count)], worst)
+                    for count, worst in cells
+                ]
+            ):
+                spans.append(paint.style(text, OUTCOME_COLOR[worst]))
             body.append("".join(spans))
         if not names:
             body.append(paint.style("  gathering run history…", "dim"))
@@ -6047,9 +6365,10 @@ class AppOverlays(AppRender):
             if nxt is None or nxt < 0:
                 continue
             items.append((nxt, str(job.get("name", ""))))
-        items.sort()
+        # ten rows are painted and the track below needs no order at all,
+        # so the tail of a big fleet is never sorted
         body = [paint.style(" %d upcoming" % len(items), "dim")]
-        for nxt, name in items[:10]:
+        for nxt, name in heapq.nsmallest(10, items):
             body.append(
                 paint.style(
                     pad_to(" " + fmt_countdown(nxt), 10), "accent", bold=True
@@ -6142,9 +6461,13 @@ class AppDrawers(AppOverlays):
         which: str,
     ) -> List[str]:
         """Splice a right-hand drawer over the dimmed table, like the
-        web page's aside."""
-        drawer_w = max(46, min(90, (cols * 3) // 5))
-        left_w = cols - drawer_w
+        web page's aside.
+
+        ``base`` arrives already cut to the left gutter (:meth:`paint`
+        passes :func:`drawer_widths`' gutter to ``render_base``), so the
+        table rows are walked once per frame rather than twice.
+        """
+        drawer_w, left_w = drawer_widths(cols)
         panel = (
             self.render_drawer_panel(paint, drawer_w, lines)
             if which == "drawer"
@@ -6152,10 +6475,9 @@ class AppDrawers(AppOverlays):
         )
         rows = []
         border = paint.style("│", "accent")
+        blank = cut_to_width(paint.row(), left_w - 1)
         for idx in range(lines):
-            left = cut_to_width(
-                base[idx] if idx < len(base) else paint.row(), left_w - 1
-            )
+            left = base[idx] if idx < len(base) else blank
             row = panel[idx] if idx < len(panel) else ""
             rows.append(
                 left + border + cut_to_width(paint.row(row), drawer_w - 1)
@@ -6308,17 +6630,11 @@ class AppDrawers(AppOverlays):
                 paint.style("  ── end of run output (no-output) ──", "dim")
             )
         if self.wrap:
-            # wrapped lines can span several rows, so sizing the scroll
-            # window still needs the full walk (each line's transforms
-            # are memoised, so the walk is regex-free after warm-up)
-            display: List[str] = []
-            for stream, line, when in tail.lines:
-                display.extend(render(stream, line, when))
-            display.extend(suffix)
-            max_scroll = max(0, len(display) - available)
-            self.log_scroll = min(self.log_scroll, max_scroll)
-            end = len(display) - self.log_scroll
-            rows.extend(display[max(0, end - available) : end])
+            rows.extend(
+                self._wrapped_window(
+                    tail, suffix, render, content_width, available
+                )
+            )
         else:
             # unwrapped, every buffered entry paints exactly one row:
             # clamp the scroll from counts alone and build only the
@@ -6335,6 +6651,78 @@ class AppDrawers(AppOverlays):
         if not tail.lines and tail.ended is None and not tail.error:
             rows.append(paint.style("  waiting for output…", "dim"))
         return rows
+
+    def _wrap_rows(
+        self, entry: Tuple[str, str, float], content_width: int
+    ) -> int:
+        """Screen rows one buffered entry occupies with wrap on.
+
+        Memoised per line for one content width, like :meth:`_ansi_line`
+        and for the same reason: the count is asked of every buffered
+        entry on every frame, and it is a pure function of the line.
+        """
+        stream, line, _when = entry
+        if stream == "meta":
+            return 1
+        if content_width != self._wrap_width:
+            self._wrap_width = content_width
+            self._wrap_rows_cache = {}
+        cache = self._wrap_rows_cache
+        rows = cache.get(line)
+        if rows is None:
+            plain = self._ansi_line(line)[1]
+            rows = (
+                1
+                if text_width(plain) <= content_width
+                # ceil: the chunker cuts on characters, not on cells
+                else -(-len(plain) // content_width)
+            )
+            if len(cache) >= self.ANSI_CACHE_MAX:
+                cache.clear()
+            cache[line] = rows
+        return rows
+
+    def _wrapped_window(
+        self,
+        tail: "LogTail",
+        suffix: List[str],
+        render: Callable[[str, str, float], List[str]],
+        content_width: int,
+        available: int,
+    ) -> List[str]:
+        """The visible rows of a wrapped log buffer.
+
+        A wrapped entry spans an unknown number of rows, so this branch
+        cannot clamp its scroll from entry counts the way the unwrapped
+        one does.  It clamps from per-entry ROW counts instead (integer
+        work over the memoised plain text) and styles only the entries
+        the window touches: the buffer used to be rendered whole so that
+        forty rows could be sliced out of five thousand.
+        """
+        counts = [
+            self._wrap_rows(entry, content_width) for entry in tail.lines
+        ]
+        body_rows = sum(counts)
+        total = body_rows + len(suffix)
+        max_scroll = max(0, total - available)
+        self.log_scroll = min(self.log_scroll, max_scroll)
+        end = total - self.log_scroll
+        begin = max(0, end - available)
+        window: List[str] = []
+        first_row = min(begin, body_rows)
+        cursor = 0
+        for idx, count in enumerate(counts):
+            if cursor >= end:
+                break
+            if cursor + count > begin:
+                if not window:
+                    first_row = cursor
+                window.extend(render(*tail.lines[idx]))
+            cursor += count
+        visible = window[begin - first_row : end - first_row]
+        if end > body_rows:
+            visible.extend(suffix[max(0, begin - body_rows) : end - body_rows])
+        return visible
 
     def _drawer_history(
         self, paint: Painter, width: int, body_lines: int

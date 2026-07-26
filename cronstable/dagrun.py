@@ -85,6 +85,18 @@ DAG_MAX_CATCHUP = 100
 # a due wake in place -- a fast-failing store must not spin the main loop.
 ADVANCE_RETRY_DELAY = 5.0
 
+# How often the main loop re-reads a wake hint whose advance is already in
+# flight (see _hold_advancing).  Such a hint says "this run wants servicing but
+# the pass that will say when has not reported back yet": left due, it makes
+# next_wake_delay return 0.0 for the pass's whole duration, so the loop re-runs
+# its entire housekeeping block thousands of times a second.  Skipping it
+# outright is not an option either -- nothing wakes the loop when the pass
+# lands, and the fresh hint can be nearer than the sleep already committed to
+# (an approval poll, a due retry, a sensor poke) -- so it is POLLED at this
+# interval: the loop notices the pass's real hint within one poll of it being
+# written, and pays a bounded handful of passes a second meanwhile.
+ADVANCE_POLL_FLOOR = 0.2
+
 # A failed completion RMW is re-attempted on later service passes with this
 # bounded backoff.  Retrying until it lands is safe (mark_task_finished is
 # fenced and idempotent) and necessary: giving up would wedge the run forever,
@@ -159,6 +171,16 @@ class DagScheduler:
         # soonest wall-clock instant an owned run wants another advance (a due
         # sensor poke or task retry); drives the loop's sleep cap.
         self._wake: Dict[RunRef, float] = {}
+        # refs whose advance pass is in flight, refcounted (a periodic sweep
+        # holds its whole due batch while each ref's own advance_one holds it
+        # again).  A held ref's wake hint is polled at ADVANCE_POLL_FLOOR
+        # instead of read as due: the pass ALREADY under way is what decides
+        # when this run next wants advancing, so a hint left due until it
+        # reports back buys nothing and pins the main loop's sleep at zero --
+        # a full-core housekeeping spin for the pass's whole duration.  Every
+        # hold is paired with a drop in a ``finally``, so a failed or
+        # cancelled advance cannot leave a run polling forever.
+        self._advance_pending: Dict[RunRef, int] = {}
         # dag name -> run keys this node has SEEN terminal.  Terminality is
         # monotonic, so the adopt scan skips re-reading these (see
         # _adopt_one_dag); pruned against each key listing, rebuilt from
@@ -289,7 +311,14 @@ class DagScheduler:
             now >= self._next_sched_check
             or now >= self._next_adopt
             or now >= self._next_gc
-            or any(w <= now for w in self._wake.values())
+            # a ref whose advance is already in flight is not work this pass
+            # could do: advance_one would only latch its rerun flag, making
+            # the holder redo a pass nothing has changed under.
+            or any(
+                w <= now
+                for ref, w in self._wake.items()
+                if ref not in self._advance_pending
+            )
             or any(
                 pc["nextTryAt"] <= now
                 for pc in self._pending_completions.values()
@@ -359,7 +388,14 @@ class DagScheduler:
             ):
                 del self._locks[ref]
         candidates = [self._next_sched_check]
-        candidates.extend(self._wake.values())
+        # A hint whose advance is in flight is stale by construction (the pass
+        # rewrites it on the way out), so it is polled rather than honoured as
+        # due -- see ADVANCE_POLL_FLOOR.
+        poll_floor = now + ADVANCE_POLL_FLOOR
+        for ref, hint in self._wake.items():
+            if ref in self._advance_pending and hint < poll_floor:
+                hint = poll_floor
+            candidates.append(hint)
         for pc in self._pending_completions.values():
             candidates.append(pc["nextTryAt"])
         for when in self._next_logical.values():
@@ -645,8 +681,12 @@ class DagScheduler:
         self._locks.setdefault(ref, asyncio.Lock())
         self._renewers[ref] = asyncio.ensure_future(self._renew_loop(ref))
         self._wake[ref] = _now()  # advance promptly
-        await self._reconcile_run(dagcfg, ref)
-        await self.advance_one(ref)
+        self._hold_advancing(ref)  # ...but the loop must not spin meanwhile
+        try:
+            await self._reconcile_run(dagcfg, ref)
+            await self.advance_one(ref)
+        finally:
+            self._drop_advancing(ref)
         return True
 
     async def _renew_loop(self, ref: RunRef) -> None:
@@ -789,10 +829,34 @@ class DagScheduler:
     # Advancing an owned run
     # =====================================================================
 
+    def _hold_advancing(self, ref: RunRef) -> None:
+        """Take ``ref``'s wake hint out of the loop's sleep index."""
+        self._advance_pending[ref] = self._advance_pending.get(ref, 0) + 1
+
+    def _drop_advancing(self, ref: RunRef) -> None:
+        """Release one :meth:`_hold_advancing` hold on ``ref``."""
+        left = self._advance_pending.get(ref, 0) - 1
+        if left > 0:
+            self._advance_pending[ref] = left
+        else:
+            self._advance_pending.pop(ref, None)
+
     async def _advance_owned(self, now: float) -> None:
-        for ref in list(self._owned):
-            if self._wake.get(ref, 0.0) <= now:
+        due = [ref for ref in self._owned if self._wake.get(ref, 0.0) <= now]
+        if not due:
+            return
+        # Hold the WHOLE due batch, not one ref at a time: the walk is
+        # sequential and every advance awaits the store, so each ref this pass
+        # has not reached yet still carries a due wake and would keep
+        # next_wake_delay pinned at 0 for the pass's whole duration.
+        for ref in due:
+            self._hold_advancing(ref)
+        try:
+            for ref in due:
                 await self.advance_one(ref)
+        finally:
+            for ref in due:
+                self._drop_advancing(ref)
 
     async def advance_one(self, ref: RunRef) -> None:
         """Advance ``ref`` once, coalescing concurrent requests.
@@ -814,12 +878,31 @@ class DagScheduler:
             # under the lock, so the flag cannot be missed.
             self._advance_again.add(ref)
             return
-        async with lock:
-            while True:
-                self._advance_again.discard(ref)
-                await self._advance_locked(ref)
-                if ref not in self._advance_again:
-                    return
+        self._hold_advancing(ref)
+        try:
+            async with lock:
+                while True:
+                    self._advance_again.discard(ref)
+                    await self._advance_locked(ref)
+                    if ref not in self._advance_again:
+                        return
+        finally:
+            self._drop_advancing(ref)
+
+    def _spawn_advance(self, ref: RunRef) -> None:
+        """Advance ``ref`` soon, off the caller's critical path.
+
+        Used by the completion and approval paths, which must not block the
+        reaper (or an HTTP handler) on the per-run lock a periodic advance may
+        be holding.  The hint left behind is one poll out, not the "due now"
+        0.0 this used to write: the advance is already spawned, so the hint is
+        only the backstop for the window before that task starts (and for the
+        case where it never does -- ``_track_state_write`` sheds writes under
+        overload), whereas a due-now hint pinned :meth:`next_wake_delay` at 0
+        and spun the whole main loop until the advance rewrote it.
+        """
+        self._wake[ref] = _now() + ADVANCE_POLL_FLOOR
+        self._cron._track_state_write(self.advance_one(ref))
 
     async def _advance_locked(self, ref: RunRef) -> None:
         lease = self._owned.get(ref)
@@ -1564,8 +1647,7 @@ class DagScheduler:
                     )
         # one fresh advance for the whole batch, off the reaper's critical path
         # (a concurrent periodic advance may hold the per-run lock).
-        self._wake[ref] = 0.0
-        self._cron._track_state_write(self.advance_one(ref))
+        self._spawn_advance(ref)
 
     async def _finish_task(
         self,
@@ -1641,8 +1723,7 @@ class DagScheduler:
                 )
         # trigger a fresh advance without blocking the reaper on the per-run
         # lock (a concurrent periodic advance may hold it).
-        self._wake[ref] = 0.0
-        self._cron._track_state_write(self.advance_one(ref))
+        self._spawn_advance(ref)
 
     def _queue_completion(
         self,
@@ -1819,10 +1900,7 @@ class DagScheduler:
         )
         _stored, result = await self._mutate(dag_name, run_key, transform)
         if result and result.get("ok"):
-            self._wake[(dag_name, run_key)] = 0.0
-            self._cron._track_state_write(
-                self.advance_one((dag_name, run_key))
-            )
+            self._spawn_advance((dag_name, run_key))
         return result or {"ok": False, "reason": "no such run"}
 
     async def trigger_run(
@@ -1928,14 +2006,29 @@ class DagScheduler:
 
     @staticmethod
     def _summarize_run(body: Dict[str, Any]) -> Dict[str, Any]:
-        """The handful of fields list_dags' rollup needs from a run document,
-        plus whether the run is terminal (so its summary can be cached)."""
+        """Everything the run listings need from a run document, plus whether
+        the run is terminal (so its summary can be cached).
+
+        Serves both list_dags' rollup and :meth:`list_runs`, so it carries the
+        run-list fields (``runId``/``logicalDate``/``taskStates``) too: one
+        cache entry per run, filled once, rather than each caller re-reading
+        and re-parsing every retained document.  The task histogram is a walk
+        of the body the caller has already parsed, which is cheap next to the
+        parse it saves on later calls.
+        """
+        counts: Dict[str, int] = {}
+        for entry in body.get("tasks", {}).values():
+            st = entry.get("state", "unknown")
+            counts[st] = counts.get(st, 0) + 1
         return {
             "runKey": body.get("runKey"),
+            "runId": body.get("runId"),
             "state": str(body.get("state", "running")),
             "kind": body.get("kind"),
+            "logicalDate": body.get("logicalDate"),
             "createdAt": body.get("createdAt"),
             "updatedAt": body.get("updatedAt"),
+            "taskStates": counts,
             "terminal": dag.is_terminal_run(body),
         }
 
@@ -1962,13 +2055,13 @@ class DagScheduler:
             "totalRuns": len(summaries),
         }
 
-    async def _bulk_rollup(
+    async def _bulk_summaries(
         self, backend: StateBackend, ns: str, name: str
-    ) -> Optional[Dict[str, Any]]:
-        """One list_documents sweep: rebuild the cache from every body and roll
-        it up. Used for the cold cache / large-delta case and when the backend
-        cannot list keys only. Returns None (omit the rollup) on a hiccup,
-        matching the old degrade behaviour."""
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One list_documents sweep: rebuild the cache from every body. Used
+        for the cold cache / large-delta case and when the backend cannot list
+        keys only. Returns None on a hiccup, matching the old degrade
+        behaviour."""
         try:
             docs = await asyncio.wait_for(
                 backend.list_documents(ns), timeout=STATE_OP_TIMEOUT
@@ -1985,19 +2078,29 @@ class DagScheduler:
             summaries.append(s)
             if isinstance(s["runKey"], str):
                 cache[s["runKey"]] = s
+        return summaries
+
+    async def _bulk_rollup(
+        self, backend: StateBackend, ns: str, name: str
+    ) -> Optional[Dict[str, Any]]:
+        """The full-sweep rollup: :meth:`_bulk_summaries`, rolled up."""
+        summaries = await self._bulk_summaries(backend, ns, name)
+        if summaries is None:
+            return None
         return self._rollup_from_summaries(summaries)
 
-    async def _dag_run_rollup(
+    async def _run_summaries(
         self, backend: StateBackend, name: str
-    ) -> Optional[Dict[str, Any]]:
-        """Per-dag run rollup for list_dags, caching immutable terminal runs.
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Every retained run's summary, caching immutable terminal runs.
 
         Lists keys only, drops cache entries for GC'd runs, and re-reads just
         the new or still-running documents (terminal ones are served from
-        cache) -- so a ~3s /dags poll stops re-parsing every retained run of
-        every dag. Falls back to a single full parse when the backend cannot
-        list keys only or when many bodies need reading at once (cold cache).
-        Best-effort: returns None to omit the rollup rather than failing /dags.
+        cache) -- so a ~3s /dags poll, and every run-list request, stop
+        re-parsing every retained run of every dag. Falls back to a single
+        full parse when the backend cannot list keys only or when many bodies
+        need reading at once (cold cache). Best-effort: returns None (the
+        caller degrades) rather than failing the request.
         """
         ns = self._ns(name)
         try:
@@ -2010,7 +2113,7 @@ class DagScheduler:
             return None
         if keys is None:
             # backend has no keys-only listing: one full parse, no caching win
-            return await self._bulk_rollup(backend, ns, name)
+            return await self._bulk_summaries(backend, ns, name)
         cache = self._dag_summary_cache.setdefault(name, {})
         keyset = set(keys)
         for gone in [k for k in cache if k not in keyset]:
@@ -2019,7 +2122,7 @@ class DagScheduler:
             k for k in keys if not (k in cache and cache[k]["terminal"])
         ]
         if len(to_read) > DAG_ROLLUP_BULK_THRESHOLD:
-            return await self._bulk_rollup(backend, ns, name)
+            return await self._bulk_summaries(backend, ns, name)
         for key in to_read:
             try:
                 body = await asyncio.wait_for(
@@ -2033,7 +2136,16 @@ class DagScheduler:
                 cache.pop(key, None)  # deleted since the listing
                 continue
             cache[key] = self._summarize_run(body)
-        return self._rollup_from_summaries(list(cache.values()))
+        return list(cache.values())
+
+    async def _dag_run_rollup(
+        self, backend: StateBackend, name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Per-dag run rollup for list_dags, over the cached summaries."""
+        summaries = await self._run_summaries(backend, name)
+        if summaries is None:
+            return None
+        return self._rollup_from_summaries(summaries)
 
     async def get_run(
         self, dag_name: str, run_key: str
@@ -2131,15 +2243,34 @@ class DagScheduler:
     async def list_runs(
         self, dag_name: str, *, limit: int = 50
     ) -> Optional[List[Dict[str, Any]]]:
+        """The newest ``limit`` runs of ``dag_name``, newest first.
+
+        Served from the same per-key summary cache list_dags' rollup fills, so
+        a drawer open (or an MCP run listing) re-reads only the runs that are
+        still going: reading and parsing all ``retainRuns`` documents cost
+        tens of milliseconds of CPU per request on a wide mapped fan-out, all
+        of it re-deriving summaries of runs that finished long ago.
+        """
         backend = self._backend()
         if backend is None or dag_name not in self._dags():
             return None
-        docs = await asyncio.wait_for(
-            backend.list_documents(self._ns(dag_name)),
-            timeout=STATE_OP_TIMEOUT,
+        summaries = await self._run_summaries(backend, dag_name)
+        if summaries is None:
+            # the keys-only listing or a body read failed: take the plain
+            # full-listing path, which surfaces a store failure to the caller
+            # exactly as this method always has.
+            docs = await asyncio.wait_for(
+                backend.list_documents(self._ns(dag_name)),
+                timeout=STATE_OP_TIMEOUT,
+            )
+            docs.sort(
+                key=lambda b: float(b.get("createdAt") or 0), reverse=True
+            )
+            return [_listed_run(self._summarize_run(b)) for b in docs[:limit]]
+        summaries.sort(
+            key=lambda s: float(s.get("createdAt") or 0), reverse=True
         )
-        docs.sort(key=lambda b: float(b.get("createdAt") or 0), reverse=True)
-        return [_run_summary(b) for b in docs[:limit]]
+        return [_listed_run(s) for s in summaries[:limit]]
 
     # =====================================================================
     # Retention GC (DAG-owned; dag_run documents live outside the record GC)
@@ -2299,6 +2430,7 @@ class DagScheduler:
         self._renewers.clear()
         self._owned.clear()
         self._wake.clear()
+        self._advance_pending.clear()
         self._locks.clear()
         self._next_logical.clear()
         self._seeded.clear()
@@ -2343,19 +2475,22 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime.datetime]:
     return dt
 
 
-def _run_summary(body: Dict[str, Any]) -> Dict[str, Any]:
-    tasks = body.get("tasks", {})
-    counts: Dict[str, int] = {}
-    for entry in tasks.values():
-        st = entry.get("state", "unknown")
-        counts[st] = counts.get(st, 0) + 1
+def _listed_run(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """One run summary as the run-list payload.
+
+    Rebuilt field by field rather than returned as-is: a summary carries the
+    rollup's private ``terminal`` flag, and callers must never see it (nor be
+    able to mutate the cached dict it may have come from).  The single
+    definition of that payload, so the cached and full-listing paths of
+    :meth:`DagScheduler.list_runs` cannot drift apart.
+    """
     return {
-        "runKey": body.get("runKey"),
-        "runId": body.get("runId"),
-        "state": body.get("state"),
-        "kind": body.get("kind"),
-        "logicalDate": body.get("logicalDate"),
-        "createdAt": body.get("createdAt"),
-        "updatedAt": body.get("updatedAt"),
-        "taskStates": counts,
+        "runKey": summary.get("runKey"),
+        "runId": summary.get("runId"),
+        "state": summary.get("state"),
+        "kind": summary.get("kind"),
+        "logicalDate": summary.get("logicalDate"),
+        "createdAt": summary.get("createdAt"),
+        "updatedAt": summary.get("updatedAt"),
+        "taskStates": dict(summary.get("taskStates") or {}),
     }

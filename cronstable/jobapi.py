@@ -33,6 +33,7 @@ the HTTP surface over them.  It is imported only when a ``state`` section with
 
 import asyncio
 import hmac
+import json
 import logging
 import math
 import os
@@ -79,6 +80,38 @@ MAX_LOCK_PERMITS = 1024
 MAX_LOCK_TTL = 30 * 86400.0
 
 
+def _json_response(
+    payload: Any, *, status: int = 200, trusted: bool = False
+) -> web.Response:
+    """A JSON ``web.Response`` serialized with the orjson-accelerated encoder.
+
+    The local twin of :func:`cronstable.cron._json_response` (this module
+    deliberately does not import cron, which imports it): it serializes with
+    :func:`cronstable._json.dumps_bytes` instead of the stdlib ``json.dumps``
+    aiohttp's ``web.json_response`` reaches for, so a response ships compact
+    separators and, where orjson is installed, encodes several times faster.
+    A web response is transient rather than a durable cross-fleet record, so a
+    value the portability gate rejects falls back to the stdlib and never 500s
+    the endpoint.
+
+    ``trusted`` skips that gate, and is for payloads whose every value the
+    daemon computed itself.  It is deliberately NOT set on the handlers that
+    echo store-read or request-supplied values (the kv/cursor reads, the kv and
+    artifact listings): those carry whatever a job wrote, which is exactly the
+    input the gate exists for.
+    """
+    try:
+        body = _json.dumps_bytes(payload, trusted=trusted)
+    except (_json.UnsupportedValue, ValueError):
+        # ValueError as well as UnsupportedValue: the no-orjson flavour of
+        # dumps_bytes keeps allow_nan=False, which surfaces a non-finite
+        # float from a trusted caller as the stdlib's bare ValueError.
+        body = json.dumps(payload, default=str).encode("utf-8")
+    return web.Response(
+        body=body, status=status, content_type="application/json"
+    )
+
+
 def _bracket_host(host: str) -> str:
     """A host formatted for a URL authority (IPv6 literals bracketed).
 
@@ -120,6 +153,12 @@ class RunContext:
     job's name), reading, overwriting or destroying its state.  ``secrets`` is
     the run-scoped, in-memory staging table -- resolved by the daemon at
     launch and dropped when the run ends.
+
+    ``token_bytes`` is the token pre-encoded for the constant-time compare in
+    :meth:`JobStateAPI._run`, which scans every live run on every request:
+    encoding inside that loop allocated one throwaway bytes object per live
+    run per request.  The web API's ``_WebToken`` precomputes it for the same
+    reason.
     """
 
     token: str
@@ -131,6 +170,10 @@ class RunContext:
     default_scope: str
     allowed_scopes: Set[str] = field(default_factory=set)
     secrets: Dict[str, str] = field(default_factory=dict)
+    token_bytes: bytes = field(init=False, repr=False, default=b"")
+
+    def __post_init__(self) -> None:
+        self.token_bytes = self.token.encode("utf-8")
 
 
 @dataclass
@@ -588,20 +631,20 @@ class JobStateAPI:
             except web.HTTPException:
                 raise
             except JobStateError as ex:
-                return web.json_response({"error": str(ex)}, status=ex.status)
+                return _json_response({"error": str(ex)}, status=ex.status)
             except _json.UnsupportedValue as ex:
                 # defence in depth: the value primitives pre-validate via
                 # _check_size, but any handler that writes a client value
                 # without it would otherwise let a non-portable value surface
                 # as a 500.  It is the caller's bad input -> a clean 400.
-                return web.json_response({"error": str(ex)}, status=400)
+                return _json_response({"error": str(ex)}, status=400)
             except (
                 asyncio.TimeoutError,
                 OSError,
                 _DocumentUnreadable,
             ) as ex:
                 logger.warning("state job API: backend error: %s", ex)
-                return web.json_response(
+                return _json_response(
                     {"error": "state backend unavailable: {}".format(ex)},
                     status=503,
                 )
@@ -628,8 +671,8 @@ class JobStateAPI:
             presented_bytes = presented.encode("utf-8")
         except UnicodeEncodeError:
             raise web.HTTPUnauthorized() from None
-        for token, ctx in self._runs.items():
-            if hmac.compare_digest(presented_bytes, token.encode("utf-8")):
+        for ctx in self._runs.values():
+            if hmac.compare_digest(presented_bytes, ctx.token_bytes):
                 return ctx
         raise web.HTTPUnauthorized()
 
@@ -714,7 +757,7 @@ class JobStateAPI:
 
     async def _h_run(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
-        return web.json_response(
+        return _json_response(
             {
                 "runId": ctx.run_id,
                 "job": ctx.job_name,
@@ -722,7 +765,8 @@ class JobStateAPI:
                 "scheduledAt": ctx.scheduled_at,
                 "host": ctx.host,
                 "defaultScope": ctx.default_scope,
-            }
+            },
+            trusted=True,
         )
 
     # --- handlers: kv ----------------------------------------------------
@@ -734,7 +778,7 @@ class JobStateAPI:
         body = await jobstate.kv_get(self._backend(), scope, key)
         if body is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             {"value": body.get("value"), "updatedAt": body.get("updatedAt")}
         )
 
@@ -750,7 +794,9 @@ class JobStateAPI:
             payload.get("value"),
             max_bytes=self._max_value_bytes,
         )
-        return web.json_response({"ok": True, "updatedAt": body["updatedAt"]})
+        return _json_response(
+            {"ok": True, "updatedAt": body["updatedAt"]}, trusted=True
+        )
 
     async def _h_kv_delete(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
@@ -758,13 +804,13 @@ class JobStateAPI:
         scope = self._scope(ctx, payload.get("scope"))
         key = self._require(payload.get("key"), "key")
         existed = await jobstate.kv_delete(self._backend(), scope, key)
-        return web.json_response({"existed": existed})
+        return _json_response({"existed": existed}, trusted=True)
 
     async def _h_kv_list(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
         scope = self._scope(ctx, request.query.get("scope"))
         bodies = await jobstate.kv_list(self._backend(), scope)
-        return web.json_response(
+        return _json_response(
             {
                 "scope": scope,
                 "keys": [
@@ -787,7 +833,7 @@ class JobStateAPI:
         body = await jobstate.cursor_get(self._backend(), scope, name)
         if body is None:
             raise web.HTTPNotFound()
-        return web.json_response(
+        return _json_response(
             {"value": body.get("value"), "updatedAt": body.get("updatedAt")}
         )
 
@@ -806,7 +852,7 @@ class JobStateAPI:
             force=bool(payload.get("force")),
             max_bytes=self._max_value_bytes,
         )
-        return web.json_response(result)
+        return _json_response(result)
 
     # --- handlers: idempotency -------------------------------------------
 
@@ -826,7 +872,7 @@ class JobStateAPI:
         result = await jobstate.idempotency_claim(
             self._backend(), scope, key, ttl=ttl
         )
-        return web.json_response(result)
+        return _json_response(result)
 
     async def _h_idem_release(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
@@ -836,7 +882,7 @@ class JobStateAPI:
         released = await jobstate.idempotency_release(
             self._backend(), scope, key
         )
-        return web.json_response({"released": released})
+        return _json_response({"released": released}, trusted=True)
 
     # --- handlers: artifact ----------------------------------------------
 
@@ -852,8 +898,8 @@ class JobStateAPI:
             data,
             max_bytes=self._max_artifact_bytes,
         )
-        return web.json_response(
-            {"sha256": record["sha256"], "size": record["size"]}
+        return _json_response(
+            {"sha256": record["sha256"], "size": record["size"]}, trusted=True
         )
 
     async def _h_artifact_get(
@@ -879,7 +925,7 @@ class JobStateAPI:
         ctx = self._run(request)
         scope = self._scope(ctx, request.query.get("scope"))
         listing = await jobstate.artifact_list(self._backend(), scope)
-        return web.json_response(
+        return _json_response(
             {
                 "scope": scope,
                 "artifacts": [
@@ -929,14 +975,14 @@ class JobStateAPI:
             wait=bool(payload.get("wait")),
             block_seconds=block_seconds,
         )
-        return web.json_response(result)
+        return _json_response(result)
 
     async def _h_lock_release(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
         payload = await self._json_body(request)
         token = self._require(payload.get("token"), "token")
         released = await self.locks.release(ctx.token, token)
-        return web.json_response({"released": released})
+        return _json_response({"released": released}, trusted=True)
 
     # --- handlers: secret ------------------------------------------------
 
@@ -945,8 +991,8 @@ class JobStateAPI:
         name = self._require(request.query.get("name"), "name")
         if name not in ctx.secrets:
             raise web.HTTPNotFound()
-        return web.json_response({"value": ctx.secrets[name]})
+        return _json_response({"value": ctx.secrets[name]})
 
     async def _h_secret_list(self, request: web.Request) -> web.Response:
         ctx = self._run(request)
-        return web.json_response({"names": sorted(ctx.secrets)})
+        return _json_response({"names": sorted(ctx.secrets)})
