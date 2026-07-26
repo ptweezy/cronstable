@@ -695,6 +695,52 @@ jobs:
     assert message in str(exc.value)
 
 
+@pytest.mark.parametrize(
+    "snippet, message",
+    [
+        ("    killTimeout: .nan\n", "killTimeout"),
+        ("    executionTimeout: .nan\n", "executionTimeout"),
+        (
+            "    monitorResources:\n      interval: .nan\n",
+            "monitorResources.interval",
+        ),
+        (
+            "    onFailure:\n      retry:\n        maximumRetries: 3\n"
+            "        initialDelay: .nan\n        maximumDelay: 10\n"
+            "        backoffMultiplier: 2\n",
+            "initialDelay",
+        ),
+        (
+            "    onFailure:\n      retry:\n        maximumRetries: 3\n"
+            "        initialDelay: 1\n        maximumDelay: .nan\n"
+            "        backoffMultiplier: 2\n",
+            "maximumDelay",
+        ),
+        (
+            "    onFailure:\n      retry:\n        maximumRetries: 3\n"
+            "        initialDelay: 1\n        maximumDelay: 10\n"
+            "        backoffMultiplier: .nan\n",
+            "backoffMultiplier",
+        ),
+    ],
+)
+def test_nan_rejected_on_float_ranges(snippet, message):
+    # strictyaml's Float() parses `.nan`, so these range checks are the only
+    # gate between a NaN and the runtime timers/backoff math that would
+    # otherwise consume it.  NaN fails every comparison, which is why the
+    # checks use the negated `if not value >= bound` form; this pins that
+    # form against a well-meaning `if value < bound` inversion.
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "jobs:\n"
+            "  - name: test\n"
+            "    command: foo\n"
+            '    schedule: "* * * * *"\n' + snippet,
+            "",
+        )
+    assert message in str(exc.value)
+
+
 def test_invalid_retry_backoff():
     with pytest.raises(ConfigError) as exc:
         config.parse_config_string(

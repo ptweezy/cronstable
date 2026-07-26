@@ -684,6 +684,26 @@ async def test_lock_acquire_permits_over_cap_400(tmp_path):
         await backend.stop()
 
 
+def test_json_response_is_compact_and_falls_back():
+    # The orjson-accelerated encoder replaces aiohttp's stdlib json.dumps on
+    # every handler: compact separators, and a value the portability gate
+    # rejects degrades to the stdlib rather than 500ing a transient response.
+    resp = jobapi._json_response({"a": 1, "b": "x"})
+    assert resp.body == b'{"a":1,"b":"x"}'
+    assert resp.content_type == "application/json"
+    # a store-read value the fleet-portability gate refuses (non-finite float)
+    fallback = jobapi._json_response({"value": float("inf")})
+    assert fallback.body in (b'{"value":Infinity}', b'{"value": Infinity}')
+    assert jobapi._json_response({}, status=503).status == 503
+
+
+def test_run_context_precomputes_its_token_bytes():
+    # _run scans every live run per request; the encode used to happen inside
+    # that loop, one throwaway bytes object per run per request.
+    ctx = _ctx(token="tok")
+    assert ctx.token_bytes == b"tok"
+
+
 def test_bracket_host_formats_ipv6_authority():
     # the bound host goes into CRONSTABLE_STATE_URL: an IPv6 literal must be
     # bracketed or "http://::1:8080" is unparseable to every consumer.
@@ -915,10 +935,12 @@ async def test_cron_stages_secrets(tmp_path):
         if cron.state_backend is not None:
             await cron.state_backend.stop()
 
+
 # ===========================================================================
 # Degraded paths: a vanished backend, probe/renewal timeouts, lease
 # takeover, junk request bodies, and the auth/bind parsers.
 # ===========================================================================
+
 
 def _lease(name="lock/s/l#0", holder="h#x", fence=1):
     return Lease(name, holder, fence, 9e18)
@@ -1005,9 +1027,7 @@ async def test_blocking_acquire_retries_until_deadline(monkeypatch):
     backend = _Denying()
     mgr = _manager(backend, ttl=5.0)
     _instant_sleep(monkeypatch)
-    result = await mgr.acquire(
-        "run", "s", "l", wait=True, block_seconds=0.05
-    )
+    result = await mgr.acquire("run", "s", "l", wait=True, block_seconds=0.05)
     assert result == {"acquired": False}
     assert backend.attempts > 1  # it kept retrying between sleeps
 
@@ -1353,9 +1373,7 @@ async def test_error_mw_maps_unportable_value_to_400():
     # defence in depth: a handler that lets a non-portable value reach the
     # serializer raises _json.UnsupportedValue, which the error middleware maps
     # to a clean 400 (the caller's bad input), not a 500.
-    api = JobStateAPI(
-        lambda: None, host="h", base_holder="h#proc", config={}
-    )
+    api = JobStateAPI(lambda: None, host="h", base_holder="h#proc", config={})
     mw = api._middlewares()[0]
 
     async def handler(_request):

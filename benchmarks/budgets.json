@@ -16,8 +16,26 @@
   "+60%) because ubuntu-latest runners vary run to run; the relative gate",
   "handles single-release moves, this file only caps the compounding.",
   "",
-  "Values are the metric's own unit: seconds, except mem.* in MB."
+  "Values are the metric's own unit: seconds, except mem.* in MB.",
+  "",
+  "'proposed' below is NOT read by compare.py (it loads 'budgets' only).",
+  "It is where a ceiling waits out the ritual: a metric added this cycle",
+  "has no merged best-of-rounds CI value to size a ceiling against, and",
+  "an ubuntu-latest number is not a local one.  Move an entry into",
+  "'budgets' once one release has published an 'observed' value for it,",
+  "filling in 'observed' and 'set' at the same time.  The 'local' figures",
+  "recorded here are the developer-machine measurements the proposals were",
+  "derived from (max ~= 1.7x local, the same headroom the armed ceilings",
+  "carry) and exist only to make the later sizing decision auditable.  They",
+  "were taken on the post-audit tree, so they already price in the fixes."
  ],
+ "proposed": {
+  "config.reload_gc_100k": {"max": 2.2, "unit": "s", "local": 1.305},
+  "mem.gc_pause_100k": {"max": 0.11, "unit": "s", "local": 0.065},
+  "loop.idle_wake_rate": {"max": 0.045, "unit": "s", "local": 0.0266},
+  "state.mutate_document_1k": {"max": 1.9, "unit": "s", "local": 1.161},
+  "webui.render_term_5k": {"max": 0.115, "unit": "s", "local": 0.0690}
+ },
  "budgets": {
   "startup.import_daemon": {"max": 0.50, "unit": "s", "observed": 0.309, "set": "2026-07-24"},
   "schedule.cold_build_100k": {"max": 4.0, "unit": "s", "observed": 2.586, "set": "2026-07-24"},
