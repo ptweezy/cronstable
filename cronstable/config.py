@@ -1985,16 +1985,20 @@ class JobConfig:
         # clear configuration error.  Written as plain `if ... raise` rather
         # than through a helper: this runs once per job on every load and
         # reload, and a closure plus ~16 calls is most of its cost.
+        # The Float-typed checks stay in the negated `if not value >= bound`
+        # form on purpose: NaN fails every comparison, so the tempting
+        # inversion (`if value < bound`) waves NaN through (strictyaml's
+        # Float() parses `.nan`) where this form rejects it.
         if self.saveLimit < 0:
             raise self._reject("saveLimit must be >= 0")
         if self.maxLineLength <= 0:
             raise self._reject("maxLineLength must be > 0")
-        if self.killTimeout < 0:
+        if not self.killTimeout >= 0:
             raise self._reject("killTimeout must be >= 0")
         # sampling walks the whole process table each tick, so a sub-100ms
         # cadence is a busy-loop footgun; the history cap bounds what one run
         # can add to a durable ledger record (0 = summary only, no series).
-        if self.monitorResourcesInterval < 0.1:
+        if not self.monitorResourcesInterval >= 0.1:
             raise self._reject(
                 "monitorResources.interval must be >= 0.1 (seconds)"
             )
@@ -2022,7 +2026,7 @@ class JobConfig:
             and self.startingDeadlineSeconds <= 0
         ):
             raise self._reject("startingDeadlineSeconds must be > 0 when set")
-        if self.executionTimeout is not None and self.executionTimeout <= 0:
+        if self.executionTimeout is not None and not self.executionTimeout > 0:
             raise self._reject("executionTimeout must be > 0 when set")
         for key in (
             "maxTimeSinceSuccessSeconds",
@@ -2047,11 +2051,11 @@ class JobConfig:
                 raise self._reject(
                     "onFailure.retry.maximumRetries must be >= -1"
                 )
-            if retry["initialDelay"] < 0:
+            if not retry["initialDelay"] >= 0:
                 raise self._reject("onFailure.retry.initialDelay must be >= 0")
-            if retry["maximumDelay"] <= 0:
+            if not retry["maximumDelay"] > 0:
                 raise self._reject("onFailure.retry.maximumDelay must be > 0")
-            if retry["backoffMultiplier"] <= 0:
+            if not retry["backoffMultiplier"] > 0:
                 raise self._reject(
                     "onFailure.retry.backoffMultiplier must be > 0"
                 )
