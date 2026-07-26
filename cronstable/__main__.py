@@ -1,5 +1,4 @@
 import argparse
-import asyncio
 import logging
 import os
 import sys
@@ -104,29 +103,246 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     # keys) hang off the SAME `state` subparser as the admin actions above and
     # coexist with them (the action name routes); the other verbs (cursor/
     # lock/artifact/idempotent/secret) are their own top-level commands. Both
-    # are thin clients of the daemon's loopback endpoint. Imported here (not at
-    # module load) so the import cost is paid only when the CLI is built.
-    from cronstable import jobcli
-
-    jobcli.add_state_job_actions(actions)
-    jobcli.add_job_commands(sub)
-
-    # `cronstable mcp` and `cronstable tui` register as bare stubs below, NOT
-    # by importing cronstable.mcpcli / cronstable.tui. Importing tui alone runs
-    # its ~7000-line module body and pulls unicodedata's C table plus dozens of
-    # other modules (~50ms), and every job-spawned thin client (`state get`,
-    # `lock`, `xcom pull`) builds this parser first, so the eager import
-    # taxed a hot path for two commands almost never the one invoked. The real
-    # modules are imported only inside their dispatch branches (see main_loop).
+    # are thin clients of the daemon's loopback endpoint.
+    #
+    # `cronstable jobcli`, `mcp` and `tui` all register as bare stubs below,
+    # NOT by importing cronstable.jobcli / cronstable.mcpcli / cronstable.tui.
+    # Importing tui alone runs its ~7000-line module body and pulls
+    # unicodedata's C table plus dozens of other modules (~50ms), and jobcli
+    # drags urllib.request/ssl/email in for ~27ms; every job-spawned thin
+    # client (`state get`, `lock`, `xcom pull`) builds this parser first, and
+    # so does the daemon and `--version`, so an eager import taxed every
+    # invocation for commands almost never the one invoked. The real modules
+    # are imported only inside their dispatch branches (see main_loop).
     # A parity test (tests/test_cli_stubs.py) keeps the stub flags in lockstep
-    # with the real add_mcp_command / add_tui_command definitions.
+    # with the real add_state_job_actions / add_job_commands /
+    # add_mcp_command / add_tui_command definitions.
+    _add_jobcli_stub(actions, sub)
     _add_mcp_stub(sub)
     _add_tui_stub(sub)
 
 
-# Mirrors of cronstable.mcpcli / cronstable.tui module constants used only to
-# register their subparsers. Kept here so building the CLI never imports those
-# modules; the parity test asserts these match the originals.
+def _add_scope_flags_stub(parser: Any) -> None:
+    """Mirror of cronstable.jobcli._add_scope_flags."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--scope",
+        metavar="NAME",
+        help="the namespace to act in (default: this job's own name)",
+    )
+    group.add_argument(
+        "--global",
+        dest="use_global",
+        action="store_true",
+        help="act in the shared `global` scope (cross-job coordination)",
+    )
+
+
+def _add_jobcli_stub(actions: Any, sub: Any) -> None:
+    """Register the job-facing verbs without importing cronstable.jobcli.
+
+    ``actions`` is the `cronstable state` action subparser (the KV verbs share
+    it with the offline admin actions); ``sub`` is the root command subparser
+    (cursor / lock / artifact / idempotent / xcom / secret).  Must stay
+    flag-for-flag identical to jobcli.add_state_job_actions and
+    jobcli.add_job_commands; the parity test enforces it.
+    """
+    _add_jobcli_state_stub(actions)
+    _add_jobcli_cursor_stub(sub)
+    _add_jobcli_lock_stub(sub)
+    _add_jobcli_artifact_stub(sub)
+    _add_jobcli_idempotent_stub(sub)
+    _add_jobcli_xcom_stub(sub)
+    _add_jobcli_secret_stub(sub)
+
+
+def _add_jobcli_state_stub(actions: Any) -> None:
+    """Mirror of cronstable.jobcli.add_state_job_actions."""
+    get = actions.add_parser("get", help="print a durable KV value")
+    get.add_argument("key")
+    _add_scope_flags_stub(get)
+
+    setp = actions.add_parser("set", help="set a durable KV value")
+    setp.add_argument("key")
+    setp.add_argument("value")
+    setp.add_argument(
+        "--json",
+        action="store_true",
+        help="parse VALUE as JSON instead of storing it as a string",
+    )
+    _add_scope_flags_stub(setp)
+
+    delete = actions.add_parser("delete", help="delete a durable KV value")
+    delete.add_argument("key")
+    _add_scope_flags_stub(delete)
+
+    keys = actions.add_parser("keys", help="list the keys in a scope")
+    _add_scope_flags_stub(keys)
+
+
+def _add_jobcli_cursor_stub(sub: Any) -> None:
+    cursor = sub.add_parser(
+        "cursor", help="read or advance a monotonic ETL cursor/watermark"
+    )
+    cursor_actions = cursor.add_subparsers(
+        dest="cursor_command", metavar="ACTION"
+    )
+    cget = cursor_actions.add_parser("get", help="print a cursor's value")
+    cget.add_argument("name")
+    _add_scope_flags_stub(cget)
+    cadv = cursor_actions.add_parser(
+        "advance", help="advance a cursor (monotonic unless --force)"
+    )
+    cadv.add_argument("name")
+    cadv.add_argument("value")
+    cadv.add_argument(
+        "--force",
+        action="store_true",
+        help="set the value even if it moves the cursor backwards",
+    )
+    _add_scope_flags_stub(cadv)
+
+
+def _add_jobcli_lock_stub(sub: Any) -> None:
+    lock = sub.add_parser(
+        "lock", help="a fleet-wide distributed mutex or semaphore"
+    )
+    lock_actions = lock.add_subparsers(dest="lock_command", metavar="ACTION")
+    for verb, help_text in (
+        ("acquire", "take the lock; print its hold token"),
+        ("run", "hold the lock while running a command"),
+    ):
+        p = lock_actions.add_parser(verb, help=help_text)
+        p.add_argument("name")
+        p.add_argument(
+            "--permits",
+            type=int,
+            default=1,
+            help="semaphore capacity (default 1 = a mutex)",
+        )
+        p.add_argument(
+            "--wait",
+            action="store_true",
+            help="block until the lock is free (up to --timeout)",
+        )
+        p.add_argument(
+            "--timeout",
+            type=float,
+            default=0.0,
+            metavar="SECONDS",
+            help="how long --wait blocks before giving up",
+        )
+        p.add_argument(
+            "--ttl",
+            type=float,
+            default=None,
+            metavar="SECONDS",
+            help="lease TTL (default: state.jobApi.lockTtlSeconds)",
+        )
+        _add_scope_flags_stub(p)
+        if verb == "run":
+            p.add_argument(
+                "run_command",
+                nargs="*",
+                metavar="command",
+                help="the command to run while holding the lock (after --)",
+            )
+    lrel = lock_actions.add_parser("release", help="release a held lock")
+    lrel.add_argument("token")
+
+
+def _add_jobcli_artifact_stub(sub: Any) -> None:
+    artifact = sub.add_parser(
+        "artifact", help="publish or fetch a named artifact blob"
+    )
+    art_actions = artifact.add_subparsers(
+        dest="artifact_command", metavar="ACTION"
+    )
+    aput = art_actions.add_parser(
+        "put", help="publish an artifact (from FILE or stdin)"
+    )
+    aput.add_argument("name")
+    aput.add_argument("file", nargs="?", default=None)
+    _add_scope_flags_stub(aput)
+    aget = art_actions.add_parser(
+        "get", help="fetch an artifact (to -o FILE or stdout)"
+    )
+    aget.add_argument("name")
+    aget.add_argument("-o", "--output", default=None, metavar="FILE")
+    _add_scope_flags_stub(aget)
+    alist = art_actions.add_parser("list", help="list artifact names")
+    _add_scope_flags_stub(alist)
+
+
+def _add_jobcli_idempotent_stub(sub: Any) -> None:
+    idem = sub.add_parser(
+        "idempotent",
+        help="claim a key once fleet-wide (exit 0 fresh, 5 duplicate, "
+        "1 error)",
+    )
+    idem.add_argument("key")
+    idem.add_argument(
+        "--ttl",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="expire the claim after N seconds (0 = permanent)",
+    )
+    idem.add_argument(
+        "--release",
+        action="store_true",
+        help="drop the claim instead of making it",
+    )
+    _add_scope_flags_stub(idem)
+
+
+def _add_jobcli_xcom_stub(sub: Any) -> None:
+    xcom = sub.add_parser(
+        "xcom",
+        help="publish or read a DAG task output (XCom) within a dag_run",
+    )
+    xcom_actions = xcom.add_subparsers(dest="xcom_command", metavar="ACTION")
+    xpush = xcom_actions.add_parser(
+        "push", help="publish this task's output under a key (FILE or stdin)"
+    )
+    xpush.add_argument("--key", required=True, help="the XCom key to publish")
+    xpush.add_argument("file", nargs="?", default=None)
+    xpull = xcom_actions.add_parser(
+        "pull", help="read an upstream task's output by key"
+    )
+    xpull.add_argument(
+        "--task", required=True, metavar="TASK", help="the upstream task id"
+    )
+    xpull.add_argument("--key", required=True, help="the XCom key to read")
+    xpull.add_argument(
+        "--map-index",
+        type=int,
+        default=None,
+        metavar="I",
+        help="read a specific mapped instance of the upstream task",
+    )
+    xpull.add_argument("-o", "--output", default=None, metavar="FILE")
+    xcom_actions.add_parser("list", help="list XCom keys in this run")
+
+
+def _add_jobcli_secret_stub(sub: Any) -> None:
+    secret = sub.add_parser(
+        "secret", help="read a run-scoped secret staged for this run"
+    )
+    secret_actions = secret.add_subparsers(
+        dest="secret_command", metavar="ACTION"
+    )
+    sget = secret_actions.add_parser("get", help="print a secret's value")
+    sget.add_argument("name")
+    secret_actions.add_parser("list", help="list staged secret names")
+
+
+# Mirrors of cronstable.jobcli / cronstable.mcpcli / cronstable.tui module
+# constants used only to register their subparsers or route to them. Kept here
+# so building the CLI (and routing a `state` ADMIN action, which reaches
+# state_admin, not jobcli) never imports those modules; the parity test asserts
+# these match the originals.
+_JOBCLI_STATE_ACTIONS = frozenset({"get", "set", "delete", "keys"})
 _MCP_DEFAULT_URL = "http://127.0.0.1:8080"
 _MCP_ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
 _MCP_ENV_CACERT = "CRONSTABLE_WEB_CACERT"
@@ -347,7 +563,13 @@ def _add_tui_stub(sub: Any) -> None:
     )
 
 
-def main_loop(loop):
+def main_loop(loop=None):
+    """Parse argv, dispatch, and (for the daemon) run the scheduler.
+
+    ``loop`` is optional: passing one keeps it the caller's to close, while
+    omitting it defers building a loop -- and importing asyncio at all -- to
+    :func:`_run_daemon`, the only branch that needs either.
+    """
     parser = argparse.ArgumentParser(prog="cronstable")
     parser.add_argument(
         "-c",
@@ -425,10 +647,12 @@ def main_loop(loop):
     if command == "state":
         # `state get/set/delete/keys` are job-facing (they reach the running
         # daemon's loopback endpoint); everything else under `state` is offline
-        # store administration. Route by action name so the two coexist.
-        from cronstable import jobcli
+        # store administration. Route by action name so the two coexist --
+        # off the mirrored set, not jobcli's own, so an admin action does not
+        # import jobcli's urllib/ssl/email graph to read a frozenset.
+        if getattr(args, "state_command", None) in _JOBCLI_STATE_ACTIONS:
+            from cronstable import jobcli
 
-        if getattr(args, "state_command", None) in jobcli.STATE_JOB_ACTIONS:
             sys.exit(jobcli.dispatch(args))
         # lazy import: the admin module (tarfile etc.) costs the daemon and
         # the stateless install nothing.
@@ -473,15 +697,46 @@ def main_loop(loop):
         parser.print_help(sys.stderr)
         sys.exit(1)
 
+    # --job-set-id and --validate-config are pure config questions: they parse,
+    # answer and exit without ever running a scheduler. Answering them through
+    # the config/fingerprint modules directly skips constructing a Cron, which
+    # would import the whole daemon graph (aiohttp and friends) and build a
+    # PrometheusMetrics, a NodeResourceSampler and a BonjourAdvertiser that
+    # this process is about to throw away. The answers are identical:
+    # Cron.update_config delegates all validation to parse_config_with_sources
+    # (so the same ConfigError surfaces from the same place), and
+    # Cron.job_set_id is job_set_id() over cron_jobs, which _apply_reload
+    # builds from config.jobs keyed by name without filtering any of them.
+    from cronstable.config import ConfigError, parse_config_with_sources
+
+    if args.job_set_id or args.validate_config:
+        try:
+            config, _sources = parse_config_with_sources(args.config)
+        except ConfigError as err:
+            logger.error("Configuration error: %s", str(err))
+            sys.exit(1)
+        if args.job_set_id:
+            from collections import OrderedDict
+
+            from cronstable.fingerprint import job_set_id
+
+            # Key by name exactly as _apply_reload does, so a config that
+            # somehow carries a repeated job name fingerprints identically
+            # here and in the daemon.
+            jobs = OrderedDict((job.name, job) for job in config.jobs)
+            print(job_set_id(jobs.values()))
+        else:
+            logger.info("Configuration is valid.")
+        sys.exit(0)
+
     # Imported here, not at module top: this pulls in aiohttp, strictyaml,
     # sentry_sdk and the rest of the daemon graph (~300ms of import). The
-    # branches that exit before this point -- --version and the state / xcom
-    # / lock / cursor / artifact / idempotent / secret subcommands (thin
-    # urllib clients of the running daemon, routinely spawned from inside
-    # jobs) -- never touch Cron, so a job-facing CLI call no longer pays that
-    # cost. Everything from here down (the daemon, --job-set-id,
-    # --validate-config) needs it.
-    from cronstable.cron import ConfigError, Cron
+    # branches that exit before this point -- --version, --job-set-id,
+    # --validate-config and the state / xcom / lock / cursor / artifact /
+    # idempotent / secret subcommands (thin urllib clients of the running
+    # daemon, routinely spawned from inside jobs) -- never touch Cron, so a
+    # job-facing CLI call no longer pays that cost. Only the daemon does.
+    from cronstable.cron import Cron
 
     try:
         cron = Cron(args.config)
@@ -489,24 +744,84 @@ def main_loop(loop):
         logger.error("Configuration error: %s", str(err))
         sys.exit(1)
 
-    if args.job_set_id:
-        print(cron.job_set_id())
-        sys.exit(0)
+    _run_daemon(cron, loop)
 
-    if args.validate_config:
-        logger.info("Configuration is valid.")
-        sys.exit(0)
 
-    # Wire Ctrl-C / termination to a graceful shutdown.  The mechanism differs
-    # per platform (loop signal handlers on POSIX, signal.signal on Windows),
-    # so it lives behind platform.install_shutdown_handlers.
-    remove_shutdown_handlers = platform.install_shutdown_handlers(
-        loop, cron.signal_shutdown
+#: Floor on the shared default executor's worker count.  CPython sizes it
+#: ``min(32, cpu_count + 4)``, i.e. 5-6 slots on the 1-2 vCPU containers
+#: cronstable is routinely deployed in -- and that one pool carries the config
+#: reparse, the leadership lease read/write, the per-completion archive redact
+#: and ResourceMonitor.stop(), the /jobs serialize and every getaddrinfo.  Its
+#: queue is unbounded, so a minute boundary that finishes hundreds of jobs can
+#: park a lease renewal behind them until its renewDeadlineSeconds expires and
+#: the node drops leadership.  A floor of 8 does not remove that ordering
+#: hazard (only a dedicated lease executor does), but it stops the smallest
+#: deployments from being the tightest.
+_MIN_EXECUTOR_WORKERS = 8
+
+#: Ceiling, kept at CPython's own so a many-core host does not grow an
+#: unbounded thread set for what is an I/O-wait pool.
+_MAX_EXECUTOR_WORKERS = 32
+
+#: Thread-name prefix, so a thread dump or a `py-spy dump` attributes the pool
+#: instead of showing anonymous ThreadPoolExecutor-N-M workers.
+EXECUTOR_THREAD_PREFIX = "cronstable-exec"
+
+
+def executor_workers() -> int:
+    """How many workers the shared default thread pool gets."""
+    return max(
+        _MIN_EXECUTOR_WORKERS,
+        min(_MAX_EXECUTOR_WORKERS, (os.cpu_count() or 1) + 4),
     )
+
+
+def _install_default_executor(loop) -> None:
+    """Give ``loop`` an explicitly sized, named default thread pool.
+
+    Sized with a floor because the interpreter's own default is derived from
+    cpu_count alone and takes no account of how many distinct subsystems share
+    this one pool.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    loop.set_default_executor(
+        ThreadPoolExecutor(
+            max_workers=executor_workers(),
+            thread_name_prefix=EXECUTOR_THREAD_PREFIX,
+        )
+    )
+
+
+def _run_daemon(cron, loop=None) -> None:
+    """Run the scheduler to completion, with shutdown signalling wired up.
+
+    The event loop is built HERE rather than in :func:`main` because asyncio
+    is a ~50ms import (and several MB of RSS) that only this branch needs:
+    ``--version``, ``--third-party-licenses`` and every job-spawned thin
+    client (`state get`, `lock`, `xcom pull`) have already exited by now.  A
+    loop the caller supplied stays the caller's to close; one built here is
+    closed here.
+
+    Wiring Ctrl-C / termination to a graceful shutdown differs per platform
+    (loop signal handlers on POSIX, signal.signal on Windows), so it lives
+    behind platform.install_shutdown_handlers.
+    """
+    owned = loop is None
+    if owned:
+        loop = _new_event_loop()
     try:
-        loop.run_until_complete(cron.run())
+        _install_default_executor(loop)
+        remove_shutdown_handlers = platform.install_shutdown_handlers(
+            loop, cron.signal_shutdown
+        )
+        try:
+            loop.run_until_complete(cron.run())
+        finally:
+            remove_shutdown_handlers()
     finally:
-        remove_shutdown_handlers()
+        if owned:
+            loop.close()
 
 
 def _new_event_loop():  # pragma: no cover
@@ -528,7 +843,13 @@ def _new_event_loop():  # pragma: no cover
     ``asyncio.new_event_loop()`` yields the right stock loop per platform: a
     subprocess-capable Proactor loop on Windows (the default since 3.8) and a
     selector loop on POSIX.
+
+    ``asyncio`` is imported here, not at module scope: it is the single
+    largest import on the entry point's graph and only the daemon branch
+    reaches this function.
     """
+    import asyncio
+
     if sys.platform != "win32":
         try:
             import uvloop
@@ -540,11 +861,7 @@ def _new_event_loop():  # pragma: no cover
 
 
 def main():  # pragma: no cover
-    _loop = _new_event_loop()
-    try:
-        main_loop(_loop)
-    finally:
-        _loop.close()
+    main_loop()
 
 
 if __name__ == "__main__":  # pragma: no cover

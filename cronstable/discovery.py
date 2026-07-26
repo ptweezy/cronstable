@@ -7,9 +7,9 @@ The advert carries no secrets: instance name, port, scheme and version
 only; a client still needs a bearer token to read anything.
 
 python-zeroconf is an optional extra (``pip install
-"cronstable[discovery]"``); the import is guarded, and config validation
-refuses ``web.bonjour`` when the library is absent.  Unlike push (an
-alerting channel that must fail closed), a *runtime* advert failure is
+"cronstable[discovery]"``); the import is guarded and deferred, and config
+validation refuses ``web.bonjour`` when the library is absent.  Unlike push
+(an alerting channel that must fail closed), a *runtime* advert failure is
 logged and swallowed: discovery is a convenience, and an mDNS hiccup
 must never take down a scheduler.
 """
@@ -20,15 +20,80 @@ import re
 import socket
 from typing import Any, Dict, Optional
 
-try:
-    from zeroconf import ServiceInfo
-    from zeroconf.asyncio import AsyncZeroconf
-
-    HAVE_ZEROCONF = True
-except ImportError:  # pragma: no cover - exercised on the bare baseline
-    HAVE_ZEROCONF = False
-
 logger = logging.getLogger("cronstable")
+
+#: python-zeroconf's two entry points, bound by :func:`_probe_zeroconf` on the
+#: first ask.  They are module globals rather than names imported at the point
+#: of use so that the probe result is shared and so the advert can be driven
+#: against doubles.
+ServiceInfo: Any = None
+AsyncZeroconf: Any = None
+
+
+def _probe_zeroconf() -> bool:
+    """Import python-zeroconf and report whether it is usable.
+
+    Deferred out of module import because ``cronstable.cron`` imports this
+    module unconditionally while ``web.bonjour`` is off by default: pulling
+    zeroconf into every daemon start, ``--validate-config`` and
+    ``--job-set-id`` cost ~24 ms and ~3.6 MB of RSS that only an advertising
+    deployment has any use for.
+
+    It stays a real import rather than an ``importlib.util.find_spec`` probe:
+    ``find_spec`` answers "is it findable", and a findable-but-broken install
+    (a missing transitive dependency, a half-extracted frozen bundle) would
+    then pass config validation and fail at advert time instead.  Any import
+    failure, not only ``ImportError``, counts as unusable: a package that
+    explodes on import cannot serve an advert either, and reporting it through
+    the config gate is what keeps :meth:`BonjourAdvertiser.start_stop`'s
+    never-raises contract true without moving the probe inside its try.
+    """
+    global ServiceInfo, AsyncZeroconf
+    try:
+        from zeroconf import ServiceInfo as _service_info
+        from zeroconf.asyncio import AsyncZeroconf as _async_zeroconf
+    except Exception as exc:  # pragma: no cover - bare baseline
+        logger.debug("bonjour: python-zeroconf is unavailable: %s", exc)
+        return False
+    # Bound only after BOTH imports succeeded, so a half-import can never
+    # leave one name usable and the other None, and only where nothing has
+    # already put something there, so an installed double survives a probe
+    # that runs for the sake of the other name.
+    if ServiceInfo is None:
+        ServiceInfo = _service_info
+    if AsyncZeroconf is None:
+        AsyncZeroconf = _async_zeroconf
+    return True
+
+
+def _zeroconf_ready() -> bool:
+    """Whether the advert machinery is usable, probing at most once.
+
+    Already-bound names short-circuit the probe, which is what lets a caller
+    (or a test) install its own ``ServiceInfo``/``AsyncZeroconf`` and have the
+    advert path use them instead of re-importing over the top.
+    """
+    if ServiceInfo is not None and AsyncZeroconf is not None:
+        return True
+    return _probe_zeroconf()
+
+
+def __getattr__(name: str) -> Any:
+    """Serve ``HAVE_ZEROCONF`` on demand (PEP 562).
+
+    ``cronstable.config`` reads it to refuse ``web.bonjour`` on a host without
+    the library, and that read is itself already lazy (only a config that asks
+    for the advert performs it), so answering it here is what keeps the import
+    off the default startup path while giving the exact same answer.  Assigning
+    the name (as the tests do) puts it in the module dict and takes precedence,
+    since this hook only runs for a name the module does not already have.
+    """
+    if name == "HAVE_ZEROCONF":
+        return _zeroconf_ready()
+    raise AttributeError(
+        "module {!r} has no attribute {!r}".format(__name__, name)
+    )
+
 
 SERVICE_TYPE = "_cronstable._tcp.local."
 
@@ -147,7 +212,7 @@ class BonjourAdvertiser:
             self._signature = None
             await self._unregister()
             return
-        if not HAVE_ZEROCONF:  # pragma: no cover - config validation gates
+        if not _zeroconf_ready():  # pragma: no cover - config gates this
             self._signature = None
             logger.error(
                 "bonjour: python-zeroconf is not installed; not advertising"

@@ -66,6 +66,13 @@ _MIN_USABLE_TTL = 3
 # timeout is sized off this (see EtcdBackend.request_timeout) so the whole
 # cycle -- and so the gap between two successful contacts -- stays inside the
 # lease window even when one endpoint is slow.
+#
+# The campaign is one POST or two depending on the round, and the two cases are
+# mutually exclusive with the re-grant, which is what keeps this at 5: a round
+# that keeps its lease costs keepalive + range (+ txn only if the key vanished
+# under a live lease) + reboot-ran range + CAS; a round that lost its lease
+# costs keepalive + grant + txn + reboot-ran range + CAS, skipping the range
+# because a fresh lease has no key to find. See _campaign.
 _ETCD_POSTS_PER_CYCLE = 5
 
 # Bounded retries for the @reboot-ran compare-and-swap (see
@@ -368,6 +375,15 @@ class EtcdBackend(LeaseBackend):
         # one (a follower defers no one-shots, and a takeover forces its own
         # unthrottled re-read via _reboot_ran_synced).
         self._reboot_refresh_next = 0.0
+        # Whether the next campaign must go through the create-if-absent
+        # transaction rather than the plain look that serves the steady state
+        # (see _campaign). True from construction and from every lease
+        # (re-)grant, because a fresh lease has no key of ours to find and a
+        # never-created key must be raced for atomically. Cleared once a
+        # transaction has run, after which the key exists (ours or a rival's)
+        # and a linearizable range answers the same question without a raft
+        # proposal.
+        self._campaign_must_create = True
         self._holder: Optional[str] = None
         self._lease_id: Optional[str] = None
         # wall-clock expiry, for the dashboard/lease_detail display ONLY
@@ -889,11 +905,52 @@ class EtcdBackend(LeaseBackend):
 
         ``holder`` is the display name stored at the key; ``won`` is whether
         the key is bound to *our* lease (the fence; see :func:`campaign_won`).
+
+        A campaign is only ever *decided* by the create-if-absent transaction
+        when the key does not exist, which after the first election is never:
+        in the steady state the compare fails on every node, leader and
+        follower alike, and only the failure branch's range result is read.
+        etcd classifies a transaction as read-only only when every op in BOTH
+        branches is a Range, so the unreachable ``requestPut`` in the success
+        branch put every one of those rounds through raft as a proposal:
+        appended and WAL-fsynced on every etcd member, ~12 times a minute per
+        node forever, applying nothing.  So once a transaction has run, look
+        with a plain range instead and submit another only if the key turns
+        out to be gone.
+
+        The fence is preserved bit-for-bit: a range defaults to linearizable
+        (not serializable), its ``kvs`` carry the bound ``lease``, and the
+        same :func:`campaign_won` / :func:`holder_from_txn_response` read it
+        out of the same shape the failure branch would have produced.  An
+        empty range still falls through to the transaction, so the first
+        election, a post-expiry failover and a hand-deleted key are all still
+        atomically fenced by the create compare and at most one node can win.
+
+        ``_campaign_must_create`` is what keeps the *worst-case* POST count of
+        a renew cycle unchanged (see ``_ETCD_POSTS_PER_CYCLE``): the round
+        that re-grants a lease is exactly the round whose key was deleted with
+        the old lease, so it skips a look that would come back empty.
         """
+        if not self._campaign_must_create:
+            observed = await self._post(
+                "/v3/kv/range", {"key": _b64(self.election_name)}
+            )
+            if observed.get("kvs"):
+                # Same shape the transaction's failure branch returns, so the
+                # holder/fence readers below are the identical code path.
+                as_txn = {"responses": [{"response_range": observed}]}
+                return (
+                    holder_from_txn_response(as_txn, self.identity),
+                    campaign_won(as_txn, lease_id),
+                )
         resp = await self._post(
             "/v3/kv/txn",
             build_campaign_txn(self.election_name, self.identity, lease_id),
         )
+        # A key now exists at the election name (ours if the compare
+        # succeeded, the incumbent's if it failed), so the next round can
+        # read rather than propose.
+        self._campaign_must_create = False
         return (
             holder_from_txn_response(resp, self.identity),
             campaign_won(resp, lease_id),
@@ -988,6 +1045,11 @@ class EtcdBackend(LeaseBackend):
         if self._lease_id is None:
             lease_mono = _monotonic()
             self._lease_id, granted = await self._grant_lease()
+            # A fresh lease has no key: etcd deleted the old one along with
+            # the lease that held it, so this round campaigns through the
+            # create-if-absent transaction rather than looking first. See
+            # _campaign (and _ETCD_POSTS_PER_CYCLE, which this keeps at 5).
+            self._campaign_must_create = True
             if granted is not None:
                 self._narrow_effective_ttl(granted)
         if self._lease_id is None:

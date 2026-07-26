@@ -723,6 +723,12 @@ async def test_artifact_get_strict_propagates_a_transient_read_error(
     backend = _backend(tmp_path)
     await backend.start()
     await jobstate.artifact_put(backend, "s", "items", b'["a"]')
+    # Drop the best-effort read cache first: the put's own prune pass already
+    # read this record, and a cached body would satisfy the non-strict read
+    # from memory (correctly -- a record file is immutable) without ever
+    # touching the broken file.  What the contrast below is about is the read
+    # that really does reach the store.
+    backend._record_cache.clear()
     _break_record_reads(
         monkeypatch, backend, jobstate.ARTIFACT_STREAM_PREFIX + "s"
     )
