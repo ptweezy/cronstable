@@ -44,6 +44,17 @@ from cronstable.cronexpr import CronTab
 CRONTAB_EXTENSIONS = frozenset({".crontab", ".cron"})
 CRONTAB_BASENAME = "crontab"
 
+#: Private key under which :func:`parse_crontab` hands the already-parsed
+#: :class:`~cronstable.cronexpr.CronTab` to
+#: :class:`~cronstable.config.JobConfig` on the job dict.  The classic loader
+#: has to build the schedule anyway, to report a bad field with its file and
+#: line, and JobConfig would otherwise parse the identical ``(expression,
+#: hash_key)`` pair a second time and throw the first one away.  A CronTab is
+#: immutable once built, so handing the same object downstream is safe.  The
+#: leading underscore keeps it out of the YAML schema's key space, which is
+#: closed, so only this module can ever set it.
+PARSED_SCHEDULE_KEY = "_parsed_schedule"
+
 #: The ``man 5 crontab`` schedule nicknames.  All are accepted;
 #: ``@midnight`` is rewritten to its synonym ``@daily`` (the cron
 #: expression engine understands every nickname except that one) and
@@ -172,7 +183,9 @@ def parse_crontab(data: str, path: str) -> List[Dict[str, Any]]:
     the YAML front end (name/command/schedule strings, plus environment /
     shell / timezone when the crontab sets them), ready for the standard
     defaults merge -- so a crontab job internally gets cronstable's standard
-    configuration, not an emulation of cron's.
+    configuration, not an emulation of cron's.  The one addition is
+    :data:`PARSED_SCHEDULE_KEY`, carrying the CronTab this function already
+    had to build so the config loader does not build it twice.
 
     Job names are ``<file name>:<line number>`` (``legacy.crontab:7``):
     unique within a file, stable across reloads while the file is
@@ -250,14 +263,15 @@ def _job_from_line(
             "{}: schedule {!r} has no command".format(where, schedule)
         )
     name = "{}:{}".format(label, lineno)
+    tab = None
     if schedule != "@reboot":
-        # Validate here so a bad field is reported with its file and line;
-        # JobConfig parses the same string again later, but anonymously.
+        # Parse here so a bad field is reported with its file and line;
+        # JobConfig would otherwise parse the same string again, anonymously.
         # The job name seeds the H hash form, exactly as JobConfig will;
         # note these names embed the LINE number, so inserting lines above
         # an H entry re-hashes its slot along with renaming it.
         try:
-            CronTab(schedule, hash_key=name)
+            tab = CronTab(schedule, hash_key=name)
         except ValueError as ex:
             raise CrontabError(
                 "{}: invalid schedule {!r}: {}".format(where, schedule, ex)
@@ -267,6 +281,10 @@ def _job_from_line(
         "schedule": schedule,
         "command": _unescape_percent(command, where),
     }
+    if tab is not None:
+        # the (expression, hash_key) pair JobConfig would rebuild is exactly
+        # the one just parsed; see PARSED_SCHEDULE_KEY
+        job[PARSED_SCHEDULE_KEY] = tab
     if environment:
         # Snapshot: assignments apply to the entries below them, so a
         # later reassignment must not leak back into this job.

@@ -62,20 +62,31 @@ when a `state:` section is configured). `state_admin.py` (which depends on
 
 ## The event loop
 
-`main()` in `__main__.py` creates a fresh event loop with
-`asyncio.new_event_loop()` and runs `main_loop(loop)` inside a `try/finally`
-that always calls `loop.close()`. The daemon runs on Windows too; the event loop
-is created the same way on every OS, and the only difference is shutdown-handler
+`main()` in `__main__.py` builds no event loop at all. It calls `main_loop()`
+with no argument, and the loop is created and closed inside `_run_daemon`, on
+the daemon branch only. That is deliberate: `asyncio` is a ~50 ms import (and
+several MB of RSS), and every branch that exits earlier (`--version`,
+`--third-party-licenses`, `--validate-config`, `--job-set-id`, and the
+job-spawned thin clients like `state get`, `lock` and `xcom pull`) must not pay
+it. `main_loop(loop)` still accepts a caller-supplied loop, which the test
+suite relies on; a loop passed in stays the caller's to close, while one built
+by `_run_daemon` is closed there. The daemon runs on Windows too; the loop is
+created the same way on every OS, and the only difference is shutdown-handler
 wiring via `platform.install_shutdown_handlers` (Windows uses the Proactor loop,
-which lacks `add_signal_handler`).
+which lacks `add_signal_handler`). `_run_daemon` also installs an explicitly
+sized, named default thread pool (see `executor_workers()`).
 
 `main_loop` parses arguments (`-c/--config`, `-l/--log-level`,
-`-v/--validate-config`, `--version`), calls `logging.basicConfig` at the chosen
-level, and constructs `Cron(args.config)`. Construction calls
-`Cron.update_config()` once eagerly, so a `ConfigError` at startup is caught in
-`main_loop` and turned into exit code 1. With `--validate-config`, a successful
-construction logs `"Configuration is valid."` and exits 0 without starting the
-loop. With `--version`, the version is printed and the process exits 0 before
+`-v/--validate-config`, `--version`). The two pure config questions answer
+without constructing a `Cron`: `--validate-config` and `--job-set-id` call
+`config.parse_config_with_sources()` (and, for the latter,
+`fingerprint.job_set_id()`) directly, so neither imports the daemon graph nor
+builds the metrics/sampler/advertiser objects a `Cron` carries. A `ConfigError`
+from that parse is caught and turned into exit code 1; a clean parse logs
+`"Configuration is valid."` or prints the id, and exits 0. Only the daemon
+branch reaches `Cron(args.config)`, whose construction calls
+`Cron.update_config()` once eagerly and whose `ConfigError` is handled the same
+way. With `--version`, the version is printed and the process exits 0 before
 any config is loaded.
 
 The whole daemon is single-threaded: one event loop drives the scheduler loop,
