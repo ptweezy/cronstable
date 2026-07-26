@@ -26,26 +26,60 @@ CRONSTABLE_DEMO_VIEW_TOKEN=new-value docker compose up -d
 
 ## Standing it up
 
-Any small always-on box works (a $4–6/mo VPS is the reliable choice
-while App Store review depends on this being up; a homelab host behind
-a tunnel works too, with your uptime as the risk).
+Any always-on machine works, including one at home: the compose file
+brings up the daemon plus a **Cloudflare Tunnel** that publishes it, so
+the host needs no port forwarding, no static IP and no inbound firewall
+hole, and TLS terminates at Cloudflare (nothing to renew here).
 
-1. DNS: point `demo.cronstable.com` at the host.
-2. `docker compose -f docker-compose.yml up -d --build`
-   — the daemon listens on loopback only (`127.0.0.1:8080`).
-3. TLS: `caddy run --config Caddyfile` (or adapt to your proxy).
-   Caddy obtains and renews the certificate on its own.
-4. Verify from outside:
+1. Create the tunnel: Cloudflare **Zero Trust** dashboard → **Networks**
+   → **Tunnels** → *Create a tunnel* → **Cloudflared** → name it, pick
+   **Docker**, and copy the token out of the command it shows you.
+2. Add a **public hostname** to that tunnel:
+   - Subdomain `demo`, domain `cronstable.com`
+   - Type **HTTP**, URL **`cronstable-demo:8080`** — the daemon's name on
+     the compose network, not `localhost`; the tunnel runs in its own
+     container. Cloudflare creates the DNS record for you.
+3. Put the token in place:
+
+   ```sh
+   cp .env.example .env    # then paste the token into CLOUDFLARE_TUNNEL_TOKEN
+   ```
+
+4. `docker compose up -d --build`
+5. Verify from anywhere:
 
    ```sh
    curl -H "Authorization: Bearer cronstable-public-demo-view" \
         https://demo.cronstable.com/summary
    ```
 
-The container keeps run history in the `demo-state` volume (so the
-board survives restarts populated), drops all capabilities, and is
-memory/CPU-capped; the demo jobs are pure shell noise with no network
-egress worth speaking of.
+The daemon keeps run history in the `demo-state` volume (so the board
+survives restarts populated), drops all capabilities, and is memory and
+CPU capped; the demo jobs are pure shell noise with no network egress
+worth speaking of. Nothing is published to the host except a loopback
+port for local `curl`.
+
+### If the host is a Mac
+
+A Mac left alone will quietly take the demo down, so three settings
+matter more than anything in this directory:
+
+```sh
+sudo pmset -a sleep 0 disksleep 0   # never doze
+sudo pmset -a autorestart 1         # come back after a power cut
+```
+
+Also enable automatic login (System Settings → Users & Groups →
+Automatic login) and Docker Desktop's *Start Docker Desktop when you
+sign in*. Without those, a power blip leaves the machine sitting at the
+login window with nothing running, and `restart: unless-stopped` never
+gets a chance to help.
+
+Uptime is then only as good as your house. That is fine for a demo, but
+App Store review can arrive at any hour and a dead demo backend is a
+plausible rejection, so it is worth monitoring — a `maxTimeSinceSuccess`
+SLA on another cronstable install, pointed at this one, is the
+self-hosted way to find out before Apple does.
 
 ## What the app points at
 
