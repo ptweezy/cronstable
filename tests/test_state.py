@@ -3359,6 +3359,98 @@ async def test_locked_touch_without_fd_utime_support(tmp_path, monkeypatch):
     await backend.stop()
 
 
+async def test_locked_bootstrap_write_loss_is_not_an_error(
+    tmp_path, monkeypatch
+):
+    # Two contenders can both open a FRESH lock file and observe size 0;
+    # the first writes the bootstrap byte and takes the byte-range lock,
+    # and on Windows the loser's own write then lands on the locked range
+    # and fails with EACCES (PermissionError).  The loser must fall
+    # through and contend on the lock like any other second-comer, not
+    # blow PermissionError out of the state op (it escaped acquire_lease
+    # and killed a whole retry-claim pass).  Simulated on every platform:
+    # the fake write installs the rival's byte and raises what the
+    # Windows kernel would.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "race.lock")
+    real_write = os.write
+
+    def _rival_won(fdesc, data):
+        try:
+            ours = os.path.samestat(os.fstat(fdesc), os.stat(lock_path))
+        except OSError:
+            ours = False
+        if not ours:
+            return real_write(fdesc, data)
+        real_write(fdesc, b"\0")  # the rival's byte, already on disk
+        raise PermissionError(13, "byte range held by the rival")
+
+    monkeypatch.setattr(os, "write", _rival_won)
+    entered = False
+    with backend._locked(lock_path):
+        entered = True
+    assert entered
+    await backend.stop()
+
+
+async def test_locked_bootstrap_write_race_real_byte_lock(
+    tmp_path, monkeypatch
+):
+    if not state.IS_WINDOWS:
+        pytest.skip("msvcrt byte-range lock semantics are Windows-only")
+    import msvcrt
+
+    # The same race against the real kernel: a rival holds the locked
+    # bootstrap byte while our first fstat still reports the empty file
+    # the loser saw before the rival won (the stale observation that
+    # makes it attempt the write).  The write fails with the genuine
+    # EACCES; _locked must wait the rival out and acquire, not raise.
+    backend = _backend(tmp_path)
+    await backend.start()
+    lock_path = os.path.join(backend.base, state.LEASES_DIR, "kernel.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    rival = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    os.write(rival, b"\0")
+    os.lseek(rival, 0, os.SEEK_SET)
+    msvcrt.locking(rival, msvcrt.LK_NBLCK, 1)
+    real_fstat = os.fstat
+    lied = {"done": False}
+
+    def _stale_fstat(fdesc):
+        result = real_fstat(fdesc)
+        if not lied["done"]:
+            try:
+                ours = os.path.samestat(result, os.stat(lock_path))
+            except OSError:
+                ours = False
+            if ours:
+                lied["done"] = True
+                values = list(result)
+                values[6] = 0  # st_size as the loser saw it pre-race
+                return os.stat_result(tuple(values))
+        return result
+
+    monkeypatch.setattr(os, "fstat", _stale_fstat)
+
+    def _release():
+        time.sleep(0.3)
+        os.lseek(rival, 0, os.SEEK_SET)
+        msvcrt.locking(rival, msvcrt.LK_UNLCK, 1)
+        os.close(rival)
+
+    releaser = threading.Thread(target=_release)
+    releaser.start()
+    entered = False
+    try:
+        with backend._locked(lock_path):
+            entered = True
+    finally:
+        releaser.join()
+    assert entered
+    await backend.stop()
+
+
 async def test_gc_keeps_stream_when_listdir_fails(tmp_path, monkeypatch):
     # A managed candidate stream whose directory cannot be listed (a
     # transient I/O error mid-sweep) is kept, never partially collected.

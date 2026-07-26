@@ -2146,7 +2146,16 @@ class FilesystemStateBackend(StateBackend):
             try:
                 # msvcrt.locking needs a byte present to lock; guarantee one.
                 if os.fstat(fdesc).st_size == 0:
-                    os.write(fdesc, b"\0")
+                    try:
+                        os.write(fdesc, b"\0")
+                    except PermissionError:
+                        # Windows: a rival won the bootstrap between our
+                        # fstat and write (it wrote the byte and holds the
+                        # byte-range lock, so our write lands on the locked
+                        # range and fails with EACCES).  The byte exists
+                        # now; fall through and contend on the lock like
+                        # any other second-comer.
+                        pass
                 with exclusive_file_lock(fdesc):
                     try:
                         same = os.path.samestat(
