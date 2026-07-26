@@ -22,6 +22,29 @@ REDACTED = "***REDACTED***"
 
 _Repl = Union[str, Callable[[re.Match], str]]
 
+#: The keyword alternatives inside the key=value pattern's key group, in
+#: match order.  Held as data rather than spelled inline in the pattern
+#: source so the casefold gate below can be checked against them at import:
+#: a keyword added here that no gate word covers would silently stop being
+#: redacted, which in this module is a leak, not a slowdown.
+_KEY_KEYWORDS: Tuple[str, ...] = (
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "api[_-]?key",
+    "apikey",
+    "access[_-]?key",
+    "secret[_-]?key",
+    "auth[_-]?token",
+    "credential",
+    "private[_-]?key",
+    # known vendor keys whose credential suffix is not on the generic list
+    # ("auth" alone would swallow e.g. "oauth: on").
+    "rediscli[_-]?auth",
+)
+
 
 # (compiled pattern, replacement) applied in order.  Replacements that need to
 # keep surrounding context (a key name, a URL host) use a callable; the rest
@@ -66,13 +89,8 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     (
         re.compile(
             r"(?i)(?=[pstacr])("
-            r"password|passwd|pwd|secret|token|api[_-]?key|apikey|"
-            r"access[_-]?key|secret[_-]?key|auth[_-]?token|credential|"
-            r"private[_-]?key"
-            # known vendor keys whose credential suffix is not on the
-            # generic list ("auth" alone would swallow e.g. "oauth: on").
-            r"|rediscli[_-]?auth"
-            r")(s?)([\"']?\s*[=:]\s*)"
+            + "|".join(_KEY_KEYWORDS)
+            + r")(s?)([\"']?\s*[=:]\s*)"
             r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'"
             r"|[^\s,}\]]+(?=\s*[,}\]])|[^\r\n]+)"
         ),
@@ -141,22 +159,44 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     (re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*"), REDACTED),
 ]
 
-# Cheap prefilter, parallel to _PATTERNS (same order). Each entry is a literal
-# that MUST be present in a line for the corresponding pattern to have any
-# chance of matching, or None for the always-run patterns (the case-insensitive
-# ones, and the key=value pattern, which have no single required literal).
-# redact_secrets skips any pattern whose literal is absent: since that sub()
+#: Gate words for the key=value pattern, one covering substring per keyword
+#: group.  Deliberately i-FREE: U+0131 (dotless i) is matched by ``(?i)i`` but
+#: casefolds to itself, so a gate word spelling "credential" or
+#: "authorization" would be invisible to "credentıal", i.e. a redaction FALSE
+#: negative in a module whose bias is meant to run the other way.  Every
+#: keyword is checked against these at import (see below).
+_GATE_KEY: Tuple[str, ...] = (
+    "passw",  # password, passwd
+    "pwd",
+    "secret",  # secret, secret_key
+    "token",  # token, auth_token
+    "key",  # api_key, apikey, access_key, secret_key, private_key
+    "auth",  # auth_token, rediscli_auth
+    "credent",  # credential
+)
+
+# Cheap prefilter, parallel to _PATTERNS (same order), of two kinds:
+#
+# * a plain literal that MUST be present in a line for the corresponding
+#   pattern to have any chance of matching, tested against the line as-is;
+# * a tuple of CASEFOLDED substrings, ANY of which must be present in one
+#   casefolded copy of the line, for the three case-insensitive patterns
+#   (key=value, Bearer, Authorization: Basic).  None of those three has a
+#   single required literal, so before the fold gate they ran on every line
+#   and cost roughly 70% of a clean line's redaction.
+#
+# redact_secrets skips any pattern whose gate is closed: since that sub()
 # could only be a no-op, the elision keeps the output byte-identical while
-# dropping a typical no-secret line from 12 regex passes to the 3 always-on
-# ones. "***REDACTED***" contains none of these literals, so an earlier
-# redaction can never spuriously trip a later gate. Kept in lockstep with
-# _PATTERNS by the check below -- a plain `if`, deliberately not an `assert`,
-# because the release binary runs under -OO, which strips asserts.
-_PATTERN_GATES: Tuple[Optional[str], ...] = (
-    None,  # 1. key = value / key: value (case-insensitive keywords)
+# dropping a typical no-secret line from 12 regex passes to none.
+# "***REDACTED***" contains none of these literals, so an earlier redaction
+# can never spuriously trip a later gate. Kept in lockstep with _PATTERNS by
+# the checks below: plain `if`s, deliberately not `assert`s, because the
+# release binary runs under -OO, which strips asserts.
+_PATTERN_GATES: Tuple[Union[str, Tuple[str, ...]], ...] = (
+    _GATE_KEY,  # 1. key = value / key: value (case-insensitive keywords)
     "://",  # 2. scheme://user:PASSWORD@host
-    None,  # 3. Bearer <token> (case-insensitive)
-    None,  # 4. Authorization: Basic <base64> (case-insensitive)
+    ("bearer",),  # 3. Bearer <token> (case-insensitive)
+    ("author",),  # 4. Authorization: Basic <base64> (case-insensitive)
     "AKIA",  # 5. AWS access key id
     "xox",  # 6. Slack tokens
     "gh",  # 7. GitHub ghp_/gho_/ghs_/ghu_/ghr_ tokens
@@ -166,8 +206,61 @@ _PATTERN_GATES: Tuple[Optional[str], ...] = (
     "eyJ",  # 11. JWT (base64url of the opening '{"')
     "-----",  # 12. PEM -----BEGIN ... PRIVATE KEY----- header
 )
+
+
+def _key_gate_covers(keyword: str) -> bool:
+    """Whether every literal spelling of ``keyword`` trips :data:`_GATE_KEY`.
+
+    Both renderings of an optional separator are checked, because the gate
+    runs on the line and the line may carry either: a gate word of "passw"
+    would cover "password" but not a hypothetical "pass[_-]?word".
+    """
+    for sep in ("", "_", "-"):
+        literal = keyword.replace("[_-]?", sep)
+        if not any(word in literal for word in _GATE_KEY):
+            return False
+    return True
+
+
 if len(_PATTERN_GATES) != len(_PATTERNS):  # pragma: no cover - dev invariant
     raise RuntimeError("redact: _PATTERN_GATES is out of step with _PATTERNS")
+if not all(  # pragma: no cover - dev invariant
+    _key_gate_covers(keyword) for keyword in _KEY_KEYWORDS
+):
+    raise RuntimeError(
+        "redact: a _KEY_KEYWORDS entry is not covered by _GATE_KEY, so it "
+        "would be gated out and never redacted"
+    )
+if any(  # pragma: no cover - dev invariant
+    keyword[0] not in "pstacr" for keyword in _KEY_KEYWORDS
+):
+    raise RuntimeError(
+        "redact: a _KEY_KEYWORDS entry starts outside the (?=[pstacr]) "
+        "prescan lookahead, which would narrow what the pattern matches"
+    )
+if any(  # pragma: no cover - dev invariant
+    "i" in word
+    for gate in _PATTERN_GATES
+    if not isinstance(gate, str)
+    for word in gate
+):
+    raise RuntimeError(
+        "redact: a casefold gate word contains 'i', which U+0131 evades"
+    )
+
+#: The gates and patterns flattened into one tuple of
+#: ``(literal gate, casefold gate, bound sub, replacement)``, built once at
+#: import.  The literal gate is ``""`` (never consulted) on a fold-gated
+#: entry.  Per call this replaces a fresh ``zip(..., strict=True)`` and a
+#: nested tuple unpack, which together cost more than the gate tests they fed.
+_STEPS: Tuple[
+    Tuple[str, Optional[Tuple[str, ...]], Callable[..., str], _Repl], ...
+] = tuple(
+    (gate, None, pattern.sub, repl)
+    if isinstance(gate, str)
+    else ("", gate, pattern.sub, repl)
+    for (pattern, repl), gate in zip(_PATTERNS, _PATTERN_GATES, strict=True)
+)
 
 _PEM_BEGIN = re.compile(r"(?i)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _PEM_END = re.compile(r"(?i)-----END [A-Z0-9 ]*PRIVATE KEY-----")
@@ -181,15 +274,32 @@ def redact_secrets(text: str) -> str:
     *sequence* of lines that may contain a multi-line PEM block, use
     :func:`redact_lines`, which redacts the block's body, not just its header.
     """
-    for (pattern, repl), required in zip(
-        _PATTERNS, _PATTERN_GATES, strict=True
-    ):
-        # Skip a pattern whose mandatory literal is absent from the line: its
-        # sub() would be a guaranteed no-op, so eliding it leaves the output
-        # byte-identical while sparing most lines all but the always-on passes.
-        if required is not None and required not in text:
-            continue
-        text = pattern.sub(repl, text)
+    # One casefolded copy for the three case-insensitive gates, taken BEFORE
+    # any substitution and reused for the whole pass.  That stays sound
+    # because a replacement only ever echoes back text it just matched or
+    # inserts REDACTED, whose '*' fences cannot join with neighbouring text
+    # into a gate word: the set of gate words present can shrink over the
+    # pass but never grow, and a gate that opens for a word a previous
+    # pattern has since removed merely runs a sub() that today runs anyway.
+    # casefold(), not lower(): U+017F folds to 's' and so matches (?i)s.
+    low = text.casefold()
+    for required, folded, sub, repl in _STEPS:
+        # Skip a pattern whose gate is closed: its sub() would be a
+        # guaranteed no-op, so eliding it leaves the output byte-identical
+        # while sparing a clean line every regex pass.  Gates are consumed
+        # in PATTERN order, never hoisted: running the Bearer or Basic
+        # pattern ahead of the "://" one changes the output of a URL
+        # carrying an embedded token.
+        if folded is None:
+            if required not in text:
+                continue
+        else:
+            for word in folded:
+                if word in low:
+                    break
+            else:
+                continue
+        text = sub(repl, text)
     return text
 
 

@@ -1794,3 +1794,116 @@ async def test_job_families_omit_last_run_cpu_when_unmonitored():
         )
         is None
     )
+
+
+# ---- the two-phase render seam (families / render_prepared) ----------------
+
+
+def _pinned_cron():
+    """A Cron whose exposition is byte-stable across scrapes.
+
+    Seeding ``_next_fire`` takes the steady-state next-run path; without it
+    the startup fallback recomputes the gauge from the wall clock and two
+    renders of identical state differ in the last decimal.
+    """
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    cron._next_fire["alpha"] = datetime.datetime(
+        2026, 7, 25, 12, 0, tzinfo=datetime.timezone.utc
+    )
+    return cron
+
+
+async def test_two_phase_render_matches_the_one_shot_render():
+    # phase one on the loop + phase two anywhere must be byte-identical to
+    # render(), in both exposition formats, or the seam is not a seam.
+    cron = _pinned_cron()
+    cron.metrics.job_run_recorded("alpha", "success", 2.5)
+    for openmetrics in (False, True):
+        expected = cron.metrics.render(cron, openmetrics)
+        got = cron.metrics.render_prepared(
+            cron.metrics.families(cron), openmetrics
+        )
+        assert got == expected
+
+
+async def test_families_returns_a_private_list_each_call():
+    # phase two is only safe off the loop because the list it renders is
+    # freshly built and shared with nobody.
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    first = cron.metrics.families(cron)
+    second = cron.metrics.families(cron)
+    assert first is not second
+    assert all(a is not b for a, b in zip(first, second, strict=True))
+    # and phase two does not consume or mutate what it renders
+    before = [(f.name, len(f.samples)) for f in first]
+    cron.metrics.render_prepared(first)
+    assert [(f.name, len(f.samples)) for f in first] == before
+
+
+async def test_render_prepared_matches_when_run_off_the_loop():
+    # the shape the caller uses: families on the loop, render in an executor.
+    import asyncio
+
+    cron = _pinned_cron()
+    cron.metrics.job_run_recorded("alpha", "success", 1.0)
+    families = cron.metrics.families(cron)
+    inline = cron.metrics.render_prepared(families)
+    offloaded = await asyncio.get_running_loop().run_in_executor(
+        None, cron.metrics.render_prepared, cron.metrics.families(cron)
+    )
+    assert offloaded == inline
+
+
+async def test_label_blocks_memo_persists_across_scrapes():
+    # the seam must not reintroduce a per-scrape rebuild of the label memo:
+    # a second scrape reuses the blocks the first one built.
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    cron.metrics.render(cron)
+    warm = dict(cron.metrics._label_blocks)
+    assert warm  # the first scrape populated it
+    cron.metrics.render(cron)
+    assert cron.metrics._label_blocks == warm
+
+
+# ---- the label-block memo's cap -------------------------------------------
+
+
+def test_label_block_memo_stops_accepting_at_the_cap(monkeypatch):
+    # Past the cap the memo must PIN what it holds rather than drop it: a
+    # clear-on-full thrashes, ending each pass holding a fraction of a
+    # working set and starting the next one cold.
+    monkeypatch.setattr(cronstable.prometheus, "LABEL_BLOCK_CACHE_MAX", 4)
+    cache = {}
+    block_for = cronstable.prometheus._make_label_block_builder(cache)
+    for i in range(20):
+        block_for({"job_name": "job%d" % i})
+    assert len(cache) == 4  # capped, and never emptied along the way
+    assert cache[(("job_name", "job0"),)] == '{job_name="job0"}'
+
+
+def test_label_block_memo_still_correct_past_the_cap(monkeypatch):
+    # an un-memoized overflow block is built fresh and is identical to the
+    # memoized one, escaping included.
+    monkeypatch.setattr(cronstable.prometheus, "LABEL_BLOCK_CACHE_MAX", 1)
+    cache = {}
+    block_for = cronstable.prometheus._make_label_block_builder(cache)
+    block_for({"job_name": "first"})
+    assert len(cache) == 1
+    assert block_for({"job_name": 'q"uote'}) == '{job_name="q\\"uote"}'
+    assert block_for({"job_name": "a", "le": "1.0"}) == (
+        '{job_name="a",le="1.0"}'
+    )
+    assert len(cache) == 1  # still pinned to the first entry
+
+
+def test_render_is_stable_when_the_memo_overflows(monkeypatch):
+    # the exposition must not depend on whether a block was served warm.
+    cron = _pinned_cron()
+    cron.metrics.job_run_recorded("alpha", "success", 3.0)
+    uncapped = cron.metrics.render(cron)
+    cron.metrics._label_blocks.clear()
+    monkeypatch.setattr(cronstable.prometheus, "LABEL_BLOCK_CACHE_MAX", 3)
+    assert cron.metrics.render(cron) == uncapped
