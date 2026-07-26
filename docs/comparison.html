@@ -1131,11 +1131,8 @@ $ cronstable mcp <span class="k">--check</span>
  *  This is not a canned animation. The header mark integrates the full
  *  nonlinear cart/double-pendulum dynamics (RK4 at 240 Hz) and balances
  *  itself with an LQR controller whose gains are computed at page load
- *  from a numerical linearization (discrete Riccati iteration). A weak
- *  detent spring at the elbow gives the stand its deliberate slight bend —
- *  the leaned pose is a true equilibrium, solved in the constructor, and
- *  the controller regulates to it. While the daemon is live the letter
- *  stands with that easy bend, riding out little gusts; lose the
+ *  from a numerical linearization (discrete Riccati iteration). While the
+ *  daemon is live it stands upright, swaying in a little breeze; lose the
  *  signal and the motor cuts — it collapses and swings, pumping energy
  *  (dE/dt = -a*G exactly) but held just short of the top. When the signal
  *  returns, a receding-horizon cross-entropy planner threads the swing
@@ -1158,12 +1155,6 @@ $ cronstable mcp <span class="k">--check</span>
     L1: 0.34, L2: 0.26,      // link lengths (m)
     m1: 0.14, m2: 0.09,      // point masses at link tips (kg)
     d1: 0.005, d2: 0.002,    // joint viscous damping
-    kElbow: 0.06,            // elbow detent: sinusoidal (magnetic-style), torque k*sin(rel-rest).
-                             // Deliberately WEAK: it only has to define the bent stand (the rest
-                             // angle absorbs the difference); anything stiffer measurably drags
-                             // on the swing-up (Monte-Carlo'd — k=0.25 strands recoveries whirling)
-    bendStand: 0.10,         // the stand is deliberately bent: link 2 leans this far (rad)
-    elbowRest: 0,            // detent rest angle; computed from bendStand in the constructor
     trackHalf: 0.42,         // cart travel each side of center (m)
     aMaxBalance: 18,         // accel authority while balancing (m/s^2)
     aMaxCatch: 24,           // extra muscle in the first 1.2 s of a catch
@@ -1202,14 +1193,8 @@ $ cronstable mcp <span class="k">--check</span>
     const M11 = M * p.L1 * p.L1;
     const M12 = p.m2 * p.L1 * p.L2 * cD;
     const M22 = p.m2 * p.L2 * p.L2;
-    // elbow detent: a weak SINUSOIDAL spring (magnetic-cogging style) with a
-    // bent rest angle — it is what makes the standing l lean. Sinusoidal, not
-    // linear-wrapped: the torque is smooth and periodic over full elbow
-    // rotations (a wrapped linear spring flips sign discontinuously at the
-    // fold, which poisons RK4 and the CEM rollouts during a tumble).
-    const spr = p.kElbow ? p.kElbow * Math.sin(th2 - th1 - p.elbowRest) : 0;
-    const Q1 = -p.d1 * w1 + p.d2 * (w2 - w1) + spr;
-    const Q2 = -p.d2 * (w2 - w1) - spr;
+    const Q1 = -p.d1 * w1 + p.d2 * (w2 - w1);
+    const Q2 = -p.d2 * (w2 - w1);
     const b1 = -p.m2 * p.L1 * p.L2 * w2 * w2 * sD + p.g * M * p.L1 * s1 - M * p.L1 * c1 * a + Q1;
     const b2 = p.m2 * p.L1 * p.L2 * w1 * w1 * sD + p.g * p.m2 * p.L2 * s2 - p.m2 * p.L2 * c2 * a + Q2;
     const det = M11 * M22 - M12 * M12;
@@ -1225,23 +1210,22 @@ $ cronstable mcp <span class="k">--check</span>
     const k4 = deriv(p, s4, a);
     return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
   }
-  // pendulum energy in the cart frame (incl. the detent's PE); the swing-up
-  // target is the energy AT the bent stand — sim.EUP, computed per instance
+  // pendulum energy in the cart frame; upright = eUp
   function energy(p, s) {
     const th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
     const M = p.m1 + p.m2;
     return 0.5 * M * p.L1 * p.L1 * w1 * w1
       + 0.5 * p.m2 * p.L2 * p.L2 * w2 * w2
       + p.m2 * p.L1 * p.L2 * w1 * w2 * Math.cos(th1 - th2)
-      + p.g * (M * p.L1 * Math.cos(th1) + p.m2 * p.L2 * Math.cos(th2))
-      + p.kElbow * (1 - Math.cos(th2 - th1 - p.elbowRest));
+      + p.g * (M * p.L1 * Math.cos(th1) + p.m2 * p.L2 * Math.cos(th2));
   }
+  const eUp = (p) => p.g * ((p.m1 + p.m2) * p.L1 + p.m2 * p.L2);
   // energy-flow coupling: dE/dt = -a * G(s); the pump pushes against G
   const Gterm = (p, s) =>
     (p.m1 + p.m2) * p.L1 * Math.cos(s[2]) * s[3] + p.m2 * p.L2 * Math.cos(s[4]) * s[5];
 
-  // ---- LQR gains from a numerical linearization at the (bent) stand ----
-  function computeLQR(p, s0) {
+  // ---- LQR gains from a numerical linearization at the upright ----
+  function computeLQR(p) {
     const n = 6, eps = 1e-6, dtc = 0.002;
     const mm = (A, B) => {
       const rn = A.length, cm = B[0].length, kk = B.length;
@@ -1255,7 +1239,7 @@ $ cronstable mcp <span class="k">--check</span>
       return C;
     };
     const eye = (k) => Array.from({ length: k }, (_, i) => Array.from({ length: k }, (_, j) => (i === j ? 1 : 0)));
-    const f0 = deriv(p, s0, 0);
+    const s0 = [0, 0, 0, 0, 0, 0], f0 = deriv(p, s0, 0);
     const A = eye(n).map((r) => r.map(() => 0));
     for (let j = 0; j < n; j++) {
       const sp = s0.slice(); sp[j] += eps;
@@ -1316,7 +1300,7 @@ $ cronstable mcp <span class="k">--check</span>
         limpDuration: 0.55,
         disconnectedEnergyFrac: 0.94,  // strive, never top out, while offline
         seed: 1,
-        gusts: true,
+        breeze: true,
       }, opts || {});
       // track bounds (m, relative to the balance point x = 0). trackMin/
       // trackMax params make the track asymmetric — the wordmark mount
@@ -1325,26 +1309,9 @@ $ cronstable mcp <span class="k">--check</span>
       this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
       this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
       this.rand = mulberry32(this.opts.seed);
-      // the stand is deliberately BENT (bendStand): solve the elbow detent's
-      // rest angle so the leaned pose is a true equilibrium — link 2 leans by
-      // bendStand, link 1 counter-leans so the chain's CG sits plumb over the
-      // cart, and gravity's torque about the elbow is held by the spring.
-      // The LQR is linearized there and _wrapped() measures errors from
-      // there, so the controller balances the bent letter on purpose.
-      {
-        const p = this.p;
-        const A = (p.m1 + p.m2) * p.L1, B = p.m2 * p.L2;
-        const th2s = p.kElbow ? p.bendStand : 0;   // no spring, no bend to hold
-        const th1s = Math.asin(clamp(-(B / A) * Math.sin(th2s), -1, 1));
-        const stretch = p.kElbow
-          ? Math.asin(clamp(B * p.g * Math.sin(th2s) / p.kElbow, -1, 1)) : 0;
-        p.elbowRest = (th2s - th1s) - stretch;
-        this.sEq = [0, 0, th1s, 0, th2s, 0];
-        this.EUP = energy(p, this.sEq);
-      }
-      const lq = computeLQR(this.p, this.sEq);
+      const lq = computeLQR(this.p);
       this.K = lq.K; this.P = lq.P;
-      this.s = this.sEq.slice();
+      this.s = [0, 0, 0, 0, 0, 0];
       this.mode = "balance";
       this.connected = true;
       this.t = 0;
@@ -1357,7 +1324,7 @@ $ cronstable mcp <span class="k">--check</span>
       this.cem = null;
       this.lastVerify = -1;
       this.onMode = null;
-      this.noise = { gustT: 3 + 4 * this.rand(), gust: 0, gustEnd: 0 };
+      this.noise = { breeze: 0, flutter: 0 };
     }
     setConnected(c) {
       c = !!c;
@@ -1431,8 +1398,7 @@ $ cronstable mcp <span class="k">--check</span>
     }
     _wrapped(s) {
       s = s || this.s;
-      const q = this.sEq;   // errors are measured from the bent stand
-      return [s[0], s[1], wrapA(s[2] - q[2]), s[3], wrapA(s[4] - q[4]), s[5]];
+      return [s[0], s[1], wrapA(s[2]), s[3], wrapA(s[4]), s[5]];
     }
     _lqrAccel(z, aMax) {
       let a = 0;
@@ -1467,7 +1433,7 @@ $ cronstable mcp <span class="k">--check</span>
       return Math.min(1.35, 1.10 + Math.floor(tSw / 6) * 0.05);
     }
     _pumpAccel() {
-      const p = this.p, s = this.s, EUP = this.EUP;
+      const p = this.p, s = this.s, EUP = eUp(p);
       const E = energy(p, s);
       const dE = EUP * this._pumpTarget() - E;
       let a;
@@ -1558,7 +1524,7 @@ $ cronstable mcp <span class="k">--check</span>
              Math.abs(zf[3]) < 0.5 && Math.abs(zf[5]) < 0.6;
     }
     _swingFrame() {
-      const p = this.p, EUP = this.EUP;
+      const p = this.p, EUP = eUp(p);
       const E = energy(p, this.s);
       const z2 = wrapA(this.s[2]);
       const inRegion = this.connected &&
@@ -1587,15 +1553,30 @@ $ cronstable mcp <span class="k">--check</span>
             this._toMode(this.connected ? "swing" : "limp");
           } else {
             a = this._lqrAccel(z, this._balanceAuthority());
-            if (this.opts.gusts) {
-              const n = this.noise;
-              if (this.t > n.gustT) {
-                n.gust = (this.rand() - 0.5) * 0.55;  // a whisper: the standing l should sway, not lurch
-                n.gustEnd = this.t + 0.25;
-                n.gustT = this.t + 2.5 + 5 * this.rand();
-              }
-              if (this.t < n.gustEnd) this.s[3] += n.gust * dt * 6;
-              a = clamp(a + (this.rand() - 0.5) * 0.5, -p.aMaxBalance, p.aMaxBalance);
+            if (this.opts.breeze) {
+              // a varying little breeze instead of random gusts. The push
+              // itself is a fast Ornstein-Uhlenbeck flutter (0.8 s memory,
+              // zero mean, so there is never a sustained lean for the cart
+              // to walk away under); its strength is breathed by a slow
+              // envelope (9 s memory, squared then saturated so a swell
+              // has a hard ceiling) that swells, lulls, and leaves real
+              // near-still spells. The noise gains are sigma*sqrt(12) for
+              // uniform increments, holding each process near unit
+              // variance, so `wind` reads directly in rad/s^2 on the
+              // shoulder; the elbow takes a lighter share of the load.
+              const n = this.noise, rt = Math.sqrt(dt);
+              n.breeze += (-n.breeze / 9) * dt + 1.63 * rt * (this.rand() - 0.5);
+              n.flutter += (-n.flutter / 0.8) * dt + 5.48 * rt * (this.rand() - 0.5);
+              // room fades the wind if the cart strays from the l's cell
+              // (the track has only ~0.48 m of run-out on the "e" side);
+              // ease brings it back in after a catch, while the mark still
+              // balances on reduced authority (_balanceAuthority).
+              const room = 1 / (1 + 40 * this.s[0] * this.s[0]);
+              const ease = this.catchT >= 0 ? Math.min(1, (this.t - this.catchT) / 1.5) : 1;
+              const swell = n.breeze * n.breeze;
+              const wind = 0.1 * (0.25 + 1.05 * swell / (1 + swell)) * n.flutter * room * ease;
+              this.s[3] += wind * dt;
+              this.s[5] += 0.6 * wind * dt;
             }
           }
         } else if (this.mode === "limp") {
@@ -1774,16 +1755,7 @@ $ cronstable mcp <span class="k">--check</span>
       this._raf = 0;
       this._last = 0;
       const up = this.sim.connected;
-      if (up) this.sim.s = this.sim.sEq.slice();
-      else {
-        // dead hang, settled numerically: the elbow detent keeps a hint of
-        // the bend even hanging, so the honest still pose keeps its character
-        const p = this.sim.p, hd = Object.assign({}, p, { d1: 0.5, d2: 0.35 });
-        let s = [0, 0, Math.PI, 0, Math.PI, 0];
-        for (let i = 0; i < 960; i++) s = rk4(hd, s, 0, p.dt);
-        s[1] = 0; s[3] = 0; s[5] = 0;
-        this.sim.s = s;
-      }
+      this.sim.s = up ? [0, 0, 0, 0, 0, 0] : [0, 0, Math.PI, 0, Math.PI, 0];
       this.sim.mode = up ? "balance" : "limp";
       if (this._gate) { this._gate.x = this._gate.rest; this._gate.settledAt = -1; this._gate.v = 0; this._gate.rv = 0; this.sim.xMax = this._gate.restM; }
       this.trail.length = 0;
@@ -1975,7 +1947,7 @@ $ cronstable mcp <span class="k">--check</span>
     // (applied only here, once the pendulum takes over, so the no-JS printed
     // l keeps exact metrics) pull the flanking letters toward the stem; the
     // slot's content box — and with it x = 0 — stays midway between them.
-    const tuck = slotW * 0.16;
+    const tuck = slotW * 0.12;
     const railL = prefix ? -(adv(prefix) + slotW / 2 - tuck) : -(p.trackHalf * 1.05 * S + pad);
     const railR = suffix ? adv(suffix) + slotW / 2 - ls - tuck : p.trackHalf * 1.05 * S + pad;
     // the dynamic right gate may open out to the middle of the page during

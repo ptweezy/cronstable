@@ -68,3 +68,8 @@ target/
 
 # Local-only changelog tooling
 /scripts/*
+
+# Screenshot-pipeline scratch output: raw captures land here for review before
+# the keepers are copied over docs/img/ (the tracked, published set)
+/docs/screenshots/shots/
+/docs/screenshots/reel/
