@@ -3,8 +3,8 @@
 This document is the wire contract between a cronstable daemon and a push
 relay: the hosted service that accepts sealed alert ciphertexts from daemons
 and forwards them to the platform push service (APNs). The reference
-implementation — the source of the hosted relay at
-`https://relay.cronstable.com/` — is published at
+implementation (the source of the hosted relay at
+`https://relay.cronstable.com/`) is published at
 [ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay);
 anything that implements this contract can serve as the relay a daemon's
 `push.relay.url` points at.

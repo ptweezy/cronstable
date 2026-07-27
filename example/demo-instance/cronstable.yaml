@@ -1,15 +1,15 @@
 # The PUBLIC READ-ONLY DEMO instance (demo.cronstable.com).
 #
 # This board backs the companion app's "Try the demo" button and App Store
-# review: a plausible homelab fleet with something on every screen — healthy
-# heartbeats, a live log streamer, a failure with a meaty log tail to triage,
-# a flaky job that retries its way out, a long runner you can catch mid-run,
-# an SLA-monitored job, and a small DAG.
+# review. It is a plausible homelab fleet with something on every screen:
+# healthy heartbeats, a live log streamer, a failure with a meaty log tail
+# to triage, a flaky job that retries its way out, a long runner you can
+# catch mid-run, an SLA-monitored job, and a small DAG.
 #
 # Access model, on purpose:
 #   - The only credential is a VIEW-scoped bearer token (below). It is
 #     deliberately public: it ships inside the app and appears in the runbook
-#     (see README.md). View scope can read state and logs, and nothing else —
+#     (see README.md). View scope can read state and logs, and nothing else:
 #     no run/cancel/pause, no approvals, no pairing.
 #   - No `push:` block: pairing a device against the demo makes no sense and
 #     would need control of a relay topic; the app's demo mode renders its
@@ -52,7 +52,7 @@ jobs:
     command: echo "♥ heartbeat $(date -u +%H:%M:%S) UTC"
     schedule: "* * * * *"
 
-  # Streams a line per second for ~20 s — the live log tail demo.
+  # Streams a line per second for ~20 s: the live log tail demo.
   - name: sensor-sweep
     command: |
       echo "sweeping 20 sensors..."
@@ -63,7 +63,7 @@ jobs:
       echo "sweep complete: 20/20 nominal"
     schedule: "*/3 * * * *"
 
-  # ALWAYS fails, with a log tail worth reading — the app's incident /
+  # ALWAYS fails, with a log tail worth reading: the app's incident /
   # verdict showcase. The stderr lines are what the push payload's
   # log_tail would carry for a real failure.
   - name: backup-verify
@@ -76,8 +76,8 @@ jobs:
       exit 1
     schedule: "*/10 * * * *"
 
-  # Fails about a third of the time, and retries usually rescue it —
-  # the retry/backoff timeline demo, flipping green most of the time.
+  # Fails about a third of the time, and retries usually rescue it: the
+  # retry/backoff timeline demo, flipping green most of the time.
   - name: feed-sync
     command: |
       echo "pulling 14 feeds at $(date -u +%T)..."
@@ -119,7 +119,7 @@ jobs:
       maxRuntimeSeconds: 300
 
   # Effectively never scheduled; exists to show the Pending state (and,
-  # on installs with control scope, the "Run now" button — not here).
+  # on installs with control scope, the "Run now" button, not here).
   - name: restore-drill
     command: echo "🚀 restore drill launched at $(date -u +%T) UTC"
     schedule: "0 3 1 1 *"
