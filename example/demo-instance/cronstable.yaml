@@ -1,0 +1,161 @@
+# The PUBLIC READ-ONLY DEMO instance (demo.cronstable.com).
+#
+# This board backs the companion app's "Try the demo" button and App Store
+# review. It is a plausible homelab fleet with something on every screen:
+# healthy heartbeats, a live log streamer, a failure with a meaty log tail
+# to triage, a flaky job that retries its way out, a long runner you can
+# catch mid-run, an SLA-monitored job, and a small DAG.
+#
+# Access model, on purpose:
+#   - The only credential is a VIEW-scoped bearer token (below). It is
+#     deliberately public: it ships inside the app and appears in the runbook
+#     (see README.md). View scope can read state and logs, and nothing else:
+#     no run/cancel/pause, no approvals, no pairing.
+#   - No `push:` block: pairing a device against the demo makes no sense and
+#     would need control of a relay topic; the app's demo mode renders its
+#     own sample alerts locally.
+#
+# Bring-up: docker-compose.yml next to this file, which also runs the
+# Cloudflare Tunnel that publishes this daemon and terminates TLS.
+
+defaults:
+  shell: /bin/bash
+  captureStdout: true
+  captureStderr: true
+
+# Durable run history: job detail and run screens stay populated across
+# container restarts, and the DAG below requires the state store + loopback.
+state:
+  path: /var/lib/cronstable/state
+  jobApi:
+    enabled: true
+
+web:
+  # Plaintext on the container port; TLS is the reverse proxy's job.
+  listen:
+    - http://0.0.0.0:8080
+  authTokens:
+    - label: public-demo-viewer
+      scopes:
+        - view
+      fromEnvVar: CRONSTABLE_DEMO_VIEW_TOKEN
+
+jobs:
+  # A first run the moment the daemon starts, so a fresh deploy is never an
+  # empty board.
+  - name: welcome
+    command: echo "👋 cronstable public demo up on $HOSTNAME at $(date -u +'%Y-%m-%d %H:%M:%S') UTC"
+    schedule: "@reboot"
+
+  # The steady green pulse.
+  - name: heartbeat
+    command: echo "♥ heartbeat $(date -u +%H:%M:%S) UTC"
+    schedule: "* * * * *"
+
+  # Streams a line per second for ~20 s: the live log tail demo.
+  - name: sensor-sweep
+    command: |
+      echo "sweeping 20 sensors..."
+      for i in $(seq 1 20); do
+        echo "sensor $i/20: ok ($((RANDOM % 30 + 40)).$((RANDOM % 9))°C) at $(date -u +%T)"
+        sleep 1
+      done
+      echo "sweep complete: 20/20 nominal"
+    schedule: "*/3 * * * *"
+
+  # ALWAYS fails, with a log tail worth reading: the app's incident /
+  # verdict showcase. The stderr lines are what the push payload's
+  # log_tail would carry for a real failure.
+  - name: backup-verify
+    command: |
+      echo "verify: opening snapshot catalog..."
+      echo "verify: snapshot $(date -u +%Y-%m-%d)T01:00Z has 41,283 entries"
+      echo "ERROR: checksum mismatch in chunk 0x9f31 (media/photos/2019/IMG_2214.jpg)" 1>&2
+      echo "ERROR: 3 of 41,283 objects failed verification" 1>&2
+      echo "hint: run 'restic check --read-data' on the backup host" 1>&2
+      exit 1
+    schedule: "*/10 * * * *"
+
+  # Fails about a third of the time, and retries usually rescue it: the
+  # retry/backoff timeline demo, flipping green most of the time.
+  - name: feed-sync
+    command: |
+      echo "pulling 14 feeds at $(date -u +%T)..."
+      if (( RANDOM % 3 == 0 )); then
+        echo "upstream 502 from feeds.example.net, will retry" 1>&2
+        exit 6
+      fi
+      echo "14/14 feeds fresh"
+    schedule: "*/5 * * * *"
+    onFailure:
+      retry:
+        maximumRetries: 3
+        initialDelay: 5
+        maximumDelay: 60
+        backoffMultiplier: 2
+
+  # Runs ~90 s with progress output: catch it Running, watch the live
+  # tail, later the Live Activity demo.
+  - name: media-reindex
+    command: |
+      echo "reindexing library..."
+      for i in $(seq 1 18); do
+        echo "batch $i/18 indexed ($((i * 512)) items)"
+        sleep 5
+      done
+      echo "reindex complete: 9216 items"
+    schedule: "*/15 * * * *"
+    concurrencyPolicy: Forbid
+
+  # SLA-monitored: succeeds every 10 minutes, monitored for staleness and
+  # overrun, so the job detail screen shows a live SLA panel (and never
+  # breaches while healthy).
+  - name: offsite-snapshot
+    command: |
+      echo "snapshot shipped at $(date -u +%T) ($((RANDOM % 400 + 200)) MiB)"
+    schedule: "*/10 * * * *"
+    sla:
+      maxTimeSinceSuccessSeconds: 1800
+      maxRuntimeSeconds: 300
+
+  # Effectively never scheduled; exists to show the Pending state (and,
+  # on installs with control scope, the "Run now" button, not here).
+  - name: restore-drill
+    command: echo "🚀 restore drill launched at $(date -u +%T) UTC"
+    schedule: "0 3 1 1 *"
+
+  # The disabled state.
+  - name: legacy-mirror
+    enabled: false
+    command: echo "decommissioned 2025; kept for reference"
+    schedule: "0 4 * * *"
+
+# A small, healthy pipeline for the DAG screens: fan out over three
+# shares, then summarize. Every 30 minutes, history capped.
+dags:
+  - name: nightly-archive
+    schedule: "*/30 * * * *"
+    onMissed: skip
+    retainRuns: 48
+    tasks:
+      - id: plan
+        command: |
+          set -eu
+          echo '["documents", "media", "homelab-configs"]' | cronstable xcom push --key shares
+      - id: archive-share
+        dependsOn:
+          - plan
+        expand:
+          fromTask: plan
+          key: shares
+        command: |
+          set -eu
+          echo "archiving share $CRONSTABLE_DAG_MAP_ITEM (#$CRONSTABLE_DAG_MAP_INDEX)"
+          sleep $((RANDOM % 5 + 2))
+          echo "share $CRONSTABLE_DAG_MAP_ITEM archived"
+      - id: manifest
+        dependsOn:
+          - archive-share
+        command: |
+          set -eu
+          echo "manifest written for 3 shares at $(date -u +%T)"
