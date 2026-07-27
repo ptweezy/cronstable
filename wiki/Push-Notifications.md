@@ -45,7 +45,7 @@ published at
 (MIT), including its delivery policy (per-device coalescing, flap
 suppression, rate limits) and self-hosting instructions. Because alerts
 are sealed before they leave the daemon, pointing at the hosted relay
-trusts it with routing metadata only — never content.
+trusts it with routing metadata only, never content.
 
 `devicesFile` is only needed on a stateless install; with a
 [`state:`](Durable-State) section the registry rides the durable store

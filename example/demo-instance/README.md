@@ -2,7 +2,7 @@
 
 The always-on demo daemon behind the companion app's **"Try the demo"**
 button (and App Store review): a plausible homelab board with something
-on every screen. `cronstable.yaml` here is the whole personality —
+on every screen. `cronstable.yaml` here is the whole personality:
 healthy pulses, a live log streamer, one failure with a log tail worth
 triaging (`backup-verify`), a retrying flaky job, a long runner, an
 SLA-monitored job, and a small DAG.
@@ -10,7 +10,7 @@ SLA-monitored job, and a small DAG.
 ## Access model (deliberately public)
 
 The instance serves **one credential: a `view`-scoped bearer token**,
-and it is public *by design* — it ships inside the app and sits right
+and it is public *by design*; it ships inside the app and sits right
 here in the compose file (default `cronstable-public-demo-view`). View
 scope reads jobs, runs, logs and `/summary`; every mutating call
 (run/cancel/pause, approvals, device pairing) answers 403 by scope.
@@ -36,7 +36,7 @@ hole, and TLS terminates at Cloudflare (nothing to renew here).
    **Docker**, and copy the token out of the command it shows you.
 2. Add a **public hostname** to that tunnel:
    - Subdomain `demo`, domain `cronstable.com`
-   - Type **HTTP**, URL **`cronstable-demo:8080`** — the daemon's name on
+   - Type **HTTP**, URL **`cronstable-demo:8080`**, the daemon's name on
      the compose network, not `localhost`; the tunnel runs in its own
      container. Cloudflare creates the DNS record for you.
 3. Put the token in place:
@@ -77,7 +77,7 @@ gets a chance to help.
 
 Uptime is then only as good as your house. That is fine for a demo, but
 App Store review can arrive at any hour and a dead demo backend is a
-plausible rejection, so it is worth monitoring — a `maxTimeSinceSuccess`
+plausible rejection, so it is worth monitoring. A `maxTimeSinceSuccess`
 SLA on another cronstable install, pointed at this one, is the
 self-hosted way to find out before Apple does.
 
@@ -85,6 +85,6 @@ self-hosted way to find out before Apple does.
 
 - Base URL: `https://demo.cronstable.com`
 - Token: the view token above (bake into the "Try the demo" action).
-- `GET /whoami` answers `{label: "public-demo-viewer", scopes: ["view"]}` —
+- `GET /whoami` answers `{label: "public-demo-viewer", scopes: ["view"]}`,
   exactly the shape the app uses to hide mutating affordances in demo
   mode.

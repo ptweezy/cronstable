@@ -5,7 +5,7 @@
 #
 # Two containers: the daemon, and a Cloudflare Tunnel that publishes it at
 # demo.cronstable.com.  The tunnel dials OUT to Cloudflare, so the host
-# needs no port forwarding, no static IP and no inbound firewall hole --
+# needs no port forwarding, no static IP and no inbound firewall hole,
 # which is what makes running this on a machine at home reasonable.  TLS
 # terminates at Cloudflare, so there is no certificate to manage here.
 
@@ -60,7 +60,7 @@ services:
     environment:
       # Required: the `:?` makes a missing token a startup error rather
       # than a container that quietly retries forever.  Keep it in .env,
-      # which is gitignored -- anyone holding it can publish traffic
+      # which is gitignored. Anyone holding it can publish traffic
       # through your tunnel.
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in example/demo-instance/.env}
     depends_on:
