@@ -180,7 +180,7 @@ def main():
             "configurable:true,get:()=>CL,set:(v)=>{const orig=v.mountGlyph;"
             "v.mountGlyph=function(slot,opts){const L=orig.call(v,slot,opts);"
             "L.sync=()=>{};if(L._raf)cancelAnimationFrame(L._raf);L._raf=0;"
-            "L.sim.opts.gusts=false;L.sim.setConnected(true);"
+            "L.sim.opts.breeze=false;L.sim.setConnected(true);"
             "L.sim.s=[0,0,0,0,0,0];L.sim.mode='balance';L.sim.a=0;"
             "L._render();window.__pendLogo=L;return L;};CL=v;}});})();"
         )
