@@ -658,8 +658,8 @@ daemon, job set, cluster, and schedules for real while it types:
 Even the wordmark is on duty: the `l` in the header's "cronstable" is a
 **live cart-and-double-pendulum simulation** balanced by a real LQR controller
 whose gains are computed in your browser at page load, not a canned
-animation. While the daemon is live it stands upright, riding out little
-gusts; sweep your cursor through it to brush it aside, right-click to knock
+animation. While the daemon is live it stands upright, swaying in a little
+breeze; sweep your cursor through it to brush it aside, right-click to knock
 it clean over. Lose the daemon and its motor cuts: the letter collapses out
 of the word and swings, and when the signal returns a planner threads the
 swing-up back into a verified catch; the word heals. Stability is the
@@ -2436,8 +2436,14 @@ your commits (DCO), and
 for how releases work. cronstable is [MIT-licensed](LICENSE); see
 [LICENSING.md](LICENSING.md) for how the repository's licensing is organized.
 
+**Security.** Please report vulnerabilities privately rather than in a public
+issue; [SECURITY.md](SECURITY.md) has the disclosure process, what is in scope
+(including the hosted relay and the public demo), and what to expect.
+
 **Trademarks.** The MIT License covers the code, not the brand. cronstable™ and
-the cronstable logo are trademarks of the cronstable authors; see
-[TRADEMARKS.md](TRADEMARKS.md).
+the cronstable logo are trademarks of Parker Loflin; see
+[TRADEMARKS.md](TRADEMARKS.md). The rendered logo artwork is also reserved
+rather than MIT-granted, while the code that draws it stays MIT; see
+[Brand assets](LICENSING.md#brand-assets).
 
 cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
