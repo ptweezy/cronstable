@@ -28,6 +28,9 @@ info:
     `web:` section is configured. Every route is documented in prose on the
     HTTP-API wiki page; this spec is the generated-client contract.
   version: "1.2.x"
+  contact:
+    name: cronstable
+    url: https://github.com/ptweezy/cronstable
   license:
     name: MIT
     url: https://github.com/ptweezy/cronstable/blob/main/LICENSE
