@@ -5,6 +5,14 @@ This repository is **MIT-licensed by default**. The full text is in
 directory that ships its own `LICENSE` file, which governs that directory
 instead.
 
+This file travels with the code: it is packaged (alongside
+[TRADEMARKS.md](TRADEMARKS.md)) into every wheel's `dist-info/licenses/`
+directory. Paths in this document are **repository paths**. A distribution will
+not contain most of them, because `pro/` and the `docs/` website tree are pruned
+from everything published (see `MANIFEST.in`); the paths still identify exactly
+which files each statement is about, and all of them can be inspected at
+<https://github.com/ptweezy/cronstable>.
+
 ## Why this file exists
 
 cronstable is planned to grow.
@@ -23,10 +31,51 @@ cronstable is planned to grow.
 | --- | --- | --- |
 | `/` core (`cronstable/`, docs, tests, CI, packaging, ...) | MIT | See [LICENSE](LICENSE). |
 | `pro/` | Proprietary | cronstable Pro (the `cronstable-pro` package). See [pro/LICENSE](pro/LICENSE). Not open source. |
+| rendered brand artwork under `docs/` | Reserved | The finished logo and social card. See [Brand assets](#brand-assets) below. |
 
 As more proprietary components are added, each gets its own `LICENSE` file under
 the same rule, and a row here. Proprietary directories are pruned from the public
 MIT sdist (see `MANIFEST.in`), so they are never distributed through PyPI.
+
+## Brand assets
+
+One narrow set of files is **excluded from the MIT grant**: the rendered brand
+artwork. These sit in directories that are otherwise MIT (they share `docs/img/`
+with dozens of ordinary screenshots), so a directory-level `LICENSE` file would
+claim too much. They are listed by name instead, in three places that a reader
+can reach from wherever they start:
+
+- [LICENSE](LICENSE) names the exclusion, so the operative grant is not silent
+  about its own scope.
+- this section holds the authoritative list.
+- [docs/img/README.md](docs/img/README.md) repeats it next to the files.
+
+The list:
+
+| Pattern | What it is |
+| --- | --- |
+| `docs/**/logo-balance.gif`, `docs/**/logo-balance.webp` | the animated wordmark, dark |
+| `docs/**/logo-balance-light.gif`, `docs/**/logo-balance-light.webp` | the animated wordmark, light |
+| `docs/**/social-preview.png` | the repository social card |
+
+These are the finished logo, not source. They may be reproduced **unmodified**
+when referring to cronstable itself, which is the same latitude the nominative
+fair use section of [TRADEMARKS.md](TRADEMARKS.md) gives the name: write about
+the project, link to it, illustrate a post about it. Every other right,
+including the right to modify them or to adopt them as the identity of another
+product, is reserved by Parker Loflin.
+
+Two things this deliberately does **not** do:
+
+- **It does not touch the logo engine.** The cart-and-double-pendulum simulation
+  that draws the wordmark lives in `cronstable/web/index.html` and
+  `docs/logo-lab.html`. Both are ordinary product source and stay MIT, so a fork
+  keeps a working dashboard and is free to run, study, and modify the physics.
+  What a fork may not do is keep calling the result cronstable, and that is a
+  trademark question rather than a copyright one.
+- **It is not retroactive.** Anyone who already received these files under the
+  MIT License keeps that grant for the copies they received. The reservation
+  applies going forward, which is the most any license change can do.
 
 ## Keeping the boundary clean
 
