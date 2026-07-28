@@ -658,8 +658,8 @@ daemon, job set, cluster, and schedules for real while it types:
 Even the wordmark is on duty: the `l` in the header's "cronstable" is a
 **live cart-and-double-pendulum simulation** balanced by a real LQR controller
 whose gains are computed in your browser at page load, not a canned
-animation. While the daemon is live it stands upright, riding out little
-gusts; sweep your cursor through it to brush it aside, right-click to knock
+animation. While the daemon is live it stands upright, swaying in a little
+breeze; sweep your cursor through it to brush it aside, right-click to knock
 it clean over. Lose the daemon and its motor cuts: the letter collapses out
 of the word and swings, and when the signal returns a planner threads the
 swing-up back into a verified catch; the word heals. Stability is the
