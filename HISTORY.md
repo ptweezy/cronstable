@@ -5,45 +5,9 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## Unreleased
+## 1.2.34 (2026-07-27)
 
-A presentation release: nothing in the daemon, the scheduler, the API or the
-CLI behaves differently. The header lockup sheds its tagline, the balanced
-`l`'s ambient motion is rebuilt so the mark breathes instead of being shoved,
-and the README's recorded loops are re-cut as a three-minute take.
-
-- **The header lockup drops the `// job scheduler` tag.** The wordmark now
-  stands alone beside the trademark and the version chips. The tag is gone
-  from the dashboard header (`cronstable/web/index.html`), its demo mirror,
-  the comparison page, and the social card; nothing else in the header moves.
-- **The standing `l` sways in a breeze instead of riding out gusts.** The
-  ambient disturbance on a balanced mark was a random gust every few seconds;
-  it is now a fast zero-mean Ornstein-Uhlenbeck flutter (0.8 s memory) whose
-  strength is breathed by a slow envelope (9 s memory, squared and saturated,
-  so a swell has a hard ceiling), giving swells, lulls and genuine near-still
-  spells with no sustained lean for the cart to walk away under. The wind
-  fades as the cart strays from the `l`'s cell (the track has only about
-  0.48 m of run-out on the "e" side) and eases back in after a catch, while
-  the mark is still balancing on reduced authority. The engine copies in the
-  dashboard, the demo, the logo lab and the comparison page stay identical.
-- **The README loops are re-recorded as a three-minute take**, up from about
-  40 seconds. The recording keeps the breeze off, so the mark stands dead
-  still between events and every disturbance is one of the seven theme-hop
-  glitches, each knocking the pendulum with a seeded random direction and
-  magnitude; the fourth cuts the signal outright for a full collapse and a
-  verified catch on reconnect. Still stretches are encoded as long frame
-  *durations* rather than frames, which is how a three-minute loop stays near
-  the size of the old 40-second one, and the final state settles sub-pixel
-  onto frame 0 so the seam is invisible.
-- **The loop clip is centered on the resting lockup.** It hugs the wordmark
-  vertically with a symmetric pad instead of spanning the mark's svg, whose
-  reserved below-rail swing room the choreography never fills; the deepest
-  swing ink across every frame stays 7 device px clear of the bottom edge.
-- **Screenshot scratch output is no longer tracked.**
-  `docs/screenshots/shots/` and `docs/screenshots/reel/` are gitignored and
-  their committed captures removed: raw captures land there for review, and
-  only the keepers copied over `docs/img/` are published. Everything in them
-  is regenerable by the capture scripts.
+- Logo changes: simplification
 
 ## 1.2.33 (2026-07-25)
 
