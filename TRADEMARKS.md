@@ -18,6 +18,18 @@ broad rights over the *code*: use, modification, and redistribution. It does
 Copyright and trademark are separate bodies of law: you keep every freedom the
 MIT License gives you over the source while the name and logo stay protected.
 
+## The artwork is reserved separately
+
+Trademark and copyright protect different things here. Trademark protects the
+**mark**: the name and the logo as identifiers that tell you where the software
+came from. Copyright protects the **artwork**: the specific rendered image
+files. So the logo is held back twice over, and the rendered logo files are also
+excluded from the MIT grant. The exact list is in the brand assets section of
+[LICENSING.md](LICENSING.md).
+
+The code that *draws* the logo stays MIT, like the rest of the source. The mark
+it produces is still a mark.
+
 ## What you may do without asking
 
 - Refer to the project by name, truthfully (nominative fair use), e.g. "a plugin
