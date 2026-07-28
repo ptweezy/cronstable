@@ -141,6 +141,7 @@ def test_jobcli_stub_matches_real_registration():
         ("_TUI_ENV_CLIENT_KEY", "cronstable.tui", "ENV_CLIENT_KEY"),
         ("_TUI_ENV_INSECURE", "cronstable.tui", "ENV_INSECURE"),
         ("_TUI_THEME_HUES", "cronstable.tui", "THEME_HUES"),
+        ("_TUI_THEME_NAMES", "cronstable.tui", "THEME_NAMES"),
     ],
 )
 def test_stub_constants_match_source(const_name, module_name, attr):

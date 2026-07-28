@@ -358,6 +358,21 @@ _TUI_ENV_CLIENT_CERT = "CRONSTABLE_WEB_CLIENT_CERT"
 _TUI_ENV_CLIENT_KEY = "CRONSTABLE_WEB_CLIENT_KEY"
 _TUI_ENV_INSECURE = "CRONSTABLE_WEB_INSECURE"
 _TUI_THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
+#: Mirrors cronstable.tui.THEME_NAMES: every hue's tiers, hue-grouped and
+#: darkest first.  Only carolina has a third (deep phosphor) tier.
+_TUI_THEME_NAMES = [
+    "carolina-dark",
+    "carolina",
+    "carolina-light",
+    "amber",
+    "amber-light",
+    "green",
+    "green-light",
+    "modern",
+    "modern-light",
+    "standard",
+    "standard-light",
+]
 
 
 def _add_mcp_stub(sub: Any) -> None:
@@ -524,8 +539,7 @@ def _add_tui_stub(sub: Any) -> None:
     parser.add_argument(
         "--theme",
         default=None,
-        choices=list(_TUI_THEME_HUES)
-        + [h + "-light" for h in _TUI_THEME_HUES],
+        choices=list(_TUI_THEME_NAMES),
         help="start on a specific theme (persisted for next time)",
     )
     parser.add_argument(

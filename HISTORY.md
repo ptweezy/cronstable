@@ -5,6 +5,34 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## Unreleased
+
+### A third Carolina tier, and it is the new default
+
+- **`carolina` is now a mid-tone theme** and the shipped default on both the
+  web dashboard and the TUI: the same Carolina-blue phosphor, lifted off black
+  onto a lit navy ground. Its five surfaces ride one Lab hue ray at flat
+  chroma with an even lightness ladder, so the chrome reads as one material.
+  The old near-black palette is unchanged and keeps its place under the new
+  name **`carolina-dark`**. `carolina-light` is untouched. Eleven themes now,
+  not ten.
+- **A theme is a hue plus a surface tier**, where it used to be a hue plus a
+  light/dark bool. `t` still cycles hues; `T` now steps the current hue's
+  tiers rather than flipping a flag, so it behaves exactly as before for the
+  four two-tier hues and walks deep, mid, paper for carolina. The TUI's
+  `theme`/`light` pref pair collapses into one full theme name, migrating the
+  old bool on read and dropping it on the next write. `--theme` gains
+  `carolina-dark`.
+- The raised floor costs the shared dark status inks their contrast, since
+  they were tuned against surfaces near black. Carolina mid re-inks the
+  eleven that cannot hold 4.5:1 down to `--hover`, along with two ANSI
+  positions and four color-vision remaps, on the same principle the paper
+  themes already use.
+- The CRT scanline and vignette strengths are scaled to the new ground.
+  At the phosphor themes' full strength the vignette pulled the edges of the
+  page a third of the way back down toward the deep theme, because those
+  values are calibrated against a background that is already black.
+
 ## 1.2.34 (2026-07-27)
 
 - Logo changes: simplification

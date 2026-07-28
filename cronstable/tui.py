@@ -655,16 +655,34 @@ def compute_view(
 
 
 # ===================================================================
-#  themes: the web dashboard's ten looks, re-inked in ANSI
+#  themes: the web dashboard's eleven looks, re-inked in ANSI
 # ===================================================================
-#: hue -> (dark aka phosphor, light aka paper) palettes.  Each palette is
-#: a flat name->#rrggbb map; the painter turns them into SGR sequences.
-#: Same five hues and the same t / T cycling as the web page.
+#: A theme is a hue plus a surface tier.  Most hues have two tiers, phosphor
+#: (dark) and paper (light); carolina has a third, its deep phosphor, because
+#: the default sits between the two.  Each palette is a flat name->#rrggbb
+#: map; the painter turns them into SGR sequences.  Same five hues and the
+#: same t / T cycling as the web page.
 THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
 
+#: hue -> its tiers, ordered darkest first (the order T walks them in).  This
+#: is the source of truth for which theme names exist; THEME_NAMES flattens it
+#: for the --theme choices and for validating a stored pref.
+THEME_TIERS: Dict[str, Tuple[str, ...]] = {
+    "carolina": ("carolina-dark", "carolina", "carolina-light"),
+    "amber": ("amber", "amber-light"),
+    "green": ("green", "green-light"),
+    "modern": ("modern", "modern-light"),
+    "standard": ("standard", "standard-light"),
+}
+THEME_NAMES = [name for hue in THEME_HUES for name in THEME_TIERS[hue]]
+
+#: What an unknown or unset theme resolves to.  Not THEME_NAMES[0]: the tier
+#: tuples run darkest first, so that would land on the deep phosphor.
+DEFAULT_THEME = "carolina"
+
 _P = {
-    # carolina: the default Carolina-blue CRT phosphor
-    "carolina": {
+    # carolina-dark: the deep Carolina-blue CRT phosphor
+    "carolina-dark": {
         "bg": "#06131d",
         "fg": "#9ed3f5",
         "bright": "#d3ecfd",
@@ -678,6 +696,27 @@ _P = {
         "pending": "#c9a94a",
         "warn": "#ffb64a",
         "off": "#3f5b6e",
+    },
+    # carolina: the default, the same phosphor lifted off black onto a lit
+    # navy ground (the web block's --bg / --hover, shared exactly).  The inks
+    # are re-solved for that ground rather than copied from the web theme:
+    # the TUI holds dim at ~3.3:1 and off at ~2.5:1 on purpose, so they recede,
+    # and border is a ~1.6:1 hairline.  Up here #4B9CD3 is too dark to carry
+    # text, so accent takes the lifted blue and the frame keeps its weight.
+    "carolina": {
+        "bg": "#192f40",
+        "fg": "#cce3fa",
+        "bright": "#e9f4fe",
+        "dim": "#5481a0",
+        "accent": "#8ec2ee",
+        "border": "#2e5066",
+        "sel": "#2e4355",
+        "ok": "#32d092",
+        "fail": "#ff817c",
+        "run": "#8ec2ee",
+        "pending": "#cdac4d",
+        "warn": "#fcb348",
+        "off": "#506c80",
     },
     "carolina-light": {
         "bg": "#eef4f9",
@@ -831,15 +870,42 @@ _CVD = {
 CVD_MODES = ["none", "deutan", "tritan"]
 
 
-class Theme:
-    """One resolved theme: named colours -> ready-made SGR fragments."""
+def theme_hue(name: str) -> str:
+    """The hue that owns a theme name (``carolina-dark`` -> ``carolina``)."""
+    for hue in THEME_HUES:
+        if name in THEME_TIERS[hue]:
+            return hue
+    return THEME_HUES[0]
 
-    def __init__(self, hue: str, light: bool, cvd: str = "none") -> None:
-        self.hue = hue if hue in THEME_HUES else THEME_HUES[0]
-        self.light = light
+
+def theme_tier_label(name: str) -> str:
+    """What ``T`` just landed on, for the toast and the settings sheet."""
+    if name.endswith("-light"):
+        return "paper"
+    if name.endswith("-dark"):
+        return "deep phosphor"
+    return "phosphor"
+
+
+class Theme:
+    """One resolved theme: named colours -> ready-made SGR fragments.
+
+    ``name`` is the full theme name and is authoritative; the hue and the
+    light flag are derived from it.  ``light`` is still accepted so the older
+    ``Theme(hue, light=True)`` spelling keeps working, but it only applies to
+    a bare hue: passing a full name wins.
+    """
+
+    def __init__(
+        self, name: str, light: bool = False, cvd: str = "none"
+    ) -> None:
+        if light and name in THEME_HUES:
+            name = THEME_TIERS[name][-1]
+        self.name = name if name in _P else DEFAULT_THEME
+        self.hue = theme_hue(self.name)
+        self.light = self.name.endswith("-light")
         self.cvd = cvd if cvd in _CVD else "none"
-        name = self.hue + ("-light" if light else "")
-        palette = dict(_P.get(name, _P["carolina"]))
+        palette = dict(_P[self.name])
         palette.update(_CVD[self.cvd])
         self.colors = palette
         # SGR fragments precomputed once per theme: fg()/bg() run for every
@@ -847,10 +913,6 @@ class Theme:
         # there dominated their cost.
         self._fg = {key: _sgr_fg(spec) for key, spec in palette.items()}
         self._bg = {key: _sgr_bg(spec) for key, spec in palette.items()}
-
-    @property
-    def name(self) -> str:
-        return self.hue + ("-light" if self.light else "")
 
     def fg(self, key: str) -> str:
         got = self._fg.get(key)
@@ -1209,8 +1271,7 @@ def colour_runs(cells: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
 # ===================================================================
 #: Defaults mirror the web page's prefs where they translate to a tty.
 PREF_DEFAULTS: Dict[str, Any] = {
-    "theme": "carolina",  # hue
-    "light": False,  # phosphor (dark) vs paper (light)
+    "theme": DEFAULT_THEME,  # full theme name, e.g. "carolina-dark"
     "cvd": "none",  # colour-vision remap
     "poll_ms": DEFAULT_POLL_MS,
     "wrap": False,  # log line wrap
@@ -1252,7 +1313,12 @@ def load_prefs(path: Optional[str] = None) -> Dict[str, Any]:
                 isinstance(default, float) and isinstance(value, (int, float))
             ):
                 prefs[key] = value
-    if prefs["theme"] not in THEME_HUES:
+        # Legacy prefs stored the tier as a separate "light" bool alongside a
+        # bare hue.  Fold it into the name; save_prefs writes only the keys in
+        # PREF_DEFAULTS, so the stale bool retires itself on the next write.
+        if raw.get("light") is True and prefs["theme"] in THEME_HUES:
+            prefs["theme"] = THEME_TIERS[str(prefs["theme"])][-1]
+    if prefs["theme"] not in THEME_NAMES:
         prefs["theme"] = PREF_DEFAULTS["theme"]
     if prefs["cvd"] not in CVD_MODES:
         prefs["cvd"] = "none"
@@ -2316,9 +2382,7 @@ class App:
         self.keys = keys
         self.prefs = prefs
         self.prefs_file = prefs_file
-        self.theme = Theme(
-            prefs["theme"], bool(prefs["light"]), str(prefs["cvd"])
-        )
+        self.theme = Theme(str(prefs["theme"]), cvd=str(prefs["cvd"]))
 
         # ---- data mirrors of the daemon ----
         self.jobs: List[Dict[str, Any]] = []
@@ -3242,8 +3306,7 @@ class AppActions(App):
     def _retheme(self) -> None:
         self.theme = Theme(
             str(self.prefs["theme"]),
-            bool(self.prefs["light"]),
-            str(self.prefs["cvd"]),
+            cvd=str(self.prefs["cvd"]),
         )
         # memoised log lines carry the old theme's SGR ink
         self._ansi_cache.clear()
@@ -3254,20 +3317,34 @@ class AppActions(App):
         save_prefs(self.prefs, self.prefs_file)
 
     def cycle_theme(self) -> None:
+        """``t``: next hue, holding the tier you are on.
+
+        Paper stays paper; any dark tier lands on the next hue's default, so
+        coming back around to carolina gives the mid tier rather than the deep
+        one you did not ask for.
+        """
         hues = THEME_HUES
-        idx = hues.index(str(self.prefs["theme"]))
-        self.prefs["theme"] = hues[(idx + 1) % len(hues)]
+        idx = hues.index(self.theme.hue)
+        hue = hues[(idx + 1) % len(hues)]
+        tiers = THEME_TIERS[hue]
+        self.prefs["theme"] = tiers[-1] if self.theme.light else hue
         self.save_prefs()
         self._retheme()
         self.toast("info", "◐ theme: %s" % self.theme.name)
 
     def toggle_light_dark(self) -> None:
-        self.prefs["light"] = not bool(self.prefs["light"])
+        """``T``: step the current hue's tiers, darkest first, wrapping.
+
+        For the two-tier hues that is exactly the old phosphor/paper flip;
+        carolina walks deep -> mid -> paper, so every tier stays reachable
+        from the keyboard.
+        """
+        tiers = THEME_TIERS[self.theme.hue]
+        nxt = tiers[(tiers.index(self.theme.name) + 1) % len(tiers)]
+        self.prefs["theme"] = nxt
         self.save_prefs()
         self._retheme()
-        self.toast(
-            "info", "◑ %s" % ("paper" if self.prefs["light"] else "phosphor")
-        )
+        self.toast("info", "◑ %s" % theme_tier_label(nxt))
 
     def cycle_cvd(self) -> None:
         idx = CVD_MODES.index(str(self.prefs["cvd"]))
@@ -5360,7 +5437,7 @@ class AppOverlays(AppRender):
             ("Theme", "%s" % self.theme.name, self.cycle_theme),
             (
                 "Light / dark",
-                "paper" if prefs["light"] else "phosphor",
+                theme_tier_label(self.theme.name),
                 self.toggle_light_dark,
             ),
             ("Color vision", str(prefs["cvd"]), self.cycle_cvd),
@@ -7541,7 +7618,7 @@ def add_tui_command(sub: Any) -> None:
     parser.add_argument(
         "--theme",
         default=None,
-        choices=list(THEME_HUES) + [h + "-light" for h in THEME_HUES],
+        choices=list(THEME_NAMES),
         help="start on a specific theme (persisted for next time)",
     )
     parser.add_argument(
@@ -7676,9 +7753,8 @@ def dispatch(args: Any) -> int:
         return 2
     prefs = load_prefs()
     if getattr(args, "theme", None):
-        theme = str(args.theme)
-        prefs["light"] = theme.endswith("-light")
-        prefs["theme"] = theme.replace("-light", "")
+        # argparse already constrains this to THEME_NAMES
+        prefs["theme"] = str(args.theme)
     if getattr(args, "ascii", False):
         prefs["ascii"] = True
     if getattr(args, "poll", None) is not None:

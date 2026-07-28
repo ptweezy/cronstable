@@ -30,10 +30,16 @@
   }
 
   /* ---------- dark phosphor themes ---------- */
-  html[data-theme="carolina"]{
+  html[data-theme="carolina-dark"]{
     --bg:#04070b;--bg2:#060c13;--panel:#081019;--panel2:#0b1620;--hover:#0f1e2b;
     --border:#173347;--border2:#22506e;--fg:#5cabde;--fg-dim:#4b9cd3;--fg-faint:#5a90b0;
     --accent:#b5ddf5;--glow:rgba(92,171,222,.5);--selbg:rgba(75,156,211,.12);
+  }
+  /* the default: the same phosphor lifted off black onto a lit navy ground */
+  html[data-theme="carolina"]{
+    --bg:#192f40;--bg2:#1e3445;--panel:#23394a;--panel2:#293e4f;--hover:#2e4355;
+    --border:#476680;--border2:#4b9cd3;--fg:#cce3fa;--fg-dim:#8ec2ee;--fg-faint:#94b9d3;
+    --accent:#a5cee9;--glow:rgba(75,156,211,.26);--selbg:rgba(75,156,211,.12);
   }
   html[data-theme="amber"]{
     --bg:#0a0806;--bg2:#0f0b07;--panel:#110c07;--panel2:#160f08;--hover:#1d1409;
@@ -416,6 +422,7 @@
   <span class="pill"><span class="dot live"></span>live</span>
   <select id="themeSel" title="Theme" aria-label="Theme">
         <option value="carolina">Carolina</option>
+        <option value="carolina-dark">Carolina · dark</option>
         <option value="carolina-light">Carolina · light</option>
         <option value="amber">Amber</option>
         <option value="amber-light">Amber · light</option>
@@ -825,7 +832,7 @@
 
         <tr>
           <td class="feat"><div class="f-name">Live web dashboard</div><div class="f-sub">tail · run · cancel</div></td>
-          <td class="cs yes"><span class="mk">✓</span><span class="cap">live tail · 10 themes</span></td>
+          <td class="cs yes"><span class="mk">✓</span><span class="cap">live tail · 11 themes</span></td>
           <td class="no" title="REST API only; no HTML dashboard, log tailing, or cancel."><span class="mk">–</span></td>
           <td class="no" title="Only a Prometheus /metrics endpoint; no web dashboard or run/cancel."><span class="mk">–</span></td>
           <td class="no" title="No web UI; open feature request, no --enable-web flag."><span class="mk">–</span></td>
@@ -1000,8 +1007,8 @@
       <div class="ph"><span class="pi" aria-hidden="true">
         <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="1.4"></rect><path d="M8 20h8M12 16v4"></path></svg>
       </span>Live console</div>
-      <p>A web dashboard that <b>tails logs</b>, <b>runs and cancels</b> jobs on demand, and walks any DAG's task graph, with 10 phosphor themes. Backed by an <b>HTTP REST API</b> and native <b>Prometheus + statsd</b>.</p>
-      <div class="tags"><span>live tail</span><span>run/cancel</span><span>REST API</span><span>Prometheus</span><span>10 themes</span></div>
+      <p>A web dashboard that <b>tails logs</b>, <b>runs and cancels</b> jobs on demand, and walks any DAG's task graph, with 11 phosphor themes. Backed by an <b>HTTP REST API</b> and native <b>Prometheus + statsd</b>.</p>
+      <div class="tags"><span>live tail</span><span>run/cancel</span><span>REST API</span><span>Prometheus</span><span>11 themes</span></div>
     </div>
 
     <div class="pil">

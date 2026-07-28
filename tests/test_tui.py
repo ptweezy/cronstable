@@ -551,8 +551,36 @@ def test_theme_lookup_and_cvd():
     assert dark.colors["bg"] != light.colors["bg"]
     deutan = Theme("carolina", light=False, cvd="deutan")
     assert deutan.colors["ok"] != dark.colors["ok"]
-    # unknown hue falls back rather than raising
+    # unknown hue falls back rather than raising, and lands on the DEFAULT
+    # tier (the tier tuples run darkest first, so not simply THEME_NAMES[0])
     assert Theme("nope", light=False).hue == "carolina"
+    assert Theme("nope", light=False).name == "carolina"
+
+
+def test_theme_tiers():
+    """carolina carries three surface tiers; every other hue carries two."""
+    assert tui.THEME_TIERS["carolina"] == (
+        "carolina-dark",
+        "carolina",
+        "carolina-light",
+    )
+    for hue in tui.THEME_HUES:
+        if hue != "carolina":
+            assert tui.THEME_TIERS[hue] == (hue, hue + "-light")
+    # every name resolves to its own palette; none silently share one
+    assert len(tui.THEME_NAMES) == 11
+    bgs = {n: Theme(n).colors["bg"] for n in tui.THEME_NAMES}
+    assert len(set(bgs.values())) == 11, bgs
+    # the three carolina tiers step monotonically from deep to paper
+    tiers = [Theme(n).colors["bg"] for n in tui.THEME_TIERS["carolina"]]
+    lums = [int(c[1:3], 16) + int(c[3:5], 16) + int(c[5:7], 16) for c in tiers]
+    assert lums[0] < lums[1] < lums[2], tiers
+    # name is authoritative; hue and light are derived from it
+    assert Theme("carolina-dark").hue == "carolina"
+    assert Theme("carolina-dark").light is False
+    assert Theme("carolina-light").light is True
+    # the legacy Theme(hue, light=True) spelling still resolves
+    assert Theme("amber", light=True).name == "amber-light"
 
 
 def test_prefs_roundtrip(tmp_path):
@@ -573,6 +601,76 @@ def test_prefs_roundtrip(tmp_path):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"theme": "plaid"}, fh)
     assert load_prefs(path)["theme"] == "carolina"
+    # full tier names survive a round trip
+    for name in ("carolina-dark", "carolina-light", "amber-light"):
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"theme": name}, fh)
+        assert load_prefs(path)["theme"] == name
+
+
+def test_prefs_migrate_legacy_light_bool(tmp_path):
+    """Old prefs stored the tier as a separate bool beside a bare hue."""
+    path = str(tmp_path / "tui.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"theme": "amber", "light": True}, fh)
+    prefs = load_prefs(path)
+    assert prefs["theme"] == "amber-light"
+    assert "light" not in prefs
+    # light=False keeps the bare hue, which is now the default tier
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"theme": "green", "light": False}, fh)
+    assert load_prefs(path)["theme"] == "green"
+    # and the stale bool is dropped on the next write
+    save_prefs(load_prefs(path), path)
+    with open(path, encoding="utf-8") as fh:
+        assert "light" not in json.load(fh)
+
+
+def test_theme_tiers_match_the_web_page():
+    """The theme table is hand-copied into three places and nothing else
+    pins it: the JS ``THEME_TIERS``, the CSS palette blocks, and this
+    module's ``THEME_TIERS``.  A name that exists on one side but not the
+    others is the failure mode that matters, because the page derives the
+    ``data-theme`` attribute from the list and a name with no palette block
+    renders with every surface variable unset (:root defines only the status
+    and ANSI inks), i.e. an unstyled page rather than a graceful fallback.
+    """
+    import pathlib
+    import re
+
+    web_html = (
+        pathlib.Path(tui.__file__).parent / "web" / "index.html"
+    ).read_text(encoding="utf-8")
+
+    block = re.search(
+        r"const THEME_TIERS = \{(.*?)\n  \};", web_html, re.S
+    )
+    assert block, "THEME_TIERS not found in web/index.html"
+    web_tiers = {
+        hue: tuple(re.findall(r'"([^"]+)"', names))
+        for hue, names in re.findall(
+            r"(\w+):\s*\[([^\]]*)\]", block.group(1)
+        )
+    }
+    assert web_tiers == tui.THEME_TIERS
+
+    # every reachable name has a CSS palette block defining all 13 surface
+    # variables, so no keyboard path can land on an unstyled theme
+    required = {
+        "--bg", "--bg2", "--panel", "--panel2", "--hover", "--border",
+        "--border2", "--fg", "--fg-dim", "--fg-faint", "--accent",
+        "--glow", "--selbg",
+    }
+    for name in tui.THEME_NAMES:
+        rule = re.search(
+            r'html\[data-theme="%s"\]\s*\{(.*?)\n  \}' % re.escape(name),
+            web_html,
+            re.S,
+        )
+        assert rule, "no CSS palette block for theme %r" % name
+        declared = set(re.findall(r"(--[a-z0-9-]+):", rule.group(1)))
+        missing = required - declared
+        assert not missing, "%s is missing %s" % (name, sorted(missing))
 
 
 def test_help_overlay_carries_the_web_table():
@@ -1203,13 +1301,25 @@ async def test_theme_cycling_persists(tmp_path):
         app = await h.start(tmp_path)
         await _wait_for(lambda: len(app.jobs) == 1)
         assert app.theme.hue == "carolina"
+        # the default is the mid tier, not the deep phosphor
+        assert app.theme.name == "carolina"
+        # T walks carolina's three tiers and wraps back to the mid one
+        h.keys.send("T")
+        await _wait_for(lambda: app.theme.name == "carolina-light")
+        h.keys.send("T")
+        await _wait_for(lambda: app.theme.name == "carolina-dark")
+        assert app.theme.light is False
+        h.keys.send("T")
+        await _wait_for(lambda: app.theme.name == "carolina")
+        # t moves the hue, holding the tier
         h.keys.send("t")
         await _wait_for(lambda: app.theme.hue == "amber")
         h.keys.send("T")
         await _wait_for(lambda: app.theme.light)
         saved = load_prefs(str(tmp_path / "prefs.json"))
-        assert saved["theme"] == "amber"
-        assert saved["light"] is True
+        assert saved["theme"] == "amber-light"
+        # the tier lives in the name now; the legacy bool is not written
+        assert "light" not in saved
     finally:
         await h.stop()
 
@@ -1518,7 +1628,7 @@ async def test_ansi_memo_repaint_is_identical_and_regex_free(
     # the memo hands back the same entry object on a hit
     assert app._ansi_line("plain 005") is app._ansi_line("plain 005")
     # a theme change invalidates the memo: entries carry theme ink
-    app.prefs["light"] = not app.prefs["light"]
+    app.prefs["theme"] = "carolina-light"
     app._retheme()
     assert app._ansi_cache == {}
     app._drawer_logs(tui.Painter(app.theme), 100, 20)

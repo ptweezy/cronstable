@@ -47,10 +47,12 @@ WHOAMI_BODY = json.dumps(
     }
 )
 
-# the full theme matrix (5 hues x dark/paper); the overview is shot under all
-# ten to drive the theme-row loop, other scenes take a tasteful subset
+# the full theme matrix: five hues, each in a phosphor and a paper tier, plus
+# carolina's third (deep phosphor) tier. The overview is shot under all eleven
+# to drive the theme-row loop, other scenes take a tasteful subset
 ALL_THEMES = [
     "carolina", "amber", "green", "modern", "standard",
+    "carolina-dark",
     "carolina-light", "amber-light", "green-light",
     "modern-light", "standard-light",
 ]
@@ -337,7 +339,7 @@ def main():
         api("POST", "/jobs/risk-model-recompute/start")  # 30s CPU burn
         page.wait_for_timeout(7000)
 
-        # ---- overview: the marquee frame, shot under ALL ten themes ----
+        # ---- overview: the marquee frame, shot under ALL eleven themes ----
         if wants("overview"):
             close_overlays(page)
             set_sort(page)

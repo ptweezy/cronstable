@@ -1,7 +1,7 @@
 """Render social-card.html to the 1280x640 GitHub social-preview PNG.
 
 Needs no daemon: the card is a static page styled after the dashboard's
-carolina theme, with docs/img/dashboard-overview.png inset for the product
+carolina-dark theme, with docs/img/dashboard-overview.png inset for the product
 shot (regenerate that first if the UI changed). The PNG lands in shots/;
 GitHub wants it uploaded by hand under Settings -> General -> Social preview
 (there is no API for it), and the upload limit is 1 MB.

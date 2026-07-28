@@ -10,7 +10,7 @@ seamless loops:
   (colour-vision-safe palette, larger UI scale, the settings panel). No theme
   or font cycling here -- the variety is the screens.
 * `dashboard-themes.webp` -- the theme + font showcase: the identical overview
-  frame under all ten themes, each shown in both the terminal monospace and
+  frame under all eleven themes, each shown in both the terminal monospace and
   the readable proportional-sans interface font.
 
 Each also gets a `.gif` twin as a fallback for clients that don't render
@@ -91,7 +91,7 @@ SEGMENTS = [
 # the readable sans interface font, dissolving between each -- so it showcases
 # the theme axis and the font axis together. ----
 THEME_ORDER = [
-    "carolina", "carolina-light", "amber", "amber-light",
+    "carolina-dark", "carolina", "carolina-light", "amber", "amber-light",
     "green", "green-light", "modern", "modern-light",
     "standard", "standard-light",
 ]

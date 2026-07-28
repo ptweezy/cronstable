@@ -243,6 +243,7 @@ def main():
             ("amber", "dashboard-theme-amber"),
             ("green", "dashboard-theme-green"),
             ("modern", "dashboard-theme-modern"),
+            ("carolina-dark", "dashboard-theme-carolina-dark"),
             ("carolina-light", "dashboard-theme-carolina-light"),
         ]:
             if not wants(fname):
@@ -257,7 +258,9 @@ def main():
                 results[fname] = f"FAIL {e}"
         if not ONLY or any(
             wants(f"dashboard-theme-{t}")
-            for t in ("amber", "green", "modern", "carolina-light")
+            for t in (
+                "amber", "green", "modern", "carolina-dark", "carolina-light",
+            )
         ):
             fresh(page)  # back to the default carolina
 

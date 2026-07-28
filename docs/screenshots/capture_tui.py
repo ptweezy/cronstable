@@ -190,18 +190,20 @@ async def capture_all():  # noqa: C901 - one linear staging walk
         await snap(app, term, "tui-overview")
 
     # ---- theme variants on the same board ----------------------------
-    for hue, light, fname in [
-        ("amber", False, "tui-theme-amber"),
-        ("green", False, "tui-theme-green"),
-        ("modern", False, "tui-theme-modern"),
-        ("carolina", True, "tui-theme-carolina-light"),
+    for theme, fname in [
+        ("amber", "tui-theme-amber"),
+        ("green", "tui-theme-green"),
+        ("modern", "tui-theme-modern"),
+        ("carolina-dark", "tui-theme-carolina-dark"),
+        ("carolina-light", "tui-theme-carolina-light"),
     ]:
         if not wants(fname):
             continue
-        app.prefs["theme"], app.prefs["light"] = hue, light
+        app.prefs["theme"] = theme
         app._retheme()
         await snap(app, term, fname)
-    app.prefs["theme"], app.prefs["light"] = "carolina", False
+    # back to the default tier: every remaining shot is taken on it
+    app.prefs["theme"] = "carolina"
     app._retheme()
 
     # ---- job drawer: live logs on the 5s heartbeat probe -------------
@@ -408,19 +410,22 @@ SGR = re.compile(r"\x1b\[([0-9;]*)m")
 ANSI_ANY = re.compile(
     r"\x1b(?:\[[0-9;:?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?)"
 )
-DEF_FG = "#9ed3f5"
+#: the default tier's ink, used by every shot that is not a theme variant
+DEF_FG = "#cce3fa"
 
 #: per-theme page/window chrome behind the frame (theme -> bg of frame)
 _THEME_BG = {
     "tui-theme-amber": "#160d02",
     "tui-theme-green": "#03130a",
     "tui-theme-modern": "#101418",
+    "tui-theme-carolina-dark": "#06131d",
     "tui-theme-carolina-light": "#eef4f9",
 }
 _THEME_FG = {
     "tui-theme-amber": "#f5c169",
     "tui-theme-green": "#7ee2a1",
     "tui-theme-modern": "#d7dde3",
+    "tui-theme-carolina-dark": "#9ed3f5",
     "tui-theme-carolina-light": "#173751",
 }
 
@@ -489,10 +494,10 @@ def row_to_html(row, def_fg):
 
 
 def frame_html(name, rows):
-    term_bg = _THEME_BG.get(name, "#06131d")
+    term_bg = _THEME_BG.get(name, "#192f40")
     def_fg = _THEME_FG.get(name, DEF_FG)
     body = "\n".join(row_to_html(r.rstrip(), def_fg) or "&nbsp;" for r in rows)
-    bar_bg = "#0a1a28" if name not in _THEME_BG else term_bg
+    bar_bg = "#1e3445" if name not in _THEME_BG else term_bg
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>
 html,body {{ margin:0; padding:24px; background:#101418; }}
 .term {{

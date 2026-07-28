@@ -854,6 +854,13 @@ async def test_tour_themes_cvd_ascii_and_narrow(tmp_path):
         await _wait_for(lambda: len(app.jobs) == 1)
         app.prefs["compact"] = True
         app.prefs["ascii"] = True
+        # every one of the eleven palettes gets a render pass, including
+        # carolina's third (deep phosphor) tier, which a plain hue cycle
+        # never visits
+        for name in tui.THEME_NAMES:
+            app.prefs["theme"] = name
+            app._retheme()
+            await snap_text(h)
         for _ in tui.THEME_HUES:
             app.cycle_theme()
             await snap_text(h)

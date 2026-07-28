@@ -93,8 +93,9 @@
     --glow:     rgba(121, 192, 255, .0);
     --selbg:    rgba(121, 192, 255, .12);
   }
-  /* Carolina Blue CRT phosphor — #4B9CD3 is the hero (seated as --fg-dim) */
-  html[data-theme="carolina"] {
+  /* Carolina Blue CRT phosphor, the deep tier: #4B9CD3 is the hero (seated as
+     --fg-dim) */
+  html[data-theme="carolina-dark"] {
     --bg:       #04070b;
     --bg2:      #060c13;
     --panel:    #081019;
@@ -108,6 +109,56 @@
     --accent:   #b5ddf5;
     --glow:     rgba(92, 171, 222, .5);
     --selbg:    rgba(75, 156, 211, .12);
+  }
+  /* Carolina mid, the default: the same phosphor lifted off black onto a lit
+     navy ground. The five surfaces ride one Lab hue ray at flat chroma with an
+     even L* ladder (18.4 to 27.4, steps within 0.04 of each other), so the
+     chrome reads as one material rather than a stack of greys. Up here
+     #4B9CD3 is too dark to carry text, so the brand hex seats at --border2 and
+     --fg-dim takes the hero's place at reading weight. */
+  html[data-theme="carolina"] {
+    --bg:       #192f40;
+    --bg2:      #1e3445;
+    --panel:    #23394a;
+    --panel2:   #293e4f;
+    --hover:    #2e4355;
+    --border:   #476680;
+    --border2:  #4b9cd3;
+    --fg:       #cce3fa;
+    --fg-dim:   #8ec2ee;
+    --fg-faint: #94b9d3;
+    --accent:   #a5cee9;
+    /* half the deep tier's glow: 6px of bloom that vanishes into black reads as
+       haze once the ground has light in it */
+    --glow:     rgba(75, 156, 211, .26);
+    --selbg:    rgba(75, 156, 211, .12);
+
+    /* The raised floor costs the shared dark inks their contrast: --hover is
+       L* 27 here where the other phosphor themes sit near L* 5. Same rule as
+       the paper block below, and the same binding surface: every ink has to
+       hold 4.5:1 all the way down to --hover, so the ones that cannot are
+       re-lifted along their own hue. --ok, --pending and --paused already
+       clear it and stay verbatim. */
+    --fail:             #ffa195;
+    --run:              #79b7ff;
+    --disabled:         #abb3bf;
+    --cancelled:        #d39dff;
+    --unknown:          #c9d4e1;
+    --peer-agreed:      #51c95e;
+    --peer-syncing:     #e2a732;
+    --peer-bad:         #ff9284;
+    --peer-unreachable: #bac3ce;
+    --peer-self:        #accbff;
+    --peer-unknown:     #abb3bf;
+    /* the three neutrals take a wider band (L* 72.7 / 78.5 / 84.6) than the
+       chromatics do: greys can only be told apart by lightness, which is
+       exactly what the floor compresses */
+
+    /* black and bright-black: :root's #555 tops out at 2.8:1 on pure black, so
+       it clears nothing on any well, and lifting it alone would land it 0.4 L*
+       from --ansi-90, so the pair moves together */
+    --ansi-30:          #8b939c;
+    --ansi-90:          #b0b8c4;
   }
   /* "standard" — the family's plain member: neutral charcoal, saturated
      inks, no phosphor physics (flat like modern) */
@@ -308,6 +359,21 @@
     --peer-self: #5a45c9;
     --ansi-32: #0d5c25; --ansi-36: #187884;
   }
+  /* carolina mid needs the same 4.5:1-down-to---hover treatment applied to the
+     remapped inks. These are (0,2,1) selectors, so they beat the [data-cvd]
+     blocks above on specificity and the whole theme stays in one region of the
+     file. Only the inks that miss the floor move. */
+  html[data-cvd="deutan"][data-theme="carolina"] {
+    --fail: #ff9970;          /* the vermillion is L* 63 and reads 3.6 on --hover */
+    --peer-bad: #ff9970;
+    --peer-agreed: #21c79f;   /* 4.54 on --hover, no margin */
+    /* lifting peer-agreed walks it into --ok, which a deuteranope separates by
+       lightness alone (simulated dE 4.3 -> 3.5), so --ok moves up too: 6.3 */
+    --ok: #41ecc1;
+  }
+  html[data-cvd="tritan"][data-theme="carolina"] {
+    --peer-self: #bba6ff;     /* 4.48 on --hover */
+  }
 
   * { box-sizing: border-box; }
   html { height: 100%; }
@@ -382,6 +448,24 @@
   html[data-theme$="-light"] body.fx #crt::after {
     background: radial-gradient(ellipse at center,
       rgba(0,0,0,0) 55%, rgba(0,0,0,.12) 100%);
+  }
+  /* the same problem one tier up. These strengths are calibrated against a bg
+     that is already black, where subtracting 45% of nothing costs nothing.
+     Carolina mid has real light in its surfaces, so at full strength the
+     vignette drags the edges of the page a third of the way back down to the
+     deep theme and the scanlines stripe the text instead of sitting under it.
+     Scaled to the ground it actually renders on. */
+  html[data-theme="carolina"] body.scan #crt::before {
+    background: repeating-linear-gradient(
+      to bottom,
+      rgba(0,0,0,0) 0px,
+      rgba(0,0,0,0) 1px,
+      rgba(0,0,0,.07) 1px,
+      rgba(0,0,0,.07) 3px);
+  }
+  html[data-theme="carolina"] body.fx #crt::after {
+    background: radial-gradient(ellipse at center,
+      rgba(0,0,0,0) 62%, rgba(0,0,0,.15) 100%);
   }
   body.fx.flicker #crt { animation: flicker 3.2s infinite steps(60); }
   @keyframes flicker {
@@ -705,7 +789,10 @@
   }
   html[data-theme="amber"] .term { background: #070502; color: #e8c98a; }
   html[data-theme="green"] .term { background: #030806; color: #b6ffce; }
-  html[data-theme="carolina"] .term { background: #030609; color: #9fd0ee; }
+  html[data-theme="carolina-dark"] .term { background: #030609; color: #9fd0ee; }
+  /* the mid theme's well sits just under its --bg (L* 16.1 vs 18.4) so the log
+     still reads as a recessed pane without punching a black hole in the page */
+  html[data-theme="carolina"] .term { background: #152a3a; color: #bad5ef; }
   /* paper terms: ink on paper, no glass-black well */
   html[data-theme$="-light"] .term { background: #f6f8fa; color: #1f2328; }
   html[data-theme="amber-light"] .term { background: #fbf4e0; color: #4a3606; }
@@ -1821,10 +1908,11 @@
     <h3>settings</h3>
     <div class="body">
       <div class="setrow">
-        <span class="lab">Theme<small>phosphor (dark) or paper (light)</small></span>
+        <span class="lab">Theme<small>phosphor (dark) or paper (light); carolina adds a deeper phosphor</small></span>
         <select class="mini" id="setTheme">
           <optgroup label="phosphor">
             <option value="carolina">carolina</option>
+            <option value="carolina-dark">carolina (dark)</option>
             <option value="amber">amber</option>
             <option value="green">green</option>
             <option value="modern">modern (no CRT)</option>
@@ -2023,7 +2111,6 @@
 <div id="bootScreen" class="boot" style="display:none" aria-hidden="true" role="status" aria-live="polite">
   <div class="boot-log" id="bootLog"></div>
 </div>
-
 <script id="cronstable-demo-backend">
 /* Injected before the dashboard app; patches window.fetch to serve a synthetic fleet. */
 try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
@@ -9837,34 +9924,59 @@ var qrcode = function() {
   // ===================================================================
   //  settings / theme / prefs application
   // ===================================================================
-  // every theme is a hue x variant pair: "green" (phosphor) / "green-light" (paper)
+  // A theme is a hue plus a surface tier. Most hues have two tiers, phosphor
+  // and paper ("green" / "green-light"); carolina has a third, its deep
+  // phosphor ("carolina-dark"), because the default sits between the two.
+  // THEME_TIERS is the single source of truth for what names exist: the tier
+  // lists are ordered darkest first, which is the order T walks them in.
   const THEME_HUES = ["carolina", "amber", "green", "modern", "standard"];
+  const THEME_TIERS = {
+    carolina: ["carolina-dark", "carolina", "carolina-light"],
+    amber:    ["amber", "amber-light"],
+    green:    ["green", "green-light"],
+    modern:   ["modern", "modern-light"],
+    standard: ["standard", "standard-light"],
+  };
+  const THEME_NAMES = THEME_HUES.flatMap((h) => THEME_TIERS[h]);
   const FLAT_HUES = ["modern", "standard"];   // no CRT physics on these
+  // The theme name is authoritative; hue and tier are derived from it, never
+  // recombined into one. Reassembling a {hue, light} pair by concatenation is
+  // what would let a "carolina-dark" + light pair serialize to the nonexistent
+  // "carolina-dark-light", which has no palette block at all.
   function themeParts(t) {
-    const light = /-light$/.test(t);
-    const hue = light ? t.slice(0, -6) : t;
     // self-heal a garbage stored pref (old builds, hand-edited localStorage)
-    return { hue: THEME_HUES.includes(hue) ? hue : "carolina", light };
+    const name = THEME_NAMES.includes(t) ? t : "carolina";
+    const hue = THEME_HUES.find((h) => THEME_TIERS[h].includes(name));
+    return { name, hue, light: /-light$/.test(name) };
   }
   function applyTheme() {
     const p = themeParts(prefs.theme);
-    document.documentElement.setAttribute("data-theme", p.hue + (p.light ? "-light" : ""));
+    document.documentElement.setAttribute("data-theme", p.name);
     // CRT effects are meaningless on the flat themes (modern, standard)
     const fxAllowed = !FLAT_HUES.includes(p.hue);
     document.body.classList.toggle("fx", prefs.fx && fxAllowed);
     document.body.classList.toggle("flicker", prefs.fx && fxAllowed);
     document.body.classList.toggle("scan", prefs.scan && fxAllowed);
   }
-  function setTheme(v) { prefs.theme = v; savePref("theme"); applyTheme(); syncSettings(); }
+  // normalize on the way in, so an unknown name can never reach localStorage
+  function setTheme(v) { prefs.theme = themeParts(v).name; savePref("theme"); applyTheme(); syncSettings(); }
+  // t: next hue, holding the tier you are on. Paper stays paper; any dark tier
+  // lands on the next hue's default (for carolina that is the mid one, not the
+  // deep one, so a plain hue cycle never dead-ends in a tier you did not pick).
   function cycleTheme() {
     const p = themeParts(prefs.theme);
     const hue = THEME_HUES[(THEME_HUES.indexOf(p.hue) + 1) % THEME_HUES.length];
-    setTheme(hue + (p.light ? "-light" : ""));
+    const tiers = THEME_TIERS[hue];
+    setTheme(p.light ? tiers[tiers.length - 1] : hue);
     toast("info", "theme: " + prefs.theme);
   }
+  // T: step the current hue's tiers, darkest first and wrapping. For the
+  // two-tier hues that is exactly the old dark/paper flip; carolina walks
+  // deep -> mid -> paper, so every tier stays reachable from the keyboard.
   function toggleLightDark() {
     const p = themeParts(prefs.theme);
-    setTheme(p.light ? p.hue : p.hue + "-light");
+    const tiers = THEME_TIERS[p.hue];
+    setTheme(tiers[(tiers.indexOf(p.name) + 1) % tiers.length]);
     toast("info", "theme: " + prefs.theme);
   }
   function setFx(v) { prefs.fx = v; savePref("fx"); applyTheme(); syncSettings(); }
@@ -9926,7 +10038,10 @@ var qrcode = function() {
     prefs.notify = v && ("Notification" in window); savePref("notify"); syncSettings(); restartPolling();
   }
   function syncSettings() {
-    $("setTheme").value = prefs.theme;
+    // the normalized name, not the raw pref: a stored theme with no <option>
+    // (a hand-edited value, or a name from a newer build) would otherwise set
+    // the select to "" and render the row blank while the page paints fine
+    $("setTheme").value = themeParts(prefs.theme).name;
     $("setFx").checked = prefs.fx;
     $("setScan").checked = prefs.scan;
     $("setDensity").checked = prefs.density;

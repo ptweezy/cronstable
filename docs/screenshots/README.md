@@ -58,7 +58,7 @@ clipping. To refresh them after a UI change:
    ```
 
 5. **The GitHub social-preview card** (`social-preview.png`, 1280x640) is
-   rendered from `social-card.html`, a static page styled after the carolina
+   rendered from `social-card.html`, a static page styled after the carolina-dark
    theme with `docs/img/dashboard-overview.png` inset as the product shot, so
    regenerate that overview first if the UI changed. Also needs Pillow:
 
@@ -95,7 +95,7 @@ clipping. To refresh them after a UI change:
 ## Regenerating the animated hero reel + theme row
 
 The README's two animated loops — `docs/img/dashboard-reel.webp` (the hero
-tour) and `docs/img/dashboard-themes.webp` (the ten-theme sweep), each with a
+tour) and `docs/img/dashboard-themes.webp` (the eleven-theme sweep), each with a
 `.gif` twin — are built in two steps off the **same running grand-tour fleet**
 as the stills above (so boot it first, per step 1, and let it warm):
 
@@ -118,7 +118,7 @@ long-duration frame and **cutting hard** between screens (a cut costs zero
 frames). The hero reel stays in **one style throughout** — the light carolina
 theme, terminal monospace — and gets its variety from the different screens it
 tours. The theme + font showcase is the theme row, which cuts through the
-overview under all ten themes, each in both the monospace and the readable
+overview under all eleven themes, each in both the monospace and the readable
 sans interface font. Both loops are cut-only (no soft dissolve frames), so
 every frame is a pristine still and they run at full 1600px / q94. Tune the
 `SEGMENTS` timeline and per-asset width/quality at the top of the script and

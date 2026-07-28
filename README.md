@@ -155,7 +155,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 * Optional **[live control panel](#web-dashboard)**: watch every job's status,
   tail its logs in real time, run or cancel jobs on demand, review run history
   and success rates, drive DAG runs and approvals, and keep an eye on the whole
-  cluster, from one self-contained page with ten themes and a shortcut for
+  cluster, from one self-contained page with eleven themes and a shortcut for
   everything and a **[terminal twin](#terminal-dashboard)**
   (`cronstable tui`) with the same keys
 
@@ -610,16 +610,18 @@ counters, artifacts, and quarantine.
 
 ### Make it yours
 
-**Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor),
-amber and green phosphor, and flat **modern** and **standard** looks, each in
-a dark (phosphor) and a light (paper) variant. Cycle hues with `t`, flip
-light/dark with `T`. CRT glow, scanlines, compact density, desktop failure
+**Eleven themes**: **carolina** (the default, a Carolina-blue CRT phosphor
+lifted off black onto a lit navy ground), amber and green phosphor, and flat
+**modern** and **standard** looks, each in a dark (phosphor) and a light
+(paper) variant. Carolina carries a third: **carolina-dark**, the deep
+phosphor, for rooms where the mid tone is still too bright. Cycle hues with
+`t`, step the current hue's surfaces with `T`. CRT glow, scanlines, compact density, desktop failure
 notifications, audible cues, and the polling interval are all toggles,
 remembered per browser, and the CRT effects honor `prefers-reduced-motion`:
 
-[![The same cronstable board cycling through all ten themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)
+[![The same cronstable board cycling through all eleven themes (carolina, amber, green, modern and standard, each in a dark phosphor and a light paper variant, plus carolina's deep phosphor tier) and, for each, the terminal monospace and the readable proportional-sans interface font](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp)
 
-*(One board, ten themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
+*(One board, eleven themes, two interface fonts, animated: [WebP](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.webp), [GIF](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-themes.gif). The four stills below are pulled from it.)*
 
 | Amber phosphor CRT | Green phosphor CRT |
 | :---: | :---: |
@@ -739,8 +741,8 @@ is calm); the **heatmap** turns history into a punchcard and the
 | :---: | :---: | :---: |
 | [![The wallboard: worst-first tiles with failure ages and exit codes, run sparklines, and the tally foot](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-wallboard.png) | [![The activity heatmap: one row per job, one cell per hour, worst outcome colored and shaded by volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-heatmap.png) | [![The state inspector: store inventory, record streams, and document namespaces from the durable state store](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-state.png) |
 
-The **same ten themes** as the browser (`t` cycles the hue, `T` flips
-phosphor ↔ paper), with the same colour-vision-safe remaps and an
+The **same eleven themes** as the browser (`t` cycles the hue, `T` steps
+that hue's surfaces), with the same colour-vision-safe remaps and an
 `--ascii` glyph mode:
 
 | Amber phosphor | Green phosphor |
