@@ -3,6 +3,10 @@
 Thanks for working on cronstable! This document covers local development and,
 importantly, how releases are cut.
 
+One routing note before anything else: **security problems do not go in the
+issue tracker**. [SECURITY.md](SECURITY.md) has the private reporting route and
+what to include.
+
 ## Signing off your commits (DCO)
 
 cronstable uses the [Developer Certificate of Origin](DCO) (DCO): a lightweight,

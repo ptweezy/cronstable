@@ -5,6 +5,14 @@ This repository is **MIT-licensed by default**. The full text is in
 directory that ships its own `LICENSE` file, which governs that directory
 instead.
 
+This file travels with the code: it is packaged (alongside
+[TRADEMARKS.md](TRADEMARKS.md)) into every wheel's `dist-info/licenses/`
+directory. Paths in this document are **repository paths**. A distribution will
+not contain most of them, because `pro/` and the `docs/` website tree are pruned
+from everything published (see `MANIFEST.in`); the paths still identify exactly
+which files each statement is about, and all of them can be inspected at
+<https://github.com/ptweezy/cronstable>.
+
 ## Why this file exists
 
 cronstable is planned to grow.

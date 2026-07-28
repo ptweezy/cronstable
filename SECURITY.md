@@ -43,8 +43,8 @@ Helpful things to include, when you have them:
   token scoping, and the Server-Sent Events stream
 - the MCP server
 - the encrypted push pipeline in `cronstable/push.py` and the device-pairing
-  flow, including anything that could expose plaintext alert content or a
-  device key
+  flow, on both the daemon side and the companion-app side, including anything
+  that could expose plaintext alert content or a device key
 - the published container images and standalone binaries
 - the hosted services operated for this project: `relay.cronstable.com` (source
   in [ptweezy/cronstable-relay](https://github.com/ptweezy/cronstable-relay))
