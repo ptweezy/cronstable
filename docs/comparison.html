@@ -198,6 +198,13 @@
   .eyebrow .dot{background:var(--fg-dim)}
   .wordmark{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:14px;-webkit-user-select:none;user-select:none}
   .wordmark .name{font-family:var(--mono);font-weight:700;font-size:clamp(22px,3.2vw,30px);letter-spacing:.5px;color:var(--fg)}
+  /* the name and the ™ travel as one flex item so the mark can never wrap
+     away from the final e at narrow widths. the ™ also stays a sibling of
+     .name rather than moving inside it: the pendulum engine measures the
+     slot's siblings inside .name to place the track's right gate, and a ™
+     in that walk would push the gate out by a full-size glyph advance */
+  .wordmark .brand-line{white-space:nowrap}
+  .wordmark .tm{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--fg-faint);margin-left:2px;transform:translateY(-6px);cursor:default}
   .wordmark .say{font-family:var(--mono);color:var(--fg-faint);font-size:13px}
   h1{
     font-family:var(--mono);font-weight:700;font-size:clamp(26px,4.7vw,48px);line-height:1.06;
@@ -427,7 +434,7 @@
   <!-- HERO -->
   <header>
     <div class="wordmark" title="the l is a self-balancing double pendulum — click the wordmark to nudge it, sweep your cursor to brush it">
-      <span class="name">cronstab<span class="mark" id="heroMark">l</span>e</span>
+      <span class="brand-line"><span class="name">cronstab<span class="mark" id="heroMark">l</span>e</span><span class="tm" title="cronstable is a trademark of the cronstable authors">™</span></span>
       <span class="say">/ kraahn-stuh-bl /</span>
     </div>
 

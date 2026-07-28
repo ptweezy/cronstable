@@ -98,6 +98,10 @@ FROM python:3.14-slim
 LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.description="A modern, rootless-container-friendly cron replacement." \
       org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
+      org.opencontainers.image.url="https://github.com/ptweezy/cronstable" \
+      org.opencontainers.image.documentation="https://github.com/ptweezy/cronstable/wiki" \
+      org.opencontainers.image.authors="Parker Loflin <ptweezy@runforyour.money>" \
+      org.opencontainers.image.vendor="Parker Loflin" \
       org.opencontainers.image.licenses="MIT"
 
 # Flush stdout/stderr immediately (cronstable logs to them) and never write .pyc

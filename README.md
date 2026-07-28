@@ -2436,8 +2436,14 @@ your commits (DCO), and
 for how releases work. cronstable is [MIT-licensed](LICENSE); see
 [LICENSING.md](LICENSING.md) for how the repository's licensing is organized.
 
+**Security.** Please report vulnerabilities privately rather than in a public
+issue; [SECURITY.md](SECURITY.md) has the disclosure process, what is in scope
+(including the hosted relay and the public demo), and what to expect.
+
 **Trademarks.** The MIT License covers the code, not the brand. cronstable™ and
-the cronstable logo are trademarks of the cronstable authors; see
-[TRADEMARKS.md](TRADEMARKS.md).
+the cronstable logo are trademarks of Parker Loflin; see
+[TRADEMARKS.md](TRADEMARKS.md). The rendered logo artwork is also reserved
+rather than MIT-granted, while the code that draws it stays MIT; see
+[Brand assets](LICENSING.md#brand-assets).
 
 cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron) (by Gustavo Carneiro), continuing development from version 0.19.
