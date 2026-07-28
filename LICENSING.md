@@ -33,8 +33,16 @@ MIT sdist (see `MANIFEST.in`), so they are never distributed through PyPI.
 
 One narrow set of files is **excluded from the MIT grant**: the rendered brand
 artwork. These sit in directories that are otherwise MIT (they share `docs/img/`
-with dozens of ordinary screenshots), so they are listed by name here rather than
-fenced off with their own `LICENSE` file:
+with dozens of ordinary screenshots), so a directory-level `LICENSE` file would
+claim too much. They are listed by name instead, in three places that a reader
+can reach from wherever they start:
+
+- [LICENSE](LICENSE) names the exclusion, so the operative grant is not silent
+  about its own scope.
+- this section holds the authoritative list.
+- [docs/img/README.md](docs/img/README.md) repeats it next to the files.
+
+The list:
 
 | Pattern | What it is |
 | --- | --- |
