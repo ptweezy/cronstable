@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -1760,6 +1761,141 @@ async def test_store_trouble_503_keeps_the_store_detail_in_the_log(
     leaked = [r for r in caplog.records if str(path) in r.getMessage()]
     assert len(leaked) == len(calls)
     assert all(r.levelno == logging.WARNING for r in leaked)
+
+
+async def test_pairing_400_keeps_the_pynacl_import_detail_in_the_log(
+    tmp_path, monkeypatch, caplog
+):
+    # HAVE_PYNACL is find_spec, which answers "findable", not "imports":
+    # the half-installed case (libsodium present, _cffi_backend missing)
+    # reaches _sealed_box and raises an ImportError naming the install
+    # layout, typically an absolute .so/.pyd path or a missing SONAME.
+    # validate_public_key re-raises that PushError unchanged to keep a
+    # broken library distinct from a broken key, and the pairing handler
+    # returns a PushError's text verbatim, so the reason has to stay in
+    # the log.  No pynacl needed: the import is forced to fail.
+    monkeypatch.setattr(push, "HAVE_PYNACL", True)
+    monkeypatch.setitem(sys.modules, "nacl.public", None)
+    cron = _cron()
+    cron._push_service = _service(
+        push.FileDeviceStore(str(tmp_path / "d.json"))
+    )
+    body = _pair_body(base64.b64encode(b"\x01" * 32).decode("ascii"))
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        with pytest.raises(web.HTTPBadRequest) as raised:
+            await cron._web_push_pair(_Req(body=body))
+    text = raised.value.text or ""
+    assert "nacl.public" not in text
+    assert "sys.modules" not in text
+    assert "the reason is in the cronstable log" in text
+    assert 'pip install "cronstable[push]"' in text
+    leaked = [r for r in caplog.records if "nacl.public" in r.getMessage()]
+    assert len(leaked) == 1
+    assert leaked[0].levelno == logging.WARNING
+
+
+def test_redact_userinfo_in_scrubs_relay_credentials():
+    url = "http://user:p4ssw0rd@relay.example:8443/send"
+    assert push._userinfo_of(url) == "user:p4ssw0rd"
+    assert push._redact_userinfo_in("relay unreachable: " + url, url) == (
+        "relay unreachable: http://***@relay.example:8443/send"
+    )
+    # a password containing '@' is cut at the LAST '@', so no tail of the
+    # secret survives
+    at_url = "http://user:p@ss@relay.example/send"
+    assert push._userinfo_of(at_url) == "user:p@ss"
+    assert "p@ss" not in push._redact_userinfo_in(at_url, at_url)
+    # a credential-free relay url leaves the text untouched
+    plain = "http://relay.example/send"
+    assert push._redact_userinfo_in("relay unreachable: x", plain) == (
+        "relay unreachable: x"
+    )
+
+
+@pytest.mark.parametrize("char", ["/", "?", "#"])
+def test_redact_userinfo_in_survives_an_unescaped_delimiter(char):
+    # A password carrying one of these ends the authority early, so the
+    # netloc urlparse reads back is a truncated "user:p" with no '@' in
+    # it and _userinfo_of has no needle to offer.  The whole URL comes
+    # out instead, because "" from _userinfo_of means "cannot name it",
+    # not "nothing to hide".  These are not exotic: '/' is in the base64
+    # alphabet, so a generated relay password lands here.  They are also
+    # exactly the URLs yarl refuses, which is to say exactly the ones
+    # that reach this redactor as an InvalidUrlClientError.
+    url = "http://user:p{}4ssw0rd@relay.example/send".format(char)
+    assert push._userinfo_of(url) == ""
+    out = push._redact_userinfo_in("relay unreachable: " + url, url)
+    assert "4ssw0rd" not in out
+    assert out == "relay unreachable: <relay url>"
+
+
+def test_redact_userinfo_in_leaves_a_credential_free_url_readable():
+    # The blunt whole-URL pass is gated on an '@': a relay with no
+    # credentials must keep its host and path in the diagnostic, which is
+    # the only thing that tells an operator WHICH endpoint is down.
+    url = "http://relay.example:8443/send"
+    text = "relay unreachable: Cannot connect to host relay.example:8443"
+    assert push._redact_userinfo_in(text, url) == text
+
+
+def test_redact_userinfo_in_flattens_control_chars_either_way():
+    # The strip runs before the credential check, not after it, so two
+    # deployments hitting the same error get the same shaped log line
+    # whether or not the relay url carries credentials.
+    for url in (
+        "http://relay.example/send",
+        "http://user:p4ssw0rd@relay.example/send",
+    ):
+        out = push._redact_userinfo_in("relay unreachable:\r\n\tbad", url)
+        assert "\r" not in out and "\n" not in out and "\t" not in out
+
+
+def test_redact_userinfo_in_survives_control_chars_in_the_url():
+    # urlsplit deletes tab/CR/LF before parsing, so a needle taken from
+    # the parse cannot match an exception text that still carries them
+    # (aiohttp quotes the configured string verbatim).
+    for char in ("\t", "\r", "\n"):
+        url = "http://user:p4ssw0rd{}x@relay.example:99999/s".format(char)
+        out = push._redact_userinfo_in("relay unreachable: " + url, url)
+        assert "p4ssw0rd" not in out
+        assert "***@relay.example" in out
+
+
+async def test_relay_outcome_redacts_url_credentials(tmp_path, monkeypatch):
+    # push.relay.url is the one URL the config accepts with embedded
+    # credentials, and aiohttp raises InvalidUrlClientError (a ClientError)
+    # for a URL yarl rejects, with the whole URL as its text.  That outcome
+    # is logged by send_report and returned as a test alert's 502 body.
+    import aiohttp
+
+    monkeypatch.setattr(push, "seal_to_device", lambda key, plain: "Y2k=")
+    service = _service(
+        push.FileDeviceStore(str(tmp_path / "d.json")),
+        # port out of range: yarl refuses it, so this never leaves the box
+        relay_url="http://user:p4ssw0rd@relay.example:99999/send",
+    )
+    device = {"id": "d1", "publicKey": "k", "pushToken": "t"}
+    async with aiohttp.ClientSession() as session:
+        outcome = await service._send_to_device(
+            session, device, b"{}", "collapse", "time-sensitive", False
+        )
+    assert outcome["error"]
+    assert "p4ssw0rd" not in outcome["error"]
+    assert "***@relay.example" in outcome["error"]
+
+    # The fan-out's catch-all files whatever those two except clauses did
+    # not (an ssl or aiohttp error quotes the URL just as readily), and it
+    # reaches the same daemon log line and the same /push/test 502 body.
+    async def _unmodelled(*args, **kwargs):
+        raise RuntimeError(
+            "handshake to {} failed".format(service.relay_url)
+        )
+
+    monkeypatch.setattr(service, "_send_to_device", _unmodelled)
+    fanned = await service.send_test(device)
+    assert fanned["error"].startswith("unexpected RuntimeError: ")
+    assert "p4ssw0rd" not in fanned["error"]
+    assert "***@relay.example" in fanned["error"]
 
 
 @requires_pynacl

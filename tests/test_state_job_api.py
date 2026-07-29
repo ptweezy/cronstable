@@ -13,6 +13,8 @@ clock (lock TTLs are kept at the floor and never waited on for a renewal).
 """
 
 import asyncio
+import json
+import logging
 import os
 import sys
 
@@ -1281,6 +1283,53 @@ async def test_backend_document_error_is_503_over_http(tmp_path, monkeypatch):
     finally:
         await api.stop()
         await backend.stop()
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_backend_error_503_keeps_the_store_detail_in_the_log(
+    tmp_path, monkeypatch, caplog, wrapped
+):
+    # The 503 body is the fact, not the store's own words.  An OSError out
+    # of the store reads "[Errno 13] Permission denied: <absolute document
+    # path>", and _DocumentUnreadable is built from exactly that text, so
+    # echoing either would hand the calling job the daemon's store layout
+    # and errno.  The caller here is a job command, which is a less trusted
+    # party than the daemon.  Mirrors
+    # test_store_trouble_503_keeps_the_store_detail_in_the_log in
+    # tests/test_push.py, which pins the same split for the push registry.
+    from cronstable.state import _DocumentUnreadable
+
+    api, backend = await _make_api(tmp_path)
+    api.register_run(_ctx())
+    # forward slashes on purpose: OSError renders its filename through
+    # repr, which on Windows would double every backslash and stop this
+    # test's own substring check from matching the path it planted.
+    doc = str(tmp_path).replace(os.sep, "/") + "/store/kv/job/k.doc"
+    detail = "[Errno 13] Permission denied: '{}'".format(doc)
+
+    async def broken(*args, **kwargs):
+        if wrapped:
+            raise _DocumentUnreadable(detail)
+        raise OSError(13, "Permission denied", doc)
+
+    monkeypatch.setattr(jobapi.jobstate, "kv_get", broken)
+    try:
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            async with aiohttp.ClientSession(headers=_auth()) as s:
+                r = await s.get(api.base_url + "/v1/kv/get?key=k")
+                assert r.status == 503
+                body = await r.text()
+    finally:
+        await api.stop()
+        await backend.stop()
+    assert doc not in body
+    assert "Errno" not in body
+    assert json.loads(body)["error"] == (
+        "state backend unavailable; the reason is in the cronstable log"
+    )
+    leaked = [r for r in caplog.records if doc in r.getMessage()]
+    assert len(leaked) == 1
+    assert leaked[0].levelno == logging.WARNING
 
 
 # ---------------------------------------------------------------------------

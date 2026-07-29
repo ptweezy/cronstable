@@ -1,5 +1,6 @@
 import asyncio
 import asyncio.subprocess
+import html
 import logging
 import os
 import subprocess
@@ -21,6 +22,7 @@ from typing import (
     Optional,
     Tuple,
 )
+from urllib.parse import urlsplit, urlunsplit
 
 from cronstable import platform, push
 from cronstable.config import JobConfig, schedule_object_to_crontab
@@ -857,6 +859,32 @@ class ShellReporter(Reporter):
             )
 
 
+def _scrub_url_in(text: str, url: str) -> str:
+    """``text`` with the webhook URL and its request target removed.
+
+    The response body is third-party text, and a receiver can quote the
+    request target straight back: finalhandler's ``Cannot POST /<path>``
+    (Express's default for an unrouted path), Apache 2.2-era 404s, and
+    some gateway error pages all do.  ``webhook.url`` is a secret whose
+    secret part IS the path or query (see config.py's ``webhook.url``
+    docs), so the body cannot be logged raw.  The HTML-escaped spelling
+    is scrubbed too, because a server that echoes usually escapes what
+    it echoes.
+    """
+    parts = urlsplit(url)
+    target = urlunsplit(("", "", parts.path, parts.query, ""))
+    out = text
+    for needle in (url, target, parts.path):
+        # len > 1 guards a root path: replacing "/" would redact every
+        # slash in an otherwise innocent body.
+        if len(needle) > 1:
+            out = out.replace(needle, "<redacted>")
+            escaped = html.escape(needle, quote=False)
+            if escaped != needle:
+                out = out.replace(escaped, "<redacted>")
+    return out
+
+
 class WebhookReporter(Reporter):
     async def report(
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
@@ -897,29 +925,90 @@ class WebhookReporter(Reporter):
         import aiohttp
 
         timeout = aiohttp.ClientTimeout(total=webhook["timeout"])
+        # Encoded OUTSIDE the try below: a rendered body carrying a lone
+        # surrogate (a job environment variable arriving through
+        # os.environ's surrogateescape, interpolated by the template)
+        # raises UnicodeEncodeError here, and that is a template bug
+        # worth _report_common's traceback, not a "check webhook.url and
+        # the network" line about a request that was never attempted.
+        data = body.encode("utf-8")
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.request(
-                webhook["method"],
-                url,
-                data=body.encode("utf-8"),
-                headers=headers,
-            ) as resp:
-                if resp.status >= 400:
-                    # never log the URL: Slack/Discord-style webhook URLs
-                    # embed a secret token.
-                    logger.error(
-                        "webhook reporter of job %s: server returned"
-                        " HTTP %s: %s",
-                        job.config.name,
-                        resp.status,
-                        (await resp.text())[:1024],
-                    )
-                else:
-                    logger.debug(
-                        "webhook reporter of job %s: HTTP %s",
-                        job.config.name,
-                        resp.status,
-                    )
+            try:
+                async with session.request(
+                    webhook["method"],
+                    url,
+                    data=data,
+                    headers=headers,
+                ) as resp:
+                    if resp.status >= 400:
+                        # never log the URL: Slack/Discord-style webhook
+                        # URLs embed a secret token.  The response body
+                        # is scrubbed for it too, and BEFORE the slice:
+                        # the body is third-party text and a receiver
+                        # that echoes the request target back (Express
+                        # answers an unrouted path with "Cannot POST
+                        # /<path>") would otherwise write the token to
+                        # the log on every failing report.  Slicing
+                        # first could also cut a needle in half and
+                        # leave a prefix of the token behind.
+                        #
+                        # errors="replace" rather than aiohttp's strict
+                        # default: the body is third-party bytes and a
+                        # receiver whose error page does not match its
+                        # own declared charset (a latin-1 gateway page
+                        # labelled utf-8) would otherwise raise
+                        # UnicodeDecodeError out of a request that
+                        # COMPLETED, costing this line its status code
+                        # and reporting a served 500 as a failure to
+                        # reach the server at all.
+                        logger.error(
+                            "webhook reporter of job %s: server returned"
+                            " HTTP %s: %s",
+                            job.config.name,
+                            resp.status,
+                            _scrub_url_in(
+                                await resp.text(errors="replace"), url
+                            )[:1024],
+                        )
+                    else:
+                        logger.debug(
+                            "webhook reporter of job %s: HTTP %s",
+                            job.config.name,
+                            resp.status,
+                        )
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                UnicodeError,
+            ) as exc:
+                # Caught HERE rather than left to _report_common's
+                # catch-all, which logs the exception and its traceback:
+                # the URL is the credential in this model (config.py
+                # documents webhook.url as a secret, since a Slack or
+                # Discord URL embeds its token) and it is unvalidated, so
+                # a spelling yarl rejects (scheme omitted, typo'd port,
+                # empty host) raises aiohttp's InvalidUrlClientError,
+                # whose str() IS the URL.  Report the failure kind only,
+                # matching the HTTP-error branch above, which keeps the
+                # URL out of the log the same way.
+                #
+                # UnicodeError is in the tuple for the one failure here
+                # that is not a ClientError subclass: a host yarl accepts
+                # but idna rejects at connect time (a doubled dot, a
+                # label over 63 characters) raises UnicodeEncodeError out
+                # of getaddrinfo, which would otherwise reach the
+                # catch-all's traceback.  It is a connect failure like
+                # the rest of this arm, so "request failed" is honest.
+                # The two Unicode failures that are NOT connect failures
+                # are kept out of here on purpose: the body decode above
+                # is errors="replace", and the request body's encode
+                # happens before the try.
+                logger.error(
+                    "webhook reporter of job %s: request failed (%s);"
+                    " check webhook.url and the network",
+                    job.config.name,
+                    type(exc).__name__,
+                )
 
 
 class PushReporter(Reporter):
