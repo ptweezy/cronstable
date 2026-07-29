@@ -8,6 +8,7 @@ project, on which cronstable is based.
 ## 1.2.34 (2026-07-27)
 
 - Logo changes: simplification
+- Address GitHub security findings
 
 ## 1.2.33 (2026-07-25)
 

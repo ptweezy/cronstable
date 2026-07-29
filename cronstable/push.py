@@ -45,6 +45,7 @@ import secrets
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     # aiohttp is the relay client, and nothing else here touches it.  Importing
@@ -151,6 +152,82 @@ class PushError(Exception):
     """A push operation failed (bad device material, store trouble)."""
 
 
+# urlsplit deletes exactly these three characters from a URL before it
+# parses (urllib.parse._UNSAFE_URL_BYTES_TO_REMOVE), so a userinfo read
+# back out of a parse has already lost any the operator embedded, while
+# the exception text quoting the URL still carries them and a literal
+# match in _redact_userinfo_in would find nothing.  Both the text and
+# the needle are stripped of these three there, which is what lets the
+# two match; it also keeps a CR out of a line headed for the daemon log.
+_URL_DELETED_CHARS = {ord(c): None for c in "\t\r\n"}
+
+
+def _userinfo_of(url: str) -> str:
+    """The ``user[:pass]`` userinfo of ``url``, or ``""`` if it has none.
+
+    ``push.relay.url`` is the one URL the config accepts with embedded
+    credentials (unlike ``cluster.etcd.endpoints``, which refuses them
+    outright), because a self-hosted relay behind HTTP Basic auth is a
+    legitimate deployment.  Accepting it means every string that may
+    quote the URL back has to be scrubbed first: see
+    :func:`_redact_userinfo_in`.
+
+    Answers ``""`` for a userinfo urlparse cannot name, which is NOT the
+    same as "no credentials": a password containing an unescaped ``/``,
+    ``?`` or ``#`` ends the authority early, so the netloc read back is
+    a truncated ``user:p`` with no ``@`` in it at all.  Callers must
+    treat an empty answer as "unknown", never as "nothing to hide";
+    :func:`_redact_userinfo_in` is what closes that case.
+    """
+    # The config gate (_build_push_config) has already established a
+    # http/https scheme and a non-empty netloc, so urlparse reads the
+    # authority correctly here for any well-formed URL, and the
+    # scheme-less ambiguity that config._redact_userinfo exists to
+    # handle cannot arise.
+    netloc = urlparse(url).netloc
+    # rsplit, not split: userinfo ends at the LAST '@', so a password
+    # containing '@' is not cut short, which would leave a tail of the
+    # secret behind in the redacted output.
+    return netloc.rsplit("@", 1)[0] if "@" in netloc else ""
+
+
+def _redact_userinfo_in(text: str, url: str) -> str:
+    """``text`` with ``url``'s credentials taken out.
+
+    Scrubs a whole message rather than a bare URL, because the leak this
+    prevents is an exception whose text merely *contains* the relay URL:
+    aiohttp raises ``InvalidUrlClientError`` for a URL yarl rejects (an
+    out-of-range port, an empty host, an unescaped ``/`` in the
+    password) and its ``str()`` is the configured URL verbatim,
+    credentials included.  That instance is an ``aiohttp.ClientError``,
+    so it lands in a per-device outcome and from there in both the
+    daemon log and a test alert's 502 body.  The needle is matched
+    literally because that exception quotes the configured string
+    untouched, even where yarl would have normalized it.
+
+    Two passes, because one is not enough.  The precise pass replaces
+    the parsed ``userinfo@`` with ``***@``, keeping the host and path
+    readable, and covers every URL urlparse can read an authority out
+    of.  The blunt pass takes out the whole URL, and exists for the
+    inputs :func:`_userinfo_of` cannot name: a password carrying an
+    unescaped ``/``, ``?`` or ``#`` truncates the authority, so the
+    precise pass has no needle to match and would otherwise leave the
+    password in the message intact.  Those URLs are exactly the ones
+    yarl refuses, which is to say exactly the ones that reach here.
+    The blunt pass is gated on an ``@`` being present at all, so a
+    credential-free relay URL keeps its diagnostic in one piece; when
+    the precise pass fired it finds nothing left to do.
+    """
+    out = text.translate(_URL_DELETED_CHARS)
+    needle = url.translate(_URL_DELETED_CHARS)
+    userinfo = _userinfo_of(url)
+    if userinfo:
+        out = out.replace(userinfo + "@", "***@")
+    if "@" in needle:
+        out = out.replace(needle, "<relay url>")
+    return out
+
+
 def _sealed_box(raw: bytes) -> Any:
     """A libsodium sealed box over a raw 32-byte X25519 public key.
 
@@ -164,9 +241,19 @@ def _sealed_box(raw: bytes) -> Any:
     try:
         from nacl.public import PublicKey, SealedBox
     except ImportError as exc:
+        # The ImportError names the install layout (the missing extension
+        # module's absolute path, or a loader/SONAME string), and this
+        # PushError's text is returned to a client verbatim in two places:
+        # the pairing 400 (Cron._web_push_pair) and the test-alert 502
+        # (via seal_to_device and the per-device outcome).  So the reason
+        # goes to the log an operator reads and the raised sentence is
+        # fixed, matching how the store-backed PushErrors either side of
+        # that handler are already treated.
+        logger.warning("push: PyNaCl is findable but will not import: %s", exc)
         raise PushError(
-            "PyNaCl is installed but cannot be imported ({}); reinstall "
-            'the push extra (pip install "cronstable[push]")'.format(exc)
+            "PyNaCl is installed but cannot be imported; the reason is in "
+            "the cronstable log (reinstall the push extra: pip install "
+            '"cronstable[push]")'
         ) from None
     return SealedBox(PublicKey(raw))
 
@@ -1233,8 +1320,16 @@ class PushService:
                     {
                         "device": device.get("id"),
                         "status": None,
-                        "error": "unexpected {}: {}".format(
-                            type(outcome).__name__, outcome
+                        # Redacted like the ClientError arm in
+                        # _send_to_device: this catch-all sees whatever
+                        # that method's two except clauses did not, and
+                        # an aiohttp/ssl error that quotes the relay URL
+                        # can land here just as easily.
+                        "error": _redact_userinfo_in(
+                            "unexpected {}: {}".format(
+                                type(outcome).__name__, outcome
+                            ),
+                            self.relay_url,
                         ),
                     }
                 )
@@ -1286,7 +1381,9 @@ class PushService:
                         resp.status, (await resp.text())[:512]
                     )
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            outcome["error"] = "relay unreachable: {}".format(exc)
+            outcome["error"] = _redact_userinfo_in(
+                "relay unreachable: {}".format(exc), self.relay_url
+            )
         return outcome
 
 
