@@ -833,9 +833,14 @@ async def test_report_webhook_error_body_cannot_echo_the_secret_url(caplog):
     secret_path = "/services/T00000/B00000/s3cr3tTOKEN"
 
     async def echoing(request):
+        # The echoed target is the local constant, not request.path.  The
+        # two are identical here (the route IS secret_path), and building
+        # the body from the request would be a real reflected-XSS shape
+        # that CodeQL flags as py/reflective-xss, in a fixture whose only
+        # job is to put the secret path into a response body.
         return aioweb.Response(
             status=404,
-            text="<pre>Cannot POST {}</pre>".format(request.path),
+            text="<pre>Cannot POST {}</pre>".format(secret_path),
             content_type="text/html",
         )
 
