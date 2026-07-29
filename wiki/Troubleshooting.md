@@ -392,6 +392,28 @@ an empty rendered body is also skipped.
 
 **Fix.** Provide the required fields. See [Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
 
+### A webhook report logs `request failed` and the URL is not shown
+
+**Symptom.** The log carries `webhook reporter of job <name>: request failed
+(<ExceptionType>); check webhook.url and the network`, with no URL and no traceback.
+
+**Cause.** The request never completed. The exception type names which kind of failure
+it was: `InvalidUrlClientError` means the configured `url` is not a URL aiohttp can
+build (a missing scheme, a non-numeric or out-of-range port, an empty host),
+`ClientConnectorError` and `ClientConnectorDNSError` mean the host was not reachable,
+and `TimeoutError` means nothing answered within `timeout`. That last one covers name
+resolution as well as the endpoint: resolving the host happens inside the same
+`timeout`, so a resolver that does not answer reads exactly like a slow server. A
+host that resolves but that idna rejects (a doubled dot, a label over 63 characters)
+arrives as `UnicodeEncodeError`. The URL is deliberately
+withheld: a Slack or Discord webhook URL embeds its own token, so `webhook.url` is
+treated as a secret and never written to the log, in the same way the HTTP-error
+branch above it logs the status and response body but not the URL.
+
+**Fix.** Check `webhook.url` for a typo, starting with the scheme and the port, then
+check that the host resolves and is reachable from the daemon. See
+[Reporting (Mail, Sentry, Shell, Webhook)](Reporting).
+
 ## Metrics
 
 ### No statsd metrics arrive
