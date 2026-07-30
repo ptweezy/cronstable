@@ -4,8 +4,9 @@
 #  A NINE-node mutual-TLS, leader-electing cluster (distribution: spread) that
 #  shares ONE durable state store, running the entire scheduled back-office of
 #  a fictional commerce platform: classic jobs + durable-state jobs + five
-#  orchestration DAGs + second-level SLA probes, with all four failure
-#  reporters wired to live sinks. See example/grand-tour/README.md for the full
+#  orchestration DAGs + second-level SLA probes, with all five failure
+#  reporters wired to live sinks (the fifth, push, goes to a paired phone and
+#  stays silent until one pairs). See example/grand-tour/README.md for the full
 #  tour and example/grand-tour/platform.yaml for the annotated job set.
 #
 #    docker compose -f example/grand-tour/docker-compose.yml up --build     # start
@@ -32,7 +33,16 @@
 #  env, so the compose file needs no per-node peer lists: every node shares one
 #  CLUSTER_HOSTS list and drops itself by NODE_NAME.
 #
-#  THREE env knobs (all optional, all default to the simplest thing):
+#  PUSH NOTIFICATIONS: the nodes carry a `push:` section (platform.yaml) and
+#  three jobs plus the daemon `notify:` block opt into it, but the channel is
+#  SILENT until a device pairs: open any dashboard, run "Pair a device" from
+#  the command palette, and scan the QR with the companion app. The pairing
+#  registry rides the shared state volume, so pairing against ONE node arms
+#  all nine. Send yourself a test alert without waiting for the clock:
+#    curl http://localhost:8080/push/devices                     # list pairings
+#    curl -X POST http://localhost:8080/push/devices/<id>/test    # fire one now
+#
+#  FOUR env knobs (all optional, all default to the simplest thing):
 #    * Compare a single leader with the per-job spread:
 #        DISTRIBUTION=single-leader docker compose -f example/grand-tour/docker-compose.yml up -d
 #    * Swap the gossip mesh for a lease over the shared mount (NO certs, NO
@@ -40,8 +50,11 @@
 #      lease backend is single-leader only, so `spread` does not apply):
 #        BACKEND=filesystem docker compose -f example/grand-tour/docker-compose.yml up
 #    * Turn on bearer-token auth for the dashboard + REST API (uncomment
-#      web.authToken in platform.yaml first; /metrics stays public):
+#      web.authToken in platform.yaml first, and delete push.allowUnauthenticated
+#      while you are there; /metrics stays public):
 #        WEB_TOKEN=some-secret docker compose -f example/grand-tour/docker-compose.yml up
+#    * Send push alerts through your OWN relay instead of the hosted one:
+#        PUSH_RELAY_URL=http://my-relay:8080/ docker compose -f example/grand-tour/docker-compose.yml up
 #
 #  NOTE ON SIZE: 9 is an odd cluster size (quorum 5, tolerates 4 node failures).
 #  Stop 5+ nodes and the cluster loses quorum: Leader jobs stand down while
@@ -72,6 +85,12 @@ x-node-env: &node-env
   # Leave empty to keep the sentry reporter a no-op; set a real DSN to light up
   # fraud-model-refresh's Sentry report.
   SENTRY_DSN: ""
+  # Where sealed push alerts are POSTed (push.relay.url in platform.yaml).
+  # Defaults to the hosted relay; point it at a self-hosted one to keep the
+  # ciphertext on your own infrastructure. Alerts are sealed before they
+  # leave the daemon either way, so the relay only ever sees routing
+  # metadata. Nothing is sent at all until a device pairs.
+  PUSH_RELAY_URL: ${PUSH_RELAY_URL:-https://relay.cronstable.com/}
 
 x-node: &node
   build:

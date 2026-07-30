@@ -14,9 +14,10 @@ fleet it runs, all together:
 - five **orchestration DAGs**, one per pattern (dynamic fan-out ETL, linear
   pipeline, static diamond, and two human-gated releases),
 - **second-level SLA probes**, and
-- **all four failure reporters** wired to live sinks (Mailpit for mail, an echo
-  server for webhooks, a statsd exporter for metrics, stdout for shell pages),
-  plus **success** reports; Sentry is one env var away.
+- **all five failure reporters** wired to live sinks (Mailpit for mail, an echo
+  server for webhooks, a statsd exporter for metrics, stdout for shell pages,
+  and **end-to-end encrypted push** to a paired phone), plus **success**
+  reports and daemon-event `notify:` alerts; Sentry is one env var away.
 
 Each example is deliberately **small**: every job shows exactly one feature, so
 you can read it top to bottom and know what it proves.
@@ -95,6 +96,10 @@ or task that demonstrates it. The big ones:
 | | **mail** / **webhook** / **shell** / **sentry** reporters | `cert-expiry-check` / `db-health-orders` / `slow-report-generator` / `fraud-model-refresh` |
 | | reporter on **success** (`onSuccess`) | `ops-heartbeat-report` |
 | | mail **SMTP auth + HTML**; webhook **method/headers/contentType** | `cert-expiry-check`; `db-health-orders` |
+| **Push** | **end-to-end encrypted** alerts + cluster-visible pairing registry | `push:` block (see *Things to try*) |
+| | `priority: time-sensitive` vs **`passive`**, `includeLogTail` on/off | `alert-selftest` / `ops-heartbeat-report` |
+| | push beside the other reporters on one hook | `fraud-model-refresh` (sentry + mail + push) |
+| | **`notify:`** daemon events (DAG failure, approval gate, leadership, quorum) | `notify:` block |
 | **Concurrency** | `Forbid` (node) vs `Replace` vs **`concurrencyScope: cluster`** | `warehouse-sync` / `search-reindex` / `inventory-sync` |
 | | fleet **mutex** vs fleet **semaphore** (`lock --permits N`) | `compact-warehouse` / `render-thumbnails` |
 | **Clustering** | mTLS attestation, quorum election, `distribution: spread` | whole cluster; `node-entrypoint.sh` + `gen-certs.sh` |
@@ -129,15 +134,15 @@ their own:
 | **:25–:29** | `config-lint` "fails" only because it wrote to stderr | `failsWhen: producesStderr` |
 | **:35–:39** | `format-check` "fails" only because it wrote to stdout | `failsWhen: producesStdout` |
 | **:45–:47** | `cert-expiry-check` fails alone and **mails** on-call (SMTP auth + HTML) | mail report (see Mailpit) |
-| **:20 & :40** | `alert-selftest` force-fails and posts a webhook | `failsWhen: always`; alert self-test |
-| **:50** | `fraud-model-refresh` fails | Sentry (no-op until `SENTRY_DSN` set) + mail |
+| **:20 & :40** | `alert-selftest` force-fails, posts a webhook and **pushes** to paired phones | `failsWhen: always`; alert self-test; push `time-sensitive` |
+| **:50** | `fraud-model-refresh` fails | Sentry (no-op until `SENTRY_DSN` set) + mail + **push** |
 | every 5th min | `webhook-dispatch` fails, retries, then mails on permanent failure | finite retry + `onPermanentFailure` |
-| every 5 min | `ops-heartbeat-report` succeeds and posts a **success** webhook + mail | `onSuccess` reporter |
+| every 5 min | `ops-heartbeat-report` succeeds and posts a **success** webhook + mail, and pushes a **passive** alert | `onSuccess` reporter; push `passive` |
 | every 5 min | `outbox-flush` fails a few times, then self-heals (never permanent) | `retry: maximumRetries: -1` |
 | every **:00** | four `hourly-*` reports collide | Schedule tab thundering-herd warning |
 | continuous | `warehouse-sync` (node `Forbid`), `inventory-sync` (**cluster** `Forbid`), `search-reindex` (`Replace` → Cancelled), `render-thumbnails` (2-permit **semaphore**) | concurrency policies |
 | every 3 min | the `orders-etl` DAG runs end to end | XCom + fan-out + fan-in |
-| every 15 min | the `data-quality-gate` diamond certifies (even UTC hours) or skips `certify` (odd hours, a check fails) | `triggerRule: all_success` cascade |
+| every 15 min | the `data-quality-gate` diamond certifies (even UTC hours) or skips `certify` (odd hours, a check fails, and `notify:` pushes a `dag_failure`) | `triggerRule: all_success` cascade; `notify:` events |
 | every few s | the `pulse-*` probes tick the next-run countdown **in seconds** | second-level scheduling |
 
 ## Things to try
@@ -162,7 +167,9 @@ their own:
 
    Stop the leader and watch a follower adopt the lease file within a TTL.
 5. **Turn on API auth.** Uncomment `web.authToken` in
-   [`platform.yaml`](platform.yaml), then:
+   [`platform.yaml`](platform.yaml) (and delete `push.allowUnauthenticated`
+   while you are in there, so the pairing endpoints sit behind the token
+   too), then:
 
    ```console
    WEB_TOKEN=s3cret docker compose -f example/grand-tour/docker-compose.yml up -d
@@ -238,6 +245,45 @@ their own:
     business-day jobs (`LW`, `L-3`, `15W`, `5#3`) land where the engine
     says, and the per-minute hum is summarized below the grid instead of
     flooding it.
+13. **Pair a phone and get pushed.** The fleet carries a `push:` section, but
+    the channel is silent until a device pairs. Open any dashboard, run
+    **Pair a device** from the command palette, and scan the QR with the
+    companion app. The registry rides the shared state volume, so pairing
+    against one node arms all nine, and whichever node owns a failing job
+    pushes to the same phone.
+
+    Do not wait for the clock; fire one on demand:
+
+    ```console
+    curl http://localhost:8080/push/devices                    # list pairings
+    curl -X POST http://localhost:8080/push/devices/<id>/test  # send a test alert
+    ```
+
+    Then let it self-drive: `alert-selftest` pages at **:20** and **:40**,
+    `fraud-model-refresh` at **:50** (push beside Sentry and mail on one
+    hook), `ops-heartbeat-report` sends a quiet **passive** success alert
+    every 5 minutes, and the `notify:` block pushes `dag_failure` when
+    `data-quality-gate` fails on odd hours. Trigger `release-train`
+    (item 6) to get an `approval_waiting` push, or stop a node for a
+    `leader_change`.
+
+    Every push hook here sits on a **`Leader`** job on purpose: the relay
+    coalesces on the run, so an `EveryNode` job failing on nine nodes is
+    nine runs and nine notifications. Keep that in mind before adding
+    `report: push:` to `db-health-orders` or the `pulse-*` probes.
+
+    Two things worth knowing about how this is wired:
+
+    - The alert is **sealed on the node** before it leaves. The relay sees a
+      device token, a ciphertext and an opaque coalescing hash, never the
+      job name, hostname or log tail. Point `PUSH_RELAY_URL` at your own
+      relay to keep even that metadata in-house.
+    - `push.allowUnauthenticated: true` in [`platform.yaml`](platform.yaml)
+      is there **only** because the tour boots with an open dashboard on a
+      published port. Without it the daemon refuses to start, because
+      `/push/devices` is a mutating endpoint and an unauthenticated pairing
+      is permanent access to every future alert. Turn on `web.authToken`
+      (item 5) and delete that line.
 
 ## Alternate leadership backends (config only)
 
@@ -277,7 +323,7 @@ See [`example/kubernetes`](../kubernetes) and
 | File | Purpose |
 | --- | --- |
 | [`docker-compose.yml`](docker-compose.yml) | the nine nodes plus the Mailpit / statsd / webhook sinks; its header comments list the things to try |
-| [`platform.yaml`](platform.yaml) | the annotated job set + DAGs + `state:` + `web:` (mounted identically into all nine nodes) |
+| [`platform.yaml`](platform.yaml) | the annotated job set + DAGs + `state:` + `web:` + `push:` + `notify:` (mounted identically into all nine nodes) |
 | [`_defaults.yaml`](_defaults.yaml) | shared `defaults:` + custom `logging:`, pulled in via `include:` |
 | [`legacy.crontab`](legacy.crontab) | a classic Vixie crontab, loaded as-is from the same config dir |
 | [`platform.env`](platform.env) | `env_file` for `backup-warehouse` |
