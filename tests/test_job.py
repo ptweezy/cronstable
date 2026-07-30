@@ -775,6 +775,204 @@ async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_report_webhook_bad_url_keeps_the_secret_out_of_the_log(caplog):
+    # webhook.url is a secret in this model (config.py documents it as one:
+    # a Slack/Discord URL embeds its token) and the schema does not check
+    # its shape, so a spelling yarl rejects raises aiohttp's
+    # InvalidUrlClientError, whose str() IS the url.  Left to
+    # _report_common's catch-all that would be logged twice over, once as
+    # the message and once in the traceback, so the reporter catches it
+    # here and reports the failure kind alone.
+    url = "https://hooks.slack.example:443x/services/T0/B0/s3cr3tTOKEN"
+    conf = cronstable.config.parse_config_string(
+        _webhook_job_config(f"            value: {url}"), ""
+    )
+    job_config = conf.jobs[0]
+    job = _webhook_job(job_config)
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cronstable.job.WebhookReporter().report(
+            False, job, job_config.onFailure["report"]
+        )
+    assert "s3cr3tTOKEN" not in caplog.text
+    assert "hooks.slack.example" not in caplog.text
+    assert (
+        "webhook reporter of job test: request failed"
+        " (InvalidUrlClientError); check webhook.url and the network"
+    ) in caplog.text
+
+
+def test_scrub_url_in():
+    scrub = cronstable.job._scrub_url_in
+    url = "https://hooks.example/services/T0/B0/s3cr3tTOKEN"
+    assert scrub("Cannot POST /services/T0/B0/s3cr3tTOKEN", url) == (
+        "Cannot POST <redacted>"
+    )
+    assert scrub("fetching " + url, url) == "fetching <redacted>"
+    # an echoing server usually escapes what it echoes
+    q_url = "https://hooks.example/hook?a=1&token=s3cr3tTOKEN"
+    assert "s3cr3tTOKEN" not in scrub(
+        "bad target /hook?a=1&amp;token=s3cr3tTOKEN", q_url
+    )
+    # a root-path webhook must not turn every slash into a redaction
+    assert scrub("a/b/c not found", "https://hooks.example/") == (
+        "a/b/c not found"
+    )
+    # an ordinary diagnostic body survives intact
+    assert scrub("invalid_payload", url) == "invalid_payload"
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_error_body_cannot_echo_the_secret_url(caplog):
+    # The response body is third-party text and the reporter logs it, so a
+    # receiver that quotes the request target back (Express answers an
+    # unrouted path with "Cannot POST /<path>") would otherwise write the
+    # webhook's own token into the daemon log on every failing report.
+    from aiohttp import web as aioweb
+    from aiohttp.test_utils import TestServer
+
+    secret_path = "/services/T00000/B00000/s3cr3tTOKEN"
+
+    async def echoing(request):
+        # The echoed target is the local constant, not request.path.  The
+        # two are identical here (the route IS secret_path), and building
+        # the body from the request would be a real reflected-XSS shape
+        # that CodeQL flags as py/reflective-xss, in a fixture whose only
+        # job is to put the secret path into a response body.
+        return aioweb.Response(
+            status=404,
+            text="<pre>Cannot POST {}</pre>".format(secret_path),
+            content_type="text/html",
+        )
+
+    app = aioweb.Application()
+    app.router.add_route("*", secret_path, echoing)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        url = str(server.make_url(secret_path))
+        conf = cronstable.config.parse_config_string(
+            _webhook_job_config(f"            value: {url}"), ""
+        )
+        job_config = conf.jobs[0]
+        job = _webhook_job(job_config)
+        with caplog.at_level(logging.ERROR, logger="cronstable"):
+            await cronstable.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+    finally:
+        await server.close()
+    assert "server returned HTTP 404" in caplog.text
+    assert "s3cr3tTOKEN" not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_undecodable_error_body_keeps_the_status(caplog):
+    # A receiver whose error page does not match its own declared charset
+    # (a latin-1 gateway page labelled utf-8) made aiohttp's strict
+    # resp.text() raise UnicodeDecodeError.  That is NOT a ClientError,
+    # so it lands in the same except arm as a connect failure, and a
+    # request that completed with a served 500 would be reported as
+    # "request failed ... check webhook.url and the network" with the
+    # status dropped.  errors="replace" keeps the diagnostic truthful.
+    from aiohttp import web as aioweb
+    from aiohttp.test_utils import TestServer
+
+    secret_path = "/services/T00000/B00000/s3cr3tTOKEN"
+
+    async def mislabelled(request):
+        return aioweb.Response(
+            status=500,
+            body="rejected: caf\xe9 at {}".format(request.path).encode(
+                "latin-1"
+            ),
+            headers={"Content-Type": "text/plain; charset=utf-8"},
+        )
+
+    app = aioweb.Application()
+    app.router.add_route("*", secret_path, mislabelled)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        url = str(server.make_url(secret_path))
+        conf = cronstable.config.parse_config_string(
+            _webhook_job_config(f"            value: {url}"), ""
+        )
+        job_config = conf.jobs[0]
+        job = _webhook_job(job_config)
+        with caplog.at_level(logging.ERROR, logger="cronstable"):
+            await cronstable.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+    finally:
+        await server.close()
+    assert "server returned HTTP 500" in caplog.text
+    assert "rejected:" in caplog.text
+    assert "request failed" not in caplog.text
+    # the undecodable byte degrades to U+FFFD; the token still never
+    # reaches the log, because the scrub runs on the decoded text
+    assert "�" in caplog.text
+    assert "s3cr3tTOKEN" not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_unencodable_body_is_not_a_request_failure(
+    caplog, monkeypatch
+):
+    # The request body's encode is deliberately OUTSIDE the reporter's
+    # except arm: a template rendering a lone surrogate (a job env var
+    # arriving through os.environ's surrogateescape) is a template bug
+    # that belongs in _report_common's traceback, not a line telling the
+    # operator to check webhook.url and the network for a request that
+    # was never attempted.
+    url = "https://hooks.example/services/T0/B0/s3cr3tTOKEN"
+    conf = cronstable.config.parse_config_string(
+        _webhook_job_config(f"            value: {url}"), ""
+    )
+    job_config = conf.jobs[0]
+    job = _webhook_job(job_config)
+
+    class _Surrogate:
+        def render(self, *args, **kwargs):
+            return "output \ud800 here"
+
+    monkeypatch.setattr(
+        cronstable.job, "_compiled_template", lambda body: _Surrogate()
+    )
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        with pytest.raises(UnicodeEncodeError):
+            await cronstable.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+    assert "request failed" not in caplog.text
+    assert "s3cr3tTOKEN" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_idna_host_is_contained(caplog):
+    # A host yarl accepts but idna rejects at connect time (a doubled dot)
+    # raises UnicodeError out of getaddrinfo, which is NOT a ClientError,
+    # so without it in the catch tuple it would reach _report_common's
+    # catch-all and be logged with a traceback.
+    url = "https://hooks..slack.example/services/T0/B0/s3cr3tTOKEN"
+    conf = cronstable.config.parse_config_string(
+        _webhook_job_config(f"            value: {url}"), ""
+    )
+    job_config = conf.jobs[0]
+    job = _webhook_job(job_config)
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        await cronstable.job.WebhookReporter().report(
+            False, job, job_config.onFailure["report"]
+        )
+    assert "s3cr3tTOKEN" not in caplog.text
+    assert "webhook reporter of job test: request failed" in caplog.text
+    # no traceback: the catch-all was never reached
+    assert "Traceback" not in caplog.text
+    assert "site-packages" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_report_webhook_disabled():
     # with no url source configured (the default), the reporter must return
     # early without opening any HTTP session

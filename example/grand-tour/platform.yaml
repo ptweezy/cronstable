@@ -31,10 +31,16 @@
 #                   user/group privilege drop, enabled:false, saveLimit
 #   Failure/report  failsWhen (stderr / stdout / always), onFailure /
 #                   onPermanentFailure / onSuccess, retry with backoff (finite
-#                   AND retry-forever), and ALL FOUR reporters: mail (-> Mailpit,
+#                   AND retry-forever), and ALL FIVE reporters: mail (-> Mailpit,
 #                   with SMTP auth + HTML), webhook (-> the echo sink, custom
 #                   method/headers/contentType), shell (pager), sentry
-#                   (fromEnvVar + extra/body; no-ops until a DSN is set)
+#                   (fromEnvVar + extra/body; no-ops until a DSN is set), push
+#                   (end-to-end encrypted alerts to a paired phone; silent
+#                   until a device pairs)
+#   Notifications   push: relay + durable device registry, per-hook opt-in with
+#                   priority + includeLogTail, and a notify: block that pushes
+#                   DAEMON events (DAG failures, approval gates, leadership and
+#                   quorum changes) rather than job runs
 #   Concurrency     Allow / Forbid / Replace, concurrencyScope: cluster
 #                   (fleet-wide single-flight), plus a fleet SEMAPHORE (lock
 #                   --permits N) and a fleet MUTEX (lock --permits 1)
@@ -78,6 +84,10 @@
 #    :45-:47     cert-expiry-check fails alone and MAILS on-call (-> Mailpit)
 #    every 5th   webhook-dispatch fails, retries with backoff, then on
 #                permanent failure mails on-call
+#    :20 & :40   alert-selftest force-fails and PUSHES to every paired phone
+#    :50         fraud-model-refresh fails: sentry + mail + PUSH together
+#    every 5 min ops-heartbeat-report succeeds and pushes a PASSIVE success
+#                alert (the quiet interruption level)
 #    every :00   four hourly-* reports collide (thundering-herd warning)
 #    continuous  warehouse-sync overruns (node Forbid); inventory-sync is
 #                fleet-wide Forbid; search-reindex is Replaced -> Cancelled;
@@ -171,6 +181,60 @@ web:
   # canary already present this same token, so they keep working.
   # authToken:
   #   fromEnvVar: CRONSTABLE_WEB_TOKEN
+
+# ---- Push: end-to-end encrypted alerts to a paired phone ----------------
+# [feature: push] The fifth reporter. The daemon seals each alert to every
+# paired device's X25519 public key, so the relay that forwards it to APNs
+# sees only a device token, a ciphertext and an opaque coalescing hash,
+# never a job name, hostname or log line. This section says WHERE alerts go
+# and where pairings live; turning the channel on stays per-hook (see the
+# `report: push:` blocks on alert-selftest, fraud-model-refresh and
+# ops-heartbeat-report below, and the `notify:` block after this one).
+#
+# The device registry rides the durable `state:` store above (no
+# devicesFile needed), so it is CLUSTER-VISIBLE: pair once against any node
+# and all nine push to that phone. The registry is never swept by state gc.
+#
+# Nothing leaves the machine until a device pairs. Open any dashboard, hit
+# the command palette and pick "Pair a device" (or GET /push/devices to
+# list, POST to pair by hand), then scan the QR with the companion app.
+push:
+  relay:
+    # The hosted relay by default; point PUSH_RELAY_URL at your own to run
+    # the tour against a self-hosted one (see docker-compose.yml).
+    url: ${PUSH_RELAY_URL:-https://relay.cronstable.com/}
+    timeout: 10
+  # [feature: push.allowUnauthenticated] The tour boots OPEN by design (see
+  # web.authToken above), and a `push:` section on a routable listener with
+  # no token is otherwise a hard ConfigError: /push/devices is a mutating
+  # endpoint, and without a token the web app installs no auth middleware at
+  # all, so anything that can reach the port could pair its own key and keep
+  # receiving every alert. This flag is the documented escape hatch, correct
+  # here (a laptop demo on a published port) and wrong in production. When
+  # you turn on web.authToken, DELETE this line: with a token configured the
+  # gate is satisfied and the pairing QR carries the token to the phone.
+  allowUnauthenticated: true
+
+# ---- Daemon + orchestration event notifications ------------------------
+# [feature: notify] The hooks on a job report on JOB RUNS. This block reports
+# on the daemon's own events instead, and is the only way to get a DAG
+# failure or an approval gate onto a phone. Push-only on purpose: routing
+# these to mail as well would double every alert the tour already sends.
+#
+# What fires here, on the tour's own clock: `dag_failure` when the
+# data-quality-gate diamond fails a check (odd UTC hours), `approval_waiting`
+# the moment you trigger release-train or hotfix-release and their gate
+# starts waiting, and `leader_change` / `quorum_loss` when you stop nodes to
+# watch the fleet re-home its work.
+notify:
+  events:
+    - dag_failure
+    - approval_waiting
+    - leader_change
+    - quorum_loss
+  report:
+    push:
+      enabled: true
 
 jobs:
   # =====================================================================
@@ -571,6 +635,17 @@ jobs:
             value: http://webhook-sink:8080/heartbeat
           body: |
             {"text": "✅ {{ name }} OK on {{ environment.HOSTNAME }} (success={{ success }})"}
+        # [feature: push priority: passive] the success side of the push
+        # channel, and the contrast with the two failure hooks above: a green
+        # heartbeat every 5 minutes must NOT buzz a pocket, so it goes out at
+        # the passive interruption level (it lands in the notification list
+        # and in the next scheduled summary, silently). includeLogTail is off:
+        # the payload is "this succeeded", and the one output line adds
+        # nothing. Push kind is `success` rather than `failure`.
+        push:
+          enabled: true
+          priority: passive
+          includeLogTail: false
         mail:
           from: cronstable@meridian.example
           to: ops@meridian.example
@@ -705,6 +780,13 @@ jobs:
           extra:
             service: fraud
             pipeline: ml
+        # push rides alongside sentry and mail on the same hook: the five
+        # reporters are independent, and one failing (an unreachable relay,
+        # an unset DSN) never affects the others.
+        push:
+          enabled: true
+          priority: time-sensitive
+          includeLogTail: true
         mail:
           from: cronstable@meridian.example
           to: ml-oncall@meridian.example
@@ -814,10 +896,18 @@ jobs:
             <h3>Certificate expiring</h3>
             <pre>{{ stderr }}</pre>
 
-  # [feature: failsWhen always] an alerting SELF-TEST: it exits 0 and its stdout
-  # is ignored (producesStdout:false), yet failsWhen.always forces every run to
-  # count as FAILED, so it exercises the alert path end-to-end on a fixed cadence
-  # (proving the webhook route is live). Runs twice an hour to keep the noise low.
+  # [feature: failsWhen always + push reporter] an alerting SELF-TEST: it exits 0
+  # and its stdout is ignored (producesStdout:false), yet failsWhen.always forces
+  # every run to count as FAILED, so it exercises the alert path end-to-end on a
+  # fixed cadence (proving the webhook AND push routes are live). Runs twice an
+  # hour to keep the noise low.
+  #
+  # This is the tour's primary push demo, and it is Leader (not EveryNode) for a
+  # reason worth knowing before you enable push anywhere else: the relay's
+  # coalescing hash covers the RUN, so nine nodes failing the same job are nine
+  # distinct runs and nine separate notifications. An EveryNode job on a
+  # per-minute schedule is a firehose on a phone. Every push hook in this file
+  # sits on a Leader job, so each event is exactly one notification.
   - name: alert-selftest
     command: echo "alert self-test firing from $HOSTNAME"
     schedule: "20,40 * * * *"
@@ -832,6 +922,13 @@ jobs:
             value: http://webhook-sink:8080/alert-selftest
           body: |
             {"text": "🔔 alert self-test from {{ environment.HOSTNAME }} — alerting path is live"}
+        push:
+          enabled: true
+          # break through a Focus mode / scheduled summary: this is a page
+          priority: time-sensitive
+          # carry the captured output inside the sealed payload (the app
+          # renders it; the relay never sees it)
+          includeLogTail: true
 
   - name: api-canary
     command: echo "api /healthz 200 OK from $HOSTNAME"

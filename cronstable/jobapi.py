@@ -643,10 +643,31 @@ class JobStateAPI:
                 OSError,
                 _DocumentUnreadable,
             ) as ex:
-                logger.warning("state job API: backend error: %s", ex)
+                # The exception text stays OUT of the body.  An OSError
+                # reads "[Errno 13] Permission denied: <absolute document
+                # path>", and _DocumentUnreadable is built from exactly
+                # that text (state.py), so echoing it would hand the
+                # calling job the daemon's store layout and errno.  The
+                # caller is a job command, which is a less trusted party
+                # than the daemon: it runs the operator's arbitrary shell
+                # and may already be demoted to another uid.  Same move as
+                # Cron._push_store_unavailable (cron.py): the detail goes
+                # to the log an operator reads, the caller gets a fixed
+                # sentence.  asyncio.TimeoutError stays in the tuple; it
+                # is only redundant with OSError from 3.11 on, and the
+                # supported floor is 3.10.
+                logger.warning(
+                    "state job API: backend error serving %s: %s",
+                    request.rel_url.path,
+                    ex,
+                )
                 return _json_response(
-                    {"error": "state backend unavailable: {}".format(ex)},
+                    {
+                        "error": "state backend unavailable; the reason "
+                        "is in the cronstable log"
+                    },
                     status=503,
+                    trusted=True,
                 )
 
         return [error_mw]

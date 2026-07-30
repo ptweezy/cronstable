@@ -1400,6 +1400,85 @@ def schedule_slot(
     return now.replace(second=0, microsecond=0)
 
 
+#: Built once, on the first web start (see :func:`_access_log_class`).
+_ACCESS_LOG_CLASS: Optional[type] = None
+
+
+def _redact_query_token(path_qs: str) -> str:
+    """``path_qs`` with any ``token`` query value replaced by ``***``.
+
+    The auth middleware lets the web bearer token ride a ``token`` query
+    parameter on the calendar-feed paths alone, because a calendar client
+    cannot attach an Authorization header, and the dashboard mints exactly
+    that URL for an operator to subscribe with.  aiohttp's access log
+    renders ``request.path_qs``, so without this every poll of the feed
+    (calendar apps refresh on their own cadence, hourly or faster) would
+    write a live token into the log at INFO.
+    """
+    path, sep, query = path_qs.partition("?")
+    if not sep:
+        return path_qs
+    parts = []
+    for item in query.split("&"):
+        key, eq, _ = item.partition("=")
+        parts.append("token=***" if eq and key == "token" else item)
+    return path + sep + "&".join(parts)
+
+
+class _RedactedRequest:
+    """A read-only view of a request with a scrubbed ``path_qs``.
+
+    Everything except ``path_qs`` is forwarded to the real request, so
+    aiohttp's other log directives (``%a`` reads ``remote``, ``%{...}i``
+    reads ``headers``) see exactly what they always did.  A proxy rather
+    than ``BaseRequest.clone``: clone refuses a request whose body has
+    been read, and rebuilding a whole request per logged line is far more
+    work than swapping one string.
+    """
+
+    __slots__ = ("_request", "path_qs")
+
+    def __init__(self, request: Any, path_qs: str) -> None:
+        self._request = request
+        self.path_qs = path_qs
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._request, name)
+
+
+def _access_log_class() -> type:
+    """aiohttp's access logger, with the feed token redacted.
+
+    Built lazily and cached: importing ``aiohttp.web_log`` at module scope
+    would defeat the lazy aiohttp door above, which exists to keep 155 ms
+    and 21 MB of RSS off every daemon start.
+
+    The hook is ``log``, the one method
+    :class:`aiohttp.abc.AbstractAccessLogger` actually declares.  The
+    tempting override is ``_format_r``, the ``%r`` directive's formatter,
+    but ``AccessLogger.compile_format`` resolves every directive with
+    ``getattr(AccessLogger, ...)`` against the base class and memoizes the
+    result in a class-level cache, so a subclass's ``_format_r`` is never
+    called.  Redacting the request before delegating leaves the log format
+    aiohttp's own and survives that internal.
+    """
+    global _ACCESS_LOG_CLASS
+    if _ACCESS_LOG_CLASS is None:
+        from aiohttp.web_log import AccessLogger
+
+        class _RedactingAccessLogger(AccessLogger):  # type: ignore[misc]
+            def log(self, request: Any, response: Any, time: float) -> None:
+                path_qs = getattr(request, "path_qs", "")
+                if "token=" in path_qs:
+                    request = _RedactedRequest(
+                        request, _redact_query_token(path_qs)
+                    )
+                super().log(request, response, time)
+
+        _ACCESS_LOG_CLASS = _RedactingAccessLogger
+    return _ACCESS_LOG_CLASS
+
+
 def web_site_from_url(
     runner: web.AppRunner,
     url: str,
@@ -3020,11 +3099,15 @@ class Cron:
             fields = push.validate_pairing(body)
         except push.PushError as exc:
             # Safe to echo, unlike the store's PushErrors either side of
-            # it: validate_pairing raises only statically authored
-            # sentences about the caller's own body (missing or over-long
-            # field, bad base64, wrong key length) -- no path, no errno,
-            # no library text.  Its one brush with PyNaCl re-raises a
-            # fixed string, so nacl's own wording cannot escape here.
+            # it: every message validate_pairing can raise is a statically
+            # authored sentence about the caller's own body (missing or
+            # over-long field, bad base64, wrong key length, unusable
+            # key), carrying at most an integer length.  No path, no
+            # errno, no library text.  Both of its brushes with PyNaCl
+            # (the import failure in push._sealed_box and the low-order
+            # key refusal in push.validate_public_key) keep their detail
+            # in the log and raise a fixed string, so nacl's own wording
+            # cannot escape here.
             raise web.HTTPBadRequest(text=str(exc)) from None
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
@@ -6071,7 +6154,9 @@ class Cron:
                     handler = getattr(self, handler_name)
                 routes.append(web.route(method, path, handler))
             app.add_routes(routes)
-            self.web_runner = web.AppRunner(app)
+            self.web_runner = web.AppRunner(
+                app, access_log_class=_access_log_class()
+            )
             await self.web_runner.setup()
             socket_mode = web_config.get("socketMode")
             self._web_tcp_bound = []
@@ -7519,7 +7604,9 @@ class Cron:
                 # the token may ride a `token` query parameter instead (the
                 # secret-address model calendar services use).  Same token,
                 # same constant-time compare; every other path keeps the
-                # token out of URLs (and so out of logs and referrers).
+                # token out of URLs (and so out of referrers).  The access
+                # log is covered for this path too: the runner redacts the
+                # `token` value out of the request line (_access_log_class).
                 # Matched precisely so no future route gains URL-token auth
                 # by accident of its name.
                 if request.path.endswith("/calendar.ics"):

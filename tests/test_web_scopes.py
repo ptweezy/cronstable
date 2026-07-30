@@ -1,18 +1,22 @@
 """Scoped web bearer tokens (web.authTokens).
 
-Covers the three layers of the feature:
+Covers the four layers of the feature:
   * ``_effective_web_scopes`` / ``_required_web_scope``: the scope model.
   * ``Cron._resolve_web_tokens``: config -> token table (fail-closed).
   * ``Cron._make_auth_middleware``: 401 (unrecognised token) vs 403
     (recognised token, insufficient scope), plus the .ics carve-out and the
     backward-compatible scalar path, as fast fake-request unit tests and one
     real-aiohttp end-to-end boot.
+  * ``_redact_query_token`` / ``_access_log_class``: the carve-out's fallout,
+    keeping the URL-borne token out of the aiohttp access log.
 
 Mirrors the bearer-auth unit tests in tests/test_ui_endpoints.py (fake request
 + sentinel-return / pytest.raises) and the app-boot test in tests/test_cron.py.
 """
 
 import asyncio
+import logging
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -493,6 +497,113 @@ async def test_scoped_tokens_end_to_end():
                 base + "/status", headers=_bearer("apprtok")
             ) as resp:
                 assert resp.status == 200
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+# --------------------------------------------------------------------------
+# the .ics carve-out puts the token in the URL, so it must stay out of the
+# access log (cron._access_log_class)
+# --------------------------------------------------------------------------
+
+
+def test_redact_query_token():
+    redact = cronstable.cron._redact_query_token
+    assert redact("/calendar.ics?token=s3cr3t") == "/calendar.ics?token=***"
+    assert redact("/jobs/j/calendar.ics?token=s3cr3t&alarm=10") == (
+        "/jobs/j/calendar.ics?token=***&alarm=10"
+    )
+    assert redact("/calendar.ics?alarm=10&token=s3cr3t") == (
+        "/calendar.ics?alarm=10&token=***"
+    )
+    # nothing to redact: left byte for byte alone
+    assert redact("/status") == "/status"
+    assert redact("/status?x=1") == "/status?x=1"
+    # a bare `token` with no '=' is not a value, and a key that merely ends
+    # in "token" is a different parameter
+    assert redact("/calendar.ics?token") == "/calendar.ics?token"
+    assert redact("/x?pushToken=abc") == "/x?pushToken=abc"
+
+
+class _LoggedRequest:
+    """The slice of aiohttp's Request its default access log renders."""
+
+    def __init__(self, path_qs):
+        self.method = "GET"
+        self.path_qs = path_qs
+        self.version = _Version()
+        self.remote = "127.0.0.1"
+        self.headers = {"Referer": "-", "User-Agent": "cal/1.0"}
+
+
+class _Version:
+    major = 1
+    minor = 1
+
+
+def test_web_access_log_redacts_calendar_token(caplog):
+    # aiohttp renders request.path_qs into the access line at INFO, and the
+    # dashboard mints /calendar.ics?token=<web bearer token> for operators
+    # to subscribe with, so an unredacted line writes a live all-scopes
+    # credential to the log on every poll.  Asserts on the EMITTED line
+    # rather than on the override, so an aiohttp upgrade that renames the
+    # %r hook fails here instead of silently restoring the leak.
+    logger_cls = cronstable.cron._access_log_class()
+    logger = logging.getLogger("test.access")
+    access = logger_cls(logger, logger_cls.LOG_FORMAT)
+    response = SimpleNamespace(status=200, body_length=183, headers={})
+    with caplog.at_level(logging.INFO, logger="test.access"):
+        access.log(
+            _LoggedRequest("/calendar.ics?token=s3cr3tTOKEN"), response, 0.01
+        )
+        access.log(_LoggedRequest("/status"), response, 0.01)
+    assert "s3cr3tTOKEN" not in caplog.text
+    assert "GET /calendar.ics?token=*** HTTP/1.1" in caplog.text
+    # an ordinary request line is untouched
+    assert "GET /status HTTP/1.1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_web_access_log_redaction_is_installed_on_the_runner(caplog):
+    # Pins the one line that installs _access_log_class on the runner
+    # (Cron.start_stop_web_app).  The unit test above proves the class
+    # redacts; only a real request through the real runner proves the
+    # daemon uses it, and deleting the access_log_class argument leaves
+    # every other test in the suite green.  This also exercises
+    # aiohttp's own RequestHandler.log_access rather than calling log()
+    # by hand.
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_DISABLED_JOB)
+    web_config = {
+        "listen": ["http://127.0.0.1:0"],
+        "authTokens": [
+            {"value": "s3cr3tTOKEN", "scopes": ["view"], "label": "cal"},
+        ],
+    }
+    await cron.start_stop_web_app(web_config)
+    try:
+        port = cron.web_runner.addresses[0][1]
+        url = "http://127.0.0.1:{}/jobs/test/calendar.ics?token={}".format(
+            port, "s3cr3tTOKEN"
+        )
+        with caplog.at_level(logging.INFO, logger="aiohttp.access"):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    assert resp.status == 200
+                    await resp.read()
+            # aiohttp emits the access line after the body is written;
+            # the same settle the teardown above uses.
+            await asyncio.sleep(0.25)
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "aiohttp.access"
+        ]
+        assert lines, "no access log line captured"
+        assert "s3cr3tTOKEN" not in "\n".join(lines), lines
+        assert any("calendar.ics?token=***" in ln for ln in lines), lines
     finally:
         await cron.start_stop_web_app(None)
         await asyncio.sleep(0.25)
