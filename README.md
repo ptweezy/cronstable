@@ -26,7 +26,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   `RuntimeDefault` seccomp, every Linux capability dropped (see
   [Production container deployment](#production-container-deployment)).
 * **Prebuilt for practically everything.** Multi-architecture images on GHCR
-  and Docker Hub plus self-contained binaries for Linux (glibc and musl),
+  and Docker Hub. Also, self-contained binaries for Linux (glibc and musl),
   macOS (signed and notarized) and Windows, so Python on the host is optional
   (see [Installation](#installation)).
 * **Observability and durability**: A live
