@@ -100,12 +100,12 @@ LABEL org.opencontainers.image.title="cronstable" \
       org.opencontainers.image.source="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.url="https://github.com/ptweezy/cronstable" \
       org.opencontainers.image.documentation="https://github.com/ptweezy/cronstable/wiki" \
-      org.opencontainers.image.authors="Parker Loflin <ptweezy@runforyour.money>" \
+      org.opencontainers.image.authors="Parker Loflin <parker@cronstable.dev>" \
       org.opencontainers.image.vendor="Parker Loflin" \
       org.opencontainers.image.licenses="MIT"
 
 # Flush stdout/stderr immediately (cronstable logs to them) and never write .pyc
-# files — because remember....the read-only root filesystem.
+# files because of the read-only root filesystem.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
