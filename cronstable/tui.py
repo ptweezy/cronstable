@@ -2431,7 +2431,6 @@ class App:
         self.zen_on = False
         self.last_key_mono = time.monotonic()
         self.boot_rows: List[str] = []
-        self.wb_exit_hint_at = 0.0
 
         # ---- plumbing ----
         # memo for the per-line ANSI transforms: line -> (rewritten,
@@ -2454,7 +2453,6 @@ class App:
             Tuple[str, "LogTail", List[Tuple[str, str, float]], int, int, Any]
         ] = None
         self.toasts: List[Tuple[str, str, float]] = []
-        self.dirty = True
         self._dirty_event = asyncio.Event()
         self._poll_wakeup = asyncio.Event()
         self._tasks: List["asyncio.Task[None]"] = []
@@ -2464,7 +2462,6 @@ class App:
     #  little state helpers
     # ---------------------------------------------------------------
     def mark(self) -> None:
-        self.dirty = True
         self._dirty_event.set()
 
     #: Cache bound: ~2x the worst-case buffered line count across every
@@ -2808,7 +2805,6 @@ class App:
             if delay > 0:
                 await asyncio.sleep(delay)
             self._paint_gate = time.monotonic() + 0.033
-            self.dirty = False
             self.paint()
         # one final frame so "quitting" states are not left half-drawn
 
