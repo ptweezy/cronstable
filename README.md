@@ -34,8 +34,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   per-job [resource monitoring](#resource-monitoring), and opt-in
   [durable state](https://github.com/ptweezy/cronstable/wiki/Durable-State),
   [orchestration DAGs](https://github.com/ptweezy/cronstable/wiki/Orchestration-and-DAGs)
-  and [leader-elected clustering](#clustering-and-leader-election), all in one
-  daemon.
+  and [leader-elected clustering](#clustering-and-leader-election).
 
 ## Features
 
@@ -128,9 +127,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   [Calendar Export](https://github.com/ptweezy/cronstable/wiki/Calendar-Export)
   wiki page)
 * Optional **[MCP server](https://github.com/ptweezy/cronstable/wiki/MCP)** for
-  AI agents (Claude, Cursor, VS Code Copilot). An agent can **observe**
+  AI agents. An agent can **observe**
   cronstable, **author and debug schedules** with the daemon's own engine
-  (validate/explain an expression, explain field-by-field why a job did not
+  (validate/explain an expression, explain field by field why a job did not
   run at a timestamp), and **control** it when you opt in. It is read-only by
   default and exposes tools, resources, and triage prompts covering jobs,
   DAGs, the cluster/fleet, metrics, and durable state. It is served at
@@ -165,9 +164,9 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 ## Quick start
 
-Sixty seconds to a running scheduler with a live dashboard. Install it (see
-[Installation](#installation) for Docker, Homebrew, and no-Python binary
-options):
+You can have a running scheduler with a live dashboard in about a minute.
+Install it (see [Installation](#installation) for Docker, Homebrew, and
+no-Python binary options):
 
 ```shell
 pip install cronstable
@@ -187,15 +186,15 @@ web:
     - http://127.0.0.1:8080      # optional: the REST API + dashboard
 ```
 
-Run it (always in the foreground, in true 12-factor spirit):
+Run it (always in the foreground):
 
 ```shell
 cronstable -c cronstable.yaml
 ```
 
-That's it. Open <http://127.0.0.1:8080/> and watch `hello` fire once a minute,
-with its output tailing live in the [dashboard](#web-dashboard). From here,
-each of these is a few lines away:
+Open <http://127.0.0.1:8080/> and watch `hello` fire once a minute,
+with its output tailing live in the [dashboard](#web-dashboard). From there, each of
+these is a few lines of config away:
 
 * **Never miss a silent failure**: retries with backoff and a Slack/mail/Sentry
   report when a job ultimately fails ([tutorial](#tutorial-1-alert-when-a-job-fails-then-retry-it)).
@@ -544,10 +543,10 @@ headline ("4 share exit=69, likely one cause"). Click any job (or press
 | [![Live log tailing with ANSI color, timestamps, and in-log search](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-logs.png) | [![Run history with success rate, duration chart, and per-run CPU and peak-memory columns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-history.png) | [![A plain-English schedule with timezone-aware next-run times](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-schedule.png) |
 | Follow a running job's output **live** over Server-Sent Events, with ANSI color, in-log **grep** (plain text or regex), per-line timestamps, line-wrap, and one-click download. | **Success rate** plus average / min / max duration over the retained history, with a color-coded per-run chart; with [resource monitoring](#resource-monitoring) on, **CPU time and peak memory** per run and in the stats. | A **plain-English** reading of the cron expression and a **timezone-aware preview of the next run times**, computed live in the browser. |
 
-**Everything is one keypress away**: a fuzzy command palette (`Ctrl-K` / `⌘K`)
-runs any action or jumps to any job, `?` lists every shortcut, `/` filters,
-`j`/`k` move the cursor, `r` runs the selected job and `x` cancels it. You can
-**run a single job, or every failing job at once, on demand**, with a click.
+Every action has a key. A fuzzy command palette (`Ctrl-K` / `⌘K`) runs any
+action or jumps to any job, `?` lists every shortcut, `/` filters, `j`/`k`
+move the cursor, `r` runs the selected job and `x` cancels it. A click runs a
+single job on demand, or every failing job at once.
 
 | Fuzzy command palette | Keyboard-first, with a shortcut for everything |
 | :---: | :---: |
@@ -579,13 +578,13 @@ so any node can serve the single pane of glass.
 | [![The cluster panel: nine peers, all agreed, quorum met, with per-node load and per-node job ownership](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-cluster.png) | [![The fleet view: a jobs-by-nodes matrix with each node's last outcome and age per job](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-fleet.png) |
 | Nine nodes, `8/8 agreed`, quorum met, per-node **load meters** and per-node **owns** counts under `distribution: spread`. | Every node's state for every job, one glance: ok / failing / running cells with ages, per-column node health, and a **failing only** filter. |
 
-### Built for the 3 a.m. incident
+### When things break
 
-When things break, the dashboard leans in: the verdict bar's **incident
-timeline** lays out every job's most recent finish, newest first, with the
-correlated blast-radius set highlighted; the **mitigate console** start/cancels
-the failing set in bulk and copies a Markdown incident summary for your ticket;
-and the **multi-tail console** merges up to four jobs' live logs into one
+Three panels are aimed at the 3 a.m. incident. The verdict bar's incident
+timeline lays out every job's most recent finish, newest first, with the
+correlated blast-radius set highlighted. The mitigate console starts or
+cancels the failing set in bulk and copies a Markdown incident summary for
+your ticket. The multi-tail console merges up to four jobs' live logs into one
 pane, like tailing a set of pods.
 
 | Incident timeline | Merged multi-tail |
@@ -608,7 +607,7 @@ counters, artifacts, and quarantine.
 | :---: | :---: | :---: |
 | [![The wallboard: worst-first job tiles with an INCIDENT stamp and next-fire countdowns](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-wallboard.png) | [![The activity heatmap punchcard: one row per job, cells colored by worst outcome and shaded by run volume](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-heatmap.png) | [![The durable-state inspector: record counts per kind, op latencies, and per-primitive tabs](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-state.png) |
 
-### Make it yours
+### Themes, Readability, and Accessibility
 
 **Ten themes**: **carolina** (the default, a Carolina-blue CRT phosphor),
 amber and green phosphor, and flat **modern** and **standard** looks, each in
@@ -655,19 +654,12 @@ daemon, job set, cluster, and schedules for real while it types:
 | :---: | :---: |
 | [![The settings panel: theme picker with carolina selected, CRT toggles, notifications, zen, and refresh interval](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-settings.png) | [![The boot self-test screen: firmware version, job-set id, cluster role, and schedule scan, all OK](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-boot.png) |
 
-Even the wordmark is on duty: the `l` in the header's "cronstable" is a
-**live cart-and-double-pendulum simulation** balanced by a real LQR controller
-whose gains are computed in your browser at page load, not a canned
-animation. While the daemon is live it stands upright, swaying in a little
-breeze; sweep your cursor through it to brush it aside, right-click to knock
-it clean over. Lose the daemon and its motor cuts: the letter collapses out
-of the word and swings, and when the signal returns a planner threads the
-swing-up back into a verified catch; the word heals. Stability is the
-product; the logo has to earn it too.
+The `l` in the header's "cronstable" is a live cart-and-double-pendulum
+simulation. I like to call him double-P, Peter Parker, or PP.
 
 Run history and live logs are kept **in memory only** (unless you opt into the
 durable state store), and the page is served with a strict
-Content-Security-Policy. Turn it on with a one-line `web:` block: the
+Content-Security-Policy. A one-line `web:` block turns it on: the
 [**web dashboard tour**](https://github.com/ptweezy/cronstable/wiki/Web-Dashboard)
 in the wiki is the full walkthrough, and
 [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
@@ -718,9 +710,9 @@ render in the terminal too, every node's state for every job:
 | :---: | :---: |
 | [![The cluster panel: nine gossiping peers, all agreed, with per-node load and the lease detail](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-cluster.png) | [![The fleet view: a 59-job by 9-node matrix of live cells: ok, failing, and running with ages](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-fleet.png) |
 
-When things break, the same incident kit leans in: the verdict bar's
-correlation headline, the timeline, the mitigate console's bulk
-start/cancel with a Markdown writeup, and a **multi-tail** that merges
+The same incident tools are here: the verdict bar's correlation
+headline, the timeline, the mitigate console's bulk start and cancel
+with a Markdown writeup, and a **multi-tail** that merges
 up to four live logs:
 
 | Incident timeline | Merged multi-tail |
@@ -748,9 +740,9 @@ phosphor ↔ paper), with the same colour-vision-safe remaps and an
 | :---: | :---: |
 | [![The TUI in the flat modern theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-modern.png) | [![The TUI in the carolina light paper theme](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-theme-carolina-light.png) |
 
-And yes, the control room still gets its power-on: the same **BIOS-style
-boot self-test**, probing the daemon for real, next to the settings
-sheet where the theme, refresh, zen, and cues live:
+The TUI runs the same BIOS-style boot self-test, probing the daemon for
+real, next to the settings sheet where the theme, refresh, zen and cues
+live:
 
 | Startup self-test | Settings |
 | :---: | :---: |
@@ -764,15 +756,16 @@ cronstable tui --job nightly-backup       # deep-link a job's drawer
 ```
 
 Web-only physics (CRT glow, scanlines, the pendulum wordmark) stay in
-the browser; the terminal gets honest glyphs, the same status colours,
+the browser; the terminal gets plain glyphs, the same status colours,
 and a bell instead of desktop notifications. The
 [**Terminal Dashboard**](https://github.com/ptweezy/cronstable/wiki/Terminal-Dashboard)
 wiki page is the full reference (options, every key, the panel tour).
 
 ## Tutorials
 
-Four short, copy-paste-runnable walkthroughs, each built on the
-[quick start](#quick-start) config and each ending where the wiki goes deeper.
+Four short walkthroughs you can copy and run, each built on the
+[quick start](#quick-start) config and each pointing at the wiki page that
+covers it in full.
 
 ### Tutorial 1: Alert when a job fails, then retry it
 
@@ -808,8 +801,8 @@ and [Reporting](https://github.com/ptweezy/cronstable/wiki/Reporting) in the wik
 
 ### Tutorial 2: Survive restarts, catch up what was missed
 
-Stateless is the default, and a feature. But when a deploy or a reboot lands
-mid-schedule, one `state:` block gives jobs a memory:
+Stateless is the default. When a deploy or a reboot lands mid-schedule, one
+`state:` block gives jobs a memory:
 
 ```yaml
 state:
