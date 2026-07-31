@@ -686,10 +686,7 @@ drawer, `r` runs, `x` cancels, `/` filters, `g` refreshes, `i` opens the
 incident timeline, `w` the wallboard, `Ctrl-K` the fuzzy command
 palette, and `?` lists everything (terminal-only extras like quit,
 sort/filter cycling, and drawer tabs are grouped separately in that
-overlay). It is hand-rolled on the stdlib + the core aiohttp dependency,
-so it adds nothing to the install. Every screenshot below is the real
-TUI against the same live 9-node [grand tour](example/grand-tour) fleet
-the web-dashboard shots use, same staged incident and all:
+overlay).
 
 [![The cronstable TUI: a live 59-job board with status glyphs, next-fire countdowns, run sparklines, live CPU/memory chips, cluster owner column, and the verdict bar correlating a staged failure](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/tui-overview.png)
 
