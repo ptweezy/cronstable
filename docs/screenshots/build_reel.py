@@ -28,7 +28,6 @@ Pillow.
 
 Usage: python build_reel.py [reel|themes]   (default: both)
 """
-import json
 import sys
 from pathlib import Path
 
@@ -37,9 +36,6 @@ from PIL import Image
 HERE = Path(__file__).parent
 SRC = HERE / "reel"
 IMG = HERE.parent / "img"          # docs/img
-MANIFEST = json.loads((SRC / "manifest.json").read_text()) if (
-    SRC / "manifest.json"
-).exists() else {}
 
 # The reel cuts hard (few frames), so we can afford a large, high-quality
 # frame: 1600px supersampled from the 3360px stills, near-max libwebp quality.

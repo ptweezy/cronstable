@@ -835,7 +835,6 @@ async def test_job_state_api_serves_over_tls(tmp_path):
     await backend.start()
     api = JobStateAPI(
         lambda: backend,
-        host="h",
         base_holder="h#proc",
         config={
             "listen": "https://localhost:{}".format(port),
@@ -878,7 +877,6 @@ async def test_job_state_api_plaintext_base_url_is_unchanged(tmp_path):
     await backend.start()
     api = JobStateAPI(
         lambda: backend,
-        host="h",
         base_holder="h#proc",
         config={"maxValueBytes": 0, "maxArtifactBytes": 0},
     )

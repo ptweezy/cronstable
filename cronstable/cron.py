@@ -1087,10 +1087,6 @@ def schedule_str(job: JobConfig) -> str:
     return schedule_object_to_crontab(unparsed)
 
 
-def command_str(command: Union[str, List[str]]) -> str:
-    return command if isinstance(command, str) else " ".join(command)
-
-
 def _json_response(
     payload: Any,
     *,
@@ -6850,7 +6846,6 @@ class Cron:
             )
         api = JobStateAPI(
             lambda: self.state_backend,
-            host=self._state_host,
             base_holder=self._slot_holder(),
             config=job_api_cfg,
         )
