@@ -471,8 +471,8 @@ class JobStateAPI:
     """The loopback HTTP server plus its per-run token and secret registry.
 
     Constructed with a *getter* for the current state backend (which the
-    scheduler may swap on a config reload), the host name, a base lease-holder
-    string, and the resolved ``state.jobApi`` config.  Owned by
+    scheduler may swap on a config reload), a base lease-holder string, and
+    the resolved ``state.jobApi`` config.  Owned by
     :class:`cronstable.cron.Cron`, which registers a run before launching it
     and
     finishes it (dropping its token and secrets, releasing its locks) when it
@@ -483,12 +483,10 @@ class JobStateAPI:
         self,
         backend_getter: Callable[[], Optional[StateBackend]],
         *,
-        host: str,
         base_holder: str,
         config: Dict[str, Any],
     ) -> None:
         self._backend_getter = backend_getter
-        self._host = host
         self._config = config
         self._runs: Dict[str, RunContext] = {}
         self._runner: Optional[web.AppRunner] = None

@@ -119,7 +119,7 @@ def test_resource_usage_from_dict_defaults_samples():
 @pytest.mark.asyncio
 async def test_monitor_samples_a_real_process():
     proc = await _spawn_busy(0.6)
-    monitor = ResourceMonitor(proc.pid, job_name="busy", interval=0.05)
+    monitor = ResourceMonitor(proc.pid, interval=0.05)
     monitor.start()
     assert monitor.available
     await proc.wait()
@@ -134,7 +134,7 @@ async def test_monitor_samples_a_real_process():
 @pytest.mark.asyncio
 async def test_monitor_live_snapshot():
     proc = await _spawn_busy(0.6)
-    monitor = ResourceMonitor(proc.pid, job_name="busy", interval=0.05)
+    monitor = ResourceMonitor(proc.pid, interval=0.05)
     # no sample yet -> no live snapshot
     assert monitor.snapshot() is None
     monitor.start()
@@ -180,7 +180,7 @@ async def test_monitor_accumulates_sequential_children():
     # regression: an `sh -c 'a; b'` style run, where one child exits before
     # the next starts, must accumulate every child's CPU time rather than
     # plateauing at the largest instantaneous tree sum.
-    monitor = ResourceMonitor(123, job_name="seq", interval=0.05)
+    monitor = ResourceMonitor(123, interval=0.05)
     root = _FakeProcess(pid=123, create_time=100.0, user=0.1)
     child_a = _FakeProcess(pid=200, create_time=101.0, user=10.0)
     # child B reuses child A's pid (fresh create_time): the accounting must
@@ -219,7 +219,7 @@ async def test_monitor_transient_read_failure_does_not_double_count():
     # its CPU twice (banked total + full cumulative reading).
     import psutil
 
-    monitor = ResourceMonitor(123, job_name="flaky", interval=0.05)
+    monitor = ResourceMonitor(123, interval=0.05)
     root = _FakeProcess(pid=123, create_time=100.0, user=0.1)
     child = _FakeProcess(pid=200, create_time=101.0, user=5.0)
     monitor._proc = root
@@ -298,7 +298,7 @@ def test_node_sampler_snapshot_is_memoised(monkeypatch):
 @pytest.mark.asyncio
 async def test_monitor_stop_is_idempotent():
     proc = await _spawn_busy(0.2)
-    monitor = ResourceMonitor(proc.pid, job_name="busy", interval=0.05)
+    monitor = ResourceMonitor(proc.pid, interval=0.05)
     monitor.start()
     await proc.wait()
     first = await monitor.stop()
@@ -311,7 +311,7 @@ async def test_monitor_stop_is_idempotent():
 async def test_monitor_bogus_pid_is_inert():
     # a pid that is (almost certainly) not a live process: the monitor must
     # stay inert and yield no usage rather than raising.
-    monitor = ResourceMonitor(2**31 - 1, job_name="ghost", interval=0.05)
+    monitor = ResourceMonitor(2**31 - 1, interval=0.05)
     monitor.start()
     assert not monitor.available
     assert await monitor.stop() is None
@@ -321,7 +321,7 @@ async def test_monitor_bogus_pid_is_inert():
 async def test_monitor_without_psutil_is_noop(monkeypatch):
     # simulate a checkout without the optional import resolving.
     monkeypatch.setattr("cronstable.resources.psutil", None)
-    monitor = ResourceMonitor(1, job_name="x", interval=0.05)
+    monitor = ResourceMonitor(1, interval=0.05)
     monitor.start()
     assert not monitor.available
     assert await monitor.stop() is None
@@ -641,7 +641,7 @@ def test_resource_usage_series_parse_is_capped():
 @pytest.mark.asyncio
 async def test_monitor_records_chart_series():
     proc = await _spawn_busy(0.6)
-    monitor = ResourceMonitor(proc.pid, job_name="busy", interval=0.05)
+    monitor = ResourceMonitor(proc.pid, interval=0.05)
     monitor.start()
     await asyncio.sleep(0.25)
     live = monitor.series()
@@ -661,7 +661,7 @@ async def test_monitor_records_chart_series():
 async def test_monitor_history_zero_disables_series():
     proc = await _spawn_busy(0.4)
     monitor = ResourceMonitor(
-        proc.pid, job_name="busy", interval=0.05, history=0
+        proc.pid, interval=0.05, history=0
     )
     monitor.start()
     await asyncio.sleep(0.15)
@@ -937,7 +937,7 @@ def test_tree_from_index_folds_tree_and_skips_impostors(monkeypatch):
     procs = {200: child, 300: grandchild, 400: stale}  # 500 is absent
     _patch_process_table(monkeypatch, procs)
 
-    monitor = ResourceMonitor(100, job_name="tree", interval=1.0, history=0)
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
     monitor._proc = root
     # 200 is listed a second time under itself: the already-seen guard must
     # skip the duplicate rather than looping.
@@ -953,7 +953,7 @@ def test_tree_from_index_folds_tree_and_skips_impostors(monkeypatch):
 def test_tree_from_index_root_gone_returns_root_only():
     # if the root's create_time read fails, the tree collapses to the root
     # alone (read below on its own).
-    monitor = ResourceMonitor(100, job_name="lone", interval=1.0, history=0)
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
     root = _FakeProc(pid=100, create_time=1000.0)
     root.create_time_error = psutil.NoSuchProcess(100)
     tree = monitor._tree_from_index(root, {100: [200]})
@@ -971,7 +971,7 @@ def test_sample_locked_skips_unreadable_members(monkeypatch):
     broken.memory_info_error = RuntimeError("weird")
     _patch_process_table(monkeypatch, {200: denied, 300: broken})
 
-    monitor = ResourceMonitor(100, job_name="skip", interval=1.0, history=0)
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
     monitor._proc = root
     monitor._sample_locked({100: [200, 300]})
 
@@ -983,7 +983,7 @@ def test_sample_locked_skips_unreadable_members(monkeypatch):
 def test_sample_locked_children_walk_root_transient():
     # without a shared index the tree is walked via children(); a transient
     # failure there falls back to reading the root alone.
-    monitor = ResourceMonitor(100, job_name="walk", interval=1.0, history=0)
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
     root = _FakeProc(pid=100, create_time=1000.0, user=1.5, rss=2048)
     root.children_error = psutil.NoSuchProcess(100)
     monitor._proc = root
@@ -996,7 +996,7 @@ def test_sample_locked_children_walk_root_transient():
 def test_sample_locked_children_walk_hard_error_is_inert():
     # a non-transient error from children() aborts the sample entirely (no
     # reading banked) rather than raising out of the sampler.
-    monitor = ResourceMonitor(100, job_name="hard", interval=1.0, history=0)
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
     root = _FakeProc(pid=100, create_time=1000.0, user=1.5)
     root.children_error = RuntimeError("table read blew up")
     monitor._proc = root
@@ -1289,7 +1289,7 @@ def test_sample_locked_zero_dt_keeps_previous_cpu_percent(monkeypatch):
     # two samples at the same monotonic instant give dt == 0, so the live CPU%
     # is left untouched rather than dividing by zero.
     monkeypatch.setattr(resources.time, "monotonic", lambda: 500.0)
-    monitor = ResourceMonitor(100, job_name="dt0", interval=1.0, history=0)
+    monitor = ResourceMonitor(100, interval=1.0, history=0)
     root = _FakeProc(pid=100, create_time=1000.0, user=1.0, system=0.5,
                      rss=2048)
     monitor._proc = root
@@ -1471,7 +1471,7 @@ def _snapshot_ticker(monitor, index, age=0.0):
 
 
 def _snapshot_monitor(pid=1234, interval=1.0):
-    monitor = ResourceMonitor(pid, job_name="j", interval=interval)
+    monitor = ResourceMonitor(pid, interval=interval)
     monitor._proc = _CountingProc(pid, 100.0, user=1.0, system=0.5, rss=4096)
     return monitor
 
