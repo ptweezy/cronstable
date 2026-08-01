@@ -64,7 +64,7 @@ async def _make_api(tmp_path, **cfg_over):
     config = {"maxValueBytes": 0, "maxArtifactBytes": 0, "lockTtlSeconds": 5}
     config.update(cfg_over)
     api = JobStateAPI(
-        lambda: backend, host="h", base_holder="h#proc", config=config
+        lambda: backend, base_holder="h#proc", config=config
     )
     await api.start()
     return api, backend
@@ -1251,7 +1251,6 @@ async def test_lock_permits_must_be_integer_over_http(tmp_path):
 async def test_backend_gone_is_503_over_http(tmp_path):
     api = JobStateAPI(
         lambda: None,
-        host="h",
         base_holder="h#proc",
         config={"maxValueBytes": 0, "maxArtifactBytes": 0},
     )
@@ -1345,7 +1344,6 @@ class _HeaderReq:
 def test_auth_surrogate_token_is_401(tmp_path):
     api = JobStateAPI(
         lambda: None,
-        host="h",
         base_holder="h#proc",
         config={},
     )
@@ -1358,7 +1356,6 @@ def test_auth_surrogate_token_is_401(tmp_path):
 def _bind_of(listen):
     api = JobStateAPI(
         lambda: None,
-        host="h",
         base_holder="h#proc",
         config={"listen": listen} if listen else {},
     )
@@ -1422,7 +1419,7 @@ async def test_error_mw_maps_unportable_value_to_400():
     # defence in depth: a handler that lets a non-portable value reach the
     # serializer raises _json.UnsupportedValue, which the error middleware maps
     # to a clean 400 (the caller's bad input), not a 500.
-    api = JobStateAPI(lambda: None, host="h", base_holder="h#proc", config={})
+    api = JobStateAPI(lambda: None, base_holder="h#proc", config={})
     mw = api._middlewares()[0]
 
     async def handler(_request):

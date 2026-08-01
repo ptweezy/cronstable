@@ -5593,16 +5593,27 @@ def bench_resources_monitor_stop():
         raise Skip("psutil not installed: %r" % exc) from None
     n = _n(100, floor=2)
 
+    def _monitor():
+        # The baseline side of a release comparison runs THIS file against
+        # an older install, which may still require the job_name kwarg the
+        # current tree dropped.  Construct under either signature, or the
+        # metric never compares and expected_gated.txt calls it a dead
+        # gate.  A second TypeError is real drift and reaches the Skip.
+        try:
+            return ResourceMonitor(os.getpid())
+        except TypeError:
+            return ResourceMonitor(os.getpid(), job_name="bench")
+
     async def run():
         try:
-            probe = ResourceMonitor(os.getpid(), job_name="bench")
+            probe = _monitor()
         except TypeError as exc:
             raise Skip("ResourceMonitor signature changed: %r" % exc) from None
         if not hasattr(probe, "_proc") or not hasattr(probe, "stop"):
             raise Skip("ResourceMonitor internals not present")
         monitors = []
         for _ in range(n + 1):
-            monitor = ResourceMonitor(os.getpid(), job_name="bench")
+            monitor = _monitor()
             # attached WITHOUT start(): see the docstring
             monitor._proc = psutil.Process(os.getpid())
             monitors.append(monitor)
