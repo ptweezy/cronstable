@@ -477,12 +477,10 @@ class ResourceMonitor:
         self,
         pid: int,
         *,
-        job_name: str,
         interval: float = SAMPLE_INTERVAL,
         history: int = MONITOR_HISTORY_DEFAULT,
     ) -> None:
         self._pid = pid
-        self._job_name = job_name
         self._interval = interval
         # bounded chart series of the run's samples (see _SeriesRecorder);
         # history <= 0 keeps the summary numbers only.

@@ -9074,58 +9074,6 @@ async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
 
 
 
-# --- CancelledError re-raise paths (defensive) -----------------------
-
-
-async def test_catchup_pause_excusal_window_reraises_cancelled(tmp_path):
-    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
-
-    async def boom(*a, **k):
-        raise asyncio.CancelledError()
-
-    cron.state_backend.list_records = boom  # type: ignore[method-assign]
-    with pytest.raises(asyncio.CancelledError):
-        await cron._pause_excusal_window("j")
-
-
-async def test_catchup_evaluate_catch_up_pause_pin_reraises_cancelled(tmp_path):
-    cron = await _cron_with_watermark(
-        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
-    )
-    cron._paused["j"] = _catchup_pause()
-
-    async def boom(name):
-        raise asyncio.CancelledError()
-
-    cron._pending_catchup_watermark = boom  # type: ignore[method-assign]
-    with pytest.raises(asyncio.CancelledError):
-        await cron._evaluate_catch_up(_NOW)
-
-
-async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
-    tmp_path,
-):
-    cron = await _catchup_reboot_cron(tmp_path)
-    cron._state_on_unavailable = "fail-closed"
-    seen = {"n": 0}
-
-    async def marker(job):
-        seen["n"] += 1
-        if seen["n"] == 1:
-            return False  # absent at the gate
-        raise asyncio.CancelledError()  # cancelled during the re-check
-
-    async def boom(*a, **k):
-        raise asyncio.TimeoutError()
-
-    cron._reboot_marker_covers = marker  # type: ignore[method-assign]
-    cron.state_backend.append_record = boom  # type: ignore[method-assign]
-    with pytest.raises(asyncio.CancelledError):
-        await cron._reboot_boot_gate(cron.cron_jobs["boot"])
-
-
-
-
 # ---------------------------------------------------------------------------
 # Cluster concurrency slot leasing.
 #   _log_cluster_role error swallow, maybe_launch_job cluster start-failure
@@ -10152,7 +10100,6 @@ async def test_slotlease_pursue_replace_polls_until_slot_frees(monkeypatch):
 # alongside the real happy-path behaviour so the in-memory maps are asserted.
 
 from cronstable.cron import JobRunInfo as _JRI5
-from cronstable.cron import _job_run_info_from_dict as _from_dict5
 from cronstable.fingerprint import job_digest as _job_digest5
 from tests.test_state import _UTC as _UTC5
 from tests.test_state import _state_cfg as _scfg5
@@ -11747,7 +11694,6 @@ async def test_retryclaim_claim_under_lease_durable_read_error_false(
         job = cron.cron_jobs["j"]
         foreign = _retryclaim_foreign(cron, job, host="node-a")
         await cron.state_backend.append_record("retries/j", foreign)
-        now = cronstable.cron.get_now(datetime.timezone.utc)
 
         async def _boom(name):
             raise OSError("ledger read fail")
