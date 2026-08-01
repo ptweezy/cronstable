@@ -1338,7 +1338,6 @@ class RunningJob:
             # after launch, so a long run is sampled from as early as possible.
             self._resource_monitor = ResourceMonitor(
                 self.proc.pid,
-                job_name=self.config.name,
                 interval=self.config.monitorResourcesInterval,
                 history=self.config.monitorResourcesHistory,
             )
