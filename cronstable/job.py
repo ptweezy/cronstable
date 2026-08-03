@@ -1547,9 +1547,12 @@ class RunningJob:
         self._terminated = True
         # Graceful first: SIGTERM the group. This reaches the descendants even
         # once the leader itself has exited, which is exactly the case that
-        # wedges the run. Where the group cannot be signalled (Windows has no
-        # graceful kill, and no group to aim one at) fall back to the direct
-        # child, as before.
+        # wedges the run. On Windows this step IS the taskkill tree kill:
+        # there is no graceful signal, and the tree walk must run while the
+        # root is still alive to anchor it (killing the root first, as the
+        # fallback below does, would orphan every descendant for good). The
+        # fallback to the direct child remains for a group/tree that could
+        # not be signalled at all.
         if not await platform.kill_process_group(self.proc.pid, force=False):
             if self.proc.returncode is None:
                 try:

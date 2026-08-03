@@ -784,12 +784,15 @@ async def test_bounded_schedule_exhausts_without_crash(tmp_path):
     cron = await _make_cron(tmp_path, yaml)
     try:
         _set_cmd(cron, "once", "a", [_PY, "-c", "pass"])
-        # force the last (only) occurrence to be due, then fire it
+        # force the last (only) occurrence to be RECENTLY due (within
+        # DAG_CATCHUP_LIMIT: a 2020 instant would be a stall-sized gap now,
+        # which resumes past the occurrence instead of firing it), then
+        # fire it: computing the following occurrence exhausts the schedule.
         cron._dag._seeded["once"] = cron._dag._sched_sig(
             cron.cron_dags["once"]
         )
-        cron._dag._next_logical["once"] = datetime.datetime(
-            2020, 1, 1, tzinfo=_UTC
+        cron._dag._next_logical["once"] = _utcnow() - datetime.timedelta(
+            seconds=1
         )
         await cron._dag._fire_scheduled(dagrun._now())
         # the exhausted index was dropped, not poisoned with None ...
@@ -3419,7 +3422,16 @@ async def test_fire_scheduled_cluster_deny_and_cancel(tmp_path, monkeypatch):
         await _teardown(cron)
 
 
-async def test_fire_forward_stops_at_catchup_cap(tmp_path, monkeypatch):
+async def test_fire_forward_gap_resumes_instead_of_replaying(
+    tmp_path, monkeypatch
+):
+    # regression: a next-fire far behind now (suspend, stall, forward clock
+    # jump WHILE RUNNING) used to replay every missed occurrence as a
+    # backdated scheduled run (DAG_MAX_CATCHUP per pass, each pass
+    # immediately due again until the whole gap drained) regardless of
+    # onMissed, whose default is skip. It must resume like the boot seed
+    # instead: fire the current slot only if now itself matches, resync
+    # strictly future, and (below) leave the gap to onMissed.
     yaml = (
         "dags:\n  - name: ff\n    schedule: '* * * * *'\n    tasks:\n"
         "      - id: a\n        command: 'x'\n"
@@ -3429,16 +3441,76 @@ async def test_fire_forward_stops_at_catchup_cap(tmp_path, monkeypatch):
         d = cron._dag
         dagcfg = cron.cron_dags["ff"]
         created = []
+        caught_up = []
 
         async def _noop(cfg, when, kind):
-            created.append(when)
+            created.append((when, kind))
+
+        async def _catch(cfg, nd):
+            caught_up.append(cfg.name)
 
         monkeypatch.setattr(d, "_create_run", _noop)
-        # far enough back that the per-minute schedule has many more due
-        # instants than the cap: the fire loop stops at DAG_MAX_CATCHUP.
-        d._next_logical["ff"] = _utcnow() - datetime.timedelta(hours=5)
-        await d._fire_forward(dagcfg, _utcnow())
-        assert len(created) == dagrun.DAG_MAX_CATCHUP
+        monkeypatch.setattr(d, "_catch_up", _catch)
+        # a fixed pass instant makes the fired slot exact (no wall-clock
+        # dependence); the per-minute schedule always matches its minute.
+        now_dt = datetime.datetime(2026, 3, 3, 12, 30, 45, tzinfo=_UTC)
+        d._next_logical["ff"] = now_dt - datetime.timedelta(hours=5)
+        await d._fire_forward(dagcfg, now_dt)
+        # exactly ONE run (the current slot, as a normal scheduled fire),
+        # not the ~300 backdated occurrences of the 5h gap...
+        assert created == [
+            (datetime.datetime(2026, 3, 3, 12, 30, tzinfo=_UTC), "scheduled")
+        ]
+        # ...the index resynced strictly past the pass instant, so the next
+        # pass cannot re-enter the gap...
+        assert d._next_logical["ff"] > now_dt
+        # ...and onMissed: skip (this dag's default) replayed nothing.
+        assert caught_up == []
+    finally:
+        await _teardown(cron)
+
+
+async def test_fire_forward_gap_hands_the_gap_to_onmissed(
+    tmp_path, monkeypatch
+):
+    # the other half of the resume rule: a dag that ASKED for catch-up
+    # (onMissed: run-all) hands the gap to the same catch-up the boot seed
+    # uses (deadline, run-once coalesce and DAG_MAX_CATCHUP all apply
+    # there), and an hourly schedule whose minute does not match now fires
+    # no current slot at all.
+    yaml = (
+        "dags:\n  - name: fh\n    schedule: '0 * * * *'\n"
+        "    onMissed: run-all\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        d = cron._dag
+        dagcfg = cron.cron_dags["fh"]
+        created = []
+        caught_up = []
+
+        async def _noop(cfg, when, kind):
+            created.append((when, kind))
+
+        async def _catch(cfg, nd):
+            caught_up.append((cfg.name, nd))
+
+        monkeypatch.setattr(d, "_create_run", _noop)
+        monkeypatch.setattr(d, "_catch_up", _catch)
+        now_dt = datetime.datetime(2026, 3, 3, 12, 30, 45, tzinfo=_UTC)
+        d._next_logical["fh"] = now_dt - datetime.timedelta(hours=6)
+        await d._fire_forward(dagcfg, now_dt)
+        assert created == []  # 12:30 is not an occurrence of '0 * * * *'
+        assert caught_up == [("fh", now_dt)]  # the gap went to onMissed
+        # resynced to the NEXT hourly occurrence (a range, not an exact
+        # instant: a schedule with no timezone fires in local time, and a
+        # half-hour-offset host would shift the exact minute).
+        assert (
+            now_dt
+            < d._next_logical["fh"]
+            <= now_dt + datetime.timedelta(hours=1)
+        )
     finally:
         await _teardown(cron)
 
