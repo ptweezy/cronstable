@@ -1,6 +1,7 @@
-# Keep the build context small. NOTE: .git MUST be included — setuptools_scm
-# derives the version from git tags during `pip install .`. README.md and
-# LICENSE must also stay: pyproject.toml references them at build time.
+# Keep the build context small. NOTE: .git MUST be included because
+# setuptools_scm derives the version from git tags during `pip install .`.
+# README.md and LICENSE must also stay: pyproject.toml references them at
+# build time.
 .venv
 .venv314
 .tox
@@ -13,12 +14,16 @@ build
 __pycache__
 *.pyc
 
-# Not needed to build the package; excluded to shrink the build context.
+# None of this is needed to build the package, so it's excluded to shrink
+# the build context.
+# pyinstaller/ is NOT excluded: its Makefile builds with the repo root as
+# the context (`docker build -f Dockerfile ..`), so this file governs that
+# build too, and the image runs `pyinstaller pyinstaller/cronstable.spec`
+# from the copied tree; excluding the directory broke that build outright.
 .claude
 .github
 docker
 example
-pyinstaller
 scripts
 target
 tests

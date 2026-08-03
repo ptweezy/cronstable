@@ -508,9 +508,16 @@ def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
 
 
 def effective_state(spec: DagSpec, body: Dict[str, Any], task_id: str) -> str:
-    """The state a dependency check should see for ``task_id``."""
+    """The state a dependency check should see for ``task_id``.
+
+    Keyed on the RUN's recorded expansion as well as the spec: a run whose
+    task fanned out under an older spec keeps folding its instances even if
+    a reload since removed ``expand:`` from the task. Its placeholder is
+    parked in the non-terminal EXPANDED state, so consulting it instead
+    would leave every downstream (and the run) waiting forever.
+    """
     task = spec.by_id[task_id]
-    if task.expand is not None:
+    if task.expand is not None or task_id in body.get("mapped", {}):
         return _mapped_group_state(body, task_id)
     return str(body["tasks"].get(task_id, {}).get("state", PENDING))
 
@@ -725,9 +732,13 @@ def _instances_of(
     """The concrete (taskkey, map_index, item) instances of ``task``.
 
     A plain task is one instance keyed by its id; a mapped task is its
-    materialised ``<id>#<i>`` instances (empty until expansion).
+    materialised ``<id>#<i>`` instances (empty until expansion). The run
+    body's recorded fan-out wins over the spec (the mirror of
+    :func:`effective_state`): a task that expanded before a reload removed
+    its ``expand:`` keeps dispatching its recorded instances, because its
+    placeholder is parked EXPANDED and no path could ever advance it.
     """
-    if task.expand is None:
+    if task.expand is None and task.id not in body.get("mapped", {}):
         return [(task.id, None, None)]
     mapped = body.get("mapped", {}).get(task.id)
     if mapped is None:
@@ -1057,7 +1068,11 @@ def _maybe_terminalise(spec, body, now, result) -> None:
     mapped_all = body.get("mapped", {})
     failed = False
     for task in spec.tasks:
-        if task.expand is None or task.id not in mapped_all:
+        # keyed on the RUN's recorded fan-out, not the spec: a task that
+        # expanded before a reload removed its `expand:` still contributes
+        # its instances, never its placeholder (parked non-terminally in
+        # EXPANDED, which would hold the run open forever).
+        if task.id not in mapped_all:
             entry = tasks.get(task.id)
             if entry is None:
                 continue  # task added post-creation: not part of this run
@@ -1185,10 +1200,13 @@ def _entry_quiescence(
         # quiescent verdict resting on it would keep the document forever).
         return _Q_ACT
     if state == EXPANDED:
-        if task.expand is None:
-            # the spec stopped mapping this task while its placeholder is
-            # still marked expanded: the full pass owns that corner.
+        if task.expand is None and task_id not in body.get("mapped", {}):
+            # marked expanded with no recorded fan-out to stand in for it:
+            # a shape this scan does not recognise; the full pass owns it.
             return _Q_ACT
+        # the recorded instances carry the real state (even if the spec
+        # stopped mapping the task since: dispatch and terminalisation key
+        # on the run's recorded fan-out, and neither consults this entry).
         return _Q_INERT
     if state == UP_FOR_RETRY:
         try:
@@ -1262,7 +1280,7 @@ def _q_blocked(
     Anything that cannot be positively matched to a consulted slot falls
     back to the full pass.
     """
-    if task.expand is None:
+    if task.expand is None and task.id not in body.get("mapped", {}):
         return _Q_BLOCKED if taskkey == task.id else _Q_ACT
     mapped = body.get("mapped", {}).get(task.id)
     items = mapped.get("items") if isinstance(mapped, dict) else None

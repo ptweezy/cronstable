@@ -1024,8 +1024,9 @@ async def test_calendar_query_params_are_clamped():
 
 
 class _AuthReq:
-    def __init__(self, path, headers=None, query=None):
+    def __init__(self, path, headers=None, query=None, method="GET"):
         self.path = path
+        self.method = method  # the preflight carve-out dispatches on it
         self.headers = headers or {}
         self.query = query or {}
         # the middleware files the matched token on the request

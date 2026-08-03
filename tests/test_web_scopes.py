@@ -607,3 +607,30 @@ async def test_web_access_log_redaction_is_installed_on_the_runner(caplog):
     finally:
         await cron.start_stop_web_app(None)
         await asyncio.sleep(0.25)
+
+
+# --------------------------------------------------------------------------
+# the CORS-preflight carve-out: a credential-less preflight passes the gate
+# (the Fetch standard strips credentials from preflights, and the /mcp
+# OPTIONS route enforces mcp.allowedOrigins itself); a bare OPTIONS without
+# the defining header stays 401.
+# --------------------------------------------------------------------------
+
+
+async def test_cors_preflight_passes_the_bearer_gate():
+    mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ctl")))
+    req = _ScopedReq(
+        "/mcp",
+        method="OPTIONS",
+        headers={
+            "Origin": "https://inspector.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert await _run(mw, req) == "ok"
+
+
+async def test_bare_options_without_preflight_header_is_401():
+    mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ctl")))
+    with pytest.raises(web.HTTPUnauthorized):
+        await _run(mw, _ScopedReq("/mcp", method="OPTIONS"))

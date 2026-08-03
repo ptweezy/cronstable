@@ -4478,3 +4478,36 @@ def test_parse_iso_edge_cases():
     assert dagrun._parse_iso("not-a-date") is None
     dt = dagrun._parse_iso("2026-01-01T00:00:00")  # naive: read as UTC
     assert dt.tzinfo == datetime.timezone.utc
+
+
+async def test_reconcile_on_boot_isolates_a_failing_run(
+    tmp_path, monkeypatch
+):
+    # One stalled or unreadable run document must not abort boot
+    # reconciliation: the loop runs inside the state-rehydration tail, and
+    # an escaping raise used to skip every remaining run AND the
+    # _start_job_api call after it, for the life of the backend generation.
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        dagcfg = cron.cron_dags["lin"]
+        assert await cron._dag._create_doc(dagcfg, "boom-run", None, "manual")
+        assert await cron._dag._create_doc(dagcfg, "ok-run", None, "manual")
+        cron._dag.forget()  # a fresh restart owns nothing
+
+        real = cron._dag._try_own
+
+        async def flaky(dagcfg_, ref):
+            if ref[1] == "boom-run":
+                raise asyncio.TimeoutError()  # a stalled adoption RMW
+            return await real(dagcfg_, ref)
+
+        monkeypatch.setattr(cron._dag, "_try_own", flaky)
+        await cron._dag.reconcile_on_boot()  # must not raise
+        assert ("lin", "ok-run") in cron._dag._owned  # the healthy run won
+        assert ("lin", "boom-run") not in cron._dag._owned
+        monkeypatch.undo()
+        await _drive(cron, "lin", "ok-run")  # reap the adopted launch
+    finally:
+        await _teardown(cron)

@@ -1094,7 +1094,9 @@ async def test_auth_middleware():
         def __init__(self, auth):
             self.headers = {"Authorization": auth} if auth else {}
             # the middleware consults these on non-bearer requests (the
-            # .ics query-token carve-out); a real request always has them
+            # .ics query-token carve-out, the preflight carve-out's method
+            # dispatch); a real request always has them
+            self.method = "GET"
             self.path = "/jobs"
             self.query = {}
             # the middleware files the matched token on the request
@@ -2094,6 +2096,7 @@ async def test_auth_middleware_public_path():
     class FakeRequest:
         def __init__(self, path, auth=None):
             self.path = path
+            self.method = "GET"
             self.headers = {"Authorization": auth} if auth else {}
 
     # the UI page is reachable without a token...
@@ -11957,3 +11960,142 @@ async def test_retryclaim_reap_retry_task_logs_exception(caplog):
     with caplog.at_level(logging.ERROR, logger="cronstable"):
         cronstable.cron.Cron._reap_retry_task("j", task)
     assert any("retry task died" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Web-app lifecycle hardening from the 2026-08-02 review: an all-binds-failed
+# start must retry on the next housekeeping pass, a teardown must end open
+# SSE tails promptly, and a credential-less CORS preflight must reach the
+# /mcp OPTIONS route through the bearer gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_web_app_retries_bind_after_all_listens_fail():
+    # A predecessor (here: a plain socket) still holds the only listen port,
+    # so every bind fails. web_config must NOT latch: the unchanged latch is
+    # what makes the next housekeeping pass retry, and latching it left the
+    # web API down for the daemon's life once the port freed.
+    import socket
+
+    blocker = socket.socket()
+    try:
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        listen = {"listen": ["http://127.0.0.1:{}".format(port)]}
+        cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+        try:
+            await cron.start_stop_web_app(listen)
+            assert cron.web_runner is None  # torn down, nothing half-bound
+            assert cron.web_config is None  # not latched: a retry will run
+            blocker.close()  # the old holder exits; the port frees
+            await cron.start_stop_web_app(listen)  # the next pass
+            assert cron.web_runner is not None
+            assert cron.web_runner.addresses
+        finally:
+            await cron.start_stop_web_app(None)
+            await asyncio.sleep(0.25)
+    finally:
+        blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_web_teardown_ends_open_sse_tails_promptly(monkeypatch):
+    # An SSE log tail never finishes on its own: site.stop() only closes the
+    # listening socket and the 15s keep-alive pings keep succeeding on the
+    # established connection. Without the on_shutdown drain, a teardown
+    # blocked on aiohttp's 60s in-flight-handler wait, freezing the
+    # housekeeping loop (and with it every job launch) for the duration.
+    import aiohttp
+
+    from cronstable.job import JobOutputStream
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    live = JobOutputStream()
+    live.publish("stdout", "hello")  # replay content the client can sync on
+    monkeypatch.setattr(cron, "_job_output", lambda name: live)
+    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        session = aiohttp.ClientSession()
+        try:
+            resp = await session.get(base + "/jobs/alpha/logs")
+            # the replayed frame proves the tail handler is up and
+            # subscribed (frame shape: "event: <name>" then "data: <line>")
+            event_line = await resp.content.readline()
+            data_line = await resp.content.readline()
+            assert event_line.startswith(b"event:")
+            assert b"hello" in data_line
+            # teardown with the tail still open must complete promptly, not
+            # after aiohttp's 60s shutdown timeout.
+            await asyncio.wait_for(cron.start_stop_web_app(None), timeout=5)
+            # the handler ended the stream via the end-of-output path
+            rest = await resp.content.read()
+            assert b"event: end" in rest
+        finally:
+            await session.close()
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_reaches_mcp_options_through_auth():
+    # A browser preflight carries no Authorization by the Fetch standard, so
+    # the bearer gate must pass it through to the /mcp OPTIONS route, which
+    # enforces mcp.allowedOrigins itself; the POST that follows still
+    # authenticates normally.
+    import aiohttp
+
+    from cronstable.config import _build_mcp_config
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+        },
+        _build_mcp_config(
+            {
+                "enabled": True,
+                "allowedOrigins": ["https://inspector.example"],
+            }
+        ),
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        preflight = {
+            "Origin": "https://inspector.example",
+            "Access-Control-Request-Method": "POST",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.options(base + "/mcp", headers=preflight) as r:
+                assert r.status == 204
+                assert (
+                    r.headers["Access-Control-Allow-Origin"]
+                    == "https://inspector.example"
+                )
+                assert "Authorization" in (
+                    r.headers["Access-Control-Allow-Headers"]
+                )
+            # a foreign origin's preflight is refused by the route itself
+            async with session.options(
+                base + "/mcp",
+                headers={
+                    "Origin": "https://evil.example",
+                    "Access-Control-Request-Method": "POST",
+                },
+            ) as r:
+                assert r.status == 403
+            # the carve-out is preflights only: a bare OPTIONS keeps the 401
+            async with session.options(base + "/mcp") as r:
+                assert r.status == 401
+            # and the actual POST still requires the bearer
+            async with session.post(base + "/mcp", json={}) as r:
+                assert r.status == 401
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)

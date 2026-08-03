@@ -9,13 +9,13 @@ remote daemon and needs nothing on the daemon side beyond the existing
 
 Design notes, in the spirit of the rest of the codebase:
 
-* **No new dependencies.**  The terminal layer (raw mode, ANSI painting,
+* No new dependencies.  The terminal layer (raw mode, ANSI painting,
   key decoding, themes) is hand-rolled on the stdlib, exactly as the MCP
   server hand-rolls JSON-RPC; the HTTP/SSE client rides the core
   ``aiohttp`` dependency the daemon already carries.  ``aiohttp`` is
   imported lazily so registering the subcommand keeps ``cronstable
   --help`` (and the other thin CLIs) fast.
-* **Keyboard parity with the web dashboard.**  The web page's shortcut
+* Keyboard parity with the web dashboard.  The web page's shortcut
   map is mirrored key for key (``j``/``k``, ``Enter``, ``r``/``x``,
   ``g``/``t``/``T``/``i``/``w``/``a``, ``/``, ``?``, ``Ctrl-K``
   palette, ``Esc`` close-priority), including its guard semantics: list
@@ -24,11 +24,11 @@ Design notes, in the spirit of the rest of the codebase:
   (drawer tab switching, ``q`` to quit, sort/filter cycling) are grouped
   separately in the ``?`` overlay so the shared muscle memory stays
   honest.
-* **Same client semantics as the page.**  The status classifier, sort
+* Same client semantics as the page.  The status classifier, sort
   order, failure-verdict correlation, palette fuzzy scoring, and the
   plain-English schedule text are line-for-line ports of the web UI's
   client-side logic, so both frontends always agree on what they say.
-* **Windows and POSIX alike.**  Key input uses ``termios`` +
+* Windows and POSIX alike.  Key input uses ``termios`` +
   ``loop.add_reader`` on POSIX and an ``msvcrt`` reader thread on
   Windows (the Proactor loop cannot watch stdin); ANSI output is enabled
   on Windows via ``SetConsoleMode``.  All of it follows the
@@ -618,8 +618,8 @@ def compute_view(
         # The web sorts (and tie-breaks) names with localeCompare, whose
         # CLDR root collation is case-insensitive at the primary level and
         # orders lowercase BEFORE uppercase on a pure case tie ('apple' <
-        # 'Backup' < 'zeta', and 'backup' < 'Backup') -- while a raw
-        # Python str compare is code-point order, which fronts EVERY
+        # 'Backup' < 'zeta', and 'backup' < 'Backup').  A raw Python str
+        # compare is code-point order instead, which fronts EVERY
         # uppercase-initial name and inverts case ties.  casefold gives
         # the primary level, swapcase the lowercase-first tertiary tie,
         # and the raw name keeps the key total; this applies to the name
@@ -894,6 +894,11 @@ _ANSI_RE = re.compile(
     r"|)"  # a bare or trailing ESC
 )
 
+#: The 8-bit C1 controls: one-byte aliases of the ESC-introduced
+#: sequences (\u009b is CSI, \u009d is OSC), honoured by terminals that
+#: interpret C1 in UTF-8 mode, so they die wherever their ESC forms do.
+_C1_RE = re.compile(r"[\u0080-\u009f]")
+
 
 def strip_ansi(text: str) -> str:
     # every _ANSI_RE alternative starts at an ESC, so escape-free text (the
@@ -910,8 +915,11 @@ def scrub_non_sgr(text: str) -> str:
     under clustering from *other machines* over gossip) are painted to
     the live terminal, so anything that could move the cursor, retitle
     the window, or write the clipboard (OSC 52) must never survive into
-    a frame; the painter's own SGR colours do.
+    a frame; the painter's own SGR colours do.  The C1 range needs no
+    ESC introducer, so it is dropped outright.
     """
+    if not text.isascii():
+        text = _C1_RE.sub("", text)
     if "\x1b" not in text:
         return text
     return _ANSI_RE.sub(
@@ -1024,15 +1032,18 @@ def oneline(text: Any) -> str:
     Multi-line job commands are common (``set -eu\\n...``); a literal
     newline inside a table cell would break the painted row, so cells
     show the command flattened; copying still yields the original.
-    Escapes and C0 controls are dropped outright: these strings come
+    Escapes and C0/C1 controls are dropped outright: these strings come
     from the API and carry no legitimate styling of their own.
     """
     return " ".join(_CTRL_RE.sub("", strip_ansi(str(text))).split())
 
 
-#: C0 controls that must never reach a painted frame (ESC survives for
-#: :func:`rewrite_sgr`; \\r and \\t are handled semantically below).
-_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+#: C0 controls, plus the 8-bit C1 range, that must never reach a painted
+#: frame (ESC survives for :func:`rewrite_sgr`; \\r and \\t are handled
+#: semantically below).
+_CTRL_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f\u0080-\u009f]"
+)
 
 
 def sanitize_log_line(line: str) -> str:
@@ -1041,8 +1052,9 @@ def sanitize_log_line(line: str) -> str:
     A stray ``\\r`` would yank the cursor to column 1 mid-row (cmd.exe
     jobs emit CRLF; progress bars emit many), so carriage returns get
     log-viewer overwrite semantics: keep the last non-empty segment.
-    Tabs expand, and the remaining C0 controls are dropped, except
-    ``ESC``, which :func:`rewrite_sgr` re-inks or strips.
+    Tabs expand, and the remaining C0 controls and the 8-bit C1 range
+    are dropped, except ``ESC``, which :func:`rewrite_sgr` re-inks or
+    strips.
     """
     if "\r" in line:
         segments = line.split("\r")
@@ -6097,7 +6109,9 @@ class AppOverlays(AppRender):
                 age_h = (now - epoch) / 3600
                 if age_h >= buckets:
                     continue
-                idx = buckets - 1 - int(age_h)
+                # a future-dated finish (remote daemon clock skew) counts
+                # as age zero; a negative age would index past ``cells``
+                idx = buckets - 1 - int(max(0.0, age_h))
                 count, worst = cells[idx]
                 if HEAT_RANK[key] >= HEAT_RANK[worst]:
                     worst = key

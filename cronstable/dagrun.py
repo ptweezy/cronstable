@@ -1911,13 +1911,38 @@ class DagScheduler:
                     "dag %s: boot reconciliation timed out reading runs", name
                 )
                 continue
+            except Exception as ex:
+                logger.warning(
+                    "dag %s: boot reconciliation could not read runs "
+                    "(continuing with the remaining dags): %s",
+                    name,
+                    ex,
+                )
+                continue
             for body in docs:
                 if dag.is_terminal_run(body):
                     continue
                 run_key = body.get("runKey")
                 if not isinstance(run_key, str):
                     continue
-                await self._try_own(dagcfg, (name, run_key))
+                try:
+                    await self._try_own(dagcfg, (name, run_key))
+                except Exception as ex:
+                    # One stalled or strict-unreadable run document must not
+                    # abort boot reconciliation: this loop runs inside the
+                    # state-rehydration tail, and an escaping raise skipped
+                    # every remaining run AND the _start_job_api call after
+                    # it, for the life of the backend generation (the
+                    # rehydrated latch is already set, so no later pass
+                    # retries). The run stays unowned here; the next service
+                    # pass retries owning it.
+                    logger.warning(
+                        "dag %s: boot reconciliation of run %s failed "
+                        "(continuing with the remaining runs): %s",
+                        name,
+                        run_key,
+                        ex,
+                    )
 
     async def _reconcile_run(
         self, dagcfg: Any, ref: RunRef

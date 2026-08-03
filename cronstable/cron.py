@@ -1795,6 +1795,17 @@ class Cron:
         # so it always reflects the current config after a reload.
         self.mcp_config = None  # type: Optional[MCPConfig]
         self._mcp = None  # type: Optional[Any]
+        # Live SSE log-tail subscriptions, so a web-app teardown can end them
+        # (via the end-of-output sentinel) BEFORE aiohttp waits its shutdown
+        # timeout for in-flight handlers. A tail never finishes on its own:
+        # site.stop() only closes the listening socket and the keep-alive
+        # pings keep succeeding on the established connection, so without
+        # this every restart with an open tail froze the housekeeping loop
+        # (and with it all job launches) for the full 60s timeout.
+        # _web_draining refuses tails that arrive mid-teardown, after the
+        # sentinel broadcast already happened.
+        self._web_sse_queues = set()  # type: "set[asyncio.Queue]"
+        self._web_draining = False
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
         # optional gossip observability overlay: a SECOND, election-inert
@@ -5794,6 +5805,21 @@ class Cron:
                 return running.output
         return None
 
+    async def _web_on_shutdown(self, app: web.Application) -> None:
+        """End every live SSE tail so the web app can tear down promptly.
+
+        Runs inside ``web_runner.cleanup()`` BEFORE aiohttp waits (its 60s
+        shutdown timeout) for in-flight handlers, which is the only moment
+        the wait can be made short: a tail handler otherwise never returns,
+        so a web/mcp/TLS config change with one dashboard tab tailing logs
+        stalled scheduling for the full timeout, and sub-minute jobs lost
+        every slot past CATCHUP_LIMIT. The queue sentinel reuses the
+        end-of-output path, so the client sees an ordinary end-of-stream.
+        """
+        self._web_draining = True
+        for queue in list(self._web_sse_queues):
+            queue.put_nowait(None)
+
     def _sse_headers(self) -> Dict[str, str]:
         assert self.web_config is not None
         headers = {
@@ -5820,6 +5846,14 @@ class Cron:
         # everything captured before now; the queue receives only lines
         # published after: together, no duplicates and no gaps.
         queue = output.subscribe()
+        # Registered (no await since the drain check) so a teardown can end
+        # this tail; a tail arriving after the broadcast must not enter a
+        # loop nothing would ever wake again (see _web_on_shutdown).
+        if self._web_draining:
+            output.unsubscribe(queue)
+            await resp.write(b"event: end\ndata: {}\n\n")
+            return
+        self._web_sse_queues.add(queue)
         try:
             # One write for the whole retained buffer, not one per line: a tab
             # opening on a chatty job replays up to LIVE_LOG_LIMIT lines, and
@@ -5847,6 +5881,7 @@ class Cron:
             # client navigated away / closed the tab: nothing to do
             pass
         finally:
+            self._web_sse_queues.discard(queue)
             output.unsubscribe(queue)
 
     @staticmethod
@@ -6135,6 +6170,11 @@ class Cron:
                     self._make_auth_middleware(token_table, frozenset(public))
                 )
             app = web.Application(middlewares=middlewares)
+            # New app generation: tails may subscribe again, and the
+            # on_shutdown hook is what ends them at the NEXT teardown (see
+            # _web_on_shutdown for why cleanup would otherwise stall).
+            self._web_draining = False
+            app.on_shutdown.append(self._web_on_shutdown)
             # The MCP server (POST /mcp) rides these same listeners and the
             # auth middleware above: /mcp is NEVER added to `public`, so it
             # inherits the bearer-token gate. Built here (not in __init__) so a
@@ -6176,6 +6216,7 @@ class Cron:
             await self.web_runner.setup()
             socket_mode = web_config.get("socketMode")
             self._web_tcp_bound = []
+            bound_any = False
             for addr in web_config["listen"]:
                 # everything `addresses` gains from start() below belongs
                 # to this entry (see _record_bound_listeners)
@@ -6191,15 +6232,33 @@ class Cron:
                     # update or reporting it as an internal bug.
                     logger.warning("web: could not listen on %s: %s", addr, ex)
                     continue
+                bound_any = True
                 self._record_bound_listeners(
                     urlparse(addr).scheme, bound_before
                 )
                 logger.info("web: started listening on %s", addr)
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
-            self.web_config = web_config
-            self.mcp_config = mcp_config
-            self._web_tls_signature = tls_signature
+            if not bound_any:
+                # Every listen entry failed to bind (a predecessor still
+                # draining its jobs and holding the port is the classic).
+                # Tear the runner back down and do NOT latch web_config: the
+                # same rule _build_web_tls documents, an unchanged latch is
+                # what makes the next housekeeping pass retry the bind
+                # instead of concluding "nothing changed" and leaving the
+                # dashboard, /metrics and /mcp down for the daemon's life.
+                logger.error(
+                    "web: no listen address could be bound, so the web API "
+                    "is not up; retrying on the next housekeeping pass"
+                )
+                await self.web_runner.cleanup()
+                self.web_runner = None
+                self._mcp = None
+                self._web_tcp_bound = []
+            else:
+                self.web_config = web_config
+                self.mcp_config = mcp_config
+                self._web_tls_signature = tls_signature
 
         # Node history sampling follows the web API's lifecycle: the ring
         # only feeds the dashboard's node chart, so it runs whenever the web
@@ -7607,6 +7666,22 @@ class Cron:
         @web.middleware
         async def auth_middleware(request, handler):
             if public_paths and request.path in public_paths:
+                return await handler(request)
+            # A CORS preflight passes without a token: the Fetch standard
+            # strips credentials from preflights, so demanding a bearer here
+            # made the OPTIONS route registered for exactly this purpose
+            # (MCPHandler.handle_options, which enforces mcp.allowedOrigins)
+            # unreachable in every token-authenticated deployment, and config
+            # validation makes a token mandatory on any routable listener
+            # with MCP enabled: allow-listed browser MCP clients could never
+            # connect. Safe to pass: a preflight response carries only CORS
+            # policy, and the credentialed request that follows is
+            # authenticated normally. Matched by the defining header, not by
+            # path, so a bare unauthenticated OPTIONS probe stays a 401.
+            if (
+                request.method == "OPTIONS"
+                and "Access-Control-Request-Method" in request.headers
+            ):
                 return await handler(request)
             header = request.headers.get("Authorization", "")
             scheme, _, presented = header.partition(" ")
