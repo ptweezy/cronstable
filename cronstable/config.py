@@ -4451,6 +4451,24 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     where an included or config-dir sibling file is parsed standalone and
     the section a job depends on may legitimately live in another file.
     """
+    # The scheduler indexes jobs by name (concurrency gating, pause state,
+    # run history, the durable in-flight record), so of two same-named jobs
+    # only the later definition would ever run, silently. Rejected here, on
+    # the assembled config, for the same reason the dag checks below reject
+    # duplicate dag names: the usual source is the same name in two
+    # config-dir or included files, or two crontab files sharing a basename
+    # (their auto-generated '<basename>:<line>' names then collide).
+    dup_jobs = sorted(
+        name
+        for name, count in Counter(job.name for job in config.jobs).items()
+        if count > 1
+    )
+    if dup_jobs:
+        raise ConfigError(
+            "duplicate job name(s): {}; the scheduler tracks jobs by name, "
+            "so all but the last definition of a name would silently never "
+            "run. Rename the duplicates.".format(", ".join(dup_jobs))
+        )
     if config.state_config is None:
         offenders = sorted(
             job.name

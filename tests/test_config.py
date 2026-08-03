@@ -2442,3 +2442,23 @@ def test_env_interp_hostile_timezone_raises_configerror_not_oserror(
             "    timezone: ${TZ_FROM_ENV}\n",
             "test.yaml",
         )
+
+
+def test_duplicate_job_names_rejected(tmp_path):
+    # the scheduler tracks jobs by name (concurrency, pause state, run
+    # history), so of two same-named jobs only the last would ever run,
+    # silently; the assembled config refuses the collision instead.
+    cfg = tmp_path / "dup.yaml"
+    cfg.write_text(
+        "jobs:\n"
+        "  - name: backup\n"
+        '    schedule: "0 1 * * *"\n'
+        "    command: echo one\n"
+        "  - name: backup\n"
+        '    schedule: "0 2 * * *"\n'
+        "    command: echo two\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config(str(cfg))
+    assert "duplicate job name" in str(exc.value)
+    assert "backup" in str(exc.value)

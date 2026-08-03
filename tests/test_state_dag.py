@@ -2453,3 +2453,60 @@ def test_reload_retyped_to_mapped_while_pending_still_expands():
     assert _state(body, "w#1") == dag.SUCCESS
     assert dag.is_terminal_run(body)
     assert body["state"] == dag.SUCCESS
+
+
+def test_expand_removed_by_reload_still_dispatches_and_terminalises():
+    # A run that fanned out under an older spec must keep folding its
+    # recorded instances after a reload removes the task's `expand:`. The
+    # placeholder is parked in the non-terminal EXPANDED state and no path
+    # can advance it, so keying dispatch on the spec instead of the run's
+    # recorded fan-out wedged the run (its lease, its downstream tasks and
+    # its GC) until the daemon was restarted with the old config.
+    spec_v1 = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    ex1 = _Executor(
+        spec_v1,
+        outcomes={"gen": True, "work#0": True, "work#1": True},
+        xcom={"gen": ["x", "y"]},
+    )
+    body = _body(spec_v1)
+    for _ in range(6):
+        body, _ = ex1.step(body)
+        entry = body["tasks"].get("work#1")
+        if entry is not None and entry.get("state") == dag.SUCCESS:
+            break
+    else:
+        raise AssertionError("fan-out did not complete under the old spec")
+    assert body["tasks"]["work"]["state"] == dag.EXPANDED
+    assert _state(body, "collect") == dag.PENDING
+
+    # the reload: work is now a plain task, but this run's fan-out already
+    # happened; the recorded instances (all SUCCESS) carry the state.
+    spec_v2 = _spec(
+        TaskSpec("gen"),
+        TaskSpec("work"),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    assert dag.effective_state(spec_v2, body, "work") == dag.SUCCESS
+    # the stale placeholder must read INERT to the quiescence pre-scan (the
+    # full pass never touches it; ACT would defeat quiescence for the rest
+    # of the run's retention).
+    assert (
+        dag._entry_quiescence(
+            spec_v2, body, "work", body["tasks"]["work"], ex1.now, "proc-A"
+        )
+        == dag._Q_INERT
+    )
+    ex2 = _Executor(spec_v2, outcomes={"collect": True})
+    body = ex2.run(body)
+    assert body["state"] == dag.SUCCESS
+    assert _state(body, "collect") == dag.SUCCESS
+    # the placeholder itself is left as the fan-out marked it
+    assert body["tasks"]["work"]["state"] == dag.EXPANDED

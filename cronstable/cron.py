@@ -167,7 +167,7 @@ WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
 # to spawn such a pass and that pass actually starting. A subsystem that can
 # name its own settling time parks that instead: DagScheduler no longer parks
 # 0.0 anywhere, it parks now + dagrun.ADVANCE_POLL_FLOOR (0.2 s) and floors
-# in-flight refs to the same value. The two compose -- the specific floor
+# in-flight refs to the same value. The two compose: the specific floor
 # where the subsystem knows better, this one everywhere else. Flooring costs
 # at most this much extra latency on a sub-minute DAG poke, and only the fire
 # path (a real due instant, not a hint) may drive the sleep below it.
@@ -178,7 +178,7 @@ MIN_TICK_SLEEP = 0.02
 # replayed so a frequently-scheduled job is not silently dropped by tick
 # overhead (a long config reload, many simultaneous launches); a larger gap is
 # a stall/suspend/clock jump, which we resume past by firing only the most
-# recent occurrence -- matching cron's no-catch-up-after-an-outage behaviour,
+# recent occurrence, matching cron's no-catch-up-after-an-outage behaviour,
 # so a long freeze cannot unleash a burst of backdated launches.
 CATCHUP_LIMIT = datetime.timedelta(seconds=10)
 # Hard cap on how many missed occurrences a single job replays on restart under
@@ -195,10 +195,10 @@ RUN_HISTORY_LIMIT = 50
 # ledger (see _depends_on_past_ok). The gate needs only the newest success/
 # failure record, so it probes this many newest records and widens to the
 # full RUN_HISTORY_LIMIT window only when the whole probe page is non-run
-# outcomes (cancelled/skipped) -- reading a few records instead of 50 on the
-# common path, while preserving the same skip window.
+# outcomes (cancelled/skipped): the common path reads a few records
+# instead of 50 and the skip window stays the same.
 DEPENDS_GATE_PROBE = 8
-# How many compact run summaries to embed per job in the /jobs payload — enough
+# How many compact run summaries to embed per job in the /jobs payload: enough
 # for the dashboard's inline sparkline without shipping the full detailed
 # history on every poll. The full history is available from /jobs/{name}/runs.
 JOBS_INLINE_HISTORY = 20
@@ -214,7 +214,7 @@ LOG_STREAM_PREFIX = "logs/"
 # Prefix for a job's catch-up checkpoint stream: an "open" intent is recorded
 # before a backfill is scheduled and a "close" after it completes, so a
 # restart mid-backfill (or mid-jitter) resumes from the intent's watermark
-# instead of silently forfeiting the owed runs -- the run ledger's derived
+# instead of silently forfeiting the owed runs; the run ledger's derived
 # watermark alone cannot tell a backfilled slot from an ordinary run that
 # advanced it past the still-missing slots.  At-least-once: a crash between
 # the last launch and the close record replays; that is the documented trade.
@@ -237,7 +237,7 @@ STATE_OP_TIMEOUT = 10.0
 # a live backend), so it only trips when writes are genuinely not completing.
 MAX_PENDING_STATE_WRITES = 8192
 # How long to wait before re-evaluating catch-up when it could not resolve on
-# a pass -- the state backend had not (re)started yet, or the cluster had not
+# a pass: the state backend had not (re)started yet, or the cluster had not
 # converged on an owner.  Keeps the retry off the per-second hot path.
 CATCHUP_RECHECK_INTERVAL = 30.0
 # Longest a backfill launch waits for a non-Forbid job to go idle between
@@ -284,7 +284,7 @@ BOOT_TIME_TOLERANCE = 60.0
 # cross-jobset garbage collection: a job stream is garbage only when nobody
 # has claimed its name for state.gcGraceSeconds. Per-host (rather than one
 # stream shared and count-pruned across the whole fleet) so the retained
-# history a node can prove absence over never shrinks as the fleet grows --
+# history a node can prove absence over never shrinks as the fleet grows:
 # a single shared stream's count-based prune was reached by write VOLUME
 # (nodes x writes/day), so past a fleet-size threshold the retained span fell
 # under gcGraceSeconds and GC deferred forever, growing every removed job's
@@ -294,7 +294,7 @@ MANIFEST_STREAM_PREFIX = "manifests/"
 # size). At 4 manifests/node/day, 512 records span ~128 days for any single
 # host, comfortably outliving any realistic gcGraceSeconds regardless of how
 # many other nodes share the store. (The GC pass additionally refuses to run
-# until the retained history -- across every host's stream -- provably
+# until the retained history (across every host's stream) provably
 # covers one full grace window.) A host that stops writing (scaled down,
 # renamed) leaves its manifest stream at whatever size it last reached; that
 # stream is then swept by the normal collect_garbage prefix/keep-set path
@@ -356,7 +356,7 @@ RETRY_CLAIM_TTL = 30.0
 # the claim scan may take it over. This only covers a live owner whose fire
 # is slightly late (slow loop, small clock skew); it CANNOT cover an owner
 # deferring on a closed cluster gate, whose re-check cadence is its own
-# ladder delay -- the consume-time newest-record re-check under the claim
+# ladder delay; the consume-time newest-record re-check under the claim
 # lease is what prevents a double-fire there, and is load-bearing.
 RETRY_CLAIM_GRACE = 30.0
 # Runtime pause/resume (POST /jobs/{name}/pause): how long a pause lasts
@@ -388,7 +388,7 @@ SLA_CHECK_RUNTIME = "maxRuntime"
 # only second-half values ever keyed into _sla_state).  Because it is a
 # bounded 3-tuple, the per-job latch bookkeeping walks THESE three names
 # rather than scanning the whole (name, check) latch map for a matching
-# name half -- so a widespread breach across many jobs stays O(jobs), not
+# name half, so a widespread breach across many jobs stays O(jobs), not
 # O(jobs x total-latches).
 SLA_CHECKS = (SLA_CHECK_STALE, SLA_CHECK_LATE, SLA_CHECK_RUNTIME)
 # How deep the boot rehydrate re-reads a job's run ledger when the warmed
@@ -420,7 +420,7 @@ TREND_SCAN_LIMIT = 5000
 # job per window.  Kept short so the age-relative windows barely drift, and
 # a locally finished run busts the cache outright (see _record_run), so the
 # TTL only bounds ledger writes this node did not make (other cluster
-# nodes' runs) -- exactly the (record_count, newest_finished_at) change a
+# nodes' runs), exactly the (record_count, newest_finished_at) change a
 # poll would otherwise re-read the whole ledger to notice.
 JOB_TRENDS_CACHE_TTL = 5.0
 # requests served without bearer-token auth even when authToken is configured.
@@ -614,19 +614,19 @@ def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
     The same-origin test behind the web API's CSRF/DNS-rebinding gate
     (:meth:`Cron._make_origin_middleware`): a page served by this daemon
     posts with an Origin whose authority is exactly the URL the operator is
-    browsing -- the ``Host`` header -- while a foreign page's Origin names
+    browsing (the ``Host`` header) while a foreign page's Origin names
     the attacker's site.  ``Host`` cannot be chosen by the attacker's page
     (the browser sets both headers), so equality is a trustworthy
     same-origin signal.
 
     Compares authority only (hostname + port, default ports normalized from
-    the Origin's scheme -- for a same-origin request both headers come from
+    the Origin's scheme; for a same-origin request both headers come from
     one URL, so their implicit ports agree).  The scheme is deliberately NOT
     compared: behind a TLS-terminating reverse proxy the browser's Origin
     says ``https`` while the daemon speaks plain http, and a strict scheme
     compare would 403 the operator's own dashboard.  ``Origin: null``
     (sandboxed iframes, some redirect chains) and anything unparsable never
-    match -- fail closed.
+    match: fail closed.
     """
     if not host:
         return False
@@ -671,8 +671,8 @@ def _http_for_action_error(
     """Map an :class:`ApiActionError` to the matching aiohttp response.
 
     ``headers`` (the operator's ``web.headers``) is applied where the pre-MCP
-    handlers applied it -- the ``409`` conflict bodies of the job start/cancel
-    routes -- and omitted elsewhere, preserving the documented behavior.
+    handlers applied it (the ``409`` conflict bodies of the job start/cancel
+    routes) and omitted elsewhere, preserving the documented behavior.
     """
     status_map = {
         400: web.HTTPBadRequest,
@@ -695,7 +695,7 @@ def _http_for_action_error(
 # deliberately strict:
 #   - 'unsafe-inline' for script/style is unavoidable (everything is inlined),
 #     but connect-src 'self' confines any hypothetical injected script to this
-#     origin — it cannot exfiltrate to an attacker's server;
+#     origin: it cannot exfiltrate to an attacker's server;
 #   - frame-ancestors 'none' (plus X-Frame-Options) blocks clickjacking of the
 #     run/cancel controls; base-uri/form-action 'none' close those vectors.
 # Operators can override any of these via the web.headers config option, which
@@ -889,7 +889,7 @@ def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
     must survive foreign/hand-written records: a naive timestamp is pinned to
     UTC rather than returned naive, because a naive datetime escaping into
     schedule arithmetic (``_compute_next_fire``) or a ``duration`` subtraction
-    raises TypeError against the aware datetimes everything else uses -- and
+    raises TypeError against the aware datetimes everything else uses, and
     on the catch-up path that would crash the scheduler at every boot until
     the record is deleted.
     """
@@ -931,7 +931,7 @@ def _fold_manifest(
 
     Shared by the daemon pass and `cronstable state gc` so both read a
     manifest identically; a missing/mis-typed key contributes nothing (an
-    older node's record simply advertises less -- see
+    older node's record simply advertises less; see
     :func:`_manifests_cover_scopes` for why that also gates artifact GC).
     """
     jobs = rec.get("jobs")
@@ -1101,7 +1101,7 @@ def _json_response(
     separators so the payload ships fewer bytes) instead of the stdlib.  A web
     response is transient (never a durable, cross-fleet record), so a
     non-finite float or other non-portable value falls back to the stdlib and
-    never 500s the endpoint -- exactly as :func:`cronstable.mcp._dumps` does.
+    never 500s the endpoint, exactly as :func:`cronstable.mcp._dumps` does.
 
     That same transience is why the encode is ``trusted``: the portability
     walk it skips exists to keep bytes that are round-tripped through
@@ -1232,9 +1232,9 @@ def _jobs_conditional_response(
 
     The tag is a strong hash of the payload with each job's volatile
     relative ``scheduled_in`` swapped for its STABLE absolute next-fire
-    instant.  So it changes exactly when the displayed data changes -- a
+    instant.  So it changes exactly when the displayed data changes (a
     fire advancing, a run starting/finishing, a pause, a reload, a live
-    resource sample -- but NOT merely because the countdown ticked down
+    resource sample) but NOT merely because the countdown ticked down
     between two polls (every client recomputes that locally from the
     poll it holds, so a 304 that keeps the old body stays correct).  Pure
     and free of scheduler state, so it can run on an executor for a large
@@ -1366,7 +1366,7 @@ def schedule_slot(
 ) -> datetime.datetime:
     """The scheduling instant to test ``job`` against on this tick.
 
-    Truncated to the job's own resolution -- the whole second for a
+    Truncated to the job's own resolution: the whole second for a
     second-level job (``has_seconds``), otherwise the top of the minute, which
     reproduces the historical minute-tick behaviour exactly.  Used both to
     decide whether the job is due (:meth:`Cron.job_should_run`) and to
@@ -1377,7 +1377,7 @@ def schedule_slot(
     timezone-aware UTC datetime).  Passing it means the whole pass reads the
     clock ONCE: the same instant decides "due" and is recorded for de-dup, so
     the two cannot straddle a slot boundary and double-launch a single-slot
-    job -- and a whole-second slot the previous pass overran can be serviced
+    job, and a whole-second slot the previous pass overran can be serviced
     after the fact.  It is rendered into the job's own frame first: an explicit
     timezone via ``astimezone``, or local time (naive, matching
     ``get_now(None)``) for a job without one.  ``now`` omitted keeps the old
@@ -1545,8 +1545,8 @@ class Cron:
     def __init__(
         self, config_arg: Optional[str], *, config_yaml: Optional[str] = None
     ) -> None:
-        # Prometheus accumulators (GET /metrics). Owned here -- not by the
-        # web app -- so counters survive web-app restarts and cluster-manager
+        # Prometheus accumulators (GET /metrics). Owned here (not by the
+        # web app) so counters survive web-app restarts and cluster-manager
         # rebuilds; created before update_config so the first parse result is
         # already recorded. See cronstable.prometheus.
         self.metrics = PrometheusMetrics()
@@ -1589,6 +1589,14 @@ class Cron:
         # list of cron jobs already running
         # name -> list of RunningJob
         self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
+        # name -> lock serialising maybe_launch_job per job. The
+        # Forbid/Replace gate reads running_jobs several awaits BEFORE the
+        # launch appends to it (cluster slot claim, subprocess spawn), so
+        # two concurrent entries for one job (a dashboard double-click, a
+        # manual start racing the scheduled fire, MCP) would both pass
+        # the gate and double-launch. Minted on first use; pruned with the
+        # other per-job maps on reload (never while held).
+        self._launch_locks = defaultdict(asyncio.Lock)  # type: Dict[str, asyncio.Lock]
         # name -> the last scheduling slot (a UTC datetime) we launched the job
         # in, retained for status/introspection.  Pruned on reload; the
         # forward-only next-fire index below is what actually de-duplicates
@@ -1729,7 +1737,7 @@ class Cron:
         # TTL lease each slot-gated job holds while it runs here, the renew
         # task keeping it alive, a per-job asyncio.Lock serializing
         # claim/release (an unserialized release racing the next claim
-        # could revoke the fresh claim's lease -- same-holder re-acquire
+        # could revoke the fresh claim's lease; same-holder re-acquire
         # keeps the fence, so a stale release still matches), and the
         # single-flight Replace pursuit tasks waiting out a foreign holder.
         # Declared ABOVE the config load below because _apply_reload's prune
@@ -1787,12 +1795,23 @@ class Cron:
         # so it always reflects the current config after a reload.
         self.mcp_config = None  # type: Optional[MCPConfig]
         self._mcp = None  # type: Optional[Any]
+        # Live SSE log-tail subscriptions, so a web-app teardown can end them
+        # (via the end-of-output sentinel) BEFORE aiohttp waits its shutdown
+        # timeout for in-flight handlers. A tail never finishes on its own:
+        # site.stop() only closes the listening socket and the keep-alive
+        # pings keep succeeding on the established connection, so without
+        # this every restart with an open tail froze the housekeeping loop
+        # (and with it all job launches) for the full 60s timeout.
+        # _web_draining refuses tails that arrive mid-teardown, after the
+        # sentinel broadcast already happened.
+        self._web_sse_queues = set()  # type: "set[asyncio.Queue]"
+        self._web_draining = False
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
         # optional gossip observability overlay: a SECOND, election-inert
         # gossip manager stood up alongside a lease leadership backend so a
         # kubernetes/etcd/filesystem cluster can still share fleet data
-        # (per-node CPU/memory + job summaries). None when unused -- including
+        # (per-node CPU/memory + job summaries). None when unused, including
         # backend: gossip, where the election mesh (cluster_manager) already
         # carries fleet data and IS the fleet backend. See
         # start_stop_observability and _fleet_backend.
@@ -1835,7 +1854,7 @@ class Cron:
         # whether missed-run catch-up has fully resolved; evaluation starts on
         # the first start-up pass but is NOT latched while it cannot actually
         # run yet (the state backend failed to start and is being retried, or
-        # the cluster has no positive owner) -- latching there would forfeit
+        # the cluster has no positive owner): latching there would forfeit
         # the owed backfill forever. See _catch_up.
         self._caught_up = False
         # job names whose catch-up decision is final (backfill scheduled,
@@ -1847,7 +1866,7 @@ class Cron:
         self._catchup_next_retry = 0.0
         # the instant of the FIRST catch-up evaluation: deferred retries
         # (backend down at boot) must count missed slots against this, not a
-        # later "now" -- the live scheduler ran (statelessly) in between, so
+        # later "now"; the live scheduler ran (statelessly) in between, so
         # a later window would replay runs that actually happened.
         self._catchup_reference: Optional[datetime.datetime] = None
         # the in-flight catch-up evaluation, when one is running.  The
@@ -1877,8 +1896,8 @@ class Cron:
         self._counter_snapshot_next = 0.0
         # whether this PROCESS already seeded the Prometheus accumulators
         # from a durable snapshot. Never reset (unlike _state_rehydrated):
-        # seeding ADDS into live counters, so a second seed -- e.g. after a
-        # state.path change swapped stores -- would double-count.
+        # seeding ADDS into live counters, so a second seed (e.g. after a
+        # state.path change swapped stores) would double-count.
         self._counters_seeded = False
         # loop-clock instants the next manifest write / GC pass are due.
         self._manifest_next = 0.0
@@ -1894,7 +1913,7 @@ class Cron:
         # not stack passes).
         self._gc_task: Optional[asyncio.Task] = None
         # the newest in-flight retry-ladder write per job, so ladder records
-        # can be ORDERED (a settle chained after its pending) -- two
+        # can be ORDERED (a settle chained after its pending): two
         # unordered fire-and-forget appends could land newest-first
         # inverted and resurrect a consumed retry on the next boot.
         self._retry_write_tail: Dict[str, asyncio.Task] = {}
@@ -1912,7 +1931,7 @@ class Cron:
         # sort key is the wall clock read on each write's own worker thread,
         # so for a near-instant run (e.g. a start_failed job) the close
         # could sort BEFORE the open and leave "open" newest for a finished
-        # run -- which the next restart would reconcile as a spurious
+        # run, which the next restart would reconcile as a spurious
         # interrupted run. Chaining each job's inflight writes keeps the
         # close after the open.
         self._inflight_write_tail: Dict[str, asyncio.Task] = {}
@@ -1953,7 +1972,7 @@ class Cron:
         self._paused_reboot_jobs = set()  # type: Set[str]
         # A per-PROCESS token stamped into in-flight run records (with the
         # host and pid), so reconciliation can tell "a previous daemon on
-        # this host wrote this" from "this very process wrote it" -- the
+        # this host wrote this" from "this very process wrote it"; the
         # state backend's own instance id will not do, because a state-
         # section reload rebuilds the backend (new id) while runs from this
         # process are still live.
@@ -1997,15 +2016,15 @@ class Cron:
         startup = True
         applied_logging_config: Optional[LoggingConfig] = None
         while not self._stop_event.is_set():
-            # Housekeeping -- reloading the config from disk, (re)starting the
-            # cluster manager and web app, applying logging config -- runs at
+            # Housekeeping (reloading the config from disk, (re)starting the
+            # cluster manager and web app, applying logging config) runs at
             # most once per wall-clock minute. When a sub-minute schedule makes
             # the loop tick every second (see the sleep below), rereading and
             # reparsing the config 60 times a minute would be pointless IO/CPU,
             # so gate it: config-reload latency stays ~1 minute, exactly as in
             # the minute-tick era. In pure minute-tick mode (no second-level
             # job) `not self._needs_subminute()` forces housekeeping every
-            # iteration, so behaviour there is byte-identical to before -- and
+            # iteration, so behaviour there is byte-identical to before, and
             # a frozen-clock test still reloads every loop.
             now_minute = get_now(datetime.timezone.utc).replace(
                 second=0, microsecond=0
@@ -2024,8 +2043,8 @@ class Cron:
                 try:
                     # reload_config runs the disk read + full reparse OFF the
                     # event loop (in a worker thread), so a slow parse no
-                    # longer freezes the whole loop -- web API, cluster gossip,
-                    # job output pumping -- for its duration once a minute. The
+                    # longer freezes the whole loop (web API, cluster gossip,
+                    # job output pumping) for its duration once a minute. The
                     # parsed job set is applied here, on the loop thread, and
                     # BEFORE _service_slots below, so the cluster gate is in
                     # place before the first spawn_jobs (a reload that enables
@@ -2066,7 +2085,7 @@ class Cron:
                     # ConfigError (an authToken that resolves empty) used to
                     # share the try/except above and skip start_stop_cluster
                     # entirely, so _elect_leader_configured stayed False and
-                    # every node ran every Leader job ungated -- the gate
+                    # every node ran every Leader job ungated: the gate
                     # failed OPEN on an unrelated web error, on startup and on
                     # every reload iteration. The cluster gate must engage
                     # regardless of the web app's fate.
@@ -2110,8 +2129,8 @@ class Cron:
             startup = False
             # Sleep until the soonest job's next fire (or the next housekeeping
             # minute, whichever is first). asyncio.wait_for schedules its
-            # timeout against loop.time() -- the event loop's MONOTONIC clock
-            # -- so the wait length is derived from the wall clock but realized
+            # timeout against loop.time() (the event loop's MONOTONIC clock),
+            # so the wait length is derived from the wall clock but realized
             # monotonically: a wall-clock/NTP step during the sleep cannot
             # stretch or collapse it, and (because firing compares the wall
             # clock against the fixed, forward-only next-fire instants in the
@@ -2127,7 +2146,7 @@ class Cron:
         logger.info("Shutting down (after currently running jobs finish)...")
         while self.retry_state:
             # settle=None: a graceful stop must NOT settle the durable
-            # ladder records -- surviving the restart (re-arming from the
+            # ladder records; surviving the restart (re-arming from the
             # persisted "pending" on the next boot) is the entire point of
             # restart-durable retries.
             cancel_all = [
@@ -2144,7 +2163,7 @@ class Cron:
         # and keeping the gossip listener / lease renew loop alive through it
         # would hold leadership on a node that no longer schedules anything,
         # stalling every Leader job cluster-wide until the slowest local job
-        # finishes -- instead of the documented release-on-graceful-stop
+        # finishes, instead of the documented release-on-graceful-stop
         # failover. Retries were all cancelled above, so no retry task is
         # left to consult the stopped manager. The cost is confined to the
         # jobs still draining: the new owner may start one of those while it
@@ -2267,7 +2286,7 @@ class Cron:
         registers as a change. When the config source is a DIRECTORY its own
         mtime is folded in as well, so a brand-new entry dropped into the dir
         (which touches none of the already-tracked files) is still noticed. All
-        of this is a handful of ``os.stat`` calls -- microseconds -- versus a
+        of this is a handful of ``os.stat`` calls (microseconds) versus a
         full strictyaml reparse, which is the whole point.
         """
         parts: List[tuple] = []
@@ -2336,7 +2355,7 @@ class Cron:
         housekeeping pass compares against the on-disk state we actually
         parsed. (A file edited in the microseconds between the parse's read and
         this stat would be recorded as already-current and picked up only on a
-        later change -- an acceptable, vanishingly narrow window for a
+        later change, an acceptable, vanishingly narrow window for a
         once-a-minute reload.)
         """
         self._config_sources = sources
@@ -2369,12 +2388,12 @@ class Cron:
 
     async def reload_config(self) -> CronstableConfig:
         """Like :meth:`update_config`, but runs the disk read + full reparse
-        OFF the event loop, in a worker thread -- and skips it entirely when
+        OFF the event loop, in a worker thread, and skips it entirely when
         nothing the last parse read has changed on disk.
 
         The reparse is a synchronous file read plus a full strictyaml parse;
-        run inline on the scheduling tick it froze the entire event loop -- web
-        API, cluster gossip, job output pumping -- for its whole duration, once
+        run inline on the scheduling tick it froze the entire event loop (web
+        API, cluster gossip, job output pumping) for its whole duration, once
         a minute. First we compare a cheap stat fingerprint
         (:meth:`_config_signature`) of the files the last successful parse read
         against the stored one; if they match, the config on disk is unchanged
@@ -2502,6 +2521,18 @@ class Cron:
             for name, lock in self._slot_locks.items()
             if name in slot_live or lock.locked()
         }
+        # The per-job launch locks leak the same way and are pruned under
+        # the same rule: never drop one somebody holds (a waiter would mint
+        # a fresh lock and race the very launch the lock serialises); a
+        # removed-but-mid-launch name keeps its entry until a later reload.
+        self._launch_locks = defaultdict(
+            asyncio.Lock,
+            {
+                name: lock
+                for name, lock in self._launch_locks.items()
+                if name in keep or lock.locked()
+            },
+        )
         self._last_real_outcome = {
             name: outcome
             for name, outcome in self._last_real_outcome.items()
@@ -2560,7 +2591,7 @@ class Cron:
         # Prune the finished-run display data the same way. A removed job's
         # last_run/run_history is unreachable (jobs_payload and the /runs
         # endpoints iterate cron_jobs only), so keeping it is pure leaked
-        # memory -- worst under classic crontabs, whose <file>:<line> job
+        # memory, worst under classic crontabs, whose <file>:<line> job
         # names are reminted by every line added or removed above them.
         self.last_run = {
             name: info for name, info in self.last_run.items() if name in keep
@@ -2636,7 +2667,7 @@ class Cron:
         payload["enabled"] = True
         # lease backends (kubernetes/etcd/filesystem) have no fleet view of
         # their own, but the observability overlay mesh serves one when
-        # installed (see _fleet_backend) -- tell the dashboard whether its
+        # installed (see _fleet_backend): tell the dashboard whether its
         # fleet view has data behind it. The gossip payload stays unchanged:
         # its UI path always shows the fleet view.
         if payload.get("backend") != "gossip":
@@ -2644,7 +2675,7 @@ class Cron:
         # this node's own live CPU/memory, sampled fresh: always shown in the
         # cluster panel (it is local and free), independent of whether peers
         # share theirs. Peer load rides view_dict's per-peer node_stats (only
-        # populated when the cluster shares node stats -- observability).
+        # populated when the cluster shares node stats: observability).
         payload["node_stats"] = self.node_resource_snapshot()
         return payload
 
@@ -2661,7 +2692,7 @@ class Cron:
         Merged entirely from state this node already holds: its own scheduler
         snapshot plus the per-job summaries each peer piggybacked on the
         gossip exchanges this node has already made (see
-        :meth:`cronstable.cluster.ClusterManager.fleet_view`) -- serving this
+        :meth:`cronstable.cluster.ClusterManager.fleet_view`); serving this
         endpoint triggers no peer traffic.  ``enabled: false`` when there is
         no cluster, or the backend has no node-to-node channel to have
         carried summaries (a lease backend without the observability
@@ -2735,8 +2766,8 @@ class Cron:
 
         Oldest-first ``[t, cpu%, mem%]`` points from the background sampler
         (see ``web.nodeHistory``), fetched lazily when the chart is opened
-        rather than riding the /node poll.  ``enabled`` is false -- with no
-        points -- when the sampler is off (``nodeHistory: false``) or psutil
+        rather than riding the /node poll.  ``enabled`` is false (with no
+        points) when the sampler is off (``nodeHistory: false``) or psutil
         is unavailable, so the dashboard hides the chart instead of showing
         an eternally-empty one.
         """
@@ -2788,7 +2819,7 @@ class Cron:
             headers.update(custom)
             # Unlike the other handlers, the Content-Type is the endpoint's
             # contract (scrapers parse it for the format version), so it
-            # wins over an operator-configured web.headers Content-Type --
+            # wins over an operator-configured web.headers Content-Type,
             # in ANY spelling: header names are case-insensitive on the
             # wire but this dict is not, and a case-variant leftover would
             # be emitted as a second, conflicting Content-Type header.
@@ -3048,15 +3079,15 @@ class Cron:
         reading the daemon log, not for whoever holds a token at the far
         end of the socket: they name the devices registry's absolute
         path and quote the underlying OSError or state-backend text
-        verbatim, and deliberately so -- :meth:`push.FileDeviceStore._read`
+        verbatim, and deliberately so (:meth:`push.FileDeviceStore._read`
         and :meth:`push.StateDeviceStore._bounded`, the latter folding in
         the exception type precisely because a backend's bare string is
-        unactionable on its own.  Returning that text as the response
+        unactionable on its own).  Returning that text as the response
         body published this daemon's filesystem layout to every caller of
         the pairing routes, and the listing needs only a ``view`` scope.
         So the detail goes where it was written to go, and the caller
-        gets the fact -- the store is unreachable, the request did not
-        happen -- which is all ``docs/openapi.yaml`` ever promised for a
+        gets the fact (the store is unreachable, the request did not
+        happen), which is all ``docs/openapi.yaml`` ever promised for a
         503.  The same move as :meth:`_timezone_error`: build the body
         from what the caller already knows, never from the exception.
         """
@@ -3237,8 +3268,8 @@ class Cron:
         # A deep copy, never the caller's dict: the convergence guard
         # above compares by equality, and holding an alias would make a
         # config edit that mutates the same dict in place compare equal
-        # to itself forever (the mergedicts/DEFAULT_CONFIG sharing trap)
-        # -- a changed push: section would then never be re-applied.
+        # to itself forever (the mergedicts/DEFAULT_CONFIG sharing trap);
+        # a changed push: section would then never be re-applied.
         self._applied_push_config = copy.deepcopy(push_config)
         push.set_service(service)
         logger.info("push: service running (registry %s)", store.describe())
@@ -3257,7 +3288,7 @@ class Cron:
         except (ZoneInfoNotFoundError, ValueError, KeyError, OSError):
             # ZoneInfo maps its key onto a filesystem path, so an over-long
             # (ENAMETOOLONG) or otherwise unopenable key surfaces as OSError
-            # rather than ZoneInfoNotFoundError -- still just an unknown name.
+            # rather than ZoneInfoNotFoundError: still just an unknown name.
             raise ValueError("unknown timezone: {}".format(tz_name)) from None
 
     @staticmethod
@@ -3926,7 +3957,7 @@ class Cron:
         # IS its boot run: retire the pending entry and record the run with
         # the cluster (when a manager is up), or _process_pending_reboots
         # would find reboot_ran(name) False after convergence and run the
-        # one-shot a second time -- possibly on another node, since the
+        # one-shot a second time, possibly on another node, since the
         # manual run was never gossiped/persisted as ran. Recording BEFORE
         # spawning mirrors the deferred-launch path's at-most-once ordering.
         if name in self._pending_reboot_jobs:
@@ -3936,7 +3967,7 @@ class Cron:
             # pop, not del: a concurrent manual start of the same name can
             # retire the entry while the await above yields (the gossip push
             # awaits peers), and the loser of that race must not 500 on a
-            # KeyError -- the entry is retired (and logged) exactly once,
+            # KeyError; the entry is retired (and logged) exactly once,
             # mark_reboot_ran is idempotent, and both requests still launch
             # below, exactly as two manual starts of any other job would.
             if self._pending_reboot_jobs.pop(name, None) is not None:
@@ -4879,8 +4910,8 @@ class Cron:
         Installed on the leadership backend as its job-summaries provider
         (see :meth:`start_stop_cluster`); the gossip backend piggybacks it on
         every ``/peer`` response, which is how the dashboard's fleet view can
-        show runs happening on other nodes.  Deliberately lean -- one small
-        fixed-shape entry per job -- because it travels in a byte-capped
+        show runs happening on other nodes.  Deliberately lean (one small
+        fixed-shape entry per job) because it travels in a byte-capped
         gossip payload: no command line, no ``fail_reason`` (arbitrary-length
         operator text), no run history.  Those stay on the owning node's own
         API.
@@ -5272,7 +5303,7 @@ class Cron:
         """Store health + topology for the state inspector, metadata only.
 
         Per-prefix stream/document counts, capped scope lists, and active
-        leases -- never a record payload or a KV value.  Also carries THIS
+        leases, never a record payload or a KV value.  Also carries THIS
         node's live retry ladder and held concurrency slots (straight from
         memory).  ``enabled: false`` when no state backend is configured.
         Behind ``GET /state`` and MCP ``cron_inspect_state``.
@@ -5355,7 +5386,7 @@ class Cron:
             docs = []
         # KV values are stripped to a size/type summary (a KV value is
         # arbitrary job-authored data that may be sensitive). Cursor
-        # watermarks are returned verbatim ON PURPOSE -- they are small
+        # watermarks are returned verbatim ON PURPOSE: they are small
         # progress markers (a timestamp / offset / id), the operator opted
         # into seeing them, and hiding them would gut the cursor panel.
         # Idempotency docs carry only key/claimedAt/expiresAt (no value).
@@ -5541,8 +5572,8 @@ class Cron:
         run-so-far series of each currently-running monitored instance;
         ``runs`` the recorded series of recent finished runs (oldest first,
         rehydrated from the durable ledger across restarts), capped by the
-        ``runs`` query parameter.  Both are empty -- and ``monitored`` false
-        -- for a job that never opted in, so the dashboard can tell "not
+        ``runs`` query parameter.  Both are empty, and ``monitored`` false,
+        for a job that never opted in, so the dashboard can tell "not
         monitored" from "no data yet".
         """
         assert self.web_config is not None
@@ -5608,7 +5639,7 @@ class Cron:
         The long-horizon sibling of ``/jobs/{name}/runs``: the same stats
         shape (:func:`_run_stats`), computed per :data:`TREND_WINDOWS`
         window (plus ``all``) over the ledger, which survives restarts and
-        -- on a shared mount -- merges every node's runs.  Bounded by the
+        (on a shared mount) merges every node's runs.  Bounded by the
         store's ``maxRunsPerJob`` retention.  Degrades to the in-memory
         history (``source: memory``) without a healthy backend, so the
         endpoint always answers.
@@ -5756,7 +5787,7 @@ class Cron:
         A DAG task runs as a :class:`RunningJob` under the template name
         ``<dag>.<task_id>`` (its instances share that key), so locate the one
         whose ``dag_ref`` matches this run + instance key.  Only a *currently
-        running* instance has a reachable buffer -- a finished DAG task's
+        running* instance has a reachable buffer: a finished DAG task's
         output is not retained under the template name (its completion routes
         to the DAG driver, not the per-job last_run), so this returns ``None``
         once the task is done.
@@ -5773,6 +5804,21 @@ class Cron:
             ):
                 return running.output
         return None
+
+    async def _web_on_shutdown(self, app: web.Application) -> None:
+        """End every live SSE tail so the web app can tear down promptly.
+
+        Runs inside ``web_runner.cleanup()`` BEFORE aiohttp waits (its 60s
+        shutdown timeout) for in-flight handlers, which is the only moment
+        the wait can be made short: a tail handler otherwise never returns,
+        so a web/mcp/TLS config change with one dashboard tab tailing logs
+        stalled scheduling for the full timeout, and sub-minute jobs lost
+        every slot past CATCHUP_LIMIT. The queue sentinel reuses the
+        end-of-output path, so the client sees an ordinary end-of-stream.
+        """
+        self._web_draining = True
+        for queue in list(self._web_sse_queues):
+            queue.put_nowait(None)
 
     def _sse_headers(self) -> Dict[str, str]:
         assert self.web_config is not None
@@ -5798,8 +5844,16 @@ class Cron:
         # Subscribe first, then snapshot the buffer: there is no await between
         # the two, so no line can slip through the gap. The snapshot holds
         # everything captured before now; the queue receives only lines
-        # published after — together, no duplicates and no gaps.
+        # published after: together, no duplicates and no gaps.
         queue = output.subscribe()
+        # Registered (no await since the drain check) so a teardown can end
+        # this tail; a tail arriving after the broadcast must not enter a
+        # loop nothing would ever wake again (see _web_on_shutdown).
+        if self._web_draining:
+            output.unsubscribe(queue)
+            await resp.write(b"event: end\ndata: {}\n\n")
+            return
+        self._web_sse_queues.add(queue)
         try:
             # One write for the whole retained buffer, not one per line: a tab
             # opening on a chatty job replays up to LIVE_LOG_LIMIT lines, and
@@ -5827,6 +5881,7 @@ class Cron:
             # client navigated away / closed the tab: nothing to do
             pass
         finally:
+            self._web_sse_queues.discard(queue)
             output.unsubscribe(queue)
 
     @staticmethod
@@ -5867,7 +5922,7 @@ class Cron:
     ) -> Optional[Dict[str, Any]]:
         """Last retained log lines of a job, or ``None`` if unknown.
 
-        Behind MCP ``cron_tail_job_logs`` -- the poll/cursor projection of the
+        Behind MCP ``cron_tail_job_logs``, the poll/cursor projection of the
         SSE stream at ``GET /jobs/{name}/logs``.
         """
         if name not in self.cron_jobs:
@@ -6067,7 +6122,7 @@ class Cron:
             metrics_config = resolve_metrics_config(web_config)
             middlewares = []
             # Cross-site request defense for the mutating endpoints, ALWAYS
-            # installed -- with authToken unset this is the only thing between
+            # installed: with authToken unset this is the only thing between
             # a localhost-bound daemon and any web page the operator visits
             # (see _make_origin_middleware). Outermost, so a foreign page is
             # refused before auth or handlers run. An operator who explicitly
@@ -6115,8 +6170,13 @@ class Cron:
                     self._make_auth_middleware(token_table, frozenset(public))
                 )
             app = web.Application(middlewares=middlewares)
+            # New app generation: tails may subscribe again, and the
+            # on_shutdown hook is what ends them at the NEXT teardown (see
+            # _web_on_shutdown for why cleanup would otherwise stall).
+            self._web_draining = False
+            app.on_shutdown.append(self._web_on_shutdown)
             # The MCP server (POST /mcp) rides these same listeners and the
-            # auth middleware above -- /mcp is NEVER added to `public`, so it
+            # auth middleware above: /mcp is NEVER added to `public`, so it
             # inherits the bearer-token gate. Built here (not in __init__) so a
             # reload rebuilds it against the current config. The fail-closed
             # no-token-on-a-routable-listener check ran at parse time
@@ -6156,6 +6216,7 @@ class Cron:
             await self.web_runner.setup()
             socket_mode = web_config.get("socketMode")
             self._web_tcp_bound = []
+            bound_any = False
             for addr in web_config["listen"]:
                 # everything `addresses` gains from start() below belongs
                 # to this entry (see _record_bound_listeners)
@@ -6171,15 +6232,33 @@ class Cron:
                     # update or reporting it as an internal bug.
                     logger.warning("web: could not listen on %s: %s", addr, ex)
                     continue
+                bound_any = True
                 self._record_bound_listeners(
                     urlparse(addr).scheme, bound_before
                 )
                 logger.info("web: started listening on %s", addr)
                 if socket_mode:
                     self._apply_socket_mode(addr, socket_mode)
-            self.web_config = web_config
-            self.mcp_config = mcp_config
-            self._web_tls_signature = tls_signature
+            if not bound_any:
+                # Every listen entry failed to bind (a predecessor still
+                # draining its jobs and holding the port is the classic).
+                # Tear the runner back down and do NOT latch web_config: the
+                # same rule _build_web_tls documents, an unchanged latch is
+                # what makes the next housekeeping pass retry the bind
+                # instead of concluding "nothing changed" and leaving the
+                # dashboard, /metrics and /mcp down for the daemon's life.
+                logger.error(
+                    "web: no listen address could be bound, so the web API "
+                    "is not up; retrying on the next housekeeping pass"
+                )
+                await self.web_runner.cleanup()
+                self.web_runner = None
+                self._mcp = None
+                self._web_tcp_bound = []
+            else:
+                self.web_config = web_config
+                self.mcp_config = mcp_config
+                self._web_tls_signature = tls_signature
 
         # Node history sampling follows the web API's lifecycle: the ring
         # only feeds the dashboard's node chart, so it runs whenever the web
@@ -6318,7 +6397,7 @@ class Cron:
         election manager's behavior. Restarting the manager on a difference in
         them would, on a lease backend, drop the leadership lease and pause
         Leader jobs fleet-wide for an edit that changes nothing about
-        election -- so the restart comparison strips them from both sides.
+        election, so the restart comparison strips them from both sides.
         """
         return {
             key: value
@@ -6337,7 +6416,7 @@ class Cron:
         # Restart the manager when the cluster section is removed or changed,
         # mirroring start_stop_web_app. The id it reports tracks config reloads
         # on its own (it calls self.job_set_id each round), so only a change to
-        # the cluster section itself (peers/tls/listen) needs a restart -- plus
+        # the cluster section itself (peers/tls/listen) needs a restart, plus
         # an in-place TLS cert rotation, which leaves the config bytes
         # identical but the on-disk material new (cert-manager / Vault / a
         # Kubernetes secret refresh); without this the cluster keeps serving
@@ -6365,8 +6444,8 @@ class Cron:
                 # down: cert-manager / Vault / a Kubernetes secret refresh are
                 # not atomic across all three files, so a reload can observe a
                 # half-written or briefly-absent cert.  If the new material is
-                # not yet loadable, keep the running manager -- still serving
-                # the valid old cert -- and retry next reload, rather than
+                # not yet loadable, keep the running manager (still serving
+                # the valid old cert) and retry next reload, rather than
                 # stopping it and then failing to rebuild, which would wedge
                 # Leader / PreferLeader closed for up to a reload.  (Make-
                 # before-break is infeasible for gossip: the new manager binds
@@ -6399,15 +6478,15 @@ class Cron:
                 and not gossip_tls_loadable(cluster_config)
             ):
                 # A genuine config change (peers/listen) tears the old manager
-                # down regardless -- but if it coincides with an in-flight cert
+                # down regardless, but if it coincides with an in-flight cert
                 # rotation (half-written/absent cert files), the rebuild's
                 # ClusterManager.__init__ would raise on the bad material and
                 # leave NO manager, wedging Leader/PreferLeader closed up to
                 # a reload. The cert-only path above does not cover
                 # this combined case. Dry-run the NEW config's gossip TLS first
                 # (the incoming paths, which a config edit may have repointed):
-                # if it cannot load now, keep the running manager -- still
-                # serving the valid old cert -- retry next reload, accepting
+                # if it cannot load now, keep the running manager (still
+                # serving the valid old cert) and retry next reload, accepting
                 # that the peers/listen change also waits one reload (a stale-
                 # but-functional cluster beats no manager). Non-gossip backends
                 # and tls-less configs always pass, so this is gossip-only.
@@ -6482,14 +6561,14 @@ class Cron:
                 self._was_policy_conflict = False
         if cluster_config is not None and self.cluster_manager is not None:
             # The manager was KEPT across this reload (only observability
-            # keys -- or nothing -- changed), but it latched the node-stats
+            # keys, or nothing, changed), but it latched the node-stats
             # share flag once, at whichever set_node_stats_provider call it
             # last saw. Re-reconcile it to the NEW config unconditionally, or
             # a shareNodeStats toggle would never reach a running gossip
             # election mesh: off would keep gossiping CPU/memory until some
             # unrelated restart, on would never start. Safe on a running
-            # manager -- the call only reassigns the provider and flag, picked
-            # up on the next /peer round -- and a no-op on the lease backends
+            # manager (the call only reassigns the provider and flag, picked
+            # up on the next /peer round) and a no-op on the lease backends
             # (their seam default ignores it). Same share expression as the
             # build path below.
             self.cluster_manager.set_node_stats_provider(
@@ -6505,14 +6584,14 @@ class Cron:
                 logger.warning("%s", warning)
             try:
                 # Construct INSIDE the try: a backend's __init__/start can
-                # raise on an operational misconfiguration -- the gossip
+                # raise on an operational misconfiguration; the gossip
                 # manager builds the TLS contexts (loading the CA/cert/key
                 # files: OSError/ssl.SSLError) and start() parses listen
                 # (ValueError) and binds the port (OSError); a lease backend's
                 # start() may fail to load in-cluster/kubeconfig credentials
                 # or build a client TLS context (ConfigError/OSError/SSLError).
                 # All are misconfigurations we log and keep running through,
-                # not bugs -- so they must not escape to the run loop's generic
+                # not bugs, so they must not escape to the run loop's generic
                 # "please report this as a bug" handler.
                 manager = make_backend(cluster_config, self.job_set_id)
                 # Install the fleet-view summaries provider BEFORE start():
@@ -6524,7 +6603,7 @@ class Cron:
                 # Always install the node-stats provider so a gossip cluster
                 # shows THIS node's own load in its /cluster + /fleet self
                 # readouts (local, free); `share` gates whether we ALSO gossip
-                # it to peers -- on only when observability is enabled with
+                # it to peers: on only when observability is enabled with
                 # backend: gossip (no separate overlay mesh; the lease+overlay
                 # case installs on the overlay in start_stop_observability). A
                 # no-op on the lease backends (their seam default ignores it).
@@ -6547,7 +6626,7 @@ class Cron:
                 # than aborting the reload. (A backend cleans up its own
                 # half-started state on failure.) aiohttp.ClientError /
                 # asyncio.TimeoutError cover a lease backend that cannot reach
-                # or authenticate to its store at start() -- an operational
+                # or authenticate to its store at start(), an operational
                 # misconfiguration to log, not the generic "report a bug" path
                 # (a ClientResponseError on a rejected token is not OSError).
                 logger.error("cluster: failed to start: %s", ex)
@@ -6568,7 +6647,7 @@ class Cron:
 
         The observability overlay mesh when one is running (a lease cluster
         that opted into ``cluster.observability``), else the leadership backend
-        itself -- which provides the fleet view directly under ``backend:
+        itself, which provides the fleet view directly under ``backend:
         gossip`` and returns ``None`` for the lease backends (no fleet).
         """
         return (
@@ -6584,7 +6663,7 @@ class Cron:
 
         The overlay is a SECOND, election-inert gossip manager that a lease
         cluster (kubernetes/etcd/filesystem) stands up purely to exchange fleet
-        data -- per-node CPU/memory and job summaries -- since a lease backend
+        data (per-node CPU/memory and job summaries), since a lease backend
         has no node-to-node channel of its own.  It is built from the resolved
         ``observabilityMesh`` config (see
         :func:`cronstable.config._attach_observability`); ``None`` there means
@@ -6612,7 +6691,7 @@ class Cron:
             else:
                 reason = None
             # make-before-break is infeasible for gossip (same listen port), so
-            # a cert rotation only tears down once the NEW material loads --
+            # a cert rotation only tears down once the NEW material loads;
             # otherwise keep the running overlay serving the valid old cert.
             if reason is not None and mesh_config is not None:
                 from cronstable.cluster import gossip_tls_loadable
@@ -6629,7 +6708,7 @@ class Cron:
                 await mesh.stop()
                 self.observability_mesh = None
         if mesh_config is not None and self.observability_mesh is not None:
-            # The overlay was KEPT across this reload -- and shareNodeStats
+            # The overlay was KEPT across this reload, and shareNodeStats
             # lives on the CLUSTER config, not on the resolved mesh config the
             # keep/rebuild comparison above sees, so a toggle always lands
             # here. The mesh latched the flag at its last
@@ -6686,8 +6765,8 @@ class Cron:
         no election or convergence to reason about, and is rebuilt only when
         the ``state`` section is added, removed, or changed (the backend
         tracks the job-set id itself via ``self.job_set_id``, so an ordinary
-        reload that only edits jobs does not disturb it).  A start failure --
-        an unwritable path, a bad mount -- is logged and swallowed, exactly
+        reload that only edits jobs does not disturb it).  A start failure
+        (an unwritable path, a bad mount) is logged and swallowed, exactly
         like a cluster start failure, so durability being misconfigured never
         stops cronstable from running jobs in memory.
 
@@ -6745,7 +6824,7 @@ class Cron:
             self._state_rehydrated = False
             # the concurrency slots live in the OLD store: drop the held
             # leases (they lapse there by TTL) and stop their renewers and
-            # any Replace pursuits -- re-claiming in the new store is the
+            # any Replace pursuits; re-claiming in the new store is the
             # next launch's business. The lock-fidelity verdict is also
             # per-store.
             for task in list(self._slot_renewers.values()):
@@ -6797,7 +6876,7 @@ class Cron:
             self._state_max_runs = state_config.get("maxRunsPerJob", 0)
             # a fresh backend generation re-anchors the periodic chores:
             # record this node's manifest immediately (the GC anchor), and
-            # let the first GC pass run on the next housekeeping tick --
+            # let the first GC pass run on the next housekeeping tick;
             # gcGraceSeconds is what protects young state, not a delay here.
             self._manifest_next = 0.0
             self._gc_next = 0.0
@@ -6816,7 +6895,7 @@ class Cron:
             await self._rehydrate_from_state()
             # expose this backend to job commands over a loopback
             # endpoint (opt-out via state.jobApi.enabled). A start failure is
-            # logged and swallowed -- the scheduler's own durable features do
+            # logged and swallowed: the scheduler's own durable features do
             # not depend on it.
             await self._start_job_api(state_config)
 
@@ -7071,8 +7150,8 @@ class Cron:
         """Record this node's loaded job set to its OWN manifest stream.
 
         The anchor for cross-jobset garbage collection: a job's durable
-        streams are garbage only when NO recent manifest -- from any host's
-        stream, running any job set, under this deploymentId -- references
+        streams are garbage only when NO recent manifest (from any host's
+        stream, running any job set, under this deploymentId) references
         its name. Every node sharing the store contributes its own
         ``manifests/<host>`` stream (see :data:`MANIFEST_STREAM_PREFIX`), so a
         fleet whose members run different job sets never collects each
@@ -7113,8 +7192,8 @@ class Cron:
         """The pause-stream keep-set: kept jobs that hold a LIVE pause.
 
         Starts from every kept job name and DROPS only those whose
-        ``paused/<job>`` stream tops out at a non-live record -- a resume, an
-        expired window, or a foreign/corrupt one -- so
+        ``paused/<job>`` stream tops out at a non-live record (a resume, an
+        expired window, or a foreign/corrupt one), so
         :meth:`StateBackend.collect_garbage` reclaims the dead stream. That
         collection stays grace-gated on the record's OWN age, which
         independently protects a pause a peer wrote moments ago (its fresh
@@ -7123,7 +7202,7 @@ class Cron:
         or any doubt keeps the name, so GC never eats a live pause. A job with
         no pause stream never appears in the listing and is simply kept. Reads
         only streams that exist, so once the dead ones are collected the cost
-        falls away -- and a later pause re-creates a collected stream, leaving
+        falls away, and a later pause re-creates a collected stream, leaving
         cross-node propagation (:meth:`_refresh_pauses_from_store`) intact.
         """
         keep = set(names)
@@ -7149,7 +7228,7 @@ class Cron:
                 # paused right now on THIS node: keep unconditionally, without
                 # a read. Covers the window where the pause write is still in
                 # flight and the stream's newest durable record is the prior
-                # resume -- reading it would drop the stream mid-pause (GC then
+                # resume; reading it would drop the stream mid-pause (GC then
                 # grace-keeps it only if that stale resume is young enough).
                 continue
             try:
@@ -7176,8 +7255,8 @@ class Cron:
     async def _collect_state_garbage(self) -> None:
         """One automatic garbage-collection pass (see state.gcGraceSeconds).
 
-        Builds the keep-set from the union of recent manifests -- read across
-        every host's own ``manifests/<host>`` stream, bounded per host -- plus
+        Builds the keep-set from the union of recent manifests (read across
+        every host's own ``manifests/<host>`` stream, bounded per host) plus
         this node's own loaded config, so GC still cannot eat live jobs even
         when a manifest stream is unreadable or empty, and hands the deletion
         to the backend.  The same pass manages the ``artifacts/`` streams and
@@ -7244,7 +7323,7 @@ class Cron:
         # deleted: unless the manifest history reaches back at least one
         # full grace window, a job could be missing from every manifest
         # simply because nobody had recorded manifests yet (a fresh store,
-        # or the first pass after upgrading a pre-manifest store) -- defer
+        # or the first pass after upgrading a pre-manifest store); defer
         # rather than collect with zero effective grace.
         oldest: Optional[datetime.datetime] = None
         for rec in manifests:
@@ -7301,7 +7380,7 @@ class Cron:
         if scopes_covered:
             # folds artifacts/<scope> into ``keep`` (so a removed scope's
             # stream ages out like any other) and collects removed dags' run
-            # documents; skipped entirely -- everything kept -- while any
+            # documents; skipped entirely (everything kept) while any
             # recent manifest predates scope advertising.
             await self._gc_dag_state(
                 backend, keep, art_scopes, live_dags, grace
@@ -7317,7 +7396,7 @@ class Cron:
 
         try:
             # bounded: a worker thread wedged in a dead-mount syscall must
-            # not leave _gc_task pending forever -- the single-flight check
+            # not leave _gc_task pending forever; the single-flight check
             # would then disable automatic GC for the life of the process.
             result = await asyncio.wait_for(
                 backend.collect_garbage(
@@ -7365,9 +7444,9 @@ class Cron:
         :meth:`DagScheduler.gc_removed_dags` (terminal runs older than the
         grace only), then adds ``artifacts/`` to the keep map keyed by the
         live scopes: job names, configured/manifested shared scopes, and the
-        XCom scope of every run document still on disk.  Any doubt --
-        namespaces or documents unreadable, a namespace whose name is
-        unrecoverable -- leaves artifact streams unmanaged (all kept) this
+        XCom scope of every run document still on disk.  Any doubt
+        (namespaces or documents unreadable, a namespace whose name is
+        unrecoverable) leaves artifact streams unmanaged (all kept) this
         pass instead of collecting on a partial view.
         """
         from cronstable.dag import DAG_RUN_NS_PREFIX, xcom_scope
@@ -7588,6 +7667,22 @@ class Cron:
         async def auth_middleware(request, handler):
             if public_paths and request.path in public_paths:
                 return await handler(request)
+            # A CORS preflight passes without a token: the Fetch standard
+            # strips credentials from preflights, so demanding a bearer here
+            # made the OPTIONS route registered for exactly this purpose
+            # (MCPHandler.handle_options, which enforces mcp.allowedOrigins)
+            # unreachable in every token-authenticated deployment, and config
+            # validation makes a token mandatory on any routable listener
+            # with MCP enabled: allow-listed browser MCP clients could never
+            # connect. Safe to pass: a preflight response carries only CORS
+            # policy, and the credentialed request that follows is
+            # authenticated normally. Matched by the defining header, not by
+            # path, so a bare unauthenticated OPTIONS probe stays a 401.
+            if (
+                request.method == "OPTIONS"
+                and "Access-Control-Request-Method" in request.headers
+            ):
+                return await handler(request)
             header = request.headers.get("Authorization", "")
             scheme, _, presented = header.partition(" ")
             # RFC 7235: the auth scheme is case-insensitive (Bearer/bearer).
@@ -7657,8 +7752,8 @@ class Cron:
         :meth:`cronstable.mcp.MCPHandler.handle_http`): the POST control
         routes (``/jobs/{name}/start``, ``/jobs/{name}/cancel``,
         ``/jobs/{name}/pause``, ``/jobs/{name}/resume``,
-        ``/dags/{name}/trigger``, ...) are CORS "simple requests" -- no
-        preflight -- so without this any web page the operator happens to
+        ``/dags/{name}/trigger``, ...) are CORS "simple requests" (no
+        preflight), so without this any web page the operator happens to
         visit can fire them at a localhost-bound daemon.  ``web.authToken``
         also defeats that (a foreign page cannot attach the bearer header),
         but the token is opt-in, and the default posture of an enabled
@@ -7666,11 +7761,11 @@ class Cron:
 
         The rule, per request:
 
-        * safe methods (:data:`WEB_SAFE_METHODS`) pass -- nothing they hit
+        * safe methods (:data:`WEB_SAFE_METHODS`) pass: nothing they hit
           mutates, and CORS preflight must keep reaching /mcp's handler;
         * paths enforcing their own list (:data:`WEB_ORIGIN_EXEMPT_PATHS`)
-          pass -- /mcp 403s foreign Origins itself;
-        * no ``Origin`` header passes -- curl/CLI/monitoring clients (every
+          pass: /mcp 403s foreign Origins itself;
+        * no ``Origin`` header passes: curl/CLI/monitoring clients (every
           current browser sends Origin on cross-site POSTs, which are the
           attack this defends against);
         * an Origin naming this daemon's own authority
@@ -7680,7 +7775,7 @@ class Cron:
 
         Honest residual: a DNS-rebinding page served on the daemon's OWN
         port (so Origin and Host genuinely agree after the rebind) passes
-        the equality test -- Origin-vs-Host cannot distinguish it from the
+        the equality test: Origin-vs-Host cannot distinguish it from the
         real dashboard. Cross-port and cross-host rebinds are refused, and
         ``web.authToken`` closes the residual completely (a rebound page
         holds no token).
@@ -7817,8 +7912,8 @@ class Cron:
         Render ``after`` into the job's own frame (its timezone, or the
         system-local zone when it has none) and ask the cron engine for the
         delay to the next match.  The frame is kept timezone-AWARE in both
-        cases, so ``CronTab.next`` computes the delay as a real duration --
-        correcting for any utcoffset (DST) change across the interval -- and
+        cases, so ``CronTab.next`` computes the delay as a real duration,
+        correcting for any utcoffset (DST) change across the interval, and
         adding it back to the UTC ``after`` yields the correct UTC fire
         instant.  A naive local frame would defeat that correction: the
         engine would return a civil wall-clock delta that, added to a UTC
@@ -7850,7 +7945,7 @@ class Cron:
         """Seed the index for any enabled CronTab job missing from it.
 
         Seeds strictly-future (the next boundary after ``now``), so a job just
-        added on a reload -- or every job at start-up -- skips the in-progress
+        added on a reload (or every job at start-up) skips the in-progress
         slot rather than firing once for the partial period already under way.
         """
         for name, job in self.cron_jobs.items():
@@ -7882,8 +7977,8 @@ class Cron:
         in ``utc``: ``utc: true`` -> UTC, ``utc: false`` with no timezone ->
         local, an explicit ``timezone`` -> that zone with ``utc`` inert).  The
         timezone is compared by its canonical string so ``datetime.timezone``
-        ``.utc`` and ``ZoneInfo("UTC")`` -- distinct objects that fire
-        identically -- are treated as equal (an object-identity compare would
+        ``.utc`` and ``ZoneInfo("UTC")`` (distinct objects that fire
+        identically) are treated as equal (an object-identity compare would
         force a needless reseed that could skip a fire on the reload boundary).
         The raw ``utc`` field is deliberately NOT compared: it is fully carried
         by the resolved timezone and has no further effect on the fire instants
@@ -8024,20 +8119,20 @@ class Cron:
 
         When ``fire_slot`` (its current next-fire, known ``<= now``) is within
         :data:`CATCHUP_LIMIT` of ``now``, walk forward occurrence by occurrence
-        while still ``<= now`` -- replaying each missed slot so a frequently
+        while still ``<= now``, replaying each missed slot so a frequently
         scheduled job overrun by a slow pass is not silently dropped.  This
         walk is bounded: at most ``CATCHUP_LIMIT`` occurrences even for a
         per-second job.
 
         A larger gap is a stall/suspend/forward-clock-jump, NOT tick overhead,
         and is handled WITHOUT walking the window: enumerating it would iterate
-        once per missed occurrence -- millions of times for a per-second job
+        once per missed occurrence: millions of times for a per-second job
         across a multi-hour gap, unbounded for an RTC-less boot corrected
-        forward by years -- blocking the event loop and exhausting memory only
+        forward by years, blocking the event loop and exhausting memory only
         to discard the result.  Instead the job resumes exactly where the old
         per-tick scheduler would, in O(1): fire the current slot only if now
         itself matches (a per-second job fires once at the current second; a
-        sparse job -- ``*/15``, hourly, daily -- whose current slot does not
+        sparse job (``*/15``, hourly, daily) whose current slot does not
         match fires nothing), then resync to the next occurrence after ``now``.
         This is cron's no-catch-up-after-an-outage rule.
         """
@@ -8049,8 +8144,8 @@ class Cron:
                 job.name,
                 (now - fire_slot).total_seconds(),
             )
-            # Resume at the current slot, firing only if it matches -- the same
-            # decision the old tick made via schedule_slot + crontab.test --
+            # Resume at the current slot, firing only if it matches (the same
+            # decision the old tick made via schedule_slot + crontab.test)
             # and resync to the first occurrence after now (no enumeration).
             crontab = job.schedule
             assert isinstance(crontab, CronTab)
@@ -8058,8 +8153,8 @@ class Cron:
             # Record the fired slot as an aware-UTC instant, matching the
             # normal branch below (whose fires are the aware-UTC next-fire
             # entries), so _last_run_slot never mixes naive and aware values.
-            # schedule_slot renders now into the job's OWN frame -- naive local
-            # for a job with no timezone -- which is what crontab.test must
+            # schedule_slot renders now into the job's OWN frame (naive local
+            # for a job with no timezone), which is what crontab.test must
             # match against; the recorded slot is then converted back to UTC.
             # astimezone(utc) reads a naive slot as local (as schedule_slot
             # produced it) and is a no-op for an already-UTC one.
@@ -8098,7 +8193,7 @@ class Cron:
         Reads the newest checkpoint record: an ``open`` without a following
         ``close`` means a previous backfill (here or on a crashed node) never
         completed, and catch-up should resume from ITS watermark rather than
-        the run ledger's -- ordinary runs finishing after that boot advanced
+        the run ledger's: ordinary runs finishing after that boot advanced
         the derived watermark past the still-unreplayed slots.
         """
         backend = self.state_backend
@@ -8172,7 +8267,7 @@ class Cron:
         is still applied later by its daemon worker thread, so a stalled
         ``open`` can land on disk AFTER the cycle's ``close`` and sort newer
         (record order is the writer's clock at the actual write).  The next
-        restart then resumes an already-completed cycle -- a bounded replay,
+        restart then resumes an already-completed cycle: a bounded replay,
         never a loss.
         """
         backend = self.state_backend
@@ -8206,16 +8301,16 @@ class Cron:
     ) -> Tuple[int, Optional[str]]:
         """How many catch-up launches ``job`` is owed, and from where.
 
-        Reads the durable last-run watermark -- hoisted back to an open
+        Reads the durable last-run watermark, hoisted back to an open
         checkpoint's (older) watermark when a previous backfill never closed
-        (see :meth:`_pending_catchup_watermark`) -- and steps the schedule
+        (see :meth:`_pending_catchup_watermark`), and steps the schedule
         forward from it (DST-safe, via :meth:`_compute_next_fire`), bounded by
         ``startingDeadlineSeconds`` and :data:`MAX_CATCHUP_OCCURRENCES`.
         Occurrences inside a durable pause window are stepped over instead of
         counted (see :meth:`_pause_excusal_window`); occurrences on either
         side of it stay owed.
         Returns ``(0, ...)`` when nothing was missed or the job never ran
-        under this store (no reference point, so -- like anacron/systemd -- a
+        under this store (no reference point, so, like anacron/systemd, a
         first-ever run just schedules forward); ``(1, ...)`` for ``run-once``
         when at least one slot was missed (every missed slot coalesced into a
         single launch); or the bounded count of missed slots for ``run-all``.
@@ -8305,7 +8400,7 @@ class Cron:
         owner, schedules the catch-up launches spread over
         ``catchupJitterSeconds`` so a fleet does not all fire at once.  A
         no-op without a ``state`` section (there is no durable watermark to
-        compare against) -- catch-up is a stateful-only feature.
+        compare against): catch-up is a stateful-only feature.
 
         Resolution is NOT latched while it cannot actually happen yet: with a
         configured-but-unstarted backend (start_stop_state retries it every
@@ -8315,8 +8410,8 @@ class Cron:
         affected jobs stay pending and are re-evaluated every
         :data:`CATCHUP_RECHECK_INTERVAL`.  Latching there
         (the old behaviour) forfeited the owed backfill forever.  Per-job
-        decisions that ARE final -- backfill scheduled, nothing owed, another
-        node positively owns it -- are remembered in ``_catchup_done`` so they
+        decisions that ARE final (backfill scheduled, nothing owed, another
+        node positively owns it) are remembered in ``_catchup_done`` so they
         are not re-processed while a sibling job stays pending.  All store
         I/O here is guarded and bounded: a store error defers (never forfeits,
         never crashes the caller).
@@ -8366,8 +8461,8 @@ class Cron:
             return
         unresolved = False
         if self.state_backend is None:
-            # configured but not (yet) running -- a bad mount at boot that
-            # start_stop_state keeps retrying: keep the whole evaluation
+            # configured but not (yet) running (a bad mount at boot that
+            # start_stop_state keeps retrying): keep the whole evaluation
             # pending rather than forfeiting the backfill.
             unresolved = True
         else:
@@ -8504,7 +8599,7 @@ class Cron:
         """Launch a job's catch-up runs, after its jitter offset.
 
         Sleeps out the per-job jitter (interruptibly, so shutdown wakes it at
-        once), then REVALIDATES everything the sleep may have invalidated --
+        once), then REVALIDATES everything the sleep may have invalidated:
         the job may have been removed/disabled/edited by a reload (the live
         definition is launched, never the boot-time capture), cluster
         ownership may have moved (the new owner resumes from the open
@@ -8516,7 +8611,7 @@ class Cron:
         owed runs and ``run-all`` cannot stampede N concurrent instances.
         Uses :meth:`maybe_launch_job` with ``with_retries=False``, not
         :meth:`launch_scheduled_job`: a backfill is best-effort and must not
-        arm retries -- nor capture a LIVE retry ladder armed by a concurrent
+        arm retries, nor capture a LIVE retry ladder armed by a concurrent
         scheduled fire, whose budget its failures would burn.  Failure
         reporting still applies (the reaper reports every finished run), and
         each finished run is recorded to the ledger, advancing the watermark
@@ -8597,7 +8692,7 @@ class Cron:
                 # Revalidate EVERY iteration, not just after the jitter: a
                 # serialized run-all backfill spans count x run-duration,
                 # plenty of time for a reload to remove/disable the job or
-                # for ownership to move -- launching on after either would
+                # for ownership to move; launching on after either would
                 # run a dead definition or double-run against the new owner
                 # (which resumes from the still-open checkpoint).
                 live = self.cron_jobs.get(job.name)
@@ -8651,7 +8746,7 @@ class Cron:
         """Wait until no instance of ``name`` is running (backfill pacing).
 
         Returns ``False`` when shutdown was signalled while waiting; ``True``
-        means "go ahead" -- either the job went idle or ``max_wait`` seconds
+        means "go ahead": either the job went idle or ``max_wait`` seconds
         elapsed first (used by the non-Forbid policies, where the wait is
         pacing rather than correctness and must not starve forever).  Polling
         (rather than plumbing a completion event out of the reaper) keeps the
@@ -8686,11 +8781,11 @@ class Cron:
         await self.spawn_jobs(startup, now)
         # Every pass, not just start-up: _catch_up latches itself once fully
         # resolved (one boolean check per pass thereafter) but must be able
-        # to retry when the backend or the cluster was not ready at boot --
+        # to retry when the backend or the cluster was not ready at boot;
         # latching on the first pass forfeited the owed backfill forever.
         # Spawned, not awaited: the evaluation performs bounded store reads
         # (up to STATE_OP_TIMEOUT each), and a slow-but-alive mount must not
-        # stall this pass -- job launches outrank catch-up bookkeeping.
+        # stall this pass; job launches outrank catch-up bookkeeping.
         # Tracked in _catchup_tasks so shutdown cancels a straggler.
         if not self._caught_up and (
             self._catchup_eval_task is None or self._catchup_eval_task.done()
@@ -8900,7 +8995,7 @@ class Cron:
         One round per catch-up depth: within a round the due jobs launch
         concurrently in config order (so N jobs due in the same slot cost about
         one spawn-time, not N), while a single job's own catch-up replays run
-        in successive rounds -- i.e. sequentially -- so its concurrencyPolicy
+        in successive rounds (i.e. sequentially), so its concurrencyPolicy
         still applies between them.  The common case (every job has exactly one
         fire) is a single round.
         """
@@ -8911,8 +9006,8 @@ class Cron:
                 if r >= len(fires):
                     continue
                 # record the slot this fire is for (status/introspection), then
-                # gate on the cluster -- recorded whether or not this node runs
-                # it, mirroring the old per-slot bookkeeping.
+                # gate on the cluster (recorded whether or not this node runs
+                # it, mirroring the old per-slot bookkeeping).
                 self._last_run_slot[job.name] = fires[r]
                 if self._cluster_allows(job):
                     # the lateAfter reference, recorded INSIDE the ownership
@@ -9006,7 +9101,7 @@ class Cron:
         """Record-then-run boot dedupe for a non-deferred @reboot job.
 
         ``True`` -> launch (with the marker recorded FIRST, so a crash
-        between record and spawn errs toward not re-running -- the same
+        between record and spawn errs toward not re-running, the same
         at-most-once ordering as the cluster's mark_reboot_ran path).
         ``False`` -> skip: the marker proves this boot's run already
         happened, or the store is unavailable under ``onStoreUnavailable:
@@ -9181,8 +9276,8 @@ class Cron:
                 # removed election is retired without running, the same way
                 # job_should_run and the manual web trigger refuse a disabled
                 # job rather than running it once on convergence. (enabled is
-                # checked last so a name reused for a non-@reboot job -- which
-                # need not carry the attribute -- short-circuits on the
+                # checked last so a name reused for a non-@reboot job (which
+                # need not carry the attribute) short-circuits on the
                 # schedule check, as _is_deferrable_reboot does on the gated
                 # paths.)
                 if (
@@ -9195,14 +9290,14 @@ class Cron:
         mgr = self.cluster_manager
         if mgr is None:
             # Election wanted but no manager (store unreachable / backend
-            # failed to start). A Leader @reboot one-shot stays fail-closed --
+            # failed to start). A Leader @reboot one-shot stays fail-closed:
             # keep it pending and re-evaluate once a manager comes up. But a
             # PreferLeader one-shot's contract is NEVER-SKIP: it must run
             # somewhere even when the store is unreachable (accepting a
             # possible double-run), exactly the asymmetry _cluster_allows
             # applies to *scheduled* PreferLeader jobs in this same mgr-is-None
             # case. Not mirroring it here would drop the one-shot forever on a
-            # persistent start failure -- the very store-unreachable case
+            # persistent start failure: the very store-unreachable case
             # PreferLeader exists to survive. There is no store to record the
             # run to, so a later-starting manager may not see it ran; that is
             # the documented PreferLeader double-run cost, strictly better than
@@ -9233,7 +9328,7 @@ class Cron:
             return
         for name in list(self._pending_reboot_jobs):
             if name not in self.cron_jobs:
-                # Absent right now -- but @reboot only defers at startup, so a
+                # Absent right now, but @reboot only defers at startup, so a
                 # name that vanishes mid-reload (templating glitch, transient
                 # remove-then-re-add) could otherwise be lost forever. Keep it
                 # pending and re-evaluate next wakeup; the launch below is
@@ -9283,7 +9378,7 @@ class Cron:
             # (_cluster_allows), not a name comparison: a lease backend's
             # leader_name() reports the holder's display *identity*
             # (cluster.kubernetes.identity), which may legitimately differ from
-            # node_name -- comparing those two would make the holder fail to
+            # node_name; comparing those two would make the holder fail to
             # recognise itself, so the one-shot would never run on any node.
             # is_leader()/is_available_leader()/is_job_owner() self-recognise
             # correctly regardless of an identity != nodeName mismatch.
@@ -9314,11 +9409,11 @@ class Cron:
         (``cluster.electLeader``); then it depends on the job's
         ``clusterPolicy``:
 
-        * ``EveryNode`` — run on every replica, independent of cluster state
+        * ``EveryNode``: run on every replica, independent of cluster state
           (so these jobs keep firing even if the manager failed to start);
-        * ``Leader`` (default) — only the quorum-gated elected owner runs it
+        * ``Leader`` (default): only the quorum-gated elected owner runs it
           (at-most-once; skips when there is no quorum);
-        * ``PreferLeader`` — the reachable agreeing owner runs it, ignoring
+        * ``PreferLeader``: the reachable agreeing owner runs it, ignoring
           quorum (never skips while a node is up, but may double-run across a
           partition).
 
@@ -9330,7 +9425,7 @@ class Cron:
 
         When election is configured but no manager is running, ``Leader`` fails
         *closed* (return False) so a broken cluster does not make every replica
-        fire, while ``PreferLeader`` (never-skip) runs anyway -- a node with no
+        fire, while ``PreferLeader`` (never-skip) runs anyway: a node with no
         manager is the "store unreachable" case its contract already accepts a
         double-run for, so skipping it would drop the job to at-most-zero.
         Manual (API) triggers go through
@@ -9342,7 +9437,7 @@ class Cron:
         double-running across a failover), but merely deferred and re-checked
         on a transient fail-closed denial (see ``_cluster_owner_moved``).
 
-        A detected conflict (``mgr.has_conflict()`` — a duplicate ``nodeName``,
+        A detected conflict (``mgr.has_conflict()``: a duplicate ``nodeName``,
         an agreeing peer declaring a different cluster size ``N``, or an
         agreeing peer running a different coordination policy
         (``distribution`` / ``electLeader``)) additionally makes ``Leader``
@@ -9350,7 +9445,7 @@ class Cron:
         name, disagree on ``N`` (either lets two nodes each elect themselves),
         or pick owners by different rules (which would double-run or drop a
         ``Leader`` job), so skipping is the at-most-once-preserving choice.
-        ``PreferLeader`` is left running — it already accepts double-runs as
+        ``PreferLeader`` is left running: it already accepts double-runs as
         the price of never skipping.
         """
         if not self._elect_leader_configured:
@@ -9363,7 +9458,7 @@ class Cron:
             # start, or a reload tore the old one down and the rebuild raised).
             # That is precisely the "store/quorum unreachable" condition, so
             # honour each policy's contract: Leader fails CLOSED
-            # (at-most-once), but PreferLeader is never-skip -- it must run
+            # (at-most-once), but PreferLeader is never-skip; it must run
             # anyway (accepting a possible double-run) rather than be silently
             # skipped on every replica, which for a fleet-wide start failure
             # would drop the job to at-most-ZERO, defeating the whole point of
@@ -9385,7 +9480,7 @@ class Cron:
             # A backend read should never raise, but a bug in one (a bad gossip
             # payload reaching election, a KeyError in rendezvous hashing) must
             # not escape: spawn_jobs runs OUTSIDE the run loop's try/except, so
-            # an exception here would kill the whole scheduler -- including the
+            # an exception here would kill the whole scheduler, including the
             # EveryNode jobs meant to survive a broken manager. Fail closed
             # (skip this leader-gated job) and keep scheduling.
             logger.exception(
@@ -9398,8 +9493,8 @@ class Cron:
     def _log_cluster_role(self) -> None:
         """Log this node's run-eligibility transitions (once per change).
 
-        Quorum membership is logged in both modes, so any node -- leader or
-        follower -- records losing (and regaining) quorum, the gate that
+        Quorum membership is logged in both modes, so any node, leader or
+        follower, records losing (and regaining) quorum, the gate that
         decides whether the cluster can run leader-gated work at all.
         Single-leader mode additionally logs this node acquiring or losing the
         one scheduled-job leadership.
@@ -9408,7 +9503,7 @@ class Cron:
             return
         # spawn_jobs (this method's only caller) runs OUTSIDE run()'s
         # try/except, so an exception from any backend read below would kill
-        # the whole scheduler -- the failure mode _cluster_allows is hardened
+        # the whole scheduler: the failure mode _cluster_allows is hardened
         # against, but this method runs one step earlier on the same unguarded
         # path. It only logs, so swallow any backend-read error and keep
         # scheduling (the run/skip decision stays fail-closed in
@@ -9465,7 +9560,7 @@ class Cron:
             # A coordination-policy divergence (an agreeing peer running a
             # different distribution / electLeader) selects a different owner
             # and would double-run or drop Leader jobs, so it fails the Leader
-            # gate closed exactly like the two conflicts above -- but unlike
+            # gate closed exactly like the two conflicts above, but unlike
             # them it would otherwise stand Leader jobs down cluster-wide with
             # nothing in the log. Surface it just as loudly, once per change.
             policy_conflict = mgr.conflicting_policies()
@@ -9485,8 +9580,8 @@ class Cron:
                     )
                 self._was_policy_conflict = bool(policy_conflict)
         # Quorum membership is logged on *every* node, in both modes, so a
-        # follower that drops below quorum -- i.e. the whole cluster losing the
-        # ability to elect a leader -- leaves a breadcrumb in its own log, not
+        # follower that drops below quorum (i.e. the whole cluster losing the
+        # ability to elect a leader) leaves a breadcrumb in its own log, not
         # only the ex-leader's (in single-leader mode only the ex-leader's
         # is_leader() flips, so without this a follower logs nothing on quorum
         # loss).
@@ -9687,20 +9782,37 @@ class Cron:
         """Launch ``job`` unless concurrencyPolicy forbids it.
 
         Returns whether a new instance was actually launched (False only
-        for the ``Forbid`` skip), so a caller accounting for launches --
-        the retry metric -- does not count a swallowed one.
+        for the ``Forbid`` skip), so a caller accounting for launches
+        (the retry metric) does not count a swallowed one.
 
         ``with_retries=False`` (catch-up backfills) launches WITHOUT the
         job's retry state: a backfill must not attach itself to a live retry
-        ladder armed by a concurrent scheduled fire -- its failures would
+        ladder armed by a concurrent scheduled fire; its failures would
         cancel the legitimate pending retry and burn the shared budget toward
         a premature onPermanentFailure.
+
+        The whole method holds the job's launch lock: the concurrency gate
+        below reads ``running_jobs`` several awaits before the launch appends
+        to it (the cluster slot claim's store round-trips, the subprocess
+        spawn inside ``start()``), and every entry point here runs in its own
+        task (the scheduler loop, each web/MCP request, a retry timer). Two
+        concurrent entries for the same job would both see the gate open in
+        that window and double-launch a Forbid job. The lock is per job name,
+        so distinct jobs still launch concurrently; a second entry for the
+        SAME job waits and then reads the gate the first entry settled.
         """
+        async with self._launch_locks[job.name]:
+            return await self._launch_job_locked(job, with_retries)
+
+    async def _launch_job_locked(
+        self, job: JobConfig, with_retries: bool
+    ) -> bool:
+        """The body of :meth:`maybe_launch_job`, under its per-job lock."""
         # .get(), not self.running_jobs[job.name]: a bare subscript on this
         # defaultdict would INSERT an empty-list entry for a not-yet-running
         # job. Such a jobless key makes `self.running_jobs` truthy while
         # holding nothing to reap, and the reaper's idle wait
-        # (_wait_for_running_jobs) blocks on _jobs_running without a timeout --
+        # (_wait_for_running_jobs) blocks on _jobs_running without a timeout,
         # so a phantom key left behind (e.g. if start() below raises before the
         # append) would spin the reaper hot at shutdown instead of letting it
         # exit. Reading with .get() never creates the key.
@@ -9716,8 +9828,8 @@ class Cron:
                 # the slot is deliberately DROPPED, not late: an overrun is
                 # maxRuntime's to report, once. RECORD the excuse (pop the due
                 # slot) rather than only inferring it from running_jobs, so it
-                # survives the run ending and the reaper emptying running_jobs
-                # -- otherwise the stale due latches lateAfter in the window
+                # survives the run ending and the reaper emptying running_jobs;
+                # otherwise the stale due latches lateAfter in the window
                 # between the run finishing and the next slot launching. This
                 # mirrors the cluster-slot path, which excuses via
                 # _sla_peer_owns_slot. Popping lands lateAfter on its "nothing
@@ -9727,7 +9839,12 @@ class Cron:
                 self._sla_due.pop(job.name, None)
                 return False
             elif job.concurrencyPolicy == "Replace":
-                for running_job in self.running_jobs[job.name]:
+                # over a SNAPSHOT: each cancel awaits (killTimeout), and the
+                # reaper concurrently remove()s finished instances from the
+                # live list; shrinking it mid-iteration would make the
+                # iterator skip the next instance, leaving it running,
+                # unmarked, beside the replacement.
+                for running_job in list(self.running_jobs[job.name]):
                     # mark before cancelling so the reaper treats the forced
                     # termination as a replacement, not a job failure.
                     running_job.replaced = True
@@ -9762,8 +9879,8 @@ class Cron:
             # start() handles the expected spawn failures itself (the
             # instance still registers, start_failed, and the reaper pairs
             # the finish); anything escaping here never registers, so the
-            # slot claim above must be handed back or its refcount -- and
-            # the lease's renew task -- would outlive the launch forever.
+            # slot claim above must be handed back or its refcount (and
+            # the lease's renew task) would outlive the launch forever.
             if job.concurrencyScope == "cluster":
                 await self._release_cluster_slot(job)
             # likewise the job-API run registration: a launch that never
@@ -9983,7 +10100,7 @@ class Cron:
             lease_name = self._slot_name(name)
             got = await self._acquire_slot_lease(backend, lease_name)
             if got is None:
-                # denied, sick, or timed out -- a bounded read tells a live
+                # denied, sick, or timed out: a bounded read tells a live
                 # foreign holder apart from a store that cannot answer (the
                 # lease API fails closed, so None alone proves nothing).
                 observed: Optional[Lease] = None
@@ -10043,15 +10160,15 @@ class Cron:
             )
             # a fresh slot win is the one moment a foreign orphaned run is
             # provably unrenewed: reconcile its in-flight record (does not
-            # prove the process died -- see _reconcile_open_record).
+            # prove the process died; see _reconcile_open_record).
             await self._reconcile_takeover_inflight(job)
             return True
 
     def _spawn_slot_pursuit(self, job: JobConfig, observed: Lease) -> None:
         """Start (or keep) the background Replace pursuit for ``job``.
 
-        The pursuit -- asking the foreign holder to yield, waiting it out,
-        then re-attempting the launch -- takes up to ~2 slot TTLs, so it
+        The pursuit (asking the foreign holder to yield, waiting it out,
+        then re-attempting the launch) takes up to ~2 slot TTLs, so it
         must never run inline on the scheduler pass (one held slot would
         stall every other due job); single-flight per job.
         """
@@ -10083,10 +10200,10 @@ class Cron:
         exact FENCE, so a request left over from a previous incarnation is
         inert (a takeover always bumps the fence).  The holder's renew task
         observes it within one renew period and cancels its instances
-        (marked replaced); when the slot frees -- release or TTL expiry --
+        (marked replaced); when the slot frees (release or TTL expiry)
         the launch goes back through every normal gate.  Bounded: a holder
         that never yields (still running, or its node is gone but the
-        record write failed) forfeits this launch with a warning -- no-run
+        record write failed) forfeits this launch with a warning: no-run
         over double-run.
         """
         backend = self.state_backend
@@ -10163,12 +10280,12 @@ class Cron:
 
         Renews at a third of the TTL, and doubles as the Replace listener:
         each cycle reads the newest cancel record and, when one targets our
-        exact fence, cancels the local instances (marked replaced -- not a
+        exact fence, cancels the local instances (marked replaced, not a
         failure) so the requesting node can take the slot.  A renew that is
         positively refused because another node took the lease over logs
         and stops renewing but NEVER cancels the running work (a store blip
-        must not kill a healthy job); an ambiguous refusal keeps retrying
-        -- the store deliberately allows a same-fence renew slightly past
+        must not kill a healthy job); an ambiguous refusal keeps retrying:
+        the store deliberately allows a same-fence renew slightly past
         expiry, so a single unreadable blip self-heals.
         """
         period = max(1.0, self._slot_ttl / 3)
@@ -10237,7 +10354,7 @@ class Cron:
                 # exact point does NOT reliably raise: on Python <=3.11
                 # asyncio.wait_for returns the resolved renew result instead of
                 # propagating the CancelledError (`if fut.done(): return
-                # fut.result()`), so the cancel only lands at the next sleep --
+                # fut.result()`), so the cancel only lands at the next sleep,
                 # after this iteration's tail would otherwise run.  Stand down
                 # now, without touching _slot_leases: re-populating the entry
                 # the release just popped would make _release_slot_lease treat
@@ -10280,7 +10397,7 @@ class Cron:
 
         Refcounted (see ``_slot_refs``): every claim increments, every
         finished instance decrements, and the lease is released only at
-        zero AND with no registered instances -- so a Replace overlap or a
+        zero AND with no registered instances, so a Replace overlap or a
         claim whose instance is still being spawned cannot lose its lease
         to a stale release.  The release itself is fire-and-forget; when
         no lease was recorded (a degraded launch, or an acquire whose
@@ -10312,7 +10429,7 @@ class Cron:
             return
         # Serialized under the per-job slot mutex, like _release_phantom_slot:
         # this write is scheduled fire-and-forget by _release_cluster_slot, so
-        # a fresh same-holder re-claim can land before it -- and a same-holder
+        # a fresh same-holder re-claim can land before it, and a same-holder
         # re-acquire KEEPS the fence, so this stale release would still match
         # on disk and revoke the new claim's lease (its renewer spinning, a
         # peer's Forbid claim then double-running). A fresh claim installs
@@ -10345,7 +10462,7 @@ class Cron:
         # launch left our token on disk but no local Lease), so without the
         # mutex a fresh claim that installs a real lease L (same holder,
         # since the token is process-wide) between this read and its
-        # release would see L released out from under a live run -- the
+        # release would see L released out from under a live run: the
         # slot freed while we believe we hold it, its renewer spinning,
         # and a peer's Forbid claim then double-running. A fresh claim
         # installs _slot_leases[name] under this same mutex, so once one is
@@ -10386,7 +10503,7 @@ class Cron:
         The open and its paired close run on separate worker threads whose
         filename sort key is each thread's own wall-clock read, so an
         unordered pair could land filename-inverted (close before open) for
-        a near-instant run and leave "open" newest -- a spurious interrupted
+        a near-instant run and leave "open" newest: a spurious interrupted
         run on the next restart.  Chaining each job's inflight writes (the
         same idiom as :meth:`_queue_retry_write`) keeps the stream's order
         equal to the launch/finish order.
@@ -10485,7 +10602,7 @@ class Cron:
         vanishing.  Three guards keep live runs safe: a record written by
         THIS process (a state-section reload rebuilt the backend under a
         live run) is skipped; live local instances outrank the ledger; and
-        a recorded pid that still exists is left alone -- a daemon crash
+        a recorded pid that still exists is left alone: a daemon crash
         does not kill the job processes it spawned.
         """
         backend = self.state_backend
@@ -10546,7 +10663,7 @@ class Cron:
         """On a fresh slot win, close a foreign holder's orphaned run.
 
         A just-acquired slot proves the previous holder made NO successful
-        renewal for a full TTL -- not that its process died (it may still
+        renewal for a full TTL, not that its process died (it may still
         be running if it lost store access; that overlap is the documented
         at-least-once trade).  The fence supersession is what makes closing
         the record safe: any late write the old incarnation makes is
@@ -10573,8 +10690,8 @@ class Cron:
             return
         if rec.get("host") == self._state_host:
             # a same-host orphan (a previous daemon on this host): our own
-            # live run is never reconciled, and -- exactly as the
-            # rehydration path does -- a recorded pid that is still alive
+            # live run is never reconciled, and, exactly as the
+            # rehydration path does, a recorded pid that is still alive
             # means the job process outlived its daemon (a crash does not
             # kill spawned children), so the run is NOT interrupted. Only a
             # genuinely foreign host's record is judged purely by fence
@@ -10617,7 +10734,7 @@ class Cron:
         instant, so the watermark advances over exactly the interrupted
         slot); under ``run-once``/``run-all`` it carries the instant as
         ``interruptedAt`` instead, leaving the durable watermark untouched
-        so the interrupted occurrence is still owed to catch-up -- crash
+        so the interrupted occurrence is still owed to catch-up: crash
         recovery must not silently downgrade those jobs to at-most-once.
         """
         started_iso = rec.get("startedAt")
@@ -10934,7 +11051,7 @@ class Cron:
         a small, ordinary counter reset.  Gated on ``_counters_seeded``: a
         run finishing in the window between the backend coming up and the
         seed attempt must not write a snapshot the seed would then read
-        back -- ingesting this process's own events twice.
+        back, ingesting this process's own events twice.
         """
         backend = self.state_backend
         if backend is None or not self._counters_seeded:
@@ -10964,7 +11081,7 @@ class Cron:
         """Write a finished run's captured output to the durable log store.
 
         Opt-in per job (``archiveOutput``).  What is archived is the run's
-        live-tail ring buffer -- the newest
+        live-tail ring buffer: the newest
         :data:`cronstable.job.LIVE_LOG_LIMIT`
         lines (each already bounded by ``maxLineLength``); older lines were
         evicted from the ring before archiving and are accounted for in the
@@ -11086,8 +11203,8 @@ class Cron:
         (a job that already carries in-memory history, or one that finished a
         run while the read awaited) still seed the reference before skipping
         the rest of the warm-up. Without it, a job that FAILED during a state
-        outage -- non-empty run_history by the time the store finally comes
-        up -- would skip seeding, and _sla_stale_reference would re-baseline
+        outage (non-empty run_history by the time the store finally comes
+        up) would skip seeding, and _sla_stale_reference would re-baseline
         it on process start: exactly the silent threshold the deep re-read
         exists to prevent, one guard higher. By finished_at, not by position:
         record filenames order on WRITE time and run-record writes are
@@ -11131,7 +11248,7 @@ class Cron:
         warmed = 0
         for name in list(self.cron_jobs):
             # a job that already accumulated in-memory history this process
-            # (unusual at boot) is left as the live source of truth -- but the
+            # (unusual at boot) is left as the live source of truth, but the
             # staleness reference is still seeded from that history, so a job
             # that only FAILED during a state outage does not re-baseline
             # maxTimeSinceSuccess on process start when the store returns.
@@ -11245,8 +11362,8 @@ class Cron:
 
         Attempted at most ONCE per process (never per backend generation):
         seeding ADDS into the live accumulators (pre-restart and
-        post-restart events are disjoint), so seeding twice -- or, worse,
-        seeding from a snapshot THIS process already wrote -- would
+        post-restart events are disjoint), so seeding twice (or, worse,
+        seeding from a snapshot THIS process already wrote) would
         double-count.  The latch is therefore set BEFORE the read: it also
         gates :meth:`_persist_counter_snapshot`, so no snapshot of this
         process's own counters can exist in the store until the one seed
@@ -11292,8 +11409,8 @@ class Cron:
         on top of a job's retry stream is a retry the previous process armed
         but never resolved.  ABSOLUTE-deadline re-arming: the record's
         ``notBefore`` is an instant, so the re-armed task sleeps only the
-        remaining time -- zero when the deadline passed while the daemon was
-        down.  Invalidation is by PER-JOB config digest
+        remaining time (zero when the deadline passed while the daemon was
+        down).  Invalidation is by PER-JOB config digest
         (:func:`cronstable.fingerprint.job_digest`): stricter than whole-set
         job-set-id invalidation, which would drop every pending retry
         whenever ANY job changed, while a digest mismatch means THIS job's
@@ -11314,7 +11431,7 @@ class Cron:
         record written by ANOTHER host is that host's live business and is
         neither re-armed nor settled here; and a pending record older than
         the job's newest KNOWN run (the history warmed just above, plus
-        anything recorded in-memory) is settled as superseded -- the ladder
+        anything recorded in-memory) is settled as superseded: the ladder
         demonstrably resolved somehow (perhaps while the store was down and
         the settle write was dropped), and re-running it would be the exact
         double-run this method promises to avoid.
@@ -11591,7 +11708,7 @@ class Cron:
         success/failure record, but non-run outcomes (cancelled/skipped) at the
         head must be skipped over.  Probe :data:`DEPENDS_GATE_PROBE` newest
         records first and widen to the full :data:`RUN_HISTORY_LIMIT` window
-        ONLY when that page is entirely non-run outcomes -- so the common case
+        ONLY when that page is entirely non-run outcomes, so the common case
         (the newest record is a real outcome) materialises a few records
         instead of all 50, without shrinking the skip window a real answer
         may need.
@@ -11623,30 +11740,30 @@ class Cron:
         """Whether ``job``'s depends-on-past gate permits a scheduled fire.
 
         ``True`` (allow) unless ``onlyIfLastSucceeded`` is set AND the job's
-        most recent *run* outcome was a failure -- or its previous instance is
+        most recent *run* outcome was a failure, or its previous instance is
         STILL RUNNING (an unfinished run has not "succeeded", and letting the
         answer depend on whether it happens to finish first would make the
         gate a race).  The last real outcome is the NEWEST of two sources,
         by ``finished_at``:
 
         * the in-memory history (``run_history``), which the finished-run
-          path updates synchronously -- the durable write behind it is
+          path updates synchronously: the durable write behind it is
           fire-and-forget, so the ledger alone can be a beat stale and would
           re-run a job whose failure record is still in flight;
         * the durable ledger, which sees runs from OTHER nodes on a shared
           mount (guarded and bounded: a store error/timeout degrades to the
-          in-memory view with a warning -- fail open, like "no backend" --
+          in-memory view with a warning (fail open, like "no backend")
           rather than stalling or crashing the launch path, which runs
           outside run()'s try/except).
 
         Non-run outcomes (``cancelled``/``skipped``) are skipped in both, so
         a skipped tick does not itself clear the gate and only a genuine
-        success re-opens it -- within each source's bounded window
+        success re-opens it, within each source's bounded window
         (:data:`RUN_HISTORY_LIMIT` newest entries), which a pathological pile
         of consecutive non-run records could in principle exhaust.  No prior
         run in either source -> allow (there is nothing to depend on, and a
         first-ever run must not be blocked).  Without a state backend the
-        gate still works from the in-memory history -- it simply is not
+        gate still works from the in-memory history; it simply is not
         restart-surviving (history resets with the process).
 
         The still-running block is SKIPPED for ``concurrencyPolicy:
@@ -11758,7 +11875,7 @@ class Cron:
             # a DAG task instance, not a scheduled job. Route its
             # completion to the DAG scheduler (which records the durable
             # per-task transition and advances the graph) and skip the whole
-            # job record/retry/inflight/cluster-slot path -- a task's lifecycle
+            # job record/retry/inflight/cluster-slot path: a task's lifecycle
             # lives in its dag_run document, not the job streams.
             await self._handle_finished_dag_task(job)
             return
@@ -11770,7 +11887,7 @@ class Cron:
         if last_instance and self.state_backend is not None:
             # the job went 1 -> 0 live instances here: close the in-flight
             # record. Fire-and-forget; runs before the replaced/cancelled
-            # early-returns below on purpose -- a replaced instance ending
+            # early-returns below on purpose: a replaced instance ending
             # the job's last local instance must still close the record.
             # Ordered behind the open so a near-instant run's close cannot
             # sort ahead of it (see _inflight_write_tail).
@@ -12102,7 +12219,7 @@ class Cron:
             # loss / reload moved ownership while we slept), and
             # maybe_launch_job does NOT gate. Relaunching unconditionally
             # would run a Leader-policy job here while the new owner also
-            # runs it on its next tick -- the exact double-run the
+            # runs it on its next tick: the exact double-run the
             # abstraction promises to prevent.
             if self._cluster_allows(job):
                 # Settle the durable pending record BEFORE launching (the
@@ -12114,7 +12231,7 @@ class Cron:
                 # launches anyway (at-least-once, bounded replay). When
                 # cross-node retry resume is active the decision also
                 # serializes on the per-job claim lease and re-checks that
-                # the newest ladder record is still OUR OWN pending -- a
+                # the newest ladder record is still OUR OWN pending: a
                 # peer that claimed this ladder while we slept or deferred
                 # ends it here ("abort") without settling, so the
                 # claimer's record stays newest.
@@ -12140,14 +12257,14 @@ class Cron:
                 # ownership genuinely moved: end this node's retry sequence
                 # (on a shared store the ladder is handed off for the new
                 # owner to resume; otherwise the new owner picks up only
-                # the job's future scheduled firings -- see _abandon_retry).
+                # the job's future scheduled firings; see _abandon_retry).
                 self._abandon_retry(job, retry_num)
                 return
             # A transient fail-closed denial (lost quorum, a nodeName/size/
             # policy conflict, a backend read error, no manager): this node
             # may well still be the rightful owner, and ending the sequence
             # here would end it EVERYWHERE for an @reboot keep-alive job
-            # (maximumRetries: -1) -- reboot_ran was recorded before the
+            # (maximumRetries: -1): reboot_ran was recorded before the
             # first launch, so no other node ever restarts it. Keep the
             # retry alive and re-check the gate after another delay.
             state = self.retry_state.get(job_name)
@@ -12172,7 +12289,7 @@ class Cron:
             )
             await asyncio.sleep(recheck)
         # counted on the launch result (not where the retry is armed) so the
-        # counter reports retries actually launched -- net of cancellations,
+        # counter reports retries actually launched, net of cancellations,
         # abandonments, and a concurrencyPolicy=Forbid skip.
         if await self.maybe_launch_job(job):
             self.metrics.job_retry_launched(job_name)
@@ -12236,7 +12353,7 @@ class Cron:
         write nothing by design): the store being down/rebuilding here can
         leave a stale ``pending`` on top of the stream, which a later boot
         would resurrect were it not for the superseded-by-run re-arm guard
-        -- worth a counter and a line, never silence.
+        (worth a counter and a line, never silence).
         """
         if not self._state_configured:
             return
@@ -12457,7 +12574,7 @@ class Cron:
         the record-before-run half of restart-durable retries: once it
         lands, a crash cannot re-arm the attempt that is about to run.
         When it cannot land: the default ``degrade`` policy launches anyway
-        (at-least-once -- a crash in the narrow window before the record
+        (at-least-once: a crash in the narrow window before the record
         is retried by a later settle could replay this one attempt after a
         restart), while ``fail-closed`` reports False so the caller defers
         the launch and re-checks, exactly like a closed cluster gate.
@@ -12561,7 +12678,7 @@ class Cron:
         own copy; a foreign pending on the shared stream is another node's
         live ladder, exactly as in rehydration).  ``@reboot`` ladders are
         anchored to a HOST's boot (the re-arm validity is judged against
-        this host's boot marker), so they never move either -- an
+        this host's boot marker), so they never move either: an
         abandoned @reboot keep-alive still ends cluster-wide, as
         documented.
         """
@@ -12587,7 +12704,7 @@ class Cron:
     ) -> Optional[Lease]:
         """``acquire_lease`` for a retry claim, mapping a timeout OR a raised
         store error to ``None`` so the caller's read-back-and-policy path
-        decides -- the same containment as :meth:`_acquire_slot_lease`.  An
+        decides, the same containment as :meth:`_acquire_slot_lease`.  An
         escape here kills the ``schedule_retry_job`` task (silently dropping
         the due retry) AND is re-raised by ``cancel_job_retries``' awaiter on
         the job's next fire, outside ``run()``'s try/except: the whole
@@ -12632,8 +12749,8 @@ class Cron:
         * the consume serializes on the SAME per-job claim lease the scan
           uses, so a claimer's re-read-then-append and our re-check-then-
           settle cannot interleave;
-        * the newest ladder record must still be a record THIS host wrote
-          -- a foreign newest record (a claimer's pending, or its
+        * the newest ladder record must still be a record THIS host wrote:
+          a foreign newest record (a claimer's pending, or its
           settled/"launched" after it already fired) means the ladder
           positively moved, and the only safe move is to end it locally
           without settling (``abort``): our settle landing on top would
@@ -12641,8 +12758,8 @@ class Cron:
           the next boot.
 
         The staleness grace (:data:`RETRY_CLAIM_GRACE`) cannot protect a
-        gate-deferred owner -- its re-check cadence is its own ladder
-        delay, arbitrarily longer than any constant -- so this re-check is
+        gate-deferred owner (its re-check cadence is its own ladder
+        delay, arbitrarily longer than any constant), so this re-check is
         load-bearing for at-most-once, not defensive hardening.  Read/
         acquire failures follow ``onStoreUnavailable``: degrade proceeds
         (unserialized, at-least-once), fail-closed defers.
@@ -12732,8 +12849,8 @@ class Cron:
         The cross-node half of restart-surviving retries: a pending record
         whose owner crashed (stale past its deadline plus
         :data:`RETRY_CLAIM_GRACE`) or a ``handoff`` record from an owner
-        that positively relinquished is claimed -- under a per-job TTL
-        lease, with a re-read inside it -- and re-armed locally exactly
+        that positively relinquished is claimed (under a per-job TTL
+        lease, with a re-read inside it) and re-armed locally exactly
         like rehydration re-arms this host's own pendings.  Spawned from
         the housekeeping pass about once a minute; every failure degrades
         to "not this pass".
@@ -12845,7 +12962,7 @@ class Cron:
         # window a scheduled fire of this job could have launched, failed,
         # and armed a LIVE local ladder (its retry_state.task). Overwriting
         # retry_state[name] here would strand that task as a second,
-        # uncancelled same-node ladder -- and because both write host ==
+        # uncancelled same-node ladder, and because both write host ==
         # self._state_host, the foreign-record abort in the consume path
         # never fires, so the job double-fires on ONE node. That live
         # ladder outranks (exactly as the top guard at the method start
@@ -12965,7 +13082,7 @@ class Cron:
         except asyncio.TimeoutError:
             # We are abandoning this claim (the caller arms no ladder). The
             # write is shielded, so without this cancel it would still land
-            # LATER as an own-host pending -- which our own future scans
+            # LATER as an own-host pending, which our own future scans
             # skip (a host never claims its own pending) and rehydration
             # never re-arms, while a live original owner reading it aborts
             # its ladder: an unreclaimable orphan that silently drops the
@@ -12985,11 +13102,11 @@ class Cron:
 
         Mirrors :meth:`_validate_pending_retry`'s checks (shape, digest,
         budget, deadline) with the cross-node rules on top: only a FOREIGN
-        ``pending`` stale past :data:`RETRY_CLAIM_GRACE` (a crashed owner
-        -- a live one fires within moments of its deadline) or a
+        ``pending`` stale past :data:`RETRY_CLAIM_GRACE` (a crashed owner;
+        a live one fires within moments of its deadline) or a
         ``handoff`` (an owner that positively relinquished; no grace)
-        qualifies.  Every validation failure here just declines the claim
-        -- settling another host's record on local suspicion alone would
+        qualifies.  Every validation failure here just declines the claim:
+        settling another host's record on local suspicion alone would
         race its live owner; the durable superseded-by-run check (which
         has store-wide evidence) happens under the claim lease instead.
         """
@@ -13049,8 +13166,8 @@ class Cron:
         still-converging view, a backend read error, no manager), where this
         node may well still be the rightful owner and abandoning would end
         the sequence for good.
-        Decided from the seam's self-recognising ``is_available_*`` reads --
-        never a display-name comparison -- so a lease holder in its
+        Decided from the seam's self-recognising ``is_available_*`` reads
+        (never a display-name comparison), so a lease holder in its
         self-demotion window (still observing itself as holder while
         ``is_leader()`` already reports False) is not mistaken for a move.
         """
@@ -13068,7 +13185,7 @@ class Cron:
             if not mgr.view_settled():
                 # a freshly rebuilt gossip manager holds the never-skip
                 # available_* gates closed while peers re-attest its new
-                # instance_id -- even on the rightful owner, and even while
+                # instance_id, even on the rightful owner, and even while
                 # QUORATE (quorum needs only a majority attesting us; the
                 # hold waits for every current-build agreeing peer). A False
                 # from those gates is then the hold, not an observed move;
@@ -13096,7 +13213,7 @@ class Cron:
         while the retry sat pending (a manual API start, a concurrencyPolicy
         Allow overlap) captured this same JobRetryState, and its own later
         failure would otherwise re-arm a retry on a state no longer in
-        ``retry_state`` -- which ``cancel_job_retries`` could never find or
+        ``retry_state``, which ``cancel_job_retries`` could never find or
         cancel, so the orphan would relaunch the job even after a later
         successful run.
 
@@ -13104,7 +13221,7 @@ class Cron:
         election) the ladder is HANDED OFF instead of settled dead: a
         ``handoff`` record carrying the attempt, the job digest and a
         now-due deadline lands on the stream, and the new owner's claim
-        scan picks it up (no staleness grace -- the old owner has
+        scan picks it up (no staleness grace: the old owner has
         positively relinquished).  No ``cancelled`` run-history record is
         written on that path: the attempt is not ending, it is moving.
         """
@@ -13120,7 +13237,7 @@ class Cron:
             # peer that took ownership while we were demoted-but-blind may
             # have claimed and RUN this attempt; that run finished BEFORE now,
             # so a now-stamped anchor ("at") would make the completed run look
-            # older than the record and the new owner would re-run it -- a
+            # older than the record and the new owner would re-run it: a
             # double-fire across failover. notBefore stays now so the new owner
             # still runs a genuinely-unresolved ladder promptly.
             armed_at = state.armed_at if state is not None else None
@@ -13222,8 +13339,8 @@ class Cron:
         state.cancelled = True
         # Settle the durable ladder record (fire-and-forget) so a pending
         # retry is not re-armed on the next boot. Skipped when settle is
-        # None -- the graceful-shutdown path, where surviving the restart is
-        # the point -- and when no retry was ever scheduled this ladder
+        # None (the graceful-shutdown path, where surviving the restart is
+        # the point) and when no retry was ever scheduled this ladder
         # (count == 0: nothing durable was written, and settling here would
         # add one durable write to every successful run of a retry-armed
         # job).

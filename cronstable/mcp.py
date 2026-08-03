@@ -31,6 +31,7 @@ only (no resources/prompts yet), pinned to protocol revision
 import json as _stdlib_json
 import logging
 import re
+from contextvars import ContextVar
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -48,7 +49,7 @@ from aiohttp import web
 
 from cronstable import _json
 from cronstable import version as _version
-from cronstable.cron import ApiActionError
+from cronstable.cron import WEB_TOKEN_REQUEST_KEY, ApiActionError
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
     from cronstable.cron import Cron
@@ -81,6 +82,25 @@ ToolHandler = Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
 _MethodHandler = Callable[
     [Dict[str, Any]], Awaitable[Optional[Dict[str, Any]]]
 ]
+
+# Tools whose REST counterpart is gated behind a scope BEYOND the `control`
+# the auth middleware already demands for POST /mcp (cron._WEB_SCOPE_OVERRIDES
+# promotes the DAG decision route to `approve`). Without this table a
+# control-scoped token could take, via tools/call, exactly the action the
+# operator withheld from it over REST. Enforced in _m_tools_call against the
+# scopes of the presented token.
+_TOOL_SCOPE_OVERRIDES = {
+    "cron_decide_gate": "approve",
+}
+
+#: Scopes granted to the caller of the current request, set by handle_http
+#: from the token the web auth middleware matched; None when auth is off
+#: (where REST grants every action too) and in direct handle_message use
+#: (tests, which model the unauthenticated daemon). A ContextVar, not an
+#: attribute: one handler instance serves concurrent requests.
+_caller_scopes: "ContextVar[Optional[frozenset]]" = ContextVar(
+    "cronstable_mcp_caller_scopes", default=None
+)
 
 
 class MCPError(Exception):
@@ -321,6 +341,15 @@ class MCPHandler:
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
             raise MCPError(INVALID_PARAMS, "'arguments' must be an object")
+        required_scope = _TOOL_SCOPE_OVERRIDES.get(name)
+        if required_scope is not None:
+            granted = _caller_scopes.get()
+            if granted is not None and required_scope not in granted:
+                return _tool_error(
+                    "the presented web token lacks the {!r} scope this tool "
+                    "requires (the REST route for the same action is gated "
+                    "identically)".format(required_scope)
+                )
         handler = cast(ToolHandler, tool["handler"])
         try:
             return await handler(arguments)
@@ -403,6 +432,10 @@ class MCPHandler:
             and request.content_length > self._max_body
         ):
             return self._http_error(413, "request body too large", origin)
+        # File the caller's granted scopes where tools/call can consult them
+        # (per-request task context, so concurrent requests cannot bleed).
+        token = request.get(WEB_TOKEN_REQUEST_KEY)
+        _caller_scopes.set(token.scopes if token is not None else None)
         raw = await request.read()
         if len(raw) > self._max_body:
             return self._http_error(413, "request body too large", origin)
@@ -973,7 +1006,8 @@ class MCPHandler:
                 "cron_decide_gate",
                 "Decide approval gate",
                 "Approve or reject a DAG approval gate. "
-                "Requires confirm=true.",
+                "Requires confirm=true; with scoped web tokens, the "
+                "presented token must hold the approve scope.",
                 obj(
                     {
                         "dag": _STR,

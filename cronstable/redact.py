@@ -121,8 +121,18 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # form is anchored to the header name: "basic" is an ordinary English
     # word, and an unanchored pattern redacted innocent text like
     # "basic understanding" wholesale.
+    # Both charsets are RFC 7235 token68 (letters, digits, "-._~+/", then
+    # optional trailing "="), the grammar of the credentials slot in an
+    # Authorization header (RFC 6750 for Bearer).  The earlier Bearer charset
+    # stopped at [A-Za-z0-9._-]: a standard-base64 token with a "+" or "/" in
+    # its first 8 chars escaped whole (no matchable run), and one further in
+    # matched only up to it, persisting the tail of a live credential while
+    # the archive was stamped redacted (the partial redaction the key=value
+    # comment above rules out).  Termination is unchanged: whitespace, quotes
+    # and JSON delimiters sit outside the charset, so surrounding prose and
+    # structure still end the match exactly where they used to.
     (
-        re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._\-]{8,})"),
+        re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._~+/\-]{8,}=*)"),
         lambda m: m.group(1) + REDACTED,
     ),
     # The separator is "a colon (spaces optional on either side) OR at least
@@ -130,9 +140,14 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
     # (no space after the colon) is just as valid -- and as leaky -- as the
     # spaced form, while still requiring SOME separator so an unbroken
     # "authorizationbasic" in random text cannot match.
+    # Same token68 charset as Bearer above (base64url emitters put "-" and
+    # "_" in the payload, and the old [A-Za-z0-9+/=] leaked the tail past the
+    # first one); "=" stays inside the run here, not only trailing, so every
+    # sloppily-padded value the old charset caught is still caught.
     (
         re.compile(
-            r"(?i)(authorization(?:\s*:\s*|\s+)basic\s+)([A-Za-z0-9+/=]{8,})"
+            r"(?i)(authorization(?:\s*:\s*|\s+)basic\s+)"
+            r"([A-Za-z0-9._~+/=\-]{8,})"
         ),
         lambda m: m.group(1) + REDACTED,
     ),

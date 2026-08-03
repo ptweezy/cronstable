@@ -515,6 +515,91 @@ def test_bridge_empty_200_body_becomes_error_frame(monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# UTF-8 stdio discipline: MCP mandates UTF-8 JSON-RPC, but piped stdio on
+# Windows defaults to the ANSI codepage (cp1252), which cannot carry an emoji
+# or box-drawing char in a tool result.
+# ---------------------------------------------------------------------------
+
+
+def _cp1252_stdio(inbound: bytes):
+    """A (stdin, stdout, raw stdout) trio dressed in cp1252, like a Windows
+    pipe: text wrappers whose declared encoding is NOT UTF-8."""
+    stdin_raw = io.BytesIO(inbound)
+    stdout_raw = io.BytesIO()
+    fake_stdin = io.TextIOWrapper(stdin_raw, encoding="cp1252")
+    fake_stdout = io.TextIOWrapper(
+        stdout_raw, encoding="cp1252", write_through=True
+    )
+    return fake_stdin, fake_stdout, stdout_raw
+
+
+def test_bridge_stdio_helpers_round_trip_non_ascii(monkeypatch):
+    # the helpers must yield UTF-8 streams no matter what encoding the host
+    # dressed the stdio pair in; a frame with an accent, a check mark and an
+    # emoji must come back byte-identical, terminated by a bare newline.
+    frame = '{"jsonrpc": "2.0", "id": 1, "result": {"text": "état ✓ 🚀"}}'
+    fake_stdin, fake_stdout, stdout_raw = _cp1252_stdio(
+        (frame + "\n").encode("utf-8")
+    )
+    monkeypatch.setattr(sys, "stdin", fake_stdin)
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+    reader, writer = mcpcli._bridge_stdio()
+    try:
+        line = reader.readline().strip()
+        assert json.loads(line)["result"]["text"] == "état ✓ 🚀"
+        mcpcli._write_reply(writer, line.encode("utf-8"))
+    finally:
+        mcpcli._release_stream(reader, fake_stdin)
+        mcpcli._release_stream(writer, fake_stdout)
+    assert stdout_raw.getvalue() == (frame + "\n").encode("utf-8")
+
+
+def test_bridge_is_utf8_end_to_end_despite_cp1252_stdio(monkeypatch):
+    # the whole loop under cp1252 stdio: the inbound frame must reach _post
+    # byte-identical (not mojibake), and the daemon's raw UTF-8 reply must go
+    # out undamaged instead of raising UnicodeEncodeError mid-session.
+    request = (
+        '{"jsonrpc": "2.0", "id": 1, "method": "tools/call",'
+        ' "params": {"note": "café"}}'
+    )
+    reply = '{"jsonrpc": "2.0", "id": 1, "result": {"text": "box ┌─┐ 🎉"}}'
+    fake_stdin, fake_stdout, stdout_raw = _cp1252_stdio(
+        (request + "\n").encode("utf-8")
+    )
+    monkeypatch.setattr(sys, "stdin", fake_stdin)
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+    recorder = _PostRecorder([(200, reply.encode("utf-8"))])
+    monkeypatch.setattr(mcpcli, "_post", recorder)
+    code = mcpcli._run_bridge(_args())
+    assert code == 0
+    assert recorder.calls[0]["frame"] == request.encode("utf-8")
+    assert stdout_raw.getvalue() == (reply + "\n").encode("utf-8")
+
+
+def test_bridge_stdio_falls_back_to_bufferless_streams(monkeypatch):
+    # the seam the rest of this file uses: a StringIO stdin has no binary
+    # buffer to wrap, so the helpers must hand it back usable as-is rather
+    # than fail, keeping every capsys-based bridge test working.
+    fake_stdin = io.StringIO('{"id": 1}\n')
+    fake_stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", fake_stdin)
+    monkeypatch.setattr(sys, "stdout", fake_stdout)
+    reader, writer = mcpcli._bridge_stdio()
+    try:
+        assert reader is fake_stdin
+        assert writer is fake_stdout
+        assert reader.readline() == '{"id": 1}\n'
+        writer.write("ok\n")
+        assert fake_stdout.getvalue() == "ok\n"
+    finally:
+        # releasing a passed-through stream must not close or detach it
+        mcpcli._release_stream(reader, fake_stdin)
+        mcpcli._release_stream(writer, fake_stdout)
+    assert not fake_stdin.closed
+    assert not fake_stdout.closed
+
+
+# ---------------------------------------------------------------------------
 # --check: the initialize + tools/list handshake self-test
 # ---------------------------------------------------------------------------
 
