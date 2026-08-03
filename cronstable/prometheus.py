@@ -521,11 +521,29 @@ class PrometheusMetrics:
         # and capped at LABEL_BLOCK_CACHE_MAX so it cannot grow into
         # permanent RSS on a six-figure fleet.
         self._label_blocks: _LabelBlockCache = {}
+        # A persisted histogram baseline whose bucket bounds did not match at
+        # seed time, parked as (bounds, {job: histogram fields}) instead of
+        # dropped: the daemon seeds counters during state startup, BEFORE the
+        # web app applies a configured web.metrics.durationBuckets, so on a
+        # custom-bucket deployment every restart seeds against the defaults
+        # and mismatches. The next set_duration_buckets call resolves the
+        # slot: adopted when the bounds it applies equal the parked ones,
+        # dropped otherwise (the snapshot is then genuinely stale).
+        self._pending_histogram_seed: Optional[
+            Tuple[Tuple[float, ...], Dict[str, Dict[str, Any]]]
+        ] = None
 
     # -- configuration ----------------------------------------------------
 
     def set_duration_buckets(self, buckets: Sequence[float]) -> None:
         new = tuple(buckets)
+        # Any explicit bucket choice resolves a parked histogram baseline
+        # (see seed_counters): adopted below if its bounds are exactly what
+        # is being applied, dropped otherwise, INCLUDING the no-change path
+        # (bounds equal to the current ones can never equal the parked ones,
+        # or the baseline would not have been parked).
+        pending = self._pending_histogram_seed
+        self._pending_histogram_seed = None
         if new == self._buckets:
             return
         self._buckets = new
@@ -539,6 +557,20 @@ class PrometheusMetrics:
             job.bucket_counts = [0] * len(new)
             job.duration_sum = 0.0
             job.duration_count = 0
+        if pending is not None and pending[0] == new:
+            # The parked baseline was persisted under exactly these bounds:
+            # restore it now that the reset above has re-based every job on
+            # them. _seed_histogram ADDS, the same discipline seed_counters
+            # uses, and the accumulators here are freshly zeroed, so the
+            # addition IS the baseline; anything observed between seed and
+            # now was binned under the old bounds and fell to the reset, the
+            # same fate any bucket change deals live samples. Later runs
+            # then pile on top of the restored baseline. Jobs pruned since
+            # the seed are skipped, honouring the reload-prune contract.
+            for name, fields in pending[1].items():
+                parked = self._jobs.get(name)
+                if parked is not None:
+                    self._seed_histogram(parked, fields)
 
     def prune(self, job_names: Iterable[str]) -> None:
         """Drop accumulators for jobs no longer in the loaded config."""
@@ -672,19 +704,27 @@ class PrometheusMetrics:
         Histogram state is seeded only when the persisted bucket bounds
         equal the current ones, mirroring the bucket-change reset rule;
         the outcome counters are seeded regardless, mirroring
-        :meth:`set_duration_buckets` leaving counters untouched.  Corrupt
+        :meth:`set_duration_buckets` leaving counters untouched.  A bounds
+        MISMATCH parks the histogram fields (with their bounds) rather than
+        dropping them: the daemon calls this during state startup, before
+        the web app has applied a configured ``durationBuckets``, so on a
+        custom-bucket deployment the mismatch is an ordering artefact, not
+        staleness; :meth:`set_duration_buckets` adopts or drops the parked
+        baseline once the configured bounds actually arrive.  Corrupt
         or foreign-shaped fields are skipped one by one, never fatal.
         """
         jobs = snapshot.get("jobs")
         if not isinstance(jobs, dict):
             return 0
         raw_buckets = snapshot.get("buckets")
-        try:
-            buckets_match = isinstance(raw_buckets, list) and (
-                tuple(float(b) for b in raw_buckets) == self._buckets
-            )
-        except (TypeError, ValueError):
-            buckets_match = False
+        snapshot_buckets: Optional[Tuple[float, ...]] = None
+        if isinstance(raw_buckets, list):
+            try:
+                snapshot_buckets = tuple(float(b) for b in raw_buckets)
+            except (TypeError, ValueError):
+                snapshot_buckets = None
+        buckets_match = snapshot_buckets == self._buckets
+        pending_jobs: Dict[str, Dict[str, Any]] = {}
         keep_set = set(keep)
         seeded = 0
         for name, data in jobs.items():
@@ -732,6 +772,19 @@ class PrometheusMetrics:
                 job.max_rss_observed = max_rss
             if buckets_match:
                 self._seed_histogram(job, data)
+            elif snapshot_buckets is not None and isinstance(
+                data.get("bucket_counts"), list
+            ):
+                # Coercible bounds that merely differ from the (still
+                # default) live ones: park this job's histogram fields for
+                # set_duration_buckets to adopt or drop. Field validation is
+                # deferred to _seed_histogram at adoption, which checks them
+                # against the very bounds being applied.
+                pending_jobs[name] = {
+                    "duration_sum": data.get("duration_sum"),
+                    "duration_count": data.get("duration_count"),
+                    "bucket_counts": data.get("bucket_counts"),
+                }
             for attr in ("last_success_time", "last_failure_time"):
                 value = data.get(attr)
                 if isinstance(value, (int, float)) and not isinstance(
@@ -741,6 +794,10 @@ class PrometheusMetrics:
                     if current is None or float(value) > current:
                         setattr(job, attr, float(value))
             seeded += 1
+        if pending_jobs and snapshot_buckets is not None:
+            # (the second test is for the type checker: parking above
+            # already required coercible bounds)
+            self._pending_histogram_seed = (snapshot_buckets, pending_jobs)
         return seeded
 
     def _seed_histogram(self, job: _JobMetrics, data: Dict[str, Any]) -> None:

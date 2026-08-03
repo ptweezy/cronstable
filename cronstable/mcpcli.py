@@ -33,6 +33,7 @@ is sniffed from the ``initialize`` reply and stamped on every later request.
 """
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -228,19 +229,96 @@ def _post(
         ) from ex
 
 
-def _emit(obj: Any) -> None:
-    """Write one JSON frame to stdout (the only thing stdout ever carries)."""
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+def _utf8_stream(stream: Any) -> Any:
+    """``stream`` as UTF-8 text, wrapping its binary buffer when it has one.
+
+    MCP mandates UTF-8 JSON-RPC and the daemon replies in raw UTF-8, but a
+    piped stdio pair on Windows defaults to the ANSI codepage (cp1252): an
+    emoji or box-drawing char in a tool result then raises
+    UnicodeEncodeError on write and kills the bridge mid-session, and
+    inbound non-ASCII arrives mojibake.  Wrapping the underlying binary
+    buffer pins the bridge to UTF-8 on every platform.  ``newline=""``
+    keeps frames byte-exact in both directions: no CRLF translation on
+    write (a frame ends with a bare LF) and untranslated line endings on
+    read (the loop strips them anyway).
+
+    A stream without a binary buffer (a test's StringIO, a captured or
+    already-detached stream) is reconfigured in place when it supports
+    that, and otherwise handed back as-is, so the bridge still runs over
+    whatever the harness supplied.
+    """
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        try:
+            return io.TextIOWrapper(
+                buffer, encoding="utf-8", newline="", write_through=True
+            )
+        except (OSError, ValueError):
+            pass
+    try:
+        stream.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError, ValueError):
+        pass
+    return stream
 
 
-def _error_frame(msg_id: Any, code: int, message: str) -> None:
+def _bridge_stdio() -> Tuple[Any, Any]:
+    """The bridge's (stdin, stdout) as UTF-8 text streams.
+
+    Resolved once at bridge start and used only by the frame loop, so help
+    text and error messages elsewhere keep the console's own encoding.
+    """
+    return _utf8_stream(sys.stdin), _utf8_stream(sys.stdout)
+
+
+def _release_stream(wrapped: Any, original: Any) -> None:
+    """Detach a wrapper made by :func:`_utf8_stream`, leaving ``original``
+    usable.
+
+    A dropped TextIOWrapper CLOSES its buffer, and that buffer belongs to
+    the real stdin/stdout, which whatever runs after the bridge (the
+    interpreter's own shutdown, a test harness) still owns.  Flush what the
+    wrapper holds, then detach it so nothing is closed underneath the
+    original stream.  A stream that was passed through as-is (the
+    no-buffer fallback) has nothing to release.
+    """
+    if wrapped is original:
+        return
+    try:
+        wrapped.flush()
+    except (OSError, ValueError):
+        pass
+    try:
+        wrapped.detach()
+    except (OSError, ValueError):
+        pass
+
+
+def _emit(out: Any, obj: Any) -> None:
+    """Write one JSON frame to ``out`` (stdout carries only JSON-RPC)."""
+    out.write(json.dumps(obj) + "\n")
+    out.flush()
+
+
+def _write_reply(out: Any, body: bytes) -> None:
+    """Write a daemon reply body to ``out`` as one newline-terminated frame.
+
+    The daemon's body is raw UTF-8 JSON; decoding here and writing through
+    the UTF-8 stream from :func:`_utf8_stream` re-emits those bytes exactly,
+    with a single trailing LF as the frame delimiter.
+    """
+    out.write(body.decode("utf-8").rstrip("\n") + "\n")
+    out.flush()
+
+
+def _error_frame(out: Any, msg_id: Any, code: int, message: str) -> None:
     _emit(
+        out,
         {
             "jsonrpc": "2.0",
             "id": msg_id,
             "error": {"code": code, "message": message},
-        }
+        },
     )
 
 
@@ -257,49 +335,59 @@ def _run_bridge(args: argparse.Namespace) -> int:
         print(str(ex), file=sys.stderr)
         return 1
     protocol_version = args.protocol_version or DEFAULT_PROTOCOL_VERSION
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            _error_frame(None, _PARSE_ERROR, "parse error")
-            continue
-        is_request = isinstance(msg, dict) and "id" in msg
-        msg_id = msg.get("id") if isinstance(msg, dict) else None
-        method = msg.get("method") if isinstance(msg, dict) else None
-        try:
-            status, body = _post(
-                args.url,
-                line.encode("utf-8"),
-                token,
-                protocol_version,
-                args.timeout,
-                opener=opener,
-            )
-        except _BridgeError as ex:
-            if is_request:
-                _error_frame(msg_id, _TRANSPORT_ERROR, str(ex))
+    # UTF-8 stdio for the frame loop only (see _utf8_stream): resolved here,
+    # after the fatal-error path above, so a bridge that never starts its
+    # loop leaves the process streams untouched.
+    stdin, stdout = _bridge_stdio()
+    try:
+        for line in stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                _error_frame(stdout, None, _PARSE_ERROR, "parse error")
+                continue
+            is_request = isinstance(msg, dict) and "id" in msg
+            msg_id = msg.get("id") if isinstance(msg, dict) else None
+            method = msg.get("method") if isinstance(msg, dict) else None
+            try:
+                status, body = _post(
+                    args.url,
+                    line.encode("utf-8"),
+                    token,
+                    protocol_version,
+                    args.timeout,
+                    opener=opener,
+                )
+            except _BridgeError as ex:
+                if is_request:
+                    _error_frame(stdout, msg_id, _TRANSPORT_ERROR, str(ex))
+                else:
+                    print(str(ex), file=sys.stderr)
+                continue
+            # learn the negotiated protocol version from the initialize reply
+            # and stamp it on every subsequent request (how a "dumb" proxy
+            # discovers the value it must send).
+            if method == "initialize" and status == 200 and body:
+                sniffed = _sniff_protocol_version(body)
+                if sniffed is not None:
+                    protocol_version = sniffed
+            if not is_request:
+                continue  # a notification gets no reply frame
+            if status == 200 and body:
+                _write_reply(stdout, body)
             else:
-                print(str(ex), file=sys.stderr)
-            continue
-        # learn the negotiated protocol version from the initialize reply and
-        # stamp it on every subsequent request (how a "dumb" proxy discovers
-        # the value it must send).
-        if method == "initialize" and status == 200 and body:
-            sniffed = _sniff_protocol_version(body)
-            if sniffed is not None:
-                protocol_version = sniffed
-        if not is_request:
-            continue  # a notification gets no reply frame
-        if status == 200 and body:
-            sys.stdout.write(body.decode("utf-8").rstrip("\n") + "\n")
-            sys.stdout.flush()
-        else:
-            _error_frame(
-                msg_id, _TRANSPORT_ERROR, _http_error_message(status, body)
-            )
+                _error_frame(
+                    stdout,
+                    msg_id,
+                    _TRANSPORT_ERROR,
+                    _http_error_message(status, body),
+                )
+    finally:
+        _release_stream(stdin, sys.stdin)
+        _release_stream(stdout, sys.stdout)
     return 0
 
 

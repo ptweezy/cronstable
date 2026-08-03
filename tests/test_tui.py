@@ -530,6 +530,33 @@ def test_hostile_escapes_never_reach_a_frame():
     assert "\x1b[31m" in pad_to(styled, 30)
 
 
+def test_c1_controls_never_reach_a_frame():
+    """The 8-bit C1 range (\\u0080-\\u009f) aliases the ESC-introduced
+    sequences (\\u009b is CSI, \\u009d is OSC) and needs no ESC, so a
+    terminal that honours C1 in UTF-8 mode would clear the screen or
+    write the clipboard from bytes the ESC-anchored scrubbers never
+    see; both the log path and the name path must drop the range."""
+    theme = Theme("carolina", light=False)
+    c1 = {chr(cp) for cp in range(0x80, 0xA0)}
+    log = "wipe\u009b2Jout"  # C1 CSI 2J: erase display
+    name = "job\u009d52;c;AAAA\x07x"  # C1 OSC 52: clipboard write
+    for out in (
+        sanitize_log_line(log),
+        sanitize_log_line("nel\u0085glued"),  # NEL is C1 like the rest
+        rewrite_sgr(sanitize_log_line(log), theme),
+        scrub_non_sgr(name),
+        oneline(name),
+        pad_to(name, 32),
+        truncate(name, 32),
+    ):
+        assert not c1 & set(out), repr(out)
+    # the payload renders as inert text once the introducer is gone
+    assert sanitize_log_line(log) == "wipe2Jout"
+    # printable non-ASCII is not collateral: accents and box drawing
+    assert sanitize_log_line("café │ naïve") == "café │ naïve"
+    assert scrub_non_sgr("café │ naïve") == "café │ naïve"
+
+
 def test_spark_cells_scale_and_color():
     history = [
         {"outcome": "success", "duration": 1.0},
@@ -2757,6 +2784,23 @@ def test_render_heat_bucket_edges(tmp_path):
         ]
     }
     assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
+
+
+def test_render_heat_future_run_lands_in_newest_bucket(tmp_path):
+    # remote daemon clock skew can date a finish more than an hour into
+    # this host's future; that must shade the newest cell, not crash
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.heat_data = {
+        "j": [
+            {"outcome": "failure", "finished_at": _iso_ago(-2 * 3600)},
+            {"outcome": "success", "finished_at": _iso_ago(60)},
+        ]
+    }
+    body = _txt(app.render_heat(paint, 110, 30))
+    assert "activity heatmap" in body
+    # both runs share the newest bucket: one cell at volume 2
+    assert "▒" in body and "░" not in body
 
 
 def test_render_press_full_grid(tmp_path):

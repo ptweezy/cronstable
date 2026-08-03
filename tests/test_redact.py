@@ -145,6 +145,43 @@ def test_bearer_token_redacted():
     assert REDACTED in out
 
 
+def test_bearer_token68_charset_fully_redacted():
+    # RFC 6750 bearer tokens are token68: '+', '/' and trailing '=' are all
+    # legal.  The old [A-Za-z0-9._-] charset meant a '+' inside the first 8
+    # chars left no matchable run at all (the token escaped whole), and a
+    # later '+' ended the match early, leaking the tail of a live credential
+    # while the archive was stamped redacted.
+    out = redact_secrets(
+        "Authorization: Bearer abc+defghijklmnopqrstuvwxyz012345"
+    )
+    assert out == "Authorization: Bearer " + REDACTED
+    out = redact_secrets("Bearer abcdefgh+SECRETTAILSECRETTAIL")
+    assert "SECRETTAIL" not in out
+    assert out == "Bearer " + REDACTED
+
+
+def test_bearer_token_terminators_and_padding_preserved():
+    # the looser charset must not swallow trailing prose or structure:
+    # whitespace and quotes still end the token, and '=' padding rides along.
+    out = redact_secrets('{"authz": "Bearer dG9rZW4+with/slash==", "x": 1}')
+    assert "dG9rZW4" not in out
+    assert '"x": 1' in out
+    out = redact_secrets("Bearer abc12345== then prose")
+    assert out == "Bearer " + REDACTED + " then prose"
+    # short prose after the word "bearer" still has no 8-char run to match.
+    plain = "the bearer of it left"
+    assert redact_secrets(plain) == plain
+
+
+def test_basic_credentials_token68_charset_fully_redacted():
+    # RFC 7235's credentials production is token68 for Basic too: a
+    # base64url-emitting client puts '-' and '_' in the payload, and the old
+    # [A-Za-z0-9+/=] charset redacted only up to the first one, leaking the
+    # tail.
+    out = redact_secrets("Authorization: Basic dXNlcjpw-XNzd29yZA__")
+    assert out == "Authorization: Basic " + REDACTED
+
+
 def test_cloud_and_service_tokens_redacted():
     assert redact_secrets("AKIAIOSFODNN7EXAMPLE") == REDACTED
     assert REDACTED in redact_secrets("xoxb-123456789012-abcdefghij")

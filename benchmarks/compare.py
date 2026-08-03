@@ -12,9 +12,9 @@ Outputs:
   --svg PATH         diverging bar chart of every compared metric
   --merged-out PATH  the merged current-side results as one JSON document
 
-Gating: a metric fails when it slows down by more than its declared gate
-percentage AND by more than its absolute floor AND by more than a couple of
-its measured noise bands (the round-to-round scatter of the two sides, so
+Gating: a metric fails when its slowdown exceeds all three limits at once:
+the declared gate percentage, the absolute floor, and a couple of its
+measured noise bands (the round-to-round scatter of the two sides, so
 measurement noise on a jittery metric never gates).  Failures exit 1 unless
 --warn-only (ordinary commits) or --accept (an acknowledged, intentional
 regression).
@@ -63,11 +63,11 @@ _DARK = {
 # Significance guard for the gate.  A metric's round-to-round scatter is
 # estimated as the coefficient of variation of its per-round estimator values;
 # the two sides' CoVs combine in quadrature into a noise band.  A regression
-# gates only when it ALSO exceeds _SIG_SIGMA noise bands -- so measurement
+# gates only when it also exceeds _SIG_SIGMA noise bands, so measurement
 # noise can never trip the gate, and the gate percentage can be tightened
 # without drowning in false positives.  When a side has fewer than two rounds
 # the noise cannot be estimated, and the guard falls back to not suppressing
-# (the gate behaves exactly as it did before this guard existed).
+# (the percentage and floor tests then apply on their own).
 _SIG_SIGMA = 2.0
 _MIN_ROUNDS_FOR_NOISE = 2
 
@@ -144,8 +144,8 @@ def _load_budgets(path):
     drift: a metric taking the maximum legal regression on each of several
     quick releases compounds with a green gate every time.  The checked-in
     budget file pins an absolute ceiling for a handful of headline metrics;
-    raising one is a deliberate, reviewed edit to that file, never a
-    side-effect of accepting a relative regression.
+    raising one takes a deliberate, reviewed edit to that file and cannot
+    happen as a side effect of accepting a relative regression.
     """
     with open(path, "r", encoding="utf-8") as f:
         doc = json.load(f)
@@ -176,14 +176,14 @@ def _budget_failures(budgets, current):
 
 
 def _load_expected_gated(path):
-    """Metric ids that must be compared (measured on BOTH sides) every run.
+    """Metric ids that must be compared (measured on both sides) every run.
 
     A gate whose baseline side skips is silently ungated forever: the
     comparator files it under first-release 'new' coverage, which is never
     warned about, so a gate that died because a private seam drifted is
     indistinguishable from a metric added this release.  This checked-in
     list makes the coverage claim falsifiable: a listed metric that was not
-    compared is an integrity failure, not a footnote.
+    compared counts as an integrity failure rather than a footnote.
     """
     names = []
     with open(path, "r", encoding="utf-8") as f:
@@ -209,10 +209,9 @@ def _merge(docs):
                 slot.setdefault("skip_reason", entry.get("reason"))
                 # Keep the skipped row's declared config. bench.py stamps
                 # gate_pct/gate_floor/info on a skipped result too, and that
-                # is the only thing downstream can use to tell coverage the
-                # gate LOST from an info-only metric that never gates;
-                # discarding it here made every skipped metric look ungateable
-                # by design.
+                # is the only thing downstream can use to tell lost gate
+                # coverage from an info-only metric that never gates; without
+                # it every skipped metric looks ungateable by design.
                 slot.setdefault("skipped_entry", entry)
                 continue
             if slot["entry"] is None:
@@ -257,13 +256,14 @@ def _rel_cov(entry):
     ``round_values``; needs at least two rounds to estimate scatter, else
     None.  Returned as a fraction of the metric's center.
 
-    From three rounds up the scatter is a ROBUST estimate: the median absolute
+    From three rounds up the scatter is a robust estimate: the median absolute
     deviation scaled to a standard-deviation equivalent (x1.4826).  A single
     throttled/GC-stalled round then cannot inflate the band and so cannot mask
-    a real regression behind it -- the failure mode a plain stdev has on a
-    handful of noisy samples.  (A degenerate MAD of 0, e.g. a tied median on
-    few points, falls back to stdev so the band is never falsely zero.)  Two
-    rounds carry too little shape for a robust estimator, so they keep stdev.
+    a real regression behind it, which is the failure mode a plain stdev
+    has on a handful of noisy samples.  (A degenerate MAD of 0, e.g. a tied
+    median on few points, falls back to stdev so the band is never falsely
+    zero.)  Two rounds carry too little shape for a robust estimator, so
+    they keep stdev.
     """
     rounds = entry.get("round_values") or []
     if len(rounds) < _MIN_ROUNDS_FOR_NOISE:
@@ -295,17 +295,16 @@ def _adjusted_values(name, base, cur, base_floor, cur_floor):
     ``cronstable --version`` and the import timings are dominated by Python's
     own process spawn + interpreter init, which cronstable cannot regress.
     Subtracting each side's ``startup.python_baseline`` isolates cronstable's
-    OWN contribution, so a regression in import cost is measured against the
+    own contribution, so a regression in import cost is measured against the
     ~9ms cronstable actually owns rather than being diluted by ~30ms of
     un-regressable interpreter overhead.  Returns the pair of adjusted values,
     or the raw pair when the floor is unknown or would leave a non-positive
     remainder (a subtraction artefact, not a real measurement).
 
-    The gate's sensitivity after this is ``gate_pct`` of the OWN share (25%
-    for the startup benches), floored by :func:`_adjusted_floor`.  It is not a
-    fixed millisecond figure: this docstring previously promised to catch
-    "+2ms", which no startup metric has ever delivered, since +2ms is under
-    25% of every measured own share.
+    The gate's sensitivity after this is ``gate_pct`` of the own share (25%
+    for the startup benches), floored by :func:`_adjusted_floor`.  That is a
+    relative figure, not a flat millisecond one: a +2ms move is under 25% of
+    every measured own share, so no startup metric can promise to catch it.
     """
     if not name.startswith("startup.") or name == "startup.python_baseline":
         return base["value"], cur["value"]
@@ -331,21 +330,21 @@ def _adjusted_floor(cur, adj_cur):
     """``gate_floor`` brought onto the scale :func:`_adjusted_values` left.
 
     ``gate_floor`` is an absolute "too small to bother failing a release over"
-    threshold, calibrated against a metric's RAW value.  When the startup
+    threshold, calibrated against a metric's raw value.  When the startup
     adjustment strips the interpreter floor, the quantity being gated shrinks
     (often to a small fraction of the raw total) while the constant does not,
-    so the unscaled floor silently re-imposed the very dilution the
+    so an unscaled floor silently re-imposes the very dilution the
     subtraction exists to remove: ``startup.import_cronexpr`` owns ~9.5ms of
     its ~41ms total against a 10ms default floor, so even a +100% regression
-    in cronstable's own import cost could not clear it and the metric was
-    effectively ungated.
+    in cronstable's own import cost could not clear it and the metric would
+    be effectively ungated.
 
     Deliberately a flat cap rather than the same ratio the values were reduced
-    by: a proportional floor still scales with the interpreter overhead, which
-    left the effective threshold drifting to roughly +47% instead of the
+    by: a proportional floor still scales with the interpreter overhead,
+    which lets the effective threshold drift to roughly +47% instead of the
     declared ``gate_pct``.  Capping makes ``gate_pct`` the binding constraint
-    wherever a percentage is meaningful, so the sensitivity this module
-    documents is the sensitivity it delivers.
+    wherever a percentage is meaningful, so metrics really do gate at the
+    percentage they declare.
 
     Returns ``gate_floor`` unchanged whenever no adjustment happened: every
     non-startup metric, plus any startup metric whose interpreter floor was
@@ -379,7 +378,7 @@ def _declared_gate_pct(baseline, current, name):
     """``gate_pct`` for ``name`` from whichever side declares one.
 
     A skipped entry still carries the benchmark's declared gate, so this
-    distinguishes a metric that WOULD gate from an ``info=True`` metric that
+    distinguishes a metric that would gate from an ``info=True`` metric that
     never gates by design (``gate_pct`` is None for those, see bench.py).
     """
     for side in (current, baseline):
@@ -392,7 +391,7 @@ def _declared_gate_pct(baseline, current, name):
 def _gate_coverage(baseline, current):
     """How much of the declared gate this run actually compared.
 
-    A gate can only fire on a metric measured on BOTH sides, and a metric can
+    A gate can only fire on a metric measured on both sides, and a metric can
     fall out three ways: skipped on both sides, skipped (or absent) now after
     the baseline measured it, or measured only now.  None of the three
     produces a row that can gate, and the first produces no row at all, so a
@@ -458,7 +457,7 @@ def _compare(baseline, current):
         delta = _delta_pct(adj_base, adj_cur)
         noise = _noise_band(base, cur)
         # Unknown noise (too few rounds) never suppresses: the guard is only
-        # allowed to make the gate MORE conservative, never to hide a
+        # allowed to make the gate more conservative, never to hide a
         # regression when it lacks the data to prove it is noise.
         significant = noise is None or (
             delta is not None and abs(delta) / 100.0 > _SIG_SIGMA * noise
@@ -466,17 +465,18 @@ def _compare(baseline, current):
         gated = False
         gate_pct = cur.get("gate_pct")
         # The floor is brought onto the same scale as the values: comparing
-        # an adjusted delta against the raw-scale constant is what made the
+        # an adjusted delta against the raw-scale constant leaves the
         # small-own-share startup metrics ungateable.
         floor_used = _adjusted_floor(cur, adj_cur)
-        # The gate a metric actually delivers, not the one it declares: the
-        # percentage and absolute tests are ANDed, so on a metric whose value
-        # sits near (or under) its floor the floor binds and the real
-        # sensitivity is 100*floor/value, however tight gate_pct reads.  The
-        # floor itself is deliberate harness policy (jitter on a tiny metric
-        # must never gate); what was missing is anything REPORTING when it
-        # binds, which is how a third of the suite ran undersized against the
-        # harness's own 50ms+ sizing rule with nobody able to see it.
+        # The gate a metric actually delivers rather than the one it
+        # declares: the percentage and absolute tests are ANDed, so on a
+        # metric whose value sits near (or under) its floor the floor binds
+        # and the real sensitivity is 100*floor/value, however tight
+        # gate_pct reads.  The floor itself is deliberate harness policy
+        # (jitter on a tiny metric must never gate), but until this figure
+        # was reported nothing showed when the floor binds, and a third of
+        # the suite ran undersized against the harness's own 50ms+ sizing
+        # rule without anyone seeing it.
         effective_pct = gate_pct
         if gate_pct is not None and adj_base > 0:
             effective_pct = max(gate_pct, 100.0 * floor_used / adj_base)
@@ -618,7 +618,7 @@ def build_svg(rows, base_label, cur_label):
         ".zero{stroke:%(baseline)s;stroke-width:1}"
         ".stripe{fill:%(stripe)s}"
         ".fast{fill:%(faster)s}.slow{fill:%(slower)s}"
-        # a label drawn INSIDE a clamped bar: near-black reads on both the
+        # a label drawn inside a clamped bar: near-black reads on both the
         # blue and the red fill, in either theme (>=4.5:1), where white would
         # fail on the red; so it needs no per-theme override.
         ".inlabel{fill:#000000}" % _LIGHT
@@ -667,7 +667,7 @@ def build_svg(rows, base_label, cur_label):
             % (top + i * row_h, width - 24, row_h)
         )
 
-    # The tick labels sit at BOTH ends of the plot: with every metric shown
+    # The tick labels sit at both ends of the plot: with every metric shown
     # the bottom axis can be a full screen below the title.
     for tick in (-limit, -limit / 2.0, limit / 2.0, limit):
         x = center + tick * scale
@@ -711,10 +711,10 @@ def build_svg(rows, base_label, cur_label):
                 '<path class="%s" d="%s"/>'
                 % (cls, _bar_path(center, y_bar, length, bar_h, rightward))
             )
-        # Place the percentage just past the bar's data-end -- UNLESS a large
+        # Place the percentage just past the bar's data-end, unless a large
         # (clamped) bar would push it off the plot: past the right edge, or
         # left into the metric-name gutter (the bug where a -94% label landed
-        # on top of the name). Then draw it INSIDE the bar's end instead, so
+        # on top of the name). Then draw it inside the bar's end instead, so
         # the number stays readable rather than colliding or clipping.
         pad = 6.0
         # rough font-size-10 advance; err high so a borderline label goes
@@ -828,7 +828,7 @@ def build_md(
             lines.append(
                 "**Gate integrity: FAILED.** Metrics listed in "
                 "`benchmarks/expected_gated.txt` that this run did not "
-                "compare (a dead gate, not a pass): %s."
+                "compare (a dead gate rather than a pass): %s."
                 % ", ".join(expected_missing)
             )
         lines.append("")
@@ -839,10 +839,10 @@ def build_md(
         )
         lines.append("")
         lines.append(
-            "A regression gates only when it exceeds its declared limit AND "
-            "%.0f noise bands -- the +- column, the two sides' round-to-round "
-            "scatter combined in quadrature -- so measurement noise alone "
-            "cannot fail the gate." % _SIG_SIGMA
+            "A regression gates only when it exceeds both its declared limit "
+            "and %.0f noise bands (the +- column: the two sides' "
+            "round-to-round scatter combined in quadrature), so measurement "
+            "noise alone cannot fail the gate." % _SIG_SIGMA
         )
         lines.append("")
         suppressed = [r for r in rows if r.get("suppressed")]
@@ -883,7 +883,7 @@ def build_md(
             noise_cell = "%.1f%%" % noise if noise is not None else "n/a"
             declared = entry.get("gate_pct")
             effective = row.get("effective_pct")
-            # The gate the metric DELIVERS: gate_pct where the percentage
+            # The gate the metric delivers: gate_pct where the percentage
             # binds, 100*floor/value where the absolute floor does.  A
             # floor-bound cell names both numbers so an undersized workload
             # is visible in the release table rather than only in the
@@ -980,13 +980,14 @@ def main(argv=None):
         "--budgets",
         help="benchmarks/budgets.json: absolute ceilings for headline "
         "metrics; a breach fails even when the relative gate passes, and "
-        "[perf:accept] does not excuse it (the ritual is editing the file)",
+        "[perf:accept] does not excuse it (the only override is a reviewed "
+        "edit to the file)",
     )
     parser.add_argument(
         "--expected-gated",
         help="benchmarks/expected_gated.txt: metric ids that must be "
         "compared on both sides; a listed metric that was not compared is "
-        "an integrity failure, not [perf:accept]-able",
+        "an integrity failure that [perf:accept] cannot excuse",
     )
     args = parser.parse_args(argv)
 
@@ -1007,8 +1008,8 @@ def main(argv=None):
             "cronstable_version", "baseline"
         )
 
-    # An incomparable pair is a broken measurement, not a pass or a fail:
-    # refuse to render a verdict from it at all (exit 2, even under
+    # An incomparable pair is a broken measurement rather than a pass or a
+    # fail: refuse to render a verdict from it at all (exit 2, even under
     # --warn-only).  A best-effort install that lands on one side only would
     # otherwise report a backend swap as a large code regression, or mask a
     # real one.
@@ -1069,13 +1070,13 @@ def main(argv=None):
         % (comparable, cur_label, base_label or "no baseline", len(violations))
     )
     # Run-level sizing feedback, printed with the run summary (before any
-    # verdict lines): which metrics' declared gate_pct is fiction because
-    # the absolute floor binds instead.
+    # verdict lines): which metrics' declared gate_pct overstates the real
+    # sensitivity because the absolute floor binds instead.
     floor_bound = _floor_bound(rows)
     if floor_bound:
         print(
             "::notice::perf sizing: %d metric(s) are floor-bound (the "
-            "absolute floor, not gate_pct, is the real sensitivity -- the "
+            "absolute floor sets the real sensitivity, not gate_pct; the "
             "workload is undersized against the harness's 50ms+ rule): %s"
             % (
                 len(floor_bound),
@@ -1106,7 +1107,7 @@ def main(argv=None):
         else:
             print("::error::perf gate: %s" % violation)
     # A regression that cleared its raw limit but sat inside the noise band
-    # is deliberately not gated -- but it must reach the job log, not only
+    # is deliberately not gated, but it must reach the job log and not only
     # the rendered report: a +18% move printing as "0 gate violation(s)"
     # with no other output reads as a clean pass.
     for row in rows:
@@ -1145,8 +1146,8 @@ def main(argv=None):
             )
 
     # --accept excuses relative regressions only.  A budget breach or a dead
-    # gate is not a perf trade-off a commit subject can acknowledge; each has
-    # its own ritual (a reviewed edit to budgets.json / expected_gated.txt).
+    # gate is not a perf trade-off a commit subject can acknowledge; each
+    # takes its own reviewed edit (budgets.json / expected_gated.txt).
     failed = bool(violations and not args.accept)
     failed = failed or bool(budget_breaches) or bool(expected_missing)
     if failed and not args.warn_only:

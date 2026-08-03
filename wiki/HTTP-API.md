@@ -1484,7 +1484,10 @@ imply `control`. The required scope for a route is the safe-method default
 (`GET`/`HEAD`/`OPTIONS` → `view`, everything else → `control`) with two
 promotions: the approval decision needs `approve`, and `/mcp` needs `control`.
 A newly added `POST` route therefore requires `control` automatically rather
-than slipping through unguarded.
+than slipping through unguarded. The promotion follows the action across
+transports: the MCP `cron_decide_gate` tool also requires the presented
+token to hold `approve`, so a `[control]` token cannot take the decision
+through `/mcp` that this table denies it over REST.
 
 The two failure modes are distinct:
 
