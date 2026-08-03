@@ -3,11 +3,12 @@ Amazon S3 Files.
 
 cronstable is stateless by default: run history, retry counters, the
 next-fire index and the leadership view all live in memory and reset on
-restart, and that zero-disk story is a feature.  This module adds the *opt-in* other half: when a
-``state`` config section is present, a :class:`StateBackend` gives cronstable a
-durable, restart-surviving place to keep records and a lock it can coordinate
-on.  Absent the section the backend is never constructed and the in-memory path
-is byte-identical to before.
+restart, and that zero-disk story is a feature.  This module adds the
+*opt-in* other half: when a ``state`` config section is present, a
+:class:`StateBackend` gives cronstable a durable, restart-surviving place
+to keep records and a lock it can coordinate on.  Absent the section the
+backend is never constructed and the in-memory path is byte-identical to
+before.
 
 The design rests on one observation: a local filesystem and an Amazon S3
 Files mount are the *same kind of backend*, a POSIX filesystem with atomic
