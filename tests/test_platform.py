@@ -51,6 +51,96 @@ def test_new_process_group_kwargs_matches_platform():
         assert kwargs == {"start_new_session": True}
 
 
+@pytest.mark.asyncio
+async def test_kill_process_group_windows_tree_kills_on_the_graceful_call(
+    monkeypatch,
+):
+    # regression: the non-forced Windows call used to report False without
+    # signalling anything, leaving the caller (RunningJob.cancel) to
+    # TerminateProcess the direct child. The LATER forced taskkill /T
+    # then ran against a dead root, whose descendants were no longer in any
+    # walkable tree. String-form commands run via cmd.exe /c, so the actual
+    # workload is always such a descendant and survived every cancel. The
+    # tree kill must therefore happen on the non-forced call itself, while
+    # the root is still alive to anchor the walk.
+    calls = []
+
+    async def fake_taskkill(pid):
+        calls.append(pid)
+        return True
+
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform, "_taskkill_tree", fake_taskkill)
+    assert await platform.kill_process_group(4242, force=False) is True
+    assert await platform.kill_process_group(4242, force=True) is True
+    assert calls == [4242, 4242]
+
+
+async def _windows_children_of(pid):
+    # Win32_Process, not wmic (removed on current Windows 11).
+    proc = await asyncio.create_subprocess_exec(
+        "powershell",
+        "-NoProfile",
+        "-Command",
+        "(Get-CimInstance Win32_Process -Filter 'ParentProcessId={}')"
+        ".ProcessId".format(pid),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return [int(line) for line in out.split() if line.strip().isdigit()]
+
+
+async def _windows_pid_alive(pid):
+    proc = await asyncio.create_subprocess_exec(
+        "tasklist",
+        "/FI",
+        "PID eq {}".format(pid),
+        "/NH",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return str(pid).encode() in out
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="taskkill tree kill is Windows-only"
+)
+@pytest.mark.asyncio
+async def test_kill_process_group_windows_reaches_the_grandchild():
+    # end to end on a real tree, the same shape as a string-form `command:`
+    # job (cmd.exe /c means the workload is a grandchild of nothing we hold
+    # a handle to). The non-forced call must take the whole tree down.
+    proc = await asyncio.create_subprocess_shell(
+        "ping -n 60 127.0.0.1 >NUL",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        grandchildren = []
+        for _ in range(50):  # ping needs a moment to spawn
+            grandchildren = await _windows_children_of(proc.pid)
+            if grandchildren:
+                break
+            await asyncio.sleep(0.1)
+        assert grandchildren, "the shell never spawned its ping child"
+
+        assert await platform.kill_process_group(proc.pid, force=False)
+        await asyncio.wait_for(proc.wait(), 10)
+        for pid in grandchildren:
+            for _ in range(50):  # taskkill delivery is asynchronous
+                if not await _windows_pid_alive(pid):
+                    break
+                await asyncio.sleep(0.1)
+            assert not await _windows_pid_alive(pid), (
+                "descendant %d survived the tree kill" % pid
+            )
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+
+
 @pytest.mark.skipif(
     platform.IS_WINDOWS, reason="killpg / process groups are POSIX-only"
 )

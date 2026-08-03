@@ -314,6 +314,50 @@ async def test_concurrency_policy(policy):
                 await rj.cancel()
 
 
+@pytest.mark.asyncio
+async def test_concurrent_launches_cannot_double_start_a_forbid_job(
+    monkeypatch,
+):
+    # regression: the Forbid/Replace gate reads running_jobs several awaits
+    # BEFORE the launch appends to it (the cluster slot claim, the
+    # subprocess spawn inside start()), so two concurrent entries (a
+    # dashboard double-click, a manual start racing the scheduled fire)
+    # both saw the gate open and double-launched a Forbid job. The per-job
+    # launch lock serialises them: exactly one instance starts, the loser
+    # takes the ordinary Forbid drop.
+    cron = cronstable.cron.Cron(
+        None, config_yaml=CONCURRENT_JOB.format(policy="Forbid")
+    )
+    job = cron.cron_jobs["test"]
+
+    # widen the gate-to-append window deterministically: the first launch
+    # parks inside start() (a slow spawn) until released.
+    release = asyncio.Event()
+    real_start = RunningJob.start
+
+    async def slow_start(self):
+        await release.wait()
+        await real_start(self)
+
+    monkeypatch.setattr(RunningJob, "start", slow_start)
+    try:
+        first = asyncio.ensure_future(cron.maybe_launch_job(job))
+        second = asyncio.ensure_future(cron.maybe_launch_job(job))
+        # let both tasks run up to their park/lock-wait before releasing,
+        # so the second entry genuinely overlaps the first's spawn window.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(first, second)
+
+        assert sorted(results) == [False, True]
+        assert len(cron.running_jobs["test"]) == 1
+    finally:
+        for rj in list(cron.running_jobs.get("test", [])):
+            if rj.proc is not None and rj.proc.returncode is None:
+                await rj.cancel()
+
+
 FAILED_SPAWN_REPLACE_JOB = (
     "jobs:\n  - name: test\n"
     + yaml_command(["cronstable-no-such-binary-xyz"])
