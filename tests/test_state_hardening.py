@@ -30,7 +30,14 @@ regresses, the matching test fails.  Covered invariants:
   dedupe re-put re-arms that guard -- the KEEP biases the blob sweep
   builds on;
 * the document delete path rides out Windows sharing violations like the
-  replace-write path does.
+  replace-write path does;
+* stream/document-namespace enumeration decodes a lone-surrogate name
+  exactly (the surrogatepass inverse of ``_fs_safe``), and a token that
+  cannot round-trip is reported through ``complete``, never returned
+  garbled;
+* record filenames stay monotonic per stream across a backward wall-clock
+  step, so the amortised prune never deletes the just-written record and
+  the derive_max watermark never hides it.
 
 No tight wall-clock timing anywhere: lease expiry is driven by
 monkeypatching ``cronstable.state._now`` (the one time source), so nothing here
@@ -911,3 +918,159 @@ async def test_document_delete_retries_sharing_violation(
     assert calls["n"] == 2  # the transient hold really was retried away
     assert not os.path.exists(doc_path)
     assert await backend.read_document("ns", "k") is None
+
+
+# --- 15: lone-surrogate names round-trip through enumeration -----------------
+
+
+async def test_stream_audit_roundtrips_lone_surrogate_names(tmp_path):
+    # Job names come from os.fsdecode'd crontab filenames, so a stream name
+    # can carry a lone surrogate; _fs_safe encodes it via surrogatepass.
+    # Decoding the token back with errors="replace" returned a DIFFERENT
+    # name (U+FFFD in place of the surrogate) while still reporting the
+    # listing complete: the orphan-blob sweep re-encoded the garbled name,
+    # read a stream that does not exist (silently empty), dropped the real
+    # stream's digests from its referenced set, and deleted still-referenced
+    # payload blobs.
+    backend = _backend(tmp_path)
+    await backend.start()
+    surrogate = "artifacts/caf\udce9"
+    plain = "artifacts/plain"
+    for stream in (surrogate, plain):
+        await backend.append_record(stream, {"sha256": "a" * 64})
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is True
+    assert set(names) == {surrogate, plain}
+    # _fs_safe over every returned name reproduces exactly the on-disk
+    # tokens, so keep-sets built from these names protect the real dirs.
+    records_root = os.path.join(backend.base, "records")
+    prefix_token = state._fs_safe_fragment("artifacts/")
+    on_disk = {
+        t for t in os.listdir(records_root) if t.startswith(prefix_token)
+    }
+    assert {state._fs_safe(n) for n in names} == on_disk
+    # each returned name feeds straight back into a record read, the exact
+    # call the sweep's referenced-digest builder makes.
+    for name in names:
+        assert await backend.list_records(name) == [{"sha256": "a" * 64}]
+
+
+async def test_stream_audit_never_returns_foreign_tokens_garbled(tmp_path):
+    # A records-root entry _fs_safe cannot have produced (undecodable bytes,
+    # or an alias that decodes but re-encodes to a DIFFERENT token) must be
+    # reported through ``complete``, never returned as a mangled name a
+    # destructive caller could act on.
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.append_record("artifacts/plain", {"n": 1})
+    records_root = os.path.join(backend.base, "records")
+    os.mkdir(os.path.join(records_root, "artifacts%2Fbad%FF"))
+    os.mkdir(os.path.join(records_root, "artifacts%2fx"))
+    names, complete = await backend.list_stream_names_audit("")
+    assert complete is False
+    assert "artifacts/plain" in names
+    assert "artifacts/bad\ufffd" not in names
+    assert "artifacts/x" not in names  # the %2f alias must not decode
+    # every returned name still round-trips to a real on-disk token.
+    for name in names:
+        assert os.path.isdir(
+            os.path.join(records_root, state._fs_safe(name))
+        )
+
+
+async def test_document_namespaces_roundtrip_lone_surrogate_names(tmp_path):
+    # The docs-side twin: a dag-run namespace named after an os.fsdecode'd
+    # dag name can carry a lone surrogate.  A replace-decoded (garbled)
+    # namespace reads as a REMOVED dag to the GC, whose runs' XCom scopes
+    # then lose their keep-set protection.
+    backend = _backend(tmp_path)
+    await backend.start()
+
+    def put(body):
+        return lambda _cur: (body, None)
+
+    surrogate_ns = "dagrun/caf\udce9"
+    await backend.mutate_document(surrogate_ns, "r1", put({"runId": "1"}))
+    await backend.mutate_document("dagrun/plain", "r1", put({"runId": "2"}))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert complete is True
+    assert set(names) == {surrogate_ns, "dagrun/plain"}
+    # the returned namespace addresses the real documents.
+    assert await backend.list_documents(surrogate_ns) == [{"runId": "1"}]
+    # a foreign token that cannot round-trip is reported, never garbled.
+    docs_root = os.path.join(backend.base, "docs")
+    os.mkdir(os.path.join(docs_root, "dagrun%2Fbad%FF"))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert complete is False
+    assert "dagrun/bad\ufffd" not in names
+
+
+# --- 16: record names stay monotonic across a backward clock step ------------
+
+
+async def test_backward_clock_step_never_prunes_the_fresh_record(
+    tmp_path, monkeypatch
+):
+    # Record filenames embed the wall clock, and both the amortised prune
+    # (keep the lexicographic tail) and the derive_max memo (scan only names
+    # above the watermark) assume they only ever grow.  A backward step (NTP
+    # correcting a fast host clock) minted names BELOW retained history: at
+    # the prune cap, the very next amortised prune deleted the just-written,
+    # acknowledged record while keeping stale future-dated ones, and
+    # derive_max kept answering from the pre-step fold.
+    backend = _backend(tmp_path)
+    await backend.start()
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    keep = 3
+    total = state._PRUNE_EVERY_APPENDS
+    ids = []
+    for i in range(total):
+        clock["t"] += 1.0
+        ids.append(
+            await backend.append_record(
+                "runs/j", {"seq": i}, prune_keep=keep
+            )
+        )
+    # arm the derive_max memo: its watermark is the newest pre-step name.
+    assert await backend.derive_max("runs/j", "seq") == total - 1
+    clock["t"] = 1000.0  # the wall clock steps backwards
+    # append number _PRUNE_EVERY_APPENDS + 1 carries the due prune itself.
+    ids.append(
+        await backend.append_record("runs/j", {"seq": total}, prune_keep=keep)
+    )
+    recs = await backend.list_records("runs/j")
+    assert {"seq": total} in recs  # survived the prune it carried
+    assert len(recs) == keep  # and the prune still bounded the stream
+    assert recs[-1] == {"seq": total}  # newest by name, like by ack order
+    assert await backend.derive_max("runs/j", "seq") == total
+    # ids stay strictly increasing and parseable by the epoch reader.
+    assert ids == sorted(ids)
+    assert len(set(ids)) == len(ids)
+    assert state._record_epoch(ids[-1]) != float("inf")
+
+
+async def test_backward_clock_step_survives_a_process_restart(
+    tmp_path, monkeypatch
+):
+    # The name floor is in-process state, so a restart must re-learn it from
+    # the stream directory itself: the first append of a fresh backend
+    # (which always carries an immediately-due prune) must land above the
+    # retained future-dated history, not below it.
+    backend = _backend(tmp_path)
+    await backend.start()
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    keep = 3
+    for i in range(keep):
+        clock["t"] += 1.0
+        await backend.append_record("runs/j", {"seq": i}, prune_keep=keep)
+    clock["t"] = 1000.0  # steps back, and then the daemon restarts
+    backend2 = _backend(tmp_path)
+    await backend2.start()
+    await backend2.append_record("runs/j", {"seq": keep}, prune_keep=keep)
+    recs = await backend2.list_records("runs/j")
+    assert {"seq": keep} in recs
+    assert recs[-1] == {"seq": keep}
+    assert len(recs) == keep
+    assert await backend2.derive_max("runs/j", "seq") == keep

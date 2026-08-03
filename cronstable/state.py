@@ -1,20 +1,19 @@
 """Optional durable state backend: one filesystem seam for local disk and
 Amazon S3 Files.
 
-cronstable is stateless by default -- run history, retry counters, the
-next-fire
-index and the leadership view all live in memory and reset on restart, and that
-zero-disk story is a feature.  This module adds the *opt-in* other half: when a
+cronstable is stateless by default: run history, retry counters, the
+next-fire index and the leadership view all live in memory and reset on
+restart, and that zero-disk story is a feature.  This module adds the *opt-in* other half: when a
 ``state`` config section is present, a :class:`StateBackend` gives cronstable a
 durable, restart-surviving place to keep records and a lock it can coordinate
 on.  Absent the section the backend is never constructed and the in-memory path
 is byte-identical to before.
 
-The one design decision that makes this elegant is that a **local filesystem**
-and an **Amazon S3 Files** mount are the *same kind of backend*: a POSIX
-filesystem with atomic file rename and advisory ``flock``.  So there is one
-implementation, :class:`FilesystemStateBackend`, and the *mount*, not the code
--- decides its reach:
+The design rests on one observation: a local filesystem and an Amazon S3
+Files mount are the *same kind of backend*, a POSIX filesystem with atomic
+file rename and advisory ``flock``.  So there is one implementation,
+:class:`FilesystemStateBackend`, and the *mount*, not the code, decides its
+reach:
 
 * point ``state.path`` at a local directory and you get single-node restart
   durability;
@@ -26,12 +25,12 @@ implementation, :class:`FilesystemStateBackend`, and the *mount*, not the code
 Two invariants keep that correct on every backing store, including an S3 Files
 mount whose object side has no native rename:
 
-* **one immutable object per record.**  Records are never rewritten in place;
+* one immutable object per record.  Records are never rewritten in place;
   each is written once to a unique filename (via a temp file + atomic rename)
   and thereafter only read or deleted.  The "last fired" cursor is therefore
   *derived* (the max over the immutable records), never a mutable file, so
   nothing depends on rewriting an existing object.
-* **every record is schema-versioned.**  A record this build cannot understand
+* every record is schema-versioned.  A record this build cannot understand
   (an unknown ``schemaVersion``, truncated JSON from a crash mid-write on a
   store without atomic rename) is quarantined on read, never guessed at, so one
   poison object can never brick startup.
@@ -115,7 +114,7 @@ TMP_MAX_AGE = 86400.0
 # QUARANTINE_DIR; TMP_DIR holds the write-temp files atomically renamed into
 # place.  DOCS_DIR holds the mutable job-facing documents (KV / cursor /
 # idempotency), one file per key rewritten via atomic rename under an advisory
-# flock -- the same lease-file discipline generalised to arbitrary values, so
+# flock, the same lease-file discipline generalised to arbitrary values, so
 # it is equally safe on an S3 Files mount (file rename is atomic there even
 # though object rename is not).  BLOBS_DIR holds the content-addressed artifact
 # payloads, each an immutable file named by its SHA-256.  Directories are only
@@ -132,8 +131,8 @@ BLOBS_DIR = "blobs"
 # BULK bounds the high-volume record/document ops so a wedged mount plus a busy
 # scheduler cannot pile up an unbounded number of stuck daemon threads.  LEASE
 # is a SEPARATE, dedicated lane for the coordination ops (lease acquire /
-# renew / release / read): a burst of bulk record writes -- or bulk threads
-# wedged on a hung mount -- must never hold every slot and starve a lease renew
+# renew / release / read): a burst of bulk record writes, or bulk threads
+# wedged on a hung mount, must never hold every slot and starve a lease renew
 # below its TTL, which would expire a live holder's lease and hand its fenced
 # work to a standby (split-brain / double-fire).  Leases are few and each op is
 # tiny, so a small isolated lane both prevents the starvation and still bounds
@@ -228,12 +227,12 @@ _FS_SAFE_MAX = 130
 # Marker joining a length-truncated token's kept head to its digest (see
 # _fs_safe).  The natural encoding ("%" + two uppercase hex digits) can never
 # emit it, so its presence in an on-disk token positively identifies a
-# truncated token -- one whose logical name is NOT recoverable from the
+# truncated token, one whose logical name is NOT recoverable from the
 # token alone.
 _FS_TRUNCATION_MARKER = "%."
 
 # Filename of the sidecar written inside a length-truncated stream's
-# directory, holding the exact logical stream name (raw UTF-8) -- the only
+# directory, holding the exact logical stream name (raw UTF-8), the only
 # way such a stream's name can round-trip back out of list_stream_names
 # (a garbled name re-encodes to a DIFFERENT token, making the stream
 # invisible to the GC keep-set builders and its state collectable as
@@ -247,7 +246,8 @@ def _now() -> float:
 
     Lease expiry and filename ordering are judged against this.  Across a
     *shared* mount the comparison spans hosts, so the HA use of leases assumes
-    bounded clock skew (NTP) -- documented, and irrelevant to single-node use.
+    bounded clock skew (NTP); that is documented, and irrelevant to
+    single-node use.
     """
     return time.time()
 
@@ -264,18 +264,18 @@ def _fs_safe(name: str) -> str:
     path component everywhere:
 
     * a token that IS a reserved Windows device name (``con``, ``nul``, ...)
-      gets its first character force-encoded -- unambiguous, since the natural
-      encoding never escapes a safe character;
+      gets its first character force-encoded, which is unambiguous since the
+      natural encoding never escapes a safe character;
     * a token longer than :data:`_FS_SAFE_MAX` (ENAMETOOLONG territory) is
       truncated and re-uniqued with a SHA-256 digest of the original name,
-      joined by ``%.`` -- a marker the natural encoding (``%`` + 2 uppercase
+      joined by ``%.``, a marker the natural encoding (``%`` + 2 uppercase
       hex) can never emit;
     * an empty name maps to ``_``.
 
     The encode uses ``surrogatepass`` so the function is TOTAL, as documented:
     argv, filenames and ``os.fsdecode`` output are decoded with
     ``surrogateescape``, so a name sourced from any of them can carry a lone
-    surrogate that a strict encode rejects with a UnicodeEncodeError -- which
+    surrogate that a strict encode rejects with a UnicodeEncodeError, which
     surfaced as an HTTP 500 out of every jobstate primitive rather than a
     4xx.  ``surrogatepass`` maps each such code point to its own distinct
     three-byte sequence, so injectivity is preserved.
@@ -305,8 +305,8 @@ def _fs_safe_fragment(fragment: str) -> str:
     adjustments.  Valid for *prefix* matching because those adjustments only
     ever rewrite a token's FIRST character (reserved device names, which are
     whole-token matches a multi-part prefix can never be) or its over-length
-    TAIL (the digest truncation keeps the head intact) -- a managed prefix
-    like ``runs/`` therefore always survives verbatim at the front of the
+    TAIL (the digest truncation keeps the head intact), so a managed prefix
+    like ``runs/`` always survives verbatim at the front of the
     stream's encoded directory name.
     """
     out: List[str] = []
@@ -319,11 +319,40 @@ def _fs_safe_fragment(fragment: str) -> str:
     return "".join(out)
 
 
+def _decode_fs_token(token: str) -> Optional[str]:
+    """The logical name a non-truncated ``_fs_safe`` token encodes, or None.
+
+    Inverts :func:`_fs_safe` exactly: unquote to BYTES, then decode with the
+    same ``surrogatepass`` the encoder used, so a name carrying a lone
+    surrogate (job names come from ``os.fsdecode``'d crontab filenames)
+    round-trips instead of collapsing to U+FFFD.  A ``replace`` decode here
+    returned a DIFFERENT name while the listing still read complete: the GC
+    keep-set builders and the orphan-blob sweep re-encode each listed name,
+    so a garbled one made them read a stream that does not exist (silently
+    empty) and delete state the real stream still references.  ``None`` for
+    a token the encoder cannot have produced (undecodable bytes, or a name
+    that does not re-encode to this exact token, e.g. a lowercase-hex
+    alias): the caller must report the entry unnameable, never act on a
+    mangled name.
+    """
+    from urllib.parse import unquote_to_bytes
+
+    try:
+        name = unquote_to_bytes(token).decode("utf-8", "surrogatepass")
+    except UnicodeError:
+        # undecodable byte sequence, or a listing entry that itself carries
+        # a lone surrogate (unquote_to_bytes encodes its input strictly).
+        return None
+    if not name or _fs_safe(name) != token:
+        return None
+    return name
+
+
 def _record_epoch(name: str) -> float:
     """The write-epoch a record filename sorts by, or ``+inf`` (unknown).
 
     Unknown/foreign filenames map to ``+inf`` so an age-based sweep treats
-    them as brand new and keeps their stream -- never delete what cannot be
+    them as brand new and keeps their stream: never delete what cannot be
     classified.  Guarded against ``float()``'s non-numeric spellings: a file
     named ``nan-...`` would otherwise parse to NaN, every comparison against
     it would be False, and the keep-unclassifiable contract would invert.
@@ -335,6 +364,39 @@ def _record_epoch(name: str) -> float:
     if math.isnan(epoch) or math.isinf(epoch):
         return float("inf")
     return epoch
+
+
+def _record_name_epoch_str(stem: str) -> Optional[str]:
+    """The canonical zero-padded epoch head of a record filename stem.
+
+    ``None`` for anything not shaped like the ``{:020.6f}`` head every name
+    this module generates starts with.  Only canonical stems may seed the
+    monotonic-name floor (see ``_next_record_name``): a foreign name's head
+    cannot be bumped, and no generated (numeric) name could sort above a
+    non-numeric one anyway.
+    """
+    head = stem.split("-", 1)[0]
+    if (
+        len(head) == 20
+        and head[13] == "."
+        and head[:13].isdigit()
+        and head[14:].isdigit()
+    ):
+        return head
+    return None
+
+
+def _bump_record_epoch_str(head: str) -> str:
+    """``head`` plus exactly one microsecond, in the same fixed-width form.
+
+    Digit arithmetic, not float: near current epochs one float ULP is about
+    a quarter microsecond, so a float round-trip could re-emit the SAME
+    formatted head and break the strictly-above contract the name floor
+    depends on.
+    """
+    digits = head.replace(".", "")
+    bumped = str(int(digits) + 1).rjust(len(digits), "0")
+    return "{}.{}".format(bumped[:-6], bumped[-6:])
 
 
 def _unescape_mount(field: str) -> str:
@@ -409,7 +471,7 @@ def _local_lock_reason(path: str) -> Optional[str]:
     Inspects the mount options of NFS-family mounts: ``nolock`` and
     ``local_lock=flock``/``local_lock=all`` make the kernel satisfy flock
     requests locally without ever consulting the server, so two hosts each
-    "hold" the same exclusive lock -- exactly the silent double-run a
+    "hold" the same exclusive lock, exactly the silent double-run a
     coordination consumer must refuse.  Linux-only (like the topology
     probe); an undecidable mount returns ``None``, leaving the functional
     probe and the operator's ``topology`` assertion as the remaining
@@ -468,7 +530,7 @@ class _DocumentUnreadable(Exception):
     The document analogue of :class:`_LeaseUnreadable`: raised (internally)
     from the strict read inside :meth:`FilesystemStateBackend.mutate_document`
     when the document file is unreadable for any reason other than plain
-    absence -- a transient I/O error on a shared mount, or corrupt content.
+    absence: a transient I/O error on a shared mount, or corrupt content.
     A read-modify-write cannot proceed safely without a trustworthy current
     value (it would silently clobber a live document, or advance a monotonic
     cursor backwards), so the mutation *fails* rather than guessing.  It
@@ -619,15 +681,15 @@ class StateBackend(abc.ABC):
 
         ``strict=True`` makes an environmentally-unreadable record (an NFS
         blip) or one written by a NEWER schema PROPAGATE as an exception
-        instead of being silently skipped -- required by any caller for whom
-        a missed record is worse than a failed read (the orphan-blob sweep,
+        instead of being silently skipped; any caller for whom a missed
+        record is worse than a failed read needs that (the orphan-blob sweep,
         which must not mistake "a reference I could not read" for "no
         reference").  The default stays best-effort.
 
         ``limit`` bounds the window of readable records considered (its
         historical meaning).  ``predicate`` optionally filters which of that
         window is returned, and ``max_matches`` stops the scan early once that
-        many matching records are collected -- so a caller after "the newest
+        many matching records are collected, so a caller after "the newest
         record satisfying P" parses only down to the first match rather than
         the whole window.  With both unset the result is unchanged.
         """
@@ -637,7 +699,7 @@ class StateBackend(abc.ABC):
         """Logical stream names currently on disk starting with ``prefix``.
 
         For a *family* of per-host/per-scope streams sharing a prefix (e.g.
-        ``"manifests/"`` -- one stream per host, see
+        ``"manifests/"``, one stream per host, see
         :data:`cronstable.cron.MANIFEST_STREAM_PREFIX`) a caller that must read
         every member's own records (not just check keep-set membership, which
         :meth:`collect_garbage`'s ``keep`` mapping already covers) needs to
@@ -653,8 +715,8 @@ class StateBackend(abc.ABC):
         ``complete`` is ``False`` when a stream matching ``prefix`` exists
         but could not be NAMED (a legacy length-truncated directory without
         its logical-name sidecar, which :meth:`list_stream_names` silently
-        skips).  A caller that will DELETE based on the listing -- the
-        orphan-blob sweep builds its referenced-digest set from it -- must
+        skips).  A caller that will DELETE based on the listing (the
+        orphan-blob sweep builds its referenced-digest set from it) must
         distinguish "no other streams" from "streams I cannot see" and keep
         on any doubt.  The base backend cannot enumerate at all, so it
         reports an incomplete empty listing.
@@ -678,7 +740,7 @@ class StateBackend(abc.ABC):
         Keeps a stream bounded the way the in-memory ``maxlen`` deque did.
         ``keep <= 0`` deletes the whole stream.  Single-node safe (per-key
         deletes); a cluster where several nodes prune the same stream may race
-        on individual deletes, which is harmless (a missing file is ignored) --
+        on individual deletes, which is harmless (a missing file is ignored);
         the leader-gated variant is a later phase.
         """
 
@@ -706,7 +768,7 @@ class StateBackend(abc.ABC):
 
         Runs ``transform(current_body)`` under an advisory ``flock`` over the
         document's dedicated lock file, so on a shared mount the whole RMW is
-        serialised fleet-wide -- the property a monotonic cursor and a
+        serialised fleet-wide, the property a monotonic cursor and a
         create-if-absent idempotency claim both depend on.  ``transform``
         returns ``(new_body, result)``: ``new_body`` is the JSON body to
         persist, or :data:`DOC_KEEP` to leave the document untouched, or
@@ -747,7 +809,7 @@ class StateBackend(abc.ABC):
         namespaces (``dagrun/<dag>``) so it can keep every live run's XCom
         stream and collect the runs of dags removed from config.  ``complete``
         is ``False`` when a matching namespace exists on disk but its logical
-        name is unrecoverable (a length-truncated directory -- document
+        name is unrecoverable (a length-truncated directory; document
         namespaces have no name sidecar), so a deleting caller keeps instead.
         The base backend cannot enumerate at all, so it reports an incomplete
         empty listing.
@@ -855,7 +917,7 @@ class StateBackend(abc.ABC):
         inspector: health (:meth:`view_dict` + :meth:`stats`) plus, on
         backends that can enumerate their store, per-prefix stream/document
         counts, scope lists, and active leases.  NEVER returns record payloads
-        or document values -- the inspector is a metadata surface only.  The
+        or document values: the inspector is a metadata surface only.  The
         base backend cannot enumerate, so it reports ``enumerable: false`` and
         the health block alone."""
         return {
@@ -875,7 +937,7 @@ class _StateWorker:
     The unit the pool below hands work to.  Its whole reason to exist is that
     creating an OS thread (stack, TLS, interpreter thread state, scheduler
     enqueue) costs far more than the handoff of a callable to a thread already
-    parked on a queue -- and :meth:`FilesystemStateBackend._call` used to pay
+    parked on a queue, and :meth:`FilesystemStateBackend._call` used to pay
     that per op.
 
     The worker returns itself to the idle pool only *after* the op it was
@@ -983,8 +1045,8 @@ class FilesystemStateBackend(StateBackend):
         # collide on a name.  os.urandom is fine (uniqueness, not secrecy).
         self._instance = os.urandom(6).hex()
         # The sync halves below run on (daemon) worker threads, several of
-        # which may be in flight at once -- two jobs finishing together each
-        # schedule an append.  An unlocked `self._seq += 1` is a read-modify-
+        # which may be in flight at once (two jobs finishing together each
+        # schedule an append).  An unlocked `self._seq += 1` is a read-modify-
         # write two threads can interleave, and a duplicated seq (plus the
         # coarse Windows clock) means a duplicated record id: one record
         # silently clobbering another via the atomic rename.
@@ -1017,7 +1079,7 @@ class FilesystemStateBackend(StateBackend):
         self._throttle_wait_seconds = 0.0
         # Live worker-thread gauges per lane, plus high-water marks.  A slot is
         # held for a thread's whole lifetime, so a hung mount pins its lane's
-        # gauge at capacity -- exactly the "the store is wedged" signal that
+        # gauge at capacity, exactly the "store is wedged" signal that
         # the completed-op counters above (which only tick when an op FINISHES)
         # cannot show.  Touched only from the event-loop thread, but guarded by
         # _stats_lock so stats() reads a consistent snapshot.
@@ -1035,6 +1097,19 @@ class FilesystemStateBackend(StateBackend):
         # is injective, so the two keyings are interchangeable otherwise.
         self._prune_countdown: Dict[str, int] = {}
         self._prune_gate_lock = threading.Lock()
+        # Per-stream record-name floor (see _next_record_name): the highest
+        # name stem known for each stream, so a backward wall-clock step can
+        # never mint a name that sorts below retained history (the amortised
+        # prune keeps the lexicographic tail and would delete the JUST-
+        # WRITTEN record; the derive_max watermark would exclude it for the
+        # life of the process).  Keyed by the on-disk token like
+        # _prune_countdown and bounded the same way; an absent key means
+        # "not seeded yet", and seeding reads the stream's directory once
+        # per process.  Written from worker threads, hence the lock;
+        # _next_seq nests inside it (floor lock then seq lock, never the
+        # reverse), so the pair cannot deadlock.
+        self._record_name_floor: Dict[str, str] = {}
+        self._record_name_floor_lock = threading.Lock()
         # Derived-cursor memo (see _derive_max_sync): (stream token, field)
         # to (newest record filename folded so far, best value over every
         # record at or below that filename).  Lets a repeat derive_max parse
@@ -1086,7 +1161,7 @@ class FilesystemStateBackend(StateBackend):
         """The ``(lock file, doc file)`` for one document.
 
         Like a lease, the flock rides a stable side-file (``.lock``) while the
-        value file (``.doc``) is swapped out by the atomic rename -- locking
+        value file (``.doc``) is swapped out by the atomic rename; locking
         the value file directly would lock an inode about to be replaced.
         """
         ns_dir = self._doc_dir(namespace)
@@ -1134,14 +1209,14 @@ class FilesystemStateBackend(StateBackend):
         Not ``asyncio.to_thread``: the default executor's threads are
         non-daemonic and joined at interpreter exit, so one worker wedged in
         an uninterruptible NFS syscall (the classic dead-server hard mount)
-        would hang process shutdown forever -- exactly what the bounded
+        would hang process shutdown forever, exactly what the bounded
         shutdown flush promises cannot happen.  Daemon threads keep a hung
         store abandonable: callers can time out (``asyncio.wait_for``) and
         exit; the OS reclaims the stuck thread.
 
         The daemon threads are POOLED (:class:`_StateWorker`) rather than
         created per call, which was ~130 us of pure dispatch on every state
-        op -- several times the store work itself on a read from a warm page
+        op, several times the store work itself on a read from a warm page
         cache.  Abandonability is unchanged: a worker rejoins the pool only
         once its op returns, so a wedged one is never handed more work and
         the next op spawns a replacement.
@@ -1158,7 +1233,7 @@ class FilesystemStateBackend(StateBackend):
             # queues as a cheap pending coroutine, not a held thread slot.
             # Lease operations BYPASS the bucket: they are tiny, and a
             # coordination renew queued behind a burst of bulk record writes
-            # could overshoot its TTL -- expiring a live holder's lease and
+            # could overshoot its TTL, expiring a live holder's lease and
             # double-running the very job the lease exists to fence.  The
             # billing cost this exempts is a few small requests per renew
             # period, not the bulk traffic the bucket is for.
@@ -1168,8 +1243,8 @@ class FilesystemStateBackend(StateBackend):
                     self._throttled_ops += 1
                     self._throttle_wait_seconds += waited
         # Pick the worker lane.  Lease/coordination ops get their OWN pool so a
-        # burst of bulk record writes -- or bulk threads wedged on a hung mount
-        # -- can never hold every slot and delay a lease renew past its TTL.
+        # burst of bulk record writes (or bulk threads wedged on a hung mount)
+        # can never hold every slot and delay a lease renew past its TTL.
         # Same split-brain hazard the rate-limiter bypass above guards against,
         # extended to the worker-slot pool it left exposed: the bypass kept a
         # renew off the throttle queue, but it still had to win one of the
@@ -1183,7 +1258,7 @@ class FilesystemStateBackend(StateBackend):
                 self._call_slots = asyncio.Semaphore(BULK_CALL_SLOTS)
             slots = self._call_slots
         # The slot is held for the THREAD's lifetime, released from its
-        # completion callback -- not scoped to this await, which a wait_for
+        # completion callback, not scoped to this await, which a wait_for
         # timeout can cancel while the thread is still stuck in a syscall.
         # Scoping it here would un-bound the thread count in exactly the
         # hung-store case the cap exists for.
@@ -1224,7 +1299,7 @@ class FilesystemStateBackend(StateBackend):
             except RuntimeError:
                 # the loop already closed (late finish during teardown):
                 # nothing is waiting; drop the result (the slot stays taken,
-                # which is moot -- the loop is gone).
+                # which is moot: the loop is gone).
                 pass
 
         try:
@@ -1276,7 +1351,7 @@ class FilesystemStateBackend(StateBackend):
 
     def _start_sync(self) -> None:
         # 0o700 (further narrowed by the umask): records and archived output
-        # can carry job output -- secrets, even post-redaction -- so nothing
+        # can carry job output (secrets, even post-redaction), so nothing
         # here should be world-readable on a multi-user host.  Only applied to
         # directories this process creates; an operator who pre-created the
         # tree with wider modes has made that choice deliberately.
@@ -1319,7 +1394,7 @@ class FilesystemStateBackend(StateBackend):
         warning at start instead of quietly quarantining history record by
         record.  Read raw (not via ``_read_record``): a newer-versioned stamp
         is exactly the record whose version mismatch is meaningful, and the
-        normal reader would quarantine it.  Best-effort throughout -- the
+        normal reader would quarantine it.  Best-effort throughout: the
         stamp is advisory, never load-bearing.
         """
         stream_dir = self._stream_dir("meta")
@@ -1341,7 +1416,7 @@ class FilesystemStateBackend(StateBackend):
                     logger.warning(
                         "state: the store at %s was last stamped by a build "
                         "writing record scheme %r (this build writes %r); "
-                        "records this build cannot read are quarantined -- "
+                        "records this build cannot read are quarantined; "
                         "consider `cronstable state migrate-schema`",
                         self.base,
                         version,
@@ -1436,15 +1511,15 @@ class FilesystemStateBackend(StateBackend):
         """Write ``payload`` to ``dest`` via a temp file + atomic rename.
 
         The rename is atomic on a local filesystem, on Windows (os.replace),
-        and -- crucially -- on an Amazon S3 Files mount, where *file* rename is
-        atomic even though the underlying object store has no native rename.  A
+        and on an Amazon S3 Files mount, where *file* rename is atomic even
+        though the underlying object store has no native rename.  A
         reader therefore never observes a half-written ``dest``.
 
         Data files are created 0o600 (narrowed further by the umask): records
         and archived output can carry job output, which is exactly where
         secrets live.  After the rename the parent directory is flushed (see
         :func:`cronstable.platform.fsync_directory`), because without it the
-        rename itself is not crash-durable -- a power loss could silently
+        rename itself is not crash-durable: a power loss could silently
         drop an acknowledged record, regress the derived watermark, and
         double-run jobs on the next boot.
         """
@@ -1469,13 +1544,13 @@ class FilesystemStateBackend(StateBackend):
         A freshly created stream/namespace/blob-shard directory can have
         every file written into it individually fsynced, yet the directory
         ENTRY that makes the subtree reachable from its parent was never
-        itself made durable -- a power loss right after can drop the whole
+        itself made durable; a power loss right after can drop the whole
         newly-created subtree (parent and all), taking every acknowledged
         record inside it with it.  Walks up from ``path`` to the first
         already-existing ancestor *before* creating anything, so exactly the
         newly-created levels are known; after ``makedirs``, flushes each
         newly-created directory's PARENT (the parent is where the "this
-        subdirectory exists" entry actually lives) -- which is exactly the
+        subdirectory exists" entry actually lives), which is exactly the
         pre-existing ancestor plus every newly-created level except the
         leaf itself (the leaf's own directory entry is covered by whichever
         write follows into it, e.g. :meth:`_atomic_write`).
@@ -1530,9 +1605,10 @@ class FilesystemStateBackend(StateBackend):
         # lexicographically == chronologically), then instance+seq for
         # uniqueness.  The record's own logical timestamp lives in ``data`` and
         # is what derive_max reads; the filename only orders listing.
-        rec_id = "{:020.6f}-{}-{:012d}".format(
-            _now(), self._instance, self._next_seq()
-        )
+        # Generation is floor-clamped (_next_record_name): pruning and the
+        # derive_max watermark both require names to only ever grow, even
+        # across a backward wall-clock step.
+        rec_id = self._next_record_name(token, stream_dir)
         payload = _json.dumps_bytes(
             {"schemaVersion": SCHEME_VERSION, "data": data}, sort_keys=True
         )
@@ -1592,6 +1668,100 @@ class FilesystemStateBackend(StateBackend):
         with self._prune_gate_lock:
             self._prune_countdown.pop(token, None)
 
+    def _record_name_floor_scan(self, stream_dir: str) -> str:
+        """The highest canonical record stem on disk, ``""`` when none.
+
+        Seeds the name floor: one listing per stream per process lifetime
+        (the map entry then persists), run OUTSIDE the floor lock because a
+        listing can block on a hung mount and the lock must stay memory-
+        only.  An unreadable directory seeds an empty floor: generation
+        then degrades to plain wall-clock names, never an error on the
+        append path.
+        """
+        try:
+            names = os.listdir(stream_dir)
+        except OSError:
+            return ""
+        best = ""
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            stem = name[: -len(".json")]
+            if stem > best and _record_name_epoch_str(stem) is not None:
+                best = stem
+        return best
+
+    def _next_record_name(self, token: str, stream_dir: str) -> str:
+        """A fresh record stem sorting strictly above the stream's floor.
+
+        Record names embed the wall clock, and two mechanisms assume they
+        only ever grow: :meth:`_prune_sync` keeps the lexicographic tail,
+        and the derive_max memo scans only names above its watermark.  A
+        backward clock step (NTP correcting a fast host clock, or a fast-
+        clocked peer writing to a shared store) used to mint names BELOW
+        retained history: once the stream sat at its prune cap, the very
+        next amortised prune deleted the just-acknowledged record while
+        keeping stale future-dated ones, and derive_max never saw it.  When
+        the natural stem does not clear the floor, the floor's epoch is
+        bumped one microsecond and the fresh instance+seq keeps the name
+        unique; the result parses and sorts exactly like a natural name.
+        The floor is in-process state on purpose: appends take no cross-
+        process lock, so a peer's names are folded in at seed time and at
+        each amortised prune (whose listing is already paid for), and
+        crash safety needs no extra files (a restart re-seeds from the
+        directory itself).
+        """
+        with self._record_name_floor_lock:
+            seeded = token in self._record_name_floor
+        disk = "" if seeded else self._record_name_floor_scan(stream_dir)
+        with self._record_name_floor_lock:
+            if token not in self._record_name_floor:
+                if (
+                    len(self._record_name_floor)
+                    >= _PRUNE_COUNTDOWN_MAX_STREAMS
+                ):
+                    # bound the map like _prune_countdown: only floors are
+                    # lost, and the next append per affected stream re-seeds
+                    # from one directory listing.
+                    self._record_name_floor.clear()
+                self._record_name_floor[token] = disk
+            floor = max(self._record_name_floor[token], disk)
+            stem = "{:020.6f}-{}-{:012d}".format(
+                _now(), self._instance, self._next_seq()
+            )
+            if stem <= floor:
+                stem = "{}-{}-{:012d}".format(
+                    _bump_record_epoch_str(floor.split("-", 1)[0]),
+                    self._instance,
+                    self._next_seq(),
+                )
+            self._record_name_floor[token] = stem
+        return stem
+
+    def _record_name_floor_raise(self, token: str, stem: str) -> None:
+        """Raise (never lower, never insert) one stream's name floor.
+
+        Fed by listings the prune already paid for, so names appended by
+        OTHER processes (whose clocks this one cannot observe) fold into
+        generation at every amortised prune, not only at the one-time seed.
+        Never inserts: a stream this process never appends to has no use
+        for a floor entry in the bounded map.
+        """
+        with self._record_name_floor_lock:
+            known = self._record_name_floor.get(token)
+            if known is not None and stem > known:
+                self._record_name_floor[token] = stem
+
+    def _record_name_floor_forget(self, token: str) -> None:
+        """Drop one stream's name floor after its directory is removed.
+
+        The same growth story as :meth:`_prune_countdown_forget`; a name
+        that comes back re-seeds from its (then empty) directory listing
+        on its next append.
+        """
+        with self._record_name_floor_lock:
+            self._record_name_floor.pop(token, None)
+
     def _quarantine(self, path: str, name: str, reason: str) -> None:
         dest = os.path.join(
             self.base,
@@ -1604,7 +1774,7 @@ class FilesystemStateBackend(StateBackend):
                 "state: quarantined corrupt record %s (%s)", name, reason
             )
             # stamp the QUARANTINE time: rename preserves the original write
-            # mtime, and the GC quarantine sweep ages by mtime -- without
+            # mtime, and the GC quarantine sweep ages by mtime; without
             # this, an old-written poison record could be swept in the same
             # pass it was quarantined, losing the forensics window.
             with contextlib.suppress(OSError):
@@ -1650,8 +1820,8 @@ class FilesystemStateBackend(StateBackend):
         unique forever (write epoch + per-process instance + seq) and
         thereafter only read or deleted, so ``path -> bytes`` can never go
         stale and there is nothing to invalidate.  Only a body that read back
-        VALID is cached -- never a miss, an I/O error, a quarantine or an
-        unrecognised ``schemaVersion`` -- which also leaves
+        VALID is cached (never a miss, an I/O error, a quarantine or an
+        unrecognised ``schemaVersion``), which also leaves
         ``migrate_schema``'s in-place rewrite (the one sanctioned exception
         to records-are-never-rewritten, and only ever of records this build
         cannot read) invisible to it.  Each read still parses its own body,
@@ -1660,7 +1830,7 @@ class FilesystemStateBackend(StateBackend):
         A ``strict`` read does not touch the cache in either direction.  Its
         whole contract is that a record it cannot read RIGHT NOW must fail
         the caller closed rather than be quietly resolved to something else
-        -- an environment failing is exactly what it exists to surface -- so
+        (an environment failing is exactly what it exists to surface), so
         it always goes to the store, and never substitutes a body it happens
         to remember.
         """
@@ -1680,7 +1850,7 @@ class FilesystemStateBackend(StateBackend):
                     # A derived-watermark/cursor read MUST fail closed on an
                     # environmental error: silently dropping this record would
                     # let derive_max return the max over the surviving subset
-                    # -- a value strictly BELOW the true max -- and the
+                    # (a value strictly BELOW the true max), and the
                     # catch-up caller would replay an occurrence that already
                     # ran.  Propagate so the caller treats the watermark as
                     # UNKNOWN (defer/retry), never as a lower value.  (A
@@ -1694,7 +1864,7 @@ class FilesystemStateBackend(StateBackend):
         except Exception:  # noqa: BLE001 - any content-driven parse failure
             # The CONTENT is bad: invalid/truncated JSON (ValueError), or a
             # hostile shape like >1000-deep nesting (RecursionError).  This
-            # must catch everything content-dependent -- a poison record that
+            # must catch everything content-dependent: a poison record that
             # raised out of here would escape quarantine and crash whichever
             # caller is reading the stream ("never fatal" is the invariant).
             self._quarantine(path, name, "unreadable-or-invalid-json")
@@ -1707,7 +1877,7 @@ class FilesystemStateBackend(StateBackend):
             return None
         if obj.get("schemaVersion") != SCHEME_VERSION:
             # Well-formed, just a schema version this build does not
-            # recognise -- almost always a NEWER version written by a peer
+            # recognise: almost always a NEWER version written by a peer
             # ahead in a rolling upgrade, not corruption. Quarantining (i.e.
             # deleting) it here would let an old node erase a new node's
             # records fleet-wide the moment it starts reading a shared store
@@ -1744,7 +1914,7 @@ class FilesystemStateBackend(StateBackend):
         An I/O error is the environment failing (an NFS blip, an AV
         scanner's transient hold), not the record: it is skipped for this
         read but left in place.  Quarantining here would eject perfectly
-        valid history -- and regress the derived watermark -- on every store
+        valid history (and regress the derived watermark) on every store
         hiccup.
         """
         hint = ""
@@ -1752,7 +1922,7 @@ class FilesystemStateBackend(StateBackend):
             # data files are deliberately 0o600 (they carry job output):
             # a persistent EACCES here usually means two nodes run as
             # DIFFERENT users against one shared store, which silently
-            # hides half the history -- worth a pointed hint.
+            # hides half the history; that is worth a pointed hint.
             hint = (
                 " (records are created 0o600: every node sharing this "
                 "store must run as the same user)"
@@ -1827,7 +1997,7 @@ class FilesystemStateBackend(StateBackend):
         A length-truncated token cannot be decoded back to its logical name
         (the digest replaced the tail), so without the sidecar
         :meth:`list_stream_names` would hand every consumer a garbled name
-        that re-encodes to a different token -- and the GC keep-set built
+        that re-encodes to a different token, and the GC keep-set built
         from it would miss this stream entirely.  Best-effort: a failed
         sidecar write must never fail the append it rides on (the stream is
         then merely skipped by enumeration until a later append lands it).
@@ -1846,8 +2016,6 @@ class FilesystemStateBackend(StateBackend):
     def _list_stream_names_audit_sync(
         self, prefix: str
     ) -> Tuple[List[str], bool]:
-        from urllib.parse import unquote
-
         records_root = os.path.join(self.base, RECORDS_DIR)
         token_prefix = _fs_safe_fragment(prefix)
         try:
@@ -1868,7 +2036,7 @@ class FilesystemStateBackend(StateBackend):
             if _FS_TRUNCATION_MARKER in token:
                 # a length-truncated token is not decodable: only its name
                 # sidecar knows the logical name.  A stream without a
-                # verifiable sidecar is SKIPPED, never returned garbled --
+                # verifiable sidecar is SKIPPED, never returned garbled:
                 # a garbled name re-encodes to a different token, so a GC
                 # keep-set built from it would miss the real stream and its
                 # host's state would be collected as garbage.  The skip is
@@ -1881,7 +2049,16 @@ class FilesystemStateBackend(StateBackend):
                 else:
                     complete = False
                 continue
-            names.append(unquote(token, errors="replace"))
+            name = _decode_fs_token(token)
+            if name is None:
+                # not a token _fs_safe produced (foreign, corrupt, or
+                # undecodable): the same unnameable-entry discipline as the
+                # sidecar-less truncated dir above, because a garbled or
+                # aliased name re-encodes to a DIFFERENT token, and a keep-
+                # set or blob sweep built from it destroys live state.
+                complete = False
+                continue
+            names.append(name)
         return sorted(names), complete
 
     def _list_sync(
@@ -1903,8 +2080,8 @@ class FilesystemStateBackend(StateBackend):
         if newest_first:
             names.reverse()
         out: List[Dict[str, Any]] = []
-        # `limit` bounds the WINDOW of good (readable) records considered --
-        # its historical meaning, so an all-None-predicate call is byte-for-
+        # `limit` bounds the WINDOW of good (readable) records considered
+        # (its historical meaning), so an all-None-predicate call is byte-for-
         # byte the old behaviour. `predicate` filters which of that window is
         # returned, and `max_matches` stops the scan once enough matching
         # records are in hand, so a caller wanting "the newest record that
@@ -1983,8 +2160,9 @@ class FilesystemStateBackend(StateBackend):
             newer = [n for n in listing if n > watermark]
             if watermark in listing or newer:
                 # Incremental fold, correct because record ids embed the
-                # write epoch (filenames sort chronologically) so appends
-                # only ever create names above the watermark, and because a
+                # write epoch and are floor-clamped (_next_record_name), so
+                # appends only ever create names above the watermark even
+                # across a backward wall-clock step, and because a
                 # bounded prune (keep > 0) only deletes the OLDEST records:
                 # deleting a record whose value is already folded into the
                 # cached best cannot lower a monotonic maximum.  The
@@ -2002,7 +2180,7 @@ class FilesystemStateBackend(StateBackend):
                 # scratch so the recreated records alone define the max.
                 best = None
         # strict=True: an environmental read error must PROPAGATE (fail the
-        # whole derive), never silently shrink the max -- see _read_record.
+        # whole derive), never silently shrink the max; see _read_record.
         # A raise also skips the memo write-back below, so a half-folded
         # scan is never cached.
         # Fold in chronological (filename-sorted) order so the incomparable-
@@ -2044,6 +2222,17 @@ class FilesystemStateBackend(StateBackend):
             )
         except FileNotFoundError:
             return 0
+        # The listing is already in hand: fold its newest canonical stem
+        # into the name floor, so names a PEER process appended (its clock
+        # may run ahead of this host's) raise this process's generation
+        # floor at every amortised prune, not only at the one-time seed.
+        for name in reversed(names):
+            stem = name[: -len(".json")]
+            if _record_name_epoch_str(stem) is not None:
+                self._record_name_floor_raise(
+                    os.path.basename(stream_dir), stem
+                )
+                break
         # names sort chronologically (write-epoch filename prefix); keep the
         # newest ``keep`` (the tail), delete the rest.  keep <= 0 -> all.
         to_delete = names if keep <= 0 else names[:-keep]
@@ -2070,7 +2259,7 @@ class FilesystemStateBackend(StateBackend):
         another by ``name``, and only the newest per name is ever read back
         (see ``artifact_get_record`` / ``artifact_list`` /
         ``referenced_blob_digests``), so an older record for a name that has a
-        newer one is pure dead weight -- it only pins its now-orphan blob.
+        newer one is pure dead weight: it only pins its now-orphan blob.
         Deleting those bounds the stream to the number of distinct names, and
         their blobs are reclaimed by the next orphan-blob sweep.
 
@@ -2079,7 +2268,7 @@ class FilesystemStateBackend(StateBackend):
         cannot be read *right now* (a raced deletion, an NFS blip, or a newer
         node's schema) is LEFT IN PLACE and does not count as having seen its
         value: it could be the live newest of a name, so superseding anything
-        on its account -- or deleting it -- could drop a live version.
+        on its account, or deleting it, could drop a live version.
         Best-effort like :meth:`_prune_sync`.
         """
         stream_dir = self._stream_dir(stream)
@@ -2124,10 +2313,10 @@ class FilesystemStateBackend(StateBackend):
         that entirely.
 
         Lock files are also RECLAIMED by garbage collection (a dead
-        ephemeral lease's, an orphaned idle lock's -- see
+        ephemeral lease's, an orphaned idle lock's; see
         :meth:`_gc_orphan_locks_sync`; never on any hot path), so a
         waiter can win the flock on an inode that was unlinked while it
-        waited -- a ghost nobody arriving later will ever contend on.  After
+        waited: a ghost nobody arriving later will ever contend on.  After
         acquiring, re-verify the path still names the locked inode and
         re-open if not; without this, one mutator serialises on the ghost
         while another serialises on the reclaimer's replacement file, and
@@ -2192,7 +2381,7 @@ class FilesystemStateBackend(StateBackend):
         """Read a lease file; ``None`` means *positively absent*.
 
         With ``strict`` (the locked read-modify-write paths), anything short
-        of plain absence -- a transient I/O error, corrupt content -- raises
+        of plain absence (a transient I/O error, corrupt content) raises
         :class:`_LeaseUnreadable` instead of returning ``None``.  Conflating
         "unreadable right now" with "no lease" would let one NFS blip steal a
         valid, unexpired lease from its live holder and re-issue a stale
@@ -2269,7 +2458,7 @@ class FilesystemStateBackend(StateBackend):
                 # a renew of our own still-valid lease keeps the fence.
                 fence = current.fence
             else:
-                # taking over an EXPIRED (or released) lease -- even our own:
+                # taking over an EXPIRED (or released) lease, even our own:
                 # bump the fence so any late writes issued under the previous
                 # incarnation can be fenced off.  Monotonic because release
                 # marks the lease expired in place instead of deleting it.
@@ -2314,7 +2503,7 @@ class FilesystemStateBackend(StateBackend):
                 return None
             # Renew only if we still hold it: same holder AND same fence (a
             # takeover would have bumped the fence).  Allowed even a hair past
-            # expiry, as long as nobody else took over in the meantime -- but
+            # expiry, as long as nobody else took over in the meantime, but
             # NOT past a release: a released lease is marked expired in place
             # with the same holder+fence, and a renew landing after our own
             # release (an in-flight renew loop racing shutdown) must not
@@ -2363,7 +2552,7 @@ class FilesystemStateBackend(StateBackend):
             ):
                 # Mark expired IN PLACE rather than unlinking: the lease file
                 # is the fence counter's only home, and deleting it would
-                # reset the next acquire to fence=1 -- re-issuing fence values
+                # reset the next acquire to fence=1, re-issuing fence values
                 # already handed out and defeating stale-writer detection.
                 with contextlib.suppress(OSError):
                     self._write_lease_file(
@@ -2394,8 +2583,8 @@ class FilesystemStateBackend(StateBackend):
         """Read a document body; ``None`` means *positively absent*.
 
         Mirrors :meth:`_read_lease_file`.  With ``strict`` (the locked RMW
-        inside :meth:`mutate_document`), anything short of plain absence -- a
-        transient I/O error, corrupt content, an unknown schema version --
+        inside :meth:`mutate_document`), anything short of plain absence (a
+        transient I/O error, corrupt content, an unknown schema version)
         raises :class:`_DocumentUnreadable` so the mutation fails closed
         rather than clobbering a live value or reading a torn one.  Without
         ``strict`` (the best-effort :meth:`read_document` / list) it returns
@@ -2550,8 +2739,6 @@ class FilesystemStateBackend(StateBackend):
     def _list_document_namespaces_sync(
         self, prefix: str
     ) -> Tuple[List[str], bool]:
-        from urllib.parse import unquote
-
         docs_root = os.path.join(self.base, DOCS_DIR)
         token_prefix = _fs_safe_fragment(prefix)
         try:
@@ -2576,7 +2763,15 @@ class FilesystemStateBackend(StateBackend):
                 # streams this namespace's run documents still anchor.
                 complete = False
                 continue
-            names.append(unquote(token, errors="replace"))
+            name = _decode_fs_token(token)
+            if name is None:
+                # foreign/corrupt/undecodable namespace token: the same
+                # unnameable discipline as the truncated case above (a
+                # garbled name reads as a REMOVED dag, and the GC would
+                # collect the XCom streams its runs still anchor).
+                complete = False
+                continue
+            names.append(name)
         return sorted(names), complete
 
     def _list_documents_sync(self, namespace: str) -> List[Dict[str, Any]]:
@@ -2601,7 +2796,7 @@ class FilesystemStateBackend(StateBackend):
         digest = hashlib.sha256(data).hexdigest()
         path = self._blob_path(digest)
         # content-addressed: an existing blob with this digest already holds
-        # exactly this payload, so skip the rewrite (and its fsync cost) --
+        # exactly this payload, so skip the rewrite (and its fsync cost),
         # but refresh its mtime, which is the orphan-blob sweep's age guard:
         # this payload was just (re)published and its new record has not
         # landed yet, so a concurrent sweep whose surviving references are
@@ -2639,22 +2834,22 @@ class FilesystemStateBackend(StateBackend):
         Returns ``None`` when the locks behave, else a human-readable reason
         they must not be trusted for coordination.  Two checks:
 
-        * a **functional** probe: lock a scratch file through one file
+        * a functional probe: lock a scratch file through one file
           descriptor, then attempt a non-blocking exclusive lock through a
           second descriptor of the same file.  On every real lock
           implementation the second attempt fails with contention (POSIX
           ``flock`` is per-open-file-description, Windows byte-range locks
           are per-handle); a mount whose locks are silent no-ops (some FUSE
-          filesystems) grants it -- positive proof the TTL lease's mutual
+          filesystems) grants it, positive proof that the TTL lease's mutual
           exclusion is fiction;
-        * a **mount-option** sniff (Linux): an NFS mount carrying ``nolock``
+        * a mount-option sniff (Linux): an NFS mount carrying ``nolock``
           or ``local_lock=flock``/``all`` satisfies flock host-locally, so
           the functional probe passes on every node while no lock ever
-          reaches the server -- the silent cross-host double-run.
+          reaches the server: the silent cross-host double-run.
 
         Honest limits: both checks run on one host, so a mount whose locks
         are real locally but not propagated across hosts (the ``local_lock``
-        case on a platform without ``/proc/mounts`` -- Windows, macOS) is
+        case on a platform without ``/proc/mounts``, i.e. Windows, macOS) is
         undetectable here; that residual rests on the operator's
         ``topology`` assertion and is documented.  A probe that cannot run
         (I/O error) is inconclusive and reports ``None`` rather than
@@ -2688,7 +2883,7 @@ class FilesystemStateBackend(StateBackend):
                         )
                 except OSError:
                     # contention: the second descriptor was refused while
-                    # the first held the lock -- locks genuinely exclude.
+                    # the first held the lock; locks genuinely exclude.
                     return None
         except OSError as ex:
             logger.debug("state: lock-fidelity probe inconclusive: %s", ex)
@@ -2714,14 +2909,14 @@ class FilesystemStateBackend(StateBackend):
         """Remove durable state nothing references anymore.
 
         ``keep`` maps a managed stream *prefix* (``"runs/"``, ``"logs/"``,
-        ...) to the set of suffixes (job names, hosts) that must survive --
+        ...) to the set of suffixes (job names, hosts) that must survive;
         the caller derives it from the recent manifests plus its own loaded
         config, which is what anchors cross-jobset GC to the deployment
         rather than to any single node's job set.  A stream is deleted only
         when it POSITIVELY matches a managed prefix, its suffix is not kept,
         AND its newest record is older than ``grace`` seconds (belt and
         braces for a store whose manifests are missing).  Anything that
-        cannot be classified is kept -- including a length-truncated stream
+        cannot be classified is kept, including a length-truncated stream
         directory without a verifiable logical-name sidecar, whose name the
         keep-set builder could never have seen; :data:`PROTECTED_STREAMS`
         are never touched.
@@ -2729,7 +2924,7 @@ class FilesystemStateBackend(StateBackend):
         Lease files: only the EPHEMERAL per-run classes named by
         ``ephemeral_lease_prefixes`` (the callers pass dagrun's
         ``dagadvance/`` prefix) are ever reclaimed, and then only when
-        PROVABLY dead for the whole grace window -- both the recorded
+        PROVABLY dead for the whole grace window: both the recorded
         expiry and the last write (release marks expiry ``0.0`` in place,
         so the file mtime, not the expiry, dates a release) older than
         ``grace``.  Every other lease file is never deleted, whatever its
@@ -2740,8 +2935,8 @@ class FilesystemStateBackend(StateBackend):
         window can re-collide with such a record and silently cancel a
         healthy future run (see :meth:`_gc_leases_sync`).
 
-        Orphaned ``.lock`` side-files -- a deleted document's, a reclaimed
-        or half-reclaimed lease's -- are swept once idle past the grace
+        Orphaned ``.lock`` side-files (a deleted document's, a reclaimed
+        or half-reclaimed lease's) are swept once idle past the grace
         window (:meth:`_gc_orphan_locks_sync`).  Also sweeps crash debris:
         write-temp files older than :data:`TMP_MAX_AGE` and quarantined
         records older than ``grace``.
@@ -2795,8 +2990,8 @@ class FilesystemStateBackend(StateBackend):
             ):
                 # a length-truncated token with no verifiable name sidecar
                 # (a legacy dir written before sidecars existed) was
-                # invisible to the keep-set builder -- list_stream_names
-                # skips it -- so its absence from ``keep`` proves nothing:
+                # invisible to the keep-set builder (list_stream_names
+                # skips it), so its absence from ``keep`` proves nothing:
                 # unclassifiable, keep.  The next append to the stream
                 # lands the sidecar and makes it classifiable again.
                 kept_streams += 1
@@ -2837,6 +3032,7 @@ class FilesystemStateBackend(StateBackend):
             # survive it, see _derive_max_invalidate.
             self._derive_max_invalidate(token)
             self._prune_countdown_forget(token)
+            self._record_name_floor_forget(token)
         leases_removed = self._gc_leases_sync(
             cutoff, dry_run, ephemeral_lease_prefixes
         )
@@ -2863,7 +3059,7 @@ class FilesystemStateBackend(StateBackend):
         """Whether a lease was provably dead for the whole grace window.
 
         True only when BOTH the recorded expiry and the file's mtime (the
-        last acquire/renew/release write -- release marks expiry ``0.0`` in
+        last acquire/renew/release write; release marks expiry ``0.0`` in
         place, so the expiry alone cannot date it) predate ``cutoff``.
         Every fence ever issued for the name then expired at least the
         grace window ago (each takeover happens strictly after its
@@ -2906,12 +3102,12 @@ class FilesystemStateBackend(StateBackend):
         uniquely-named file per DAG run).  Reclaiming those is safe: the
         name recurs only if the same run key is re-created after its run
         document was already GC'd, and no fence for it is persisted
-        outside the run document's own lifetime -- the grace argument
+        outside the run document's own lifetime; the grace argument
         (:meth:`_lease_dead_past_grace`) covers every in-memory holder.
 
         The check-and-delete runs under the per-lease flock so it cannot
         race a concurrent re-acquire (which holds the same flock); the
-        ``.lock`` sibling goes LAST -- an acquirer recreating it after the
+        ``.lock`` sibling goes LAST: an acquirer recreating it after the
         ``.lease`` vanished simply takes a fresh fence-1 lease.
         """
         if not ephemeral_prefixes:
@@ -2919,7 +3115,7 @@ class FilesystemStateBackend(StateBackend):
         # prefix matching happens on the encoded filename: _fs_safe only
         # rewrites a token's first character (whole-token reserved names)
         # or its over-length tail, so an encoded prefix survives verbatim
-        # at the front -- same argument as the stream keep-set matching.
+        # at the front, the same argument as the stream keep-set matching.
         prefix_tokens = tuple(
             _fs_safe_fragment(p) for p in ephemeral_prefixes if p
         )
@@ -2979,7 +3175,7 @@ class FilesystemStateBackend(StateBackend):
 
         Two orphan classes, both otherwise permanent:
 
-        * a document ``.lock`` whose ``.doc`` is ABSENT -- ``DOC_DELETE``
+        * a document ``.lock`` whose ``.doc`` is ABSENT: ``DOC_DELETE``
           never unlinks the lock file (an eager unlink split the document
           mutex across nodes on NFS/EFS: a waiter's post-acquire stat
           re-verify can be served by a stale dentry/attribute cache and
@@ -2987,7 +3183,7 @@ class FilesystemStateBackend(StateBackend):
           fresh file).  mutate_document touches the lock's mtime on every
           acquire, so idle-past-grace means no mutator ran for a whole
           grace window;
-        * a BARE lease ``.lock`` with no ``.lease`` sibling -- the Windows
+        * a BARE lease ``.lock`` with no ``.lease`` sibling: the Windows
           post-release unlink in :meth:`_gc_leases_sync` can lose to a
           scanner's transient handle, and the ``.lease``-keyed loop never
           revisits the name.  No ``.lease`` means no durable fence, so no
@@ -3068,7 +3264,7 @@ class FilesystemStateBackend(StateBackend):
             # re-judge under the flock: a concurrent acquire may have just
             # touched the lock or re-created the sibling (and _locked's
             # O_CREAT may have re-created a fresh file if another sweeper
-            # won the race -- its new mtime fails the age gate).
+            # won the race; its new mtime fails the age gate).
             try:
                 if os.stat(lock_path).st_mtime >= cutoff:
                     return False
@@ -3208,7 +3404,7 @@ class FilesystemStateBackend(StateBackend):
         of SHA-256 digests every surviving artifact record still names (the
         caller derives it from the store's live records); a blob is removed
         only when its digest is absent from that set AND it is older than
-        ``grace`` seconds -- the age guard keeps a blob a writer has *just*
+        ``grace`` seconds; the age guard keeps a blob a writer has *just*
         landed but not yet recorded (the put-blob-then-append-record window)
         from being swept out from under the pending record.
         """
@@ -3283,7 +3479,7 @@ class FilesystemStateBackend(StateBackend):
                 },
                 # Live worker-lane occupancy.  ``*_inflight`` at its
                 # ``*_capacity`` (especially sustained) is the "store wedged"
-                # signal the op counters cannot show -- they only advance when
+                # signal the op counters cannot show: they only advance when
                 # an op FINISHES, so a fully-hung mount otherwise reads idle.
                 # The lease lane is separate, so a saturated bulk lane does
                 # not imply lease renewals are blocked.
@@ -3311,9 +3507,9 @@ class FilesystemStateBackend(StateBackend):
         """Metadata-only topology snapshot (see the base docstring).
 
         Walks the on-disk tree off the event loop and returns per-prefix
-        stream/document counts, capped scope lists, and active leases -- never
+        stream/document counts, capped scope lists, and active leases, never
         a record payload or a document value.  Routed through :meth:`_call`
-        like every other op -- never the default executor, whose non-daemon
+        like every other op, never the default executor, whose non-daemon
         threads a dashboard polling this against a hung mount would wedge
         one by one until config reload (and interpreter exit) hang behind
         them; ``_call``'s abandonable daemon threads, lane cap and throttle
@@ -3412,7 +3608,7 @@ def make_state_backend(
     """Build the state backend for a ``state`` config section.
 
     Mirrors :func:`cronstable.leadership.make_backend`.  Today there is one
-    backend -- ``filesystem`` -- because a local disk and an Amazon S3 Files
+    backend, ``filesystem``, because a local disk and an Amazon S3 Files
     mount are the same POSIX backend, distinguished only by the mount.  The
     factory (and the ``backend`` key it reads, defaulting to ``filesystem``)
     keeps the seam ready for a future native-S3 (SigV4/conditional-write)

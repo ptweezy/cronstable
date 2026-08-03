@@ -63,6 +63,15 @@ class FakeReq:
         self.headers = headers or {}
         self._body = body
         self.content_length = len(body) if body else None
+        # the mapping surface the auth middleware files the matched token
+        # into (handle_http reads the caller's scopes from it)
+        self.store = {}
+
+    def __setitem__(self, key, value):
+        self.store[key] = value
+
+    def get(self, key, default=None):
+        return self.store.get(key, default)
 
     async def read(self):
         return self._body

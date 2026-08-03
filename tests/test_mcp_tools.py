@@ -245,6 +245,15 @@ class FakeReq:
         self.headers = headers or {}
         self._body = body
         self.content_length = len(body) if body else None
+        # the mapping surface the auth middleware files the matched token
+        # into (handle_http reads the caller's scopes from it)
+        self.store = {}
+
+    def __setitem__(self, key, value):
+        self.store[key] = value
+
+    def get(self, key, default=None):
+        return self.store.get(key, default)
 
     async def read(self):
         return self._body
@@ -1209,3 +1218,43 @@ async def test_numeric_arguments_survive_non_finite_json_numbers():
     # _call itself asserts no JSON-RPC error envelope: reaching a normal
     # tool result (even an isError one) is the fix for the tail/cursor pair
     await _call(h, "cron_tail_job_logs", {"job": "hello", "tail": inf})
+
+
+async def test_decide_gate_enforces_the_approve_scope():
+    # The REST decision route is gated behind `approve`
+    # (cron._WEB_SCOPE_OVERRIDES); the same action via tools/call must not
+    # be reachable with the bare `control` scope the /mcp middleware floor
+    # demands. handle_http files the presented token's scopes into
+    # _caller_scopes; None (auth off, direct handle_message) stays
+    # unrestricted, matching REST.
+    h = _handler()
+    args = {
+        "dag": "nope",
+        "run_key": "rk",
+        "taskkey": "gate",
+        "decision": "approve",
+        "confirm": True,
+    }
+    # a control-scoped caller is refused before the handler runs
+    token = mcp_mod._caller_scopes.set(frozenset({"view", "control"}))
+    try:
+        result = await _call(h, "cron_decide_gate", args)
+    finally:
+        mcp_mod._caller_scopes.reset(token)
+    assert result["isError"] is True
+    assert "approve" in result["content"][0]["text"]
+    # an approve-holder proceeds to the handler (and fails on the unknown
+    # dag, which is a different, post-authorization error)
+    token = mcp_mod._caller_scopes.set(
+        frozenset({"view", "control", "approve"})
+    )
+    try:
+        result = await _call(h, "cron_decide_gate", args)
+    finally:
+        mcp_mod._caller_scopes.reset(token)
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "scope" not in text
+    # no token context (auth off) is unrestricted, exactly like REST
+    result = await _call(h, "cron_decide_gate", args)
+    assert "scope" not in result["content"][0]["text"]

@@ -1660,6 +1660,141 @@ def test_seed_counters_matching_buckets_seeds_histogram_baseline():
     )
 
 
+def _custom_bucket_snapshot():
+    """A persisted snapshot from a deployment on durationBuckets 1/10/60."""
+    return {
+        "buckets": [1.0, 10.0, 60.0],
+        "jobs": {
+            "j": {
+                "runs": {"success": 3},
+                "duration_sum": 12.0,
+                "duration_count": 3,
+                "bucket_counts": [1, 2, 3],
+            }
+        },
+    }
+
+
+def test_seed_counters_parks_histogram_until_buckets_apply():
+    # The daemon rehydrates counters during state startup, BEFORE the web app
+    # applies a configured web.metrics.durationBuckets, so a custom-bucket
+    # deployment always seeds against the defaults and sees a bounds
+    # mismatch.  The histogram baseline must be parked and adopted when the
+    # configured bounds arrive, not silently dropped on every restart.
+    metrics = PrometheusMetrics()
+    metrics.seed_counters(_custom_bucket_snapshot(), keep=["j"])
+    text = _registry_text(metrics)
+    # outcome counters seed immediately; the histogram waits for its bounds
+    assert (
+        sample_value(
+            text, "cronstable_job_runs_total", job_name="j", status="success"
+        )
+        == 3
+    )
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 0
+    )
+    # a run recorded between seed and set is binned under the still-default
+    # bounds, so the bucket change resets it (past observations cannot be
+    # re-binned), exactly as any bucket change does today.
+    metrics.job_run_recorded("j", "success", 2.0)
+    # the web app applies the configured bounds: the parked baseline lands
+    metrics.set_duration_buckets((1.0, 10.0, 60.0))
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 3
+    )
+    assert (
+        sample_value(text, "cronstable_job_duration_seconds_sum", job_name="j")
+        == 12.0
+    )
+    for le, expected in (("1.0", 1), ("10.0", 2), ("60.0", 3), ("+Inf", 3)):
+        assert (
+            sample_value(
+                text,
+                "cronstable_job_duration_seconds_bucket",
+                job_name="j",
+                le=le,
+            )
+            == expected
+        )
+    # ...and the boot-window run still counted toward the outcome counter
+    assert (
+        sample_value(
+            text, "cronstable_job_runs_total", job_name="j", status="success"
+        )
+        == 4
+    )
+    # runs observed after adoption pile on top of the restored baseline
+    metrics.job_run_recorded("j", "success", 0.5)
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 4
+    )
+    assert (
+        sample_value(
+            text,
+            "cronstable_job_duration_seconds_bucket",
+            job_name="j",
+            le="1.0",
+        )
+        == 2
+    )
+
+
+def test_set_duration_buckets_drops_stale_parked_histogram():
+    # Control: bounds that do NOT match the parked snapshot mean the operator
+    # changed durationBuckets while the daemon was down; the parked baseline
+    # is then genuinely stale and must be dropped, and it must not linger to
+    # be adopted by some later reload back to the old bounds.
+    metrics = PrometheusMetrics()
+    metrics.seed_counters(_custom_bucket_snapshot(), keep=["j"])
+    metrics.set_duration_buckets((0.5, 5.0))
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 0
+    )
+    # a later reload to the snapshot's old bounds finds the slot empty
+    metrics.set_duration_buckets((1.0, 10.0, 60.0))
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 0
+    )
+
+
+def test_set_duration_buckets_noop_also_resolves_parked_histogram():
+    # Setting bounds equal to the current ones (a default-bucket config) is a
+    # no-op for the live histograms, but it still resolves the parked slot:
+    # the config has spoken, and bounds equal to the current ones can never
+    # equal the parked ones (parking requires a mismatch).
+    metrics = PrometheusMetrics()
+    metrics.seed_counters(_custom_bucket_snapshot(), keep=["j"])
+    metrics.set_duration_buckets(DEFAULT_DURATION_BUCKETS)
+    metrics.set_duration_buckets((1.0, 10.0, 60.0))
+    text = _registry_text(metrics)
+    assert (
+        sample_value(
+            text, "cronstable_job_duration_seconds_count", job_name="j"
+        )
+        == 0
+    )
+
+
 # ---------------------------------------------------------------------------
 # _state_families: lock-acquisition and throttle families
 # ---------------------------------------------------------------------------
