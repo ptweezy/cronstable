@@ -52,7 +52,7 @@ servers:
         default: "8080"
 
 # Bearer-token auth applies to every route when `web.authToken` is configured;
-# an unauthenticated daemon ignores it. The `.ics` calendar routes additionally
+# an unauthenticated daemon ignores it. The `.ics` calendar routes also
 # accept the same token as a `?token=` query parameter (declared per-operation),
 # because calendar clients cannot send a bearer header.
 security:
@@ -145,7 +145,7 @@ paths:
       summary: Batched fleet overview
       operationId: getSummary
       description: >-
-        One at-a-glance overview for a widget or status tile: fleet job counts,
+        Everything a widget or status tile needs in one call: fleet job counts,
         the soonest upcoming fire, this node's identity, and its cluster role.
       responses:
         "200":
@@ -183,7 +183,7 @@ paths:
       tags: [jobs]
       summary: One job's detail
       operationId: getJob
-      description: One job in the identical shape as an entry of `GET /jobs`.
+      description: One job, in the same shape as an entry of `GET /jobs`.
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
@@ -971,9 +971,9 @@ paths:
       operationId: testPushDevice
       x-required-scope: control
       description: >-
-        Seals a test payload to the device and posts it to the configured
-        relay, returning the outcome, so delivery is debuggable end to
-        end from the dashboard.
+        Seals a test payload to the device, posts it to the configured
+        relay, and returns the outcome, so delivery is debuggable end
+        to end from the dashboard.
       parameters:
         - $ref: "#/components/parameters/DeviceId"
       responses:
@@ -1316,7 +1316,19 @@ components:
       type: object
       description: One finished run.
       properties:
-        outcome: { type: string, enum: [success, failure, cancelled, unknown, skipped] }
+        outcome:
+          # Open enum (enum + bare string under anyOf): generated clients keep
+          # decoding when a newer daemon ships an outcome this list has not
+          # heard of yet, instead of failing the whole /jobs payload.
+          description: >-
+            Run outcome. Known values: success, failure, cancelled, unknown,
+            skipped. The list is open: a newer daemon may send a value that
+            is not on it, and clients must keep decoding and render the
+            unknown value neutrally.
+          anyOf:
+            - type: string
+              enum: [success, failure, cancelled, unknown, skipped]
+            - type: string
         exit_code: { type: integer, nullable: true }
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
