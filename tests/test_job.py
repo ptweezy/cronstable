@@ -2800,6 +2800,60 @@ async def test_cancel_falls_back_to_direct_kill(monkeypatch):
     assert job._terminated is True
 
 
+async def test_cancel_windows_tree_kill_runs_before_the_root_dies(
+    monkeypatch,
+):
+    # regression: on Windows the old cancel() TerminateProcess'd the direct
+    # child first (the non-forced group call reported False without
+    # signalling anything), then ran taskkill /T against the now-dead pid:
+    # "process not found", no descendant reached, and the job's real work
+    # (a grandchild, for every string-form command routed through
+    # cmd.exe /c) survived executionTimeout, Replace and manual cancel
+    # alike. Windows semantics are simulated so the ordering contract is
+    # enforced on every platform: the tree kill must run while the root is
+    # still alive to anchor the walk, and a root the tree kill took down
+    # must not be separately terminated.
+    taskkills = []
+
+    async def fake_taskkill(pid):
+        alive = proc.returncode is None
+        taskkills.append((pid, alive))
+        if alive:
+            proc.returncode = 1  # the tree kill took the root down too
+        return alive  # a second pass finds the tree gone, like taskkill 128
+
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(cronstable.platform, "_taskkill_tree", fake_taskkill)
+
+    job = _fresh_job()
+    job.config.killTimeout = 5
+
+    touched_root = []
+    proc = Mock()
+    proc.pid = 4321
+    proc.returncode = None
+    proc.terminate = lambda: touched_root.append("terminate")
+    proc.kill = lambda: touched_root.append("kill")
+
+    async def wait():
+        while proc.returncode is None:
+            await asyncio.sleep(0.01)
+        return proc.returncode
+
+    proc.wait = wait
+    job.proc = proc
+
+    await asyncio.wait_for(job.cancel(), 10)
+
+    # the graceful-step tree kill ran first, against a LIVE root; the
+    # belt-and-braces second pass then found the tree already gone.
+    assert taskkills == [(4321, True), (4321, False)]
+    # the root was never separately terminated or killed: the dead-tree
+    # second pass falls back only when the root still has no returncode.
+    assert touched_root == []
+    assert job._terminated is True
+
+
 # ---------------------------------------------------------------------------
 # live_resources / live_resource_series
 # ---------------------------------------------------------------------------

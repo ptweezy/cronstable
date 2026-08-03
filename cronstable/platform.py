@@ -1,23 +1,22 @@
 """OS-specific behavior, isolated so the rest of cronstable stays portable.
 
 cronstable began life POSIX-only.  Everything that genuinely differs between
-Unix
-and Windows lives here behind a small, uniform surface, so the scheduler, the
-job runner, the config loader and the entry point read the same on every
-platform and only this module needs a per-OS branch:
+Unix and Windows lives here behind a small, uniform surface, so the
+scheduler, the job runner, the config loader and the entry point read the
+same on every platform and only this module needs a per-OS branch:
 
-* :data:`DEFAULT_SHELL` -- how a string command is handed to a shell;
-* :data:`DEFAULT_CONFIG_PATH` -- where ``-c`` looks by default;
-* :func:`supports_unix_sockets` -- whether ``unix://`` web listeners work;
-* :func:`encode_argv` -- the argv form the platform's subprocess layer wants;
-* :func:`new_process_group_kwargs` / :func:`kill_process_group` -- spawning a
+* :data:`DEFAULT_SHELL`: how a string command is handed to a shell;
+* :data:`DEFAULT_CONFIG_PATH`: where ``-c`` looks by default;
+* :func:`supports_unix_sockets`: whether ``unix://`` web listeners work;
+* :func:`encode_argv`: the argv form the platform's subprocess layer wants;
+* :func:`new_process_group_kwargs` / :func:`kill_process_group`: spawning a
   job so its descendants are reachable as one unit, and taking that unit down;
-* :func:`install_shutdown_handlers` -- wiring Ctrl-C / termination to a
+* :func:`install_shutdown_handlers`: wiring Ctrl-C / termination to a
   graceful-shutdown callback on whichever event loop the platform provides.
 
 Per-job ``user``/``group`` switching stays in :mod:`cronstable.config` (it
-needs
-the ``grp``/``pwd`` databases), but is likewise gated on :data:`IS_WINDOWS`.
+needs the ``grp``/``pwd`` databases), but is likewise gated on
+:data:`IS_WINDOWS`.
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ if TYPE_CHECKING:
 
 # Platform-specific file-locking primitive, imported behind a ``sys.platform``
 # guard so each OS pulls in only the module it has (``fcntl`` is Unix-only,
-# ``msvcrt`` Windows-only) and mypy -- pinned to ``platform = linux`` -- checks
+# ``msvcrt`` Windows-only) and mypy, pinned to ``platform = linux``, checks
 # just the POSIX branch, exactly as the signal handling below is arranged.
 if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
     import msvcrt
@@ -68,7 +67,7 @@ IS_WINDOWS = sys.platform == "win32"
 # --- Default shell --------------------------------------------------------
 # On POSIX a string command runs as ``/bin/sh -c "<command>"``.  Windows has no
 # /bin/sh; an empty default tells the job runner (and the shell reporter) to
-# hand the command to the native command processor (``%ComSpec%`` -- i.e.
+# hand the command to the native command processor (``%ComSpec%``, i.e.
 # cmd.exe) via :func:`asyncio.create_subprocess_shell`, the closest equivalent.
 # Either platform's default can still be overridden per job with ``shell:``.
 DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
@@ -120,8 +119,8 @@ def encode_argv(argv: List[str]) -> List[Union[str, bytes]]:
 # --- Subprocess process groups -------------------------------------------
 #: How long :func:`kill_process_group` waits for a Windows ``taskkill`` to
 #: report back before giving up on it.  Generous: the caller's fallback is to
-#: kill the direct child only, so a slow-but-working taskkill is worth waiting
-#: for -- but it must never park the job runner indefinitely.
+#: kill the direct child only, so a slow-but-working taskkill is worth
+#: waiting for, but it must never park the job runner indefinitely.
 TASKKILL_TIMEOUT = 10.0
 
 
@@ -130,15 +129,15 @@ def new_process_group_kwargs() -> Dict[str, Any]:
 
     A job command routinely leaves descendants behind (``sh -c 'helper &
     main'``), and each one inherits the write-end of the job's stdout/stderr
-    pipe.  Signalling only the direct child on an ``executionTimeout`` --
-    which is all ``Popen.terminate`` can do -- kills the shell but not the
+    pipe.  Signalling only the direct child on an ``executionTimeout``
+    (which is all ``Popen.terminate`` can do) kills the shell but not the
     helper, so the pipe never reaches EOF, the run never finishes draining,
     and the job's slot is held forever (see
     :meth:`cronstable.job.RunningJob._read_job_streams`).
 
     On POSIX ``start_new_session`` puts the child in a brand-new session, so
-    it and every descendant share one process-group id -- the child's own pid
-    -- which :func:`kill_process_group` can then signal as a unit.  Windows
+    it and every descendant share one process-group id (the child's own
+    pid), which :func:`kill_process_group` can then signal as a unit.  Windows
     has no equivalent at spawn time; descendants are reached through the
     process tree instead, so no creation flag is needed there.
     """
@@ -164,17 +163,21 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
     a pgid, so there is no risk of hitting an unrelated group.
 
     Windows has no process group to signal, and no graceful equivalent at all
-    (``TerminateProcess`` is unconditional), so a non-forced call reports
-    ``False`` there and leaves the caller's direct-child terminate as the
-    graceful step.  A forced call shells out to ``taskkill /T``, which walks
-    the live parent/child tree.  Honest bound: a descendant already orphaned
-    when taskkill runs (its parent exited first) is no longer in that tree and
-    survives -- which is why the stream drain is separately bounded rather
-    than trusting this to always succeed.
+    (``TerminateProcess`` is unconditional), so BOTH calls shell out to
+    ``taskkill /F /T``, which walks the live parent/child tree.  The
+    non-forced call must not report ``False`` and leave the root to the
+    caller's direct-child terminate: ``/T`` resolves descendants through
+    their live parents, so killing the root first (as that fallback does)
+    orphans every descendant beyond the later forced pass's reach.  The
+    string-form ``command:`` runs via ``cmd.exe /c``, so the actual workload
+    is always a grandchild that would survive every cancel.  The tree kill
+    therefore happens HERE, while the root is still alive to anchor the
+    walk.  Honest bound: a descendant already orphaned before this runs (its
+    parent exited mid-run) is no longer in that tree and survives, which is
+    why the stream drain is separately bounded rather than trusting this to
+    always succeed.
     """
     if IS_WINDOWS:  # pragma: no cover - Windows-only path
-        if not force:
-            return False
         return await _taskkill_tree(pid)
     sig = signal.SIGKILL if force else signal.SIGTERM
     try:
@@ -327,7 +330,7 @@ def os_boot_time() -> Optional[float]:
     millisecond tick count that keeps running across sleep/hibernate and is
     unaffected by wall-clock steps), on POSIX from ``/proc/uptime``.  The
     derivation rides the *current* wall clock, so an NTP step shifts the
-    result by the step size -- which is why consumers compare boot times with
+    result by the step size, which is why consumers compare boot times with
     a tolerance rather than exactly.  ``None`` where neither source exists
     (macOS/BSD): the caller then treats every daemon start as a fresh boot,
     which is the pre-dedupe behaviour.
@@ -415,35 +418,33 @@ def exclusive_file_lock(
     deployment shapes:
 
     * on a **local** filesystem the lock excludes other processes on the same
-      host -- exactly right for single-node durability;
+      host, exactly right for single-node durability;
     * on a **shared** NFSv4 mount (an Amazon S3 Files / EFS mount) the same
-      lock is honoured *across hosts*, so it excludes the fleet -- exactly
+      lock is honoured *across hosts*, so it excludes the fleet, exactly
       right for HA.
 
     On POSIX this is ``fcntl.flock`` (whole-file, advisory: it does not block
     I/O by non-cooperating processes, which is fine because cronstable owns
-    both
-    sides).  On Windows it is ``msvcrt.locking`` over the first byte; Windows
-    has no cross-host story, so it only ever serialises same-host processes
-    (single-node), which is all the Windows target needs.  Blocking (the
-    default): a stuck holder would wait here, so callers run the whole locked
-    section in a worker thread (``asyncio.to_thread``) to keep it off the
-    event loop, and the section itself only rewrites a tiny file, so
+    both sides).  On Windows it is ``msvcrt.locking`` over the first byte;
+    Windows has no cross-host story, so it only ever serialises same-host
+    processes (single-node), which is all the Windows target needs.  Blocking
+    (the default): a stuck holder would wait here, so callers run the whole
+    locked section in a worker thread (``asyncio.to_thread``) to keep it off
+    the event loop, and the section itself only rewrites a tiny file, so
     contention is brief.
 
     With ``blocking=False`` a contended lock raises ``OSError`` immediately
     instead of waiting (``EWOULDBLOCK``/``EAGAIN`` on POSIX, ``EACCES`` on
     Windows).  Used by the lock-fidelity probe
     (:meth:`cronstable.state.FilesystemStateBackend.verify_locking`), whose
-    whole
-    point is observing that a second lock attempt on an already-locked file
-    *fails*: a mount whose locks are silent no-ops would grant it.
+    whole point is observing that a second lock attempt on an already-locked
+    file *fails*: a mount whose locks are silent no-ops would grant it.
     """
     if sys.platform == "win32":  # pragma: no cover - Windows-only path
         # msvcrt.locking locks ``nbytes`` from the current file position; lock
         # the first byte (the caller guarantees the lock file has one).
         # msvcrt has no true blocking mode: LK_LOCK retries internally about
-        # once a second for ~10 attempts and then raises OSError -- which
+        # once a second for ~10 attempts and then raises OSError, which
         # would surface as a spurious lease failure whenever another process
         # held the lock a little long.  Emulate flock's indefinite block with
         # a non-blocking attempt loop instead; callers already run this on a
@@ -455,8 +456,8 @@ def exclusive_file_lock(
                 break
             except OSError as ex:
                 # retry only CONTENTION (EACCES from LK_NBLCK, EDEADLOCK
-                # from the CRT); any other error -- a closed/invalid fd,
-                # say -- must surface, not become an infinite spin.
+                # from the CRT); any other error (a closed/invalid fd,
+                # say) must surface, not become an infinite spin.
                 if ex.errno not in (errno.EACCES, errno.EDEADLOCK):
                     raise
                 if not blocking:
@@ -481,7 +482,7 @@ def fsync_directory(path: str) -> None:
 
     A file's own fsync only guarantees ITS bytes are durable; the directory
     ENTRY that makes the file (or a freshly created subdirectory) reachable
-    from its parent is separate metadata, and needs its own flush -- without
+    from its parent is separate metadata, and needs its own flush: without
     it a power loss can drop a perfectly-fsynced file because the directory
     forgot it was ever created.  Used by
     :class:`cronstable.state.FilesystemStateBackend` after an atomic rename, a
@@ -492,7 +493,7 @@ def fsync_directory(path: str) -> None:
     ``os`` module has no equivalent for Windows, so this reaches for the
     underlying Win32 calls via ctypes: ``CreateFileW`` with
     ``FILE_FLAG_BACKUP_SEMANTICS`` to obtain a directory handle at all
-    (``GENERIC_WRITE`` access -- a directory handle opened read-only is
+    (``GENERIC_WRITE`` access: a directory handle opened read-only is
     accepted but ``FlushFileBuffers`` on it fails with ACCESS_DENIED), then
     ``FlushFileBuffers`` on it.  Best-effort either way: any failure (a
     filesystem that does not support it, a permissions quirk, a path that

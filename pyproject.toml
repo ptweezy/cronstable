@@ -9,8 +9,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "TRADEMARKS.md", "LICENSING.md"]
-authors = [{ name = "Parker Loflin", email = "ptweezy@runforyour.money" }]
-maintainers = [{ name = "Parker Loflin", email = "ptweezy@runforyour.money" }]
+authors = [{ name = "Parker Loflin", email = "parker@cronstable.dev" }]
+maintainers = [{ name = "Parker Loflin", email = "parker@cronstable.dev" }]
 keywords = [
     "cron",
     "crontab",

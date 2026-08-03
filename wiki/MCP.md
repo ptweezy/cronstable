@@ -204,8 +204,10 @@ The MCP surface fits cronstable's hardened posture and is safe by default:
   and an oversized request body is refused `413`.
 - **Human-in-the-loop for writes.** Mutating tools require `confirm: true`,
   backfills default to a dry-run preview, and every action re-checks the REST
-  authorization. Tool annotations are honest hints. The real guards are the
-  read-only default, the confirm gate, and server-side authorization.
+  authorization, including scope promotions: `cron_decide_gate` requires the
+  presented token to hold the `approve` scope, exactly like the REST decision
+  route. Tool annotations are honest hints. The real guards are the read-only
+  default, the confirm gate, and server-side authorization.
 - **Redaction.** `cron_inspect_state` mirrors the dashboard's metadata-only
   stance: KV values become a size/type summary and secret **names** are shown
   without values.

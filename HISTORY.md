@@ -32,6 +32,69 @@ project, on which cronstable is based.
   At the phosphor themes' full strength the vignette pulled the edges of the
   page a third of the way back down toward the deep theme, because those
   values are calibrated against a background that is already black.
+  
+## 1.2.36 (2026-08-03)
+
+Defect fixes from a full-application review.
+
+- Windows: cancelling a job (executionTimeout, Replace, shutdown, or the
+  cancel API) now kills the process tree while its root is still alive.
+  Before, the real workload of a shell-form command could survive as an
+  orphan, and a Forbid job could double-run after a timeout.
+- The Forbid/Replace launch gate is serialised per job. A manual start
+  racing the scheduled fire (or a double-click on Run) could previously
+  launch two instances of a Forbid job.
+- DAG catch-up after a suspend or a forward clock jump honours `onMissed`
+  and the same catch-up limit plain jobs use, instead of replaying every
+  missed occurrence.
+- Duplicate job names are refused at config load; previously all but the
+  last definition silently never ran.
+- A web listener whose every bind fails (port still held by a draining
+  predecessor, say) is retried on the next housekeeping pass instead of
+  staying down for the life of the process.
+- SSE log tails end at web teardown instead of waiting out aiohttp's
+  60-second shutdown timeout, so a web, TLS, or MCP config change no
+  longer stalls scheduling while open dashboard tails drain.
+- CORS preflights reach the `/mcp` OPTIONS route with authentication on, so
+  browser MCP clients on `mcp.allowedOrigins` can connect to a
+  token-protected daemon.
+- The MCP `cron_decide_gate` tool requires the `approve` token scope, like
+  the REST decision route it fronts.
+- Bearer-token redaction covers the full RFC 6750 charset: tokens carrying
+  `+`, `/` or `~` no longer escape redaction, whole or in part. The Basic
+  pattern learned the base64url alphabet too.
+- The durable store keeps record names monotonic across a backward clock
+  step. Pruning could otherwise delete a just-written record while keeping
+  stale future-dated ones, and the missed-run/retry watermarks could skip
+  new history.
+- Stream names carrying lone surrogates (from non-UTF-8 crontab filenames)
+  round-trip the store audit exactly; the orphan-blob sweep no longer
+  deletes artifact payloads such streams still reference.
+- Removing `expand:` from a task while a run is mid-flight no longer wedges
+  that run: the recorded fan-out keeps dispatching and the run reaches a
+  terminal state.
+- Boot reconciliation of DAG runs isolates a stalled or unreadable run
+  document. One bad document used to abort state rehydration entirely,
+  which also skipped starting the job API.
+- Custom `web.metrics.durationBuckets` no longer discard the persisted
+  duration histogram on every restart.
+- Dashboard: the drawer Logs pane re-attaches when a new run starts
+  producing output; a poll that never settles can no longer freeze all data
+  loading behind a still-green "live" indicator; the live CPU/RSS chip and
+  the command cell update when their rendered values change.
+- TUI: a run finishing in the local future (clock skew against a remote
+  daemon) no longer crashes the heatmap, and 8-bit C1 escape sequences from
+  job output are stripped like their 7-bit forms.
+- The MCP stdio bridge pins its stdio to UTF-8, so non-ASCII tool results
+  no longer kill it on Windows consoles.
+- CI: a fork pull request from a branch named `main` can no longer cancel
+  an in-flight release, and the pyinstaller Docker build works from the
+  repo-root context again.
+
+## 1.2.35 (2026-07-27)
+
+- Code cleanup - removal of dead and unused code
+- Author email update
 
 ## 1.2.34 (2026-07-27)
 

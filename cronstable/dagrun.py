@@ -80,6 +80,17 @@ APPROVAL_POLL_INTERVAL = 5.0
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
 
+# The furthest back _fire_forward will retroactively replay occurrence by
+# occurrence, mirroring cron.CATCHUP_LIMIT for jobs: a gap within this bound
+# is tick overhead (a slow advance pass, many simultaneous fires) and every
+# occurrence in it is fired so a frequent DAG is not silently dropped; a
+# larger gap is a stall/suspend/clock jump WHILE RUNNING, and replaying it
+# blind would stampede backdated runs the operator's onMissed policy never
+# asked for. Such a gap is instead resumed past like a boot outage: fire the
+# current slot if it matches, resync strictly future, and leave the gap to
+# the same onMissed catch-up the boot seed uses (see _fire_past_gap).
+DAG_CATCHUP_LIMIT = datetime.timedelta(seconds=10)
+
 # When an advance cannot proceed (a failed pass, or a lapsed lease that cannot
 # be verified against the store), re-check after this long instead of leaving
 # a due wake in place -- a fast-failing store must not spin the main loop.
@@ -526,6 +537,17 @@ class DagScheduler:
         self, dagcfg: Any, now_dt: datetime.datetime
     ) -> None:
         sched = dagcfg.schedule_job
+        stale = self._next_logical.get(dagcfg.name)
+        if stale is not None and now_dt - stale >= DAG_CATCHUP_LIMIT:
+            # A stall/suspend/forward clock jump, not tick overhead: the
+            # replay loop below would fire a backdated run per missed
+            # occurrence (per-pass capped, but every pass immediately due
+            # again until the whole gap is drained) regardless of onMissed.
+            # Only the one-time boot seed honoured that policy; a mid-life
+            # gap must too, or a laptop resume unleashes the exact stampede
+            # DAG_MAX_CATCHUP's cap claims to prevent.
+            await self._fire_past_gap(dagcfg, stale, now_dt)
+            return
         fired = 0
         while fired < DAG_MAX_CATCHUP:
             nxt = self._next_logical.get(dagcfg.name)
@@ -542,6 +564,64 @@ class DagScheduler:
                 break
             self._next_logical[dagcfg.name] = following
             fired += 1
+
+    async def _fire_past_gap(
+        self,
+        dagcfg: Any,
+        stale: datetime.datetime,
+        now_dt: datetime.datetime,
+    ) -> None:
+        """Resume a dag whose next-fire fell far behind (see Cron._advance).
+
+        The same decision the job scheduler makes for a stall: fire the
+        CURRENT slot only if now itself matches the schedule, resync to the
+        first occurrence strictly after now, and hand the gap to the dag's
+        ``onMissed`` policy: the boot catch-up, which already applies
+        ``startingDeadlineSeconds``, the ``run-once`` coalesce and the
+        ``DAG_MAX_CATCHUP`` bound, and whose create-if-absent dedup makes
+        re-covering the current slot harmless. ``onMissed: skip`` (the
+        default) thus skips a mid-life gap exactly as it skips a boot gap.
+        """
+        sched = dagcfg.schedule_job
+        logger.warning(
+            "dag %s: its next fire fell %.0fs behind (a slow pass, stall, "
+            "suspend, or clock change); resuming at the current slot and "
+            "leaving the gap to onMissed=%s instead of replaying it",
+            dagcfg.name,
+            (now_dt - stale).total_seconds(),
+            sched.onMissed,
+        )
+        # Imported here: cron imports this module at load, so a top-level
+        # import back into cron would be a cycle. schedule_slot renders now
+        # into the schedule's own frame (timezone, second resolution);
+        # sched is the dag's schedule carrier, a JobConfig, exactly what it
+        # expects.
+        from cronstable.cron import schedule_slot
+
+        fired_now: Optional[datetime.datetime] = None
+        if isinstance(sched.schedule, CronTab):
+            now_slot = schedule_slot(sched, now_dt)
+            if sched.schedule.test(now_slot):
+                # record as aware-UTC like every other run key; astimezone
+                # reads a naive slot as local, as schedule_slot produced it.
+                fired_now = now_slot.astimezone(datetime.timezone.utc)
+        # Create THEN resync, like the replay loop above: a create that
+        # raises (into _fire_scheduled's per-dag isolation) leaves the stale
+        # index in place, so the next pass re-enters this branch and retries;
+        # at most one scheduled run per pass by construction, so the
+        # retry cannot stampede, and create-if-absent dedups the slot if the
+        # raise landed after the document was written.
+        if fired_now is not None:
+            await self._create_run(dagcfg, fired_now, "scheduled")
+        following = self._next_fire(sched, now_dt)
+        if following is None:
+            # no further occurrence (a fixed past year): drop the index
+            # rather than poisoning it with None (see the loop above).
+            self._next_logical.pop(dagcfg.name, None)
+        else:
+            self._next_logical[dagcfg.name] = following
+        if sched.onMissed != "skip":
+            await self._catch_up(dagcfg, now_dt)
 
     async def _catch_up(self, dagcfg: Any, now_dt: datetime.datetime) -> None:
         sched = dagcfg.schedule_job
@@ -1831,13 +1911,38 @@ class DagScheduler:
                     "dag %s: boot reconciliation timed out reading runs", name
                 )
                 continue
+            except Exception as ex:
+                logger.warning(
+                    "dag %s: boot reconciliation could not read runs "
+                    "(continuing with the remaining dags): %s",
+                    name,
+                    ex,
+                )
+                continue
             for body in docs:
                 if dag.is_terminal_run(body):
                     continue
                 run_key = body.get("runKey")
                 if not isinstance(run_key, str):
                     continue
-                await self._try_own(dagcfg, (name, run_key))
+                try:
+                    await self._try_own(dagcfg, (name, run_key))
+                except Exception as ex:
+                    # One stalled or strict-unreadable run document must not
+                    # abort boot reconciliation: this loop runs inside the
+                    # state-rehydration tail, and an escaping raise skipped
+                    # every remaining run AND the _start_job_api call after
+                    # it, for the life of the backend generation (the
+                    # rehydrated latch is already set, so no later pass
+                    # retries). The run stays unowned here; the next service
+                    # pass retries owning it.
+                    logger.warning(
+                        "dag %s: boot reconciliation of run %s failed "
+                        "(continuing with the remaining runs): %s",
+                        name,
+                        run_key,
+                        ex,
+                    )
 
     async def _reconcile_run(
         self, dagcfg: Any, ref: RunRef

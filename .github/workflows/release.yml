@@ -64,13 +64,18 @@ on:
         type: string
         default: ""
 
-# One in-flight run per branch. A same-repo branch push and its PR share a group
-# (github.ref_name == the PR's head ref), so the duplicate is cancelled rather
-# than run twice. main is never cancelled (cancel-in-progress false there):
-# consecutive main pushes QUEUE so releases serialize instead of racing, and a
-# workflow_dispatch release is likewise protected from a later push cancelling it.
+# One in-flight run per (head repo, branch). A same-repo branch push and its
+# PR still share a group, so the duplicate is cancelled rather than run twice.
+# The group is qualified by the HEAD repository because cancel-in-progress
+# evaluates on the INCOMING run: an unqualified group let a fork PR whose head
+# branch was named `main` land in the push-to-main group and cancel an
+# in-flight release mid-publish (its own ref is refs/pull/N/merge, so the
+# expression below was true for it). main is never cancelled by main pushes
+# (cancel-in-progress false there): consecutive main pushes QUEUE so releases
+# serialize instead of racing, and a workflow_dispatch release is likewise
+# protected from a later push cancelling it.
 concurrency:
-  group: ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'workflow_dispatch' }}
 
 # Least-privilege default for all jobs; the publish jobs opt up to the narrower
@@ -1600,7 +1605,7 @@ jobs:
             type=raw,value=latest-debian,enable=${{ matrix.distro == 'debian' }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.5.1
+        uses: docker/login-action@v4.5.2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1608,7 +1613,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: steps.registries.outputs.dockerhub == 'true'
-        uses: docker/login-action@v4.5.1
+        uses: docker/login-action@v4.5.2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}

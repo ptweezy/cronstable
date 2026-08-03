@@ -160,28 +160,6 @@ def shoot_themes(page, scene, themes, clip=None):
     set_theme_live(page, "carolina")
 
 
-def shoot_fonts(page, scene, fonts=("mono", "sans"), clip=None):
-    """Shoot the staged scene under the interface-font options, all in the
-    default carolina theme. The mono shot keeps the plain `<scene>@carolina`
-    name; the sans shot gets a `<scene>-sans@carolina` name, so the reel can
-    pick either. Logs and cron strings stay monospace by design; the chrome,
-    job names and labels switch to the proportional sans."""
-    got = []
-    for f in fonts:
-        try:
-            set_select(page, "setFont", f)
-            page.wait_for_timeout(400)
-            name = scene if f == "mono" else f"{scene}-sans"
-            page.screenshot(path=str(OUT / f"{name}@carolina.png"), clip=clip)
-            manifest.setdefault(name, []).append("carolina")
-            got.append(f)
-            print(f"  [shot] {name}@carolina ({f})")
-        except Exception as e:
-            print(f"    {scene} font {f}: {e}")
-    set_select(page, "setFont", "mono")   # reset for the next scene
-    results[scene] = "ok" if got else "FAIL no frames"
-
-
 def shoot_combo(page, scene, combos, clip=None):
     """Shoot the staged scene under a list of (theme, font) pairs, driving both
     the theme picker and the font select live so the frame stays pixel-stable.

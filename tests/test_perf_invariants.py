@@ -11,7 +11,6 @@ every platform, on every matrix Python, in milliseconds.  This file is
 those five tests; benchmarks/README.md's waiver section points here.
 """
 
-import asyncio
 import os
 
 import pytest

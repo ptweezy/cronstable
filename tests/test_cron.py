@@ -314,6 +314,50 @@ async def test_concurrency_policy(policy):
                 await rj.cancel()
 
 
+@pytest.mark.asyncio
+async def test_concurrent_launches_cannot_double_start_a_forbid_job(
+    monkeypatch,
+):
+    # regression: the Forbid/Replace gate reads running_jobs several awaits
+    # BEFORE the launch appends to it (the cluster slot claim, the
+    # subprocess spawn inside start()), so two concurrent entries (a
+    # dashboard double-click, a manual start racing the scheduled fire)
+    # both saw the gate open and double-launched a Forbid job. The per-job
+    # launch lock serialises them: exactly one instance starts, the loser
+    # takes the ordinary Forbid drop.
+    cron = cronstable.cron.Cron(
+        None, config_yaml=CONCURRENT_JOB.format(policy="Forbid")
+    )
+    job = cron.cron_jobs["test"]
+
+    # widen the gate-to-append window deterministically: the first launch
+    # parks inside start() (a slow spawn) until released.
+    release = asyncio.Event()
+    real_start = RunningJob.start
+
+    async def slow_start(self):
+        await release.wait()
+        await real_start(self)
+
+    monkeypatch.setattr(RunningJob, "start", slow_start)
+    try:
+        first = asyncio.ensure_future(cron.maybe_launch_job(job))
+        second = asyncio.ensure_future(cron.maybe_launch_job(job))
+        # let both tasks run up to their park/lock-wait before releasing,
+        # so the second entry genuinely overlaps the first's spawn window.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        release.set()
+        results = await asyncio.gather(first, second)
+
+        assert sorted(results) == [False, True]
+        assert len(cron.running_jobs["test"]) == 1
+    finally:
+        for rj in list(cron.running_jobs.get("test", [])):
+            if rj.proc is not None and rj.proc.returncode is None:
+                await rj.cancel()
+
+
 FAILED_SPAWN_REPLACE_JOB = (
     "jobs:\n  - name: test\n"
     + yaml_command(["cronstable-no-such-binary-xyz"])
@@ -1050,7 +1094,9 @@ async def test_auth_middleware():
         def __init__(self, auth):
             self.headers = {"Authorization": auth} if auth else {}
             # the middleware consults these on non-bearer requests (the
-            # .ics query-token carve-out); a real request always has them
+            # .ics query-token carve-out, the preflight carve-out's method
+            # dispatch); a real request always has them
+            self.method = "GET"
             self.path = "/jobs"
             self.query = {}
             # the middleware files the matched token on the request
@@ -2050,6 +2096,7 @@ async def test_auth_middleware_public_path():
     class FakeRequest:
         def __init__(self, path, auth=None):
             self.path = path
+            self.method = "GET"
             self.headers = {"Authorization": auth} if auth else {}
 
     # the UI page is reachable without a token...
@@ -9074,58 +9121,6 @@ async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
 
 
 
-# --- CancelledError re-raise paths (defensive) -----------------------
-
-
-async def test_catchup_pause_excusal_window_reraises_cancelled(tmp_path):
-    cron = await _cron_with_watermark(tmp_path, None, onmissed="run-all")
-
-    async def boom(*a, **k):
-        raise asyncio.CancelledError()
-
-    cron.state_backend.list_records = boom  # type: ignore[method-assign]
-    with pytest.raises(asyncio.CancelledError):
-        await cron._pause_excusal_window("j")
-
-
-async def test_catchup_evaluate_catch_up_pause_pin_reraises_cancelled(tmp_path):
-    cron = await _cron_with_watermark(
-        tmp_path, "2026-07-01T10:00:00+00:00", onmissed="run-all"
-    )
-    cron._paused["j"] = _catchup_pause()
-
-    async def boom(name):
-        raise asyncio.CancelledError()
-
-    cron._pending_catchup_watermark = boom  # type: ignore[method-assign]
-    with pytest.raises(asyncio.CancelledError):
-        await cron._evaluate_catch_up(_NOW)
-
-
-async def test_catchup_reboot_gate_write_timeout_recheck_reraises_cancelled(
-    tmp_path,
-):
-    cron = await _catchup_reboot_cron(tmp_path)
-    cron._state_on_unavailable = "fail-closed"
-    seen = {"n": 0}
-
-    async def marker(job):
-        seen["n"] += 1
-        if seen["n"] == 1:
-            return False  # absent at the gate
-        raise asyncio.CancelledError()  # cancelled during the re-check
-
-    async def boom(*a, **k):
-        raise asyncio.TimeoutError()
-
-    cron._reboot_marker_covers = marker  # type: ignore[method-assign]
-    cron.state_backend.append_record = boom  # type: ignore[method-assign]
-    with pytest.raises(asyncio.CancelledError):
-        await cron._reboot_boot_gate(cron.cron_jobs["boot"])
-
-
-
-
 # ---------------------------------------------------------------------------
 # Cluster concurrency slot leasing.
 #   _log_cluster_role error swallow, maybe_launch_job cluster start-failure
@@ -10152,7 +10147,6 @@ async def test_slotlease_pursue_replace_polls_until_slot_frees(monkeypatch):
 # alongside the real happy-path behaviour so the in-memory maps are asserted.
 
 from cronstable.cron import JobRunInfo as _JRI5
-from cronstable.cron import _job_run_info_from_dict as _from_dict5
 from cronstable.fingerprint import job_digest as _job_digest5
 from tests.test_state import _UTC as _UTC5
 from tests.test_state import _state_cfg as _scfg5
@@ -11747,7 +11741,6 @@ async def test_retryclaim_claim_under_lease_durable_read_error_false(
         job = cron.cron_jobs["j"]
         foreign = _retryclaim_foreign(cron, job, host="node-a")
         await cron.state_backend.append_record("retries/j", foreign)
-        now = cronstable.cron.get_now(datetime.timezone.utc)
 
         async def _boom(name):
             raise OSError("ledger read fail")
@@ -11967,3 +11960,142 @@ async def test_retryclaim_reap_retry_task_logs_exception(caplog):
     with caplog.at_level(logging.ERROR, logger="cronstable"):
         cronstable.cron.Cron._reap_retry_task("j", task)
     assert any("retry task died" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Web-app lifecycle hardening from the 2026-08-02 review: an all-binds-failed
+# start must retry on the next housekeeping pass, a teardown must end open
+# SSE tails promptly, and a credential-less CORS preflight must reach the
+# /mcp OPTIONS route through the bearer gate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_web_app_retries_bind_after_all_listens_fail():
+    # A predecessor (here: a plain socket) still holds the only listen port,
+    # so every bind fails. web_config must NOT latch: the unchanged latch is
+    # what makes the next housekeeping pass retry, and latching it left the
+    # web API down for the daemon's life once the port freed.
+    import socket
+
+    blocker = socket.socket()
+    try:
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        port = blocker.getsockname()[1]
+        listen = {"listen": ["http://127.0.0.1:{}".format(port)]}
+        cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+        try:
+            await cron.start_stop_web_app(listen)
+            assert cron.web_runner is None  # torn down, nothing half-bound
+            assert cron.web_config is None  # not latched: a retry will run
+            blocker.close()  # the old holder exits; the port frees
+            await cron.start_stop_web_app(listen)  # the next pass
+            assert cron.web_runner is not None
+            assert cron.web_runner.addresses
+        finally:
+            await cron.start_stop_web_app(None)
+            await asyncio.sleep(0.25)
+    finally:
+        blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_web_teardown_ends_open_sse_tails_promptly(monkeypatch):
+    # An SSE log tail never finishes on its own: site.stop() only closes the
+    # listening socket and the 15s keep-alive pings keep succeeding on the
+    # established connection. Without the on_shutdown drain, a teardown
+    # blocked on aiohttp's 60s in-flight-handler wait, freezing the
+    # housekeeping loop (and with it every job launch) for the duration.
+    import aiohttp
+
+    from cronstable.job import JobOutputStream
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    live = JobOutputStream()
+    live.publish("stdout", "hello")  # replay content the client can sync on
+    monkeypatch.setattr(cron, "_job_output", lambda name: live)
+    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        session = aiohttp.ClientSession()
+        try:
+            resp = await session.get(base + "/jobs/alpha/logs")
+            # the replayed frame proves the tail handler is up and
+            # subscribed (frame shape: "event: <name>" then "data: <line>")
+            event_line = await resp.content.readline()
+            data_line = await resp.content.readline()
+            assert event_line.startswith(b"event:")
+            assert b"hello" in data_line
+            # teardown with the tail still open must complete promptly, not
+            # after aiohttp's 60s shutdown timeout.
+            await asyncio.wait_for(cron.start_stop_web_app(None), timeout=5)
+            # the handler ended the stream via the end-of-output path
+            rest = await resp.content.read()
+            assert b"event: end" in rest
+        finally:
+            await session.close()
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
+async def test_cors_preflight_reaches_mcp_options_through_auth():
+    # A browser preflight carries no Authorization by the Fetch standard, so
+    # the bearer gate must pass it through to the /mcp OPTIONS route, which
+    # enforces mcp.allowedOrigins itself; the POST that follows still
+    # authenticates normally.
+    import aiohttp
+
+    from cronstable.config import _build_mcp_config
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+        },
+        _build_mcp_config(
+            {
+                "enabled": True,
+                "allowedOrigins": ["https://inspector.example"],
+            }
+        ),
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        preflight = {
+            "Origin": "https://inspector.example",
+            "Access-Control-Request-Method": "POST",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.options(base + "/mcp", headers=preflight) as r:
+                assert r.status == 204
+                assert (
+                    r.headers["Access-Control-Allow-Origin"]
+                    == "https://inspector.example"
+                )
+                assert "Authorization" in (
+                    r.headers["Access-Control-Allow-Headers"]
+                )
+            # a foreign origin's preflight is refused by the route itself
+            async with session.options(
+                base + "/mcp",
+                headers={
+                    "Origin": "https://evil.example",
+                    "Access-Control-Request-Method": "POST",
+                },
+            ) as r:
+                assert r.status == 403
+            # the carve-out is preflights only: a bare OPTIONS keeps the 401
+            async with session.options(base + "/mcp") as r:
+                assert r.status == 401
+            # and the actual POST still requires the bearer
+            async with session.post(base + "/mcp", json={}) as r:
+                assert r.status == 401
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)

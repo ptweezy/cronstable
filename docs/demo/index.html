@@ -6357,9 +6357,24 @@ var qrcode = function() {
     if (t) h["Authorization"] = "Bearer " + t;
     return h;
   }
+  // Bound on any request that does not manage its own lifetime. A request
+  // that never settles (a half-open socket after a suspend or an expired
+  // NAT mapping) used to leave the poll guards' `refreshing` flags latched
+  // forever: every later poll early-returned while the header still showed
+  // "live" over indefinitely stale data.
+  const API_TIMEOUT_MS = 20000;
   async function apiFetch(path, opts) {
     opts = opts || {};
     opts.headers = authHeaders(opts.headers);
+    if (!opts.signal) {
+      // The SSE tails pass their own signal and are exempt (a tail is
+      // legitimately open-ended). The timer spans the body reads too (a
+      // pending .json() rejects on abort); firing after the response was
+      // fully consumed is a no-op.
+      const ctl = new AbortController();
+      opts.signal = ctl.signal;
+      setTimeout(() => ctl.abort(), API_TIMEOUT_MS);
+    }
     const res = await fetch(path, opts);
     if (res.status === 401) { openModal({ required: true }); throw new Error("unauthorized"); }
     return res;
@@ -7183,9 +7198,9 @@ var qrcode = function() {
       // client-side) but changes exactly when the target run changes, which
       // re-renders the "next at" cell (it has no per-second tick).
       j.scheduled_in == null ? "-" : Math.round((Date.now() / 1000 + nextRunSeconds(j)) / 60),
-      // schedule + reference frame render as cells, and a config reload can
-      // change either without touching any run-derived field.
-      j.schedule, tzCell(j),
+      // schedule + reference frame + command render as cells, and a config
+      // reload can change any of them without touching a run-derived field.
+      j.schedule, tzCell(j), j.command,
       j.last_run && j.last_run.finished_at, j.last_run && j.last_run.outcome,
       j.last_run && j.last_run.exit_code, j.last_run && j.last_run.duration,
       (j.history || []).map((h) => h.outcome + ":" + h.duration).join(","),
@@ -7202,6 +7217,12 @@ var qrcode = function() {
       j.retry ? j.retry.attempt + ":" + (j.retry.nextRetryAt || "") : "",
       j.slot ? (j.slot.held ? "h" : "w") + ":" + j.slot.refs : "",
       j.rebootPending ? "rb" : "",
+      // the live-resource chip re-samples every poll; sig the FORMATTED
+      // readout so the row rebuilds exactly when the displayed value
+      // changes (raw jitter below display precision stays a no-op).
+      j.running && j.running_resources
+        ? fmtPercent(j.running_resources.cpu_percent) + "/" + fmtBytes(j.running_resources.rss_bytes)
+        : "",
       // runtime pause + SLA state: the status cell, chips, the pause/resume
       // action button and the "next" cells all render from these.
       j.paused ? "p:" + (j.paused.until || "") + ":" + (j.paused.note || "") + ":" + (j.paused.by || "") : "",
@@ -8553,7 +8574,7 @@ var qrcode = function() {
       loadNode();
       loadDags();
       loadState();
-      if (state.drawerJob) renderDrawerMeta();
+      if (state.drawerJob) { renderDrawerMeta(); maybeReattachDrawerStream(); }
     } catch (e) {
       if (e.message !== "unauthorized") { setConnected(false); console.warn("loadJobs failed:", e); }
     } finally {
@@ -9515,6 +9536,21 @@ var qrcode = function() {
     } finally {
       if (state.stream === ctrl) state.stream = null;
     }
+  }
+
+  // The daemon closes a log stream when the tailed run's output ends (the
+  // multi-tail reconnects via its governor), so the drawer pane re-attaches
+  // here, poll-paced, whenever a run is producing output and no stream is
+  // live; without this the pane silently froze at the previous run's end
+  // and a retry's output never appeared. clear=true because attaching
+  // replays the run's whole retained buffer: clearing first repaints
+  // without duplicating a replay that already rendered.
+  function maybeReattachDrawerStream() {
+    if (!state.drawerJob || state.tab !== "logs" || state.stream) return;
+    const job = state.byName[state.drawerJob];
+    if (!job || !job.running) return;
+    if (!job.captureStdout && !job.captureStderr) return;
+    startStream(state.drawerJob, true);
   }
 
   function downloadLogs() {
