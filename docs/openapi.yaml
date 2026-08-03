@@ -228,7 +228,21 @@ paths:
                 type: object
                 properties:
                   name: { type: string }
-                  source: { type: string, enum: [durable, memory] }
+                  source:
+                    # Open enum (enum + bare string under anyOf, like
+                    # JobRun.outcome): a newer daemon may compute trends
+                    # from a source this list has not heard of yet, and
+                    # clients must keep decoding.
+                    description: >-
+                      Where the trend windows were computed from. Known
+                      values: durable, memory. The list is open: a newer
+                      daemon may send a value that is not on it, and
+                      clients must keep decoding and render the unknown
+                      value neutrally.
+                    anyOf:
+                      - type: string
+                        enum: [durable, memory]
+                      - type: string
                   generated_at: { type: string, format: date-time }
                   windows:
                     type: object
@@ -1191,7 +1205,21 @@ components:
         label: { type: string, nullable: true }
         scopes:
           type: array
-          items: { type: string, enum: [view, control, approve] }
+          items:
+            # Open enum (enum + bare string under anyOf, like
+            # JobRun.outcome): a newer daemon may grow the scope set, and
+            # clients must keep decoding. An unknown scope grants nothing
+            # the client recognizes; capability checks look for the known
+            # values only.
+            description: >-
+              Token scope. Known values: view, control, approve. The list
+              is open: a newer daemon may send a scope that is not on it,
+              and clients must keep decoding and simply not recognize the
+              unknown scope.
+            anyOf:
+              - type: string
+                enum: [view, control, approve]
+              - type: string
         allScopes: { type: boolean }
       required: [authenticated, scopes, allScopes]
 
@@ -1225,7 +1253,19 @@ components:
       description: One job's compact status.
       properties:
         job: { type: string }
-        status: { type: string, enum: [running, disabled, scheduled] }
+        status:
+          # Open enum (enum + bare string under anyOf, like JobRun.outcome):
+          # a newer daemon may add a status, and clients must keep decoding
+          # and render the unknown value neutrally.
+          description: >-
+            Job status. Known values: running, disabled, scheduled. The
+            list is open: a newer daemon may send a value that is not on
+            it, and clients must keep decoding and render the unknown
+            value neutrally.
+          anyOf:
+            - type: string
+              enum: [running, disabled, scheduled]
+            - type: string
         pid:
           type: array
           items: { type: integer }
