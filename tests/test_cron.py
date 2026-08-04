@@ -1425,6 +1425,89 @@ async def test_web_list_jobs_etag_304_and_invalidation():
     assert changed.headers["ETag"] != etag
 
 
+# enough tasks that the serialized graph clears the gzip minimum, so the
+# compression arm of the /dags conditional response is exercised for real
+_FAT_DAG = "dags:\n  - name: d\n    tasks:\n" + "".join(
+    "      - id: step-number-%02d\n        command: 'run step %02d'\n"
+    % (i, i)
+    for i in range(16)
+)
+
+
+def _hdr_req(inm=None, ae=None):
+    headers = {}
+    if inm is not None:
+        headers["If-None-Match"] = inm
+    if ae is not None:
+        headers["Accept-Encoding"] = ae
+
+    class Req:
+        pass
+
+    Req.headers = headers
+    return Req()
+
+
+@pytest.mark.asyncio
+async def test_web_list_dags_etag_304_and_gzip():
+    """GET /dags is the third leg of the dashboard's per-poll fan-out: it
+    must serve a content ETag, 304 an unchanged conditional poll instead of
+    re-shipping every task graph, move the tag when the payload changes, and
+    gzip a large body for a client that accepts it."""
+    import gzip as gzip_mod
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=_FAT_DAG)
+    cron.web_config = {}
+
+    first = await cron._web_list_dags(_hdr_req())
+    etag = first.headers["ETag"]
+    assert first.status == 200 and etag
+    assert first.headers["Vary"] == "Accept-Encoding"
+    payload = json.loads(first.text)
+    assert [d["name"] for d in payload] == ["d"]
+    assert len(payload[0]["tasks"]) == 16
+
+    # an unchanged conditional poll costs a 304, no body
+    not_modified = await cron._web_list_dags(_hdr_req(inm=etag))
+    assert not_modified.status == 304
+    assert not_modified.body in (None, b"")
+    assert not_modified.headers["ETag"] == etag
+
+    # a gzip-capable client gets the compressed representation of the same
+    # bytes (the graph is comfortably past the minimum with 16 tasks)
+    packed = await cron._web_list_dags(_hdr_req(ae="gzip"))
+    assert packed.status == 200
+    assert packed.headers.get("Content-Encoding") == "gzip"
+    assert packed.headers["ETag"] == etag
+    assert json.loads(gzip_mod.decompress(packed.body)) == payload
+
+    # a payload change moves the tag and the same conditional poll gets 200
+    cron.cron_dags["d"].enabled = False
+    changed = await cron._web_list_dags(_hdr_req(inm=etag))
+    assert changed.status == 200
+    assert changed.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_web_get_cluster_negotiates_gzip_but_never_etags():
+    """GET /cluster embeds freshly sampled node gauges, so a content tag
+    would churn per poll and never match: the handler must not emit one.
+    Gzip stays negotiated (with the size floor) and Vary rides along."""
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    resp = await cron._web_get_cluster(_hdr_req(ae="gzip"))
+    assert resp.status == 200
+    assert resp.headers.get("ETag") is None
+    assert resp.headers["Vary"] == "Accept-Encoding"
+    # the no-cluster payload is far below the gzip minimum: shipped plain
+    assert resp.headers.get("Content-Encoding") is None
+    assert json.loads(resp.text) == {"enabled": False, "peers": []}
+
+
 @pytest.mark.asyncio
 async def test_web_job_set_id():
     import json
@@ -1565,6 +1648,102 @@ def test_record_run_caps_history():
     assert hist[-1].exit_code == limit + 9
     # last_run mirrors the most recent recorded run
     assert cron.last_run["alpha"].exit_code == limit + 9
+
+
+def test_record_run_releases_superseded_ring():
+    # Only the newest finished run's output is replayable, so a superseded
+    # record must not keep its ring alive for the whole history window:
+    # before the release, 50 retained records x a 1000-line ring per job
+    # could pin gigabytes of unservable lines fleet-wide.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    first = _mk_run("success")
+    first.output.publish("stdout", "kept while newest")
+    first.output.publish("stderr", "and this one")
+    first.output.close()
+    cron._record_run("alpha", first)
+    # while newest, the ring is intact (this is what the log replay serves)
+    assert len(cron.last_run["alpha"].output.lines) == 2
+
+    second = _mk_run("failure")
+    second.output.publish("stdout", "the new newest")
+    second.output.close()
+    cron._record_run("alpha", second)
+
+    # the superseded record stays in history as a summary, but its ring is
+    # gone; the counters survive (history rows still show published totals).
+    assert cron.run_history["alpha"][0] is first
+    assert list(first.output.lines) == []
+    assert first.output.published == 2
+    # the newest record's ring is untouched
+    assert [line for _s, line in cron.last_run["alpha"].output.lines] == [
+        "the new newest"
+    ]
+
+
+_ARCHIVE_JOB = """
+jobs:
+  - name: a
+    command: echo hi
+    schedule: "*/5 * * * *"
+    captureStdout: true
+    archiveOutput: true
+"""
+
+
+class _GatedAppendBackend:
+    """A ledger stub whose appends wait for the test to open a gate.
+
+    Models a slow store: the fire-and-forget persist task is still parked on
+    its first append while later completions of the same job land.
+    """
+
+    def __init__(self):
+        self.appends = []
+        self.gate = asyncio.Event()
+
+    async def append_record(self, stream, record, prune_keep=None):
+        await self.gate.wait()
+        self.appends.append((stream, record))
+
+
+@pytest.mark.asyncio
+async def test_archive_snapshots_lines_at_record_time():
+    # The archive must write the lines the run had when it was RECORDED,
+    # not whatever the ring holds when the persist task finally runs: a
+    # back-to-back completion releases the superseded ring, and reading it
+    # late would archive nothing.
+    from tests.test_state import _drain_state_writes
+
+    cron = cronstable.cron.Cron(None, config_yaml=_ARCHIVE_JOB)
+    backend = _GatedAppendBackend()
+    cron.state_backend = backend
+
+    first = _mk_run("success")
+    first.output.publish("stdout", "one")
+    first.output.publish("stdout", "two")
+    first.output.close()
+    cron._record_run("a", first)
+
+    # the store has not accepted the first run's append yet when the next
+    # completion supersedes it and releases its ring
+    second = _mk_run("success")
+    second.output.publish("stdout", "three")
+    second.output.close()
+    cron._record_run("a", second)
+    assert list(first.output.lines) == []
+
+    backend.gate.set()
+    await _drain_state_writes(cron)
+
+    log_stream = cron._log_stream("a")
+    archived = [
+        rec for stream, rec in backend.appends if stream == log_stream
+    ]
+    assert [
+        [entry["line"] for entry in rec["lines"]] for rec in archived
+    ] == [["one", "two"], ["three"]]
+    # nothing was double-counted as evicted: the snapshot held every line
+    assert [rec["dropped_lines"] for rec in archived] == [0, 0]
 
 
 class _FakeMesh:
@@ -1711,7 +1890,7 @@ async def test_web_get_cluster_injects_local_node_stats():
     cron.cluster_manager = FakeMgr()
 
     class Req:
-        pass
+        headers: dict = {}
 
     resp = await cron._web_get_cluster(Req())
     data = json.loads(resp.text)
@@ -10451,7 +10630,10 @@ async def test_rehydrate_persist_counter_snapshot_unseeded(tmp_path):
 
 async def test_rehydrate_archive_output_no_backend():
     cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
-    await cron._archive_output(cron.cron_jobs["j"], _mem_run5("success", 0))
+    info = _mem_run5("success", 0)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
 
 
 # --- SLA last-success warm scan ---------------------------------------------

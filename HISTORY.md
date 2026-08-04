@@ -7,7 +7,8 @@ project, on which cronstable is based.
 
 ## 1.2.36 (2026-08-03)
 
-Defect fixes from a full-application review.
+Defect fixes from a full-application review, and the top findings of a
+performance review of the same tree.
 
 - Windows: cancelling a job (executionTimeout, Replace, shutdown, or the
   cancel API) now kills the process tree while its root is still alive.
@@ -62,6 +63,24 @@ Defect fixes from a full-application review.
 - CI: a fork pull request from a branch named `main` can no longer cancel
   an in-flight release, and the pyinstaller Docker build works from the
   repo-root context again.
+- A finished run's live-log ring buffer is released once a newer run
+  supersedes it. Only the newest run's logs are replayable, but every
+  retained history entry kept its full ring in memory anyway, so a
+  long-running daemon with chatty jobs slowly pinned unservable log
+  buffers, up to fifty rings per job.
+- Lease heartbeats skip the directory flush. A renew or release only moves
+  the expiry of a lease whose fence it keeps, and losing such a write to a
+  crash just means the lease expires a little earlier, so an idle HA pair
+  no longer spends tens of thousands of directory flushes a day
+  maintaining its election. Writes that issue or bump a fence keep the
+  full crash-durability barrier, and every lease write still flushes its
+  own bytes before the rename.
+- `GET /dags` answers an unchanged conditional poll with `304 Not
+  Modified` and compresses large bodies for clients that accept gzip;
+  `GET /cluster` compresses too. The per-dag run listing behind the
+  `/dags` rollup and the run drawer is additionally served from a short
+  memo between local changes, so dashboard polling of a quiet store no
+  longer performs one store listing per dag per poll per viewer.
 
 ## 1.2.35 (2026-07-27)
 

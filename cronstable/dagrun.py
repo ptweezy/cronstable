@@ -123,6 +123,19 @@ COMPLETION_RETRY_MAX_DELAY = 60.0
 #: cached) stays below this and reads only the few that changed.
 DAG_ROLLUP_BULK_THRESHOLD = 8
 
+#: How long one dag's run-summary LIST may be served from memory before the
+#: store is listed again.  The per-run summary cache above already avoids
+#: re-PARSING terminal runs, but the keys listing itself still hit the store
+#: once per dag per request: with the dashboard's /dags poll (and any open
+#: run drawer) that was N_dags listings every ~3s per viewer, forever, on a
+#: quiescent store.  Every LOCAL write funnels through _mutate/_delete_run_doc
+#: and pops the memo, so this-node changes render immediately; the TTL only
+#: bounds how late another node's writes appear in the index rollup, which is
+#: well inside the gossip staleness the fleet view already tolerates.  Sits
+#: beside the same tradeoff cron's per-job trends cache (5s TTL, busted on
+#: local completion) already made.
+DAG_SUMMARY_LIST_TTL = 5.0
+
 RunRef = Tuple[str, str]  # (dag_name, run_key)
 
 
@@ -211,6 +224,15 @@ class DagScheduler:
         # backend swap: run keys are deterministic, so the new store's runs
         # would otherwise read the old store's cached terminal state.
         self._dag_summary_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # dag name -> (monotonic stamp, summaries): the short-TTL memo over
+        # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
+        # a quiescent dag costs zero store listings between local writes.
+        # Popped by _mutate/_delete_run_doc (local changes must render at
+        # once), swept with the summary cache in forget(), and pruned of
+        # removed dags by list_dags.  See DAG_SUMMARY_LIST_TTL.
+        self._summaries_memo: Dict[
+            str, Tuple[float, List[Dict[str, Any]]]
+        ] = {}
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
@@ -288,10 +310,15 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return None, None
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             backend.mutate_document(self._ns(dag_name), key, transform),
             timeout=STATE_OP_TIMEOUT,
         )
+        # every local run-doc write funnels through here: pop the summary
+        # memo so this node's own changes (create, advance, finish, adopt)
+        # render on the very next poll instead of aging out by TTL.
+        self._summaries_memo.pop(dag_name, None)
+        return result
 
     async def _read(self, dag_name: str, key: str) -> Optional[Dict[str, Any]]:
         backend = self._backend()
@@ -2083,8 +2110,16 @@ class DagScheduler:
         owns ``schedule_str`` (avoiding a cron<->dagrun import cycle).
         """
         backend = self._backend()
+        # a reload that removed (or renamed) a dag must not leave its run
+        # summaries pinned in the caches for the life of the process; the
+        # live config is the authority on which keys may stay.
+        live = self._dags()
+        for stale in [k for k in self._summaries_memo if k not in live]:
+            del self._summaries_memo[stale]
+        for stale in [k for k in self._dag_summary_cache if k not in live]:
+            del self._dag_summary_cache[stale]
         out = []
-        for name, dagcfg in self._dags().items():
+        for name, dagcfg in live.items():
             entry: Dict[str, Any] = {
                 "name": name,
                 "enabled": dagcfg.enabled,
@@ -2195,6 +2230,31 @@ class DagScheduler:
         return self._rollup_from_summaries(summaries)
 
     async def _run_summaries(
+        self, backend: StateBackend, name: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Every retained run's summary, memoized for DAG_SUMMARY_LIST_TTL.
+
+        The memo serves the poll traffic of a QUIESCENT dag from memory:
+        without it the keys listing below still hit the store once per dag
+        per /dags poll (and per run-drawer refresh) per viewer.  A fresh
+        shallow copy is returned each time because list_runs sorts its
+        result in place.  Failures are never memoized, and local writes pop
+        the entry (see _mutate), so the TTL delays only remote nodes'
+        changes.
+        """
+        memo = self._summaries_memo.get(name)
+        if (
+            memo is not None
+            and time.monotonic() - memo[0] < DAG_SUMMARY_LIST_TTL
+        ):
+            return list(memo[1])
+        summaries = await self._run_summaries_uncached(backend, name)
+        if summaries is not None:
+            self._summaries_memo[name] = (time.monotonic(), summaries)
+            return list(summaries)
+        return None
+
+    async def _run_summaries_uncached(
         self, backend: StateBackend, name: str
     ) -> Optional[List[Dict[str, Any]]]:
         """Every retained run's summary, caching immutable terminal runs.
@@ -2436,6 +2496,9 @@ class DagScheduler:
             backend.delete_document(self._ns(name), run_key),
             timeout=STATE_OP_TIMEOUT,
         )
+        # the other local write shape (_mutate covers the rest): the memo
+        # must not keep serving a run the GC just deleted.
+        self._summaries_memo.pop(name, None)
         known = self._terminal_run_keys.get(name)
         if known is not None:
             # the key may legitimately come back (an operator backfill of the
@@ -2555,6 +2618,7 @@ class DagScheduler:
         # pass, but until then it suppresses adoption of the new store's runs,
         # so drop it here and bring that pass forward to now.
         self._dag_summary_cache.clear()
+        self._summaries_memo.clear()
         self._terminal_run_keys.clear()
         self._advance_again.clear()
         self._next_sched_check = 0.0

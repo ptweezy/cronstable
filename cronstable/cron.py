@@ -723,7 +723,11 @@ class JobRunInfo:
     """In-memory summary of a job's most recent finished run (web UI history).
 
     Retains the run's output stream so the UI can replay the last run's logs
-    after the job is no longer running. Never persisted to disk.
+    after the job is no longer running. Never persisted to disk. Only the
+    newest record's stream keeps its ring: when a later run supersedes this
+    one, :meth:`Cron._record_run` releases the ring (see
+    :meth:`cronstable.job.JobOutputStream.release_lines`), and the object
+    stays in ``run_history`` as the summary the history endpoints read.
     """
 
     outcome: str  # "success" | "failure"
@@ -1286,6 +1290,53 @@ def _jobs_conditional_response(
     if gzip_ok and len(body) >= _GZIP_MIN_BYTES:
         return etag, _gzip_body(body), True
     return etag, body, False
+
+
+def _cachable_json_response(
+    payload: Any,
+    *,
+    if_none_match: Optional[str],
+    gzip_ok: bool,
+    headers: Optional[Any] = None,
+    use_etag: bool = True,
+) -> web.Response:
+    """A :func:`_json_response` that can 304 and gzip, for the poll fan-out.
+
+    ``GET /jobs`` grew conditional responses first (see
+    :func:`_jobs_conditional_response`, which must hash a CANONICAL variant
+    because its payload carries a per-poll relative countdown); this is the
+    plain-shaped sibling for the OTHER polled endpoints, whose serialized
+    body already changes exactly when the displayed data does, so the tag
+    can simply hash the body bytes.  ``use_etag=False`` is for a payload
+    that legitimately changes on every request (``/cluster`` embeds this
+    node's freshly sampled CPU/memory), where a tag would be computed per
+    poll and never match; such a response still negotiates gzip.  ``Vary:
+    Accept-Encoding`` rides every response either way, compressed or not: a
+    shared cache that missed it would hand a gzipped body to a client that
+    cannot read one.  Serialization stays inline: these payloads are tens
+    of KB at the scales the endpoints see (dozens of dags, not thousands of
+    jobs), well under where /jobs' executor hop starts paying for itself.
+    """
+    try:
+        body = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        body = json.dumps(payload, default=str).encode("utf-8")
+    hdrs: Dict[str, str] = dict(headers) if headers else {}
+    hdrs["Vary"] = "Accept-Encoding"
+    if use_etag:
+        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+        hdrs["ETag"] = etag
+        if _etag_matches(if_none_match, etag):
+            return web.Response(status=304, headers=hdrs)
+    if gzip_ok and len(body) >= _GZIP_MIN_BYTES:
+        hdrs["Content-Encoding"] = "gzip"
+        body = _gzip_body(body)
+    return web.Response(
+        body=body,
+        status=200,
+        headers=hdrs,
+        content_type="application/json",
+    )
 
 
 def _sse_frame(stream_name: str, line: str) -> bytes:
@@ -2681,9 +2732,15 @@ class Cron:
 
     async def _web_get_cluster(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        return _json_response(
+        # no ETag: the payload embeds this node's freshly sampled CPU/memory,
+        # so a tag would churn every poll and 304 would never fire; gzip is
+        # the whole win here (peer summaries compress well).
+        return _cachable_json_response(
             self.cluster_payload(),
+            if_none_match=None,
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
             headers=self.web_config.get("headers", None),
+            use_etag=False,
         )
 
     async def _web_get_fleet(self, request: web.Request) -> web.Response:
@@ -5260,8 +5317,16 @@ class Cron:
         return dags
 
     async def _web_list_dags(self, request: web.Request) -> web.Response:
-        return _json_response(
-            await self.dags_payload(), headers=self._web_headers()
+        # Between run advances this body is byte-stable (static graphs plus
+        # the memoized rollup), and it is the third leg of the dashboard's
+        # per-poll fan-out: the conditional path lets an unchanged poll cost
+        # a 304 instead of re-shipping every dag's task graph, and a changed
+        # one ship gzipped.
+        return _cachable_json_response(
+            await self.dags_payload(),
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=self._web_headers(),
         )
 
     async def _web_dag_runs(self, request: web.Request) -> web.Response:
@@ -10925,6 +10990,7 @@ class Cron:
     def _record_run(self, name: str, info: JobRunInfo) -> None:
         # the latest finished run (for status/log replay) plus the bounded
         # history (for the dashboard's history/stats view); in-memory only.
+        prev = self.last_run.get(name)
         self.last_run[name] = info
         self.run_history[name].append(info)
         # this run changes the trends aggregate, so drop any cached payload
@@ -10962,7 +11028,37 @@ class Cron:
         # background task rather than an await here (this method is sync and on
         # the finished-job path). No-op on the stateless default.
         if self.state_backend is not None:
-            self._track_state_write(self._persist_run_record(name, info))
+            # The archive's line snapshot is taken HERE, synchronously, not
+            # inside the persist task: the task body runs after an arbitrary
+            # store latency, and by then a back-to-back completion (an Allow
+            # concurrency overlap, a sub-minute job outrunning a slow mount)
+            # can have superseded this record and released its ring below.
+            # A list of the ring's line tuples pins exactly the bytes the
+            # archive still needs, for exactly as long as it needs them.
+            job = self.cron_jobs.get(name)
+            archive_lines = (
+                list(info.output.lines)
+                if job is not None and job.archiveOutput
+                else None
+            )
+            self._track_state_write(
+                self._persist_run_record(name, info, archive_lines)
+            )
+        # Release the superseded record's ring buffer. Only the NEWEST
+        # finished run's output is ever replayable (_job_output serves
+        # last_run or a live instance), so the ring `prev` carries became
+        # unreachable the moment `info` replaced it, yet it would sit in
+        # run_history for up to RUN_HISTORY_LIMIT more completions. At the
+        # ring's own bounds that is up to 50x LIVE_LOG_LIMIT retained lines
+        # per job, gigabytes fleet-wide for chatty jobs, all unservable.
+        # The identity guards keep odd construction shapes safe (a re-record
+        # of the same info, or two records sharing one stream).
+        if (
+            prev is not None
+            and prev is not info
+            and prev.output is not info.output
+        ):
+            prev.output.release_lines()
 
     @staticmethod
     def _run_stream(name: str) -> str:
@@ -10993,7 +11089,12 @@ class Cron:
         """The durable stream name for this host's counter snapshots."""
         return COUNTER_STREAM_PREFIX + self._state_host
 
-    async def _persist_run_record(self, name: str, info: JobRunInfo) -> None:
+    async def _persist_run_record(
+        self,
+        name: str,
+        info: JobRunInfo,
+        archive_lines: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
         """Append one finished run to the durable ledger, prune, and archive.
 
         Runs as a background task (see :meth:`_record_run`).  Errors are logged
@@ -11002,7 +11103,13 @@ class Cron:
         as a noisy "task exception was never retrieved".  Pruning right after
         the append bounds the stream where it just grew, avoiding a per-minute
         fleet-wide scan.  When the job opts into ``archiveOutput`` the run's
-        captured output is archived too, in the same task.
+        captured output is archived too, in the same task, from
+        ``archive_lines``: the ring snapshot :meth:`_record_run` took at
+        record time.  The ring itself must not be read here, because the
+        record may have been superseded (and its ring released) while this
+        task waited on the store; ``None`` means the job did not archive at
+        record time, and a reload that flipped ``archiveOutput`` on since
+        then must not archive a ring this run never snapshotted.
         """
         backend = self.state_backend
         if backend is None:  # torn down between scheduling and running
@@ -11025,8 +11132,12 @@ class Cron:
                 timeout=STATE_OP_TIMEOUT,
             )
             job = self.cron_jobs.get(name)
-            if job is not None and job.archiveOutput:
-                await self._archive_output(job, info)
+            if (
+                job is not None
+                and job.archiveOutput
+                and archive_lines is not None
+            ):
+                await self._archive_output(job, info, archive_lines)
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             self.metrics.state_write_dropped("run-record")
             logger.warning(
@@ -11077,15 +11188,24 @@ class Cron:
                 "state: failed to persist the counter snapshot: %s", ex
             )
 
-    async def _archive_output(self, job: JobConfig, info: JobRunInfo) -> None:
+    async def _archive_output(
+        self,
+        job: JobConfig,
+        info: JobRunInfo,
+        raw: List[Tuple[str, str]],
+    ) -> None:
         """Write a finished run's captured output to the durable log store.
 
-        Opt-in per job (``archiveOutput``).  What is archived is the run's
-        live-tail ring buffer: the newest
-        :data:`cronstable.job.LIVE_LOG_LIMIT`
+        Opt-in per job (``archiveOutput``).  What is archived is ``raw``,
+        the record-time snapshot of the run's live-tail ring buffer: the
+        newest :data:`cronstable.job.LIVE_LOG_LIMIT`
         lines (each already bounded by ``maxLineLength``); older lines were
         evicted from the ring before archiving and are accounted for in the
-        record's ``dropped_lines`` rather than silently lost.  A job with
+        record's ``dropped_lines`` rather than silently lost.  The snapshot
+        (not the live ring) is what gets archived because the ring may
+        already have been released by a newer completion of the same job by
+        the time this write runs; ``info.output.published`` is still safe to
+        read late, since nothing publishes to a closed stream.  A job with
         ``saveLimit: 0`` (the operator's explicit "retain no output") archives
         nothing.  The lines are scrubbed of recognisable secrets
         (:func:`cronstable.redact.redact_lines`, which also tracks multi-line
@@ -11101,7 +11221,6 @@ class Cron:
         if job.saveLimit == 0:
             return
         redact = job.redactArchivedSecrets
-        raw = list(info.output.lines)
         if redact:
             # Executor-offloaded: the scrub is pure CPU over job-controlled
             # text (up to LIVE_LOG_LIMIT lines of maxLineLength each), and a

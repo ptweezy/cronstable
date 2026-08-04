@@ -169,9 +169,12 @@ class JobOutputStream:
     buffer of the most recent lines is retained so a viewer that connects
     mid-run, or just after the run finished, still sees recent context.
 
-    Nothing is ever written to disk: this lives only for as long as the run's
-    record is kept in memory, preserving cronstable's read-only-filesystem
-    deployment story.
+    Nothing is ever written to disk, preserving cronstable's
+    read-only-filesystem deployment story. The ring itself lives only while
+    this run is its job's newest (or still running): once a newer run's
+    record supersedes it the scheduler calls :meth:`release_lines`, because
+    nothing can replay a superseded ring and the bounded run history would
+    otherwise pin one full ring per retained record.
     """
 
     def __init__(self, limit: int = LIVE_LOG_LIMIT) -> None:
@@ -248,6 +251,22 @@ class JobOutputStream:
         # oldest line to make room) and the reader loop terminates.
         for queue in self._subscribers:
             self._offer(queue, None)
+
+    def release_lines(self) -> None:
+        """Drop the retained ring buffer; counters and subscribers stay.
+
+        Called when this run's record stops being its job's newest finished
+        run: the log endpoints replay only the newest finished run (or a
+        live one), so a superseded record's ring is unreachable payload,
+        yet each one held up to its full ring for as long as the record sat
+        in the bounded run history. That made steady-state memory scale
+        with history depth times ring size per job instead of one ring per
+        job. ``published``/``dropped`` are kept (they are plain counters,
+        still shown in history rows), and any still-attached subscriber
+        already received the end sentinel via :meth:`close`, so nothing
+        observes the lines vanishing.
+        """
+        self.lines.clear()
 
 
 #: Bytes pulled from a job's pipe per read.  ``StreamReader.read`` returns
