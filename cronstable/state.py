@@ -1508,7 +1508,9 @@ class FilesystemStateBackend(StateBackend):
                     raise
                 time.sleep(0.02 * (attempt + 1))
 
-    def _atomic_write(self, dest: str, payload: bytes) -> None:
+    def _atomic_write(
+        self, dest: str, payload: bytes, *, durable_rename: bool = True
+    ) -> None:
         """Write ``payload`` to ``dest`` via a temp file + atomic rename.
 
         The rename is atomic on a local filesystem, on Windows (os.replace),
@@ -1523,6 +1525,19 @@ class FilesystemStateBackend(StateBackend):
         rename itself is not crash-durable: a power loss could silently
         drop an acknowledged record, regress the derived watermark, and
         double-run jobs on the next boot.
+
+        ``durable_rename=False`` skips that directory barrier, for the one
+        write shape where losing the RENAME to a crash is harmless: a
+        same-fence lease refresh, where the pre-rename content is itself a
+        complete, valid, merely earlier state (see :meth:`_write_lease_file`).
+        The barrier is the only step skipped.  The temp-file fsync is kept
+        even then, because it protects against a different failure: a crash
+        that commits the rename but not the data leaves ``dest`` truncated
+        or empty, and a corrupt lease file fails every later acquire closed
+        (:meth:`_read_lease_file` cannot invent a fence).  Cheap-rename
+        heuristics (ext4 auto_da_alloc) make that window narrow on some
+        filesystems, but the lease protocol must not depend on which mount
+        it runs on.
         """
         tmp = self._tmp_path()
         try:
@@ -1537,7 +1552,8 @@ class FilesystemStateBackend(StateBackend):
             with contextlib.suppress(OSError):
                 os.unlink(tmp)
             raise
-        fsync_directory(os.path.dirname(dest))
+        if durable_rename:
+            fsync_directory(os.path.dirname(dest))
 
     def _makedirs_durable(self, path: str) -> None:
         """``os.makedirs(path, exist_ok=True)``, but crash-durably.
@@ -2413,15 +2429,31 @@ class FilesystemStateBackend(StateBackend):
                 raise _LeaseUnreadable(str(ex)) from ex
             return None
 
-    def _write_lease_file(self, lease_path: str, lease: Lease) -> None:
+    def _write_lease_file(
+        self, lease_path: str, lease: Lease, *, durable: bool = True
+    ) -> None:
         # trusted: a Lease is built entirely from this process's own strings,
         # ints and clock reads (see Lease.to_dict), never job or store data,
         # and this write runs on EVERY renew of every lease (~10s cadence),
         # so it skips the recursive portability pre-walk.
+        #
+        # ``durable=False`` is passed by exactly the writes that keep the
+        # fence: a renew, a release, and the same-holder still-valid acquire.
+        # Those only move ``expiresAt``, and a crash that loses the rename
+        # merely restores an EARLIER expiry: the lease expires sooner, a
+        # rival's takeover bumps the fence through the durable path, and the
+        # stale holder's writes are fenced off exactly as designed.  Every
+        # fence-CHANGING write keeps the full barrier, because acknowledging
+        # a fence and then losing it would re-issue the same fence to the
+        # next acquirer and defeat stale-writer detection.  The distinction
+        # matters at scale: elections renew every ttl/3 and every cluster
+        # slot and DAG advance lease every ~10s, so the barrier here was a
+        # continuous, wear-level fsync load (tens of thousands a day on an
+        # idle HA pair) buying durability for a value whose loss is safe.
         payload = _json.dumps_bytes(
             lease.to_dict(), sort_keys=True, trusted=True
         )
-        self._atomic_write(lease_path, payload)
+        self._atomic_write(lease_path, payload, durable_rename=durable)
 
     async def acquire_lease(
         self, name: str, holder: str, ttl: float
@@ -2471,7 +2503,15 @@ class FilesystemStateBackend(StateBackend):
                 expires_at=now + ttl,
             )
             try:
-                self._write_lease_file(lease_path, lease)
+                # Durable exactly when the fence CHANGES (first issue or
+                # takeover bump); the same-holder still-valid arm above is a
+                # renew in acquire clothing and gets the renew's cheap write
+                # (see _write_lease_file).
+                self._write_lease_file(
+                    lease_path,
+                    lease,
+                    durable=current is None or fence != current.fence,
+                )
             except OSError as ex:
                 # a write that cannot land (Windows sharing violation past
                 # the retries, a read-only blip) means we did NOT acquire:
@@ -2523,7 +2563,9 @@ class FilesystemStateBackend(StateBackend):
                 expires_at=_now() + ttl,
             )
             try:
-                self._write_lease_file(lease_path, renewed)
+                # fence unchanged by construction (the guard above requires
+                # current.fence == lease.fence): the cheap write applies.
+                self._write_lease_file(lease_path, renewed, durable=False)
             except OSError as ex:
                 # cannot persist the extension: the holder must treat the
                 # renew as failed (fail closed), not crash on it.
@@ -2555,6 +2597,9 @@ class FilesystemStateBackend(StateBackend):
                 # is the fence counter's only home, and deleting it would
                 # reset the next acquire to fence=1, re-issuing fence values
                 # already handed out and defeating stale-writer detection.
+                # Cheap write: the fence is kept, and a release lost to a
+                # crash just leaves the lease to expire by TTL, the same
+                # outcome as the unreadable-lease arm above.
                 with contextlib.suppress(OSError):
                     self._write_lease_file(
                         lease_path,
@@ -2564,6 +2609,7 @@ class FilesystemStateBackend(StateBackend):
                             fence=lease.fence,
                             expires_at=0.0,
                         ),
+                        durable=False,
                     )
 
     async def read_lease(self, name: str) -> Optional[Lease]:

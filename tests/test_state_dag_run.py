@@ -605,6 +605,61 @@ async def test_list_dags_caches_terminal_runs(tmp_path):
         await _teardown(cron)
 
 
+async def test_list_dags_memoizes_the_keys_listing(tmp_path, monkeypatch):
+    # The per-run summary cache (above) stops re-PARSING terminal runs, but
+    # the namespace keys listing itself still hit the store once per dag per
+    # request: the dashboard's ~3s /dags poll on a quiescent store. The
+    # short-TTL memo must absorb repeat listings, share them with list_runs,
+    # drop out on a local write, and honour its TTL.
+    from cronstable import dagrun as dagrun_mod
+
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        rk = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", rk)
+        assert body["state"] == dag.SUCCESS
+
+        backend = cron.state_backend
+        listings = []
+        real_keys = backend.list_document_keys
+
+        async def counting_keys(ns):
+            listings.append(ns)
+            return await real_keys(ns)
+
+        backend.list_document_keys = counting_keys
+
+        # the run's own writes popped the memo, so the first poll lists once
+        first = await cron._dag.list_dags()
+        assert next(d for d in first if d["name"] == "lin")["totalRuns"] == 1
+        assert len(listings) == 1
+
+        # repeat polls inside the TTL are served from the memo: no listing,
+        # and list_runs rides the same memo as the /dags rollup.
+        again = await cron._dag.list_dags()
+        assert next(d for d in again if d["name"] == "lin")["totalRuns"] == 1
+        runs = await cron._dag.list_runs("lin")
+        assert [r["state"] for r in runs] == [dag.SUCCESS]
+        assert len(listings) == 1
+
+        # a local write (a new run document) must render on the very next
+        # poll: the memo is popped, so the store is listed again.
+        await cron._dag.trigger_run("lin")
+        fresh = await cron._dag.list_dags()
+        assert next(d for d in fresh if d["name"] == "lin")["totalRuns"] == 2
+        assert len(listings) == 2
+
+        # and the memo expires: with the TTL forced to zero every poll
+        # lists again (the other-nodes-wrote freshness bound).
+        monkeypatch.setattr(dagrun_mod, "DAG_SUMMARY_LIST_TTL", 0.0)
+        await cron._dag.list_dags()
+        assert len(listings) == 3
+    finally:
+        await _teardown(cron)
+
+
 async def test_parallel_completions_recorded_in_one_batched_rmw(
     tmp_path, monkeypatch
 ):
