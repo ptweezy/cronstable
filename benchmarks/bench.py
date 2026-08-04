@@ -4627,6 +4627,12 @@ def bench_webapi_jobs_payload():
         request = _mocked_get("/jobs")
         t0 = time.perf_counter()
         for _ in range(20):
+            # Keep measuring the BUILD: the cross-poller response memo
+            # would otherwise serve 19 of these 20 straight from cache and
+            # the metric would stop gating the payload/encode cost its id
+            # promises. A plain attribute write, so on a release predating
+            # the memo it sets an unread attr and changes nothing.
+            cron._jobs_response_cache = None
             await cron._web_list_jobs(request)
         return time.perf_counter() - t0
 

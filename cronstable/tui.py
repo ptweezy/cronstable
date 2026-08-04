@@ -2426,6 +2426,9 @@ class App:
         self.press_suggest: Dict[str, Dict[str, Any]] = {}
         self.press_computed = 0.0
         self._press_busy = False
+        # heat overlay load in flight (spawned off the poll path; the flag
+        # stops a slow load from being double-spawned past the 60s gate)
+        self._heat_busy = False
         # week calendar: 7-day fire outlook computed locally, like pressure
         self.week: Optional[Dict[str, Any]] = None
         self.week_computed = 0.0
@@ -2720,6 +2723,14 @@ class App:
         self.verdict, self.incident_set = verdict_info(self.jobs, alert)
         self.mark()
 
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+        # in the base class (not AppActions) because the poll loop's fanout
+        # spawns the heat load through it too, not only user actions.
+        task: "asyncio.Task[None]" = asyncio.get_running_loop().create_task(
+            coro
+        )
+        task.add_done_callback(lambda t: t.exception())
+
     async def _fanout(self) -> None:
         with contextlib.suppress(Exception):
             self.cluster = await self.api.get_json("/cluster")
@@ -2732,7 +2743,14 @@ class App:
             with contextlib.suppress(Exception):
                 self.state_data = await self.api.get_json("/state")
         if self.is_open("heat") and (time.monotonic() - self.heat_loaded > 60):
-            await self._load_heat()
+            # spawned, never awaited: this fans out one /runs request per
+            # visible job, and awaiting it inline froze the whole poll
+            # pipeline (jobs table, verdict, header) for the sum of the
+            # round trips whenever the overlay was open. The busy flag
+            # covers the window where a slow load outlives the 60s gate.
+            if not self._heat_busy:
+                self._heat_busy = True
+                self._spawn(self._load_heat())
         if self.is_open("press") and (
             time.monotonic() - self.press_computed > 60
         ):
@@ -2829,14 +2847,36 @@ class App:
             self.dags = data if isinstance(data, list) else []
 
     async def _load_heat(self) -> None:
-        """Batch /jobs/{name}/runs for the punchcard (capped, cached)."""
-        self.heat_loaded = time.monotonic()
-        for job in self.jobs[:40]:  # same spirit as the web page's cap
-            name = job.get("name", "")
-            with contextlib.suppress(Exception):
-                data = await self.api.get_json("/jobs/%s/runs" % _quote(name))
-                self.heat_data[name] = data.get("runs", [])
-        self.mark()
+        """Batch /jobs/{name}/runs for the punchcard (capped, cached).
+
+        Runs as a spawned task (see _fanout) with a few requests in
+        flight at a time: strictly sequential awaits cost sum-of-RTTs
+        (seconds against a remote daemon), while an unbounded gather
+        would slam the daemon with the whole burst at once.
+        """
+        try:
+            self.heat_loaded = time.monotonic()
+            gate = asyncio.Semaphore(5)
+
+            async def fetch(job: Dict[str, Any]) -> None:
+                name = job.get("name", "")
+                async with gate:
+                    with contextlib.suppress(Exception):
+                        data = await self.api.get_json(
+                            "/jobs/%s/runs" % _quote(name)
+                        )
+                        self.heat_data[name] = data.get("runs", [])
+
+            # same spirit as the web page's cap
+            await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
+            # a job removed (or renamed) by a reload never refreshes its
+            # entry again; without this prune a long session with name
+            # churn accretes one dead run-list payload per old name.
+            for stale in [k for k in self.heat_data if k not in self.by_name]:
+                del self.heat_data[stale]
+            self.mark()
+        finally:
+            self._heat_busy = False
 
     def _pressure_entries(self) -> List[ScheduleEntry]:
         """Analyzable rows from the /jobs and /dags snapshots.
@@ -3578,12 +3618,6 @@ class AppActions(App):
             self.toast("fail", "save failed: %s" % exc)
             return
         self.toast("ok", "saved %s" % path)
-
-    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
-        task: "asyncio.Task[None]" = asyncio.get_running_loop().create_task(
-            coro
-        )
-        task.add_done_callback(lambda t: t.exception())
 
 
 # ===================================================================

@@ -126,6 +126,15 @@ LEASES_DIR = "leases"
 QUARANTINE_DIR = "quarantine"
 TMP_DIR = "tmp"
 DOCS_DIR = "docs"
+
+#: The document-namespace prefix jobstate's idempotency keys live under.
+#: Mirrors ``cronstable.jobstate.IDEM_NS_PREFIX`` (that module layers ON
+#: TOP of this one, so importing it here would cycle); a drift guard in
+#: tests/test_state.py pins the two equal.  The GC's expired-claim sweep
+#: (:meth:`FilesystemStateBackend._gc_idem_docs_sync`) recognises the
+#: namespaces to sweep by this prefix and must never guess wider: every
+#: other ``docs/`` namespace (KV, cursors, DAG runs) is durable state.
+_IDEM_DOC_NS_PREFIX = "idem/"
 BLOBS_DIR = "blobs"
 
 # Worker-thread concurrency caps (see :meth:`FilesystemStateBackend._call`).
@@ -3080,6 +3089,11 @@ class FilesystemStateBackend(StateBackend):
             self._derive_max_invalidate(token)
             self._prune_countdown_forget(token)
             self._record_name_floor_forget(token)
+        # Before the orphan-lock sweep on purpose: an idempotency doc this
+        # pass deletes leaves its ``.lock`` behind (same NFS ghost-inode
+        # rationale as DOC_DELETE), and the lock sweep of a LATER pass
+        # reclaims it once idle past grace.
+        idem_docs_removed = self._gc_idem_docs_sync(cutoff, dry_run)
         leases_removed = self._gc_leases_sync(
             cutoff, dry_run, ephemeral_lease_prefixes
         )
@@ -3096,11 +3110,91 @@ class FilesystemStateBackend(StateBackend):
             "removed": removed_streams,
             "records_removed": removed_records,
             "streams_kept": kept_streams,
+            "idem_docs_removed": idem_docs_removed,
             "leases_removed": leases_removed,
             "locks_removed": locks_removed,
             "tmp_removed": tmp_removed,
             "quarantine_removed": quarantine_removed,
         }
+
+    def _gc_idem_docs_sync(self, cutoff: float, dry_run: bool) -> int:
+        """Sweep idempotency documents whose TTL lapsed a whole grace ago.
+
+        A ``ttl > 0`` idempotency claim (jobstate.idempotency_claim) leaves
+        its ``.doc`` behind after expiry: expiry only permits a re-win, and
+        the documented per-event key pattern ("order-12345") mints a new
+        doc pair per event, so a busy dedupe scope grew a flat namespace
+        directory without bound (~750k files/year at 1k keys/day),
+        degrading every doc listing, inventory walk and backup forever.
+        An EXPIRED claim is provably dead weight: the store would already
+        let any caller re-win it, so deleting it changes no outcome.
+
+        Only docs under the idempotency namespace prefix are considered;
+        permanent claims (``ttl == 0``, no ``expiresAt``) and anything
+        unreadable (unclassifiable) are kept.  Each candidate is re-judged
+        under its own document flock so a claim re-won between the free
+        pre-check and the delete is never lost.  No per-file directory
+        fsync: a deletion resurrected by a power loss brings back an
+        EXPIRED doc, which is still re-winnable and gets re-deleted next
+        pass, unlike the active-claim DOC_DELETE whose loss un-does a
+        release.  The ``.lock`` side-files are left to the orphan-lock
+        sweep, which already owns lock reclamation and its NFS caveats.
+        """
+        removed = 0
+        docs_root = os.path.join(self.base, DOCS_DIR)
+        idem_token_prefix = _fs_safe_fragment(_IDEM_DOC_NS_PREFIX)
+        try:
+            ns_tokens = os.listdir(docs_root)
+        except OSError:
+            return 0
+        for ns_token in ns_tokens:
+            if not ns_token.startswith(idem_token_prefix):
+                continue
+            ns_dir = os.path.join(docs_root, ns_token)
+            if not os.path.isdir(ns_dir):
+                continue
+            try:
+                names = os.listdir(ns_dir)
+            except OSError:
+                continue
+            for name in names:
+                if not name.endswith(".doc"):
+                    continue
+                doc_path = os.path.join(ns_dir, name)
+                body = self._read_doc_file(doc_path)
+                if not self._idem_doc_expired(body, cutoff):
+                    continue
+                if dry_run:
+                    removed += 1
+                    continue
+                lock_path = doc_path[: -len(".doc")] + ".lock"
+                try:
+                    with self._locked(lock_path):
+                        body = self._read_doc_file(doc_path)
+                        if not self._idem_doc_expired(body, cutoff):
+                            continue  # re-won since the free pre-check
+                        with contextlib.suppress(FileNotFoundError):
+                            self._unlink(doc_path)
+                        removed += 1
+                except OSError:
+                    continue  # a held or unopenable lock: next pass
+        return removed
+
+    @staticmethod
+    def _idem_doc_expired(
+        body: Optional[Dict[str, Any]], cutoff: float
+    ) -> bool:
+        """Whether an idempotency doc's TTL lapsed before ``cutoff``.
+
+        ``None`` (absent or unreadable) and a missing/non-numeric
+        ``expiresAt`` (a permanent claim, or a doc this build cannot
+        classify) are never expired: the sweep must only ever delete what
+        it can prove dead.
+        """
+        if body is None:
+            return False
+        expires = body.get("expiresAt")
+        return isinstance(expires, (int, float)) and expires <= cutoff
 
     def _lease_dead_past_grace(self, lease_path: str, cutoff: float) -> bool:
         """Whether a lease was provably dead for the whole grace window.

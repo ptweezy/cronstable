@@ -98,6 +98,41 @@ performance review of the same tree.
   many jobs. The fork/exec setup is synchronous work on the event loop,
   and an ungated 500-job burst occupied it for up to a second each minute
   boundary while web requests and cluster heartbeats waited.
+- One built `GET /jobs` response (payload, ETag, body, gzip) is shared
+  across every poller for up to a second, and locally recorded runs,
+  launches, pauses and reloads rebuild it immediately. A wallboard plus N
+  dashboard tabs used to cost N identical builds per poll cycle.
+- The state garbage collector sweeps idempotency documents whose TTL
+  lapsed a whole grace window ago. An expired claim is already
+  re-winnable, but its document stayed on disk forever, so the documented
+  per-event dedupe pattern grew a flat directory without bound.
+- Job output mirrored to the daemon's own stdout/stderr is written by a
+  dedicated thread with a bounded queue. The write used to run on the
+  event loop, so a consumer that stopped reading (a stopped
+  `docker logs`, a suspended console) froze the entire daemon; now it
+  wedges only the mirror, which sheds oldest batches until the consumer
+  drains.
+- Dashboard: the header mark's glow is applied per drawn primitive
+  instead of on the whole svg, whose animated geometry forced a
+  near-half-viewport filter re-raster every frame; the per-second
+  relative-time sweep skips cells whose text did not change; the
+  secondary poll fetches (`/cluster`, `/node`, `/dags`, `/state`) skip a
+  cycle while their previous request is still in flight instead of
+  stacking connections against the browser's per-origin cap; and the
+  balance-recovery planner skips a frame after any pass that overran its
+  budget, so weak machines drop to half-rate planning instead of dropped
+  frames (validated by a knockover Monte Carlo: 24 of 24 seeds caught
+  and held at forced half rate; `planBudgetMs: 0` pins the budget off
+  for deterministic captures).
+- A live SSE log tail delivers a burst of lines as one joined write per
+  wake instead of one timer task, one frame build and one transport
+  write per line per viewer, which cost the scheduler's loop thousands
+  of coroutine steps a second under a chatty job.
+- TUI: the heat overlay's per-job run fetches run as a background task
+  with a few requests in flight, instead of strictly one at a time
+  inside the poll loop, which froze every panel for the sum of up to 40
+  round trips each refresh; entries for jobs removed by a reload are
+  pruned.
 
 ## 1.2.35 (2026-07-27)
 
