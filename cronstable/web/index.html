@@ -418,7 +418,14 @@
      so the balanced pendulum IS the letter. the svg is absolutely positioned
      by CronstableLogo.mountGlyph — zero layout impact; the swing plays out
      inside the header's padding band. without JS the span just prints its l. */
-  .brand .mark svg { display: block; filter: drop-shadow(0 0 5px var(--glow)); }
+  /* glow per drawn primitive, not on the svg element: the svg spans to
+     mid-page for the dynamic gate and its geometry mutates every animation
+     frame, so an element-level filter re-rasterized a near-half-viewport
+     region at frame rate forever. Per-child shadows keep each filter
+     region primitive-sized; the static rails still carry one but never
+     mutate, so they re-raster only on theme or resize. */
+  .brand .mark svg { display: block; }
+  .brand .mark svg > * { filter: drop-shadow(0 0 5px var(--glow)); }
   .brand h1 { font-size: 15px; font-weight: 700; margin: 0; letter-spacing: .5px; cursor: default; }
   .brand .tm { font-size: 9px; color: var(--fg-faint); margin-left: -6px; transform: translateY(-4px); cursor: default; user-select: none; }
   /* header text can't be selected, so these copy their value on click instead */
@@ -2478,7 +2485,29 @@
       const inRegion = this.connected &&
         E > EUP * 0.75 && E < EUP * 1.9 && Math.abs(z2) < 1.35 && Math.abs(this.s[3]) < 7;
       if (!inRegion) { this.plan = null; this.cem = null; return; }
-      this._cemFrame();
+      // one anytime-CEM iteration per frame, frame-budgeted: when the last
+      // pass ran long (a weak machine, a throttled tab), the next frame
+      // executes the standing plan instead of planning again. The
+      // (mean, sigma) warm start and the planAge bookkeeping carry across
+      // the gap untouched (the next pass shifts the mean by the WHOLE
+      // executed amount), so a skipped frame costs one slightly stale
+      // plan, never phase; the rollout-verified catch gate below still
+      // runs every frame either way. opts.planBudgetMs: 0 disables the
+      // budget, because it is the one place wall-clock feeds back into
+      // the trajectory; a deterministic rig (the README loop capture, a
+      // seeded MC) must pin it off or identical seeds can diverge on a
+      // loaded machine. Validated by MC: forced alternate-frame planning
+      // still caught and held 24/24 knockover seeds.
+      const planBudget =
+        this.opts.planBudgetMs === undefined ? 5 : this.opts.planBudgetMs;
+      if (this._planDebt) {
+        this._planDebt = false;
+      } else {
+        const planT0 = performance.now();
+        this._cemFrame();
+        this._planDebt =
+          planBudget > 0 && performance.now() - planT0 > planBudget;
+      }
       if (this.t - this.lastVerify > VERIFY_COOLDOWN && this._vCost(this.s) < ENGAGE_GATE) {
         this.lastVerify = this.t;
         if (this._tryCatch()) this._toMode("balance");
@@ -6334,16 +6363,22 @@ var qrcode = function() {
     // value. A foreground wallboard (the common case) has hidden === false and
     // is unaffected.
     if (document.hidden) return;
-    document.querySelectorAll("[data-ago]").forEach((e) => { e.textContent = fmtAgo(e.getAttribute("data-ago")); });
+    // Compare before writing, in every sweep below: most relative strings
+    // ("5m ago") change once a minute or slower, yet an unconditional
+    // assignment replaces the text node and dirties layout every second
+    // for every cell — 1000+ writes/s on a large fleet, forever. An equal
+    // string skips the write and the browser does nothing at all.
+    const put = (e, s) => { if (e.textContent !== s) e.textContent = s; };
+    document.querySelectorAll("[data-ago]").forEach((e) => { put(e, fmtAgo(e.getAttribute("data-ago"))); });
     // fleet matrix ages (compact "5m" form): kept live here so renderFleet can
     // skip its full nodes x jobs rebuild when the payload is otherwise unchanged
     // without freezing the "N ago" readouts.
-    document.querySelectorAll("[data-ago-short]").forEach((e) => { e.textContent = agoShort(e.getAttribute("data-ago-short")); });
+    document.querySelectorAll("[data-ago-short]").forEach((e) => { put(e, agoShort(e.getAttribute("data-ago-short"))); });
     // DAG/state relative cells: epoch-second "ago", and live countdowns to an
     // ISO instant (retry ladder) or an epoch instant (sensor poke / lease).
-    document.querySelectorAll("[data-ago-epoch]").forEach((e) => { e.textContent = agoEpoch(parseFloat(e.getAttribute("data-ago-epoch"))); });
-    document.querySelectorAll("[data-until-epoch]").forEach((e) => { e.textContent = untilEpoch(parseFloat(e.getAttribute("data-until-epoch"))); });
-    document.querySelectorAll("[data-until-iso]").forEach((e) => { e.textContent = fmtIn((new Date(e.getAttribute("data-until-iso")).getTime() - Date.now()) / 1000); });
+    document.querySelectorAll("[data-ago-epoch]").forEach((e) => { put(e, agoEpoch(parseFloat(e.getAttribute("data-ago-epoch")))); });
+    document.querySelectorAll("[data-until-epoch]").forEach((e) => { put(e, untilEpoch(parseFloat(e.getAttribute("data-until-epoch")))); });
+    document.querySelectorAll("[data-until-iso]").forEach((e) => { put(e, fmtIn((new Date(e.getAttribute("data-until-iso")).getTime() - Date.now()) / 1000)); });
     // a stale wallboard must not keep counting its tiles down toward runs it
     // cannot verify (they'd tick to "now" and stick) -- freeze those cells at
     // an explicit marker instead. body.tv hides the job table, so while the
@@ -6354,8 +6389,8 @@ var qrcode = function() {
       // both surfaces attach data-next only to live-countdown cells now; the
       // running/disabled/paused guard catches a job that flipped state since render
       if (!job) return;
-      if (job.running || !job.enabled || job.paused) { e.textContent = "—"; return; }
-      e.textContent = wbStale ? "stale" : fmtIn(nextRunSeconds(job));
+      if (job.running || !job.enabled || job.paused) { put(e, "—"); return; }
+      put(e, wbStale ? "stale" : fmtIn(nextRunSeconds(job)));
     });
     $("clock").textContent = utcClock();
     if (prefs.radar) renderRadar();
@@ -7573,6 +7608,14 @@ var qrcode = function() {
   //  data loading + notifications
   // ===================================================================
   let refreshing = false;
+  // One in-flight request per secondary poll endpoint. The seq counters in
+  // each loader already keep out-of-order APPLIES safe, but nothing stopped
+  // LAUNCHING a new fetch while the last still ran, so a slow daemon
+  // accumulated overlapping requests against the browser's ~6-per-origin
+  // connection cap (which the held SSE tails already lean on, see TAIL_MAX)
+  // exactly when it could least afford them. A poll cycle that finds its
+  // predecessor still pending simply skips this endpoint until it settles.
+  const secondaryInFlight = { cluster: false, node: false, dags: false, state: false };
   async function loadJobs() {
     if (refreshing) return;
     refreshing = true;
@@ -7616,6 +7659,8 @@ var qrcode = function() {
   // Live node CPU/memory meter in the header (GET /node). Best-effort: a
   // failed fetch or a node without psutil just leaves the meter empty (hidden).
   async function loadNode() {
+    if (secondaryInFlight.node) return;
+    secondaryInFlight.node = true;
     try {
       const res = await apiFetch("/node");
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -7623,6 +7668,8 @@ var qrcode = function() {
       renderNodeMeter(data.resources);
     } catch (e) {
       if (e.message !== "unauthorized") $("nodeMeter").innerHTML = "";
+    } finally {
+      secondaryInFlight.node = false;
     }
   }
   function renderNodeMeter(r) {
@@ -9466,6 +9513,8 @@ var qrcode = function() {
   // ---- DAG index card ----
   let dagReqSeq = 0, dagAppliedSeq = 0;
   async function loadDags() {
+    if (secondaryInFlight.dags) return;
+    secondaryInFlight.dags = true;
     const seq = ++dagReqSeq;
     try {
       const r = await apiFetch("/dags");
@@ -9480,6 +9529,7 @@ var qrcode = function() {
       renderDagCard();
       if (state.dagDrawer.dag) renderDagDrawerHead();
     } catch (e) { if (e.message !== "unauthorized") console.warn("loadDags failed:", e); }
+    finally { secondaryInFlight.dags = false; }
   }
   function renderDagCard() {
     const dags = state.dags.list;
@@ -10061,6 +10111,8 @@ var qrcode = function() {
     // backend exists; after that, only poll while the inspector is open (the
     // inventory walk is not free).
     if (!prefs.stateInsp && state.stateInsp.probed) return;
+    if (secondaryInFlight.state) return;
+    secondaryInFlight.state = true;
     const seq = ++stateSeq;
     try {
       const r = await apiFetch("/state");
@@ -10073,6 +10125,7 @@ var qrcode = function() {
       state.stateInsp.data = data;
       renderStateCard();
     } catch (e) { if (e.message !== "unauthorized") console.warn("loadState failed:", e); }
+    finally { secondaryInFlight.state = false; }
   }
   function renderStateCard() {
     const data = state.stateInsp.data;
@@ -10726,6 +10779,8 @@ var qrcode = function() {
   // response older than the newest one already applied (UI, alert, swimlane).
   let clusterReqSeq = 0, clusterAppliedSeq = 0;
   async function loadCluster() {
+    if (secondaryInFlight.cluster) return;
+    secondaryInFlight.cluster = true;
     const seq = ++clusterReqSeq;
     try {
       const r = await apiFetch("/cluster");
@@ -10879,6 +10934,8 @@ var qrcode = function() {
         console.warn("loadCluster failed:", e);
         clusterStale();
       }
+    } finally {
+      secondaryInFlight.cluster = false;
     }
   }
 

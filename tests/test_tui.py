@@ -2786,6 +2786,36 @@ def test_render_heat_bucket_edges(tmp_path):
     assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
 
 
+async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
+    # The heat load used to await its per-job /runs fetches strictly one at
+    # a time INSIDE the poll loop, freezing every poll surface for the sum
+    # of the round trips. It now runs spawned with a few requests in
+    # flight, and prunes entries for jobs a reload removed.
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j%02d" % i} for i in range(12)]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.heat_data["gone"] = [{"outcome": "success"}]  # a removed job's relic
+    state = {"in_flight": 0, "high": 0, "calls": 0}
+
+    class FakeApi:
+        async def get_json(self, path):
+            state["calls"] += 1
+            state["in_flight"] += 1
+            state["high"] = max(state["high"], state["in_flight"])
+            await asyncio.sleep(0.01)
+            state["in_flight"] -= 1
+            return {"runs": [{"outcome": "success"}]}
+
+    app.api = FakeApi()
+    app._heat_busy = True  # exactly as _fanout sets it before spawning
+    await app._load_heat()
+    assert state["calls"] == 12
+    assert 1 < state["high"] <= 5  # overlapped, but politely bounded
+    assert "gone" not in app.heat_data
+    assert app.heat_data["j00"] == [{"outcome": "success"}]
+    assert app._heat_busy is False  # the 60s gate can spawn again
+
+
 def test_render_heat_future_run_lands_in_newest_bucket(tmp_path):
     # remote daemon clock skew can date a finish more than an hour into
     # this host's future; that must shade the newest cell, not crash

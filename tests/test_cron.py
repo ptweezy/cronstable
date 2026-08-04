@@ -1416,13 +1416,56 @@ async def test_web_list_jobs_etag_304_and_invalidation():
 
     # a real state change (advancing a job's next fire) moves the tag, so
     # the same conditional poll now gets a fresh body instead of a 304.
+    # The live fire path pairs the advance with a launch, whose bust drops
+    # the shared response memo; poking the index directly skips that, so
+    # bust it the same way here (a next-fire-only change would otherwise
+    # simply age out of the memo within its one-second TTL).
     when = cron._next_fire.get("alpha")
     cron._next_fire["alpha"] = (
         when or DT(2000, 1, 1, tzinfo=UTC)
     ) + datetime.timedelta(hours=1)
+    cron._bust_jobs_response_cache()
     changed = await cron._web_list_jobs(req(etag))
     assert changed.status == 200
     assert changed.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
+    # N pollers inside the memo TTL must share ONE payload build (the
+    # whole point: a wallboard plus tabs used to cost N identical builds
+    # per cycle), and a locally recorded run must bust the memo so the
+    # next poll sees it immediately.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    builds = []
+    real_payload = cron.jobs_payload
+
+    def counting_payload():
+        builds.append(1)
+        return real_payload()
+
+    monkeypatch.setattr(cron, "jobs_payload", counting_payload)
+
+    def req():
+        class Req:
+            headers: dict = {}
+
+        return Req()
+
+    first = await cron._web_list_jobs(req())
+    second = await cron._web_list_jobs(req())
+    third = await cron._web_list_jobs(req())
+    assert len(builds) == 1  # one build served all three pollers
+    assert second.headers["ETag"] == first.headers["ETag"]
+    assert third.body == first.body
+
+    # a recorded run changes the payload: the memo is busted and the next
+    # poll rebuilds rather than serving the stale product out to the TTL.
+    cron._record_run("alpha", _mk_run("failure"))
+    fresh = await cron._web_list_jobs(req())
+    assert len(builds) == 2
+    assert fresh.headers["ETag"] != first.headers["ETag"]
 
 
 # enough tasks that the serialized graph clears the gzip minimum, so the
@@ -2317,6 +2360,61 @@ async def test_web_job_logs_streams_last_run():
     assert "hello world" in body
     assert "uh oh" in body
     assert "event: end" in body
+
+
+@pytest.mark.asyncio
+async def test_web_job_logs_batches_live_bursts(monkeypatch):
+    """A burst of published lines must reach the SSE client in a handful of
+    transport writes, not one write (plus one fresh wait_for timer task) per
+    line: per-line delivery on the scheduler's loop was ~2 coroutine steps
+    per line per subscriber for a chatty job."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    out = JobOutputStream()
+    out.publish("stdout", "replayed\n")
+    cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=None,
+        finished_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
+        fail_reason=None,
+        output=out,  # NOT closed: the handler stays in its live-tail loop
+    )
+    writes = []
+    real_write = web.StreamResponse.write
+
+    async def counting_write(self, data):
+        writes.append(bytes(data))
+        return await real_write(self, data)
+
+    monkeypatch.setattr(web.StreamResponse, "write", counting_write)
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        resp_task = asyncio.create_task(client.get("/jobs/alpha/logs"))
+        # wait for the handler to attach its subscriber queue
+        for _ in range(500):
+            if out._subscribers:
+                break
+            await asyncio.sleep(0.01)
+        assert out._subscribers, "tail never attached"
+        # one synchronous burst: no await between publishes, so the whole
+        # burst is queued before the handler can wake once
+        for i in range(60):
+            out.publish("stdout", "line-%d\n" % i)
+        out.close()
+        resp = await resp_task
+        body = await resp.text()
+    assert "line-0" in body and "line-59" in body and "event: end" in body
+    burst_writes = [w for w in writes if b"line-" in w]
+    # the whole 60-line burst went out in a handful of joined writes (the
+    # old per-line loop needed 60); the exact count depends on how often
+    # the handler woke mid-burst, so bound it rather than pin it.
+    assert len(burst_writes) <= 6, len(burst_writes)
+    assert sum(w.count(b"event: line") for w in burst_writes) == 60
 
 
 @pytest.mark.asyncio

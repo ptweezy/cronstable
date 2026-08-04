@@ -39,9 +39,13 @@ from cronstable.state import DOC_KEEP, StateBackend
 
 # Document-namespace prefixes (under the backend's ``docs/`` tree) and the
 # artifact records-stream prefix (under ``records/``).  Exported so the
-# scheduler's garbage collector can keep artifact streams of live scopes (KV /
-# cursor / idempotency documents live under ``docs/`` and are never swept:
-# they are durable state by definition).
+# scheduler's garbage collector can keep artifact streams of live scopes.
+# KV and cursor documents live under ``docs/`` and are never swept: they
+# are durable state by definition.  Idempotency documents are durable too,
+# with one carve-out: a ``ttl > 0`` claim whose expiry lapsed a whole GC
+# grace ago is provably re-winnable dead weight and IS swept (see
+# state._gc_idem_docs_sync; state._IDEM_DOC_NS_PREFIX mirrors
+# IDEM_NS_PREFIX below because the layering forbids the import).
 KV_NS_PREFIX = "kv/"
 CURSOR_NS_PREFIX = "cursor/"
 IDEM_NS_PREFIX = "idem/"

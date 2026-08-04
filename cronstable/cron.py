@@ -1163,6 +1163,19 @@ def _json_response(
 #: must not stall the scheduling loop.
 _JOBS_SERIALIZE_OFFLOAD_MIN = 200
 
+#: How long one built /jobs response (payload, ETag, body, gzip) is shared
+#: across pollers before it is rebuilt.  Every viewer used to pay the full
+#: per-request build even when nothing changed: a wallboard plus N tabs on
+#: one daemon is N identical builds per poll cycle.  The memo makes that
+#: at most ceil(pollMs / this) builds per cycle however many viewers watch.
+#: Local changes (a run recorded, a launch, a pause, a reload) bust the
+#: memo so they render on the very next poll; the TTL bounds the staleness
+#: of everything else (live resource samples, a fire advancing with no
+#: local bust) to under a second, inside the jitter of the 3s default poll
+#: cadence.  A single viewer polling slower than this never hits the memo,
+#: so the one-tab case behaves exactly as before.
+_JOBS_RESPONSE_TTL = 1.0
+
 #: Config-source count at or above which the once-a-minute stat fingerprint
 #: (:meth:`Cron._config_signature`) is taken on the default executor instead
 #: of inline.  One ``os.stat`` is ~14 us on local disk but 1-2 ms on the
@@ -1250,14 +1263,11 @@ def _gzip_body(body: bytes) -> bytes:
     return packer.compress(body) + packer.flush()
 
 
-def _jobs_conditional_response(
+def _jobs_response_product(
     payload: List[Dict[str, Any]],
     next_fire: Dict[str, datetime.datetime],
-    if_none_match: Optional[str],
-    gzip_ok: bool = False,
-) -> Tuple[str, Optional[bytes], bool]:
-    """The ETag for a ``/jobs`` payload and, unless the client already has
-    it, the serialized body.
+) -> Tuple[str, bytes, Optional[bytes]]:
+    """The full /jobs response product: ETag, body, and gzipped body.
 
     The tag is a strong hash of the payload with each job's volatile
     relative ``scheduled_in`` swapped for its STABLE absolute next-fire
@@ -1284,13 +1294,17 @@ def _jobs_conditional_response(
     answer, unlike the job-set fingerprint and the cluster peer ETag that
     :mod:`cronstable._json`'s stdlib-only rule is written about.
 
-    With ``gzip_ok`` a large body is returned gzipped and the third element
-    of the result says so; the caller sets ``Content-Encoding`` and the
-    mandatory ``Vary``.  The compression rides this call rather than the
-    handler so it lands inside the same executor hop the encode already
-    uses, and zlib releases the GIL.  The body carries no per-request secret
-    (the bearer token is a request header, never a response field), so the
-    BREACH/CRIME class of compression side channel has nothing to leak here.
+    A large body is gzipped too (``None`` for one under the floor: every
+    real browser accepts gzip, so building it once per product beats
+    re-deciding per client).  The compression rides this call rather than
+    the handler so it lands inside the same executor hop the encode
+    already uses, and zlib releases the GIL.  The body carries no
+    per-request secret (the bearer token is a request header, never a
+    response field), so the BREACH/CRIME class of compression side channel
+    has nothing to leak here.  The If-None-Match check lives in the
+    handler, not here: one product is shared across every concurrent
+    poller for :data:`_JOBS_RESPONSE_TTL`, and which validator each of
+    them sent is the one per-request thing about it.
     """
     canonical = [
         {**job, "scheduled_in": next_fire.get(job["name"])} for job in payload
@@ -1306,15 +1320,13 @@ def _jobs_conditional_response(
             "utf-8"
         )
     etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
-    if _etag_matches(if_none_match, etag):
-        return etag, None, False
     try:
         body = _json.dumps_bytes(payload, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
-    if gzip_ok and len(body) >= _GZIP_MIN_BYTES:
-        return etag, _gzip_body(body), True
-    return etag, body, False
+    if len(body) >= _GZIP_MIN_BYTES:
+        return etag, body, _gzip_body(body)
+    return etag, body, None
 
 
 def _cachable_json_response(
@@ -1328,7 +1340,7 @@ def _cachable_json_response(
     """A :func:`_json_response` that can 304 and gzip, for the poll fan-out.
 
     ``GET /jobs`` grew conditional responses first (see
-    :func:`_jobs_conditional_response`, which must hash a CANONICAL variant
+    :func:`_jobs_response_product`, which must hash a CANONICAL variant
     because its payload carries a per-poll relative countdown); this is the
     plain-shaped sibling for the OTHER polled endpoints, whose serialized
     body already changes exactly when the displayed data does, so the tag
@@ -1381,12 +1393,6 @@ def _sse_frame(stream_name: str, line: str) -> bytes:
         )
         + b"\n\n"
     )
-
-
-async def _sse_send_line(
-    resp: web.StreamResponse, stream_name: str, line: str
-) -> None:
-    await resp.write(_sse_frame(stream_name, line))
 
 
 def naturaltime(seconds: float) -> str:
@@ -1688,6 +1694,11 @@ class Cron:
         # bounds concurrently-executing subprocess spawns (job and DAG-task
         # launches share it); see _SPAWN_BURST_LIMIT for the why.
         self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
+        # the shared GET /jobs product: (loop.time stamp, etag, body, gz).
+        # See _JOBS_RESPONSE_TTL and _bust_jobs_response_cache.
+        self._jobs_response_cache: Optional[
+            Tuple[float, str, bytes, Optional[bytes]]
+        ] = None
         # active runtime pauses by job name (POST /jobs/{name}/pause). The
         # fire path consults ONLY this map (never store I/O there); it is
         # rehydrated from the durable paused/ streams at boot and refreshed
@@ -2567,6 +2578,8 @@ class Cron:
             for name, entry in self._trends_cache.items()
             if name in keep
         }
+        # the job set itself changed: the shared /jobs product is stale
+        self._bust_jobs_response_cache()
         # Pause state survives a job-config edit (deliberately no digest
         # check, unlike retries: the operator paused the NAME, not one
         # definition of it); only a job the reload removed is pruned.
@@ -4174,6 +4187,7 @@ class Cron:
             # so the stretch the two windows share is not credited twice.
             self._sla_bank_pause(name, replaced, now)
         self._paused[name] = info
+        self._bust_jobs_response_cache()
         # the job is excused from here on: drop any breach it latched while it
         # was still being evaluated, so the late gauge, the /jobs sla block and
         # the OVERDUE chip clear on this response rather than a minute later.
@@ -4275,6 +4289,7 @@ class Cron:
         for name, info in list(self._paused.items()):
             if info.until <= now:
                 del self._paused[name]
+                self._bust_jobs_response_cache()
                 self._sla_bank_pause(name, info, info.until)
                 self.metrics.job_pause_state(name, False)
                 logger.info(
@@ -4386,6 +4401,7 @@ class Cron:
                     # the old one already held (see _sla_bank_pause).
                     self._sla_bank_pause(name, known, now)
                 self._paused[name] = info
+                self._bust_jobs_response_cache()
                 self.metrics.job_pause_state(name, True)
                 if known is None or known.until != info.until:
                     logger.info(
@@ -5258,51 +5274,63 @@ class Cron:
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        # Build on the loop (it reads live scheduler state), then hash +
-        # serialize off it for a large fleet.  A content-hash ETag lets a
-        # conditional client (or a cache/proxy) 304 an unchanged poll,
-        # skipping the body encode and transfer; the tag is keyed on the
-        # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
-        # put while the countdown ticks and moves the instant a fire lands.
-        payload = self.jobs_payload()
-        # A plain snapshot of the index, NOT a per-job isoformat sweep: the
-        # instants change at most once per job per fire, while this ran once
-        # per job per poll on the loop thread (0.30 ms at 500 jobs). The
-        # canonical dump renders them itself, inside the executor. Snapshotted
-        # rather than passed by reference so the docstring's "free of
-        # scheduler state" promise still holds for the executor branch.
-        next_fire = dict(self._next_fire)
         inm = request.headers.get("If-None-Match")
         gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
-        if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
-            loop = asyncio.get_running_loop()
-            etag, body, packed = await loop.run_in_executor(
-                None,
-                _jobs_conditional_response,
-                payload,
-                next_fire,
-                inm,
-                gzip_ok,
-            )
-        else:
-            etag, body, packed = _jobs_conditional_response(
-                payload, next_fire, inm, gzip_ok
-            )
+        # One product (payload build + ETag + body + gzip) is shared across
+        # every poller for _JOBS_RESPONSE_TTL, busted by the local events
+        # that change the payload (_bust_jobs_response_cache): N dashboard
+        # tabs used to cost N identical builds per poll cycle. Only the
+        # If-None-Match compare and the representation pick are per-request.
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cache = self._jobs_response_cache
+        if cache is None or now - cache[0] >= _JOBS_RESPONSE_TTL:
+            # Build on the loop (it reads live scheduler state), then hash +
+            # serialize off it for a large fleet.  The tag is keyed on the
+            # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
+            # put while the countdown ticks and moves when a fire lands.
+            payload = self.jobs_payload()
+            # A plain snapshot of the index, NOT a per-job isoformat sweep:
+            # the instants change at most once per job per fire. The
+            # canonical dump renders them itself, inside the executor.
+            # Snapshotted rather than passed by reference so the product
+            # stays free of scheduler state in the executor branch.
+            next_fire = dict(self._next_fire)
+            if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+                etag, body, gz = await loop.run_in_executor(
+                    None, _jobs_response_product, payload, next_fire
+                )
+            else:
+                etag, body, gz = _jobs_response_product(payload, next_fire)
+            cache = (now, etag, body, gz)
+            self._jobs_response_cache = cache
+        _mono, etag, body, gz = cache
         headers = self._web_jobs_headers(etag)
         # on EVERY representation, compressed or not: a shared cache that
         # missed this would hand a gzipped body to a client that cannot read
         # one.
         headers["Vary"] = "Accept-Encoding"
-        if body is None:
+        if _etag_matches(inm, etag):
             return web.Response(status=304, headers=headers)
-        if packed:
+        if gzip_ok and gz is not None:
             headers["Content-Encoding"] = "gzip"
+            body = gz
         return web.Response(
             body=body,
             status=200,
             headers=headers,
             content_type="application/json",
         )
+
+    def _bust_jobs_response_cache(self) -> None:
+        """Drop the shared /jobs product so a local change renders now.
+
+        Called from exactly the events that change the payload on THIS
+        node: a run recorded, a launch (the ``running`` flag), a pause set
+        or cleared, and a reload.  Everything else (live resource samples,
+        a fire advancing) ages out within :data:`_JOBS_RESPONSE_TTL`.
+        """
+        self._jobs_response_cache = None
 
     def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
         """The configured web response headers plus the ``/jobs`` ETag."""
@@ -5958,7 +5986,8 @@ class Cron:
             )
             if replay:
                 await resp.write(replay)
-            while True:
+            ended = False
+            while not ended:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=15)
                 except asyncio.TimeoutError:
@@ -5967,8 +5996,25 @@ class Cron:
                     continue
                 if item is None:  # end-of-output sentinel
                     break
-                stream_name, line = item
-                await _sse_send_line(resp, stream_name, line)
+                # Drain the burst behind the first line before writing: a
+                # chatty job publishes lines faster than one
+                # wait_for + write round trip each, and per-line delivery
+                # cost one fresh timer task, one frame build and one
+                # transport write PER LINE PER SUBSCRIBER on the scheduler's
+                # loop (a 5k line/s job with two viewers was ~10k coroutine
+                # steps a second). One joined write per drained burst
+                # mirrors the replay path above.
+                frames = [_sse_frame(item[0], item[1])]
+                while True:
+                    try:
+                        nxt = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:  # sentinel inside the burst
+                        ended = True
+                        break
+                    frames.append(_sse_frame(nxt[0], nxt[1]))
+                await resp.write(b"".join(frames))
             await resp.write(b"event: end\ndata: {}\n\n")
         except (ConnectionResetError, asyncio.CancelledError):
             # client navigated away / closed the tab: nothing to do
@@ -9989,6 +10035,8 @@ class Cron:
             raise
         first_instance = not self.running_jobs.get(job.name)
         self.running_jobs[job.name].append(running_job)
+        # the payload's `running` flag just flipped on this node
+        self._bust_jobs_response_cache()
         # every actual launch (scheduled, manual, catch-up, retry) clears
         # the lateAfter breach condition (see _sla_periodic).
         self._sla_last_start[job.name] = get_now(datetime.timezone.utc)
@@ -11051,8 +11099,10 @@ class Cron:
         self.last_run[name] = info
         self.run_history[name].append(info)
         # this run changes the trends aggregate, so drop any cached payload
-        # for the job rather than serve it stale out to the TTL.
+        # for the job rather than serve it stale out to the TTL; same for
+        # the shared /jobs product (last_run and the history slice moved).
         self._trends_cache.pop(name, None)
+        self._bust_jobs_response_cache()
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
         self.metrics.job_run_recorded(

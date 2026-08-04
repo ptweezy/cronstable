@@ -244,7 +244,7 @@ JS_SETUP = """(seed) => {
   L.sync = () => {};                       // kickMark() etc. may not restart us
   if (L._raf) cancelAnimationFrame(L._raf);
   L._raf = 0;
-  L.sim = new window.CronstableLogo.Sim(L.sim.p, { seed, breeze: false });
+  L.sim = new window.CronstableLogo.Sim(L.sim.p, { seed, breeze: false, planBudgetMs: 0 });
   // defensive: railMax is pinned off above, but if the dynamic gate is ever
   // re-enabled here, a pre-setup disconnect must not freeze it extended
   const gt = L._gate;
@@ -263,7 +263,7 @@ JS_SEARCH = """([frames, eventsBySeed, seeds, gate]) => {
   const out = [];
   for (const seed of seeds) {
     const events = eventsBySeed[seed];
-    const sim = new window.CronstableLogo.Sim(params, { seed, breeze: false });
+    const sim = new window.CronstableLogo.Sim(params, { seed, breeze: false, planBudgetMs: 0 });
     let catchAt = -1, fellEarly = false, clamped = false, lost = false;
     for (let k = 0; k < frames; k++) {
       const ev = events[k];
