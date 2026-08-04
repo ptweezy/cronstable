@@ -138,6 +138,36 @@ DAG_SUMMARY_LIST_TTL = 5.0
 
 RunRef = Tuple[str, str]  # (dag_name, run_key)
 
+#: XCom payload size at or above which a mapped fan-out's parse (and its
+#: portability walk) runs on a worker thread instead of the scheduler's
+#: event loop.  The payload cap is dag.MAX_MAPPED_XCOM_BYTES (16 MiB), and
+#: parsing a multi-MB list inline stalled every handler and heartbeat for
+#: tens of ms per expansion; below this floor the parse is cheaper than the
+#: thread hop it would buy (a 64 KiB bytes-path parse is a few hundred us,
+#: about the hop's own dispatch cost).
+_XCOM_PARSE_OFFLOAD_MIN = 64 * 1024
+
+
+def _parse_portable_xcom(data: bytes) -> Any:
+    """Parse a mapped-task XCom payload; portability-check a usable list.
+
+    Factored out of :meth:`DagScheduler._mapped_items` so the large-payload
+    branch can run the WHOLE thing on a worker thread.  The bytes go
+    straight to ``_json.loads``: the old ``data.decode()`` allocated a full
+    second copy and forced the str branch, whose wide-int prescan is a
+    whole-payload regex rather than the bytes branch's translate fast path.
+    An over-long list skips the portability walk on purpose:
+    ``_apply_expansions`` rejects it at its own MAX_MAPPED_ITEMS check, so
+    the O(len) walk would be pure waste on a list never embedded in the run
+    document.  Raises ``_json.UnsupportedValue`` for a non-portable value
+    and any other ``ValueError`` for undecodable bytes or invalid JSON,
+    which the caller maps to its existing warn-and-empty arms.
+    """
+    parsed = _json.loads(data)
+    if isinstance(parsed, list) and len(parsed) <= dag.MAX_MAPPED_ITEMS:
+        _json.ensure_portable(parsed)
+    return parsed
+
 
 def _now() -> float:
     """Wall-clock epoch seconds for document timestamps and poke schedules.
@@ -1308,8 +1338,34 @@ class DagScheduler:
             return []
         _record, data = got
         try:
-            parsed = _json.loads(data.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+            # parse + portability walk together (see _parse_portable_xcom);
+            # a large payload takes them both to a worker thread, because a
+            # multi-MB inline parse stalls dispatch, every web handler and
+            # the cluster heartbeats for its whole duration.
+            if len(data) >= _XCOM_PARSE_OFFLOAD_MIN:
+                parsed = await asyncio.to_thread(_parse_portable_xcom, data)
+            else:
+                parsed = _parse_portable_xcom(data)
+        except _json.UnsupportedValue as exc:
+            # a value that parses but is not fleet-portable (an int outside
+            # the 64-bit window, a non-finite float): embedding it in the
+            # run document would make _json.dumps_bytes raise on EVERY
+            # advance, wedging the run forever. Treat a mis-published
+            # upstream like the not-a-list case -- warn and map to empty.
+            # (Ordered before ValueError: UnsupportedValue subclasses it.)
+            logger.warning(
+                "dag %s: xcom %r from %r contains a non-portable value "
+                "(%s); mapping it to an empty fan-out",
+                dag_name,
+                key,
+                taskkey,
+                exc,
+            )
+            return []
+        except ValueError:
+            # undecodable bytes land here too: the bytes-path loads folds
+            # what used to be the decode()'s UnicodeDecodeError into its
+            # own ValueError.
             logger.warning(
                 "dag %s: xcom %r from %r is not valid JSON; mapping it to an "
                 "empty fan-out",
@@ -1319,29 +1375,6 @@ class DagScheduler:
             )
             return []
         if isinstance(parsed, list):
-            if len(parsed) > dag.MAX_MAPPED_ITEMS:
-                # too many items to materialise; _apply_expansions fails the
-                # task at its own MAX_MAPPED_ITEMS check.  Return it directly
-                # and skip the O(len) portability walk -- pure waste on a list
-                # that is about to be rejected, never embedded in the run doc.
-                return parsed
-            try:
-                _json.ensure_portable(parsed)
-            except _json.UnsupportedValue as exc:
-                # a value that parses but is not fleet-portable (an int outside
-                # the 64-bit window, a non-finite float): embedding it in the
-                # run document would make _json.dumps_bytes raise on EVERY
-                # advance, wedging the run forever. Treat a mis-published
-                # upstream like the not-a-list case -- warn and map to empty.
-                logger.warning(
-                    "dag %s: xcom %r from %r contains a non-portable value "
-                    "(%s); mapping it to an empty fan-out",
-                    dag_name,
-                    key,
-                    taskkey,
-                    exc,
-                )
-                return []
             return parsed
         logger.warning(
             "dag %s: xcom %r from %r is a %s, not a list; mapping it to an "
@@ -1468,7 +1501,7 @@ class DagScheduler:
     ) -> Optional[Tuple[str, str, Optional[int], Optional[int]]]:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
-        token, env = self._prepare_task_run(
+        token, env = await self._prepare_task_run(
             dagcfg, run_id, ref[1], intent, template
         )
         dref = _DagRef(
@@ -1490,7 +1523,12 @@ class DagScheduler:
             dag_ref=dref,
         )
         try:
-            await running.start()
+            # a mapped fan-out launches up to MAX_CLAIMS_PER_PASS instances
+            # back to back: share the daemon-wide spawn gate so the burst's
+            # synchronous fork/exec work interleaves with other loop work
+            # (see cron._SPAWN_BURST_LIMIT).
+            async with self._cron._spawn_gate:
+                await running.start()
         except BaseException:  # noqa: BLE001 - mirror maybe_launch_job cleanup
             if token is not None and self._cron._job_api is not None:
                 await self._cron._job_api.finish_run(token)
@@ -1519,7 +1557,33 @@ class DagScheduler:
         # pid), and the reaper will record its completion.
         return (taskkey, dref.proc, pid, dref.attempt)
 
-    def _prepare_task_run(
+    @staticmethod
+    def _stage_task_secrets(dagcfg: Any, intent, template) -> Dict[str, str]:
+        """Resolve a task template's ``secrets`` blocks into a fresh map.
+
+        Pure sync (``fromFile`` opens and reads), so the launch loop can
+        push it to the default executor when a file read is involved; see
+        :meth:`_prepare_task_run`.
+        """
+        from cronstable.config import _resolve_secret
+
+        secrets: Dict[str, str] = {}
+        for spec in template.secrets:
+            name = spec.get("name")
+            try:
+                value = _resolve_secret(
+                    spec,
+                    "dag {} task {} secret {}".format(
+                        dagcfg.name, intent.task_id, name
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - a bad secret is skipped, 404s
+                continue
+            if name and value is not None:
+                secrets[name] = value
+        return secrets
+
+    async def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
     ) -> Tuple[Optional[str], Dict[str, str]]:
         """Register the task run with the loopback API; return its env.
@@ -1528,6 +1592,10 @@ class DagScheduler:
         namespace to the DAG run's XCom scope and injects the
         ``CRONSTABLE_DAG_*``
         vars, so ``cronstable xcom`` / ``artifact`` land in the run scope.
+        Like the mirror, ``fromFile`` secrets are staged on the default
+        executor so a slow secret mount stalls only this launch, never the
+        event loop; a mapped fan-out launches many instances back to back,
+        which is exactly where an inline blocking read would compound.
         """
         scope = dag.xcom_scope(dagcfg.name, run_id)
         dag_env = {
@@ -1547,23 +1615,14 @@ class DagScheduler:
         api = self._cron._job_api
         if api is None or api.base_url is None:
             return None, dag_env
-        from cronstable.config import _resolve_secret
         from cronstable.jobapi import RunContext, run_environment
 
-        secrets: Dict[str, str] = {}
-        for spec in template.secrets:
-            name = spec.get("name")
-            try:
-                value = _resolve_secret(
-                    spec,
-                    "dag {} task {} secret {}".format(
-                        dagcfg.name, intent.task_id, name
-                    ),
-                )
-            except Exception:  # noqa: BLE001 - a bad secret is skipped, 404s
-                continue
-            if name and value is not None:
-                secrets[name] = value
+        if any(spec.get("fromFile") for spec in template.secrets):
+            secrets = await asyncio.get_running_loop().run_in_executor(
+                None, self._stage_task_secrets, dagcfg, intent, template
+            )
+        else:
+            secrets = self._stage_task_secrets(dagcfg, intent, template)
         ctx = RunContext(
             token=os.urandom(32).hex(),
             run_id=os.urandom(16).hex(),

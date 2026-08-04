@@ -191,6 +191,31 @@ MAX_CATCHUP_OCCURRENCES = 100
 # In-memory only (like the rest of the run record), and bounded so a frequently
 # scheduled job cannot grow memory without limit.
 RUN_HISTORY_LIMIT = 50
+
+#: Concurrent per-job store reads in the boot warm-up
+#: (:meth:`Cron._rehydrate_from_state` and its retry re-arm scan).  The
+#: warm-up used to read every job's streams strictly one at a time, so boot
+#: paid jobs x per-read latency before the first scheduling pass: seconds
+#: on local disk at fleet scale, minutes on a network mount, none of it
+#: needed for scheduling correctness (the dashboard fills in as jobs run).
+#: Matched to the filesystem store's bulk worker lane (16 slots), where
+#: more in-flight reads would only queue; a hung mount now costs about one
+#: STATE_OP_TIMEOUT of boot delay instead of one per job.
+_REHYDRATE_CONCURRENCY = 16
+
+#: Subprocess spawns allowed to execute at once when a slot launches many
+#: jobs together (see the ``_spawn_gate`` acquire around
+#: ``RunningJob.start()``).  A spawn's fork/exec and pipe-transport setup
+#: are synchronous work ON the event loop; gathering N due jobs queues all
+#: N spawn steps into one ready-queue burst, so at 500 same-slot jobs the
+#: loop ran ~0.25-1s of contiguous spawn syscalls each minute boundary
+#: while web requests, SSE writes and gossip waited (and a loaded box
+#: could trip the CATCHUP_LIMIT resume path).  The gate does not slow the
+#: burst down (the syscalls were always loop-serial); it caps how much of
+#: it runs per loop iteration so other ready callbacks interleave.  Held
+#: only across ``start()`` itself, never across a launch's slot claims or
+#: a Replace teardown, which can legally take seconds.
+_SPAWN_BURST_LIMIT = 16
 # First page size the onlyIfLastSucceeded gate reads from the durable run
 # ledger (see _depends_on_past_ok). The gate needs only the newest success/
 # failure record, so it probes this many newest records and widens to the
@@ -1660,6 +1685,9 @@ class Cron:
         # the update_config() below runs _apply_reload the first time.
         self.last_run = {}  # type: Dict[str, JobRunInfo]
         self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
+        # bounds concurrently-executing subprocess spawns (job and DAG-task
+        # launches share it); see _SPAWN_BURST_LIMIT for the why.
+        self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
         # active runtime pauses by job name (POST /jobs/{name}/pause). The
         # fire path consults ONLY this map (never store I/O there); it is
         # rehydrated from the durable paused/ streams at boot and refreshed
@@ -9930,7 +9958,9 @@ class Cron:
         # id + token and staging its secrets) BEFORE the child launches, so the
         # child's first callback is already authorised. extra_env carries the
         # endpoint URL/token/run-context the job needs to reach it.
-        run_token, extra_env = self._prepare_job_api_run(job, retry_state)
+        run_token, extra_env = await self._prepare_job_api_run(
+            job, retry_state
+        )
         running_job = RunningJob(
             job,
             retry_state,
@@ -9939,7 +9969,10 @@ class Cron:
             run_id=extra_env.get("CRONSTABLE_RUN_ID"),
         )
         try:
-            await running_job.start()
+            # the gate releases before the except arm runs, so cleanup
+            # below never holds a spawn permit.
+            async with self._spawn_gate:
+                await running_job.start()
         except BaseException:
             # start() handles the expected spawn failures itself (the
             # instance still registers, start_failed, and the reaper pairs
@@ -9982,24 +10015,14 @@ class Cron:
         """
         return "{}#{}".format(self._state_host, self._proc_token)
 
-    def _prepare_job_api_run(
-        self, job: JobConfig, retry_state: Optional[JobRetryState]
-    ) -> Tuple[Optional[str], Dict[str, str]]:
-        """Register this run with the loopback state API; return its env.
+    def _stage_job_secrets(self, job: JobConfig) -> Dict[str, str]:
+        """Resolve a job's run-scoped ``secrets`` blocks into a fresh map.
 
-        Mints the run id + bearer token, resolves and stages the job's
-        run-scoped ``secrets`` (fresh, in memory), registers the whole
-        :class:`~cronstable.jobapi.RunContext`, and returns
-        ``(token, injected_env)`` so the launcher can hand the env to the child
-        and the reaper can revoke the token by it.  Returns ``(None, {})`` when
-        no job API is running (no ``state`` section, or jobApi disabled), so
-        the classic no-endpoint path is byte-identical.
+        Pure sync (it may open and read ``fromFile`` targets), so the launch
+        path can push it to the default executor when any file read is
+        involved; see :meth:`_prepare_job_api_run`.
         """
-        api = self._job_api
-        if api is None or api.base_url is None:
-            return None, {}
         from cronstable.config import _resolve_secret
-        from cronstable.jobapi import RunContext, run_environment
 
         secrets: Dict[str, str] = {}
         for spec in job.secrets:
@@ -10022,6 +10045,40 @@ class Cron:
                 continue
             if name and value is not None:
                 secrets[name] = value
+        return secrets
+
+    async def _prepare_job_api_run(
+        self, job: JobConfig, retry_state: Optional[JobRetryState]
+    ) -> Tuple[Optional[str], Dict[str, str]]:
+        """Register this run with the loopback state API; return its env.
+
+        Mints the run id + bearer token, resolves and stages the job's
+        run-scoped ``secrets`` (fresh, in memory), registers the whole
+        :class:`~cronstable.jobapi.RunContext`, and returns
+        ``(token, injected_env)`` so the launcher can hand the env to the child
+        and the reaper can revoke the token by it.  Returns ``(None, {})`` when
+        no job API is running (no ``state`` section, or jobApi disabled), so
+        the classic no-endpoint path is byte-identical.
+
+        A job with any ``fromFile`` secret stages them on the default
+        executor: the read runs inside the awaited launch chain, and a
+        Kubernetes secret mount or NFS target that is slow (or hung) would
+        otherwise stall the event loop itself, delaying every same-slot
+        launch, web response and cluster heartbeat with it.  Value/env
+        secrets stay inline, where the thread hop would cost more than the
+        dict they build.
+        """
+        api = self._job_api
+        if api is None or api.base_url is None:
+            return None, {}
+        from cronstable.jobapi import RunContext, run_environment
+
+        if any(spec.get("fromFile") for spec in job.secrets):
+            secrets = await asyncio.get_running_loop().run_in_executor(
+                None, self._stage_job_secrets, job
+            )
+        else:
+            secrets = self._stage_job_secrets(job)
         slot = self._last_run_slot.get(job.name)
         ctx = RunContext(
             token=os.urandom(32).hex(),
@@ -11358,14 +11415,37 @@ class Cron:
         next runs.  Bypasses :meth:`_record_run` deliberately: rehydration must
         not re-emit Prometheus counters or re-persist what it just read.  A
         poison record is skipped by :func:`_job_run_info_from_dict` (and
-        quarantined by the backend), never fatal to startup.
+        quarantined by the backend), never fatal to startup.  Reads run
+        :data:`_REHYDRATE_CONCURRENCY` jobs at a time: the warm-up sits
+        between backend start and the first scheduling pass, so its wall
+        clock is boot delay, and every per-job read is independent.
         """
         backend = self.state_backend
         if backend is None or self._state_rehydrated:
             return
         self._state_rehydrated = True
-        warmed = 0
-        for name in list(self.cron_jobs):
+        # A small worker pool over one shared name iterator, not a task per
+        # job: the strictly sequential loop this replaces paid jobs x
+        # per-read latency of boot delay, while a task per job would
+        # materialise 100k coroutines on a large crontab only to queue on
+        # the store's 16-slot bulk lane anyway. next() on the shared
+        # iterator is synchronous, so the workers partition the names
+        # race-free, and every per-job mutation below touches only that
+        # job's own keys.
+        names = iter(list(self.cron_jobs))
+        aborted = False
+
+        async def _warm_worker() -> int:
+            nonlocal aborted
+            count = 0
+            for name in names:
+                if aborted:
+                    break
+                count += await _warm_one(name)
+            return count
+
+        async def _warm_one(name: str) -> int:
+            nonlocal aborted
             # a job that already accumulated in-memory history this process
             # (unusual at boot) is left as the live source of truth, but the
             # staleness reference is still seeded from that history, so a job
@@ -11373,7 +11453,7 @@ class Cron:
             # maxTimeSinceSuccess on process start when the store returns.
             if self.run_history.get(name):
                 await self._seed_stale_reference(name, self.run_history[name])
-                continue
+                return 0
             try:
                 recs = await asyncio.wait_for(
                     backend.list_records(
@@ -11388,17 +11468,19 @@ class Cron:
                 # unhealthy (hung mount): abandon the whole warm-up rather
                 # than stalling boot for jobs x timeout. The dashboard fills
                 # in as jobs run, exactly as with no rehydration.
-                logger.warning(
-                    "state: rehydration timed out reading %s; skipping the "
-                    "rest of the warm-up (store unhealthy?)",
-                    name,
-                )
-                break
+                if not aborted:
+                    aborted = True
+                    logger.warning(
+                        "state: rehydration timed out reading %s; skipping "
+                        "the rest of the warm-up (store unhealthy?)",
+                        name,
+                    )
+                return 0
             except OSError as ex:
                 logger.warning(
                     "state: failed to rehydrate history for %s: %s", name, ex
                 )
-                continue
+                return 0
             if self.run_history.get(name):
                 # a run finished while we awaited the read (the await above
                 # yields): the live run is fresher than anything in the
@@ -11407,56 +11489,62 @@ class Cron:
                 # staleness reference is still seeded from that live history
                 # (setdefault, so a fresher live success is never clobbered).
                 await self._seed_stale_reference(name, self.run_history[name])
-                continue
+                return 0
             recs.reverse()  # oldest-first, to match the append order
             for rec in recs:
                 restored = _job_run_info_from_dict(rec)
                 if restored is not None:
                     self.run_history[name].append(restored)
             history = self.run_history.get(name)
-            if history:
-                self.last_run[name] = history[-1]
-                warmed += 1
-                # warm the staleness reference too: with a durable ledger
-                # the maxTimeSinceSuccess check must page from the REAL last
-                # success after a restart, not re-baseline on process start
-                # (that grace is only for stateless boots). Shared with the
-                # two early-continue guards above, so a job with pre-existing
-                # in-memory history is seeded the same way.
-                await self._seed_stale_reference(name, history)
-                # and the onlyIfLastSucceeded memo, for the same reason the
-                # gate keeps one: a pause running across the restart would
-                # otherwise leave the warmed ring full of "skipped" rows
-                # with no real outcome behind them. By finished_at, not by
-                # position (the same unserialized-write hazard as the success
-                # scan above): seeding the last-APPENDED real outcome could
-                # pick an older success over a newer failure and reopen the
-                # very gate this memo exists to hold.
-                reals = [
-                    r
-                    for r in history
-                    if r.outcome in ("success", "failure")
-                    and r.finished_at is not None
-                ]
-                if reals:
-                    newest = max(reals, key=lambda r: r.finished_at)
-                    self._last_real_outcome.setdefault(
-                        name, (newest.finished_at, newest.outcome)
+            if not history:
+                return 0
+            self.last_run[name] = history[-1]
+            # warm the staleness reference too: with a durable ledger
+            # the maxTimeSinceSuccess check must page from the REAL last
+            # success after a restart, not re-baseline on process start
+            # (that grace is only for stateless boots). Shared with the
+            # two early-continue guards above, so a job with pre-existing
+            # in-memory history is seeded the same way.
+            await self._seed_stale_reference(name, history)
+            # and the onlyIfLastSucceeded memo, for the same reason the
+            # gate keeps one: a pause running across the restart would
+            # otherwise leave the warmed ring full of "skipped" rows
+            # with no real outcome behind them. By finished_at, not by
+            # position (the same unserialized-write hazard as the success
+            # scan above): seeding the last-APPENDED real outcome could
+            # pick an older success over a newer failure and reopen the
+            # very gate this memo exists to hold.
+            reals = [
+                r
+                for r in history
+                if r.outcome in ("success", "failure")
+                and r.finished_at is not None
+            ]
+            if reals:
+                newest = max(reals, key=lambda r: r.finished_at)
+                self._last_real_outcome.setdefault(
+                    name, (newest.finished_at, newest.outcome)
+                )
+            # and the retry ladder's supersede watermark: last_run is
+            # history[-1], which a pause running across the restart
+            # makes a "skipped" row with a fresh finished_at. Reading
+            # the ladder's guard off that row would settle every
+            # pending retry the pause is merely holding.
+            for restored in reversed(history):
+                if (
+                    restored.outcome != "skipped"
+                    and restored.finished_at is not None
+                ):
+                    self._last_completed_at.setdefault(
+                        name, restored.finished_at
                     )
-                # and the retry ladder's supersede watermark: last_run is
-                # history[-1], which a pause running across the restart
-                # makes a "skipped" row with a fresh finished_at. Reading
-                # the ladder's guard off that row would settle every
-                # pending retry the pause is merely holding.
-                for restored in reversed(history):
-                    if (
-                        restored.outcome != "skipped"
-                        and restored.finished_at is not None
-                    ):
-                        self._last_completed_at.setdefault(
-                            name, restored.finished_at
-                        )
-                        break
+                    break
+            return 1
+
+        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
+        warmed = sum(
+            await asyncio.gather(*(_warm_worker() for _ in range(workers)))
+        )
         if warmed:
             logger.info(
                 "state: rehydrated run history for %d job(s) from the ledger",
@@ -11558,110 +11646,144 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        for name, job in list(self.cron_jobs.items()):
-            if name in self.retry_state or self.running_jobs.get(name):
-                # live activity always outranks the ledger
-                continue
+        # the same bounded worker pool as the history warm-up above, for the
+        # same reason: one read per job, strictly sequential, multiplied
+        # boot latency by job count for a scan whose per-job work is
+        # independent.
+        items = iter(list(self.cron_jobs.items()))
+        aborted = False
+
+        async def _rearm_worker() -> None:
+            nonlocal aborted
+            for name, job in items:
+                if aborted:
+                    break
+                outcome = await self._rearm_pending_retry(name, job)
+                if outcome == "timeout":
+                    if not aborted:
+                        aborted = True
+                        logger.warning(
+                            "state: retry re-arm timed out reading %s; "
+                            "skipping the rest (store unhealthy?)",
+                            name,
+                        )
+                    break
+
+        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
+        await asyncio.gather(*(_rearm_worker() for _ in range(workers)))
+
+    async def _rearm_pending_retry(
+        self, name: str, job: JobConfig
+    ) -> Optional[str]:
+        """One job's step of the retry re-arm scan (see the caller above).
+
+        Returns ``"timeout"`` when the ledger read timed out, which tells
+        the scan's worker pool to abandon the rest (a store that cannot
+        serve one read in STATE_OP_TIMEOUT is unhealthy); ``None`` in every
+        other case, re-armed or settled or skipped alike.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        if name in self.retry_state or self.running_jobs.get(name):
+            # live activity always outranks the ledger
+            return None
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._retry_stream(name), limit=1, newest_first=True
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return "timeout"
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: cannot read pending retries for %s: %s", name, ex
+            )
+            return None
+        if not recs or recs[0].get("kind") != "pending":
+            return None
+        rec = recs[0]
+        rec_host = rec.get("host")
+        if isinstance(rec_host, str) and rec_host != self._state_host:
+            # another node's live ladder (shared store): not ours to
+            # re-arm OR settle. Cross-node retry resume is a later
+            # phase's leased, reconciled affair.
+            return None
+        if name not in self._last_completed_at:
+            # The warmed ring (_rehydrate_from_state, above) is capped at
+            # RUN_HISTORY_LIMIT, so a pause holding at least that many
+            # slots fills every ring entry with "skipped" rows and floods
+            # out the real run that DID resolve this ladder, leaving the
+            # memo unset. The superseded-by-run guard would then read
+            # None and re-arm a ladder a real run already settled, a
+            # double-run this method exists to avoid (and a regression:
+            # pre-memo the skip row's fresh finished_at settled it by
+            # accident). The durable fold is flood-independent
+            # (derive_max over ranAt), so seed the memo from it before the
+            # guard reads it. One extra read, only when a pending record
+            # actually exists, so steady state is unchanged; it mirrors
+            # the deeper-read _warm_last_success_beyond_history sets for
+            # the SLA memo.
             try:
-                recs = await asyncio.wait_for(
-                    backend.list_records(
-                        self._retry_stream(name), limit=1, newest_first=True
-                    ),
+                durable_at = await asyncio.wait_for(
+                    self.durable_last_completed_at(name),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "state: retry re-arm timed out reading %s; skipping "
-                    "the rest (store unhealthy?)",
-                    name,
-                )
-                break
             except asyncio.CancelledError:
                 raise
-            except Exception as ex:  # noqa: BLE001 - degrade, never crash
-                logger.warning(
-                    "state: cannot read pending retries for %s: %s", name, ex
+            except Exception:  # noqa: BLE001 - unknown -> guard stays open
+                durable_at = None
+            parsed = (
+                _parse_iso_utc(durable_at)
+                if isinstance(durable_at, str)
+                else None
+            )
+            if parsed is not None:
+                self._last_completed_at[name] = parsed
+        validated = self._validate_pending_retry(name, job, rec)
+        if validated is None:
+            return None
+        attempt, not_before = validated
+        if isinstance(job.schedule, str) and job.schedule == "@reboot":
+            try:
+                covered = await self._reboot_marker_covers(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - unknown -> not covered
+                covered = False
+            if not covered:
+                self._persist_retry_settled(
+                    name, "superseded-by-reboot", attempt
                 )
-                continue
-            if not recs or recs[0].get("kind") != "pending":
-                continue
-            rec = recs[0]
-            rec_host = rec.get("host")
-            if isinstance(rec_host, str) and rec_host != self._state_host:
-                # another node's live ladder (shared store): not ours to
-                # re-arm OR settle. Cross-node retry resume is a later
-                # phase's leased, reconciled affair.
-                continue
-            if name not in self._last_completed_at:
-                # The warmed ring (_rehydrate_from_state, above) is capped at
-                # RUN_HISTORY_LIMIT, so a pause holding at least that many
-                # slots fills every ring entry with "skipped" rows and floods
-                # out the real run that DID resolve this ladder, leaving the
-                # memo unset. The superseded-by-run guard would then read
-                # None and re-arm a ladder a real run already settled, a
-                # double-run this method exists to avoid (and a regression:
-                # pre-memo the skip row's fresh finished_at settled it by
-                # accident). The durable fold is flood-independent
-                # (derive_max over ranAt), so seed the memo from it before the
-                # guard reads it. One extra read, only when a pending record
-                # actually exists, so steady state is unchanged; it mirrors
-                # the deeper-read _warm_last_success_beyond_history sets for
-                # the SLA memo.
-                try:
-                    durable_at = await asyncio.wait_for(
-                        self.durable_last_completed_at(name),
-                        timeout=STATE_OP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - unknown -> guard stays open
-                    durable_at = None
-                parsed = (
-                    _parse_iso_utc(durable_at)
-                    if isinstance(durable_at, str)
-                    else None
-                )
-                if parsed is not None:
-                    self._last_completed_at[name] = parsed
-            validated = self._validate_pending_retry(name, job, rec)
-            if validated is None:
-                continue
-            attempt, not_before = validated
-            if isinstance(job.schedule, str) and job.schedule == "@reboot":
-                try:
-                    covered = await self._reboot_marker_covers(job)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - unknown -> not covered
-                    covered = False
-                if not covered:
-                    self._persist_retry_settled(
-                        name, "superseded-by-reboot", attempt
-                    )
-                    continue
-            retry = job.onFailure["retry"]
-            state = JobRetryState(
-                retry["initialDelay"],
-                retry["backoffMultiplier"],
-                retry["maximumDelay"],
-            )
-            # replay the ladder to the persisted position: count == attempt,
-            # delay == what the NEXT failure would sleep.
-            for _ in range(attempt):
-                state.next_delay()
-            now = get_now(datetime.timezone.utc)
-            remaining = max(0.0, (not_before - now).total_seconds())
-            self.retry_state[name] = state
-            state.task = asyncio.create_task(
-                self.schedule_retry_job(name, remaining, attempt)
-            )
-            logger.info(
-                "Job %s: re-armed pending retry #%d from the durable "
-                "ledger (due in %.1f seconds)",
-                name,
-                attempt,
-                remaining,
-            )
+                return None
+        retry = job.onFailure["retry"]
+        state = JobRetryState(
+            retry["initialDelay"],
+            retry["backoffMultiplier"],
+            retry["maximumDelay"],
+        )
+        # replay the ladder to the persisted position: count == attempt,
+        # delay == what the NEXT failure would sleep.
+        for _ in range(attempt):
+            state.next_delay()
+        now = get_now(datetime.timezone.utc)
+        remaining = max(0.0, (not_before - now).total_seconds())
+        self.retry_state[name] = state
+        state.task = asyncio.create_task(
+            self.schedule_retry_job(name, remaining, attempt)
+        )
+        logger.info(
+            "Job %s: re-armed pending retry #%d from the durable "
+            "ledger (due in %.1f seconds)",
+            name,
+            attempt,
+            remaining,
+        )
+        return None
 
     def _validate_pending_retry(
         self, name: str, job: JobConfig, rec: Dict[str, Any]

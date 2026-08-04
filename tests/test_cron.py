@@ -9439,7 +9439,8 @@ def test_slotlease_log_cluster_role_swallows_backend_error(caplog):
 # --- _prepare_job_api_run: stage secrets, skip an unresolvable one ----------
 
 
-def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
+@pytest.mark.asyncio
+async def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
     monkeypatch, caplog
 ):
     import logging
@@ -9466,13 +9467,100 @@ def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
         stateAllowedScopes=[],
     )
     with caplog.at_level(logging.WARNING, logger="cronstable"):
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
     assert token is not None
     assert registered and registered[0].secrets == {"good": "v1"}
     assert any(
         "could not stage secret" in r.message for r in caplog.records
     )
     assert "CRONSTABLE_STATE_URL" in env or env  # env was built
+
+
+@pytest.mark.asyncio
+async def test_prepare_job_api_run_stages_fromfile_secrets_off_loop(
+    tmp_path, monkeypatch
+):
+    # A fromFile secret is a blocking open()/read() inside the awaited
+    # launch chain: on a slow or hung secret mount it must stall a worker
+    # thread, never the event loop. Value/env secrets stay inline, where
+    # the thread hop would cost more than the dict it builds.
+    import threading
+    import types
+
+    cron = cronstable.cron.Cron(None)
+    registered = []
+
+    class _Api:
+        base_url = "http://127.0.0.1:65500"
+        cacert = None
+
+        def register_run(self, ctx):
+            registered.append(ctx)
+
+    cron._job_api = _Api()
+
+    staged_on_loop_thread = []
+    real_stage = cron._stage_job_secrets
+
+    def spying_stage(job):
+        staged_on_loop_thread.append(
+            threading.current_thread() is threading.main_thread()
+        )
+        return real_stage(job)
+
+    monkeypatch.setattr(cron, "_stage_job_secrets", spying_stage)
+
+    secret_file = tmp_path / "token.txt"
+    secret_file.write_text("filed-value\n")
+    filed = types.SimpleNamespace(
+        name="s",
+        secrets=[
+            {"name": "v", "value": "plain"},
+            {"name": "f", "fromFile": str(secret_file)},
+        ],
+        stateAllowedScopes=[],
+    )
+    token, _env = await cron._prepare_job_api_run(filed, None)
+    assert token is not None
+    assert registered[-1].secrets == {"v": "plain", "f": "filed-value"}
+    assert staged_on_loop_thread == [False]  # the file read left the loop
+
+    inline = types.SimpleNamespace(
+        name="s2",
+        secrets=[{"name": "v", "value": "plain"}],
+        stateAllowedScopes=[],
+    )
+    token2, _env2 = await cron._prepare_job_api_run(inline, None)
+    assert token2 is not None
+    assert registered[-1].secrets == {"v": "plain"}
+    assert staged_on_loop_thread[-1] is True  # no hop for memory-only specs
+
+
+@pytest.mark.asyncio
+async def test_same_slot_spawn_burst_is_gated(monkeypatch):
+    # A slot that launches many jobs at once must not execute every spawn's
+    # synchronous fork/exec setup in one contiguous ready-queue burst; the
+    # daemon-wide gate caps how many run at a time so web/SSE/gossip
+    # callbacks interleave. The cap is a hard semaphore bound, so the
+    # green assertion is timing-independent.
+    yaml = "jobs:\n" + "".join(
+        "  - name: b%02d\n    command: x\n    schedule: '* * * * *'\n" % i
+        for i in range(40)
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    state = {"in_flight": 0, "high": 0, "started": 0}
+
+    async def fake_start(self):
+        state["in_flight"] += 1
+        state["high"] = max(state["high"], state["in_flight"])
+        state["started"] += 1
+        await asyncio.sleep(0.01)
+        state["in_flight"] -= 1
+
+    monkeypatch.setattr(cronstable.cron.RunningJob, "start", fake_start)
+    await cron._launch_concurrently(list(cron.cron_jobs.values()))
+    assert state["started"] == 40  # every job still launched
+    assert state["high"] <= cronstable.cron._SPAWN_BURST_LIMIT
 
 
 # --- _slot_fidelity_reason -------------------------------------------------
@@ -10081,11 +10169,10 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
             finished.append(token)
 
     cron._job_api = _Api()
-    monkeypatch.setattr(
-        cron,
-        "_prepare_job_api_run",
-        lambda j, rs: ("tok123", {"CRONSTABLE_RUN_ID": "rid"}),
-    )
+    async def _fake_prepare(j, rs):
+        return ("tok123", {"CRONSTABLE_RUN_ID": "rid"})
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
 
     class _BoomRun:
         def __init__(self, *args, **kwargs):
@@ -10253,7 +10340,10 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
             finished.append(token)
 
     cron._job_api = _Api()
-    monkeypatch.setattr(cron, "_prepare_job_api_run", lambda j, rs: ("tokN", {}))
+    async def _fake_prepare(j, rs):
+        return ("tokN", {})
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
 
     class _BoomRun:
         def __init__(self, *args, **kwargs):
@@ -10273,7 +10363,10 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
 async def test_slotlease_maybe_launch_start_failure_without_job_api(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_NODE_JOB)
     job = cron.cron_jobs["s"]
-    monkeypatch.setattr(cron, "_prepare_job_api_run", lambda j, rs: (None, {}))
+    async def _fake_prepare(j, rs):
+        return (None, {})
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
     cron._job_api = None
 
     class _BoomRun:
@@ -10690,6 +10783,43 @@ async def test_rehydrate_rehydrate_from_state_timeout_breaks(tmp_path):
     cron.state_backend.list_records = _list
     await cron._rehydrate_from_state()  # a hung store aborts the warm-up
     assert not cron.run_history.get("j")
+
+
+async def test_rehydrate_reads_jobs_concurrently(tmp_path):
+    # The warm-up must overlap its per-job ledger reads: strictly
+    # sequential reads made boot delay scale linearly with job count (the
+    # whole point of the worker pool). The rendezvous below only clears
+    # once 4 reads are in flight AT THE SAME TIME; a sequential warm-up
+    # never gets past its first read and times out instead.
+    yaml = "jobs:\n" + "".join(
+        "  - name: j%d\n    command: x\n    schedule: '@reboot'\n" % i
+        for i in range(8)
+    )
+    cron = await _rehydrate_state_cron(tmp_path, yaml)
+    cron._state_rehydrated = False
+    need = 4
+    state = {"in_flight": 0, "high": 0}
+    gate = asyncio.Event()
+
+    async def _list(stream, **kw):
+        if not stream.startswith("runs/"):
+            return []
+        state["in_flight"] += 1
+        state["high"] = max(state["high"], state["in_flight"])
+        if state["high"] >= need:
+            gate.set()
+        try:
+            # cleared only when `need` reads overlap; the 2s bound makes a
+            # sequential implementation fail fast (each lone read times
+            # out) rather than hang the test.
+            await asyncio.wait_for(gate.wait(), timeout=2.0)
+        finally:
+            state["in_flight"] -= 1
+        return []
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    assert state["high"] >= need
 
 
 async def test_rehydrate_rehydrate_from_state_oserror_continues(tmp_path):

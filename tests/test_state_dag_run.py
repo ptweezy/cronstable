@@ -331,6 +331,60 @@ async def test_mapped_upstream_publishes_nothing_expands_empty(tmp_path):
         await _teardown(cron)
 
 
+async def test_xcom_fanout_parses_bytes_and_offloads_large_payloads(
+    tmp_path, monkeypatch
+):
+    # The fan-out parse must take the artifact's BYTES straight to the
+    # decoder (the old decode() forced the slower str branch and a second
+    # full copy) and, past the offload floor, run on a worker thread: a
+    # multi-MB inline parse stalled the whole event loop per expansion.
+    import threading
+
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        backend = cron.state_backend
+        calls = []
+        real_parse = dagrun._parse_portable_xcom
+
+        def spying_parse(data):
+            calls.append(
+                (
+                    type(data),
+                    len(data),
+                    threading.current_thread() is threading.main_thread(),
+                )
+            )
+            return real_parse(data)
+
+        monkeypatch.setattr(dagrun, "_parse_portable_xcom", spying_parse)
+
+        async def publish_and_read(items, run_id):
+            scope = dag.xcom_scope("lin", run_id)
+            name = dag.xcom_name("gen", "items")
+            await jobstate.artifact_put(
+                backend, scope, name, json.dumps(items).encode()
+            )
+            return await cron._dag._read_xcom_list(
+                run_id, "lin", "gen", "items"
+            )
+
+        # small payload: parsed inline on the loop thread, from bytes
+        small = ["alpha", "beta"]
+        assert await publish_and_read(small, "r-small") == small
+        assert calls == [(bytes, len(json.dumps(small)), True)]
+
+        # large payload (past the offload floor, under MAX_MAPPED_ITEMS):
+        # same result, parsed on a worker thread, still from bytes
+        big = ["item-%04d-%s" % (i, "x" * 80) for i in range(900)]
+        assert len(json.dumps(big)) >= dagrun._XCOM_PARSE_OFFLOAD_MIN
+        assert await publish_and_read(big, "r-big") == big
+        kind, size, on_loop_thread = calls[-1]
+        assert kind is bytes
+        assert not on_loop_thread
+    finally:
+        await _teardown(cron)
+
+
 async def test_mapped_expansion_transient_read_error_is_not_an_empty_fanout(
     tmp_path, monkeypatch
 ):
@@ -3020,7 +3074,7 @@ async def test_prepare_task_run_env_and_secrets(tmp_path):
         # is still returned, token is None.
         api = cron._job_api
         cron._job_api = None
-        token, env = cron._dag._prepare_task_run(
+        token, env = await cron._dag._prepare_task_run(
             dagcfg, run_id, "manual-1", intent, template
         )
         assert token is None
@@ -3031,7 +3085,7 @@ async def test_prepare_task_run_env_and_secrets(tmp_path):
 
         # With the API up, the secret loop stages GOOD and skips the broken
         # BAD (its fromFile cannot be read) rather than failing the launch.
-        token, env = cron._dag._prepare_task_run(
+        token, env = await cron._dag._prepare_task_run(
             dagcfg, run_id, "manual-1", intent, template
         )
         assert token is not None
