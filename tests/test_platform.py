@@ -1,5 +1,7 @@
 import asyncio
 import os
+import sys
+import time
 
 import pytest
 from aiohttp import web
@@ -76,67 +78,96 @@ async def test_kill_process_group_windows_tree_kills_on_the_graceful_call(
     assert calls == [4242, 4242]
 
 
-async def _windows_children_of(pid):
-    # Win32_Process, not wmic (removed on current Windows 11).
-    proc = await asyncio.create_subprocess_exec(
-        "powershell",
-        "-NoProfile",
-        "-Command",
-        "(Get-CimInstance Win32_Process -Filter 'ParentProcessId={}')"
-        ".ProcessId".format(pid),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+def _windows_pid_alive(pid):
+    # OpenProcess/GetExitCodeProcess, not a tasklist subprocess per poll: on a
+    # degraded CI runner every process spawn crawled, and the polling in the
+    # grandchild test below stalled past the 20-minute job timeout.
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION, False, pid
     )
-    out, _ = await proc.communicate()
-    return [int(line) for line in out.split() if line.strip().isdigit()]
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
-async def _windows_pid_alive(pid):
-    proc = await asyncio.create_subprocess_exec(
-        "tasklist",
-        "/FI",
-        "PID eq {}".format(pid),
-        "/NH",
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    out, _ = await proc.communicate()
-    return str(pid).encode() in out
+def _windows_terminate(pid):
+    # best-effort cleanup so a failing run doesn't leak the sleeping
+    # grandchild for the rest of its 300s lifetime.
+    import ctypes
+
+    PROCESS_TERMINATE = 0x0001
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if handle:
+        kernel32.TerminateProcess(handle, 1)
+        kernel32.CloseHandle(handle)
 
 
 @pytest.mark.skipif(
     not platform.IS_WINDOWS, reason="taskkill tree kill is Windows-only"
 )
 @pytest.mark.asyncio
-async def test_kill_process_group_windows_reaches_the_grandchild():
+async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
     # end to end on a real tree, the same shape as a string-form `command:`
     # job (cmd.exe /c means the workload is a grandchild of nothing we hold
     # a handle to). The non-forced call must take the whole tree down.
+    #
+    # The grandchild announces its own pid through a file rather than the
+    # test walking the process tree with a Get-CimInstance poll: on a
+    # degraded CI runner each PowerShell+WMI spawn took ~15s, so 50 polls
+    # burned 13 minutes and outlived the previous 59s ping workload before
+    # ever seeing it, timing out every Windows cell (2026-08-03).
+    pid_file = tmp_path / "grandchild.pid"
+    script = tmp_path / "grandchild.py"
+    script.write_text(
+        "import os, time\n"
+        "tmp = r'{pf}' + '.tmp'\n"
+        "open(tmp, 'w').write(str(os.getpid()))\n"
+        "os.replace(tmp, r'{pf}')\n"
+        "time.sleep(300)\n".format(pf=pid_file)
+    )
     proc = await asyncio.create_subprocess_shell(
-        "ping -n 60 127.0.0.1 >NUL",
+        '"{}" "{}"'.format(sys.executable, script),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    grandchild = None
     try:
-        grandchildren = []
-        for _ in range(50):  # ping needs a moment to spawn
-            grandchildren = await _windows_children_of(proc.pid)
-            if grandchildren:
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:  # cmd needs a moment to spawn it
+            if pid_file.exists():
+                grandchild = int(pid_file.read_text())
                 break
             await asyncio.sleep(0.1)
-        assert grandchildren, "the shell never spawned its ping child"
+        assert grandchild is not None, (
+            "the shell never spawned its python child"
+        )
+        assert grandchild != proc.pid  # a real descendant, not the shell
 
         assert await platform.kill_process_group(proc.pid, force=False)
         await asyncio.wait_for(proc.wait(), 10)
-        for pid in grandchildren:
-            for _ in range(50):  # taskkill delivery is asynchronous
-                if not await _windows_pid_alive(pid):
-                    break
-                await asyncio.sleep(0.1)
-            assert not await _windows_pid_alive(pid), (
-                "descendant %d survived the tree kill" % pid
-            )
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:  # taskkill delivery is async
+            if not _windows_pid_alive(grandchild):
+                break
+            await asyncio.sleep(0.1)
+        assert not _windows_pid_alive(grandchild), (
+            "descendant %d survived the tree kill" % grandchild
+        )
     finally:
+        if grandchild is not None and _windows_pid_alive(grandchild):
+            _windows_terminate(grandchild)
         if proc.returncode is None:
             proc.kill()
 
@@ -146,8 +177,6 @@ async def test_kill_process_group_windows_reaches_the_grandchild():
 )
 @pytest.mark.asyncio
 async def test_kill_process_group_signals_the_group_then_reports_it_gone():
-    import sys
-
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-c",
