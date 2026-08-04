@@ -81,6 +81,23 @@ performance review of the same tree.
   `/dags` rollup and the run drawer is additionally served from a short
   memo between local changes, so dashboard polling of a quiet store no
   longer performs one store listing per dag per poll per viewer.
+- A mapped task's fan-out list is parsed from the artifact's bytes
+  directly (no decoded second copy) and, past 64 KiB, on a worker thread.
+  Parsing a multi-MB XCom inline used to stall the scheduler loop for
+  tens of milliseconds per expansion.
+- `fromFile` secrets are read on a worker thread when a run is staged.
+  The read sits inside the launch chain, so a slow or hung secret mount
+  (a Kubernetes secret volume, NFS) used to stall the event loop itself
+  rather than just that launch.
+- Boot rehydration reads the ledger sixteen jobs at a time instead of one
+  by one. Warm-up ran before the first scheduling pass, so its wall clock
+  was pure boot delay: seconds at fleet scale on local disk, minutes on a
+  network mount, and a hung mount now costs one read timeout, not one per
+  job.
+- Subprocess spawns are gated sixteen at a time when one slot launches
+  many jobs. The fork/exec setup is synchronous work on the event loop,
+  and an ungated 500-job burst occupied it for up to a second each minute
+  boundary while web requests and cluster heartbeats waited.
 
 ## 1.2.35 (2026-07-27)
 
