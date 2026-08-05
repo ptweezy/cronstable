@@ -127,7 +127,12 @@ performance review of the same tree.
 - A live SSE log tail delivers a burst of lines as one joined write per
   wake instead of one timer task, one frame build and one transport
   write per line per viewer, which cost the scheduler's loop thousands
-  of coroutine steps a second under a chatty job.
+  of coroutine steps a second under a chatty job. The framing benchmark
+  moved with the code: `webapi.sse_burst_20k` times the burst path and
+  retires `webapi.sse_frame_20k`, whose per-line seam no longer exists.
+  The smoke test's never-skip net is now derived from
+  `benchmarks/expected_gated.txt` instead of hand-copied from it, which
+  is the gap that had let the old metric die silently.
 - TUI: the heat overlay's per-job run fetches run as a background task
   with a few requests in flight, instead of strictly one at a time
   inside the poll loop, which froze every panel for the sum of up to 40
