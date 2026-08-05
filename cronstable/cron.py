@@ -29,6 +29,7 @@ from typing import (  # noqa
     TYPE_CHECKING,
     Any,
     Awaitable,
+    Callable,
     Coroutine,
     Deque,
     Dict,
@@ -69,7 +70,6 @@ from cronstable.config import (
     parse_config_string,
     parse_config_with_sources,
     resolve_bonjour_config,
-    schedule_object_to_crontab,
 )
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (
@@ -95,6 +95,7 @@ from cronstable.job import (
     report_event,
     report_hostname,
     report_sla_breach,
+    schedule_string,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
 from cronstable.prometheus import (
@@ -779,7 +780,9 @@ class JobRunInfo:
     stays in ``run_history`` as the summary the history endpoints read.
     """
 
-    outcome: str  # "success" | "failure"
+    # "success" | "failure" | "cancelled" | "skipped" (a pause held the slot
+    # back) | "unknown" (rehydrated row whose outcome did not survive)
+    outcome: str
     exit_code: Optional[int]
     started_at: Optional[datetime.datetime]
     finished_at: datetime.datetime
@@ -1130,14 +1133,14 @@ def _index_gzip() -> bytes:
 
 
 def schedule_str(job: JobConfig) -> str:
-    """Human-readable schedule for the web UI (the original config form)."""
-    unparsed = job.schedule_unparsed
-    if isinstance(unparsed, str):
-        return unparsed
-    # the object form: rebuild the crontab line (5 fields normally, or 6/7 when
-    # a year/second column is used) via the shared builder so it matches what
-    # the scheduler and fingerprint compute.
-    return schedule_object_to_crontab(unparsed)
+    """Human-readable schedule for the web UI (the original config form).
+
+    The web/prometheus-facing name for :func:`cronstable.job.schedule_string`
+    (kept for its established importers); one implementation, so the status
+    payload, prometheus and the reporters can never render an object-form
+    schedule differently.
+    """
+    return schedule_string(job)
 
 
 def _json_response(
@@ -4770,6 +4773,58 @@ class Cron:
             )
         return out
 
+    def _install_tail_task(
+        self,
+        tail: Dict[str, asyncio.Task],
+        name: str,
+        body: Coroutine[Any, Any, None],
+        *,
+        spawn: Callable[[Coroutine[Any, Any, None]], asyncio.Task],
+        after: Optional[Iterable[Optional[asyncio.Task]]] = None,
+    ) -> asyncio.Task:
+        """Spawn ``body`` behind ``name``'s current tail and become the tail.
+
+        The ONE implementation of the per-name chained-tail idiom, which
+        used to be pasted five times (the completion, SLA-report, inflight,
+        retry-write and pause-write paths).  Predecessors are awaited for
+        ordering only (``asyncio.wait``, so their errors stay their own);
+        ``after`` overrides the default single-predecessor list for a
+        chain that must order behind another chain too (the SLA report
+        waits on the completion tail as well as its own).  ``spawn`` turns
+        the ordered coroutine into the tracked task
+        (:meth:`_track_state_write` for state writes,
+        :meth:`_spawn_completion` for report sequences).  The
+        done-callback drops the registration only while it is still this
+        task's, so a successor installed meanwhile is never clobbered.
+        """
+        earlier = list(after) if after is not None else [tail.get(name)]
+
+        async def _ordered() -> None:
+            for prev in earlier:
+                if prev is not None and not prev.done():
+                    await asyncio.wait({prev})
+            await body
+
+        task = spawn(_ordered())
+        tail[name] = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if tail.get(name) is done:
+                del tail[name]
+
+        task.add_done_callback(_clear)
+        return task
+
+    def _spawn_completion(
+        self, coro: Coroutine[Any, Any, None]
+    ) -> asyncio.Task:
+        """A task in ``_completion_tasks``, so shutdown drains it
+        (:meth:`_drain_completions`)."""
+        task = asyncio.create_task(coro)
+        self._completion_tasks.add(task)
+        task.add_done_callback(self._completion_tasks.discard)
+        return task
+
     def _queue_sla_report(
         self, job: JobConfig, check: str, threshold: int, observed: float
     ) -> None:
@@ -4801,15 +4856,8 @@ class Cron:
             ),
         )
         report_config = job.onLate["report"]
-        earlier = [
-            self._completion_tail.get(name),
-            self._sla_report_tail.get(name),
-        ]
 
-        async def _sequenced() -> None:
-            for prev in earlier:
-                if prev is not None and not prev.done():
-                    await asyncio.wait({prev})
+        async def _report() -> None:
             try:
                 await report_sla_breach(ctx, report_config)
             except asyncio.CancelledError:
@@ -4821,16 +4869,16 @@ class Cron:
                     name,
                 )
 
-        task = asyncio.create_task(_sequenced())
-        self._completion_tasks.add(task)
-        task.add_done_callback(self._completion_tasks.discard)
-        self._sla_report_tail[name] = task
-
-        def _clear(done: asyncio.Task) -> None:
-            if self._sla_report_tail.get(name) is done:
-                del self._sla_report_tail[name]
-
-        task.add_done_callback(_clear)
+        self._install_tail_task(
+            self._sla_report_tail,
+            name,
+            _report(),
+            spawn=self._spawn_completion,
+            after=[
+                self._completion_tail.get(name),
+                self._sla_report_tail.get(name),
+            ],
+        )
 
     async def _web_start_job(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -10774,22 +10822,12 @@ class Cron:
         same idiom as :meth:`_queue_retry_write`) keeps the stream's order
         equal to the launch/finish order.
         """
-        prev = self._inflight_write_tail.get(name)
-
-        async def _ordered() -> None:
-            if prev is not None and not prev.done():
-                await asyncio.wait({prev})
-            await coro
-
-        task = self._track_state_write(_ordered())
-        self._inflight_write_tail[name] = task
-
-        def _clear(done: asyncio.Task) -> None:
-            if self._inflight_write_tail.get(name) is done:
-                del self._inflight_write_tail[name]
-
-        task.add_done_callback(_clear)
-        return task
+        return self._install_tail_task(
+            self._inflight_write_tail,
+            name,
+            coro,
+            spawn=self._track_state_write,
+        )
 
     async def _persist_inflight_open(
         self, job: JobConfig, running_job: RunningJob
@@ -12373,11 +12411,8 @@ class Cron:
         reports after the running-job drain (see :meth:`_drain_completions`).
         """
         name = job.config.name
-        prev = self._completion_tail.get(name)
 
-        async def _sequenced() -> None:
-            if prev is not None and not prev.done():
-                await asyncio.wait({prev})
+        async def _handle() -> None:
             try:
                 if failed:
                     await self.handle_job_failure(job)
@@ -12388,20 +12423,16 @@ class Cron:
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
                     "Unexpected error handling the completion of job %s; "
-                    "please report this as a bug (5)",
+                    "please report this as a bug (8)",
                     name,
                 )
 
-        task = asyncio.create_task(_sequenced())
-        self._completion_tasks.add(task)
-        task.add_done_callback(self._completion_tasks.discard)
-        self._completion_tail[name] = task
-
-        def _clear(done: asyncio.Task) -> None:
-            if self._completion_tail.get(name) is done:
-                del self._completion_tail[name]
-
-        task.add_done_callback(_clear)
+        self._install_tail_task(
+            self._completion_tail,
+            name,
+            _handle(),
+            spawn=self._spawn_completion,
+        )
 
     async def _drain_completions(self) -> None:
         """Await every in-flight report+retry-arm sequence.
@@ -12764,24 +12795,12 @@ class Cron:
         boot.  Chaining each job's writes behind the previous one keeps the
         stream's order equal to the ladder's event order.
         """
-        prev = self._retry_write_tail.get(name)
-
-        async def _ordered() -> None:
-            if prev is not None and not prev.done():
-                # ordering only; the previous write handles its own errors
-                # and _track_state_write tasks never raise.
-                await asyncio.wait({prev})
-            await self._append_retry_record(name, record)
-
-        task = self._track_state_write(_ordered())
-        self._retry_write_tail[name] = task
-
-        def _clear(done: asyncio.Task) -> None:
-            if self._retry_write_tail.get(name) is done:
-                del self._retry_write_tail[name]
-
-        task.add_done_callback(_clear)
-        return task
+        return self._install_tail_task(
+            self._retry_write_tail,
+            name,
+            self._append_retry_record(name, record),
+            spawn=self._track_state_write,
+        )
 
     async def _append_retry_record(
         self, name: str, record: Dict[str, Any]
@@ -12910,24 +12929,12 @@ class Cron:
         edge-triggered half of that signal (see :attr:`_pause_gen`).
         """
         self._pause_gen[name] = self._pause_gen.get(name, 0) + 1
-        prev = self._pause_write_tail.get(name)
-
-        async def _ordered() -> None:
-            if prev is not None and not prev.done():
-                # ordering only; the previous write handles its own errors
-                # and _track_state_write tasks never raise.
-                await asyncio.wait({prev})
-            await self._append_pause_record(name, record)
-
-        task = self._track_state_write(_ordered())
-        self._pause_write_tail[name] = task
-
-        def _clear(done: asyncio.Task) -> None:
-            if self._pause_write_tail.get(name) is done:
-                del self._pause_write_tail[name]
-
-        task.add_done_callback(_clear)
-        return task
+        return self._install_tail_task(
+            self._pause_write_tail,
+            name,
+            self._append_pause_record(name, record),
+            spawn=self._track_state_write,
+        )
 
     async def _append_pause_record(
         self, name: str, record: Dict[str, Any]

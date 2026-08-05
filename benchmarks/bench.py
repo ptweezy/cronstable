@@ -5321,7 +5321,7 @@ def bench_statsd_emit():
         message = (
             "cronstable.bench.stop:1|g\n"
             "cronstable.bench.success:1|g\n"
-            "cronstable.bench.duration:1250|ms|@0.1\n"
+            "cronstable.bench.duration:1250|ms\n"
         )
 
         async def run():

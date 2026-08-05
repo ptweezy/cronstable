@@ -704,11 +704,23 @@ class DagScheduler:
         if not missed:
             return
         targets = missed[-1:] if sched.onMissed == "run-once" else missed
-        # The same deterministic per-name spread the job engine applies
-        # (Cron._catchup_offset, stable across boots and the fleet):
-        # ``catchupJitterSeconds`` is accepted and validated on dag
-        # schedules, so it must spread their replays too, not silently
-        # apply to plain jobs only.
+        if (
+            sched.onMissed != "run-once"
+            and len(missed) >= DAG_MAX_CATCHUP
+            and nxt is not None
+            and nxt <= now_dt
+        ):
+            # the job engine's cap (cron._missed_occurrences) warns when it
+            # drops occurrences; truncating a dag's replay must be exactly
+            # as loud, never silent.
+            logger.warning(
+                "dag catch-up: %s missed at least %d runs; replaying %d "
+                "and dropping the rest (set startingDeadlineSeconds to "
+                "bound the window, or use onMissed: run-once)",
+                dagcfg.name,
+                DAG_MAX_CATCHUP,
+                DAG_MAX_CATCHUP,
+            )
         # The same deterministic per-name spread the job engine applies
         # (Cron._catchup_offset, stable across boots and the fleet):
         # ``catchupJitterSeconds`` is accepted and validated on dag
@@ -1244,7 +1256,9 @@ class DagScheduler:
                     intent.task_id,
                     success=False,
                     exit_code=127,
-                    fail_reason="launch error",
+                    # the one vocabulary for a task that never started, shared
+                    # with _launch_task's own cleanup path below
+                    fail_reason="launch failed",
                     proc=proc,
                     attempt=intent.attempt,
                     poke=intent.poke_number if intent.is_sensor else None,

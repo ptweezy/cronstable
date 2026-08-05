@@ -366,6 +366,22 @@ OUTCOME_COLOR = {
     "skipped": "off",
 }
 
+#: Theme colour for each key :func:`health` can return, shared by the jobs
+#: table, the wallboard tiles and the job drawer header.  The
+#: :data:`OUTCOME_KEY` lesson again: three hand-rolled copies of this dict
+#: used to live inline in those panels, one drifted arm away from a job
+#: painting a different verdict per panel.
+HEALTH_COLOR = {
+    "ok": "ok",
+    "fail": "fail",
+    "run": "run",
+    "pending": "pending",
+    "disabled": "off",
+    "paused": "off",
+    "cancelled": "off",
+    "unknown": "pending",
+}
+
 #: Heatmap bucket precedence. "skipped" seeds the bucket and ranks below
 #: "ok": an hour that only ever held slots back for a pause must not shade
 #: green, but one real success in it outranks any number of holds.  An
@@ -4936,16 +4952,7 @@ class AppRender(AppKeys):
     ) -> str:
         key, label = health(job)
         ascii_mode = bool(self.prefs["ascii"])
-        color = {
-            "ok": "ok",
-            "fail": "fail",
-            "run": "run",
-            "pending": "pending",
-            "disabled": "off",
-            "paused": "off",
-            "cancelled": "off",
-            "unknown": "pending",
-        }[key]
+        color = HEALTH_COLOR[key]
         last = job.get("last_run") or {}
         cells: List[str] = []
         bg = "sel" if selected else None
@@ -5156,16 +5163,7 @@ class AppRender(AppKeys):
             chunk = shown[chunk_start : chunk_start + per_row]
             lines3: List[List[str]] = [[], [], []]
             for key, job in chunk:
-                color = {
-                    "ok": "ok",
-                    "fail": "fail",
-                    "run": "run",
-                    "pending": "pending",
-                    "disabled": "off",
-                    "paused": "off",
-                    "cancelled": "off",
-                    "unknown": "pending",
-                }[key]
+                color = HEALTH_COLOR[key]
                 last = job.get("last_run") or {}
                 name = truncate(str(job.get("name", "")), tile_w - 4)
                 head = "%s %s" % (paint.glyph(key, ascii_mode), name)
@@ -6566,16 +6564,7 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         key, label = health(job) if job else ("unknown", "?")
-        color = {
-            "ok": "ok",
-            "fail": "fail",
-            "run": "run",
-            "pending": "pending",
-            "disabled": "off",
-            "paused": "off",
-            "cancelled": "off",
-            "unknown": "pending",
-        }[key]
+        color = HEALTH_COLOR[key]
         ascii_mode = bool(self.prefs["ascii"])
         rows = [
             " "

@@ -159,6 +159,25 @@ def test_resolve_metrics_config_map_form():
     assert resolved == {"public": True, "durationBuckets": (1.0, 10.0)}
 
 
+def test_peer_statuses_mirror_the_cluster_vocabulary():
+    """PEER_STATUSES is a hand-kept mirror of cluster's STATUS_* constants
+    (kept as literals so the leaf module never imports the cluster
+    machinery). This is the drift guard the mirror comment promises: a new
+    STATUS_* constant that never reaches the mirror would zero-fill the
+    per-peer gauge for every status except the one it silently misses."""
+    from cronstable import cluster, prometheus
+
+    cluster_statuses = {
+        value
+        for name, value in vars(cluster).items()
+        if name.startswith("STATUS_") and isinstance(value, str)
+    }
+    assert set(prometheus.PEER_STATUSES) == cluster_statuses
+    # the tuple is a label vocabulary: a duplicate would render the same
+    # series twice
+    assert len(prometheus.PEER_STATUSES) == len(set(prometheus.PEER_STATUSES))
+
+
 # ---------------------------------------------------------------------------
 # accumulator registry
 # ---------------------------------------------------------------------------

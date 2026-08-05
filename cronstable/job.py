@@ -62,7 +62,11 @@ def _compiled_template(source: str) -> "jinja2.Template":
     # import statement is only reached on the first distinct template anyway.
     import jinja2
 
-    return jinja2.Template(source)
+    # assigned through a typed local because jinja2.Template.__new__ is
+    # typed Any-returning (template construction can yield a subclass), and
+    # warn_return_any would flag returning the call directly.
+    template: "jinja2.Template" = jinja2.Template(source)
+    return template
 
 
 if "HOSTNAME" not in os.environ:
@@ -1817,7 +1821,7 @@ class SlaBreachContext:
         self.stdout_discarded = 0
         self.stderr_discarded = 0
         self.resource_usage = None  # type: Optional[ResourceUsage]
-        self.env = {"HOSTNAME": os.environ.get("HOSTNAME", "")}
+        self.env = {"HOSTNAME": report_hostname()}
         # read by ShellReporter for the CRONSTABLE_SLA_* exports.
         self.sla_vars = {
             "sla_check": check,
@@ -1858,7 +1862,7 @@ class SlaBreachContext:
 async def report_sla_breach(
     ctx: SlaBreachContext, report_config: dict
 ) -> None:
-    """Fan one SLA breach out to all four reporters (the onLate hook).
+    """Fan one SLA breach out to every reporter (the onLate hook).
 
     The ``_report_common`` gather idiom with ``success=False``
     throughout: an overdue job is bad news, so MailReporter's empty-body
@@ -1914,7 +1918,7 @@ class NotifyEventContext:
     block): a DAG run failure, an approval gate awaiting a decision, or a
     leadership / quorum change; none of which is a job run.
 
-    Quacks like a :class:`RunningJob` exactly as far as the four reporters read
+    Quacks like a :class:`RunningJob` exactly as far as the reporters read
     one (a minimal :class:`_NotifyJobShim` ``config``, the run-shaped fields
     empty, and a ``template_vars`` carrying the standard key set so operator
     templates written for a job render unchanged), plus the event detail:

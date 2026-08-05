@@ -7,8 +7,8 @@ project, on which cronstable is based.
 
 ## 1.2.38
 
-The top findings of a design review (redundancies, inconsistencies, and
-quirks) of the tree the 1.2.37 performance review covered.
+Findings of a design review (redundancies, inconsistencies, and quirks)
+of the tree the 1.2.37 performance review covered.
 
 - `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
   spread plain-job backfills: the same deterministic per-name offset,
@@ -77,6 +77,31 @@ quirks) of the tree the 1.2.37 performance review covered.
   running-row `never_fires` flag, the error envelope, and the new acks.
   `docs/openapi.yaml` declares the envelope, acks, and `limit`
   parameters.
+- The statsd timers (`.duration`, plus `.cpu` under `monitorResources`)
+  no longer carry a literal `@0.1` sample-rate flag. Nothing was ever
+  sampled (every run sends exactly one observation), so the flag made
+  rate-honoring statsd servers weight each observation 10x. If your
+  dashboards divided by 10 to compensate, remove that correction when
+  upgrading.
+- A DAG whose catch-up replay hits the 100-run cap now logs the same
+  warning the job engine's cap always logged, naming
+  `startingDeadlineSeconds` and `onMissed: run-once` as the escape
+  hatches; the truncation used to be silent.
+- A DAG task that never started reports `failReason: "launch failed"` on
+  both paths that can get it there; one of the two used to say
+  `"launch error"` for the same situation.
+- `cronstable state` sends its error and refusal messages to stderr, the
+  convention every other cronstable command already follows; success
+  summaries and inventories stay on stdout, so piping them is now clean.
+- A typo'd `--log-level` exits as a normal usage error naming the valid
+  levels instead of an `AttributeError` traceback, and lowercase
+  spellings (`--log-level debug`) now work; `--help` also explains that
+  `-v` is validate-config, not verbose.
+- `tox -e mypy` (the CI type gate) installs the package and drops its
+  global `--ignore-missing-imports`, which had silently typed every
+  third-party surface as `Any`; the deps that legitimately cannot
+  resolve are now enumerated per-module in `pyproject.toml`, so a new
+  unresolvable import fails the gate.
 
 ## 1.2.37
 
