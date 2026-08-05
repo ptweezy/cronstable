@@ -673,6 +673,19 @@ async def test_state_path_change_rewarms_from_new_store(tmp_path):
     )
 
 
+async def test_state_swap_resets_the_reboot_gate_health_latch(tmp_path):
+    # a store-op timeout latches _reboot_gate_sick so the rest of that boot
+    # pass stops probing the hung store; the latch is a per-store health
+    # verdict (like _slot_fidelity, reset in the same teardown) and must not
+    # survive into a replacement store brought up by a state-section reload,
+    # or @reboot dedupe stays degraded for the life of the process.
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path / "a")))
+    cron._reboot_gate_sick = True  # as a hung store's timeout would latch
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path / "b")))
+    assert cron._reboot_gate_sick is False
+
+
 _REPLACE_DEP_JOB = (
     "jobs:\n"
     "  - name: j\n"

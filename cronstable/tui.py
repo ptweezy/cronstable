@@ -386,6 +386,28 @@ def outcome_key(outcome: Optional[str]) -> str:
     return OUTCOME_KEY.get(outcome or "", "ok")
 
 
+#: Theme colour for each DAG run/task state, the port of the web page's
+#: ``dstVar``.  An explicit map over dag.py's state vocabulary (plus the
+#: run-level "scheduled"), replacing a spelling-guess ladder that handled
+#: six strings the engine never emits while ``upstream_failed`` (a failure
+#: state, fail-red on the web) fell through to neutral "dim".  The web's
+#: dedicated --unknown ink has no TUI palette twin, so "dim" stands in for
+#: it and for the web's fg-faint fallback.  Coverage of dag.py's vocabulary
+#: is test-enforced (tests/test_tui.py).
+DAG_STATE_COLOR = {
+    "pending": "pending",
+    "running": "run",
+    "up_for_retry": "pending",
+    "success": "ok",
+    "failed": "fail",
+    "skipped": "off",
+    "upstream_failed": "fail",
+    "expanded": "dim",
+    "scheduled": "pending",  # run-level: created, awaiting its slot
+    "unknown": "dim",
+}
+
+
 def outcome_color(outcome: Optional[str]) -> str:
     """Theme colour key for a run outcome, via :func:`outcome_key`."""
     return OUTCOME_COLOR[outcome_key(outcome)]
@@ -3127,17 +3149,13 @@ class App:
 
     @staticmethod
     def _dag_state_color(state: str) -> str:
-        """Theme colour key for a DAG run/task state string."""
-        low = state.lower()
-        if low in ("success", "succeeded", "done"):
-            return "ok"
-        if low in ("failed", "failure", "error"):
-            return "fail"
-        if low in ("running", "launched"):
-            return "run"
-        if low in ("awaiting", "waiting", "queued", "pending", "scheduled"):
-            return "pending"
-        return "dim"
+        """Theme colour key for a DAG run/task state string.
+
+        Reads the explicit :data:`DAG_STATE_COLOR` port of the web page's
+        ``dstVar``; anything outside the known vocabulary paints "dim",
+        matching the web's fg-faint fallback.
+        """
+        return DAG_STATE_COLOR.get(state.lower(), "dim")
 
     # ---- implemented by the mixin layers below (one concrete class,
     #      :class:`TuiApp`; the stubs keep each layer type-checkable) ----

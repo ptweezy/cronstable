@@ -27,7 +27,12 @@ from typing import (
 from urllib.parse import urlsplit, urlunsplit
 
 from cronstable import platform, push
-from cronstable.config import JobConfig, schedule_object_to_crontab
+from cronstable.config import (
+    ConfigError,
+    JobConfig,
+    _resolve_secret,
+    schedule_object_to_crontab,
+)
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
 
@@ -632,21 +637,20 @@ class SentryReporter(Reporter):
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
         config = config["sentry"]
-        if config["dsn"]["value"]:
-            dsn = config["dsn"]["value"]
-        elif config["dsn"]["fromFile"]:
-            with open(config["dsn"]["fromFile"], "rt") as dsn_file:
-                dsn = dsn_file.read().strip()
-        elif config["dsn"]["fromEnvVar"]:
-            env_var = config["dsn"]["fromEnvVar"]
-            dsn = os.environ.get(env_var, "")
-            if not dsn:
-                logger.error(
-                    "sentry: dsn env var %r is not set; not reporting",
-                    env_var,
-                )
-                return
-        else:
+        try:
+            # One resolver for every value/fromFile/fromEnvVar triple
+            # (config._resolve_secret, shared with the cluster/push/job-API
+            # secrets): an unreadable fromFile or an unset env var is a
+            # clean skip, never a traceback out of the completion path.
+            # Its messages name the config key, not the env var name; the
+            # name is config-derived and tied to a secret, so it stays out
+            # of the logs (the rule MailReporter always had, now shared by
+            # all three reporters).
+            dsn = _resolve_secret(config["dsn"], "sentry.dsn")
+        except ConfigError as ex:
+            logger.error("sentry: %s; not reporting", ex)
+            return
+        if dsn is None:
             return  # sentry disabled: early return
 
         # Imported here, past the disabled/no-DSN early returns, so the ~130ms
@@ -708,26 +712,14 @@ class MailReporter(Reporter):
         smtp_host = mail["smtpHost"]
         smtp_port = mail["smtpPort"]
 
-        password = None  # type: Optional[str]
-        username = None  # type: Optional[str]
-
-        if mail["password"]["value"]:
-            password = mail["password"]["value"]
-        elif mail["password"]["fromFile"]:
-            with open(mail["password"]["fromFile"], "rt") as pass_file:
-                password = pass_file.read().strip()
-        elif mail["password"]["fromEnvVar"]:
-            env_var = mail["password"]["fromEnvVar"]
-            password = os.environ.get(env_var)
-            if not password:
-                # The env var *name* is config-derived and tied to a secret,
-                # so we don't echo it to the logs.
-                logger.error(
-                    "mail: password env var is not set; not sending email"
-                )
-                return
-        else:
-            password = None
+        try:
+            # Shared secret resolver; see SentryReporter for the rationale
+            # (clean skip on a bad source, env var names stay out of logs).
+            # None (no source configured) means unauthenticated SMTP.
+            password = _resolve_secret(mail["password"], "mail.password")
+        except ConfigError as ex:
+            logger.error("mail: %s; not sending email", ex)
+            return
         username = mail.get("username")
 
         tmpl_vars = job.template_vars
@@ -1008,22 +1000,16 @@ class WebhookReporter(Reporter):
     ) -> None:
         webhook = config["webhook"]
 
-        url_config = webhook["url"]
-        if url_config["value"]:
-            url = url_config["value"]
-        elif url_config["fromFile"]:
-            with open(url_config["fromFile"], "rt") as url_file:
-                url = url_file.read().strip()
-        elif url_config["fromEnvVar"]:
-            env_var = url_config["fromEnvVar"]
-            url = os.environ.get(env_var, "")
-            if not url:
-                logger.error(
-                    "webhook: url env var %r is not set; not reporting",
-                    env_var,
-                )
-                return
-        else:
+        try:
+            # Shared secret resolver; see SentryReporter for the rationale
+            # (clean skip on a bad source, env var names stay out of logs;
+            # webhook.url's secret part IS the URL, so that rule matters
+            # here most of all).
+            url = _resolve_secret(webhook["url"], "webhook.url")
+        except ConfigError as ex:
+            logger.error("webhook: %s; not reporting", ex)
+            return
+        if url is None:
             return  # webhook disabled: early return
 
         template = _compiled_template(webhook["body"])

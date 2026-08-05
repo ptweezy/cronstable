@@ -5,6 +5,79 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.38
+
+The top findings of a design review (redundancies, inconsistencies, and
+quirks) of the tree the 1.2.37 performance review covered.
+
+- `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
+  spread plain-job backfills: the same deterministic per-name offset,
+  slept out on a spawned task so one dag's spread never stalls the
+  scheduler pass. The key was accepted and validated on dag schedules but
+  silently never applied.
+- Every 4xx and 5xx body the web API serves is now one JSON envelope,
+  `{"error": "<reason>"}`, across the job, DAG, schedule, state, and push
+  routes alike (the auth middleware's 401 stays bodyless). Previously the
+  body was JSON on some handler families, plain text on others, and empty
+  on a few, so a client had to sniff per endpoint.
+- `POST /jobs/{name}/start` and `/cancel` answer with the same JSON acks
+  their MCP twins return (`{"started": ...}` and `{"cancelled": ...,
+  "instances": N}`) instead of empty 200s, and the DAG run listing and
+  trigger responses carry the subject under `name` as well as `dag`, the
+  key the job routes use.
+- Every capped listing takes a `limit` query parameter; the old spellings
+  (`count` on the schedule preview, `per_job` on the calendars, `runs` on
+  the resources series) keep working as aliases read when `limit` is
+  absent. `GET /jobs/{name}/runs`, the one run listing without a cap,
+  gained the same clamped `limit` its DAG and MCP twins had; its default
+  still serves the whole retained window.
+- The schedule describers no longer speak confidently about schedules the
+  engine refuses to load. Wrap-around ranges (`fri-mon`), steps that
+  escape their field (`*/12` on months, `59/1` on minutes), and the
+  classic-crontab-only `@midnight` all read as a `Custom schedule:` line
+  now, in the daemon's describer and the dashboard sandbox alike; every
+  engine-legal quirk (`sat-sun`, `0-0`, `30/20`) keeps its prose.
+- The terminal dashboard paints DAG states from an explicit port of the
+  web page's map instead of a spelling-guess ladder, so `upstream_failed`
+  shows fail-red (it painted neutral), `up_for_retry` amber, and
+  `skipped` the neutral off ink; a parity test pins the map to the
+  engine's vocabulary and the web's map both.
+- An operator-configured `web.headers` Content-Type or proxy-buffering
+  override no longer breaks the live log tails: the SSE protocol headers
+  win over the configured map in any spelling, the same guard `/metrics`
+  already had.
+- A state-section reload that swaps in a healthy store clears the @reboot
+  gate's "store timed out, stop probing" latch along with the other
+  per-store verdicts; the latch used to survive for the life of the
+  process, leaving boot-marker dedupe degraded on a healthy replacement
+  store.
+- The mail, Sentry, and webhook reporters resolve their
+  value/fromFile/fromEnvVar secrets through the same shared resolver as
+  everything else, so an unreadable `fromFile` is a clean logged skip
+  instead of a traceback out of the completion path, and none of the
+  three echoes an env var's name to the logs (mail's long-standing rule,
+  now shared).
+- The document-key listing applies the same round-trip check the stream
+  and namespace listings use, so a foreign file in a namespace directory
+  reads as "listing unavailable" instead of decoding into a key that
+  addresses a different or nonexistent document; keys carrying a lone
+  surrogate now list correctly instead of failing the listing.
+- The two mapped fan-in reductions share one absent-instance rule: an
+  entry missing for a run-recorded index holds the run open (it reads as
+  pending), where the run terminaliser used to skip it and could complete
+  a run whose group still read running to every downstream.
+- The `dev` extra installs the same list as `requirements_dev.txt` again
+  (it had drifted, missing orjson, pynacl, and zeroconf, so an
+  extra-based checkout ran the suite with the optional-dependency test
+  arms silently skipping); a new test pins the two lists equal.
+- Reference-doc gaps closed: the configuration reference now covers
+  `notify:`, `push:`, `report.push`, `web.authTokens`, and `web.bonjour`,
+  and the HTTP API page documents the `retry`/`rebootPending`/
+  `concurrencyScope`/`slot` job fields, run records' `ranAt`, the
+  running-row `never_fires` flag, the error envelope, and the new acks.
+  `docs/openapi.yaml` declares the envelope, acks, and `limit`
+  parameters.
+
 ## 1.2.37
 
 The top findings of a performance review of the tree the 1.2.36 defect

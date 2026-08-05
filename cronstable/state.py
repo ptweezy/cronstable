@@ -2754,8 +2754,6 @@ class FilesystemStateBackend(StateBackend):
         )
 
     def _list_document_keys_sync(self, namespace: str) -> Optional[List[str]]:
-        from urllib.parse import unquote
-
         ns_dir = self._doc_dir(namespace)
         try:
             names = os.listdir(ns_dir)
@@ -2775,13 +2773,17 @@ class FilesystemStateBackend(StateBackend):
                 # returning the others would make this one invisible to a
                 # keys-driven scan.
                 return None
-            try:
-                keys.append(unquote(token, errors="strict"))
-            except UnicodeDecodeError:
-                # not a token our encoder produced (foreign/corrupt name):
-                # fall back rather than hand back a garbled key that cannot
-                # address the document.
+            key = _decode_fs_token(token)
+            if key is None:
+                # not a token our encoder produced (foreign/corrupt name,
+                # or one that does not re-encode to this exact spelling):
+                # fall back rather than hand back a garbled key that
+                # addresses a different or nonexistent document.  The
+                # round-trip check is the same one the stream and namespace
+                # listings rely on; a bare unquote here once "successfully"
+                # decoded foreign tokens into wrong keys.
                 return None
+            keys.append(key)
         keys.sort()
         return keys
 

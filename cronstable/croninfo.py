@@ -341,19 +341,48 @@ def _split_special_dow(spec: str) -> Tuple[str, List[str]]:
 _HASH_HINT = re.compile(r"(?i)(?:^|[\s,])h(?:[\s,/(]|$)")
 
 
+def _engine_accepts(expr: str, hash_key: Optional[str]) -> bool:
+    """True when the scheduling engine parses ``expr`` as-is.
+
+    The tolerant field parsers below deliberately accept a superset of the
+    engine (wrap-around ranges like ``fri-mon``, steps whose first stride
+    escapes the field, the classic-crontab-only ``@midnight``), which used
+    to keep the prose affirmative for text the daemon then refuses to
+    load.  The confident phrasing is gated on the engine's own verdict
+    instead, per the module contract: what the engine rejects reads as a
+    Custom line.  The web page's ``describeCron`` gates on the same rules
+    (``cronRejected``); the two must move together, and the Playwright
+    differential in tests/test_web_engine_parity.py pins them.
+    """
+    try:
+        if hash_key is None:
+            CronTab(expr)
+        else:
+            CronTab(expr, hash_key=hash_key)
+    except (ValueError, KeyError):
+        return False
+    return True
+
+
 def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
     """Plain-English schedule text, a port of the web ``describeCron``.
 
     Handles the 5-field core plus the 6-/7-field (year / second) forms the
-    daemon accepts; anything it cannot phrase degrades to ``Custom
-    schedule: <expr>`` rather than raising.  With a ``hash_key`` (the job
-    name), Jenkins-style ``H`` items are resolved through the engine and
-    the prose describes the hashed slot, marked as such.
+    daemon accepts; anything it cannot phrase, and anything the engine
+    itself rejects, degrades to ``Custom schedule: <expr>`` rather than
+    raising.  With a ``hash_key`` (the job name), Jenkins-style ``H``
+    items are resolved through the engine and the prose describes the
+    hashed slot, marked as such.
     """
     low = (expr or "").strip().lower()
     if low == "@reboot":
         return "Once, when cronstable starts (@reboot)"
-    if low in _MACRO_TEXT:
+    # @midnight fails the engine side of this gate: it is classic-crontab-
+    # only (the loader rewrites it to @daily before the engine ever sees
+    # it), so the literal is a config parse error and must not read as a
+    # supported spelling. It falls through to the fields path below, whose
+    # own engine gate on the ORIGINAL text sends it to the Custom line.
+    if low in _MACRO_TEXT and _engine_accepts(low, None):
         return _MACRO_TEXT[low]
     if hash_key is not None and _HASH_HINT.search(expr or ""):
         try:
@@ -390,6 +419,12 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
             _field_values(year_spec, 1970, 2099) if year_spec != "*" else None
         )
     except (ValueError, KeyError):
+        return "Custom schedule: %s" % expr
+
+    if not _engine_accepts(expr, hash_key):
+        # tolerantly phraseable but engine-rejected (a wrap-around range,
+        # a step whose stride escapes the field): never describe it as if
+        # the daemon would run it.
         return "Custom schedule: %s" % expr
 
     time_part = _describe_time(mi, hr, minutes, hours)

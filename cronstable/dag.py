@@ -464,6 +464,26 @@ class ReconcileAdvanceResult:
 # --------------------------------------------------------------------------
 
 
+def _mapped_instance_state(
+    tasks: Dict[str, Any], prefix: str, index: int
+) -> str:
+    """The state of one ``<id>#<i>`` instance of an expanded task.
+
+    THE one absent-entry rule, shared by the fan-in barrier
+    (:func:`_mapped_group_state`) and the run terminaliser
+    (:func:`_maybe_terminalise`).  Expansion materialises every instance in
+    the same RMW that records the item list, so an entry missing for a
+    run-recorded index can only mean a foreign or damaged run document; it
+    reads as ``pending`` (non-terminal) in BOTH consumers.  The two once
+    disagreed (barrier held, terminaliser skipped), so the same document
+    could complete as a run while its group still read ``running`` to every
+    downstream; under the shared rule a hole holds the run open instead,
+    where the reconcile/GC paths can see it.
+    """
+    entry = tasks.get(prefix + str(index))
+    return PENDING if entry is None else str(entry.get("state", PENDING))
+
+
 def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
     """The aggregate state of a mapped task, for downstream dep checks.
 
@@ -492,8 +512,7 @@ def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
     skipped = False
     prefix = task_id + "#"
     for i in range(len(items)):
-        entry = tasks.get(prefix + str(i))
-        state = PENDING if entry is None else entry.get("state", PENDING)
+        state = _mapped_instance_state(tasks, prefix, i)
         if state not in TERMINAL_STATES:
             return RUNNING  # fan-in barrier: not every instance is terminal
         if state in FAILURE_STATES:
@@ -1086,10 +1105,11 @@ def _maybe_terminalise(spec, body, now, result) -> None:
         items = mapped.get("items", []) if mapped is not None else []
         prefix = task.id + "#"
         for i in range(len(items)):
-            entry = tasks.get(prefix + str(i))
-            if entry is None:
-                continue  # spec task not materialised in this run: skip it
-            st = entry.get("state")
+            # _mapped_instance_state is the shared absent-entry rule: an
+            # entry missing for a run-recorded index reads as pending, so a
+            # damaged document holds the run open (matching the fan-in
+            # barrier's verdict) instead of completing around the hole.
+            st = _mapped_instance_state(tasks, prefix, i)
             if st not in TERMINAL_STATES:
                 return
             if st in FAILURE_STATES:
