@@ -7,9 +7,6 @@ project, on which cronstable is based.
 
 ## 1.2.38
 
-Findings of a design review (redundancies, inconsistencies, and quirks)
-of the tree the 1.2.37 performance review covered.
-
 - `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
   spread plain-job backfills: the same deterministic per-name offset,
   slept out on a spawned task so one dag's spread never stalls the
@@ -102,6 +99,16 @@ of the tree the 1.2.37 performance review covered.
   third-party surface as `Any`; the deps that legitimately cannot
   resolve are now enumerated per-module in `pyproject.toml`, so a new
   unresolvable import fails the gate.
+- Loading a large configuration is much faster, and the cost per job no
+  longer climbs with the size of the file. Parsing scaled with the square
+  of the job count: 1,000 jobs took 0.9 s, 4,000 took 12.5 s, and 8,000
+  took 49.6 s. The cause sat in strictyaml's bundled copy of ruamel, whose
+  sequence deep-copy re-copies the sequence's annotations once per element
+  instead of once in total, and `jobs:` is normally the only long sequence
+  a config has. cronstable now corrects that method at import time when it
+  finds it uncorrected, and the same three files parse in 0.4 s, 1.4 s and
+  2.8 s. Startup, `--validate-config`, `--job-set-id` and every config
+  reload pay the lower cost.
 
 ## 1.2.37
 
