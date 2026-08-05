@@ -2306,28 +2306,120 @@ def test_stream_reader_emit_falls_back_to_ascii_on_unicode_error():
     assert fs.flushed == 1
 
 
-async def test_flush_emit_buffer_survives_broken_daemon_stream(caplog):
-    # If the daemon's own stdout is a dead pipe, the batched passthrough flush
-    # must swallow the OSError and log a single warning -- the job's capture is
+async def test_flush_emit_buffer_survives_broken_daemon_stream(
+    caplog, monkeypatch
+):
+    # If the daemon's own stdout is a dead pipe, the mirror's writer thread
+    # must swallow the OSError and log a warning -- the job's capture is
     # unaffected, so the reader keeps going.
+    import sys
+
     fake = asyncio.StreamReader()
     fake.feed_eof()
     reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
 
-    def boom(out, text):
-        raise OSError("dead pipe")
+    class BoomBuffer:
+        def write(self, data):
+            raise OSError("dead pipe")
 
-    reader._emit = boom  # instance attr: plain function, not bound
+    class BoomStream:
+        buffer = BoomBuffer()
+
+        def write(self, text):
+            raise OSError("dead pipe")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", BoomStream())
     reader._emit_buffer = ["line\n"]
 
     with caplog.at_level(logging.WARNING, logger="cronstable"):
         reader._flush_emit_buffer()
+        assert reader._emit_buffer == []  # handed off despite the dead pipe
+        assert cronstable.job._MIRROR.drain(5.0)
 
-    assert reader._emit_buffer == []  # buffer was drained despite the failure
     assert any(
         "could not mirror" in rec.getMessage() for rec in caplog.records
     )
     await reader.join()  # let the (already EOF) read task settle
+
+
+async def test_mirror_writes_off_the_event_loop_thread(monkeypatch):
+    # The whole point of the writer thread: the passthrough write (and its
+    # flush) must never run on the event-loop thread, where a full pipe (a
+    # stopped `docker logs`, a Ctrl+S'd console) used to freeze the entire
+    # daemon behind one wedged log consumer.
+    import sys
+    import threading
+
+    writer_threads = []
+
+    class SpyBuffer:
+        def write(self, data):
+            writer_threads.append(threading.current_thread())
+
+    class SpyStream:
+        buffer = SpyBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", SpyStream())
+    fake = asyncio.StreamReader()
+    fake.feed_eof()
+    reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
+    reader._emit_buffer = ["hello\n"]
+    reader._flush_emit_buffer()
+    assert cronstable.job._MIRROR.drain(5.0)
+    assert writer_threads
+    assert all(
+        t is not threading.main_thread() for t in writer_threads
+    )
+    await reader.join()
+
+
+async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
+    # A consumer that stops reading must cost bounded memory, not unbounded
+    # queue growth: past the cap the OLDEST batch is shed and counted.
+    import sys
+    import threading
+
+    release = threading.Event()
+
+    class SlowBuffer:
+        def write(self, data):
+            release.wait(2.0)
+
+    class SlowStream:
+        buffer = SlowBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", SlowStream())
+    mirror = cronstable.job._MIRROR
+    base_dropped = mirror.dropped_batches
+    fake = asyncio.StreamReader()
+    fake.feed_eof()
+    reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
+    try:
+        for i in range(mirror.MAX_PENDING_BATCHES + 8):
+            reader._emit_buffer = ["x%d\n" % i]
+            reader._flush_emit_buffer()  # pure enqueue: returns at once
+        assert mirror.dropped_batches - base_dropped >= 1
+        with mirror._lock:
+            assert len(mirror._batches) <= mirror.MAX_PENDING_BATCHES
+    finally:
+        release.set()
+        assert mirror.drain(10.0)
+    await reader.join()
 
 
 # ---------------------------------------------------------------------------

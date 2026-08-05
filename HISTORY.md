@@ -7,7 +7,8 @@ project, on which cronstable is based.
 
 ## 1.2.36 (2026-08-03)
 
-Defect fixes from a full-application review.
+Defect fixes from a full-application review, and the top findings of a
+performance review of the same tree.
 
 - Windows: cancelling a job (executionTimeout, Replace, shutdown, or the
   cancel API) now kills the process tree while its root is still alive.
@@ -62,6 +63,81 @@ Defect fixes from a full-application review.
 - CI: a fork pull request from a branch named `main` can no longer cancel
   an in-flight release, and the pyinstaller Docker build works from the
   repo-root context again.
+- A finished run's live-log ring buffer is released once a newer run
+  supersedes it. Only the newest run's logs are replayable, but every
+  retained history entry kept its full ring in memory anyway, so a
+  long-running daemon with chatty jobs slowly pinned unservable log
+  buffers, up to fifty rings per job.
+- Lease heartbeats skip the directory flush. A renew or release only moves
+  the expiry of a lease whose fence it keeps, and losing such a write to a
+  crash just means the lease expires a little earlier, so an idle HA pair
+  no longer spends tens of thousands of directory flushes a day
+  maintaining its election. Writes that issue or bump a fence keep the
+  full crash-durability barrier, and every lease write still flushes its
+  own bytes before the rename.
+- `GET /dags` answers an unchanged conditional poll with `304 Not
+  Modified` and compresses large bodies for clients that accept gzip;
+  `GET /cluster` compresses too. The per-dag run listing behind the
+  `/dags` rollup and the run drawer is additionally served from a short
+  memo between local changes, so dashboard polling of a quiet store no
+  longer performs one store listing per dag per poll per viewer.
+- A mapped task's fan-out list is parsed from the artifact's bytes
+  directly (no decoded second copy) and, past 64 KiB, on a worker thread.
+  Parsing a multi-MB XCom inline used to stall the scheduler loop for
+  tens of milliseconds per expansion.
+- `fromFile` secrets are read on a worker thread when a run is staged.
+  The read sits inside the launch chain, so a slow or hung secret mount
+  (a Kubernetes secret volume, NFS) used to stall the event loop itself
+  rather than just that launch.
+- Boot rehydration reads the ledger sixteen jobs at a time instead of one
+  by one. Warm-up ran before the first scheduling pass, so its wall clock
+  was pure boot delay: seconds at fleet scale on local disk, minutes on a
+  network mount, and a hung mount now costs one read timeout, not one per
+  job.
+- Subprocess spawns are gated sixteen at a time when one slot launches
+  many jobs. The fork/exec setup is synchronous work on the event loop,
+  and an ungated 500-job burst occupied it for up to a second each minute
+  boundary while web requests and cluster heartbeats waited.
+- One built `GET /jobs` response (payload, ETag, body, gzip) is shared
+  across every poller for up to a second, and locally recorded runs,
+  launches, pauses and reloads rebuild it immediately. A wallboard plus N
+  dashboard tabs used to cost N identical builds per poll cycle.
+- The state garbage collector sweeps idempotency documents whose TTL
+  lapsed a whole grace window ago. An expired claim is already
+  re-winnable, but its document stayed on disk forever, so the documented
+  per-event dedupe pattern grew a flat directory without bound.
+- Job output mirrored to the daemon's own stdout/stderr is written by a
+  dedicated thread with a bounded queue. The write used to run on the
+  event loop, so a consumer that stopped reading (a stopped
+  `docker logs`, a suspended console) froze the entire daemon; now it
+  wedges only the mirror, which sheds oldest batches until the consumer
+  drains.
+- Dashboard: the header mark's glow is applied per drawn primitive
+  instead of on the whole svg, whose animated geometry forced a
+  near-half-viewport filter re-raster every frame; the per-second
+  relative-time sweep skips cells whose text did not change; the
+  secondary poll fetches (`/cluster`, `/node`, `/dags`, `/state`) skip a
+  cycle while their previous request is still in flight instead of
+  stacking connections against the browser's per-origin cap; and the
+  balance-recovery planner skips a frame after any pass that overran its
+  budget, so weak machines drop to half-rate planning instead of dropped
+  frames (validated by a knockover Monte Carlo: 24 of 24 seeds caught
+  and held at forced half rate; `planBudgetMs: 0` pins the budget off
+  for deterministic captures).
+- A live SSE log tail delivers a burst of lines as one joined write per
+  wake instead of one timer task, one frame build and one transport
+  write per line per viewer, which cost the scheduler's loop thousands
+  of coroutine steps a second under a chatty job. The framing benchmark
+  moved with the code: `webapi.sse_burst_20k` times the burst path and
+  retires `webapi.sse_frame_20k`, whose per-line seam no longer exists.
+  The smoke test's never-skip net is now derived from
+  `benchmarks/expected_gated.txt` instead of hand-copied from it, which
+  is the gap that had let the old metric die silently.
+- TUI: the heat overlay's per-job run fetches run as a background task
+  with a few requests in flight, instead of strictly one at a time
+  inside the poll loop, which froze every panel for the sum of up to 40
+  round trips each refresh; entries for jobs removed by a reload are
+  pruned.
 
 ## 1.2.35 (2026-07-27)
 

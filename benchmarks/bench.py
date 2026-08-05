@@ -4076,7 +4076,7 @@ def bench_web_append_line():
     appendLine: a scrollHeight/scrollTop read (a forced layout against the
     whole buffer), the O(1) ring trim, one node build, and the incremental
     match-count fold.  Nothing else in the suite measures it; the server
-    side of the same line is webapi.sse_frame_20k.
+    side of the same line is webapi.sse_burst_20k.
 
     Needs a ``__perf.appendLine`` hook, because appendLine lives inside the
     page's module closure and no DOM event reaches it (its only callers are
@@ -4627,6 +4627,12 @@ def bench_webapi_jobs_payload():
         request = _mocked_get("/jobs")
         t0 = time.perf_counter()
         for _ in range(20):
+            # Keep measuring the BUILD: the cross-poller response memo
+            # would otherwise serve 19 of these 20 straight from cache and
+            # the metric would stop gating the payload/encode cost its id
+            # promises. A plain attribute write, so on a release predating
+            # the memo it sets an unread attr and changes nothing.
+            cron._jobs_response_cache = None
             await cron._web_list_jobs(request)
         return time.perf_counter() - t0
 
@@ -4740,9 +4746,9 @@ class _NullStreamResponse:
 
 
 @bench(
-    "webapi.sse_frame_20k",
+    "webapi.sse_burst_20k",
     "webapi",
-    detail="SSE line framing, 4 subscribers x 20k lines",
+    detail="SSE burst framing, 4 subscribers x 20k lines, 32-line bursts",
     repeats=(3, 2, 1),
     # ~40ms of genuinely per-line work: the 10ms default floor would set the
     # real sensitivity at ~25% against a declared 15%.  Same call as
@@ -4750,16 +4756,27 @@ class _NullStreamResponse:
     # the subscriber count past anything a real tail sees.
     gate_floor=0.005,
 )
-def bench_webapi_sse_frame():
+def bench_webapi_sse_burst():
     """The live log tail's per-line, per-subscriber cost.
 
-    Every captured output line of every tailed run is JSON-encoded, decoded
-    back to str, concatenated into an ``event: line`` frame and re-encoded,
-    once per attached dashboard.  job.stream_capture_120k measures the
-    capture leg and stops at the ring buffer; the SSE leg past it was
-    called out as an accepted residual in benchmarks/README.md and has had
-    no metric since.  It runs on the scheduler's loop, so its cost is paid
-    by every job waiting to fire while somebody watches a chatty run.
+    Successor to ``webapi.sse_frame_20k``.  Delivery used to be one framed
+    ``resp.write`` per line through ``_sse_send_line``; the live loop now
+    drains each wake's burst and writes the joined frames once, and the old
+    per-line seam is gone.  The workload changed with the code, so the id
+    changed with it (the harness rule for rescales): the old number meant
+    one write per line and this one does not.  What stays per line PER
+    attached client is the ``_sse_frame`` build: every captured line of
+    every tailed run is JSON-encoded into an ``event: line`` frame once per
+    dashboard, on the scheduler's loop, so its cost is paid by every job
+    waiting to fire while somebody watches a chatty run.
+    job.stream_capture_120k measures the capture leg and stops at the ring
+    buffer; this metric owns the leg past it.
+
+    Bursts are a fixed 32 lines so the workload is deterministic: real
+    burst size is whatever piled up behind one queue wake, which is a
+    producer-rate fact the harness must not model with a clock.  32 keeps
+    the join-and-write amortization visible without hiding the per-line
+    frame builds that dominate.
 
     The line mix is the capture fixture's: mostly ASCII, a wide-glyph line
     every sixteenth, so the encoder's ASCII fast path is exercised without
@@ -4774,9 +4791,15 @@ def bench_webapi_sse_frame():
     import asyncio
 
     try:
-        from cronstable.cron import _sse_send_line
+        from cronstable.cron import _sse_frame
     except ImportError as exc:
-        raise Skip("cron._sse_send_line unavailable: %r" % exc) from None
+        raise Skip("cron._sse_frame unavailable: %r" % exc) from None
+    try:
+        probe = _sse_frame("stdout", "probe\n")
+    except TypeError as exc:
+        raise Skip("_sse_frame signature changed: %r" % exc) from None
+    if not isinstance(probe, bytes):
+        raise Skip("_sse_frame no longer returns bytes")
     n = _n(20000)
     lines = fixture(
         "sse_lines_20k",
@@ -4792,19 +4815,18 @@ def bench_webapi_sse_frame():
     )
 
     subscribers = 4
+    burst = 32
 
     async def run():
         resp = _NullStreamResponse()
-        try:
-            await _sse_send_line(resp, "stdout", lines[0])
-        except TypeError as exc:
-            raise Skip("_sse_send_line signature changed: %r" % exc) from None
-        resp.written = 0
         t0 = time.perf_counter()
         for _ in range(subscribers):
-            for i, line in enumerate(lines):
-                stream = "stderr" if i % 5 == 0 else "stdout"
-                await _sse_send_line(resp, stream, line)
+            for start in range(0, n, burst):
+                frames = []
+                for i in range(start, min(start + burst, n)):
+                    stream = "stderr" if i % 5 == 0 else "stdout"
+                    frames.append(_sse_frame(stream, lines[i]))
+                await resp.write(b"".join(frames))
         dt = time.perf_counter() - t0
         if resp.written < n * subscribers * 20:
             raise RuntimeError(

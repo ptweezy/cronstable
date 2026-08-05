@@ -19,7 +19,7 @@ RUN pyenv global 3.13.14
 # clean `COPY --from` pattern applies -- unlike the multi-arch release
 # Dockerfile, which stays on pip for architecture portability. Pin matches the
 # CI setup-uv version.
-COPY --from=ghcr.io/astral-sh/uv:0.11.26 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /bin/
 
 RUN /root/.pyenv/versions/3.13.14/bin/python -m venv /cronstable
 # Point uv at that venv (VIRTUAL_ENV) and never let it fetch a managed Python --

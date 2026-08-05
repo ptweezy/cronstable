@@ -525,7 +525,9 @@ async def test_archive_save_limit_zero_writes_nothing(tmp_path):
     # web UI keeps anyway.
     cron = await _archive_cron(tmp_path, save_limit=0)
     info = _output_run([("stdout", "must never be stored")])
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     logs = await cron.state_backend.list_records(cron._log_stream("j"))
     assert logs == []
 
@@ -537,7 +539,9 @@ async def test_archive_accounts_dropped_lines(tmp_path):
     cron = await _archive_cron(tmp_path)
     pairs = [("stdout", "line-%d" % i) for i in range(1, 9)]
     info = _output_run(pairs, limit=5)
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     (rec,) = await cron.state_backend.list_records(cron._log_stream("j"))
     assert rec["dropped_lines"] == 3
     stored = [ln["line"] for ln in rec["lines"]]
@@ -557,7 +561,9 @@ async def test_archive_redacts_multiline_pem_body(tmp_path):
             ("stdout", "-----END RSA PRIVATE KEY-----"),
         ]
     )
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     (rec,) = await cron.state_backend.list_records(cron._log_stream("j"))
     assert [ln["line"] for ln in rec["lines"]] == [REDACTED] * 4
 
@@ -567,7 +573,9 @@ async def test_archive_verbatim_when_redaction_off(tmp_path):
     # must be exactly what the job printed.
     cron = await _archive_cron(tmp_path, redact=False)
     info = _output_run([("stdout", "password=hunter2")])
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     (rec,) = await cron.state_backend.list_records(cron._log_stream("j"))
     assert rec["redacted"] is False
     assert rec["lines"][0]["line"] == "password=hunter2"

@@ -19,8 +19,11 @@
 # except the four at the bottom, each with the reason it cannot be gated.
 #
 # The in-repo smoke net (tests/test_benchmarks.py) is the companion guard:
-# it fails when a headline metric starts skipping in --smoke, which catches
-# a broken seam before CI does.
+# it derives its never-skip set from THIS file (minus documented
+# environment exceptions) and fails when a listed metric starts skipping
+# in --smoke, which catches a broken seam before CI does.  A hand-curated
+# copy of this list is how webapi.sse_frame_20k died unnoticed: it was
+# listed here but not there, so deleting its seam kept every test green.
 
 cluster.fleet_view_15x400
 cluster.job_owner_2k
@@ -106,7 +109,7 @@ webapi.auth_scope_20k
 webapi.jobs_bytes_500
 webapi.jobs_gzip_500
 webapi.jobs_payload_500
-webapi.sse_frame_20k
+webapi.sse_burst_20k
 webui.log_count_5k
 webui.render_fleet_15x400
 webui.render_rows_500

@@ -286,10 +286,14 @@ Ground rules:
 - If what you are guarding is a COUNT or an ORDERING (fsyncs per append,
   calls per batch, a check that must precede a fetch), stop: write a test
   in `tests/test_perf_invariants.py` instead. See the waivers above.
-- When a benchmark lands, add it to `tests/test_benchmarks.py`'s never-skip
-  list (mandatory when it leans on any private seam) and, once it is known
-  to compare against the current baseline release, to
-  `benchmarks/expected_gated.txt`.
+- When a benchmark lands, add it to `benchmarks/expected_gated.txt` once it
+  is known to compare against the current baseline release.  The smoke
+  net's never-skip set is derived from that file, so listing it there is
+  also what makes `tests/test_benchmarks.py` fail if it ever starts
+  skipping (the guard that matters when it leans on any private seam).  A
+  seam-leaning benchmark that cannot enter `expected_gated.txt` yet
+  (its surface is new this release) has no net until it does; prefer
+  public-surface workloads for anything that must wait.
 
 The suite's own smoke test is `tests/test_benchmarks.py`; it fails if a
 headline benchmark starts skipping, so a refactor that breaks a measured API
