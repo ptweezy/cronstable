@@ -134,7 +134,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Decide release
         id: d
         env:
@@ -289,7 +289,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Install runtime + distributable extras
         run: |
           set -euo pipefail
@@ -358,7 +358,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Build distributions
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -425,7 +425,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -774,7 +774,7 @@ jobs:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -910,7 +910,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Build binary
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -1059,7 +1059,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Install current and baseline environments
         id: envs
         env:
@@ -1278,7 +1278,7 @@ jobs:
           python-version: '3.14'
       - uses: astral-sh/setup-uv@v9.0.0
         with:
-          version: "0.11.29"
+          version: "0.12.1"
       - name: Build core + pro, prove the boundary, run pro's tests
         run: |
           set -euo pipefail
@@ -1327,7 +1327,7 @@ jobs:
           path: dist
 
       - name: Publish to PyPI (Trusted Publishing)
-        uses: pypa/gh-action-pypi-publish@v1.14.1
+        uses: pypa/gh-action-pypi-publish@v1.14.2
         with:
           # Idempotent re-runs: the publish precedes the tag/Release below, so if
           # a later step fails (e.g. the tag push) the version is already on PyPI.
@@ -1607,7 +1607,7 @@ jobs:
             type=raw,value=latest-debian,enable=${{ matrix.distro == 'debian' }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.5.2
+        uses: docker/login-action@v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1615,7 +1615,7 @@ jobs:
 
       - name: Log in to Docker Hub
         if: steps.registries.outputs.dockerhub == 'true'
-        uses: docker/login-action@v4.5.2
+        uses: docker/login-action@v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
