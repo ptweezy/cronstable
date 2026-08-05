@@ -1014,7 +1014,42 @@ async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
             await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
             )
-    assert any("url env var" in rec.message for rec in caplog.records)
+    # the skip names the config key; the env var NAME is config-derived and
+    # tied to a secret, so it must never be echoed (shared reporter rule).
+    assert any("webhook.url" in rec.message for rec in caplog.records)
+    assert not any(
+        "TEST_WEBHOOK_URL" in rec.getMessage() for rec in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_webhook_from_file_unreadable_skips_cleanly(
+    tmp_path, caplog
+):
+    # an unreadable fromFile is a clean logged skip through the shared
+    # secret resolver, never an OSError traceback out of the reporter
+    missing = tmp_path / "nope" / "hook-url"
+    conf = cronstable.config.parse_config_string(
+        _webhook_job_config(
+            "            fromFile: '{}'".format(missing.as_posix())
+        ),
+        "",
+    )
+    job_config = conf.jobs[0]
+    job = _webhook_job(job_config)
+
+    def no_session(*args, **kwargs):
+        raise AssertionError("ClientSession must not be created")
+
+    with patch("aiohttp.ClientSession", no_session):
+        with caplog.at_level(logging.ERROR, logger="cronstable"):
+            await cronstable.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+    assert any(
+        "webhook.url.fromFile could not be read" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -2483,7 +2518,12 @@ jobs:
     with caplog.at_level(logging.ERROR, logger="cronstable"):
         await cronstable.job.SentryReporter().report(True, job, report)
 
-    assert any("dsn env var" in rec.getMessage() for rec in caplog.records)
+    # the skip names the config key; the env var NAME stays out of the logs
+    # (shared reporter rule, see MailReporter's original rationale).
+    assert any("sentry.dsn" in rec.getMessage() for rec in caplog.records)
+    assert not any(
+        "TEST_SENTRY_UNSET" in rec.getMessage() for rec in caplog.records
+    )
 
 
 async def test_sentry_report_applies_environment_and_max_string_length(
@@ -2636,7 +2676,37 @@ async def test_mail_report_password_env_unset_is_skipped(monkeypatch, caplog):
             await cronstable.job.MailReporter().report(False, job, report)
 
     assert any(
-        "password env var is not set" in rec.getMessage()
+        "mail.password" in rec.getMessage() for rec in caplog.records
+    )
+    # the rule this reporter always had, kept under the shared resolver:
+    # the env var NAME is never echoed to the logs.
+    assert not any(
+        "TEST_SMTP_PW" in rec.getMessage() for rec in caplog.records
+    )
+
+
+async def test_mail_report_password_from_file_unreadable_skips(
+    tmp_path, caplog
+):
+    # an unreadable fromFile is a clean logged skip through the shared
+    # secret resolver, never an OSError traceback out of the reporter
+    job_config, report = _mail_report_config()
+    report["mail"]["password"] = {
+        "value": None,
+        "fromFile": str(tmp_path / "nope" / "smtp-pw"),
+        "fromEnvVar": None,
+    }
+    job = _mail_job_mock(job_config)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("SMTP must not be constructed")
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        with patch("aiosmtplib.SMTP", boom):
+            await cronstable.job.MailReporter().report(False, job, report)
+
+    assert any(
+        "mail.password.fromFile could not be read" in rec.getMessage()
         for rec in caplog.records
     )
 

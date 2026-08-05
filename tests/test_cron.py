@@ -2041,6 +2041,7 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
 
     class Req:
         match_info = {"name": "alpha"}
+        query: dict = {}  # the runs listing reads its `limit` param
 
     resp = await cron._web_job_runs(Req())
     body = json.loads(resp.text)
@@ -2087,6 +2088,7 @@ async def test_web_job_runs_empty_history():
 
     class Req:
         match_info = {"name": "alpha"}
+        query: dict = {}  # the runs listing reads its `limit` param
 
     resp = await cron._web_job_runs(Req())
     body = json.loads(resp.text)
@@ -2094,6 +2096,88 @@ async def test_web_job_runs_empty_history():
     assert body["stats"]["total"] == 0
     assert body["stats"]["success_rate"] is None
     assert body["stats"]["avg_duration"] is None
+
+
+@pytest.mark.asyncio
+async def test_web_job_runs_honours_limit_param():
+    # the one run-listing surface without a cap gained the same clamped
+    # `limit` its DAG and MCP twins always had; the default serves the
+    # whole retained history, exactly the old behavior
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    for n in range(5):
+        cron._record_run("alpha", _mk_run("success", dur=float(n + 1)))
+
+    class Req:
+        match_info = {"name": "alpha"}
+        query = {"limit": "2"}
+
+    resp = await cron._web_job_runs(Req())
+    body = json.loads(resp.text)
+    assert [r["duration"] for r in body["runs"]] == [4.0, 5.0]  # newest kept
+    assert body["stats"]["total"] == 5  # stats keep the whole window
+
+
+def test_web_int_query_reads_limit_before_its_legacy_alias():
+    # count/per_job/runs had grown endpoint by endpoint; every capped
+    # listing reads `limit` first and its original spelling still works
+    query_only_alias = type("Req", (), {"query": {"count": "7"}})()
+    assert (
+        cronstable.cron.Cron._web_int_query(
+            query_only_alias, "limit", default=12, lo=1, hi=60, alias="count"
+        )
+        == 7
+    )
+    both = type("Req", (), {"query": {"count": "7", "limit": "9"}})()
+    assert (
+        cronstable.cron.Cron._web_int_query(
+            both, "limit", default=12, lo=1, hi=60, alias="count"
+        )
+        == 9  # the canonical name wins when both are present
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_errors_carry_the_json_envelope():
+    # every 4xx body on this origin is the ONE envelope {"error": msg}
+    # (matching jobapi and /mcp) instead of per-handler text/plain; the
+    # bare-404 routes carry the reason too
+    import json
+
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class RunsReq:
+        match_info = {"name": "nope"}
+        headers: dict = {}
+        query: dict = {}
+
+    with pytest.raises(web.HTTPNotFound) as raised:
+        await cron._web_job_runs(RunsReq())
+    assert raised.value.content_type == "application/json"
+    assert json.loads(raised.value.text or "") == {
+        "error": "job 'nope' not found"
+    }
+
+    class PauseReq:
+        match_info = {"name": "alpha"}
+        headers: dict = {}
+        can_read_body = True
+
+        @staticmethod
+        async def json():
+            return {"durationSeconds": "soon"}
+
+    with pytest.raises(web.HTTPBadRequest) as raised:
+        await cron._web_pause_job(PauseReq())
+    assert raised.value.content_type == "application/json"
+    assert json.loads(raised.value.text or "") == {
+        "error": "durationSeconds must be an integer"
+    }
 
 
 @pytest.mark.asyncio
@@ -2183,6 +2267,14 @@ async def test_web_cancel_running_job_terminates_and_records():
 
     resp = await cron._web_cancel_job(Req())
     assert resp.status == 200
+    # the MCP cron_cancel_job ack shape (this route once returned an
+    # empty 200 while every sibling action returned JSON)
+    import json as _json_mod
+
+    assert _json_mod.loads(resp.text) == {
+        "cancelled": "test",
+        "instances": 1,
+    }
     assert rj.cancelled is True
     assert rj.proc.returncode is not None  # process actually terminated
 
@@ -3816,6 +3908,10 @@ async def test_web_start_deferred_reboot_without_manager(monkeypatch):
 
     resp = await cron._web_start_job(Req())
     assert resp.status == 200
+    import json as _json_mod
+
+    # the MCP cron_run_job ack shape (was an empty 200)
+    assert _json_mod.loads(resp.text) == {"started": "boot"}
     assert launched == ["boot"]
     assert "boot" not in cron._pending_reboot_jobs
 

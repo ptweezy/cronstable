@@ -39,6 +39,7 @@ from typing import (  # noqa
     Optional,
     Set,
     Tuple,
+    Type,
     Union,
 )
 from urllib.parse import urlparse
@@ -690,6 +691,34 @@ class ApiActionError(Exception):
         self.status = status
 
 
+def _error_body(message: str) -> str:
+    """The web API's ONE error envelope: a JSON object ``{"error": msg}``.
+
+    Every 4xx/5xx body this origin serves carries it (the raise-style
+    handlers via :func:`_api_error`, the return-style ones via
+    ``_json_response({"error": ...})``), matching the jobapi and MCP
+    surfaces, so a client parses failures one way instead of sniffing
+    text/plain per handler.  The auth middleware's bare 401 stays bodyless
+    by design.
+    """
+    return json.dumps({"error": message})
+
+
+def _api_error(
+    factory: "Type[web.HTTPException]",
+    message: str,
+    headers: Optional[Any] = None,
+) -> web.HTTPException:
+    """An aiohttp error response carrying the uniform JSON envelope."""
+    if headers is not None:
+        return factory(
+            text=_error_body(message),
+            content_type="application/json",
+            headers=headers,
+        )
+    return factory(text=_error_body(message), content_type="application/json")
+
+
 def _http_for_action_error(
     ex: "ApiActionError", headers: Optional[Any] = None
 ) -> web.HTTPException:
@@ -706,12 +735,7 @@ def _http_for_action_error(
         409: web.HTTPConflict,
     }
     factory = status_map.get(ex.status, web.HTTPBadRequest)
-    # HTTPNotFound rejects a text argument in some aiohttp versions only when
-    # the body would conflict; passing the reason as text is supported by all
-    # of these 4xx exceptions and gives the caller the actual cause.
-    if headers is not None:
-        return factory(text=ex.message, headers=headers)
-    return factory(text=ex.message)
+    return _api_error(factory, ex.message, headers)
 
 
 # Defense-in-depth security headers for the dashboard HTML document. The
@@ -2733,13 +2757,13 @@ class Cron:
         assert self.web_config is not None
         return web.Response(
             text=cronstable.version.version,
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_job_set_id(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         job_set = self.job_set_id()
-        headers = self.web_config.get("headers", None)
+        headers = self._web_headers()
         if _accepts_json(request):
             return _json_response(
                 {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
@@ -2780,7 +2804,7 @@ class Cron:
             self.cluster_payload(),
             if_none_match=None,
             gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
             use_etag=False,
         )
 
@@ -2798,7 +2822,7 @@ class Cron:
         """
         assert self.web_config is not None
         return _json_response(
-            self.fleet_payload(), headers=self.web_config.get("headers", None)
+            self.fleet_payload(), headers=self._web_headers()
         )
 
     def fleet_payload(self) -> Dict[str, Any]:
@@ -2827,9 +2851,7 @@ class Cron:
         not read the host); the dashboard then hides the node meter.
         """
         assert self.web_config is not None
-        return _json_response(
-            self.node_payload(), headers=self.web_config.get("headers", None)
-        )
+        return _json_response(self.node_payload(), headers=self._web_headers())
 
     def node_payload(self, history: bool = False) -> Dict[str, Any]:
         """This node's live CPU/memory (`GET /node`, MCP `cron_get_node`).
@@ -2886,7 +2908,7 @@ class Cron:
                 ),
                 "points": history["points"] if history is not None else [],
             },
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_metrics(self, request: web.Request) -> web.Response:
@@ -2912,7 +2934,7 @@ class Cron:
                 families, openmetrics=openmetrics
             )
         headers = {}  # type: Dict[str, str]
-        custom = self.web_config.get("headers", None)
+        custom = self._web_headers()
         if custom:
             headers.update(custom)
             # Unlike the other handlers, the Content-Type is the endpoint's
@@ -2985,9 +3007,7 @@ class Cron:
         assert self.web_config is not None
         out = self.status_payload()
         if _accepts_json(request):
-            return _json_response(
-                out, headers=self.web_config.get("headers", None)
-            )
+            return _json_response(out, headers=self._web_headers())
         else:
             lines = []
             for jobstat in out:  # type: Dict[str, Any]
@@ -3014,7 +3034,7 @@ class Cron:
                 )
             return web.Response(
                 text="\n".join(lines),
-                headers=self.web_config.get("headers", None),
+                headers=self._web_headers(),
             )
 
     def summary_payload(self) -> Dict[str, Any]:
@@ -3120,7 +3140,7 @@ class Cron:
         assert self.web_config is not None
         return _json_response(
             self.summary_payload(),
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_whoami(self, request: web.Request) -> web.Response:
@@ -3149,9 +3169,7 @@ class Cron:
                 "scopes": sorted(matched.scopes),
                 "allScopes": matched.scopes == _WEB_ALL_SCOPES,
             }
-        return _json_response(
-            payload, headers=self.web_config.get("headers", None)
-        )
+        return _json_response(payload, headers=self._web_headers())
 
     def _push_service_required(self) -> "push.PushService":
         """The running push service, or the 404 the route contract says.
@@ -3162,8 +3180,9 @@ class Cron:
         """
         service = self._push_service
         if service is None:
-            raise web.HTTPNotFound(
-                text="no `push:` section is configured on this daemon"
+            raise _api_error(
+                web.HTTPNotFound,
+                "no `push:` section is configured on this daemon",
             )
         return service
 
@@ -3190,9 +3209,10 @@ class Cron:
         from what the caller already knows, never from the exception.
         """
         logger.warning("push: %s failed: %s", doing, exc)
-        return web.HTTPServiceUnavailable(
-            text="the device registry's store is unavailable; "
-            "the reason is in the cronstable log"
+        return _api_error(
+            web.HTTPServiceUnavailable,
+            "the device registry's store is unavailable; "
+            "the reason is in the cronstable log",
         )
 
     async def _web_push_devices(self, request: web.Request) -> web.Response:
@@ -3208,7 +3228,7 @@ class Cron:
             ) from None
         return _json_response(
             {"devices": service.devices_payload()},
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_push_pair(self, request: web.Request) -> web.Response:
@@ -3217,8 +3237,8 @@ class Cron:
         try:
             body = await request.json()
         except ValueError:
-            raise web.HTTPBadRequest(
-                text="body must be a JSON object"
+            raise _api_error(
+                web.HTTPBadRequest, "body must be a JSON object"
             ) from None
         try:
             fields = push.validate_pairing(body)
@@ -3233,7 +3253,7 @@ class Cron:
             # key refusal in push.validate_public_key) keep their detail
             # in the log and raise a fixed string, so nacl's own wording
             # cannot escape here.
-            raise web.HTTPBadRequest(text=str(exc)) from None
+            raise _api_error(web.HTTPBadRequest, str(exc)) from None
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
             record, created = await service.pair(
@@ -3253,7 +3273,7 @@ class Cron:
         return _json_response(
             {"device": push.public_device(record), "created": created},
             status=201 if created else 200,
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_push_revoke(self, request: web.Request) -> web.Response:
@@ -3267,13 +3287,14 @@ class Cron:
                 exc, "revoking a device"
             ) from None
         if not removed:
-            raise web.HTTPNotFound(
-                text="no paired device with id {!r}".format(device_id)
+            raise _api_error(
+                web.HTTPNotFound,
+                "no paired device with id {!r}".format(device_id),
             )
         logger.info("push: device %s revoked", device_id)
         return _json_response(
             {"revoked": device_id},
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_push_test(self, request: web.Request) -> web.Response:
@@ -3294,14 +3315,15 @@ class Cron:
             ) from None
         device = service.get_device(device_id)
         if device is None:
-            raise web.HTTPNotFound(
-                text="no paired device with id {!r}".format(device_id)
+            raise _api_error(
+                web.HTTPNotFound,
+                "no paired device with id {!r}".format(device_id),
             )
         outcome = await service.send_test(device)
         return _json_response(
             outcome,
             status=502 if outcome.get("error") else 200,
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def start_stop_push(
@@ -3528,7 +3550,7 @@ class Cron:
     ) -> web.Response:
         """Decode an arbitrary expression for the dashboards' sandboxes."""
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        headers = self._web_headers()
         expr = request.query.get("expr", "")
         if not expr.strip():
             return _json_response(
@@ -3546,7 +3568,9 @@ class Cron:
             return _json_response(
                 {"error": tz_error}, status=400, headers=headers
             )
-        count = self._web_int_query(request, "count", default=12, lo=1, hi=60)
+        count = self._web_int_query(
+            request, "limit", default=12, lo=1, hi=60, alias="count"
+        )
         payload = self.schedule_preview_payload(
             expr, tz, count, request.query.get("seed")
         )
@@ -3681,7 +3705,7 @@ class Cron:
     async def _web_schedule_why(self, request: web.Request) -> web.Response:
         """Explain one job's schedule against one timestamp."""
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        headers = self._web_headers()
         name = request.query.get("job", "").strip()
         at = request.query.get("at", "").strip()
         if not name or not at:
@@ -3858,7 +3882,7 @@ class Cron:
         self, request: web.Request
     ) -> web.Response:
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        headers = self._web_headers()
         hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
         tz = request.query.get("tz") or None
         # Validate up front and answer 400 from the requested name, so the
@@ -3877,14 +3901,14 @@ class Cron:
         assert self.web_config is not None
         return _json_response(
             await self.schedule_duplicates_payload_async(),
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def _web_schedule_suggest(
         self, request: web.Request
     ) -> web.Response:
         assert self.web_config is not None
-        headers = self.web_config.get("headers", None)
+        headers = self._web_headers()
         period = request.query.get("period") or "hourly"
         tz = request.query.get("tz") or None
         # Validate both user inputs and answer 400 from the requested values,
@@ -3995,7 +4019,7 @@ class Cron:
         assert self.web_config is not None
         days = self._web_int_query(request, "days", default=14, lo=1, hi=60)
         per_job = self._web_int_query(
-            request, "per_job", default=100, lo=1, hi=1000
+            request, "limit", default=100, lo=1, hi=1000, alias="per_job"
         )
         # the entries snapshot reads live state, so it is taken on the
         # loop; the walk (jobs x fires, pure CPU) then runs on the
@@ -4810,19 +4834,27 @@ class Cron:
 
     async def _web_start_job(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
+        name = request.match_info["name"]
         try:
-            await self.start_job_by_name(request.match_info["name"])
+            await self.start_job_by_name(name)
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
-        return web.Response(headers=self.web_config.get("headers", None))
+        # a minimal JSON ack in the MCP cron_run_job shape; this route once
+        # returned an empty 200 while every sibling action returned JSON.
+        return _json_response({"started": name}, headers=self._web_headers())
 
     async def _web_cancel_job(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
+        name = request.match_info["name"]
         try:
-            await self.cancel_job_by_name(request.match_info["name"])
+            count = await self.cancel_job_by_name(name)
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
-        return web.Response(headers=self.web_config.get("headers", None))
+        # the MCP cron_cancel_job shape, instances included
+        return _json_response(
+            {"cancelled": name, "instances": count},
+            headers=self._web_headers(),
+        )
 
     async def _web_pause_job(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -4832,25 +4864,29 @@ class Cron:
         if duration is not None and (
             not isinstance(duration, int) or isinstance(duration, bool)
         ):
-            raise web.HTTPBadRequest(text="durationSeconds must be an integer")
+            raise _api_error(
+                web.HTTPBadRequest, "durationSeconds must be an integer"
+            )
         until_raw = body.get("until")
         until = None
         if until_raw is not None:
             if not isinstance(until_raw, str):
-                raise web.HTTPBadRequest(
-                    text="until must be an ISO-8601 timestamp string"
+                raise _api_error(
+                    web.HTTPBadRequest,
+                    "until must be an ISO-8601 timestamp string",
                 )
             until = _parse_iso_utc(until_raw)
             if until is None:
-                raise web.HTTPBadRequest(
-                    text="until is not a valid ISO-8601 timestamp"
+                raise _api_error(
+                    web.HTTPBadRequest,
+                    "until is not a valid ISO-8601 timestamp",
                 )
         note = body.get("note")
         if note is not None and not isinstance(note, str):
-            raise web.HTTPBadRequest(text="note must be a string")
+            raise _api_error(web.HTTPBadRequest, "note must be a string")
         by = body.get("by")
         if by is not None and not isinstance(by, str):
-            raise web.HTTPBadRequest(text="by must be a string")
+            raise _api_error(web.HTTPBadRequest, "by must be a string")
         try:
             paused = await self.pause_job_by_name(
                 request.match_info["name"],
@@ -4862,33 +4898,27 @@ class Cron:
             )
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
-        return _json_response(
-            {"paused": paused}, headers=self.web_config.get("headers", None)
-        )
+        return _json_response({"paused": paused}, headers=self._web_headers())
 
     async def _web_resume_job(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         body = await self._web_json_body(request)
         by = body.get("by")
         if by is not None and not isinstance(by, str):
-            raise web.HTTPBadRequest(text="by must be a string")
+            raise _api_error(web.HTTPBadRequest, "by must be a string")
         try:
             await self.resume_job_by_name(
                 request.match_info["name"], by=by or "api", channel="api"
             )
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
-        return _json_response(
-            {"paused": None}, headers=self.web_config.get("headers", None)
-        )
+        return _json_response({"paused": None}, headers=self._web_headers())
 
     def _action_http_error(self, ex: "ApiActionError") -> web.HTTPException:
         # historical parity: web.headers ride the 409 conflict bodies of the
         # start/cancel routes, but NOT their 404 (unknown job).
         assert self.web_config is not None
-        headers = (
-            self.web_config.get("headers", None) if ex.status == 409 else None
-        )
+        headers = self._web_headers() if ex.status == 409 else None
         return _http_for_action_error(ex, headers)
 
     def _security_headers(self) -> Dict[str, str]:
@@ -4900,7 +4930,7 @@ class Cron:
         """
         assert self.web_config is not None
         headers = dict(WEB_SECURITY_HEADERS)
-        custom = self.web_config.get("headers", None)
+        custom = self._web_headers()
         if custom:
             headers.update(custom)
         return headers
@@ -5335,7 +5365,7 @@ class Cron:
     def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
         """The configured web response headers plus the ``/jobs`` ETag."""
         assert self.web_config is not None
-        base = self.web_config.get("headers", None)
+        base = self._web_headers()
         headers: Dict[str, str] = dict(base) if base else {}
         headers["ETag"] = etag
         return headers
@@ -5358,6 +5388,12 @@ class Cron:
     # --- DAG introspection + control --------------------------------------
 
     def _web_headers(self) -> Any:
+        """The operator-configured ``web.headers`` map (or ``None``).
+
+        The ONE spelling of this lookup: every handler reads it through
+        here (a sweep replaced 35 inline copies), so a future policy
+        change edits one method instead of every route.
+        """
         assert self.web_config is not None
         return self.web_config.get("headers", None)
 
@@ -5390,9 +5426,14 @@ class Cron:
         limit = self._web_int_query(request, "limit", default=50, lo=1, hi=500)
         runs = await self._dag.list_runs(name, limit=limit)
         if runs is None:
-            raise web.HTTPNotFound()
+            raise _api_error(
+                web.HTTPNotFound, "dag {!r} not found".format(name)
+            )
+        # the subject rides under "name" too, the key the job runs payload
+        # uses, so generic clients can read both runs endpoints one way
         return _json_response(
-            {"dag": name, "runs": runs}, headers=self._web_headers()
+            {"dag": name, "name": name, "runs": runs},
+            headers=self._web_headers(),
         )
 
     async def _web_dag_run(self, request: web.Request) -> web.Response:
@@ -5400,7 +5441,10 @@ class Cron:
         run_key = request.match_info["run_key"]
         body = await self._dag.get_run(name, run_key)
         if body is None:
-            raise web.HTTPNotFound()
+            raise _api_error(
+                web.HTTPNotFound,
+                "dag {!r} has no run {!r}".format(name, run_key),
+            )
         return _json_response(body, headers=self._web_headers())
 
     async def _web_dag_xcom(self, request: web.Request) -> web.Response:
@@ -5408,7 +5452,10 @@ class Cron:
         run_key = request.match_info["run_key"]
         result = await self._dag.xcom_for_run(name, run_key)
         if result is None:
-            raise web.HTTPNotFound()
+            raise _api_error(
+                web.HTTPNotFound,
+                "dag {!r} has no run {!r}".format(name, run_key),
+            )
         return _json_response(result, headers=self._web_headers())
 
     # --- durable state inspector (metadata-only) --------------------------
@@ -5417,7 +5464,7 @@ class Cron:
         assert self.web_config is not None
         return _json_response(
             await self.state_payload(),
-            headers=self.web_config.get("headers", None),
+            headers=self._web_headers(),
         )
 
     async def state_payload(self) -> Dict[str, Any]:
@@ -5537,9 +5584,7 @@ class Cron:
             )
         except ApiActionError as ex:
             raise _http_for_action_error(ex) from ex
-        return _json_response(
-            payload, headers=self.web_config.get("headers", None)
-        )
+        return _json_response(payload, headers=self._web_headers())
 
     async def state_records_payload(
         self, stream: str, limit: int = 100
@@ -5586,17 +5631,18 @@ class Cron:
             )
         except ApiActionError as ex:
             raise _http_for_action_error(ex) from ex
-        return _json_response(
-            payload, headers=self.web_config.get("headers", None)
-        )
+        return _json_response(payload, headers=self._web_headers())
 
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
         run_key = await self._dag.trigger_run(name)
         if run_key is None:
-            raise web.HTTPNotFound()
+            raise _api_error(
+                web.HTTPNotFound, "dag {!r} not found".format(name)
+            )
         return _json_response(
-            {"dag": name, "runKey": run_key}, headers=self._web_headers()
+            {"dag": name, "name": name, "runKey": run_key},
+            headers=self._web_headers(),
         )
 
     async def _web_dag_backfill(self, request: web.Request) -> web.Response:
@@ -5605,12 +5651,13 @@ class Cron:
         start = payload.get("from")
         end = payload.get("to")
         if not isinstance(start, str) or not isinstance(end, str):
-            raise web.HTTPBadRequest(
-                text="backfill needs string `from` and `to` ISO dates"
+            raise _api_error(
+                web.HTTPBadRequest,
+                "backfill needs string `from` and `to` ISO dates",
             )
         result = await self._dag.backfill(name, start, end)
         if not result.get("ok"):
-            raise web.HTTPBadRequest(text=str(result.get("reason")))
+            raise _api_error(web.HTTPBadRequest, str(result.get("reason")))
         return _json_response(result, headers=self._web_headers())
 
     async def _web_dag_decision(self, request: web.Request) -> web.Response:
@@ -5620,24 +5667,40 @@ class Cron:
         payload = await self._web_json_body(request)
         decision = payload.get("decision")
         if decision not in ("approve", "reject"):
-            raise web.HTTPBadRequest(
-                text="decision must be 'approve' or 'reject'"
+            raise _api_error(
+                web.HTTPBadRequest,
+                "decision must be 'approve' or 'reject'",
             )
         by = str(payload.get("by") or "api")
         result = await self._dag.approve(
             name, run_key, taskkey, approved=(decision == "approve"), by=by
         )
         if not result.get("ok"):
-            raise web.HTTPConflict(text=str(result.get("reason")))
+            raise _api_error(web.HTTPConflict, str(result.get("reason")))
         return _json_response(result, headers=self._web_headers())
 
     @staticmethod
     def _web_int_query(
-        request: web.Request, name: str, *, default: int, lo: int, hi: int
+        request: web.Request,
+        name: str,
+        *,
+        default: int,
+        lo: int,
+        hi: int,
+        alias: Optional[str] = None,
     ) -> int:
         """A clamped integer query param; falls back to ``default`` on a
-        missing or unparseable value (a bad query is never a 400 here)."""
+        missing or unparseable value (a bad query is never a 400 here).
+
+        ``alias`` is a legacy spelling read only when ``name`` is absent:
+        the count-capping params had grown four names (``count``,
+        ``per_job``, ``runs``, ``limit``) endpoint by endpoint, so every
+        capped listing now reads ``limit`` first while its original
+        spelling keeps working.
+        """
         raw = request.query.get(name)
+        if raw is None and alias is not None:
+            raw = request.query.get(alias)
         if raw is None:
             return default
         try:
@@ -5653,11 +5716,13 @@ class Cron:
         try:
             body = await request.json()
         except Exception as ex:  # noqa: BLE001 - a malformed body is a 400
-            raise web.HTTPBadRequest(
-                text="request body is not valid JSON"
+            raise _api_error(
+                web.HTTPBadRequest, "request body is not valid JSON"
             ) from ex
         if not isinstance(body, dict):
-            raise web.HTTPBadRequest(text="request body must be a JSON object")
+            raise _api_error(
+                web.HTTPBadRequest, "request body must be a JSON object"
+            )
         return body
 
     def job_runs_payload(self, name: str) -> Optional[Dict[str, Any]]:
@@ -5679,10 +5744,23 @@ class Cron:
         name = request.match_info["name"]
         payload = self.job_runs_payload(name)
         if payload is None:
-            raise web.HTTPNotFound()
-        return _json_response(
-            payload, headers=self.web_config.get("headers", None)
+            raise _api_error(
+                web.HTTPNotFound, "job {!r} not found".format(name)
+            )
+        # the same clamped `limit` the DAG runs route (and the MCP
+        # cron_list_runs twin) applies; the retained history is bounded by
+        # RUN_HISTORY_LIMIT, so the default serves it whole, exactly the
+        # old unparameterised behavior.
+        limit = self._web_int_query(
+            request,
+            "limit",
+            default=RUN_HISTORY_LIMIT,
+            lo=1,
+            hi=RUN_HISTORY_LIMIT,
         )
+        if len(payload["runs"]) > limit:
+            payload["runs"] = payload["runs"][-limit:]  # newest retained
+        return _json_response(payload, headers=self._web_headers())
 
     async def _web_job_resources(self, request: web.Request) -> web.Response:
         """Chart-grade CPU/RSS series for one job (monitorResources jobs).
@@ -5700,14 +5778,19 @@ class Cron:
         assert self.web_config is not None
         name = request.match_info["name"]
         max_runs = self._web_int_query(
-            request, "runs", default=20, lo=0, hi=RUN_HISTORY_LIMIT
+            request,
+            "limit",
+            default=20,
+            lo=0,
+            hi=RUN_HISTORY_LIMIT,
+            alias="runs",
         )
         payload = self.job_resources_payload(name, max_runs)
         if payload is None:
-            raise web.HTTPNotFound()
-        return _json_response(
-            payload, headers=self.web_config.get("headers", None)
-        )
+            raise _api_error(
+                web.HTTPNotFound, "job {!r} not found".format(name)
+            )
+        return _json_response(payload, headers=self._web_headers())
 
     def job_resources_payload(
         self, name: str, max_runs: int
@@ -5770,9 +5853,7 @@ class Cron:
         payload = await self.job_trends_payload(name)
         if payload is None:
             raise web.HTTPNotFound()
-        return _json_response(
-            payload, headers=self.web_config.get("headers", None)
-        )
+        return _json_response(payload, headers=self._web_headers())
 
     async def job_trends_payload(self, name: str) -> Optional[Dict[str, Any]]:
         """SLA trend aggregates over the durable run ledger, or ``None``.
@@ -5943,15 +6024,24 @@ class Cron:
 
     def _sse_headers(self) -> Dict[str, str]:
         assert self.web_config is not None
-        headers = {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            # tell reverse proxies (nginx) not to buffer the event stream
-            "X-Accel-Buffering": "no",
-        }
-        custom = self.web_config.get("headers", None)
+        headers: Dict[str, str] = {}
+        custom = self._web_headers()
         if custom:
             headers.update(custom)
+            # Like /metrics, the stream framing is this endpoint's contract:
+            # an operator-configured Content-Type, cache policy, or proxy
+            # buffering override in web.headers would silently break every
+            # live tail, so the protocol headers win, in ANY spelling:
+            # header names are case-insensitive on the wire but this dict is
+            # not, and a case-variant leftover would be emitted as a second,
+            # conflicting header.
+            protocol = ("content-type", "cache-control", "x-accel-buffering")
+            for key in [k for k in headers if k.lower() in protocol]:
+                del headers[key]
+        headers["Content-Type"] = "text/event-stream"
+        headers["Cache-Control"] = "no-cache"
+        # tell reverse proxies (nginx) not to buffer the event stream
+        headers["X-Accel-Buffering"] = "no"
         return headers
 
     async def _pump_output(
@@ -6974,6 +7064,12 @@ class Cron:
                 task.cancel()
             self._slot_pursuits.clear()
             self._slot_fidelity = None
+            # The @reboot gate's "store timed out, stop probing" latch is a
+            # per-store health verdict just like the lock-fidelity one above:
+            # a replacement store earns fresh probes, it does not inherit the
+            # dead store's degraded no-dedupe mode for the life of the
+            # process.
+            self._reboot_gate_sick = False
             if self._retry_claim_task is not None:
                 self._retry_claim_task.cancel()
                 self._retry_claim_task = None
@@ -7871,11 +7967,10 @@ class Cron:
             if matched.scopes != _WEB_ALL_SCOPES:
                 required = _required_web_scope(request)
                 if required not in matched.scopes:
-                    raise web.HTTPForbidden(
-                        text=(
-                            "token {!r} lacks the {!r} scope required for "
-                            "this endpoint".format(matched.label, required)
-                        )
+                    raise _api_error(
+                        web.HTTPForbidden,
+                        "token {!r} lacks the {!r} scope required for "
+                        "this endpoint".format(matched.label, required),
                     )
             request[WEB_TOKEN_REQUEST_KEY] = matched
             return await handler(request)
@@ -7933,10 +8028,11 @@ class Cron:
                 origin, request.host
             ):
                 return await handler(request)
-            raise web.HTTPForbidden(
-                text="Origin not allowed: cross-site requests to the "
+            raise _api_error(
+                web.HTTPForbidden,
+                "Origin not allowed: cross-site requests to the "
                 "cronstable control API are refused; add the origin to "
-                "web.allowedOrigins if it is trusted"
+                "web.allowedOrigins if it is trusted",
             )
 
         return origin_middleware

@@ -2132,6 +2132,42 @@ async def test_list_document_keys_foreign_filename_reports_unable(tmp_path):
     await backend.stop()
 
 
+async def test_list_document_keys_round_trip_guard(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "real", lambda c: ({"v": 1}, None))
+    ns_dir = backend._doc_dir("ns")
+    # tokens that DECODE cleanly but that the encoder can never have
+    # produced: uppercase letters (which _fs_safe escapes) and a
+    # lowercase-hex alias of an escape.  A bare unquote once returned "KEY"
+    # and "/" for these, keys that address a different (or no) document;
+    # the _decode_fs_token round-trip check reports the listing unable
+    # instead, the same contract as the truncated-token branch.
+    for foreign in ("KEY.doc", "%2f.doc"):
+        with open(os.path.join(ns_dir, foreign), "wb") as fobj:
+            fobj.write(b"{}")
+        assert await backend.list_document_keys("ns") is None
+        os.unlink(os.path.join(ns_dir, foreign))
+    assert await backend.list_document_keys("ns") == ["real"]
+    await backend.stop()
+
+
+async def test_list_document_keys_surrogate_key_round_trips(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    # a key carrying a lone surrogate (names come from os.fsdecode'd
+    # sources elsewhere in the store) encodes via surrogatepass; the
+    # listing must hand back the SAME key, not report unable (the old
+    # strict-utf-8 unquote could not decode it) and never a U+FFFD-mangled
+    # spelling that addresses a nonexistent document.
+    key = "job-\udcff"
+    assert await backend.mutate_document(
+        "ns", key, lambda c: ({"v": 1}, None)
+    )
+    assert await backend.list_document_keys("ns") == [key]
+    await backend.stop()
+
+
 async def test_list_document_namespaces_lists_and_filters(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()

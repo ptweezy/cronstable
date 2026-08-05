@@ -1830,6 +1830,58 @@ def test_tui_outcome_mapping_has_exactly_one_home():
         assert hits < 2, "%s outcome ladder outside outcome_key" % where
 
 
+def test_dag_state_colors_cover_dag_vocabulary_and_match_web():
+    """DAG_STATE_COLOR is the explicit port of the web's ``dstVar``. The
+    old spelling-guess ladder handled six strings the engine never emits
+    while ``upstream_failed`` (a failure state, fail-red on the web)
+    painted neutral "dim"; this pins the map to dag.py's real vocabulary
+    and to the web's own map, so neither side can drift alone again."""
+    import re
+
+    from cronstable import dag
+
+    states = set(dag.TERMINAL_STATES) | {
+        dag.PENDING,
+        dag.RUNNING,
+        dag.UP_FOR_RETRY,
+        dag.EXPANDED,
+    }
+    for state in states:
+        assert state in tui.DAG_STATE_COLOR, state
+    # the drifted trio that motivated the map
+    assert tui.DAG_STATE_COLOR[dag.UPSTREAM_FAILED] == "fail"
+    assert tui.DAG_STATE_COLOR[dag.UP_FOR_RETRY] == "pending"
+    assert tui.DAG_STATE_COLOR[dag.SKIPPED] == "off"
+    # the run-level extra the TUI paints as queued work
+    assert tui.DAG_STATE_COLOR["scheduled"] == "pending"
+    # every ink the map can return exists in every palette, or a state
+    # renders in the default ink and reads as an ordinary one
+    for hue, palette in tui._P.items():
+        for ink in set(tui.DAG_STATE_COLOR.values()):
+            assert ink in palette, (hue, ink)
+    # web parity: read dstVar's own map and translate its CSS var names to
+    # the TUI's ink names (the web's --unknown and fg-faint have no TUI
+    # palette twin; "dim" stands in for both)
+    path, html = _web_page()
+    mapper = re.search(
+        r"function dstVar\(s\) \{\s*return \(\{(.*?)\}\)", html, re.S
+    )
+    assert mapper, path
+    web_map = dict(re.findall(r'(\w+): "([\w-]+)"', mapper.group(1)))
+    assert set(web_map) >= states, path
+    web2tui = {
+        "ok": "ok",
+        "fail": "fail",
+        "run": "run",
+        "pending": "pending",
+        "disabled": "off",
+        "fg-faint": "dim",
+        "unknown": "dim",
+    }
+    for state, web_var in web_map.items():
+        assert tui.DAG_STATE_COLOR[state] == web2tui[web_var], state
+
+
 def test_tui_paints_a_pause_held_slot_as_skipped_not_ok():
     """#28 residual: the web fix routed both of its outcome ladders
     through ``outcomeCls``, but the TUI's five copies were untouched, so

@@ -1562,6 +1562,35 @@ def test_security_and_sse_headers_merge_custom():
     assert sse["X-Custom"] == "yes"
 
 
+def test_sse_protocol_headers_win_over_operator_overrides():
+    # the stream framing is the endpoint's contract (mirrors /metrics): a
+    # global web.headers Content-Type / cache policy / proxy-buffering
+    # override must not break every live tail, and a case-variant spelling
+    # must not survive as a second, conflicting header on the wire.
+    cron = _cron(_RES_YAML)
+    cron.web_config = {
+        "headers": {
+            "content-type": "text/html",
+            "Cache-Control": "public, max-age=60",
+            "X-ACCEL-BUFFERING": "yes",
+            "X-Custom": "yes",
+        }
+    }
+    sse = cron._sse_headers()
+    assert sse["Content-Type"] == "text/event-stream"
+    assert sse["Cache-Control"] == "no-cache"
+    assert sse["X-Accel-Buffering"] == "no"
+    assert sse["X-Custom"] == "yes"  # non-protocol headers still ride
+    for name in ("content-type", "cache-control", "x-accel-buffering"):
+        assert [k for k in sse if k.lower() == name] == [
+            {
+                "content-type": "Content-Type",
+                "cache-control": "Cache-Control",
+                "x-accel-buffering": "X-Accel-Buffering",
+            }[name]
+        ]
+
+
 # ---------------------------------------------------------------------------
 # _resolve_web_token: the fromFile read-error path
 # ---------------------------------------------------------------------------

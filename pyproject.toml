@@ -132,6 +132,15 @@ dev = [
     # only the cluster mTLS tests use it, and it has no win-arm64 wheel; see
     # requirements_dev.txt for why it's gated to other platforms.
     "cryptography; platform_machine != 'ARM64' or sys_platform != 'win32'",
+    # The optional-extra deps the tests must really exercise (orjson, pynacl,
+    # zeroconf); requirements_dev.txt documents why each is here.  Without
+    # them a `pip install -e .[dev]` + `pytest` checkout runs the suite in
+    # the importorskip blind spot that file warns about: the accelerated
+    # JSON, push-sealing, and mDNS test arms all self-skip.  This list and
+    # requirements_dev.txt are pinned equal by tests/test_dev_deps_parity.py.
+    "orjson>=3.9; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
+    "pynacl>=1.5",
+    "zeroconf>=0.132",
     # security linter; bandit[toml] reads [tool.bandit] from pyproject.toml.
     "bandit[toml]",
     "mypy",

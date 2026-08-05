@@ -30,7 +30,7 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 
 The editable dev install (`pip install -e ".[dev]"`) and the checks (`pytest`, `ruff`, `mypy`) all run natively on Windows too. Use `.venv\Scripts\activate` to enter the venv as shown above.
 
-The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `bandit`, `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv` (the plugin that makes `tox` provision and install with uv). The console entry point `cronstable = cronstable.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
+The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: the check tooling (`bandit`, `mypy`, `mypy-extensions`, `openapi-spec-validator`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv`, the plugin that makes `tox` provision and install with uv) plus the optional-feature libraries the test suite must really exercise (`orjson`, `pynacl`, `zeroconf`, and `cryptography`, some gated by platform markers; requirements_dev.txt documents why each is there). The two lists are pinned equal by `tests/test_dev_deps_parity.py`. The console entry point `cronstable = cronstable.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
 
 ## Running the checks
 

@@ -2192,6 +2192,41 @@ def test_maybe_terminalise_ignores_unmaterialised_mapped_task():
     assert result.changed is True
 
 
+# _mapped_instance_state: the barrier and the terminaliser share one
+# absent-entry rule
+
+
+def test_absent_mapped_instance_holds_run_open_like_the_barrier():
+    # regression: the terminaliser once SKIPPED an entry missing for a
+    # run-recorded instance index while the fan-in barrier read the same
+    # hole as pending, so a damaged run document could complete as a run
+    # whose mapped group still read "running" to every downstream.  Both
+    # consumers now share _mapped_instance_state: the hole holds the run
+    # open, where the reconcile paths can see it.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["mapped"]["w"] = {"items": ["a", "b"], "expandedAt": 1.0}
+    body["tasks"]["w#0"] = {"id": "w", "state": dag.SUCCESS}
+    body["tasks"].pop("w#1", None)  # the hole: a run-recorded index, absent
+    assert dag._mapped_group_state(body, "w") == dag.RUNNING  # barrier holds
+    result = dag.AdvanceResult()
+    dag._maybe_terminalise(spec, body, 5.0, result)
+    assert result.run_terminal is False  # ...and so must the run
+    # both verdicts agree once the hole is filled terminally
+    body["tasks"]["w#1"] = {"id": "w", "state": dag.SUCCESS}
+    assert dag._mapped_group_state(body, "w") == dag.SUCCESS
+    dag._maybe_terminalise(spec, body, 6.0, result)
+    assert result.run_terminal is True
+
+
 # set_task_pid: no-op on missing run / non-running entry
 
 

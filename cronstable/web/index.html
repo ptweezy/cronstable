@@ -5847,6 +5847,59 @@ var qrcode = function() {
     return dedupePhrases(out);
   }
   // plain-English description
+  // The daemon engine's REJECTIONS that the tolerant parsers above accept
+  // while the user types (see the asymmetry note in
+  // tests/test_web_engine_parity.py): wrap-around ranges, out-of-range
+  // endpoints, oversized steps, steps whose first stride escapes the field,
+  // and the classic-crontab-only "@midnight" (the daemon's loader rewrites
+  // it to @daily; the literal is a config parse error).  describeCron gates
+  // its confident prose on this so the sandbox never affirms a schedule the
+  // daemon refuses to load; parseCron and the fire previews stay tolerant
+  // on purpose.  Mirrors cronexpr._parse_field's checks and
+  // croninfo._engine_accepts' role; the Playwright differential pins the
+  // describe output byte-for-byte.
+  function fieldRejected(spec, min, max, stepEnd, names, isDow, specials) {
+    spec = String(spec).trim().toLowerCase();
+    if (spec === "*" || spec === "?") return false;
+    for (const part of spec.split(",")) {
+      // special day forms (L / L-n / nW / LW / d#n) carry their own
+      // validation in the tolerant parsers, matching the engine's
+      if (specials && (/^l/.test(part) || /w$/.test(part) || part.includes("#"))) continue;
+      let body = part, step = null;
+      const slash = part.indexOf("/");
+      if (slash >= 0) { step = parseInt(part.slice(slash + 1), 10); body = part.slice(0, slash); }
+      if (step != null && Number.isFinite(step) && (step < 1 || step > max)) return true;
+      let lo = null, hi = null;
+      const rng = body.match(/^([^-]+)-(.+)$/);
+      if (body === "*") { lo = min; hi = stepEnd; }
+      else if (rng) {
+        lo = nameToNum(rng[1], names); hi = nameToNum(rng[2], names);
+        if (isDow && hi === 0) hi = 7; // dow range ending in 0: end reads as 7
+      } else { lo = nameToNum(body, names); hi = slash >= 0 ? stepEnd : lo; }
+      if (lo == null || hi == null) continue; // malformed: the tolerant parse degrades it
+      if (lo > hi || lo < min || hi > max) return true;
+      if (step != null && Number.isFinite(step) && (lo + step < min || lo + step > max)) return true;
+    }
+    return false;
+  }
+  function cronRejected(expr) {
+    const low = String(expr || "").trim().toLowerCase();
+    if (low === "@midnight") return true;
+    if (MACROS[low]) return false;
+    const f = low.split(/\s+/);
+    let sec = null, yr = null, core;
+    if (f.length === 5) core = f;
+    else if (f.length === 6) { core = f.slice(0, 5); yr = f[5]; }
+    else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
+    else return false; // not field-shaped: the tolerant parse degrades it
+    return (sec != null && fieldRejected(sec, 0, 59, 59, null, false, false))
+      || fieldRejected(core[0], 0, 59, 59, null, false, false)
+      || fieldRejected(core[1], 0, 23, 23, null, false, false)
+      || fieldRejected(core[2], 1, 31, 31, null, false, true)
+      || fieldRejected(core[3], 1, 12, 12, MON_NAMES, false, false)
+      || fieldRejected(core[4], 0, 7, 6, DOW_NAMES, true, true)
+      || (yr != null && yr !== "*" && fieldRejected(yr, 1970, 2099, 2099, null, false, false));
+  }
   function describeCron(expr) {
     expr = String(expr || "").trim();
     const low = expr.toLowerCase();
@@ -5856,10 +5909,13 @@ var qrcode = function() {
       "@annually": "Once a year, at midnight on 1 January",
       "@monthly": "At midnight on the 1st of every month",
       "@weekly": "At midnight every Sunday",
-      "@daily": "Every day at midnight", "@midnight": "Every day at midnight",
+      // no "@midnight" here: classic-crontab-only, the daemon rejects the
+      // literal (cronRejected below sends it to the Custom line)
+      "@daily": "Every day at midnight",
       "@hourly": "Every hour, on the hour",
     };
     if (macroText[low]) return macroText[low];
+    if (cronRejected(expr)) return "Custom schedule: " + expr;
     const p = parseCron(expr);
     if (p.type !== "fields") return "Custom schedule: " + expr;
     const f = (MACROS[low] || expr).split(/\s+/);
@@ -10098,7 +10154,13 @@ var qrcode = function() {
         toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + ")" : ""));
         $("dgBackfill").style.display = "none";
         setTimeout(loadDagRuns, 300);
-      } else { const t = await res.text().catch(() => ""); toast("err", "backfill: " + (t || "HTTP " + res.status)); }
+      } else {
+        // 4xx bodies are the uniform JSON envelope {"error": msg}; keep the
+        // raw-text fallback so an older daemon's plain body still shows
+        const t = await res.text().catch(() => "");
+        let msg = t; try { msg = JSON.parse(t).error || t; } catch (_) {}
+        toast("err", "backfill: " + (msg || "HTTP " + res.status));
+      }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
   }
 
