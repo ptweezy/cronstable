@@ -838,7 +838,27 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
     # so an ``all_done`` mapped task (whose deps verdict is "ready", never
     # "fail"/"skip") does not wedge the run when its source fails/skips.
     if task.expand is not None:
-        src = effective_state(spec, body, task.expand.from_task)
+        from_task = task.expand.from_task
+        in_run = from_task in body.get("tasks", {}) or from_task in body.get(
+            "mapped", {}
+        )
+        if not in_run:
+            # The expand source has NO entry in this run document, so it was
+            # added (or renamed into existence) by a config reload after the
+            # run was created (run creation materialises every then-current
+            # task).  It is not part of this run's plan and will never produce
+            # an item list, so the fan-out can never be built.  The same
+            # "not materialised" rule that _deps_verdict and _maybe_terminalise
+            # already apply, which this path was missing: effective_state
+            # defaults an absent entry to PENDING, so without this arm the
+            # placeholder waits on a task that will never appear.  Nothing
+            # then reaches a terminal state, so the dagadvance lease is
+            # renewed for the life of the daemon, retention GC can never
+            # collect the run, and every advance pass pays a full document
+            # deepcopy to change nothing.
+            _resolve_unmaterialised_source(task, entry, now, result)
+            return
+        src = effective_state(spec, body, from_task)
         if src in (FAILED, UPSTREAM_FAILED):
             _terminalise_task(entry, UPSTREAM_FAILED, now, result)
             return
@@ -850,6 +870,32 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
         _terminalise_task(entry, UPSTREAM_FAILED, now, result)
     elif verdict == "skip":
         _terminalise_task(entry, SKIPPED, now, result)
+
+
+def _resolve_unmaterialised_source(task, entry, now, result) -> None:
+    """Fail a mapped placeholder whose expand source is not in this run.
+
+    Reached from :func:`_propagate_placeholder` when ``expand.fromTask`` names
+    a task with no entry in the run document: a config reload renamed the
+    source (or added it) after the run was created, and ``validate_graph``
+    accepts that because the NEW spec is internally consistent.  The source
+    will never run in THIS run, so its XCom item list will never exist and the
+    placeholder can never fan out.
+
+    Failed rather than skipped, and with a reason, for the same purpose
+    :func:`_resolve_stale_placeholder` fails its case: the task genuinely
+    cannot run under this run's plan, an operator wants to see why, and a
+    silent skip would let the run report success for work that never
+    happened.  Terminalising it lets the run finish, release its lease and be
+    pruned; the next run, created wholly under the new spec, expands cleanly.
+    """
+    entry["failReason"] = (
+        "expand source {!r} has no entry in this run: it was added or "
+        "renamed by a config reload after the run was created, so its item "
+        "list can never exist and this task cannot fan out (the next run "
+        "expands normally)".format(task.expand.from_task)
+    )
+    _terminalise_task(entry, FAILED, now, result)
 
 
 def _resolve_stale_placeholder(task, entry, now, result) -> None:

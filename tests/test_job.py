@@ -145,6 +145,92 @@ jobs:
 
 
 @pytest.mark.asyncio
+async def test_stream_reader_reassembles_a_run_spanning_many_reads(
+    monkeypatch,
+):
+    # The bytes after the last newline are carried between reads. They used to
+    # be carried as one bytes object rebuilt with `tail + chunk` per read,
+    # which is quadratic; they are now carried as the list of chunks and
+    # joined once, when a newline finally terminates them. Same line out.
+    # The tiny read chunk is what forces the carry: at the real 64 KiB the
+    # whole fixture would arrive in a single read and never exercise it.
+    monkeypatch.setattr(cronstable.job, "_READ_CHUNK", 8)
+    fake = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader(
+        "j", "other", fake, "", 10, max_line_length=1 << 20
+    )
+    body = "".join("chunk{}-".format(i) for i in range(200))
+    fake.feed_data(body.encode("utf-8"))
+    fake.feed_data(b"\ntrailer\n")
+    fake.feed_eof()
+    output, discarded = await reader.join()
+    assert output == body + "\ntrailer\n"
+    assert discarded == 0
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_decodes_utf8_split_across_reads(monkeypatch):
+    # only complete lines are decoded and a multi-byte code point straddling a
+    # read boundary rides in the carried tail, so it must still decode intact
+    # now that the tail is a list of pieces rather than one buffer.
+    monkeypatch.setattr(cronstable.job, "_READ_CHUNK", 2)
+    fake = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader("j", "other", fake, "", 10)
+    fake.feed_data("start☃end\n".encode("utf-8"))
+    fake.feed_eof()
+    output, _ = await reader.join()
+    assert output == "start☃end\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_drops_an_unterminated_over_cap_run(monkeypatch):
+    # An unterminated run past the cap is dropped as it accumulates (the cap
+    # is now measured on the running length, so the pieces are never joined
+    # into one over-cap buffer), and whatever follows reads as a normal line.
+    monkeypatch.setattr(cronstable.job, "_READ_CHUNK", 16)
+    fake = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader(
+        "j", "other", fake, "", 10, max_line_length=100
+    )
+    fake.feed_data(b"before\n")
+    fake.feed_data(b"x" * 3200)  # never terminated, way past the cap
+    fake.feed_data(b"\nafter\n")
+    fake.feed_eof()
+    output, _ = await reader.join()
+    assert "before\n" in output
+    assert "after\n" in output
+    assert "x" * 101 not in output
+
+
+@pytest.mark.asyncio
+async def test_stream_reader_unterminated_run_is_not_quadratic():
+    # A job emitting a long unterminated line (a progress bar, a binary blob,
+    # a stuck writer) is read on the EVENT LOOP thread, so the accumulation
+    # cost is scheduler latency for the whole daemon. Rebuilding the tail per
+    # read made it quadratic: at the 16 MiB maxLineLength default and a 64 KiB
+    # read chunk that is ~256 growing memcpys, measured at 10.1s of pure copy
+    # for one line. Carrying the pieces and joining once measured 11ms.
+    #
+    # A wall-clock bound rather than a count because the invariant genuinely
+    # IS bytes copied. The margin makes it a safe gate rather than a flaky
+    # one: the fixed path finishes ~50x inside this bound, and the quadratic
+    # one misses it by ~10x, so nothing short of a real regression can trip
+    # it.
+    fake = asyncio.StreamReader()
+    reader = cronstable.job.StreamReader(
+        "j", "other", fake, "", 10, max_line_length=32 * 1024 * 1024
+    )
+    started = time.monotonic()
+    fake.feed_data(b"x" * (16 * 1024 * 1024))
+    fake.feed_data(b"\n")
+    fake.feed_eof()
+    output, _ = await reader.join()
+    elapsed = time.monotonic() - started
+    assert len(output) == 16 * 1024 * 1024 + 1
+    assert elapsed < 2.0, "unterminated tail took {:.2f}s".format(elapsed)
+
+
+@pytest.mark.asyncio
 async def test_job_output_stream_subscribe_then_publish():
     out = cronstable.job.JobOutputStream()
     queue = out.subscribe()

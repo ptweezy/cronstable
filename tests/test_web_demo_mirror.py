@@ -75,6 +75,60 @@ def test_demo_is_the_dashboard_plus_only_its_fake_backend():
     )
 
 
+def test_no_streamed_log_pane_measures_the_buffer_per_line():
+    """No SSE line-append path reads scroll geometry or grows textContent.
+
+    Reading ``scrollHeight``/``clientHeight`` in an append path forces a
+    synchronous layout of the whole buffered block, and ``textContent +=``
+    rebuilds it, so each costs O(buffer) per line: 2.5 ms per line at the
+    5000-line cap, i.e. seconds of frozen main thread to fill a pane.  The
+    job log pane was fixed for exactly this (see ``followBottom``), and the
+    DAG task-log pane then reintroduced both, uncapped, by bypassing the
+    shared infrastructure entirely, which is what makes this a guard on
+    the SHAPE rather than on one call site.
+    """
+    web = _read(WEB)
+    # the three streamed panes and the helper each one's `line` hook must
+    # reach. Everything else in the page (a bulk-action progress box, a
+    # status note) is bounded by a user action, not by a job's output rate.
+    for opener, helper in (
+        ("startDagTaskLog", "appendDagLogLine"),
+        ("startStream", "appendLine"),
+        ("tailConnect", "appendTailLine"),
+    ):
+        body = re.search(
+            r"function %s\(.*?\n  \}\n" % opener, web, re.DOTALL
+        )
+        assert body, "%s() not found in %s" % (opener, WEB)
+        body = body.group(0)
+        assert helper in body, (
+            "%s() no longer appends through %s(), the path that bounds the "
+            "pane at MAX_LOG_LINES and follows without a forced layout"
+            % (opener, helper)
+        )
+        for banned, why in (
+            (
+                "textContent +=",
+                "append a node instead of rebuilding the whole buffer",
+            ),
+            (
+                "clientHeight",
+                "reading scroll geometry here forces a synchronous layout of "
+                "the whole buffer; followBottom() keeps the follow bit from a "
+                "passive scroll listener instead",
+            ),
+        ):
+            assert banned not in body, (
+                "%s() reintroduced `%s`: %s" % (opener, banned, why)
+            )
+    # and the DAG helper itself still applies the cap and the shared follow
+    assert re.search(
+        r"function appendDagLogLine\(.*?MAX_LOG_LINES.*?followBottom\(",
+        web,
+        re.DOTALL,
+    ), "appendDagLogLine no longer bounds the pane / follows the shared way"
+
+
 def test_demo_mirror_has_no_crlf():
     # A Windows editor or a Python open(..., "w") without newline="" rewrites
     # the whole file CRLF, which shows up as a several-thousand-line diff and

@@ -109,6 +109,73 @@ project, on which cronstable is based.
   finds it uncorrected, and the same three files parse in 0.4 s, 1.4 s and
   2.8 s. Startup, `--validate-config`, `--job-set-id` and every config
   reload pay the lower cost.
+- A peer that gossips an empty node name can no longer stand the whole
+  cluster down. The empty string passed every validation the peer payload
+  applies (it is printable and well under the length cap) yet sorts below
+  every real name, so one buggy or hostile peer made every node that saw
+  it elect `''` as leader. No node matched that name, every `Leader` job
+  stopped firing cluster-wide, and `/cluster` still reported the cluster
+  quorate and conflict-free. Empty names are now rejected where the peer
+  payload is parsed, and all three places that fold peer names into the
+  election spell the guard the same way.
+- The `quorate_vouched` set a node advertises on `/peer` is capped, like
+  the `@reboot` ran-set beside it. It is the one re-advertised set built
+  entirely from absorbed peer data, so an inflated upstream peer could
+  walk a healthy node's own response past the size cap that honest peers
+  enforce, and they would then record it as an oversized failure and drop
+  it from their quorum. The list is sorted before it is capped, so every
+  node keeps the same prefix and the lowest names, which is what the
+  election reads. As a backstop, a response that exceeds the cap anyway
+  now sheds its observability-only job summaries rather than shipping a
+  body peers will reject.
+- `GET /metrics` is compressed for scrapers that accept gzip, which
+  Prometheus always does. Exposition text is the same metric names and
+  label blocks repeated once per job, so it compresses about 17x: at
+  10,000 jobs a 22.0 MB scrape becomes 1.32 MB for roughly 7 ms of CPU.
+  It was the largest recurring payload the daemon served and the only
+  large one going out uncompressed.
+- `GET /metrics` and `GET /fleet` share one built response across the
+  clients that ask for it within a second, the way `GET /jobs` already
+  did. Several scrapers landing together used to each rebuild the whole
+  metric universe on the event loop, and every open dashboard tab paid a
+  full fleet merge, which is O(nodes x jobs). `/fleet` also gained the
+  ETag and gzip its sibling poll endpoints had; a local change (a run, a
+  launch, a pause, a reload) still busts all three memos so it renders on
+  the very next poll.
+- A DAG task renamed while a run is in flight no longer wedges that run
+  forever. If the renamed task was the one a mapped task fans out from,
+  the run document held an entry under the old name and none under the
+  new one, and the mapped placeholder waited on a task that would never
+  appear. The run never reached a terminal state, so it renewed its
+  advance lease for the life of the daemon, retention never collected it,
+  and every advance pass copied the whole document to change nothing. The
+  placeholder now fails with a reason naming the missing source, which is
+  the rule the dependency and completion checks already applied.
+- A job that emits a very long line without a newline (a progress bar, a
+  binary blob, a stuck writer) no longer stalls the scheduler. The bytes
+  carried between reads were rebuilt on every read, which is quadratic:
+  at the 16 MiB `maxLineLength` default that measured 10.1 s of pure
+  copying on the event loop for one line. The pieces are now carried and
+  joined once, measured at 11 ms, and the length cap is applied without
+  ever assembling the over-long line.
+- Housekeeping is back to at most once per wall-clock minute on
+  deployments that run DAGs. The gate looked only at whether a cron job
+  fires at second granularity, but the DAG orchestrator also shortens the
+  loop's sleep, so a config with DAGs and no second-level job re-ran the
+  whole config reload, cluster, web, push, state and SLA block on every
+  DAG wake.
+- The DAG task log pane in the dashboard is bounded and no longer slows
+  down as it fills. It appended by rebuilding the whole buffer and
+  measured the buffer's height once per line, both of which cost more the
+  more lines were showing, and unlike the job log pane it had no line
+  cap at all. It now uses the same append path as the job log.
+- Container images build their dependency layers from `pyproject.toml`
+  alone, with the source tree copied only at the end, so a commit that
+  touches only source reuses the cached dependency layers instead of
+  recompiling every dependency for every distro and architecture. Release
+  builds deliberately miss that cache so a release still resolves every
+  dependency fresh. The build context also drops the documentation,
+  wiki, benchmark and packaging trees it never read, about 48 MB.
 
 ## 1.2.37
 
