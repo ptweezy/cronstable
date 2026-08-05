@@ -91,6 +91,7 @@ from cronstable.job import (
     NotifyEventContext,
     RunningJob,
     SlaBreachContext,
+    close_webhook_pool,
     report_config_enabled,
     report_event,
     report_hostname,
@@ -2443,6 +2444,12 @@ class Cron:
         # otherwise reclaimed only when the loop is garbage collected, which
         # emits a ResourceWarning on teardown. Safe to call more than once.
         statsd.close_endpoints()
+        # Same for the pooled webhook connections: dropped rather than
+        # closed, they leave aiohttp logging "Unclosed connector" on the way
+        # out. Safe here because the reports themselves went out during
+        # _drain_completions above, so by now the pool holds only sockets
+        # idling out their keepalive.
+        await close_webhook_pool()
 
     def _cancel_coordination_tasks(self) -> None:
         """Cancel the Replace pursuits, retry claim scan and pause refresh.
@@ -11094,60 +11101,118 @@ class Cron:
         live run) is skipped; live local instances outrank the ledger; and
         a recorded pid that still exists is left alone: a daemon crash
         does not kill the job processes it spawned.
+
+        Reads run :data:`_REHYDRATE_CONCURRENCY` jobs at a time, the same
+        bounded worker pool as the history warm-up before it and the retry
+        re-arm after it, and for the same reason: this pass sits on the boot
+        path between them, so one strictly sequential read per job made boot
+        delay scale with job count.  The pool is safe here because every
+        per-job step is independent: the read touches only that job's own
+        in-flight stream, and the reconciliation it may trigger is
+        synchronous (:meth:`_reconcile_open_record`, no await inside) and
+        writes only that job's own keys, so no two workers can interleave on
+        one stream or on shared scheduler state.  Per-job write ORDER is
+        preserved too: the ``closed`` record still goes through
+        :meth:`_queue_inflight_write`, whose tail chain is per job.  The pool
+        does change the order in which DIFFERENT jobs are reconciled, which
+        nothing downstream depends on.
         """
         backend = self.state_backend
         if backend is None:
             return
-        for name, job in list(self.cron_jobs.items()):
-            if self.running_jobs.get(name):
-                continue
-            try:
-                recs = await asyncio.wait_for(
-                    backend.list_records(
-                        self._inflight_stream(name),
-                        limit=1,
-                        newest_first=True,
-                    ),
-                    timeout=STATE_OP_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "state: in-flight reconciliation timed out reading %s; "
-                    "skipping the rest (store unhealthy?)",
-                    name,
-                )
-                break
-            except asyncio.CancelledError:
-                raise
-            except Exception as ex:  # noqa: BLE001 - degrade, never crash
-                logger.warning(
-                    "state: cannot read the in-flight record of %s: %s",
-                    name,
-                    ex,
-                )
-                continue
-            rec = recs[0] if recs else None
-            if rec is None or rec.get("kind") != "open":
-                continue
-            if rec.get("host") != self._state_host:
-                continue  # another node's business (see the slot takeover)
-            if rec.get("proc") == self._proc_token:
-                continue  # our own live run; the backend was just rebuilt
-            pid = rec.get("pid")
-            if (
-                isinstance(pid, int)
-                and not isinstance(pid, bool)
-                and platform.pid_alive(pid)
-            ):
-                logger.warning(
-                    "Job %s: the previous daemon's run (pid %d) still "
-                    "appears to be running; leaving its in-flight record "
-                    "open",
-                    name,
-                    pid,
-                )
-                continue
-            self._reconcile_open_record(name, job, rec, "reconciled-crash")
+        # A small worker pool over one shared item iterator, not a task per
+        # job: the same idiom (and the same reasoning) as the two scans that
+        # bracket this one. next() on the shared iterator is synchronous, so
+        # the workers partition the items race-free and every job is drawn
+        # exactly once, while a task per job would only materialise
+        # coroutines that queue on the store's 16-slot bulk lane anyway.
+        items = iter(list(self.cron_jobs.items()))
+        aborted = False
+
+        async def _reconcile_worker() -> None:
+            nonlocal aborted
+            for name, job in items:
+                if aborted:
+                    break
+                outcome = await self._reconcile_one_inflight(name, job)
+                if outcome == "timeout":
+                    # a store that cannot serve one read in STATE_OP_TIMEOUT
+                    # is unhealthy (hung mount): abandon the rest of the pass
+                    # rather than stalling boot for jobs x timeout. The
+                    # unreconciled runs are picked up by the next restart
+                    # that finds a healthy store. Guarded so the warning is
+                    # logged once for the pass, not once per worker that
+                    # happened to be mid-read when the mount went away.
+                    if not aborted:
+                        aborted = True
+                        logger.warning(
+                            "state: in-flight reconciliation timed out "
+                            "reading %s; skipping the rest (store "
+                            "unhealthy?)",
+                            name,
+                        )
+                    break
+
+        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
+        await asyncio.gather(*(_reconcile_worker() for _ in range(workers)))
+
+    async def _reconcile_one_inflight(
+        self, name: str, job: JobConfig
+    ) -> Optional[str]:
+        """One job's step of the boot reconciliation scan (see the caller).
+
+        Returns ``"timeout"`` when the in-flight read timed out, which tells
+        the scan's worker pool to abandon the rest of the pass; ``None`` in
+        every other case, reconciled and skipped alike.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        if self.running_jobs.get(name):
+            return None
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._inflight_stream(name),
+                    limit=1,
+                    newest_first=True,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return "timeout"
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: cannot read the in-flight record of %s: %s",
+                name,
+                ex,
+            )
+            return None
+        rec = recs[0] if recs else None
+        if rec is None or rec.get("kind") != "open":
+            return None
+        if rec.get("host") != self._state_host:
+            return None  # another node's business (see the slot takeover)
+        if rec.get("proc") == self._proc_token:
+            return None  # our own live run; the backend was just rebuilt
+        pid = rec.get("pid")
+        if (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and platform.pid_alive(pid)
+        ):
+            logger.warning(
+                "Job %s: the previous daemon's run (pid %d) still "
+                "appears to be running; leaving its in-flight record "
+                "open",
+                name,
+                pid,
+            )
+            return None
+        self._reconcile_open_record(name, job, rec, "reconciled-crash")
+        return None
 
     async def _reconcile_takeover_inflight(self, job: JobConfig) -> None:
         """On a fresh slot win, close a foreign holder's orphaned run.

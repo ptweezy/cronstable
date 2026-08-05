@@ -12,6 +12,11 @@ demo-only note that follows it about the inlined logo engine, and the blank
 line at the injection point that the block consumes.  Anything else is drift.
 Pure text comparison, so unlike ``test_web_engine_parity`` this runs
 everywhere, including CI.
+
+The file also holds the page's other copy-and-shape guards, the ones that
+want the same "read the HTML and assert on its text" machinery: the streamed
+log panes, the in-flight guard every secondary poll must carry, and the logo
+engine's two other verbatim copies out on the docs site.
 """
 
 import difflib
@@ -21,6 +26,10 @@ import re
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(ROOT, "cronstable", "web", "index.html")
 DEMO = os.path.join(ROOT, "docs", "demo", "index.html")
+# the two docs-site pages that inline the same logo engine (see
+# test_logo_engine_is_identical_in_all_four_copies)
+LAB = os.path.join(ROOT, "docs", "logo-lab.html")
+COMPARISON = os.path.join(ROOT, "docs", "comparison.html")
 
 # The injected block, matched by its script id (kept stable for exactly this
 # reason, cf. the banner comments test_web_engine_parity slices on), plus the
@@ -32,6 +41,13 @@ _DEMO_BLOCK = re.compile(
     re.DOTALL,
 )
 _TITLE = re.compile(r"<title>.*?</title>", re.DOTALL)
+
+# The logo engine block, from its banner comment to the close of the script
+# tag that holds it.  Both ends are stable by construction: the banner is the
+# first thing inside the tag on all four pages, and the engine always owns a
+# script tag of its own (the page-specific mounting code lives in a later
+# one), so the first `</script>` at column zero after the banner ends it.
+_ENGINE = re.compile(r"/\* =+\n \*  logo engine.*?\n</script>", re.DOTALL)
 
 
 def _read(path):
@@ -127,6 +143,104 @@ def test_no_streamed_log_pane_measures_the_buffer_per_line():
         web,
         re.DOTALL,
     ), "appendDagLogLine no longer bounds the pane / follows the shared way"
+
+
+def test_every_secondary_poll_loader_holds_an_in_flight_guard():
+    """No secondary poll can launch a second request over its own first.
+
+    Every one of these is fired without awaiting, from the jobs poll
+    (loadJobs) or from the cluster poll, so a daemon slower than the poll
+    interval used to add one more overlapping request per cycle against the
+    browser's ~6-per-origin connection cap, which the held SSE tails already
+    lean on.  The per-loader sequence numbers only order the APPLY; they never
+    stopped the launch.  /fleet was the loader the earlier guard sweep missed,
+    which is what makes this a guard on the whole set rather than on one call
+    site.
+    """
+    web = _read(WEB)
+    loaders = {
+        "loadCluster": "cluster",
+        "loadNode": "node",
+        "loadDags": "dags",
+        "loadState": "state",
+        "loadFleet": "fleet",
+    }
+    decl = re.search(r"const secondaryInFlight = \{(.*?)\};", web)
+    assert decl, "the secondaryInFlight registry is gone from %s" % WEB
+    keys = set(re.findall(r"(\w+): false", decl.group(1)))
+    assert keys == set(loaders.values()), (
+        "secondaryInFlight declares %s but this test knows %s. A new "
+        "secondary poll endpoint belongs in the loaders map above, with "
+        "its guard."
+        % (sorted(keys), sorted(loaders.values()))
+    )
+    for fn, key in loaders.items():
+        body = re.search(
+            r"async function %s\(.*?\n  \}\n" % fn, web, re.DOTALL
+        )
+        assert body, "%s() not found in %s" % (fn, WEB)
+        body = body.group(0)
+        assert "if (secondaryInFlight.%s) return;" % key in body, (
+            "%s() no longer skips the cycle while its predecessor is still "
+            "pending; overlapping requests stack up against the browser's "
+            "per-origin connection cap" % fn
+        )
+        assert "secondaryInFlight.%s = true;" % key in body, (
+            "%s() no longer claims its in-flight slot" % fn
+        )
+        # released from a finally, never from the happy path alone: an early
+        # return or a throw would otherwise wedge the slot true and the
+        # endpoint would never be polled again for the life of the page.
+        assert re.search(
+            r"finally\s*\{[^}]*secondaryInFlight\.%s = false;" % key, body
+        ), (
+            "%s() must clear its in-flight slot in a finally block, or one "
+            "failed request stops the endpoint from ever polling again" % fn
+        )
+
+
+def test_logo_engine_is_identical_in_all_four_copies():
+    """The pendulum logo engine is one implementation living in four files.
+
+    The dashboard owns it; the demo mirror, the logo lab and the comparison
+    page each inline a verbatim copy because GitHub Pages serves them with no
+    build step to share a file.  Only the web/demo pair had a drift guard, so
+    a fix applied to three of the four could sit unnoticed on the docs site
+    for as long as nobody happened to diff them.  The check is byte equality,
+    since each copy is pasted in wholesale.
+    """
+    blocks = {}
+    for path in (WEB, DEMO, LAB, COMPARISON):
+        found = _ENGINE.findall(_read(path))
+        assert len(found) == 1, (
+            "expected exactly one logo engine block in %s, found %d. If the "
+            "banner comment or the engine's own <script> tag changed, "
+            "update _ENGINE; it is the anchor this check slices on."
+            % (path, len(found))
+        )
+        blocks[path] = found[0]
+
+    canonical = blocks[WEB]
+    for path, block in blocks.items():
+        if block == canonical:
+            continue
+        diff = [
+            line
+            for line in difflib.unified_diff(
+                canonical.splitlines(keepends=True),
+                block.splitlines(keepends=True),
+                WEB,
+                path,
+                n=0,
+            )
+            if line[:1] in "+-" and line[:3] not in ("+++", "---")
+        ]
+        raise AssertionError(
+            "the logo engine in %s has drifted from the dashboard's copy in "
+            "%s. Re-copy the block wholesale into every page that inlines it "
+            "(%s, %s, %s). Differences:\n%s"
+            % (path, WEB, DEMO, LAB, COMPARISON, "".join(diff[:40]))
+        )
 
 
 def test_demo_mirror_has_no_crlf():

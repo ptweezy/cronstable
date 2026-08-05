@@ -141,6 +141,9 @@ dev = [
     "orjson>=3.9; python_version < '3.15' and (platform_machine != 'ARM64' or sys_platform != 'win32')",
     "pynacl>=1.5",
     "zeroconf>=0.132",
+    # drives a real Chromium for the client/daemon cron-engine differential;
+    # requirements_dev.txt explains the marker and the separate browser step.
+    "playwright; platform_machine != 'ARM64' or sys_platform != 'win32'",
     # security linter; bandit[toml] reads [tool.bandit] from pyproject.toml.
     "bandit[toml]",
     "mypy",

@@ -32,6 +32,7 @@ config.interp_2k
 config.jobconfig_3k
 config.parse_crontab_1k
 config.parse_yaml_300
+config.parse_yaml_3k
 config.reload_gc_100k
 config.reload_warm_50
 config.reload_warm_include_50

@@ -385,7 +385,12 @@ HEALTH_COLOR = {
 #: Heatmap bucket precedence. "skipped" seeds the bucket and ranks below
 #: "ok": an hour that only ever held slots back for a pause must not shade
 #: green, but one real success in it outranks any number of holds.  An
-#: empty bucket paints a blank shade, so its seed never shows.
+#: empty bucket paints a blank shade, so its seed never shows.  One rank
+#: per key :func:`outcome_key` can return, test-enforced
+#: (tests/test_tui.py): the heatmap paint loop subscripts this map bare,
+#: so a key it had never heard of cost a ``KeyError`` every frame, the
+#: whole dashboard rather than one mis-shaded cell.  Parsing clamps such a
+#: key to "unknown" first (:meth:`AppOverlays._heat_runs`).
 HEAT_RANK = {
     "skipped": 0,
     "ok": 1,
@@ -6111,6 +6116,20 @@ class AppOverlays(AppRender):
         ``.timestamp()`` per run per frame.  The cache is keyed on the run
         list object ``_load_heat`` swaps in, so it is exactly as large as
         the payload it mirrors and cannot outlive it.
+
+        The clamp to :data:`HEAT_RANK`'s vocabulary lives here rather than
+        at the two bare subscripts that read the key (``render_heat``'s
+        precedence compare and its ``OUTCOME_COLOR`` lookup): this parse
+        runs once per payload, that loop once per run per row per frame.
+        A key neither map knows can only turn up when someone grows
+        :data:`OUTCOME_KEY` an arm and misses a downstream map, and in the
+        loop that miss is a ``KeyError`` every frame; one cell in the wrong
+        shade is the cheaper failure, so an unheard-of key lands in
+        "unknown", which every downstream map already carries.  The clamp
+        is a fallback, not the guard: a parity test (tests/test_tui.py)
+        fails the build the moment HEAT_RANK drifts from what
+        ``outcome_key`` can return, so nobody has to find the drift by
+        spotting a grey cell.
         """
         runs = self.heat_data.get(name) or []
         cached = self._heat_parsed.get(name)
@@ -6128,9 +6147,8 @@ class AppOverlays(AppRender):
         for run in runs:
             epoch = parse_iso(run.get("finished_at"))
             if epoch is not None:
-                parsed.append(
-                    (epoch, outcome_key(str(run.get("outcome", ""))))
-                )
+                key = outcome_key(str(run.get("outcome", "")))
+                parsed.append((epoch, key if key in HEAT_RANK else "unknown"))
         self._heat_parsed[name] = (runs, parsed)
         return parsed
 

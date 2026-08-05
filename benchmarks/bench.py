@@ -677,6 +677,46 @@ def bench_parse_yaml():
     return time.perf_counter() - t0
 
 
+# The complexity tripwire for the YAML parse, and the reason a second size of
+# the same call is worth its CI minutes.  strictyaml's vendored
+# CommentedSeq.__deepcopy__ ran copy_attributes INSIDE its element loop, which
+# made every Seq validation quadratic in the number of jobs; the whole bill
+# lands on the one big sequence a config has, jobs:.  Measured on the
+# developer machine, 3k jobs: 6.27s with the slip, 1.18s with the call hoisted
+# (config._patch_strictyaml_seq_deepcopy).  At the 300 jobs parse_yaml_300
+# uses, the same slip is only 0.161s against 0.117s, a 38% bulge any loaded
+# runner can argue with, so the metric that was supposed to be watching this
+# call had almost no signal: 5.3x here against 1.4x there.  Sizes below
+# roughly 3k stay in the regime where the linear term dominates and hide it.
+#
+# repeats=1 in full mode, the only benchmark in the suite that measures once,
+# because the BASELINE side of the CI pairing runs the RELEASED parser and so
+# still pays the quadratic cost until a fixed release is the baseline.  Per
+# round per side the harness pays one untimed warm-up plus the repeats: a
+# round costs 14.8s on the quadratic side and 2.3s here, so across the 5
+# in-process rounds this metric is roughly 3 CI minutes for one release cycle
+# and under a minute after that.  Measuring once loses nothing the gate uses:
+# compare.py's noise band is round-to-round scatter (_rel_cov reads
+# round_values, one value per round) and its reported figure is the
+# best-of-rounds minimum, so the 5 CI rounds already supply both; the repeats
+# only sharpen a single round's own estimate.
+@bench(
+    "config.parse_yaml_3k",
+    "config",
+    detail="parse_config_string, 3k-job YAML (parse-complexity tripwire)",
+    repeats=(1, 1, 1),
+)
+def bench_parse_yaml_3k():
+    try:
+        from cronstable.config import parse_config_string
+    except ImportError as exc:
+        raise Skip("parse_config_string unavailable: %r" % exc) from None
+    text = fixture("yaml_3k", lambda: _config_yaml(_n(3000)))
+    t0 = time.perf_counter()
+    parse_config_string(text, "")
+    return time.perf_counter() - t0
+
+
 @bench(
     "config.jobconfig_3k",
     "config",
@@ -1293,7 +1333,9 @@ def bench_schedule_due_pass():
     _spawn_due_jobs walks the ENTIRE cron_jobs dict per pass to preserve
     config order, and cold_build/reseed never construct a Cron at all.  The
     100k jobs are injected straight into cron_jobs/_next_fire/_fire_heap (a
-    100k-job YAML parse costs tens of seconds and is config.py's business).
+    100k-job YAML parse costs tens of seconds even now that it is linear, and
+    parsing is config.py's business: config.parse_yaml_300 and
+    config.parse_yaml_3k gate it at sizes CI can afford).
 
     Two corrections this spec was vetted into: the pass instants sit NINE
     seconds past each minute boundary -- CATCHUP_LIMIT is 10s, and anything

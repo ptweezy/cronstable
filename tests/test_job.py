@@ -779,6 +779,9 @@ class _WebhookServer:
                 "method": request.method,
                 "headers": dict(request.headers),
                 "body": await request.text(),
+                # the client's (host, port): identical across two requests
+                # only if the second rode the first one's connection.
+                "peer": request.transport.get_extra_info("peername"),
             }
         )
         return web.Response(status=self.status, text="a response body")
@@ -1191,6 +1194,162 @@ async def test_report_webhook_custom_method_and_body():
     assert request["body"] == "job test: rc=123"
 
 
+@pytest.mark.asyncio
+async def test_webhook_reports_share_one_pooled_connection():
+    # Every report used to build its own ClientSession and pay a fresh TCP
+    # connect (and, over https, a fresh TLS handshake) on the reaper, the one
+    # loop that handles every job's completion. The sessions are still
+    # per-report; the CONNECTOR under them is shared per event loop, so the
+    # second report rides the first one's connection. Two reporter instances
+    # on purpose: the pool belongs to the loop, not to a reporter, so the
+    # SlaBreach/notify fan-outs share it with the job reports.
+    server = _WebhookServer()
+    try:
+        async with server as url:
+            conf = cronstable.config.parse_config_string(
+                _webhook_job_config(f"            value: {url}"), ""
+            )
+            job_config = conf.jobs[0]
+            job = _webhook_job(job_config)
+            for _ in range(2):
+                await cronstable.job.WebhookReporter().report(
+                    False, job, job_config.onFailure["report"]
+                )
+        first, second = server.requests
+        assert first["peer"] == second["peer"]
+    finally:
+        await cronstable.job.close_webhook_pool()
+
+
+def test_a_dead_loops_webhook_pool_is_swept_on_the_next_report():
+    # The pool is keyed weakly, but the key cannot expire: aiohttp's connector
+    # stores the loop it was built on, so the value pins its own key. A loop
+    # that reported and never called close_webhook_pool therefore kept a live
+    # connector, and its idle sockets, for the life of the process: one per
+    # reporting test in a suite that builds a loop per test, each of them an
+    # "Unclosed connector" line at exit. The next report clears them.
+    async def _open():
+        return cronstable.job._webhook_connector()
+
+    dead_loop = asyncio.new_event_loop()
+    stale = dead_loop.run_until_complete(_open())
+    dead_loop.close()
+    assert not stale.closed  # nothing has reclaimed it yet
+
+    live_loop = asyncio.new_event_loop()
+    try:
+        live = live_loop.run_until_complete(_open())
+        assert stale.closed
+        assert dead_loop not in cronstable.job._WEBHOOK_CONNECTORS
+        assert live is not stale
+    finally:
+        live_loop.run_until_complete(cronstable.job.close_webhook_pool())
+        live_loop.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_pool_does_not_cap_reports_in_flight():
+    # aiohttp's TCPConnector defaults to limit=100 connections. That default
+    # was harmless while every report built its own connector (a cap of one,
+    # applied to a pool of one), but a single loop-wide pool turns it into a
+    # daemon-wide ceiling on concurrent webhook reports across every job and
+    # every receiver. The wait for a slot happens INSIDE each report's own
+    # ClientTimeout, so a fleet-wide burst of completions at :00 would start
+    # timing reports out on connection acquisition, and one job with a long
+    # webhook.timeout could hold a slot while short-timeout reports expired
+    # behind it. The pooled connector is built with the cap off.
+    server = _WebhookServer()
+    try:
+        async with server as url:
+            conf = cronstable.config.parse_config_string(
+                _webhook_job_config(f"            value: {url}"), ""
+            )
+            job_config = conf.jobs[0]
+            job = _webhook_job(job_config)
+            await cronstable.job.WebhookReporter().report(
+                False, job, job_config.onFailure["report"]
+            )
+        loop = asyncio.get_running_loop()
+        assert cronstable.job._WEBHOOK_CONNECTORS[loop].limit == 0
+    finally:
+        await cronstable.job.close_webhook_pool()
+
+
+@pytest.mark.asyncio
+async def test_close_webhook_pool_releases_the_connections():
+    # The pool outlives a report, so something has to close it at daemon
+    # shutdown or aiohttp logs "Unclosed connector" on teardown (the same
+    # reason cronstable.statsd grew close_endpoints). Closing must also leave
+    # the reporter usable: a report arriving after the pool was closed (a
+    # late alert during shutdown) opens a fresh one rather than failing on a
+    # dead connector.
+    loop = asyncio.get_running_loop()
+    server = _WebhookServer()
+    try:
+        async with server as url:
+            conf = cronstable.config.parse_config_string(
+                _webhook_job_config(f"            value: {url}"), ""
+            )
+            job_config = conf.jobs[0]
+            job = _webhook_job(job_config)
+            reporter = cronstable.job.WebhookReporter()
+            await reporter.report(False, job, job_config.onFailure["report"])
+            pooled = cronstable.job._WEBHOOK_CONNECTORS[loop]
+            assert not pooled.closed
+
+            await cronstable.job.close_webhook_pool()
+            assert pooled.closed
+            assert loop not in cronstable.job._WEBHOOK_CONNECTORS
+            # idempotent, and safe with no pool at all
+            await cronstable.job.close_webhook_pool()
+
+            await reporter.report(False, job, job_config.onFailure["report"])
+            assert cronstable.job._WEBHOOK_CONNECTORS[loop] is not pooled
+        assert len(server.requests) == 2
+    finally:
+        await cronstable.job.close_webhook_pool()
+
+
+def test_template_vars_key_sets_stay_in_step():
+    # Three classes hand-build the reporting contract: the job run, the SLA
+    # breach and the notify event. The key set has to be the same in all
+    # three, or a template written for onFailure stops rendering the same way
+    # on onLate and on a notify: event, and that drift is invisible at
+    # runtime, since jinja renders a missing name as empty rather than
+    # raising. STANDARD_TEMPLATE_VARS names the shared keys once and this
+    # binds all three to it; the per-context tests below still spell their
+    # key sets out in full, which keeps the constant itself honest (dropping
+    # a key from the constant AND from every context would otherwise go
+    # unnoticed).
+    standard = set(cronstable.job.STANDARD_TEMPLATE_VARS)
+    conf = cronstable.config.parse_config_string(_SLA_PLAIN_JOB, "")
+    job_config = conf.jobs[0]
+
+    job = cronstable.job.RunningJob(job_config, None)
+    assert set(job.template_vars) == standard
+
+    breach = _breach_ctx(job_config)
+    assert set(breach.template_vars) == standard | {
+        "sla_check",
+        "threshold_seconds",
+        "observed_seconds",
+        "last_success_at",
+    }
+
+    event = cronstable.job.NotifyEventContext(
+        event="dagFailed",
+        success=False,
+        name="etl",
+        subject="DAG etl failed",
+        message="task extract failed",
+    )
+    assert set(event.template_vars) == standard | {
+        "event",
+        "subject",
+        "message",
+    }
+
+
 @pytest.mark.parametrize(
     "shell, command, expected_type, expected_args",
     [
@@ -1279,6 +1438,39 @@ jobs:
     assert kwargs["env"]["FOO"] == "bar"
     assert run_type == expected_type
     assert args == expected_args
+
+
+@pytest.mark.asyncio
+async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
+    # The pipe's `limit` is asyncio's flow-control watermark, not a line cap:
+    # asyncio pauses the child once twice that much output sits unread. It
+    # used to be maxLineLength because the reader called readuntil, which
+    # enforced the line cap against the stream's own limit; the chunked
+    # reader enforces the cap itself, so at the 16 MiB default the watermark
+    # was letting a chatty job park up to 32 MiB per stream in the daemon's
+    # RSS. It is pinned to the read chunk now, and the cap rides on the
+    # readers, which is where it is applied.
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print(out="hi"))
+        + """
+    schedule: "* * * * *"
+    captureStdout: true
+    captureStderr: true
+    maxLineLength: 4194304
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    try:
+        assert job.proc.stdout._limit == cronstable.job._READ_CHUNK
+        assert job.proc.stderr._limit == cronstable.job._READ_CHUNK
+        assert job._stdout_reader.max_line_length == 4194304
+        assert job._stderr_reader.max_line_length == 4194304
+    finally:
+        await job.wait()
+    assert job.stdout == "hi\n"
 
 
 @pytest.mark.asyncio

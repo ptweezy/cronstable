@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import datetime
 import json
 import logging
@@ -20,6 +21,7 @@ from cronstable.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    PeerState,
     _aged_job_summaries,
     _hrw_owner,
     _hrw_owner_bytes,
@@ -2688,6 +2690,86 @@ def test_policy_divergent_node_not_bridge_confirmed(no_tls):
         mgr.view.peers[h].mutual_agreeing |= {"node-a"}
     assert "node-a" in mgr._bridge_candidates()
     assert mgr.leader_name() == "node-a"
+
+
+# One row per peer-declared coordination field, as
+# {PeerState attribute: (aligned-value, diverging-value, detector)}.
+# The two callables take the manager because "aligned" means "whatever this
+# node declares" and every field derives that differently. `detector` is the
+# operator-facing method that must NAME the divergence.
+#
+# Adding a `declared_*` field to PeerState without adding a row here fails
+# test_declared_fields_gate_both_agreement_and_conflict on purpose: a field
+# missing from this table could be wired into one half of the divergence gate
+# only, with nothing to catch it (see cluster._declares_divergent).
+_DIVERGENCE_FIELD_CASES = {
+    "declared_size": (
+        lambda mgr: mgr.cluster_size(),
+        lambda mgr: mgr.cluster_size() + 1,
+        "conflicting_sizes",
+    ),
+    "declared_distribution": (
+        lambda mgr: mgr.distribution,
+        lambda mgr: "spread" if mgr.distribution != "spread" else "hrw",
+        "conflicting_policies",
+    ),
+    "declared_elect_leader": (
+        lambda mgr: bool(mgr.config.get("electLeader")),
+        lambda mgr: not bool(mgr.config.get("electLeader")),
+        "conflicting_policies",
+    ),
+}
+
+
+def test_declared_fields_gate_both_agreement_and_conflict(no_tls):
+    # Drift guard over the divergence gate's two halves, which are ONE safety
+    # invariant spelled in three methods. For every coordination field a peer
+    # declares, a divergent declaration must BOTH
+    #   * drop the peer from _agreeing_peers (so we neither count it toward
+    #     quorum nor gossip it as a node we vouch for, which is what stops a
+    #     third node that reaches it only across a bridge from confirming it
+    #     quorate and coordinating across a node running by other rules), and
+    #   * be named by conflicting_sizes / conflicting_policies (so the Leader
+    #     gate fails closed here and the operator sees why).
+    # Wiring a field into one half only reintroduces a split-brain: detected
+    # but still vouched for is the bridge-confirm hole; excluded but not
+    # detected is a silent stand-down with nothing on the dashboard. The
+    # per-field behaviour is covered by the two tests above; this one fences
+    # the SETS, so a fourth declared field cannot land on one side alone.
+    gated = {
+        f.name
+        for f in dataclasses.fields(PeerState)
+        if f.name.startswith("declared_")
+    }
+    cases = _DIVERGENCE_FIELD_CASES
+    assert gated == set(cases)
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
+    # the exclude set _agreeing_peers iterates must be exactly those fields
+    probe = ClusterManager(cfg, lambda: "v1:mine")
+    assert set(probe._our_declarations()) == gated
+    hosts = {"b:1": "node-b", "c:1": "node-c", "d:1": "node-d"}
+    for field, (_aligned, diverging, detector) in cases.items():
+        # a fresh manager per field: N=4, quorum 3, every peer agreed and
+        # declaring exactly what we declare.
+        mgr = ClusterManager(cfg, lambda: "v1:mine")
+        for host, name in hosts.items():
+            _seed_agree(mgr, host, name)
+            for other, (aligned, _d, _det) in cases.items():
+                setattr(mgr.view.peers[host], other, aligned(mgr))
+        assert mgr._agreeing_peer_names() == ["node-b", "node-c", "node-d"]
+        assert mgr.has_conflict() is False
+        # now diverge node-b on this one field
+        setattr(mgr.view.peers["b:1"], field, diverging(mgr))
+        assert mgr._agreeing_peer_names() == ["node-c", "node-d"], field
+        assert mgr.has_conflict() is True, field
+        named = {
+            "conflicting_sizes": mgr.conflicting_sizes(),
+            "conflicting_policies": mgr.conflicting_policies(),
+        }
+        assert named.pop(detector), field
+        # and only that detector fires, so a field cannot be reported twice
+        # under two different names in the view.
+        assert not any(named.values()), field
 
 
 @pytest.mark.asyncio

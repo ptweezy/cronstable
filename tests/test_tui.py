@@ -1852,6 +1852,28 @@ def test_health_colors_cover_the_health_vocabulary():
     assert source.count('"disabled": "off"') == 1
 
 
+def test_heat_rank_covers_the_outcome_key_vocabulary():
+    """HEAT_RANK was the one outcome map with no parity guard, and the
+    heatmap reads it with a bare subscript once per run per row per frame.
+    Grow ``outcome_key`` an arm, miss this map, and only the clamp in
+    ``_heat_runs`` stands between that and a ``KeyError`` every repaint,
+    which is the whole dashboard gone rather than one cell in the wrong
+    shade. Pin the ladder to the vocabulary its producer can emit, so the
+    drift lands on this test instead."""
+    vocabulary = set(tui.OUTCOME_KEY.values()) | {"ok"}
+    assert set(tui.HEAT_RANK) == vocabulary
+    # the two orderings the ladder exists for: an hour that only ever held
+    # slots back for a pause must not shade like a success, and a failure
+    # outranks everything else in its bucket
+    assert tui.HEAT_RANK["skipped"] < tui.HEAT_RANK["ok"]
+    assert tui.HEAT_RANK["fail"] == max(tui.HEAT_RANK.values())
+    # ties would make the worst outcome in a bucket depend on run order
+    assert len(set(tui.HEAT_RANK.values())) == len(tui.HEAT_RANK)
+    # the winning key goes straight into OUTCOME_COLOR, so the two maps
+    # have to speak the same vocabulary or the crash just moves one line
+    assert set(tui.HEAT_RANK) == set(tui.OUTCOME_COLOR)
+
+
 def test_dag_state_colors_cover_dag_vocabulary_and_match_web():
     """DAG_STATE_COLOR is the explicit port of the web's ``dstVar``. The
     old spelling-guess ladder handled six strings the engine never emits
@@ -2905,6 +2927,23 @@ def test_render_heat_future_run_lands_in_newest_bucket(tmp_path):
     assert "activity heatmap" in body
     # both runs share the newest bucket: one cell at volume 2
     assert "▒" in body and "░" not in body
+
+
+def test_render_heat_survives_an_outcome_key_the_ladder_lacks(
+    tmp_path, monkeypatch
+):
+    # if an outcome key HEAT_RANK never learned does ship, the heatmap
+    # paints it in the "unknown" ink rather than raising KeyError once a
+    # frame and taking the dashboard down with it; the parity test above
+    # fails the build on that drift, this covers the drift escaping anyway
+    monkeypatch.setitem(tui.OUTCOME_KEY, "smote", "smote")
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.heat_data = {"j": [{"outcome": "smote", "finished_at": _iso_ago(60)}]}
+    body = _txt(app.render_heat(paint, 110, 30))
+    assert "activity heatmap" in body
+    assert "░" in body  # the cell rendered, at volume 1
+    assert [key for _, key in app._heat_runs("j")] == ["unknown"]
 
 
 def test_render_press_full_grid(tmp_path):

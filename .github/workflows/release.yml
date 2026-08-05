@@ -333,6 +333,26 @@ jobs:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
       - run: pip install tox tox-uv
+      # requirements_dev.txt installs the playwright LIBRARY into the tox env,
+      # but pip cannot fetch a browser, and without one the client/daemon cron
+      # engine differential (tests/test_web_engine_parity.py) self-skips, which
+      # is why it used to run nowhere at all: the dashboard ships a SECOND
+      # implementation of the schedule dialect, and nothing compared it against
+      # the daemon's outside a dev machine where someone had run
+      # `playwright install`.
+      #
+      # Only this cell: the download is ~150 MB and the differential is
+      # platform-independent (it replays the same golden corpus through the
+      # same two engines), so a second OS or Python row buys no signal and
+      # costs a browser fetch per row. The other cells keep self-skipping.
+      # Install with the version requirements_dev.txt pins, so the build the
+      # tox env looks for is the one in the shared ms-playwright cache.
+      - name: Install Chromium for the web engine differential
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        run: |
+          set -euo pipefail
+          pip install "$(grep -E '^playwright' requirements_dev.txt)"
+          python -m playwright install --with-deps chromium
       - run: tox -e py
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
       # flag into one combined number. fail_ci_if_error stays false so a Codecov
