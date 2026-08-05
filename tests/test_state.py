@@ -2675,6 +2675,70 @@ async def test_gc_sweeps_orphan_document_lock_only_when_doc_absent(
     assert not os.path.exists(dead_lock)
 
 
+async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
+    # A ttl>0 idempotency claim used to leave its .doc behind forever after
+    # expiry (the documented per-event key pattern mints one per event, so
+    # a busy dedupe scope grew its flat namespace without bound). The GC
+    # must sweep exactly the claims whose expiry lapsed a whole grace ago:
+    # permanent claims (no expiresAt), still-live TTLs, and every other
+    # docs/ namespace stay untouched.
+    from cronstable import jobstate
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "permanent")
+        await jobstate.idempotency_claim(backend, "scope", "lapsed", ttl=5.0)
+        await jobstate.idempotency_claim(
+            backend, "scope", "alive", ttl=999999.0
+        )
+        # a KV doc in a non-idem namespace, as the never-swept control
+        await jobstate.kv_set(backend, "scope", "keep", {"v": 1})
+
+        grace = 3600.0
+        future = time.time() + 4000.0  # "lapsed" expired ~4000s ago > grace
+        monkeypatch.setattr(state, "_now", lambda: future)
+
+        dry = backend._gc_sync({"runs/": set()}, grace, (), True)
+        assert dry["idem_docs_removed"] == 1
+        ns_dir = backend._doc_dir("idem/scope")
+        assert (
+            len([n for n in os.listdir(ns_dir) if n.endswith(".doc")]) == 3
+        )  # dry run deleted nothing
+
+        gc = backend._gc_sync({"runs/": set()}, grace, (), False)
+        assert gc["idem_docs_removed"] == 1
+        docs = sorted(
+            n for n in os.listdir(ns_dir) if n.endswith(".doc")
+        )
+        assert docs == ["alive.doc", "permanent.doc"]
+        # the survivors still dedupe, and the KV control is untouched
+        again = await jobstate.idempotency_claim(
+            backend, "scope", "permanent"
+        )
+        assert again["fresh"] is False
+        kept = await jobstate.kv_get(backend, "scope", "keep")
+        assert kept is not None and kept["value"] == {"v": 1}
+        # a second pass finds nothing left to sweep
+        assert (
+            backend._gc_sync({"runs/": set()}, grace, (), False)[
+                "idem_docs_removed"
+            ]
+            == 0
+        )
+    finally:
+        await backend.stop()
+
+
+def test_idem_prefix_mirror_stays_in_sync():
+    # state cannot import jobstate (layering), so the GC recognises the
+    # idempotency namespaces by a mirrored prefix constant; this pin is
+    # what makes the mirror safe.
+    from cronstable import jobstate
+
+    assert state._IDEM_DOC_NS_PREFIX == jobstate.IDEM_NS_PREFIX
+
+
 async def test_gc_sweeps_bare_lease_lock_idle_past_grace(tmp_path):
     # A bare lease .lock with no .lease sibling (a lost post-release unlink)
     # is reclaimed once idle past the grace; a fresh bare lock and a lock with

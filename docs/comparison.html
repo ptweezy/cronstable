@@ -1191,7 +1191,13 @@ $ cronstable mcp <span class="k">--check</span>
   };
 
   // ---- dynamics: M(q) qdd = b, solved 2x2 per evaluation ----
-  function deriv(p, s, a) {
+  // derivInto writes into a caller-owned vector. A planning frame runs 8960
+  // rk4 steps and each one used to allocate eight fresh 6-element arrays, so
+  // the integrator alone churned ~4 M arrays/second during a recovery; the
+  // scratch buffers below cut that to one per step (the returned state, which
+  // callers keep). Every operation is the same double arithmetic in the same
+  // order, so the trajectory is bit-identical.
+  function derivInto(p, s, a, out) {
     const xd = s[1], th1 = s[2], w1 = s[3], th2 = s[4], w2 = s[5];
     const s1 = Math.sin(th1), c1 = Math.cos(th1);
     const s2 = Math.sin(th2), c2 = Math.cos(th2);
@@ -1205,17 +1211,28 @@ $ cronstable mcp <span class="k">--check</span>
     const b1 = -p.m2 * p.L1 * p.L2 * w2 * w2 * sD + p.g * M * p.L1 * s1 - M * p.L1 * c1 * a + Q1;
     const b2 = p.m2 * p.L1 * p.L2 * w1 * w1 * sD + p.g * p.m2 * p.L2 * s2 - p.m2 * p.L2 * c2 * a + Q2;
     const det = M11 * M22 - M12 * M12;
-    return [xd, a, w1, (M22 * b1 - M12 * b2) / det, w2, (M11 * b2 - M12 * b1) / det];
+    out[0] = xd; out[1] = a; out[2] = w1;
+    out[3] = (M22 * b1 - M12 * b2) / det;
+    out[4] = w2;
+    out[5] = (M11 * b2 - M12 * b1) / det;
+    return out;
   }
+  // allocating twin, for the handful of linearization probes in computeLQR
+  const deriv = (p, s, a) => derivInto(p, s, a, new Array(6));
+  const _k1 = new Float64Array(6), _k2 = new Float64Array(6);
+  const _k3 = new Float64Array(6), _k4 = new Float64Array(6);
+  const _sMid = new Float64Array(6);
   function rk4(p, s, a, dt) {
-    const k1 = deriv(p, s, a);
-    const s2 = s.map((v, i) => v + 0.5 * dt * k1[i]);
-    const k2 = deriv(p, s2, a);
-    const s3 = s.map((v, i) => v + 0.5 * dt * k2[i]);
-    const k3 = deriv(p, s3, a);
-    const s4 = s.map((v, i) => v + dt * k3[i]);
-    const k4 = deriv(p, s4, a);
-    return s.map((v, i) => v + (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+    derivInto(p, s, a, _k1);
+    for (let i = 0; i < 6; i++) _sMid[i] = s[i] + 0.5 * dt * _k1[i];
+    derivInto(p, _sMid, a, _k2);
+    for (let i = 0; i < 6; i++) _sMid[i] = s[i] + 0.5 * dt * _k2[i];
+    derivInto(p, _sMid, a, _k3);
+    for (let i = 0; i < 6; i++) _sMid[i] = s[i] + dt * _k3[i];
+    derivInto(p, _sMid, a, _k4);
+    const out = new Array(6);
+    for (let i = 0; i < 6; i++) out[i] = s[i] + (dt / 6) * (_k1[i] + 2 * _k2[i] + 2 * _k3[i] + _k4[i]);
+    return out;
   }
   // pendulum energy in the cart frame; upright = eUp
   function energy(p, s) {
@@ -1298,6 +1315,37 @@ $ cronstable mcp <span class="k">--check</span>
     return { K, P };
   }
 
+  // computeLQR reads exactly the seven dynamics parameters deriv reads, and
+  // takes ~6500 iterations of 6x6 matrix algebra (~30 ms, measured) to reach
+  // them. Every mount of the shipped wordmark has the same physics, so that
+  // was ~30 ms of blocking script on the critical path to first paint for an
+  // answer that never changes: the default DP's gains are seeded below, and
+  // any other parameter set is solved once and kept (docs/logo-lab.html and
+  // docs/comparison.html build several sims from one set).
+  //
+  // Keyed on the exact parameter string, so editing DP misses the seed and
+  // falls back to the solver instead of flying stale gains. K and P are read
+  // only after construction (_lqrAccel, _vCost), so sims can share them.
+  const lqrKey = (p) => [p.g, p.L1, p.L2, p.m1, p.m2, p.d1, p.d2].join("|");
+  const LQR_CACHE = new Map([["9.81|0.34|0.26|0.14|0.09|0.005|0.002", {
+    K: [5.556371740320117, 11.397213225555143, -274.7382625940304,
+        -8.892561917718053, 357.79380628190506, 43.699138936449486],
+    P: [
+      [4102.394061876565, 3403.3068673379175, -5126.758442369487, 1039.3114482356623, 16980.81586321461, 2372.023278149255],
+      [3403.3068673379175, 5770.684968269181, -11355.417120138944, 1719.9502990877688, 32280.640406622548, 4466.22709047167],
+      [-5126.758442369487, -11355.417120138944, 194942.64902431052, 1897.4647951004993, -293403.1021144789, -36614.65971869856],
+      [1039.3114482356623, 1719.9502990877688, 1897.4647951004993, 769.2702917944772, 3450.5683239105483, 598.9046117665653],
+      [16980.81586321461, 32280.640406622548, -293403.1021144789, 3450.5683239105483, 529535.3713706646, 66204.51980950462],
+      [2372.023278149255, 4466.22709047167, -36614.65971869856, 598.9046117665653, 66204.51980950462, 8461.20622167257],
+    ],
+  }]]);
+  function lqrGains(p) {
+    const key = lqrKey(p);
+    let hit = LQR_CACHE.get(key);
+    if (!hit) { hit = computeLQR(p); LQR_CACHE.set(key, hit); }
+    return hit;
+  }
+
   // ---- simulator + supervisor: balance -> limp -> swing -> balance ----
   class PendulumSim {
     constructor(params, opts) {
@@ -1316,7 +1364,7 @@ $ cronstable mcp <span class="k">--check</span>
       this.xMin = this.p.trackMin != null ? this.p.trackMin : -this.p.trackHalf;
       this.xMax = this.p.trackMax != null ? this.p.trackMax : this.p.trackHalf;
       this.rand = mulberry32(this.opts.seed);
-      const lq = computeLQR(this.p);
+      const lq = lqrGains(this.p);
       this.K = lq.K; this.P = lq.P;
       this.s = [0, 0, 0, 0, 0, 0];
       this.mode = "balance";
@@ -1537,7 +1585,29 @@ $ cronstable mcp <span class="k">--check</span>
       const inRegion = this.connected &&
         E > EUP * 0.75 && E < EUP * 1.9 && Math.abs(z2) < 1.35 && Math.abs(this.s[3]) < 7;
       if (!inRegion) { this.plan = null; this.cem = null; return; }
-      this._cemFrame();
+      // one anytime-CEM iteration per frame, frame-budgeted: when the last
+      // pass ran long (a weak machine, a throttled tab), the next frame
+      // executes the standing plan instead of planning again. The
+      // (mean, sigma) warm start and the planAge bookkeeping carry across
+      // the gap untouched (the next pass shifts the mean by the WHOLE
+      // executed amount), so a skipped frame costs one slightly stale
+      // plan, never phase; the rollout-verified catch gate below still
+      // runs every frame either way. opts.planBudgetMs: 0 disables the
+      // budget, because it is the one place wall-clock feeds back into
+      // the trajectory; a deterministic rig (the README loop capture, a
+      // seeded MC) must pin it off or identical seeds can diverge on a
+      // loaded machine. Validated by MC: forced alternate-frame planning
+      // still caught and held 24/24 knockover seeds.
+      const planBudget =
+        this.opts.planBudgetMs === undefined ? 5 : this.opts.planBudgetMs;
+      if (this._planDebt) {
+        this._planDebt = false;
+      } else {
+        const planT0 = performance.now();
+        this._cemFrame();
+        this._planDebt =
+          planBudget > 0 && performance.now() - planT0 > planBudget;
+      }
       if (this.t - this.lastVerify > VERIFY_COOLDOWN && this._vCost(this.s) < ENGAGE_GATE) {
         this.lastVerify = this.t;
         if (this._tryCatch()) this._toMode("balance");

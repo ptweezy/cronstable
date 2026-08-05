@@ -191,6 +191,31 @@ MAX_CATCHUP_OCCURRENCES = 100
 # In-memory only (like the rest of the run record), and bounded so a frequently
 # scheduled job cannot grow memory without limit.
 RUN_HISTORY_LIMIT = 50
+
+#: Concurrent per-job store reads in the boot warm-up
+#: (:meth:`Cron._rehydrate_from_state` and its retry re-arm scan).  The
+#: warm-up used to read every job's streams strictly one at a time, so boot
+#: paid jobs x per-read latency before the first scheduling pass: seconds
+#: on local disk at fleet scale, minutes on a network mount, none of it
+#: needed for scheduling correctness (the dashboard fills in as jobs run).
+#: Matched to the filesystem store's bulk worker lane (16 slots), where
+#: more in-flight reads would only queue; a hung mount now costs about one
+#: STATE_OP_TIMEOUT of boot delay instead of one per job.
+_REHYDRATE_CONCURRENCY = 16
+
+#: Subprocess spawns allowed to execute at once when a slot launches many
+#: jobs together (see the ``_spawn_gate`` acquire around
+#: ``RunningJob.start()``).  A spawn's fork/exec and pipe-transport setup
+#: are synchronous work ON the event loop; gathering N due jobs queues all
+#: N spawn steps into one ready-queue burst, so at 500 same-slot jobs the
+#: loop ran ~0.25-1s of contiguous spawn syscalls each minute boundary
+#: while web requests, SSE writes and gossip waited (and a loaded box
+#: could trip the CATCHUP_LIMIT resume path).  The gate does not slow the
+#: burst down (the syscalls were always loop-serial); it caps how much of
+#: it runs per loop iteration so other ready callbacks interleave.  Held
+#: only across ``start()`` itself, never across a launch's slot claims or
+#: a Replace teardown, which can legally take seconds.
+_SPAWN_BURST_LIMIT = 16
 # First page size the onlyIfLastSucceeded gate reads from the durable run
 # ledger (see _depends_on_past_ok). The gate needs only the newest success/
 # failure record, so it probes this many newest records and widens to the
@@ -723,7 +748,11 @@ class JobRunInfo:
     """In-memory summary of a job's most recent finished run (web UI history).
 
     Retains the run's output stream so the UI can replay the last run's logs
-    after the job is no longer running. Never persisted to disk.
+    after the job is no longer running. Never persisted to disk. Only the
+    newest record's stream keeps its ring: when a later run supersedes this
+    one, :meth:`Cron._record_run` releases the ring (see
+    :meth:`cronstable.job.JobOutputStream.release_lines`), and the object
+    stays in ``run_history`` as the summary the history endpoints read.
     """
 
     outcome: str  # "success" | "failure"
@@ -1134,6 +1163,19 @@ def _json_response(
 #: must not stall the scheduling loop.
 _JOBS_SERIALIZE_OFFLOAD_MIN = 200
 
+#: How long one built /jobs response (payload, ETag, body, gzip) is shared
+#: across pollers before it is rebuilt.  Every viewer used to pay the full
+#: per-request build even when nothing changed: a wallboard plus N tabs on
+#: one daemon is N identical builds per poll cycle.  The memo makes that
+#: at most ceil(pollMs / this) builds per cycle however many viewers watch.
+#: Local changes (a run recorded, a launch, a pause, a reload) bust the
+#: memo so they render on the very next poll; the TTL bounds the staleness
+#: of everything else (live resource samples, a fire advancing with no
+#: local bust) to under a second, inside the jitter of the 3s default poll
+#: cadence.  A single viewer polling slower than this never hits the memo,
+#: so the one-tab case behaves exactly as before.
+_JOBS_RESPONSE_TTL = 1.0
+
 #: Config-source count at or above which the once-a-minute stat fingerprint
 #: (:meth:`Cron._config_signature`) is taken on the default executor instead
 #: of inline.  One ``os.stat`` is ~14 us on local disk but 1-2 ms on the
@@ -1221,14 +1263,11 @@ def _gzip_body(body: bytes) -> bytes:
     return packer.compress(body) + packer.flush()
 
 
-def _jobs_conditional_response(
+def _jobs_response_product(
     payload: List[Dict[str, Any]],
     next_fire: Dict[str, datetime.datetime],
-    if_none_match: Optional[str],
-    gzip_ok: bool = False,
-) -> Tuple[str, Optional[bytes], bool]:
-    """The ETag for a ``/jobs`` payload and, unless the client already has
-    it, the serialized body.
+) -> Tuple[str, bytes, Optional[bytes]]:
+    """The full /jobs response product: ETag, body, and gzipped body.
 
     The tag is a strong hash of the payload with each job's volatile
     relative ``scheduled_in`` swapped for its STABLE absolute next-fire
@@ -1255,13 +1294,17 @@ def _jobs_conditional_response(
     answer, unlike the job-set fingerprint and the cluster peer ETag that
     :mod:`cronstable._json`'s stdlib-only rule is written about.
 
-    With ``gzip_ok`` a large body is returned gzipped and the third element
-    of the result says so; the caller sets ``Content-Encoding`` and the
-    mandatory ``Vary``.  The compression rides this call rather than the
-    handler so it lands inside the same executor hop the encode already
-    uses, and zlib releases the GIL.  The body carries no per-request secret
-    (the bearer token is a request header, never a response field), so the
-    BREACH/CRIME class of compression side channel has nothing to leak here.
+    A large body is gzipped too (``None`` for one under the floor: every
+    real browser accepts gzip, so building it once per product beats
+    re-deciding per client).  The compression rides this call rather than
+    the handler so it lands inside the same executor hop the encode
+    already uses, and zlib releases the GIL.  The body carries no
+    per-request secret (the bearer token is a request header, never a
+    response field), so the BREACH/CRIME class of compression side channel
+    has nothing to leak here.  The If-None-Match check lives in the
+    handler, not here: one product is shared across every concurrent
+    poller for :data:`_JOBS_RESPONSE_TTL`, and which validator each of
+    them sent is the one per-request thing about it.
     """
     canonical = [
         {**job, "scheduled_in": next_fire.get(job["name"])} for job in payload
@@ -1277,15 +1320,60 @@ def _jobs_conditional_response(
             "utf-8"
         )
     etag = '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
-    if _etag_matches(if_none_match, etag):
-        return etag, None, False
     try:
         body = _json.dumps_bytes(payload, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
+    if len(body) >= _GZIP_MIN_BYTES:
+        return etag, body, _gzip_body(body)
+    return etag, body, None
+
+
+def _cachable_json_response(
+    payload: Any,
+    *,
+    if_none_match: Optional[str],
+    gzip_ok: bool,
+    headers: Optional[Any] = None,
+    use_etag: bool = True,
+) -> web.Response:
+    """A :func:`_json_response` that can 304 and gzip, for the poll fan-out.
+
+    ``GET /jobs`` grew conditional responses first (see
+    :func:`_jobs_response_product`, which must hash a CANONICAL variant
+    because its payload carries a per-poll relative countdown); this is the
+    plain-shaped sibling for the OTHER polled endpoints, whose serialized
+    body already changes exactly when the displayed data does, so the tag
+    can simply hash the body bytes.  ``use_etag=False`` is for a payload
+    that legitimately changes on every request (``/cluster`` embeds this
+    node's freshly sampled CPU/memory), where a tag would be computed per
+    poll and never match; such a response still negotiates gzip.  ``Vary:
+    Accept-Encoding`` rides every response either way, compressed or not: a
+    shared cache that missed it would hand a gzipped body to a client that
+    cannot read one.  Serialization stays inline: these payloads are tens
+    of KB at the scales the endpoints see (dozens of dags, not thousands of
+    jobs), well under where /jobs' executor hop starts paying for itself.
+    """
+    try:
+        body = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        body = json.dumps(payload, default=str).encode("utf-8")
+    hdrs: Dict[str, str] = dict(headers) if headers else {}
+    hdrs["Vary"] = "Accept-Encoding"
+    if use_etag:
+        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+        hdrs["ETag"] = etag
+        if _etag_matches(if_none_match, etag):
+            return web.Response(status=304, headers=hdrs)
     if gzip_ok and len(body) >= _GZIP_MIN_BYTES:
-        return etag, _gzip_body(body), True
-    return etag, body, False
+        hdrs["Content-Encoding"] = "gzip"
+        body = _gzip_body(body)
+    return web.Response(
+        body=body,
+        status=200,
+        headers=hdrs,
+        content_type="application/json",
+    )
 
 
 def _sse_frame(stream_name: str, line: str) -> bytes:
@@ -1305,12 +1393,6 @@ def _sse_frame(stream_name: str, line: str) -> bytes:
         )
         + b"\n\n"
     )
-
-
-async def _sse_send_line(
-    resp: web.StreamResponse, stream_name: str, line: str
-) -> None:
-    await resp.write(_sse_frame(stream_name, line))
 
 
 def naturaltime(seconds: float) -> str:
@@ -1609,6 +1691,14 @@ class Cron:
         # the update_config() below runs _apply_reload the first time.
         self.last_run = {}  # type: Dict[str, JobRunInfo]
         self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
+        # bounds concurrently-executing subprocess spawns (job and DAG-task
+        # launches share it); see _SPAWN_BURST_LIMIT for the why.
+        self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
+        # the shared GET /jobs product: (loop.time stamp, etag, body, gz).
+        # See _JOBS_RESPONSE_TTL and _bust_jobs_response_cache.
+        self._jobs_response_cache: Optional[
+            Tuple[float, str, bytes, Optional[bytes]]
+        ] = None
         # active runtime pauses by job name (POST /jobs/{name}/pause). The
         # fire path consults ONLY this map (never store I/O there); it is
         # rehydrated from the durable paused/ streams at boot and refreshed
@@ -2488,6 +2578,8 @@ class Cron:
             for name, entry in self._trends_cache.items()
             if name in keep
         }
+        # the job set itself changed: the shared /jobs product is stale
+        self._bust_jobs_response_cache()
         # Pause state survives a job-config edit (deliberately no digest
         # check, unlike retries: the operator paused the NAME, not one
         # definition of it); only a job the reload removed is pruned.
@@ -2681,9 +2773,15 @@ class Cron:
 
     async def _web_get_cluster(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        return _json_response(
+        # no ETag: the payload embeds this node's freshly sampled CPU/memory,
+        # so a tag would churn every poll and 304 would never fire; gzip is
+        # the whole win here (peer summaries compress well).
+        return _cachable_json_response(
             self.cluster_payload(),
+            if_none_match=None,
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
             headers=self.web_config.get("headers", None),
+            use_etag=False,
         )
 
     async def _web_get_fleet(self, request: web.Request) -> web.Response:
@@ -4089,6 +4187,7 @@ class Cron:
             # so the stretch the two windows share is not credited twice.
             self._sla_bank_pause(name, replaced, now)
         self._paused[name] = info
+        self._bust_jobs_response_cache()
         # the job is excused from here on: drop any breach it latched while it
         # was still being evaluated, so the late gauge, the /jobs sla block and
         # the OVERDUE chip clear on this response rather than a minute later.
@@ -4190,6 +4289,7 @@ class Cron:
         for name, info in list(self._paused.items()):
             if info.until <= now:
                 del self._paused[name]
+                self._bust_jobs_response_cache()
                 self._sla_bank_pause(name, info, info.until)
                 self.metrics.job_pause_state(name, False)
                 logger.info(
@@ -4301,6 +4401,7 @@ class Cron:
                     # the old one already held (see _sla_bank_pause).
                     self._sla_bank_pause(name, known, now)
                 self._paused[name] = info
+                self._bust_jobs_response_cache()
                 self.metrics.job_pause_state(name, True)
                 if known is None or known.until != info.until:
                     logger.info(
@@ -5173,51 +5274,63 @@ class Cron:
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        # Build on the loop (it reads live scheduler state), then hash +
-        # serialize off it for a large fleet.  A content-hash ETag lets a
-        # conditional client (or a cache/proxy) 304 an unchanged poll,
-        # skipping the body encode and transfer; the tag is keyed on the
-        # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
-        # put while the countdown ticks and moves the instant a fire lands.
-        payload = self.jobs_payload()
-        # A plain snapshot of the index, NOT a per-job isoformat sweep: the
-        # instants change at most once per job per fire, while this ran once
-        # per job per poll on the loop thread (0.30 ms at 500 jobs). The
-        # canonical dump renders them itself, inside the executor. Snapshotted
-        # rather than passed by reference so the docstring's "free of
-        # scheduler state" promise still holds for the executor branch.
-        next_fire = dict(self._next_fire)
         inm = request.headers.get("If-None-Match")
         gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
-        if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
-            loop = asyncio.get_running_loop()
-            etag, body, packed = await loop.run_in_executor(
-                None,
-                _jobs_conditional_response,
-                payload,
-                next_fire,
-                inm,
-                gzip_ok,
-            )
-        else:
-            etag, body, packed = _jobs_conditional_response(
-                payload, next_fire, inm, gzip_ok
-            )
+        # One product (payload build + ETag + body + gzip) is shared across
+        # every poller for _JOBS_RESPONSE_TTL, busted by the local events
+        # that change the payload (_bust_jobs_response_cache): N dashboard
+        # tabs used to cost N identical builds per poll cycle. Only the
+        # If-None-Match compare and the representation pick are per-request.
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cache = self._jobs_response_cache
+        if cache is None or now - cache[0] >= _JOBS_RESPONSE_TTL:
+            # Build on the loop (it reads live scheduler state), then hash +
+            # serialize off it for a large fleet.  The tag is keyed on the
+            # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
+            # put while the countdown ticks and moves when a fire lands.
+            payload = self.jobs_payload()
+            # A plain snapshot of the index, NOT a per-job isoformat sweep:
+            # the instants change at most once per job per fire. The
+            # canonical dump renders them itself, inside the executor.
+            # Snapshotted rather than passed by reference so the product
+            # stays free of scheduler state in the executor branch.
+            next_fire = dict(self._next_fire)
+            if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+                etag, body, gz = await loop.run_in_executor(
+                    None, _jobs_response_product, payload, next_fire
+                )
+            else:
+                etag, body, gz = _jobs_response_product(payload, next_fire)
+            cache = (now, etag, body, gz)
+            self._jobs_response_cache = cache
+        _mono, etag, body, gz = cache
         headers = self._web_jobs_headers(etag)
         # on EVERY representation, compressed or not: a shared cache that
         # missed this would hand a gzipped body to a client that cannot read
         # one.
         headers["Vary"] = "Accept-Encoding"
-        if body is None:
+        if _etag_matches(inm, etag):
             return web.Response(status=304, headers=headers)
-        if packed:
+        if gzip_ok and gz is not None:
             headers["Content-Encoding"] = "gzip"
+            body = gz
         return web.Response(
             body=body,
             status=200,
             headers=headers,
             content_type="application/json",
         )
+
+    def _bust_jobs_response_cache(self) -> None:
+        """Drop the shared /jobs product so a local change renders now.
+
+        Called from exactly the events that change the payload on THIS
+        node: a run recorded, a launch (the ``running`` flag), a pause set
+        or cleared, and a reload.  Everything else (live resource samples,
+        a fire advancing) ages out within :data:`_JOBS_RESPONSE_TTL`.
+        """
+        self._jobs_response_cache = None
 
     def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
         """The configured web response headers plus the ``/jobs`` ETag."""
@@ -5260,8 +5373,16 @@ class Cron:
         return dags
 
     async def _web_list_dags(self, request: web.Request) -> web.Response:
-        return _json_response(
-            await self.dags_payload(), headers=self._web_headers()
+        # Between run advances this body is byte-stable (static graphs plus
+        # the memoized rollup), and it is the third leg of the dashboard's
+        # per-poll fan-out: the conditional path lets an unchanged poll cost
+        # a 304 instead of re-shipping every dag's task graph, and a changed
+        # one ship gzipped.
+        return _cachable_json_response(
+            await self.dags_payload(),
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=self._web_headers(),
         )
 
     async def _web_dag_runs(self, request: web.Request) -> web.Response:
@@ -5865,7 +5986,8 @@ class Cron:
             )
             if replay:
                 await resp.write(replay)
-            while True:
+            ended = False
+            while not ended:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=15)
                 except asyncio.TimeoutError:
@@ -5874,8 +5996,25 @@ class Cron:
                     continue
                 if item is None:  # end-of-output sentinel
                     break
-                stream_name, line = item
-                await _sse_send_line(resp, stream_name, line)
+                # Drain the burst behind the first line before writing: a
+                # chatty job publishes lines faster than one
+                # wait_for + write round trip each, and per-line delivery
+                # cost one fresh timer task, one frame build and one
+                # transport write PER LINE PER SUBSCRIBER on the scheduler's
+                # loop (a 5k line/s job with two viewers was ~10k coroutine
+                # steps a second). One joined write per drained burst
+                # mirrors the replay path above.
+                frames = [_sse_frame(item[0], item[1])]
+                while True:
+                    try:
+                        nxt = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is None:  # sentinel inside the burst
+                        ended = True
+                        break
+                    frames.append(_sse_frame(nxt[0], nxt[1]))
+                await resp.write(b"".join(frames))
             await resp.write(b"event: end\ndata: {}\n\n")
         except (ConnectionResetError, asyncio.CancelledError):
             # client navigated away / closed the tab: nothing to do
@@ -9865,7 +10004,9 @@ class Cron:
         # id + token and staging its secrets) BEFORE the child launches, so the
         # child's first callback is already authorised. extra_env carries the
         # endpoint URL/token/run-context the job needs to reach it.
-        run_token, extra_env = self._prepare_job_api_run(job, retry_state)
+        run_token, extra_env = await self._prepare_job_api_run(
+            job, retry_state
+        )
         running_job = RunningJob(
             job,
             retry_state,
@@ -9874,7 +10015,10 @@ class Cron:
             run_id=extra_env.get("CRONSTABLE_RUN_ID"),
         )
         try:
-            await running_job.start()
+            # the gate releases before the except arm runs, so cleanup
+            # below never holds a spawn permit.
+            async with self._spawn_gate:
+                await running_job.start()
         except BaseException:
             # start() handles the expected spawn failures itself (the
             # instance still registers, start_failed, and the reaper pairs
@@ -9891,6 +10035,8 @@ class Cron:
             raise
         first_instance = not self.running_jobs.get(job.name)
         self.running_jobs[job.name].append(running_job)
+        # the payload's `running` flag just flipped on this node
+        self._bust_jobs_response_cache()
         # every actual launch (scheduled, manual, catch-up, retry) clears
         # the lateAfter breach condition (see _sla_periodic).
         self._sla_last_start[job.name] = get_now(datetime.timezone.utc)
@@ -9917,24 +10063,14 @@ class Cron:
         """
         return "{}#{}".format(self._state_host, self._proc_token)
 
-    def _prepare_job_api_run(
-        self, job: JobConfig, retry_state: Optional[JobRetryState]
-    ) -> Tuple[Optional[str], Dict[str, str]]:
-        """Register this run with the loopback state API; return its env.
+    def _stage_job_secrets(self, job: JobConfig) -> Dict[str, str]:
+        """Resolve a job's run-scoped ``secrets`` blocks into a fresh map.
 
-        Mints the run id + bearer token, resolves and stages the job's
-        run-scoped ``secrets`` (fresh, in memory), registers the whole
-        :class:`~cronstable.jobapi.RunContext`, and returns
-        ``(token, injected_env)`` so the launcher can hand the env to the child
-        and the reaper can revoke the token by it.  Returns ``(None, {})`` when
-        no job API is running (no ``state`` section, or jobApi disabled), so
-        the classic no-endpoint path is byte-identical.
+        Pure sync (it may open and read ``fromFile`` targets), so the launch
+        path can push it to the default executor when any file read is
+        involved; see :meth:`_prepare_job_api_run`.
         """
-        api = self._job_api
-        if api is None or api.base_url is None:
-            return None, {}
         from cronstable.config import _resolve_secret
-        from cronstable.jobapi import RunContext, run_environment
 
         secrets: Dict[str, str] = {}
         for spec in job.secrets:
@@ -9957,6 +10093,40 @@ class Cron:
                 continue
             if name and value is not None:
                 secrets[name] = value
+        return secrets
+
+    async def _prepare_job_api_run(
+        self, job: JobConfig, retry_state: Optional[JobRetryState]
+    ) -> Tuple[Optional[str], Dict[str, str]]:
+        """Register this run with the loopback state API; return its env.
+
+        Mints the run id + bearer token, resolves and stages the job's
+        run-scoped ``secrets`` (fresh, in memory), registers the whole
+        :class:`~cronstable.jobapi.RunContext`, and returns
+        ``(token, injected_env)`` so the launcher can hand the env to the child
+        and the reaper can revoke the token by it.  Returns ``(None, {})`` when
+        no job API is running (no ``state`` section, or jobApi disabled), so
+        the classic no-endpoint path is byte-identical.
+
+        A job with any ``fromFile`` secret stages them on the default
+        executor: the read runs inside the awaited launch chain, and a
+        Kubernetes secret mount or NFS target that is slow (or hung) would
+        otherwise stall the event loop itself, delaying every same-slot
+        launch, web response and cluster heartbeat with it.  Value/env
+        secrets stay inline, where the thread hop would cost more than the
+        dict they build.
+        """
+        api = self._job_api
+        if api is None or api.base_url is None:
+            return None, {}
+        from cronstable.jobapi import RunContext, run_environment
+
+        if any(spec.get("fromFile") for spec in job.secrets):
+            secrets = await asyncio.get_running_loop().run_in_executor(
+                None, self._stage_job_secrets, job
+            )
+        else:
+            secrets = self._stage_job_secrets(job)
         slot = self._last_run_slot.get(job.name)
         ctx = RunContext(
             token=os.urandom(32).hex(),
@@ -10925,11 +11095,14 @@ class Cron:
     def _record_run(self, name: str, info: JobRunInfo) -> None:
         # the latest finished run (for status/log replay) plus the bounded
         # history (for the dashboard's history/stats view); in-memory only.
+        prev = self.last_run.get(name)
         self.last_run[name] = info
         self.run_history[name].append(info)
         # this run changes the trends aggregate, so drop any cached payload
-        # for the job rather than serve it stale out to the TTL.
+        # for the job rather than serve it stale out to the TTL; same for
+        # the shared /jobs product (last_run and the history slice moved).
         self._trends_cache.pop(name, None)
+        self._bust_jobs_response_cache()
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
         self.metrics.job_run_recorded(
@@ -10962,7 +11135,37 @@ class Cron:
         # background task rather than an await here (this method is sync and on
         # the finished-job path). No-op on the stateless default.
         if self.state_backend is not None:
-            self._track_state_write(self._persist_run_record(name, info))
+            # The archive's line snapshot is taken HERE, synchronously, not
+            # inside the persist task: the task body runs after an arbitrary
+            # store latency, and by then a back-to-back completion (an Allow
+            # concurrency overlap, a sub-minute job outrunning a slow mount)
+            # can have superseded this record and released its ring below.
+            # A list of the ring's line tuples pins exactly the bytes the
+            # archive still needs, for exactly as long as it needs them.
+            job = self.cron_jobs.get(name)
+            archive_lines = (
+                list(info.output.lines)
+                if job is not None and job.archiveOutput
+                else None
+            )
+            self._track_state_write(
+                self._persist_run_record(name, info, archive_lines)
+            )
+        # Release the superseded record's ring buffer. Only the NEWEST
+        # finished run's output is ever replayable (_job_output serves
+        # last_run or a live instance), so the ring `prev` carries became
+        # unreachable the moment `info` replaced it, yet it would sit in
+        # run_history for up to RUN_HISTORY_LIMIT more completions. At the
+        # ring's own bounds that is up to 50x LIVE_LOG_LIMIT retained lines
+        # per job, gigabytes fleet-wide for chatty jobs, all unservable.
+        # The identity guards keep odd construction shapes safe (a re-record
+        # of the same info, or two records sharing one stream).
+        if (
+            prev is not None
+            and prev is not info
+            and prev.output is not info.output
+        ):
+            prev.output.release_lines()
 
     @staticmethod
     def _run_stream(name: str) -> str:
@@ -10993,7 +11196,12 @@ class Cron:
         """The durable stream name for this host's counter snapshots."""
         return COUNTER_STREAM_PREFIX + self._state_host
 
-    async def _persist_run_record(self, name: str, info: JobRunInfo) -> None:
+    async def _persist_run_record(
+        self,
+        name: str,
+        info: JobRunInfo,
+        archive_lines: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
         """Append one finished run to the durable ledger, prune, and archive.
 
         Runs as a background task (see :meth:`_record_run`).  Errors are logged
@@ -11002,7 +11210,13 @@ class Cron:
         as a noisy "task exception was never retrieved".  Pruning right after
         the append bounds the stream where it just grew, avoiding a per-minute
         fleet-wide scan.  When the job opts into ``archiveOutput`` the run's
-        captured output is archived too, in the same task.
+        captured output is archived too, in the same task, from
+        ``archive_lines``: the ring snapshot :meth:`_record_run` took at
+        record time.  The ring itself must not be read here, because the
+        record may have been superseded (and its ring released) while this
+        task waited on the store; ``None`` means the job did not archive at
+        record time, and a reload that flipped ``archiveOutput`` on since
+        then must not archive a ring this run never snapshotted.
         """
         backend = self.state_backend
         if backend is None:  # torn down between scheduling and running
@@ -11025,8 +11239,12 @@ class Cron:
                 timeout=STATE_OP_TIMEOUT,
             )
             job = self.cron_jobs.get(name)
-            if job is not None and job.archiveOutput:
-                await self._archive_output(job, info)
+            if (
+                job is not None
+                and job.archiveOutput
+                and archive_lines is not None
+            ):
+                await self._archive_output(job, info, archive_lines)
         except Exception as ex:  # noqa: BLE001 - fire-and-forget; log, survive
             self.metrics.state_write_dropped("run-record")
             logger.warning(
@@ -11077,15 +11295,24 @@ class Cron:
                 "state: failed to persist the counter snapshot: %s", ex
             )
 
-    async def _archive_output(self, job: JobConfig, info: JobRunInfo) -> None:
+    async def _archive_output(
+        self,
+        job: JobConfig,
+        info: JobRunInfo,
+        raw: List[Tuple[str, str]],
+    ) -> None:
         """Write a finished run's captured output to the durable log store.
 
-        Opt-in per job (``archiveOutput``).  What is archived is the run's
-        live-tail ring buffer: the newest
-        :data:`cronstable.job.LIVE_LOG_LIMIT`
+        Opt-in per job (``archiveOutput``).  What is archived is ``raw``,
+        the record-time snapshot of the run's live-tail ring buffer: the
+        newest :data:`cronstable.job.LIVE_LOG_LIMIT`
         lines (each already bounded by ``maxLineLength``); older lines were
         evicted from the ring before archiving and are accounted for in the
-        record's ``dropped_lines`` rather than silently lost.  A job with
+        record's ``dropped_lines`` rather than silently lost.  The snapshot
+        (not the live ring) is what gets archived because the ring may
+        already have been released by a newer completion of the same job by
+        the time this write runs; ``info.output.published`` is still safe to
+        read late, since nothing publishes to a closed stream.  A job with
         ``saveLimit: 0`` (the operator's explicit "retain no output") archives
         nothing.  The lines are scrubbed of recognisable secrets
         (:func:`cronstable.redact.redact_lines`, which also tracks multi-line
@@ -11101,7 +11328,6 @@ class Cron:
         if job.saveLimit == 0:
             return
         redact = job.redactArchivedSecrets
-        raw = list(info.output.lines)
         if redact:
             # Executor-offloaded: the scrub is pure CPU over job-controlled
             # text (up to LIVE_LOG_LIMIT lines of maxLineLength each), and a
@@ -11239,14 +11465,37 @@ class Cron:
         next runs.  Bypasses :meth:`_record_run` deliberately: rehydration must
         not re-emit Prometheus counters or re-persist what it just read.  A
         poison record is skipped by :func:`_job_run_info_from_dict` (and
-        quarantined by the backend), never fatal to startup.
+        quarantined by the backend), never fatal to startup.  Reads run
+        :data:`_REHYDRATE_CONCURRENCY` jobs at a time: the warm-up sits
+        between backend start and the first scheduling pass, so its wall
+        clock is boot delay, and every per-job read is independent.
         """
         backend = self.state_backend
         if backend is None or self._state_rehydrated:
             return
         self._state_rehydrated = True
-        warmed = 0
-        for name in list(self.cron_jobs):
+        # A small worker pool over one shared name iterator, not a task per
+        # job: the strictly sequential loop this replaces paid jobs x
+        # per-read latency of boot delay, while a task per job would
+        # materialise 100k coroutines on a large crontab only to queue on
+        # the store's 16-slot bulk lane anyway. next() on the shared
+        # iterator is synchronous, so the workers partition the names
+        # race-free, and every per-job mutation below touches only that
+        # job's own keys.
+        names = iter(list(self.cron_jobs))
+        aborted = False
+
+        async def _warm_worker() -> int:
+            nonlocal aborted
+            count = 0
+            for name in names:
+                if aborted:
+                    break
+                count += await _warm_one(name)
+            return count
+
+        async def _warm_one(name: str) -> int:
+            nonlocal aborted
             # a job that already accumulated in-memory history this process
             # (unusual at boot) is left as the live source of truth, but the
             # staleness reference is still seeded from that history, so a job
@@ -11254,7 +11503,7 @@ class Cron:
             # maxTimeSinceSuccess on process start when the store returns.
             if self.run_history.get(name):
                 await self._seed_stale_reference(name, self.run_history[name])
-                continue
+                return 0
             try:
                 recs = await asyncio.wait_for(
                     backend.list_records(
@@ -11269,17 +11518,19 @@ class Cron:
                 # unhealthy (hung mount): abandon the whole warm-up rather
                 # than stalling boot for jobs x timeout. The dashboard fills
                 # in as jobs run, exactly as with no rehydration.
-                logger.warning(
-                    "state: rehydration timed out reading %s; skipping the "
-                    "rest of the warm-up (store unhealthy?)",
-                    name,
-                )
-                break
+                if not aborted:
+                    aborted = True
+                    logger.warning(
+                        "state: rehydration timed out reading %s; skipping "
+                        "the rest of the warm-up (store unhealthy?)",
+                        name,
+                    )
+                return 0
             except OSError as ex:
                 logger.warning(
                     "state: failed to rehydrate history for %s: %s", name, ex
                 )
-                continue
+                return 0
             if self.run_history.get(name):
                 # a run finished while we awaited the read (the await above
                 # yields): the live run is fresher than anything in the
@@ -11288,56 +11539,62 @@ class Cron:
                 # staleness reference is still seeded from that live history
                 # (setdefault, so a fresher live success is never clobbered).
                 await self._seed_stale_reference(name, self.run_history[name])
-                continue
+                return 0
             recs.reverse()  # oldest-first, to match the append order
             for rec in recs:
                 restored = _job_run_info_from_dict(rec)
                 if restored is not None:
                     self.run_history[name].append(restored)
             history = self.run_history.get(name)
-            if history:
-                self.last_run[name] = history[-1]
-                warmed += 1
-                # warm the staleness reference too: with a durable ledger
-                # the maxTimeSinceSuccess check must page from the REAL last
-                # success after a restart, not re-baseline on process start
-                # (that grace is only for stateless boots). Shared with the
-                # two early-continue guards above, so a job with pre-existing
-                # in-memory history is seeded the same way.
-                await self._seed_stale_reference(name, history)
-                # and the onlyIfLastSucceeded memo, for the same reason the
-                # gate keeps one: a pause running across the restart would
-                # otherwise leave the warmed ring full of "skipped" rows
-                # with no real outcome behind them. By finished_at, not by
-                # position (the same unserialized-write hazard as the success
-                # scan above): seeding the last-APPENDED real outcome could
-                # pick an older success over a newer failure and reopen the
-                # very gate this memo exists to hold.
-                reals = [
-                    r
-                    for r in history
-                    if r.outcome in ("success", "failure")
-                    and r.finished_at is not None
-                ]
-                if reals:
-                    newest = max(reals, key=lambda r: r.finished_at)
-                    self._last_real_outcome.setdefault(
-                        name, (newest.finished_at, newest.outcome)
+            if not history:
+                return 0
+            self.last_run[name] = history[-1]
+            # warm the staleness reference too: with a durable ledger
+            # the maxTimeSinceSuccess check must page from the REAL last
+            # success after a restart, not re-baseline on process start
+            # (that grace is only for stateless boots). Shared with the
+            # two early-continue guards above, so a job with pre-existing
+            # in-memory history is seeded the same way.
+            await self._seed_stale_reference(name, history)
+            # and the onlyIfLastSucceeded memo, for the same reason the
+            # gate keeps one: a pause running across the restart would
+            # otherwise leave the warmed ring full of "skipped" rows
+            # with no real outcome behind them. By finished_at, not by
+            # position (the same unserialized-write hazard as the success
+            # scan above): seeding the last-APPENDED real outcome could
+            # pick an older success over a newer failure and reopen the
+            # very gate this memo exists to hold.
+            reals = [
+                r
+                for r in history
+                if r.outcome in ("success", "failure")
+                and r.finished_at is not None
+            ]
+            if reals:
+                newest = max(reals, key=lambda r: r.finished_at)
+                self._last_real_outcome.setdefault(
+                    name, (newest.finished_at, newest.outcome)
+                )
+            # and the retry ladder's supersede watermark: last_run is
+            # history[-1], which a pause running across the restart
+            # makes a "skipped" row with a fresh finished_at. Reading
+            # the ladder's guard off that row would settle every
+            # pending retry the pause is merely holding.
+            for restored in reversed(history):
+                if (
+                    restored.outcome != "skipped"
+                    and restored.finished_at is not None
+                ):
+                    self._last_completed_at.setdefault(
+                        name, restored.finished_at
                     )
-                # and the retry ladder's supersede watermark: last_run is
-                # history[-1], which a pause running across the restart
-                # makes a "skipped" row with a fresh finished_at. Reading
-                # the ladder's guard off that row would settle every
-                # pending retry the pause is merely holding.
-                for restored in reversed(history):
-                    if (
-                        restored.outcome != "skipped"
-                        and restored.finished_at is not None
-                    ):
-                        self._last_completed_at.setdefault(
-                            name, restored.finished_at
-                        )
-                        break
+                    break
+            return 1
+
+        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
+        warmed = sum(
+            await asyncio.gather(*(_warm_worker() for _ in range(workers)))
+        )
         if warmed:
             logger.info(
                 "state: rehydrated run history for %d job(s) from the ledger",
@@ -11439,110 +11696,144 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        for name, job in list(self.cron_jobs.items()):
-            if name in self.retry_state or self.running_jobs.get(name):
-                # live activity always outranks the ledger
-                continue
+        # the same bounded worker pool as the history warm-up above, for the
+        # same reason: one read per job, strictly sequential, multiplied
+        # boot latency by job count for a scan whose per-job work is
+        # independent.
+        items = iter(list(self.cron_jobs.items()))
+        aborted = False
+
+        async def _rearm_worker() -> None:
+            nonlocal aborted
+            for name, job in items:
+                if aborted:
+                    break
+                outcome = await self._rearm_pending_retry(name, job)
+                if outcome == "timeout":
+                    if not aborted:
+                        aborted = True
+                        logger.warning(
+                            "state: retry re-arm timed out reading %s; "
+                            "skipping the rest (store unhealthy?)",
+                            name,
+                        )
+                    break
+
+        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
+        await asyncio.gather(*(_rearm_worker() for _ in range(workers)))
+
+    async def _rearm_pending_retry(
+        self, name: str, job: JobConfig
+    ) -> Optional[str]:
+        """One job's step of the retry re-arm scan (see the caller above).
+
+        Returns ``"timeout"`` when the ledger read timed out, which tells
+        the scan's worker pool to abandon the rest (a store that cannot
+        serve one read in STATE_OP_TIMEOUT is unhealthy); ``None`` in every
+        other case, re-armed or settled or skipped alike.
+        """
+        backend = self.state_backend
+        if backend is None:
+            return None
+        if name in self.retry_state or self.running_jobs.get(name):
+            # live activity always outranks the ledger
+            return None
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._retry_stream(name), limit=1, newest_first=True
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return "timeout"
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.warning(
+                "state: cannot read pending retries for %s: %s", name, ex
+            )
+            return None
+        if not recs or recs[0].get("kind") != "pending":
+            return None
+        rec = recs[0]
+        rec_host = rec.get("host")
+        if isinstance(rec_host, str) and rec_host != self._state_host:
+            # another node's live ladder (shared store): not ours to
+            # re-arm OR settle. Cross-node retry resume is a later
+            # phase's leased, reconciled affair.
+            return None
+        if name not in self._last_completed_at:
+            # The warmed ring (_rehydrate_from_state, above) is capped at
+            # RUN_HISTORY_LIMIT, so a pause holding at least that many
+            # slots fills every ring entry with "skipped" rows and floods
+            # out the real run that DID resolve this ladder, leaving the
+            # memo unset. The superseded-by-run guard would then read
+            # None and re-arm a ladder a real run already settled, a
+            # double-run this method exists to avoid (and a regression:
+            # pre-memo the skip row's fresh finished_at settled it by
+            # accident). The durable fold is flood-independent
+            # (derive_max over ranAt), so seed the memo from it before the
+            # guard reads it. One extra read, only when a pending record
+            # actually exists, so steady state is unchanged; it mirrors
+            # the deeper-read _warm_last_success_beyond_history sets for
+            # the SLA memo.
             try:
-                recs = await asyncio.wait_for(
-                    backend.list_records(
-                        self._retry_stream(name), limit=1, newest_first=True
-                    ),
+                durable_at = await asyncio.wait_for(
+                    self.durable_last_completed_at(name),
                     timeout=STATE_OP_TIMEOUT,
                 )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "state: retry re-arm timed out reading %s; skipping "
-                    "the rest (store unhealthy?)",
-                    name,
-                )
-                break
             except asyncio.CancelledError:
                 raise
-            except Exception as ex:  # noqa: BLE001 - degrade, never crash
-                logger.warning(
-                    "state: cannot read pending retries for %s: %s", name, ex
+            except Exception:  # noqa: BLE001 - unknown -> guard stays open
+                durable_at = None
+            parsed = (
+                _parse_iso_utc(durable_at)
+                if isinstance(durable_at, str)
+                else None
+            )
+            if parsed is not None:
+                self._last_completed_at[name] = parsed
+        validated = self._validate_pending_retry(name, job, rec)
+        if validated is None:
+            return None
+        attempt, not_before = validated
+        if isinstance(job.schedule, str) and job.schedule == "@reboot":
+            try:
+                covered = await self._reboot_marker_covers(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - unknown -> not covered
+                covered = False
+            if not covered:
+                self._persist_retry_settled(
+                    name, "superseded-by-reboot", attempt
                 )
-                continue
-            if not recs or recs[0].get("kind") != "pending":
-                continue
-            rec = recs[0]
-            rec_host = rec.get("host")
-            if isinstance(rec_host, str) and rec_host != self._state_host:
-                # another node's live ladder (shared store): not ours to
-                # re-arm OR settle. Cross-node retry resume is a later
-                # phase's leased, reconciled affair.
-                continue
-            if name not in self._last_completed_at:
-                # The warmed ring (_rehydrate_from_state, above) is capped at
-                # RUN_HISTORY_LIMIT, so a pause holding at least that many
-                # slots fills every ring entry with "skipped" rows and floods
-                # out the real run that DID resolve this ladder, leaving the
-                # memo unset. The superseded-by-run guard would then read
-                # None and re-arm a ladder a real run already settled, a
-                # double-run this method exists to avoid (and a regression:
-                # pre-memo the skip row's fresh finished_at settled it by
-                # accident). The durable fold is flood-independent
-                # (derive_max over ranAt), so seed the memo from it before the
-                # guard reads it. One extra read, only when a pending record
-                # actually exists, so steady state is unchanged; it mirrors
-                # the deeper-read _warm_last_success_beyond_history sets for
-                # the SLA memo.
-                try:
-                    durable_at = await asyncio.wait_for(
-                        self.durable_last_completed_at(name),
-                        timeout=STATE_OP_TIMEOUT,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - unknown -> guard stays open
-                    durable_at = None
-                parsed = (
-                    _parse_iso_utc(durable_at)
-                    if isinstance(durable_at, str)
-                    else None
-                )
-                if parsed is not None:
-                    self._last_completed_at[name] = parsed
-            validated = self._validate_pending_retry(name, job, rec)
-            if validated is None:
-                continue
-            attempt, not_before = validated
-            if isinstance(job.schedule, str) and job.schedule == "@reboot":
-                try:
-                    covered = await self._reboot_marker_covers(job)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - unknown -> not covered
-                    covered = False
-                if not covered:
-                    self._persist_retry_settled(
-                        name, "superseded-by-reboot", attempt
-                    )
-                    continue
-            retry = job.onFailure["retry"]
-            state = JobRetryState(
-                retry["initialDelay"],
-                retry["backoffMultiplier"],
-                retry["maximumDelay"],
-            )
-            # replay the ladder to the persisted position: count == attempt,
-            # delay == what the NEXT failure would sleep.
-            for _ in range(attempt):
-                state.next_delay()
-            now = get_now(datetime.timezone.utc)
-            remaining = max(0.0, (not_before - now).total_seconds())
-            self.retry_state[name] = state
-            state.task = asyncio.create_task(
-                self.schedule_retry_job(name, remaining, attempt)
-            )
-            logger.info(
-                "Job %s: re-armed pending retry #%d from the durable "
-                "ledger (due in %.1f seconds)",
-                name,
-                attempt,
-                remaining,
-            )
+                return None
+        retry = job.onFailure["retry"]
+        state = JobRetryState(
+            retry["initialDelay"],
+            retry["backoffMultiplier"],
+            retry["maximumDelay"],
+        )
+        # replay the ladder to the persisted position: count == attempt,
+        # delay == what the NEXT failure would sleep.
+        for _ in range(attempt):
+            state.next_delay()
+        now = get_now(datetime.timezone.utc)
+        remaining = max(0.0, (not_before - now).total_seconds())
+        self.retry_state[name] = state
+        state.task = asyncio.create_task(
+            self.schedule_retry_job(name, remaining, attempt)
+        )
+        logger.info(
+            "Job %s: re-armed pending retry #%d from the durable "
+            "ledger (due in %.1f seconds)",
+            name,
+            attempt,
+            remaining,
+        )
+        return None
 
     def _validate_pending_retry(
         self, name: str, job: JobConfig, rec: Dict[str, Any]

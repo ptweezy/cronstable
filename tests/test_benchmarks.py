@@ -30,6 +30,28 @@ def _run(args, **kwargs):
     )
 
 
+def _expected_gated_names():
+    """The metric ids the release comparison requires, from the one source.
+
+    Same comment-stripping parse as compare.py's _load_expected_gated, so
+    the smoke net and the release integrity check read identical lists.
+    """
+    path = os.path.join(REPO_ROOT, "benchmarks", "expected_gated.txt")
+    names = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                names.append(line)
+    return names
+
+
+def _importable(module):
+    import importlib.util
+
+    return importlib.util.find_spec(module) is not None
+
+
 def test_bench_smoke_produces_results(tmp_path):
     out = tmp_path / "smoke.json"
     proc = _run([BENCH, "--smoke", "--json", str(out)])
@@ -55,54 +77,30 @@ def test_bench_smoke_produces_results(tmp_path):
     for r in ran:
         assert r["value"] >= 0.0
         assert r["unit"] in ("s", "MB", "KB")
-    # The headline metrics must never silently skip -- including the terminal
-    # UI and the branch-win backend metrics (the web UI ones legitimately skip
-    # in smoke, since they would launch a browser).  Every 2026-07 addition
-    # that leans on a private seam is in this net BY REQUIREMENT (see
-    # benchmarks/expected_gated.txt): this test is what catches a drifted
-    # seam in the ordinary test run instead of at release time.  Not listed:
-    # json.roundtrip_orjson_3k (skips wherever the optional orjson is not
-    # installed, e.g. the tox envs) and the webui.* browser metrics.
-    for name in (
-        "startup.version",
-        "schedule.cold_build_100k",
-        "config.parse_yaml_300",
-        "state.append_1k",
-        "state.artifact_list_churn",
-        "state.depends_on_past_gate",
-        "dag.finish_fanin_1k",
-        "dag.list_dags_warm",
-        "tui.log_restyle_5k",
-        # 2026-07 additions, round 1 (bench-additions.md)
-        "loop.stall_jobs_500",
-        "cronexpr.next_dst_2k",
-        "redact.adversarial_10k",
-        "schedule.due_pass_100k",
-        "schedule.lint_250_zoned",
-        "state.lease_renew_200",
-        "state.gc_sweep_2k_streams",
-        "dag.mapped_drain_256",
-        "dag.adopt_scan_500",
-        "dag.advance_quiescent_1k",
-        "cluster.job_owner_2k",
-        "cluster.parse_summaries_6k",
-        "config.reload_warm_50",
-        "config.interp_2k",
-        "prometheus.render_500",
-        "statsd.emit_2k",
-        "webapi.jobs_payload_500",
-        "webapi.auth_scope_20k",
-        "mcp.handle_200",
-        "job.stream_capture_120k",
-        "json.roundtrip_3k",
-        # 2026-07 additions, round 2 (bench-additions-2.md)
-        "state.fanout_gather_100",
-        "state.boot_rehydrate_populated",
-        "state.list_documents_600",
-        "tui.drawer_paint_5k",
-        "webapi.jobs_bytes_500",
-        "schedule.pressure_20k_48h",
-    ):
+    # The gated metrics must never silently skip.  The set is DERIVED from
+    # benchmarks/expected_gated.txt rather than hand-curated: the previous
+    # hand list was missing webapi.sse_frame_20k, so when the branch that
+    # batched SSE delivery deleted the seam it drove, every test stayed
+    # green and the dead gate would first have surfaced as a release-time
+    # integrity failure.  Deriving makes the two nets one list: a metric
+    # the release comparison requires is a metric --smoke must run.
+    # Excused, each for an environment reason the release runner does not
+    # share: the webui.* browser metrics (smoke must not launch Chromium),
+    # the POSIX-only RSS metrics on Windows, push.seal_500 where PyNaCl is
+    # absent (the tox and WSL envs), and json.roundtrip_orjson_3k where
+    # orjson is absent (the tox envs).
+    for name in _expected_gated_names():
+        if name.startswith("webui."):
+            continue
+        if name.startswith("mem.rss_") and os.name == "nt":
+            continue
+        if name == "push.seal_500" and not _importable("nacl"):
+            continue
+        if name == "json.roundtrip_orjson_3k" and not _importable("orjson"):
+            continue
+        assert name in results, (
+            "expected-gated metric %s is not registered" % name
+        )
         assert not results[name]["skipped"], results[name]
 
 

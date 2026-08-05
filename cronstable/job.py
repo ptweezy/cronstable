@@ -1,10 +1,12 @@
 import asyncio
 import asyncio.subprocess
+import atexit
 import html
 import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -161,6 +163,109 @@ KILLED_STREAM_DRAIN_TIMEOUT = 30.0
 MAIL_REPORT_TIMEOUT = 60.0
 
 
+class _MirrorWriter:
+    """The stdout/stderr passthrough's single daemon-wide writer thread.
+
+    Job output mirrored to the daemon's own stdout/stderr used to be
+    written (and flushed) on the event-loop thread.  Batching had already
+    cut it to one write per drained read, but the write itself remained a
+    blocking syscall: with the daemon's pipe full (a stopped
+    ``docker logs``, a Ctrl+S'd console, a dead journald) it parked the
+    loop indefinitely and the whole daemon, scheduling included, froze
+    behind one wedged log consumer.  Now batches queue here and one
+    daemon thread writes them; a wedged consumer wedges only this thread,
+    and the bounded queue sheds the OLDEST batch (counted, warned once)
+    so memory stays flat however long the consumer sleeps.
+
+    One thread for both streams on purpose: it preserves the enqueue
+    order across stdout and stderr, exactly what the inline writes gave.
+    The thread starts lazily on the first mirrored batch, so a daemon
+    with no capturing jobs never creates it, and registers a bounded
+    atexit drain so an orderly shutdown flushes the tail without letting
+    a wedged pipe hold the exit hostage.
+    """
+
+    #: Retained batches (one per drained read) while the consumer stalls.
+    #: At the reader's chunk size a batch is a few KB, so the cap bounds a
+    #: fully wedged consumer to a few MB, not the run's whole output.
+    MAX_PENDING_BATCHES = 512
+
+    def __init__(self) -> None:
+        self._batches: Deque[Tuple[str, str, str]] = deque()
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._thread: Optional[threading.Thread] = None
+        self.dropped_batches = 0
+        self._drop_logged = False
+
+    def submit(self, job_name: str, stream_name: str, text: str) -> None:
+        """Queue one passthrough batch; never blocks, sheds when full."""
+        start = False
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="cronstable-mirror",
+                    daemon=True,
+                )
+                start = True
+            if len(self._batches) >= self.MAX_PENDING_BATCHES:
+                self._batches.popleft()
+                self.dropped_batches += 1
+                if not self._drop_logged:
+                    self._drop_logged = True
+                    logger.warning(
+                        "passthrough mirror is backed up (its consumer is "
+                        "not reading the daemon's output); shedding oldest "
+                        "batches until it drains"
+                    )
+            self._batches.append((job_name, stream_name, text))
+            self._idle.clear()
+            self._wake.set()
+        if start:
+            self._thread.start()
+            # bounded: an orderly exit flushes the tail, a wedged consumer
+            # cannot hold the process open past the timeout.
+            atexit.register(self._idle.wait, 1.0)
+
+    def drain(self, timeout: float) -> bool:
+        """Wait until every queued batch was written (tests, atexit)."""
+        return self._idle.wait(timeout)
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                batch = list(self._batches)
+                self._batches.clear()
+                self._wake.clear()
+            for job_name, stream_name, text in batch:
+                out = sys.stdout if stream_name == "stdout" else sys.stderr
+                try:
+                    StreamReader._emit(out, text)
+                except (OSError, ValueError):
+                    # The daemon's own stdout/stderr is broken or closed (a
+                    # dead pipe consumer). The passthrough copy is
+                    # best-effort; the capture buffers and live-tail publish
+                    # are unaffected, so log per batch and keep going.
+                    logger.warning(
+                        "job %s: could not mirror %s to the daemon's own "
+                        "stream",
+                        job_name,
+                        stream_name,
+                        exc_info=True,
+                    )
+            with self._lock:
+                if not self._batches:
+                    self._idle.set()
+
+
+#: The one mirror writer for the process; see :class:`_MirrorWriter`.
+_MIRROR = _MirrorWriter()
+
+
 class JobOutputStream:
     """In-memory, broadcastable view of a job run's captured output.
 
@@ -169,9 +274,12 @@ class JobOutputStream:
     buffer of the most recent lines is retained so a viewer that connects
     mid-run, or just after the run finished, still sees recent context.
 
-    Nothing is ever written to disk: this lives only for as long as the run's
-    record is kept in memory, preserving cronstable's read-only-filesystem
-    deployment story.
+    Nothing is ever written to disk, preserving cronstable's
+    read-only-filesystem deployment story. The ring itself lives only while
+    this run is its job's newest (or still running): once a newer run's
+    record supersedes it the scheduler calls :meth:`release_lines`, because
+    nothing can replay a superseded ring and the bounded run history would
+    otherwise pin one full ring per retained record.
     """
 
     def __init__(self, limit: int = LIVE_LOG_LIMIT) -> None:
@@ -249,6 +357,22 @@ class JobOutputStream:
         for queue in self._subscribers:
             self._offer(queue, None)
 
+    def release_lines(self) -> None:
+        """Drop the retained ring buffer; counters and subscribers stay.
+
+        Called when this run's record stops being its job's newest finished
+        run: the log endpoints replay only the newest finished run (or a
+        live one), so a superseded record's ring is unreachable payload,
+        yet each one held up to its full ring for as long as the record sat
+        in the bounded run history. That made steady-state memory scale
+        with history depth times ring size per job instead of one ring per
+        job. ``published``/``dropped`` are kept (they are plain counters,
+        still shown in history rows), and any still-attached subscriber
+        already received the end sentinel via :meth:`close`, so nothing
+        observes the lines vanishing.
+        """
+        self.lines.clear()
+
 
 #: Bytes pulled from a job's pipe per read.  ``StreamReader.read`` returns
 #: as soon as ANY data is buffered, so a bigger chunk never delays a live
@@ -319,20 +443,13 @@ class StreamReader:
             return
         text = "".join(self._emit_buffer)
         self._emit_buffer.clear()
-        out = sys.stdout if self.stream_name == "stdout" else sys.stderr
-        try:
-            self._emit(out, text)
-        except (OSError, ValueError):
-            # The daemon's own stdout/stderr is broken or closed (a dead
-            # pipe consumer). The passthrough copy is best-effort; the
-            # capture buffers and live-tail publish above are unaffected,
-            # so log once per batch and keep reading the job's output.
-            logger.warning(
-                "job %s: could not mirror %s to the daemon's own stream",
-                self.job_name,
-                self.stream_name,
-                exc_info=True,
-            )
+        # Hand the batch to the mirror's writer thread rather than writing
+        # here: this method runs on the EVENT LOOP thread, and a write to a
+        # full pipe (a stopped `docker logs`, a Ctrl+S'd console, a dead
+        # journald) blocks until the consumer drains it, which used to
+        # freeze the entire daemon, scheduling included, behind one wedged
+        # log reader.
+        _MIRROR.submit(self.job_name, self.stream_name, text)
 
     def _queue_emit(self, out_line: str) -> None:
         # One write+flush per DRAINED READ, not per line: readline() completes

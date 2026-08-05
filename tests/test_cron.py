@@ -1416,13 +1416,139 @@ async def test_web_list_jobs_etag_304_and_invalidation():
 
     # a real state change (advancing a job's next fire) moves the tag, so
     # the same conditional poll now gets a fresh body instead of a 304.
+    # The live fire path pairs the advance with a launch, whose bust drops
+    # the shared response memo; poking the index directly skips that, so
+    # bust it the same way here (a next-fire-only change would otherwise
+    # simply age out of the memo within its one-second TTL).
     when = cron._next_fire.get("alpha")
     cron._next_fire["alpha"] = (
         when or DT(2000, 1, 1, tzinfo=UTC)
     ) + datetime.timedelta(hours=1)
+    cron._bust_jobs_response_cache()
     changed = await cron._web_list_jobs(req(etag))
     assert changed.status == 200
     assert changed.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
+    # N pollers inside the memo TTL must share ONE payload build (the
+    # whole point: a wallboard plus tabs used to cost N identical builds
+    # per cycle), and a locally recorded run must bust the memo so the
+    # next poll sees it immediately.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    builds = []
+    real_payload = cron.jobs_payload
+
+    def counting_payload():
+        builds.append(1)
+        return real_payload()
+
+    monkeypatch.setattr(cron, "jobs_payload", counting_payload)
+
+    def req():
+        class Req:
+            headers: dict = {}
+
+        return Req()
+
+    first = await cron._web_list_jobs(req())
+    second = await cron._web_list_jobs(req())
+    third = await cron._web_list_jobs(req())
+    assert len(builds) == 1  # one build served all three pollers
+    assert second.headers["ETag"] == first.headers["ETag"]
+    assert third.body == first.body
+
+    # a recorded run changes the payload: the memo is busted and the next
+    # poll rebuilds rather than serving the stale product out to the TTL.
+    cron._record_run("alpha", _mk_run("failure"))
+    fresh = await cron._web_list_jobs(req())
+    assert len(builds) == 2
+    assert fresh.headers["ETag"] != first.headers["ETag"]
+
+
+# enough tasks that the serialized graph clears the gzip minimum, so the
+# compression arm of the /dags conditional response is exercised for real
+_FAT_DAG = "dags:\n  - name: d\n    tasks:\n" + "".join(
+    "      - id: step-number-%02d\n        command: 'run step %02d'\n"
+    % (i, i)
+    for i in range(16)
+)
+
+
+def _hdr_req(inm=None, ae=None):
+    headers = {}
+    if inm is not None:
+        headers["If-None-Match"] = inm
+    if ae is not None:
+        headers["Accept-Encoding"] = ae
+
+    class Req:
+        pass
+
+    Req.headers = headers
+    return Req()
+
+
+@pytest.mark.asyncio
+async def test_web_list_dags_etag_304_and_gzip():
+    """GET /dags is the third leg of the dashboard's per-poll fan-out: it
+    must serve a content ETag, 304 an unchanged conditional poll instead of
+    re-shipping every task graph, move the tag when the payload changes, and
+    gzip a large body for a client that accepts it."""
+    import gzip as gzip_mod
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=_FAT_DAG)
+    cron.web_config = {}
+
+    first = await cron._web_list_dags(_hdr_req())
+    etag = first.headers["ETag"]
+    assert first.status == 200 and etag
+    assert first.headers["Vary"] == "Accept-Encoding"
+    payload = json.loads(first.text)
+    assert [d["name"] for d in payload] == ["d"]
+    assert len(payload[0]["tasks"]) == 16
+
+    # an unchanged conditional poll costs a 304, no body
+    not_modified = await cron._web_list_dags(_hdr_req(inm=etag))
+    assert not_modified.status == 304
+    assert not_modified.body in (None, b"")
+    assert not_modified.headers["ETag"] == etag
+
+    # a gzip-capable client gets the compressed representation of the same
+    # bytes (the graph is comfortably past the minimum with 16 tasks)
+    packed = await cron._web_list_dags(_hdr_req(ae="gzip"))
+    assert packed.status == 200
+    assert packed.headers.get("Content-Encoding") == "gzip"
+    assert packed.headers["ETag"] == etag
+    assert json.loads(gzip_mod.decompress(packed.body)) == payload
+
+    # a payload change moves the tag and the same conditional poll gets 200
+    cron.cron_dags["d"].enabled = False
+    changed = await cron._web_list_dags(_hdr_req(inm=etag))
+    assert changed.status == 200
+    assert changed.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_web_get_cluster_negotiates_gzip_but_never_etags():
+    """GET /cluster embeds freshly sampled node gauges, so a content tag
+    would churn per poll and never match: the handler must not emit one.
+    Gzip stays negotiated (with the size floor) and Vary rides along."""
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    resp = await cron._web_get_cluster(_hdr_req(ae="gzip"))
+    assert resp.status == 200
+    assert resp.headers.get("ETag") is None
+    assert resp.headers["Vary"] == "Accept-Encoding"
+    # the no-cluster payload is far below the gzip minimum: shipped plain
+    assert resp.headers.get("Content-Encoding") is None
+    assert json.loads(resp.text) == {"enabled": False, "peers": []}
 
 
 @pytest.mark.asyncio
@@ -1565,6 +1691,102 @@ def test_record_run_caps_history():
     assert hist[-1].exit_code == limit + 9
     # last_run mirrors the most recent recorded run
     assert cron.last_run["alpha"].exit_code == limit + 9
+
+
+def test_record_run_releases_superseded_ring():
+    # Only the newest finished run's output is replayable, so a superseded
+    # record must not keep its ring alive for the whole history window:
+    # before the release, 50 retained records x a 1000-line ring per job
+    # could pin gigabytes of unservable lines fleet-wide.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    first = _mk_run("success")
+    first.output.publish("stdout", "kept while newest")
+    first.output.publish("stderr", "and this one")
+    first.output.close()
+    cron._record_run("alpha", first)
+    # while newest, the ring is intact (this is what the log replay serves)
+    assert len(cron.last_run["alpha"].output.lines) == 2
+
+    second = _mk_run("failure")
+    second.output.publish("stdout", "the new newest")
+    second.output.close()
+    cron._record_run("alpha", second)
+
+    # the superseded record stays in history as a summary, but its ring is
+    # gone; the counters survive (history rows still show published totals).
+    assert cron.run_history["alpha"][0] is first
+    assert list(first.output.lines) == []
+    assert first.output.published == 2
+    # the newest record's ring is untouched
+    assert [line for _s, line in cron.last_run["alpha"].output.lines] == [
+        "the new newest"
+    ]
+
+
+_ARCHIVE_JOB = """
+jobs:
+  - name: a
+    command: echo hi
+    schedule: "*/5 * * * *"
+    captureStdout: true
+    archiveOutput: true
+"""
+
+
+class _GatedAppendBackend:
+    """A ledger stub whose appends wait for the test to open a gate.
+
+    Models a slow store: the fire-and-forget persist task is still parked on
+    its first append while later completions of the same job land.
+    """
+
+    def __init__(self):
+        self.appends = []
+        self.gate = asyncio.Event()
+
+    async def append_record(self, stream, record, prune_keep=None):
+        await self.gate.wait()
+        self.appends.append((stream, record))
+
+
+@pytest.mark.asyncio
+async def test_archive_snapshots_lines_at_record_time():
+    # The archive must write the lines the run had when it was RECORDED,
+    # not whatever the ring holds when the persist task finally runs: a
+    # back-to-back completion releases the superseded ring, and reading it
+    # late would archive nothing.
+    from tests.test_state import _drain_state_writes
+
+    cron = cronstable.cron.Cron(None, config_yaml=_ARCHIVE_JOB)
+    backend = _GatedAppendBackend()
+    cron.state_backend = backend
+
+    first = _mk_run("success")
+    first.output.publish("stdout", "one")
+    first.output.publish("stdout", "two")
+    first.output.close()
+    cron._record_run("a", first)
+
+    # the store has not accepted the first run's append yet when the next
+    # completion supersedes it and releases its ring
+    second = _mk_run("success")
+    second.output.publish("stdout", "three")
+    second.output.close()
+    cron._record_run("a", second)
+    assert list(first.output.lines) == []
+
+    backend.gate.set()
+    await _drain_state_writes(cron)
+
+    log_stream = cron._log_stream("a")
+    archived = [
+        rec for stream, rec in backend.appends if stream == log_stream
+    ]
+    assert [
+        [entry["line"] for entry in rec["lines"]] for rec in archived
+    ] == [["one", "two"], ["three"]]
+    # nothing was double-counted as evicted: the snapshot held every line
+    assert [rec["dropped_lines"] for rec in archived] == [0, 0]
 
 
 class _FakeMesh:
@@ -1711,7 +1933,7 @@ async def test_web_get_cluster_injects_local_node_stats():
     cron.cluster_manager = FakeMgr()
 
     class Req:
-        pass
+        headers: dict = {}
 
     resp = await cron._web_get_cluster(Req())
     data = json.loads(resp.text)
@@ -2138,6 +2360,61 @@ async def test_web_job_logs_streams_last_run():
     assert "hello world" in body
     assert "uh oh" in body
     assert "event: end" in body
+
+
+@pytest.mark.asyncio
+async def test_web_job_logs_batches_live_bursts(monkeypatch):
+    """A burst of published lines must reach the SSE client in a handful of
+    transport writes, not one write (plus one fresh wait_for timer task) per
+    line: per-line delivery on the scheduler's loop was ~2 coroutine steps
+    per line per subscriber for a chatty job."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    out = JobOutputStream()
+    out.publish("stdout", "replayed\n")
+    cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
+        outcome="success",
+        exit_code=0,
+        started_at=None,
+        finished_at=DT(1999, 12, 31, 12, 0, 0, tzinfo=UTC),
+        fail_reason=None,
+        output=out,  # NOT closed: the handler stays in its live-tail loop
+    )
+    writes = []
+    real_write = web.StreamResponse.write
+
+    async def counting_write(self, data):
+        writes.append(bytes(data))
+        return await real_write(self, data)
+
+    monkeypatch.setattr(web.StreamResponse, "write", counting_write)
+    app = web.Application()
+    app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
+    async with TestClient(TestServer(app)) as client:
+        resp_task = asyncio.create_task(client.get("/jobs/alpha/logs"))
+        # wait for the handler to attach its subscriber queue
+        for _ in range(500):
+            if out._subscribers:
+                break
+            await asyncio.sleep(0.01)
+        assert out._subscribers, "tail never attached"
+        # one synchronous burst: no await between publishes, so the whole
+        # burst is queued before the handler can wake once
+        for i in range(60):
+            out.publish("stdout", "line-%d\n" % i)
+        out.close()
+        resp = await resp_task
+        body = await resp.text()
+    assert "line-0" in body and "line-59" in body and "event: end" in body
+    burst_writes = [w for w in writes if b"line-" in w]
+    # the whole 60-line burst went out in a handful of joined writes (the
+    # old per-line loop needed 60); the exact count depends on how often
+    # the handler woke mid-burst, so bound it rather than pin it.
+    assert len(burst_writes) <= 6, len(burst_writes)
+    assert sum(w.count(b"event: line") for w in burst_writes) == 60
 
 
 @pytest.mark.asyncio
@@ -9260,7 +9537,8 @@ def test_slotlease_log_cluster_role_swallows_backend_error(caplog):
 # --- _prepare_job_api_run: stage secrets, skip an unresolvable one ----------
 
 
-def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
+@pytest.mark.asyncio
+async def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
     monkeypatch, caplog
 ):
     import logging
@@ -9287,13 +9565,100 @@ def test_slotlease_prepare_job_api_run_skips_unresolvable_secret(
         stateAllowedScopes=[],
     )
     with caplog.at_level(logging.WARNING, logger="cronstable"):
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
     assert token is not None
     assert registered and registered[0].secrets == {"good": "v1"}
     assert any(
         "could not stage secret" in r.message for r in caplog.records
     )
     assert "CRONSTABLE_STATE_URL" in env or env  # env was built
+
+
+@pytest.mark.asyncio
+async def test_prepare_job_api_run_stages_fromfile_secrets_off_loop(
+    tmp_path, monkeypatch
+):
+    # A fromFile secret is a blocking open()/read() inside the awaited
+    # launch chain: on a slow or hung secret mount it must stall a worker
+    # thread, never the event loop. Value/env secrets stay inline, where
+    # the thread hop would cost more than the dict it builds.
+    import threading
+    import types
+
+    cron = cronstable.cron.Cron(None)
+    registered = []
+
+    class _Api:
+        base_url = "http://127.0.0.1:65500"
+        cacert = None
+
+        def register_run(self, ctx):
+            registered.append(ctx)
+
+    cron._job_api = _Api()
+
+    staged_on_loop_thread = []
+    real_stage = cron._stage_job_secrets
+
+    def spying_stage(job):
+        staged_on_loop_thread.append(
+            threading.current_thread() is threading.main_thread()
+        )
+        return real_stage(job)
+
+    monkeypatch.setattr(cron, "_stage_job_secrets", spying_stage)
+
+    secret_file = tmp_path / "token.txt"
+    secret_file.write_text("filed-value\n")
+    filed = types.SimpleNamespace(
+        name="s",
+        secrets=[
+            {"name": "v", "value": "plain"},
+            {"name": "f", "fromFile": str(secret_file)},
+        ],
+        stateAllowedScopes=[],
+    )
+    token, _env = await cron._prepare_job_api_run(filed, None)
+    assert token is not None
+    assert registered[-1].secrets == {"v": "plain", "f": "filed-value"}
+    assert staged_on_loop_thread == [False]  # the file read left the loop
+
+    inline = types.SimpleNamespace(
+        name="s2",
+        secrets=[{"name": "v", "value": "plain"}],
+        stateAllowedScopes=[],
+    )
+    token2, _env2 = await cron._prepare_job_api_run(inline, None)
+    assert token2 is not None
+    assert registered[-1].secrets == {"v": "plain"}
+    assert staged_on_loop_thread[-1] is True  # no hop for memory-only specs
+
+
+@pytest.mark.asyncio
+async def test_same_slot_spawn_burst_is_gated(monkeypatch):
+    # A slot that launches many jobs at once must not execute every spawn's
+    # synchronous fork/exec setup in one contiguous ready-queue burst; the
+    # daemon-wide gate caps how many run at a time so web/SSE/gossip
+    # callbacks interleave. The cap is a hard semaphore bound, so the
+    # green assertion is timing-independent.
+    yaml = "jobs:\n" + "".join(
+        "  - name: b%02d\n    command: x\n    schedule: '* * * * *'\n" % i
+        for i in range(40)
+    )
+    cron = cronstable.cron.Cron(None, config_yaml=yaml)
+    state = {"in_flight": 0, "high": 0, "started": 0}
+
+    async def fake_start(self):
+        state["in_flight"] += 1
+        state["high"] = max(state["high"], state["in_flight"])
+        state["started"] += 1
+        await asyncio.sleep(0.01)
+        state["in_flight"] -= 1
+
+    monkeypatch.setattr(cronstable.cron.RunningJob, "start", fake_start)
+    await cron._launch_concurrently(list(cron.cron_jobs.values()))
+    assert state["started"] == 40  # every job still launched
+    assert state["high"] <= cronstable.cron._SPAWN_BURST_LIMIT
 
 
 # --- _slot_fidelity_reason -------------------------------------------------
@@ -9902,11 +10267,10 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
             finished.append(token)
 
     cron._job_api = _Api()
-    monkeypatch.setattr(
-        cron,
-        "_prepare_job_api_run",
-        lambda j, rs: ("tok123", {"CRONSTABLE_RUN_ID": "rid"}),
-    )
+    async def _fake_prepare(j, rs):
+        return ("tok123", {"CRONSTABLE_RUN_ID": "rid"})
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
 
     class _BoomRun:
         def __init__(self, *args, **kwargs):
@@ -10074,7 +10438,10 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
             finished.append(token)
 
     cron._job_api = _Api()
-    monkeypatch.setattr(cron, "_prepare_job_api_run", lambda j, rs: ("tokN", {}))
+    async def _fake_prepare(j, rs):
+        return ("tokN", {})
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
 
     class _BoomRun:
         def __init__(self, *args, **kwargs):
@@ -10094,7 +10461,10 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
 async def test_slotlease_maybe_launch_start_failure_without_job_api(monkeypatch):
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_NODE_JOB)
     job = cron.cron_jobs["s"]
-    monkeypatch.setattr(cron, "_prepare_job_api_run", lambda j, rs: (None, {}))
+    async def _fake_prepare(j, rs):
+        return (None, {})
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _fake_prepare)
     cron._job_api = None
 
     class _BoomRun:
@@ -10451,7 +10821,10 @@ async def test_rehydrate_persist_counter_snapshot_unseeded(tmp_path):
 
 async def test_rehydrate_archive_output_no_backend():
     cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
-    await cron._archive_output(cron.cron_jobs["j"], _mem_run5("success", 0))
+    info = _mem_run5("success", 0)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
 
 
 # --- SLA last-success warm scan ---------------------------------------------
@@ -10508,6 +10881,43 @@ async def test_rehydrate_rehydrate_from_state_timeout_breaks(tmp_path):
     cron.state_backend.list_records = _list
     await cron._rehydrate_from_state()  # a hung store aborts the warm-up
     assert not cron.run_history.get("j")
+
+
+async def test_rehydrate_reads_jobs_concurrently(tmp_path):
+    # The warm-up must overlap its per-job ledger reads: strictly
+    # sequential reads made boot delay scale linearly with job count (the
+    # whole point of the worker pool). The rendezvous below only clears
+    # once 4 reads are in flight AT THE SAME TIME; a sequential warm-up
+    # never gets past its first read and times out instead.
+    yaml = "jobs:\n" + "".join(
+        "  - name: j%d\n    command: x\n    schedule: '@reboot'\n" % i
+        for i in range(8)
+    )
+    cron = await _rehydrate_state_cron(tmp_path, yaml)
+    cron._state_rehydrated = False
+    need = 4
+    state = {"in_flight": 0, "high": 0}
+    gate = asyncio.Event()
+
+    async def _list(stream, **kw):
+        if not stream.startswith("runs/"):
+            return []
+        state["in_flight"] += 1
+        state["high"] = max(state["high"], state["in_flight"])
+        if state["high"] >= need:
+            gate.set()
+        try:
+            # cleared only when `need` reads overlap; the 2s bound makes a
+            # sequential implementation fail fast (each lone read times
+            # out) rather than hang the test.
+            await asyncio.wait_for(gate.wait(), timeout=2.0)
+        finally:
+            state["in_flight"] -= 1
+        return []
+
+    cron.state_backend.list_records = _list
+    await cron._rehydrate_from_state()
+    assert state["high"] >= need
 
 
 async def test_rehydrate_rehydrate_from_state_oserror_continues(tmp_path):

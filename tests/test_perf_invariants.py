@@ -7,8 +7,10 @@ artifact contract, the per-run durable-write count, and artifact prune
 residency.  A perf gate is the wrong tool for those -- it measures a proxy
 (elapsed time) that is platform-dependent, noisy, and blind in one
 direction -- while a test gates the invariant itself in BOTH directions, on
-every platform, on every matrix Python, in milliseconds.  This file is
-those five tests; benchmarks/README.md's waiver section points here.
+every platform, on every matrix Python, in milliseconds.  This file began
+as those five tests and takes later carve-outs of the same shape (the
+lease-write durability split); benchmarks/README.md's waiver section
+points here.
 """
 
 import os
@@ -288,4 +290,86 @@ async def test_artifact_stream_residency_is_bounded_by_distinct_names(
             last_version = puts - names + i
             assert result[1] == ("payload-%d" % last_version).encode()
     finally:
+        await backend.stop()
+
+
+# --- 6. the lease-write durability split -----------------------------------
+#
+# Every lease write used to pay the full append barrier (temp fsync + rename
+# + directory flush) although elections renew every ttl/3 and every held
+# cluster slot / DAG advance lease renews every ~10s: tens of thousands of
+# barriers a day on an idle HA pair, buying durability for a value whose
+# loss is harmless.  The split is a count invariant with a safety edge in
+# each direction: a same-fence write (renew, release, same-holder valid
+# re-acquire) must NOT pay the directory barrier, and a fence-CHANGING
+# write (first issue, takeover) must ALWAYS pay it, or a crash could
+# re-issue an acknowledged fence and defeat stale-writer detection.  The
+# temp-file fsync stays on every write either way: a lease file that reads
+# back truncated after a crash fails every later acquire closed.
+
+
+async def test_lease_write_barrier_follows_the_fence(tmp_path, monkeypatch):
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        # warm up: the first lease op pays the leases directory's durable
+        # mkdir, a once-only cost outside the protocol under test.
+        warm = await backend.acquire_lease("warm", "holder-a", ttl=30.0)
+        assert warm is not None
+
+        file_fsyncs = []
+        dir_barriers = []
+        real_fsync = os.fsync
+
+        def counting_fsync(fd):
+            file_fsyncs.append(fd)
+            return real_fsync(fd)
+
+        def counting_barrier(path):
+            dir_barriers.append(path)
+            # deliberately not called through, same as the append test: the
+            # count IS the contract.
+
+        monkeypatch.setattr(os, "fsync", counting_fsync)
+        monkeypatch.setattr(state_mod, "fsync_directory", counting_barrier)
+
+        # first issue of a new lease name: fence 1 is born, barrier required
+        lease = await backend.acquire_lease("slot", "holder-a", ttl=30.0)
+        assert lease is not None and lease.fence == 1
+        assert len(file_fsyncs) == 1
+        assert len(dir_barriers) == 1, (
+            "a fence-issuing acquire must flush the rename; losing it to a "
+            "crash would re-issue the fence to the next acquirer"
+        )
+
+        # steady state: renews keep the fence and must skip the barrier
+        # (the file fsync stays: no write may leave a truncatable lease).
+        for i in range(2, 12):
+            lease = await backend.renew_lease(lease, ttl=30.0)
+            assert lease is not None
+            assert len(file_fsyncs) == i
+        assert len(dir_barriers) == 1, (
+            "a same-fence renew must not pay the directory barrier; this "
+            "is the ~10s heartbeat write of every election, cluster slot "
+            "and DAG advance lease"
+        )
+
+        # a same-holder still-valid acquire is a renew in acquire clothing
+        again = await backend.acquire_lease("slot", "holder-a", ttl=30.0)
+        assert again is not None and again.fence == lease.fence
+        assert len(dir_barriers) == 1
+
+        # release keeps the fence (expiry-in-place): no barrier either
+        await backend.release_lease(again)
+        assert len(dir_barriers) == 1
+
+        # takeover of the released lease bumps the fence: barrier required
+        taken = await backend.acquire_lease("slot", "holder-b", ttl=30.0)
+        assert taken is not None and taken.fence == again.fence + 1
+        assert len(dir_barriers) == 2, (
+            "a fence-bumping takeover must flush the rename, exactly like "
+            "first issue"
+        )
+    finally:
+        monkeypatch.undo()
         await backend.stop()

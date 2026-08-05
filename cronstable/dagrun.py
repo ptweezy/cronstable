@@ -123,7 +123,50 @@ COMPLETION_RETRY_MAX_DELAY = 60.0
 #: cached) stays below this and reads only the few that changed.
 DAG_ROLLUP_BULK_THRESHOLD = 8
 
+#: How long one dag's run-summary LIST may be served from memory before the
+#: store is listed again.  The per-run summary cache above already avoids
+#: re-PARSING terminal runs, but the keys listing itself still hit the store
+#: once per dag per request: with the dashboard's /dags poll (and any open
+#: run drawer) that was N_dags listings every ~3s per viewer, forever, on a
+#: quiescent store.  Every LOCAL write funnels through _mutate/_delete_run_doc
+#: and pops the memo, so this-node changes render immediately; the TTL only
+#: bounds how late another node's writes appear in the index rollup, which is
+#: well inside the gossip staleness the fleet view already tolerates.  Sits
+#: beside the same tradeoff cron's per-job trends cache (5s TTL, busted on
+#: local completion) already made.
+DAG_SUMMARY_LIST_TTL = 5.0
+
 RunRef = Tuple[str, str]  # (dag_name, run_key)
+
+#: XCom payload size at or above which a mapped fan-out's parse (and its
+#: portability walk) runs on a worker thread instead of the scheduler's
+#: event loop.  The payload cap is dag.MAX_MAPPED_XCOM_BYTES (16 MiB), and
+#: parsing a multi-MB list inline stalled every handler and heartbeat for
+#: tens of ms per expansion; below this floor the parse is cheaper than the
+#: thread hop it would buy (a 64 KiB bytes-path parse is a few hundred us,
+#: about the hop's own dispatch cost).
+_XCOM_PARSE_OFFLOAD_MIN = 64 * 1024
+
+
+def _parse_portable_xcom(data: bytes) -> Any:
+    """Parse a mapped-task XCom payload; portability-check a usable list.
+
+    Factored out of :meth:`DagScheduler._mapped_items` so the large-payload
+    branch can run the WHOLE thing on a worker thread.  The bytes go
+    straight to ``_json.loads``: the old ``data.decode()`` allocated a full
+    second copy and forced the str branch, whose wide-int prescan is a
+    whole-payload regex rather than the bytes branch's translate fast path.
+    An over-long list skips the portability walk on purpose:
+    ``_apply_expansions`` rejects it at its own MAX_MAPPED_ITEMS check, so
+    the O(len) walk would be pure waste on a list never embedded in the run
+    document.  Raises ``_json.UnsupportedValue`` for a non-portable value
+    and any other ``ValueError`` for undecodable bytes or invalid JSON,
+    which the caller maps to its existing warn-and-empty arms.
+    """
+    parsed = _json.loads(data)
+    if isinstance(parsed, list) and len(parsed) <= dag.MAX_MAPPED_ITEMS:
+        _json.ensure_portable(parsed)
+    return parsed
 
 
 def _now() -> float:
@@ -211,6 +254,15 @@ class DagScheduler:
         # backend swap: run keys are deterministic, so the new store's runs
         # would otherwise read the old store's cached terminal state.
         self._dag_summary_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # dag name -> (monotonic stamp, summaries): the short-TTL memo over
+        # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
+        # a quiescent dag costs zero store listings between local writes.
+        # Popped by _mutate/_delete_run_doc (local changes must render at
+        # once), swept with the summary cache in forget(), and pruned of
+        # removed dags by list_dags.  See DAG_SUMMARY_LIST_TTL.
+        self._summaries_memo: Dict[
+            str, Tuple[float, List[Dict[str, Any]]]
+        ] = {}
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
@@ -288,10 +340,15 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return None, None
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             backend.mutate_document(self._ns(dag_name), key, transform),
             timeout=STATE_OP_TIMEOUT,
         )
+        # every local run-doc write funnels through here: pop the summary
+        # memo so this node's own changes (create, advance, finish, adopt)
+        # render on the very next poll instead of aging out by TTL.
+        self._summaries_memo.pop(dag_name, None)
+        return result
 
     async def _read(self, dag_name: str, key: str) -> Optional[Dict[str, Any]]:
         backend = self._backend()
@@ -1281,8 +1338,34 @@ class DagScheduler:
             return []
         _record, data = got
         try:
-            parsed = _json.loads(data.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+            # parse + portability walk together (see _parse_portable_xcom);
+            # a large payload takes them both to a worker thread, because a
+            # multi-MB inline parse stalls dispatch, every web handler and
+            # the cluster heartbeats for its whole duration.
+            if len(data) >= _XCOM_PARSE_OFFLOAD_MIN:
+                parsed = await asyncio.to_thread(_parse_portable_xcom, data)
+            else:
+                parsed = _parse_portable_xcom(data)
+        except _json.UnsupportedValue as exc:
+            # a value that parses but is not fleet-portable (an int outside
+            # the 64-bit window, a non-finite float): embedding it in the
+            # run document would make _json.dumps_bytes raise on EVERY
+            # advance, wedging the run forever. Treat a mis-published
+            # upstream like the not-a-list case -- warn and map to empty.
+            # (Ordered before ValueError: UnsupportedValue subclasses it.)
+            logger.warning(
+                "dag %s: xcom %r from %r contains a non-portable value "
+                "(%s); mapping it to an empty fan-out",
+                dag_name,
+                key,
+                taskkey,
+                exc,
+            )
+            return []
+        except ValueError:
+            # undecodable bytes land here too: the bytes-path loads folds
+            # what used to be the decode()'s UnicodeDecodeError into its
+            # own ValueError.
             logger.warning(
                 "dag %s: xcom %r from %r is not valid JSON; mapping it to an "
                 "empty fan-out",
@@ -1292,29 +1375,6 @@ class DagScheduler:
             )
             return []
         if isinstance(parsed, list):
-            if len(parsed) > dag.MAX_MAPPED_ITEMS:
-                # too many items to materialise; _apply_expansions fails the
-                # task at its own MAX_MAPPED_ITEMS check.  Return it directly
-                # and skip the O(len) portability walk -- pure waste on a list
-                # that is about to be rejected, never embedded in the run doc.
-                return parsed
-            try:
-                _json.ensure_portable(parsed)
-            except _json.UnsupportedValue as exc:
-                # a value that parses but is not fleet-portable (an int outside
-                # the 64-bit window, a non-finite float): embedding it in the
-                # run document would make _json.dumps_bytes raise on EVERY
-                # advance, wedging the run forever. Treat a mis-published
-                # upstream like the not-a-list case -- warn and map to empty.
-                logger.warning(
-                    "dag %s: xcom %r from %r contains a non-portable value "
-                    "(%s); mapping it to an empty fan-out",
-                    dag_name,
-                    key,
-                    taskkey,
-                    exc,
-                )
-                return []
             return parsed
         logger.warning(
             "dag %s: xcom %r from %r is a %s, not a list; mapping it to an "
@@ -1441,7 +1501,7 @@ class DagScheduler:
     ) -> Optional[Tuple[str, str, Optional[int], Optional[int]]]:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
-        token, env = self._prepare_task_run(
+        token, env = await self._prepare_task_run(
             dagcfg, run_id, ref[1], intent, template
         )
         dref = _DagRef(
@@ -1463,7 +1523,12 @@ class DagScheduler:
             dag_ref=dref,
         )
         try:
-            await running.start()
+            # a mapped fan-out launches up to MAX_CLAIMS_PER_PASS instances
+            # back to back: share the daemon-wide spawn gate so the burst's
+            # synchronous fork/exec work interleaves with other loop work
+            # (see cron._SPAWN_BURST_LIMIT).
+            async with self._cron._spawn_gate:
+                await running.start()
         except BaseException:  # noqa: BLE001 - mirror maybe_launch_job cleanup
             if token is not None and self._cron._job_api is not None:
                 await self._cron._job_api.finish_run(token)
@@ -1492,7 +1557,33 @@ class DagScheduler:
         # pid), and the reaper will record its completion.
         return (taskkey, dref.proc, pid, dref.attempt)
 
-    def _prepare_task_run(
+    @staticmethod
+    def _stage_task_secrets(dagcfg: Any, intent, template) -> Dict[str, str]:
+        """Resolve a task template's ``secrets`` blocks into a fresh map.
+
+        Pure sync (``fromFile`` opens and reads), so the launch loop can
+        push it to the default executor when a file read is involved; see
+        :meth:`_prepare_task_run`.
+        """
+        from cronstable.config import _resolve_secret
+
+        secrets: Dict[str, str] = {}
+        for spec in template.secrets:
+            name = spec.get("name")
+            try:
+                value = _resolve_secret(
+                    spec,
+                    "dag {} task {} secret {}".format(
+                        dagcfg.name, intent.task_id, name
+                    ),
+                )
+            except Exception:  # noqa: BLE001 - a bad secret is skipped, 404s
+                continue
+            if name and value is not None:
+                secrets[name] = value
+        return secrets
+
+    async def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
     ) -> Tuple[Optional[str], Dict[str, str]]:
         """Register the task run with the loopback API; return its env.
@@ -1501,6 +1592,10 @@ class DagScheduler:
         namespace to the DAG run's XCom scope and injects the
         ``CRONSTABLE_DAG_*``
         vars, so ``cronstable xcom`` / ``artifact`` land in the run scope.
+        Like the mirror, ``fromFile`` secrets are staged on the default
+        executor so a slow secret mount stalls only this launch, never the
+        event loop; a mapped fan-out launches many instances back to back,
+        which is exactly where an inline blocking read would compound.
         """
         scope = dag.xcom_scope(dagcfg.name, run_id)
         dag_env = {
@@ -1520,23 +1615,14 @@ class DagScheduler:
         api = self._cron._job_api
         if api is None or api.base_url is None:
             return None, dag_env
-        from cronstable.config import _resolve_secret
         from cronstable.jobapi import RunContext, run_environment
 
-        secrets: Dict[str, str] = {}
-        for spec in template.secrets:
-            name = spec.get("name")
-            try:
-                value = _resolve_secret(
-                    spec,
-                    "dag {} task {} secret {}".format(
-                        dagcfg.name, intent.task_id, name
-                    ),
-                )
-            except Exception:  # noqa: BLE001 - a bad secret is skipped, 404s
-                continue
-            if name and value is not None:
-                secrets[name] = value
+        if any(spec.get("fromFile") for spec in template.secrets):
+            secrets = await asyncio.get_running_loop().run_in_executor(
+                None, self._stage_task_secrets, dagcfg, intent, template
+            )
+        else:
+            secrets = self._stage_task_secrets(dagcfg, intent, template)
         ctx = RunContext(
             token=os.urandom(32).hex(),
             run_id=os.urandom(16).hex(),
@@ -2083,8 +2169,16 @@ class DagScheduler:
         owns ``schedule_str`` (avoiding a cron<->dagrun import cycle).
         """
         backend = self._backend()
+        # a reload that removed (or renamed) a dag must not leave its run
+        # summaries pinned in the caches for the life of the process; the
+        # live config is the authority on which keys may stay.
+        live = self._dags()
+        for stale in [k for k in self._summaries_memo if k not in live]:
+            del self._summaries_memo[stale]
+        for stale in [k for k in self._dag_summary_cache if k not in live]:
+            del self._dag_summary_cache[stale]
         out = []
-        for name, dagcfg in self._dags().items():
+        for name, dagcfg in live.items():
             entry: Dict[str, Any] = {
                 "name": name,
                 "enabled": dagcfg.enabled,
@@ -2195,6 +2289,31 @@ class DagScheduler:
         return self._rollup_from_summaries(summaries)
 
     async def _run_summaries(
+        self, backend: StateBackend, name: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Every retained run's summary, memoized for DAG_SUMMARY_LIST_TTL.
+
+        The memo serves the poll traffic of a QUIESCENT dag from memory:
+        without it the keys listing below still hit the store once per dag
+        per /dags poll (and per run-drawer refresh) per viewer.  A fresh
+        shallow copy is returned each time because list_runs sorts its
+        result in place.  Failures are never memoized, and local writes pop
+        the entry (see _mutate), so the TTL delays only remote nodes'
+        changes.
+        """
+        memo = self._summaries_memo.get(name)
+        if (
+            memo is not None
+            and time.monotonic() - memo[0] < DAG_SUMMARY_LIST_TTL
+        ):
+            return list(memo[1])
+        summaries = await self._run_summaries_uncached(backend, name)
+        if summaries is not None:
+            self._summaries_memo[name] = (time.monotonic(), summaries)
+            return list(summaries)
+        return None
+
+    async def _run_summaries_uncached(
         self, backend: StateBackend, name: str
     ) -> Optional[List[Dict[str, Any]]]:
         """Every retained run's summary, caching immutable terminal runs.
@@ -2436,6 +2555,9 @@ class DagScheduler:
             backend.delete_document(self._ns(name), run_key),
             timeout=STATE_OP_TIMEOUT,
         )
+        # the other local write shape (_mutate covers the rest): the memo
+        # must not keep serving a run the GC just deleted.
+        self._summaries_memo.pop(name, None)
         known = self._terminal_run_keys.get(name)
         if known is not None:
             # the key may legitimately come back (an operator backfill of the
@@ -2555,6 +2677,7 @@ class DagScheduler:
         # pass, but until then it suppresses adoption of the new store's runs,
         # so drop it here and bring that pass forward to now.
         self._dag_summary_cache.clear()
+        self._summaries_memo.clear()
         self._terminal_run_keys.clear()
         self._advance_again.clear()
         self._next_sched_check = 0.0
