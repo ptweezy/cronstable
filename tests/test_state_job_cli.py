@@ -147,7 +147,7 @@ def test_state_admin_still_routes(monkeypatch, capsys, tmp_path):
     )
     code = _cli(monkeypatch, ["state", "check", "-c", str(cfg)])
     assert code == 1
-    assert "no `state:` section" in capsys.readouterr().out
+    assert "no `state:` section" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------

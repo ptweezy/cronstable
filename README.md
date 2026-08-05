@@ -1532,7 +1532,7 @@ to the Statsd listening on `my-statsd.example.com:8125`:
 my.cron.jobs.prefix.test01.start:1|g  # this one is sent when the job starts
 my.cron.jobs.prefix.test01.stop:1|g   # the rest are sent when the job stops
 my.cron.jobs.prefix.test01.success:1|g
-my.cron.jobs.prefix.test01.duration:3|ms|@0.1
+my.cron.jobs.prefix.test01.duration:3|ms
 ```
 
 ### Resource monitoring

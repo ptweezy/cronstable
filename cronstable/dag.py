@@ -1441,8 +1441,8 @@ def mark_task_finished(
 
     A sensor whose poke exited non-zero is rescheduled (``nextPokeAt`` bumped)
     rather than failed, until it succeeds or times out.  A failed plain task
-    with retries left is parked ``failed`` with ``nextRetryAt`` set; the next
-    advance re-claims it.  Otherwise the instance is terminal.
+    with retries left is parked ``up_for_retry`` with ``nextRetryAt`` set; the
+    next advance re-claims it.  Otherwise the instance is terminal.
 
     ``resources`` is the finished instance's sampled CPU/memory usage as an
     already-serialised dict (``ResourceUsage.to_dict()``), recorded verbatim

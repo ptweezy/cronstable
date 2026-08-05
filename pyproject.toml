@@ -174,10 +174,6 @@ packages = ["cronstable", "cronstable.web", "cronstable.backends"]
 [tool.setuptools_scm]
 version_file = "cronstable/version.py"
 
-[tool.black]
-line-length = 79
-target_version = ['py310', 'py311', 'py312', 'py313']
-
 [tool.ruff]
 target-version = "py310"
 line-length = 79
@@ -218,8 +214,9 @@ strict_optional = true
 [[tool.mypy.overrides]]
 # The optional-extra deps are imported behind try/except guards (orjson in
 # cronstable._json, uvloop in cronstable.__main__, pynacl in cronstable.push,
-# zeroconf in cronstable.discovery), so a checkout without the extras
-# installed must still type-check cleanly.
+# zeroconf in cronstable.discovery, kubernetes in the leadership backend's
+# official-client fast path), so a checkout without the extras installed must
+# still type-check cleanly.
 module = [
     "orjson",
     "uvloop",
@@ -227,6 +224,21 @@ module = [
     "nacl.*",
     "zeroconf",
     "zeroconf.*",
+    "kubernetes",
+    "kubernetes.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Core runtime deps that ship no py.typed marker (and whose stub packages we
+# deliberately don't add): their surface types as Any, exactly as it always
+# has. This table is the ONLY missing-import allowance; tox -e mypy runs
+# WITHOUT a global --ignore-missing-imports, so a new unresolvable import
+# fails the gate instead of silently typing as Any.
+module = [
+    "strictyaml",
+    "strictyaml.*",
+    "psutil",
 ]
 ignore_missing_imports = true
 

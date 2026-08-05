@@ -1830,6 +1830,28 @@ def test_tui_outcome_mapping_has_exactly_one_home():
         assert hits < 2, "%s outcome ladder outside outcome_key" % where
 
 
+def test_health_colors_cover_the_health_vocabulary():
+    """HEALTH_COLOR replaced three identical inline dicts (jobs table,
+    wallboard tiles, drawer header), the OUTCOME_KEY history repeating
+    itself. Pin the shared map to health()'s real return vocabulary and
+    to inks every palette carries, and fence the inline copies out."""
+    import inspect
+    import re
+
+    # every ("key", "Label") return in health() has a colour, and nothing
+    # in the map is dead vocabulary health() can never produce
+    returns = set(
+        re.findall(r'return \("(\w+)",', inspect.getsource(tui.health))
+    )
+    assert returns == set(tui.HEALTH_COLOR)
+    for ink in set(tui.HEALTH_COLOR.values()):
+        for hue, palette in tui._P.items():
+            assert ink in palette, (hue, ink)
+    # no panel regrows its own copy of the map
+    source = open(tui.__file__, encoding="utf-8").read()
+    assert source.count('"disabled": "off"') == 1
+
+
 def test_dag_state_colors_cover_dag_vocabulary_and_match_web():
     """DAG_STATE_COLOR is the explicit port of the web's ``dstVar``. The
     old spelling-guess ladder handled six strings the engine never emits

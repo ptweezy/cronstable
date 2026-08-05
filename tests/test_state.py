@@ -269,7 +269,7 @@ async def test_records_are_immutable_and_versioned(tmp_path):
     files = [n for n in os.listdir(stream_dir) if n.endswith(".json")]
     assert len(files) == 1
     on_disk = json.loads((open(os.path.join(stream_dir, files[0])).read()))
-    assert on_disk["schemaVersion"] == state.SCHEME_VERSION
+    assert on_disk["schemaVersion"] == state.SCHEMA_VERSION
     assert on_disk["data"] == {"k": "v"}
 
 
@@ -740,7 +740,7 @@ async def test_malformed_record_shape_is_still_quarantined(tmp_path):
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-bad.json"), "w") as fobj:
         json.dump(
-            {"schemaVersion": state.SCHEME_VERSION, "data": "not-a-dict"}, fobj
+            {"schemaVersion": state.SCHEMA_VERSION, "data": "not-a-dict"}, fobj
         )
     assert await backend.list_records("s") == []
     assert "00001-bad.json" not in os.listdir(stream_dir)

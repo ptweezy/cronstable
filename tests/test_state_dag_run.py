@@ -21,6 +21,7 @@ over the loopback endpoint.
 import asyncio
 import datetime
 import json
+import logging
 import sys
 
 import pytest
@@ -1897,7 +1898,11 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path):
         body = await cron._dag.get_run("lf", run_key)
         assert body["tasks"]["a"]["state"] == dag.FAILED
         assert body["tasks"]["a"]["exitCode"] == 127
-        assert body["tasks"]["a"]["failReason"] == "launch error"
+        # the one never-started vocabulary, shared with the start()-blew-up
+        # path (test_subprocess_start_failure_fails_task_cleanly below);
+        # this arm used to say "launch error" while that one said
+        # "launch failed" for the same operator-visible situation.
+        assert body["tasks"]["a"]["failReason"] == "launch failed"
         # b was still launched (and its pid recorded) despite a's failure
         assert body["tasks"]["b"]["state"] in (dag.RUNNING, dag.SUCCESS)
         cron._dag._launch_task = orig
@@ -2020,6 +2025,42 @@ async def test_catch_up_honours_starting_deadline(tmp_path):
         runs = await cron._dag.list_runs("cu", limit=10)
         # only 03:00 is younger than the 1h deadline window
         assert [r["kind"] for r in runs].count("catchup") == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_cap_truncation_is_loud(tmp_path, monkeypatch, caplog):
+    # DAG_MAX_CATCHUP truncating a run-all replay used to be silent, while
+    # the job engine's twin cap (cron.MAX_CATCHUP_OCCURRENCES) warns and
+    # names the escape hatches; dropping a dag's owed runs must be exactly
+    # as loud.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 2)
+        dagcfg = cron.cron_dags["cu"]
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+            await cron._dag._catch_up(dagcfg, now_dt)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 2
+        warned = [
+            r
+            for r in caplog.records
+            if "missed at least 2 runs" in r.getMessage()
+        ]
+        assert warned, "the truncated replay must warn"
+        # run-once coalesces by design: one launch is the contract, so the
+        # cap dropping the older slots is not a truncation worth warning on.
+        caplog.clear()
+        dagcfg1 = cron.cron_dags["cu1"]
+        await cron._dag._create_run(dagcfg1, base, "scheduled")
+        with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+            await cron._dag._catch_up(dagcfg1, now_dt)
+        assert not [
+            r for r in caplog.records if "missed at least" in r.getMessage()
+        ]
     finally:
         await _teardown(cron)
 
