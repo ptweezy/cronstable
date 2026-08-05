@@ -967,6 +967,78 @@ async def test_web_fleet_endpoint_passes_through_gossip_view():
     assert data["nodes"][0]["self"] is True
 
 
+@pytest.mark.asyncio
+async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized():
+    # /fleet rides the same dashboard poll cadence as /jobs while its build is
+    # O(nodes x jobs) with a dict copy per summary entry, so it was the one
+    # fan-out leg with no ETag, no gzip and no shared product: every open tab
+    # paid a full merge and a full uncompressed body on the scheduler's loop.
+    import gzip
+    import json
+
+    import cronstable.cron
+
+    builds = []
+
+    class StubManager:
+        def fleet_view(self):
+            builds.append(1)
+            return {
+                "enabled": True,
+                "backend": "gossip",
+                "node_name": "n",
+                "nodes": [
+                    {
+                        "node_name": "n{}".format(i),
+                        "self": i == 0,
+                        "status": "agreed",
+                        "as_of": "2026-01-01T00:00:00+00:00",
+                        "jobs": {
+                            "job-{}".format(j): {
+                                "running": False,
+                                "enabled": True,
+                                "scheduled_in": 30.0,
+                                "last": None,
+                            }
+                            for j in range(20)
+                        },
+                    }
+                    for i in range(4)
+                ],
+            }
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    first = await cron._web_get_fleet(_Req())
+    assert first.headers["Vary"] == "Accept-Encoding"
+    etag = first.headers["ETag"]
+    # one product shared across the pollers in the window
+    second = await cron._web_get_fleet(_Req())
+    assert len(builds) == 1
+    assert second.body == first.body
+    # a matching validator -> bodyless 304, so a poll of an unchanged fleet
+    # costs headers only
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    not_modified = await cron._web_get_fleet(req)
+    assert not_modified.status == 304
+    assert not_modified.headers["ETag"] == etag
+    # ... and a weak validator or a list still matches (_etag_matches)
+    req.headers = {"If-None-Match": 'W/{}, "other"'.format(etag)}
+    assert (await cron._web_get_fleet(req)).status == 304
+    # gzip for a capable client, same bytes underneath
+    req.headers = {"Accept-Encoding": "gzip"}
+    zipped = await cron._web_get_fleet(req)
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert len(zipped.body) < len(first.body)
+    assert json.loads(gzip.decompress(zipped.body))["enabled"] is True
+    # a local change renders on the next poll rather than waiting out the TTL
+    cron._bust_response_memos()
+    await cron._web_get_fleet(_Req())
+    assert len(builds) == 2
+
+
 def test_lease_backend_seam_defaults_for_fleet():
     # the ABC defaults: no summaries channel (set_provider is a no-op that
     # must still accept the scheduler's install call) and no fleet view.
@@ -3508,6 +3580,85 @@ async def test_handle_peer_includes_quorate_vouched(no_tls):
 
 
 @pytest.mark.asyncio
+async def test_handle_peer_caps_quorate_vouched(no_tls):
+    # quorate_vouched is the one re-advertised set built entirely from ABSORBED
+    # peer data (_bridge_candidates folds a peer's mutual_agreeing), so without
+    # a cap one inflated upstream peer walks OUR /peer body past
+    # MAX_PEER_RESPONSE_BYTES, and honest peers reject an oversized response,
+    # record_failure us and drop us from their agreeing sets. Cluster-wide
+    # availability loss from one peer's gossip.
+    from cronstable.cluster import (
+        MAX_ADVERTISED_CANDIDATE_NAMES,
+        MAX_PEER_RESPONSE_BYTES,
+    )
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # what a peer parsed at MAX_MEMBER_ENTRIES x MAX_PEER_FIELD_LEN can hand
+    # us: far more names, each far longer, than any real fleet has.
+    flood = {"n{:04d}".format(i) + "x" * 200 for i in range(4096)}
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    bridged = mgr._bridge_candidates()
+    assert len(bridged) == MAX_ADVERTISED_CANDIDATE_NAMES
+    # sorted before slicing: the surviving prefix is the same on every node
+    # (the election needs one shared view) and holds the LOWEST names, which
+    # is what elect_leader's min() reads, so the cap cannot change it.
+    assert bridged == sorted(flood)[:MAX_ADVERTISED_CANDIDATE_NAMES]
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(payload["quorate_vouched"]) <= MAX_ADVERTISED_CANDIDATE_NAMES
+    assert len(resp.body) <= MAX_PEER_RESPONSE_BYTES
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
+    no_tls, monkeypatch
+):
+    # Last-resort degradation: every re-advertised set is capped individually,
+    # so this should be unreachable (the byte cap is patched down here to reach
+    # it at all). If a body ever DOES exceed the cap, shipping it is the worst
+    # outcome: pollers cap the read, record us oversized and drop us from
+    # their quorum, so one over-budget field costs this node its place in the
+    # cluster. Drop the observability-only job_summaries block instead, so
+    # every election-relevant field still travels.
+    import cronstable.cluster as cluster_mod
+
+    monkeypatch.setattr(cluster_mod, "MAX_PEER_RESPONSE_BYTES", 4096)
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "job-{:03d}".format(i): {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": 5.0,
+                "last": {
+                    "outcome": "success",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "exit_code": 0,
+                },
+            }
+            for i in range(64)
+        }
+    )
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(resp.body) <= 4096
+    assert payload["job_summaries"] == {}
+    assert payload["job_summaries_truncated"] is True
+    # the election-relevant fields still travel
+    assert payload["node_name"] == "node-a"
+    assert payload["cluster_size"] == 1
+    # and the ETag is of the body we actually sent, so a poller echoing it
+    # gets a 304 for the degraded body it really holds, not the full one.
+    req = _Req()
+    req.headers = {"If-None-Match": resp.headers["ETag"]}
+    assert (await mgr._handle_peer(req)).status == 304
+
+
+@pytest.mark.asyncio
 async def test_poll_peer_round_trips_quorate_vouched(no_tls):
     # end to end: a polled quorate_vouched is parsed, stored, and drives the
     # spread Leader owner fold. node-a (spread) polls node-c, which vouches a
@@ -4250,6 +4401,89 @@ def test_parse_str_list_drops_control_char_entries():
         ["ok-job", "bad\njob", "null\x00job"], max_len=128, max_items=64
     )
     assert out == {"ok-job"}
+
+
+def test_parse_str_list_drops_the_empty_string():
+    # The empty string clears every other guard here ("".isprintable() is True
+    # and len("") is under any cap) but sorts BELOW every real node name, so
+    # one folded into mutual_agreeing makes elect_leader's min() return '' on
+    # every node that witnesses it: nobody is leader and every Leader job
+    # stops firing cluster-wide, with the view still reporting quorate.
+    out = _parse_str_list(["", "ok-job"], max_len=128, max_items=64)
+    assert out == {"ok-job"}
+
+
+def test_parse_members_drops_empty_name_or_instance():
+    # same input class as above, on the members list.
+    out = _parse_members(
+        [
+            {"node_name": "", "instance_id": "abc", "agreed": True},
+            {"node_name": "node-b", "instance_id": "", "agreed": True},
+            {"node_name": "node-c", "instance_id": "ic", "agreed": True},
+        ],
+        max_len=256,
+        max_items=64,
+    )
+    assert out == [("node-c", "ic", True)]
+
+
+def test_bridge_candidates_reject_an_empty_name(no_tls):
+    # the same guard at the fold, so the three peer folds (_bridge_candidates,
+    # _unconfirmed_contenders, _available_contenders) read identically and a
+    # future parser change cannot single this one out. Seeded directly, i.e.
+    # past the parse boundary.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # N=2, quorum 2: one witness plus the node itself is enough to confirm a
+    # bridge candidate, so an unguarded '' would be elected here.
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", ""})
+    assert mgr._bridge_candidates() == []
+    assert "" not in mgr._eligible_candidates()
+    assert mgr.leader_name() == "node-a"
+    assert mgr.is_leader()
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_empty_name_never_stands_the_cluster_down(no_tls):
+    # end to end: a peer gossiping "" in mutual_agreeing must not elect '' as
+    # leader (no node matches it, so every Leader job stops firing while
+    # /cluster still reports quorate and conflict-free).
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    me = {
+        "node_name": "node-a",
+        "instance_id": mgr.instance_id,
+        "agreed": True,
+    }
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "ib",
+                    "members": [
+                        me,
+                        {
+                            "node_name": "node-b",
+                            "instance_id": "ib",
+                            "agreed": True,
+                        },
+                    ],
+                    "mutual_agreeing": ["node-a", ""],
+                    "quorate_vouched": ["node-a", ""],
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].mutual_agreeing == {"node-a"}
+    assert mgr.view.peers["b:1"].quorate_vouched == {"node-a"}
+    assert mgr.leader_name() == "node-a"
+    assert mgr.is_leader()
 
 
 # --------------------------------------------------------------------------

@@ -517,16 +517,36 @@ class StreamReader:
         save_bottom = self.save_bottom
         discarded = self.discarded_lines
         # Bytes after the last newline seen: not a line until the next
-        # chunk (or EOF) terminates it.
-        tail = b""
+        # chunk (or EOF) terminates it.  Held as the LIST of chunks that have
+        # gone by unterminated, plus their running length, and joined exactly
+        # once, when a newline finally terminates it or at EOF.  It used
+        # to be one bytes object rebuilt as `tail + chunk` per read, which
+        # made an unterminated run quadratic on the event-loop thread: with
+        # _READ_CHUNK at 64 KiB and maxLineLength defaulting to 16 MiB, a job
+        # emitting a progress bar, a binary blob or a stuck writer's output
+        # paid ~256 growing memcpys, each up to the full cap, before the
+        # over-cap drop below could even look at it.
+        tail_parts: List[bytes] = []
+        tail_len = 0
         while True:
             chunk = await stream.read(_READ_CHUNK)
             if chunk:
-                if tail:
-                    chunk = tail + chunk
+                buffered = tail_len + len(chunk)
                 parts = chunk.split(b"\n")
-                tail = parts.pop()
-                if len(chunk) > cap:
+                rest = parts.pop()
+                if parts:
+                    # a newline in this chunk terminates the carried tail:
+                    # join it onto the first segment, once.
+                    if tail_parts:
+                        parts[0] = b"".join(tail_parts) + parts[0]
+                    tail_parts = [rest]
+                    tail_len = len(rest)
+                else:
+                    # no newline at all: carry the chunk without copying
+                    # anything that came before it.
+                    tail_parts.append(rest)
+                    tail_len = buffered
+                if buffered > cap:
                     # A segment can never be longer than the buffer it was
                     # cut from, so the per-line cap check is only reachable
                     # once the buffer itself has passed the cap: one
@@ -538,8 +558,10 @@ class StreamReader:
                     raw.decode("utf-8", errors="replace") + "\n"
                     for raw in parts
                 ]
-            elif tail and not self._too_long(tail, cap):
-                lines = [tail.decode("utf-8", errors="replace")]
+            elif tail_len and not self._over_cap(tail_len, cap):
+                lines = [
+                    b"".join(tail_parts).decode("utf-8", errors="replace")
+                ]
             else:
                 lines = []
             for line in lines:
@@ -568,15 +590,22 @@ class StreamReader:
                 # already-scheduled callback then finds an empty buffer).
                 self._flush_emit_buffer()
                 return
-            if self._too_long(tail, cap):
+            if self._over_cap(tail_len, cap):
                 # An unterminated run past the cap. Drop what has piled up
                 # and keep reading: the readuntil limit cleared its buffer
-                # and carried on in exactly the same way.
-                tail = b""
+                # and carried on in exactly the same way.  Measured on the
+                # running length, so an over-cap run is dropped without ever
+                # being joined into one buffer.
+                tail_parts = []
+                tail_len = 0
 
     def _too_long(self, raw: bytes, cap: int) -> bool:
         """Whether ``raw`` breaks the line cap, warning once when it does."""
-        if len(raw) <= cap:
+        return self._over_cap(len(raw), cap)
+
+    def _over_cap(self, size: int, cap: int) -> bool:
+        """:meth:`_too_long` on a length alone, for the unjoined tail."""
+        if size <= cap:
             return False
         logger.warning("job %s: ignored a very long line", self.job_name)
         return True

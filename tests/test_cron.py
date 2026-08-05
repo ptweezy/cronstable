@@ -1424,7 +1424,7 @@ async def test_web_list_jobs_etag_304_and_invalidation():
     cron._next_fire["alpha"] = (
         when or DT(2000, 1, 1, tzinfo=UTC)
     ) + datetime.timedelta(hours=1)
-    cron._bust_jobs_response_cache()
+    cron._bust_response_memos()
     changed = await cron._web_list_jobs(req(etag))
     assert changed.status == 200
     assert changed.headers["ETag"] != etag
@@ -8802,6 +8802,51 @@ def test_catchup_sleep_interval_capped_by_dag_wake(monkeypatch):
     cron = cronstable.cron.Cron(None)
     monkeypatch.setattr(cron._dag, "next_wake_delay", lambda: 0.3)
     assert cron._sleep_interval() == pytest.approx(0.3)
+
+
+def test_dag_wake_counts_as_a_subminute_tick(monkeypatch):
+    # run()'s housekeeping gate consulted only the CRON job set, but
+    # _sleep_interval shortens the sleep for the DAG orchestrator too
+    # (next_wake_delay always carries a 20s schedule check and a 5s approval
+    # poll, and floors at 0.2s while an advance is in flight). A deployment
+    # with DAGs and no second-level cron job therefore woke several times a
+    # minute while answering "not sub-minute", so the gate fell through to its
+    # every-iteration branch and re-ran the whole reload / cluster / web /
+    # push / state / SLA block on every DAG wake, falsifying the "at most
+    # once per wall-clock minute" contract _pause_periodic and _sla_periodic
+    # are documented on.
+    cron = cronstable.cron.Cron(None)
+    assert cron._needs_subminute() is False
+    # nothing has computed a sleep yet, and no DAGs: the pure minute-tick
+    # deployment keeps housekeeping every iteration, exactly as before.
+    assert cron._wakes_subminute() is False
+    monkeypatch.setattr(cron._dag, "next_wake_delay", lambda: 5.0)
+    cron._sleep_interval()
+    assert cron._wakes_subminute() is True
+
+
+def test_dag_wake_that_does_not_shorten_the_sleep_is_not_subminute(
+    monkeypatch,
+):
+    # the flag tracks whether the DAG wake actually WON the min(), not merely
+    # that the orchestrator answered: a hint further out than the next
+    # housekeeping boundary leaves the loop on its minute tick, where
+    # housekeeping every iteration is the documented behaviour.
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 10.0
+    )
+    cron = cronstable.cron.Cron(None)
+    monkeypatch.setattr(cron._dag, "next_wake_delay", lambda: 30.0)
+    assert cron._sleep_interval() == pytest.approx(10.0)
+    assert cron._wakes_subminute() is False
+
+
+def test_subminute_cron_job_still_gates_housekeeping_without_dags():
+    # the original predicate is untouched: a second-level cron job alone still
+    # puts the loop in sub-minute mode with no DAGs in sight.
+    cron = cronstable.cron.Cron(None, config_yaml=_SUBMINUTE_NOFIRE)
+    assert cron._needs_subminute() is True
+    assert cron._wakes_subminute() is True
 
 
 def test_catchup_due_names_dedupes_duplicate_live_entries():

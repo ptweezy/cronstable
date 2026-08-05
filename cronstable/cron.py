@@ -1227,6 +1227,28 @@ _GC_QUIET_RELOAD_MIN = 5000
 #: small deployment's scrape stays inline.
 _METRICS_OFFLOAD_MIN_JOBS = 250
 
+#: How long one rendered ``GET /metrics`` product (body plus gzip, per
+#: exposition format) is shared across scrapers before it is rebuilt.  This
+#: is the largest payload the daemon serves, and its build is the whole
+#: metric universe: without the memo, N scrapers (a Prometheus pair plus an
+#: agent, a federation puller, a human with curl) each pay a full family
+#: build on the event loop.  The memo makes that at most one build per this
+#: window however many scrapers land together.  A sub-second-stale body is
+#: safe because Prometheus timestamps a sample at SCRAPE time, so re-serving
+#: a body built up to a second earlier is indistinguishable from the scrape
+#: having arrived a second earlier, the same argument the /jobs and /peer
+#: memos make.  A scraper on a normal 15s interval never hits the memo at
+#: all; it is the simultaneous-scrapers case this exists for.
+_METRICS_RESPONSE_TTL = 1.0
+
+#: How long one built ``GET /fleet`` product is shared across pollers.  The
+#: build is O(nodes x jobs) with a dict copy per entry and every dashboard
+#: tab polls it on the same cadence as /jobs, which is memoized for exactly
+#: this reason.  The payload is peer gossip already up to a poll interval
+#: old by the time it reaches us, so a further second of sharing changes
+#: nothing a viewer can observe.
+_FLEET_RESPONSE_TTL = 1.0
+
 
 def _etag_matches(header: Optional[str], etag: str) -> bool:
     """Whether an ``If-None-Match`` header carries ``etag``.
@@ -1401,6 +1423,55 @@ def _cachable_json_response(
         headers=hdrs,
         content_type="application/json",
     )
+
+
+def _cachable_json_product(
+    payload: Any,
+) -> Tuple[str, bytes, Optional[bytes]]:
+    """A memoized JSON endpoint's product: ETag, body, and gzipped body.
+
+    The plain-shaped sibling of :func:`_jobs_response_product`, for a payload
+    whose serialized form already changes exactly when the displayed data
+    does, so the tag can simply hash the body bytes.  Hashing the bytes we
+    actually send means a 304 is served only when the representation is
+    byte-identical: there is no canonical projection to get wrong, and no way
+    for a live reading embedded in the payload to freeze behind a stale tag.
+
+    Built once per memo window rather than per request, so the digest and the
+    compression are paid once however many pollers land in that window.
+    """
+    try:
+        body = _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        body = json.dumps(payload, default=str).encode("utf-8")
+    etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
+    gz = _gzip_body(body) if len(body) >= _GZIP_MIN_BYTES else None
+    return etag, body, gz
+
+
+def _metrics_response_product(
+    render: Callable[..., str],
+    families: Any,
+    openmetrics: bool,
+) -> Tuple[bytes, Optional[bytes]]:
+    """The full /metrics response product: body bytes and gzipped body.
+
+    Pure over ``families`` (a freshly built list referenced by nobody else,
+    see :meth:`cronstable.prometheus.Metrics.families`), so a large job set
+    runs the whole thing on an executor (render AND compression, in one
+    thread hop rather than two).
+
+    The gzip is the point.  Exposition text is the same handful of metric
+    names and label blocks repeated once per job, which is close to the best
+    case for deflate: at 10,000 jobs the 22.0 MB body compresses to 1.32 MB
+    at level 1, a 16.7x reduction for about 7 ms of CPU that zlib spends with
+    the GIL released.  Prometheus advertises gzip on every scrape, so this is
+    the largest recurring payload the daemon serves and was the only large
+    one shipping uncompressed.  ``None`` below the floor, exactly as
+    :func:`_jobs_response_product` does it.
+    """
+    body = render(families, openmetrics=openmetrics).encode("utf-8")
+    return body, _gzip_body(body) if len(body) >= _GZIP_MIN_BYTES else None
 
 
 def _sse_frame(stream_name: str, line: str) -> bytes:
@@ -1722,8 +1793,20 @@ class Cron:
         # launches share it); see _SPAWN_BURST_LIMIT for the why.
         self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
         # the shared GET /jobs product: (loop.time stamp, etag, body, gz).
-        # See _JOBS_RESPONSE_TTL and _bust_jobs_response_cache.
+        # See _JOBS_RESPONSE_TTL and _bust_response_memos.
         self._jobs_response_cache: Optional[
+            Tuple[float, str, bytes, Optional[bytes]]
+        ] = None
+        # the shared GET /metrics product, per exposition format:
+        # openmetrics flag -> (loop.time stamp, body, gz). Two entries at
+        # most, so a deployment scraped in both formats memoizes both rather
+        # than thrashing one slot. See _METRICS_RESPONSE_TTL.
+        self._metrics_response_cache: Dict[
+            bool, Tuple[float, bytes, Optional[bytes]]
+        ] = {}
+        # the shared GET /fleet product: (loop.time stamp, etag, body, gz).
+        # See _FLEET_RESPONSE_TTL.
+        self._fleet_response_cache: Optional[
             Tuple[float, str, bytes, Optional[bytes]]
         ] = None
         # active runtime pauses by job name (POST /jobs/{name}/pause). The
@@ -2124,6 +2207,12 @@ class Cron:
         # holds a back-reference to this Cron and reuses its state/lease/launch
         # seams. Constructed here (cheaply) so every code path has it.
         self._dag = DagScheduler(self)
+        # Whether the last _sleep_interval() was shortened by a DAG wake, i.e.
+        # whether this loop is currently ticking sub-minute for the
+        # orchestrator's sake. run()'s housekeeping gate reads it through
+        # _wakes_subminute; False until the first sleep is computed, which is
+        # the safe direction (the startup pass housekeeps unconditionally).
+        self._dag_shortens_sleep = False
 
     async def run(self) -> None:
         self._wait_for_running_jobs_task = asyncio.create_task(
@@ -2140,9 +2229,10 @@ class Cron:
             # reparsing the config 60 times a minute would be pointless IO/CPU,
             # so gate it: config-reload latency stays ~1 minute, exactly as in
             # the minute-tick era. In pure minute-tick mode (no second-level
-            # job) `not self._needs_subminute()` forces housekeeping every
-            # iteration, so behaviour there is byte-identical to before, and
-            # a frozen-clock test still reloads every loop.
+            # job and no DAG shortening the sleep) `not _wakes_subminute()`
+            # forces housekeeping every iteration, so behaviour there is
+            # byte-identical to before, and a frozen-clock test still reloads
+            # every loop.
             now_minute = get_now(datetime.timezone.utc).replace(
                 second=0, microsecond=0
             )
@@ -2153,7 +2243,7 @@ class Cron:
             config: Optional[CronstableConfig] = None
             if (
                 startup
-                or not self._needs_subminute()
+                or not self._wakes_subminute()
                 or now_minute != self._last_housekeeping_minute
             ):
                 self._last_housekeeping_minute = now_minute
@@ -2606,7 +2696,7 @@ class Cron:
             if name in keep
         }
         # the job set itself changed: the shared /jobs product is stale
-        self._bust_jobs_response_cache()
+        self._bust_response_memos()
         # Pause state survives a job-config edit (deliberately no digest
         # check, unlike retries: the operator paused the NAME, not one
         # definition of it); only a job the reload removed is pruned.
@@ -2822,10 +2912,44 @@ class Cron:
         no cluster, or the backend has no node-to-node channel to have
         carried summaries (a lease backend without the observability
         overlay); the dashboard then hides its fleet view.
+
+        Conditional, compressed and memoized like the other legs of the poll
+        fan-out.  This one was the outlier: it rides the same dashboard poll
+        cadence as ``/jobs`` while its build is O(nodes x jobs) with a dict
+        copy per summary entry, so every open tab paid a full merge, a full
+        serialization and a full uncompressed body on the scheduler's loop.
+        The memo shares one product across the pollers in a window
+        (:data:`_FLEET_RESPONSE_TTL`); the ETag hashes the bytes actually
+        sent, so a 304 fires only when the representation is byte-identical
+        and a live per-node reading can never freeze behind a stale tag.
         """
         assert self.web_config is not None
-        return _json_response(
-            self.fleet_payload(), headers=self._web_headers()
+        inm = request.headers.get("If-None-Match")
+        gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cache = self._fleet_response_cache
+        if cache is None or now - cache[0] >= _FLEET_RESPONSE_TTL:
+            cache = (now, *_cachable_json_product(self.fleet_payload()))
+            self._fleet_response_cache = cache
+        _mono, etag, body, gz = cache
+        base = self._web_headers()
+        headers: Dict[str, str] = dict(base) if base else {}
+        headers["ETag"] = etag
+        # on EVERY representation, compressed or not: a shared cache that
+        # missed this would hand a gzipped body to a client that cannot read
+        # one.
+        headers["Vary"] = "Accept-Encoding"
+        if _etag_matches(inm, etag):
+            return web.Response(status=304, headers=headers)
+        if gzip_ok and gz is not None:
+            headers["Content-Encoding"] = "gzip"
+            body = gz
+        return web.Response(
+            body=body,
+            status=200,
+            headers=headers,
+            content_type="application/json",
         )
 
     def fleet_payload(self) -> Dict[str, Any]:
@@ -2918,24 +3042,36 @@ class Cron:
         assert self.web_config is not None
         accept = request.headers.get("Accept", "")
         openmetrics = "application/openmetrics-text" in accept
-        # The family build reads live scheduler state, so it stays on the
-        # loop; the render is pure over that freshly-built list, so a large
-        # job set does it on the executor (see _METRICS_OFFLOAD_MIN_JOBS),
-        # like the calendar builder.
-        families = self.metrics.families(self)
-        if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
-            body = await asyncio.get_running_loop().run_in_executor(
-                None,
-                partial(
-                    self.metrics.render_prepared,
-                    families,
-                    openmetrics=openmetrics,
-                ),
-            )
-        else:
-            body = self.metrics.render_prepared(
-                families, openmetrics=openmetrics
-            )
+        gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
+        # One product (family build + render + gzip) is shared across every
+        # scraper for _METRICS_RESPONSE_TTL, per exposition format. Only the
+        # representation pick below is per-request.
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        cache = self._metrics_response_cache.get(openmetrics)
+        if cache is None or now - cache[0] >= _METRICS_RESPONSE_TTL:
+            # The family build reads live scheduler state, so it stays on the
+            # loop; the render and the compression are pure over that
+            # freshly-built list, so a large job set does both on the executor
+            # (see _METRICS_OFFLOAD_MIN_JOBS), like the calendar builder.
+            families = self.metrics.families(self)
+            if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+                body, gz = await loop.run_in_executor(
+                    None,
+                    partial(
+                        _metrics_response_product,
+                        self.metrics.render_prepared,
+                        families,
+                        openmetrics,
+                    ),
+                )
+            else:
+                body, gz = _metrics_response_product(
+                    self.metrics.render_prepared, families, openmetrics
+                )
+            cache = (now, body, gz)
+            self._metrics_response_cache[openmetrics] = cache
+        _mono, body, gz = cache
         headers = {}  # type: Dict[str, str]
         custom = self._web_headers()
         if custom:
@@ -2951,7 +3087,14 @@ class Cron:
         headers["Content-Type"] = (
             CONTENT_TYPE_OPENMETRICS if openmetrics else CONTENT_TYPE_TEXT
         )
-        return web.Response(body=body.encode("utf-8"), headers=headers)
+        # on EVERY representation, compressed or not: a shared cache that
+        # missed this would hand a gzipped body to a client that cannot read
+        # one.
+        headers["Vary"] = "Accept-Encoding"
+        if gzip_ok and gz is not None:
+            headers["Content-Encoding"] = "gzip"
+            body = gz
+        return web.Response(body=body, headers=headers)
 
     def status_payload(self) -> List[Dict[str, Any]]:
         """Per-job status rows (running / disabled / scheduled).
@@ -4214,7 +4357,7 @@ class Cron:
             # so the stretch the two windows share is not credited twice.
             self._sla_bank_pause(name, replaced, now)
         self._paused[name] = info
-        self._bust_jobs_response_cache()
+        self._bust_response_memos()
         # the job is excused from here on: drop any breach it latched while it
         # was still being evaluated, so the late gauge, the /jobs sla block and
         # the OVERDUE chip clear on this response rather than a minute later.
@@ -4316,7 +4459,7 @@ class Cron:
         for name, info in list(self._paused.items()):
             if info.until <= now:
                 del self._paused[name]
-                self._bust_jobs_response_cache()
+                self._bust_response_memos()
                 self._sla_bank_pause(name, info, info.until)
                 self.metrics.job_pause_state(name, False)
                 logger.info(
@@ -4428,7 +4571,7 @@ class Cron:
                     # the old one already held (see _sla_bank_pause).
                     self._sla_bank_pause(name, known, now)
                 self._paused[name] = info
-                self._bust_jobs_response_cache()
+                self._bust_response_memos()
                 self.metrics.job_pause_state(name, True)
                 if known is None or known.until != info.until:
                     logger.info(
@@ -5356,7 +5499,7 @@ class Cron:
         gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
         # One product (payload build + ETag + body + gzip) is shared across
         # every poller for _JOBS_RESPONSE_TTL, busted by the local events
-        # that change the payload (_bust_jobs_response_cache): N dashboard
+        # that change the payload (_bust_response_memos): N dashboard
         # tabs used to cost N identical builds per poll cycle. Only the
         # If-None-Match compare and the representation pick are per-request.
         loop = asyncio.get_running_loop()
@@ -5400,15 +5543,26 @@ class Cron:
             content_type="application/json",
         )
 
-    def _bust_jobs_response_cache(self) -> None:
-        """Drop the shared /jobs product so a local change renders now.
+    def _bust_response_memos(self) -> None:
+        """Drop the shared endpoint products so a local change renders now.
 
-        Called from exactly the events that change the payload on THIS
+        Called from exactly the events that change the payloads on THIS
         node: a run recorded, a launch (the ``running`` flag), a pause set
         or cleared, and a reload.  Everything else (live resource samples,
-        a fire advancing) ages out within :data:`_JOBS_RESPONSE_TTL`.
+        a fire advancing, a counter ticking) ages out within the respective
+        TTL.
+
+        All three memoized read endpoints are busted together because all
+        three render the same local facts: ``/jobs`` shows the run and pause
+        state directly, ``/metrics`` exports it as ``cronstable_job_paused``
+        and the run counters, and ``/fleet`` carries this node's own job
+        summaries alongside its peers'.  Busting only one would leave an
+        operator watching a dashboard and a scrape that disagree about a
+        pause they just applied.
         """
         self._jobs_response_cache = None
+        self._metrics_response_cache.clear()
+        self._fleet_response_cache = None
 
     def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
         """The configured web response headers plus the ``/jobs`` ETag."""
@@ -8148,6 +8302,28 @@ class Cron:
             self._needs_subminute_cache = cached
         return cached
 
+    def _wakes_subminute(self) -> bool:
+        """Whether this loop is waking more often than once a minute.
+
+        The predicate :meth:`run`'s housekeeping gate actually wants.
+        :meth:`_needs_subminute` answers it for the CRON job set only, but
+        :meth:`_sleep_interval` shortens the sleep for the DAG orchestrator
+        too: ``next_wake_delay`` always carries a 20 s schedule check and a
+        5 s approval poll, and floors at 0.2 s while an advance is in flight.
+        A deployment with DAGs and no second-level cron job therefore woke
+        several times a minute while answering "not sub-minute", so the gate
+        fell through to its every-iteration branch and the whole reload /
+        cluster / web / push / state / SLA block ran on every DAG wake --
+        falsifying the "at most once per wall-clock minute" contract
+        :meth:`_pause_periodic` and :meth:`_sla_periodic` are documented on.
+
+        Reads the flag :meth:`_sleep_interval` set when it computed the sleep
+        this wake came out of, rather than re-querying the orchestrator: the
+        question is "was the sleep I just finished a shortened one", which is
+        exactly what that flag records, and it costs nothing.
+        """
+        return self._needs_subminute() or self._dag_shortens_sleep
+
     def _job_pos(self) -> Dict[str, int]:
         """Job name -> its position in the loaded config.
 
@@ -8358,9 +8534,19 @@ class Cron:
         # owns it rewrites the entry, so an unfloored hint spins the loop (and
         # the whole housekeeping block with it) for that pass's entire
         # duration rather than waking it once.
+        #
+        # Whether it actually shortened the sleep is recorded for run()'s
+        # housekeeping gate (see _wakes_subminute): the gate used to consult
+        # only the CRON job set, so a deployment with DAGs and no second-level
+        # cron job answered "not sub-minute" and re-ran the whole reload /
+        # cluster / web / state / SLA block on every DAG wake.
+        self._dag_shortens_sleep = False
         dag_wake = self._dag.next_wake_delay()
         if dag_wake is not None:
-            housekeeping = min(housekeeping, max(MIN_TICK_SLEEP, dag_wake))
+            dag_wake = max(MIN_TICK_SLEEP, dag_wake)
+            if dag_wake < housekeeping:
+                housekeeping = dag_wake
+                self._dag_shortens_sleep = True
         soonest = self._peek_soonest_fire()
         if soonest is None:
             return housekeeping
@@ -10180,7 +10366,7 @@ class Cron:
         first_instance = not self.running_jobs.get(job.name)
         self.running_jobs[job.name].append(running_job)
         # the payload's `running` flag just flipped on this node
-        self._bust_jobs_response_cache()
+        self._bust_response_memos()
         # every actual launch (scheduled, manual, catch-up, retry) clears
         # the lateAfter breach condition (see _sla_periodic).
         self._sla_last_start[job.name] = get_now(datetime.timezone.utc)
@@ -11236,7 +11422,7 @@ class Cron:
         # for the job rather than serve it stale out to the TTL; same for
         # the shared /jobs product (last_run and the history slice moved).
         self._trends_cache.pop(name, None)
-        self._bust_jobs_response_cache()
+        self._bust_response_memos()
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
         self.metrics.job_run_recorded(

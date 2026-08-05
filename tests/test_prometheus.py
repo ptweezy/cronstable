@@ -907,6 +907,11 @@ async def test_web_metrics_handler_reports_pause_state():
     assert "cronstable_job_late" not in text
     assert "cronstable_job_sla_breaches" not in text
     cron.metrics.job_pause_state("alpha", True)
+    # the scrape response is memoized for _METRICS_RESPONSE_TTL; the real
+    # pause paths push the state AND bust the memo in the same breath (see
+    # _bust_response_memos), which is what makes a pause render on the very
+    # next scrape rather than up to a second later.
+    cron._bust_response_memos()
     resp = await cron._web_metrics(FakeRequest())
     text = resp.body.decode("utf-8")
     assert sample_value(text, "cronstable_job_paused", job_name="alpha") == 1
@@ -937,6 +942,72 @@ async def test_web_metrics_handler_merges_operator_headers():
     # the exposition content type is the endpoint's contract: it wins over
     # an operator-configured Content-Type (unlike the other handlers).
     assert resp.headers["Content-Type"] == CONTENT_TYPE_TEXT
+
+
+@pytest.mark.asyncio
+async def test_web_metrics_gzips_for_a_capable_scraper():
+    # exposition text is the same metric names and label blocks repeated once
+    # per job, so it compresses roughly 17x; Prometheus advertises gzip on
+    # every scrape and this was the only large endpoint shipping uncompressed.
+    import gzip
+
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    plain = await cron._web_metrics(FakeRequest())
+    assert "Content-Encoding" not in plain.headers
+    assert plain.headers["Vary"] == "Accept-Encoding"  # on both representations
+    zipped = await cron._web_metrics(
+        FakeRequest({"Accept-Encoding": "gzip, deflate"})
+    )
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert zipped.headers["Vary"] == "Accept-Encoding"
+    assert zipped.headers["Content-Type"] == CONTENT_TYPE_TEXT
+    assert len(zipped.body) < len(plain.body)
+    assert gzip.decompress(zipped.body) == plain.body
+
+
+@pytest.mark.asyncio
+async def test_web_metrics_gzip_declined_when_client_says_q0():
+    # "gzip;q=0" is the wire spelling for "explicitly NOT gzip"; a substring
+    # test would compress for a client that cannot read it.
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    resp = await cron._web_metrics(FakeRequest({"Accept-Encoding": "gzip;q=0"}))
+    assert "Content-Encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_web_metrics_shares_one_build_across_simultaneous_scrapers():
+    # N scrapers landing together used to each rebuild the whole metric
+    # universe on the event loop. One build is shared for the memo window;
+    # a local change busts it (see _bust_response_memos).
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    builds = []
+    real = cron.metrics.families
+
+    def counting(target):
+        builds.append(1)
+        return real(target)
+
+    cron.metrics.families = counting
+    first = await cron._web_metrics(FakeRequest())
+    second = await cron._web_metrics(FakeRequest())
+    assert len(builds) == 1
+    assert first.body == second.body
+    # the two exposition formats are memoized independently rather than
+    # thrashing one slot.
+    await cron._web_metrics(
+        FakeRequest({"Accept": "application/openmetrics-text"})
+    )
+    assert len(builds) == 2
+    await cron._web_metrics(
+        FakeRequest({"Accept": "application/openmetrics-text"})
+    )
+    assert len(builds) == 2
+    cron._bust_response_memos()
+    await cron._web_metrics(FakeRequest())
+    assert len(builds) == 3
 
 
 @pytest.mark.asyncio

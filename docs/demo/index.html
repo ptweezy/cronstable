@@ -10953,13 +10953,35 @@ var qrcode = function() {
     } catch (e) { if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Stream ended: " + e.message); }
   }
   function stopDagTaskLog() { if (state.dagStream) { state.dagStream.abort(); state.dagStream = null; } }
+  // One line into the DAG task-log pane, on the same infrastructure the job
+  // log pane uses. This path used to read scrollHeight (a forced synchronous
+  // layout of the whole buffered block) and then do `textContent += text` per
+  // line (both O(buffer) per line), and applied no MAX_LOG_LINES cap at
+  // all, so a chatty task grew the pane without bound while getting quadratic
+  // on the way there. followBottom keeps the "reader scrolled away" bit from a
+  // passive scroll listener and coalesces the pin into one write per frame,
+  // and the cap trims the oldest NODE rather than rebuilding the view; see
+  // followBottom / appendLine. Per-line spans carry the stream so stderr reads
+  // the same red it does in every other terminal pane.
+  function appendDagLogLine(stream, text) {
+    const t = $("dgTerm"); if (!t) return;
+    // childElementCount is O(1) and self-healing: the pane is rebuilt by
+    // renderDagLogs and cleared on a task switch, so counting the live nodes
+    // beats carrying a counter that can drift out of step with them.
+    if (t.childElementCount >= MAX_LOG_LINES) { const first = t.firstElementChild; if (first) first.remove(); }
+    t.insertAdjacentHTML("beforeend", '<span class="ln ' + escAttr(stream || "") + '">' + esc(text) + "</span>");
+    followBottom(t, true, false);
+  }
   function startDagTaskLog(taskkey) {
     // idempotent: already tailing this exact task on a live stream -> no-op,
     // so a re-render can never blank/reconnect an active tail.
     if (state.dagStream && state.dagDrawer.logTask === taskkey) return;
     stopDagTaskLog();
     state.dagDrawer.logTask = taskkey;
-    const term = $("dgTerm"); if (term) term.textContent = "";
+    // reset the follow bit with the buffer, exactly as renderTerm does: the
+    // pane element can outlive a task switch, and a stale "reader scrolled
+    // away" bit would leave the fresh tail unpinned.
+    const term = $("dgTerm"); if (term) { term.textContent = ""; follower(term).at = true; }
     const note = $("dgLogNote"); if (note) note.textContent = "connecting…";
     const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
     if (!dag || !rk || !taskkey) return;
@@ -10969,10 +10991,7 @@ var qrcode = function() {
     state.dagStream = ctrl;
     readSSE(path, ctrl, {
       line: (stream, text) => {
-        const t = $("dgTerm"); if (!t) return;
-        const atBottom = t.scrollTop + t.clientHeight >= t.scrollHeight - 4;
-        t.textContent += text + "\n";
-        if (atBottom) t.scrollTop = t.scrollHeight;
+        appendDagLogLine(stream, text);
         const n = $("dgLogNote"); if (n) n.textContent = "";
       },
       end: (saw, reason) => { const n = $("dgLogNote"); if (n) n.textContent = saw ? "stream ended" : (reason === "no-output" ? "no live output (task is not running)" : "no output"); },
