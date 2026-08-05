@@ -122,6 +122,65 @@ def _load_bench():
     return mod
 
 
+def test_yaml_parse_is_gated_above_the_quadratic_threshold(monkeypatch):
+    # Config parsing was quadratic in the job count for the whole life of the
+    # project: strictyaml's vendored CommentedSeq.__deepcopy__ calls
+    # copy_attributes INSIDE its element loop, and jobs: is the one big
+    # sequence a config has, so it paid the entire bill (8k jobs took 49.6s;
+    # the hoisted call takes 3.7s). The suite never saw it, because the only
+    # YAML parse metric measured 300 jobs, where the linear term still
+    # dominates: the same slip showed there as 0.161s against 0.117s, next to
+    # 6.27s against 1.18s at 3k on the same machine.
+    #
+    # What has to survive is the SIZE, not a benchmark id. Some gated parse
+    # benchmark must hand the parser a config large enough that a quadratic
+    # term stands out from a runner's own jitter. Shrinking the big one to
+    # save CI minutes, or dropping it from expected_gated.txt so its baseline
+    # side may skip, retires the tripwire without failing anything else, so
+    # this test fails instead.
+    #
+    # The parse itself is stubbed out: this is a shape check on the workload
+    # the harness builds, not a timing test (see tests/test_perf_invariants.py
+    # for the same split), and running the real 3k-job parse here would cost
+    # the suite seconds for no added signal.
+    bench = _load_bench()
+    import cronstable.config as config
+
+    seen = []
+
+    def _record(text, path, *args, **kwargs):
+        seen.append(text)
+        return None
+
+    monkeypatch.setattr(config, "parse_config_string", _record)
+    # The sizes asserted below are the ones CI measures, and _n() scales the
+    # workload per mode, so a bench module left in quick/smoke mode would
+    # check the wrong numbers.
+    assert bench._MODE == "full"
+
+    sizes = {}
+    for spec in bench._BENCHMARKS:
+        if not spec["name"].startswith("config.parse_yaml"):
+            continue
+        seen.clear()
+        spec["fn"]()
+        assert seen, "%s never called parse_config_string" % spec["name"]
+        sizes[spec["name"]] = seen[-1].count("\n  - name:")
+    assert sizes, "no config.parse_yaml* benchmark is registered"
+
+    gated = set(_expected_gated_names())
+    big = {
+        name: jobs
+        for name, jobs in sizes.items()
+        if jobs >= 3000 and name in gated
+    }
+    assert big, (
+        "no gated config.parse_yaml* benchmark parses 3000+ jobs, so a "
+        "return of the quadratic Seq validation would not be caught: %r"
+        % (sizes,)
+    )
+
+
 def test_evict_fixtures_runs_finalizers_and_audits_loop_hygiene():
     # Regression net for the 1.2.31 webui/Playwright incident: a fixture that
     # parks a RUNNING event loop on the harness thread (Playwright's sync API

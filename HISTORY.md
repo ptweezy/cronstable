@@ -176,6 +176,79 @@ project, on which cronstable is based.
   builds deliberately miss that cache so a release still resolves every
   dependency fresh. The build context also drops the documentation,
   wiki, benchmark and packaging trees it never read, about 48 MB.
+- The webhook reporter shares one connection pool per daemon instead of
+  opening a fresh connection, and a fresh TLS handshake, for every
+  report. Each report keeps its own session, so its own timeout and
+  cookie jar, while the sockets and the SSL context underneath are
+  pooled and held for 90 seconds, long enough that a minutely job's next
+  report rides the connection its last one opened. The pool is
+  deliberately uncapped and is closed on a graceful stop.
+- The pipes of a capturing job no longer take `maxLineLength` as their
+  flow-control watermark. That number was there for the reader's old
+  `readuntil` call; the chunked reader has enforced the line cap itself for
+  a while, so all the setting still did was let asyncio buffer up to twice
+  `maxLineLength` (32 MiB by default) per stream per running job before it
+  paused the child. The watermark is the reader's own 64 KiB chunk size
+  now, and the cap is unchanged.
+- Boot-time in-flight reconciliation reads jobs sixteen at a time, like the
+  run-history warm-up and the retry re-arm on either side of it. It was
+  the last strictly sequential per-job store read on the startup path, so a
+  large crontab on a network mount paid one full read latency per job
+  before the first scheduling pass, and an unhealthy store cost one read
+  timeout per job instead of one for the pass. Each job is still reconciled
+  exactly once, and its own open and closed writes stay ordered.
+- The terminal dashboard's activity heatmap no longer dies with a
+  `KeyError` when it meets a run outcome its shading ladder does not know.
+  The lookup sat inside the paint loop, so a single unrecognised outcome
+  took the whole running dashboard down once per frame; an unknown outcome
+  now paints in the unknown ink, and a parity test fails the build if the
+  ladder falls behind the outcome vocabulary.
+- The dashboard's fleet view no longer stacks overlapping `/fleet` requests
+  when the daemon answers slower than the poll interval. It was the one
+  secondary poll the earlier in-flight sweep missed, so it added a request
+  per cycle against a per-origin connection budget the held log tails
+  already draw on. A test now holds every secondary poll to the guard, not
+  just this one.
+- The MCP `cron_query_metrics` tool builds and formats the metric universe
+  on the default executor rather than the event loop once the resident job
+  count clears the threshold `GET /metrics` already uses, so an agent
+  polling metrics no longer stalls job dispatch at fleet scale.
+- The three reporting contexts (a job run, an SLA breach, a `notify:`
+  event) name their shared `template_vars` key set once, and a parity test
+  holds all three to it. A template written for `onFailure` is meant to
+  render unchanged on `onLate` and on a notify event, and a missing name
+  renders empty instead of raising, so drift between them was invisible at
+  runtime. No key name or value changed.
+- The cluster's "a peer declared this coordination value and it is not
+  ours" check is one shared predicate now, read by the mutual-agreement
+  exclude set and by both conflict detectors, and the set of declared
+  fields those two halves cover is fenced by a test. A new coordination
+  field can no longer reach the detector without also dropping the
+  diverging peer from the agreeing set we gossip. No behaviour change.
+- What the wheel ships is derived from the source tree and diffed against
+  what `pyproject.toml` declares, so a new subpackage or a new runtime data
+  file that never reached `packages` or `package-data` fails a test instead
+  of shipping a wheel missing the dashboard page or a whole backend.
+  MANIFEST.in's add-backs inside the pruned `docs/` tree are checked to
+  still exist too.
+- Every example config under `example/` is parsed by the real parser,
+  cross-section validation included, so a schema change that leaves the
+  examples teaching an old spelling is caught here instead of by whoever
+  copied one. Compose files and Kubernetes manifests are classified out by
+  rule rather than by a skip list, so a newly added example has to parse.
+- The differential that replays the cron golden corpus through both the
+  dashboard's client-side schedule engine and the daemon's now runs in
+  CI, where playwright is a dev dependency and one matrix cell installs
+  the browser. It had been self-skipping everywhere, including on the
+  machines that changed either engine.
+- A second YAML-parse benchmark, `config.parse_yaml_3k`, gates the config
+  parse at a job count where a complexity regression is visible. The
+  quadratic `Seq` validation fixed above shows up at 300 jobs, the size
+  `config.parse_yaml_300` measures, as a 38% bulge that a loaded runner can
+  argue with; at 3,000 jobs it is 5.3x.
+- The logo engine's four inlined copies (dashboard, demo, logo lab and the
+  comparison page) are pinned identical by a test, where only the
+  dashboard and demo pair had a drift guard before.
 
 ## 1.2.37
 

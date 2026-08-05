@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -416,10 +417,12 @@ class StreamReader:
         # Longest line kept, in BYTES before decoding.  Reading in chunks
         # means asyncio's own StreamReader limit no longer bounds a line
         # (that bound came from readuntil, which _read no longer calls), so
-        # the cap is enforced by hand below.  Defaulting to the stream's
-        # own limit leaves the cap exactly where it was for a caller that
-        # passes none; the daemon passes maxLineLength explicitly, which is
-        # the same number it hands the subprocess pipe.
+        # the cap is enforced by hand below.  The daemon always passes
+        # maxLineLength explicitly; the fallback is for a caller (a test, a
+        # benchmark) that passes none, and reading the stream's own limit
+        # leaves that caller's cap exactly where it was.  That limit is NOT
+        # the pipe's watermark any more: RunningJob.start pins the watermark
+        # to the read chunk size, a buffering choice rather than a line cap.
         if max_line_length is None:
             max_line_length = getattr(
                 stream, "_limit", DEFAULT_MAX_LINE_LENGTH
@@ -1027,6 +1030,118 @@ def _scrub_url_in(text: str, url: str) -> str:
     return out
 
 
+#: How long an idle webhook connection is kept in the pool waiting for the
+#: next report.  aiohttp's own default is 15 seconds, which is shorter than
+#: the gap between two runs of a minutely job: the pool would then be empty
+#: exactly when the next report arrives and every report would pay a fresh
+#: connect (and, on https, a fresh TLS handshake).  90 seconds covers
+#: minutely reporting with margin while still letting a socket to a webhook
+#: receiver go away promptly once the jobs that used it stop failing.
+WEBHOOK_KEEPALIVE_SECONDS = 90
+
+#: One connection pool per event loop for :class:`WebhookReporter`, the same
+#: shape as the pooled statsd endpoints in cronstable.statsd.  The reporter
+#: used to build its own ClientSession per report, which cost a TCP connect,
+#: a TLS handshake and an SSL context per reported run: on a fleet where every
+#: job reports, that is the dominant cost of reporting, paid on the reaper,
+#: the one loop that handles every job's completion.
+#:
+#: Weak keys match that shape but reclaim nothing: aiohttp's connector stores
+#: the loop it was built on, so the value holds its own key alive and an entry
+#: never expires by itself.  The daemon releases its pool through
+#: :func:`close_webhook_pool` on shutdown, and any other loop's is swept by
+#: :func:`_drop_dead_webhook_pools` on the next report.
+_WEBHOOK_CONNECTORS: "weakref.WeakKeyDictionary[Any, Any]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _drop_dead_webhook_pools() -> None:
+    """Release the pools of loops that have gone away.
+
+    The entries cannot expire on their own, for the reason given above the
+    dict: the value holds its own key alive.  The daemon runs one loop and
+    closes its pool on the way out, so this sweep is for processes that build
+    a loop per unit of work.  The test suite builds one per test, and every
+    loop that reported was left holding a connector and its idle sockets,
+    which aiohttp announces as an "Unclosed connector" at exit.
+
+    The async close needs a running loop, so it is no use here.  The
+    synchronous half does the transport teardown that matters, returning
+    waiters for handshakes that will never happen.  It is a private aiohttp
+    API, so a version without it degrades to merely forgetting the connector.
+
+    One pool always survives, since the loop that reported last has no later
+    report to clear it.  In the daemon that one is closed by
+    :func:`close_webhook_pool` on a graceful stop, so the leftover belongs to
+    processes that report and then exit, and it costs a line on stderr rather
+    than a socket held past the process.
+    """
+    for dead in [lp for lp in list(_WEBHOOK_CONNECTORS) if lp.is_closed()]:
+        stale = _WEBHOOK_CONNECTORS.pop(dead, None)
+        closer = getattr(stale, "_close", None)
+        if closer is None:
+            continue
+        try:
+            closer()
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.debug("cannot close a stale webhook pool: %s", ex)
+
+
+def _webhook_connector() -> Any:
+    """The pooled connector for this loop's webhook reports."""
+    # Re-imported per call rather than passed in by the caller: past the
+    # first report this is a sys.modules hit, nothing next to the request
+    # that follows, and it keeps this helper usable without a module-scope
+    # aiohttp (WebhookReporter.report says why that import is deferred at
+    # all).
+    import aiohttp
+
+    loop = asyncio.get_running_loop()
+    _drop_dead_webhook_pools()
+    connector = _WEBHOOK_CONNECTORS.get(loop)
+    # `closed` covers the shutdown-then-report order: close_webhook_pool
+    # drops the entry, but a connector someone else closed must be replaced
+    # too rather than handed out dead, which would fail every later report.
+    if connector is None or connector.closed:
+        # limit=0 (unlimited) rather than aiohttp's default of 100.  That
+        # default is a per-connector cap, and before pooling every report
+        # built its own connector, so reports never queued on each other.
+        # One shared pool with the default would cap the whole daemon at 100
+        # webhook reports in flight across every job and every receiver, and
+        # the wait for a slot happens inside each report's own ClientTimeout:
+        # a fleet-wide burst of completions at :00 could time reports out on
+        # connection acquisition alone, and a job with a long webhook.timeout
+        # could hold a slot while short-timeout reports expire behind it.
+        connector = aiohttp.TCPConnector(
+            keepalive_timeout=WEBHOOK_KEEPALIVE_SECONDS, limit=0
+        )
+        _WEBHOOK_CONNECTORS[loop] = connector
+    return connector
+
+
+async def close_webhook_pool() -> None:
+    """Close this loop's pooled webhook connections (daemon shutdown).
+
+    Safe to call more than once and outside a loop; the next report opens a
+    fresh pool.  Without it the idle keepalive sockets are released only when
+    the loop is garbage collected, which logs aiohttp's "Unclosed connector"
+    on teardown, the same noise :func:`cronstable.statsd.close_endpoints`
+    exists to avoid.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    connector = _WEBHOOK_CONNECTORS.pop(loop, None)
+    if connector is not None:
+        # awaited, not fired and forgotten: close() shuts the transports
+        # down synchronously but returns a waiter for the TLS shutdown
+        # handshakes, and dropping that waiter unawaited earns a
+        # DeprecationWarning from aiohttp.
+        await connector.close()
+
+
 class WebhookReporter(Reporter):
     async def report(
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
@@ -1068,7 +1183,21 @@ class WebhookReporter(Reporter):
         # worth _report_common's traceback, not a "check webhook.url and
         # the network" line about a request that was never attempted.
         data = body.encode("utf-8")
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # A fresh session per report, over a SHARED connector: the session is
+        # bookkeeping (cookie jar, default headers, this report's timeout)
+        # and costs nothing to build, while the connector owns the sockets,
+        # the pool and the SSL context. Sharing the session instead would
+        # share its cookie jar across jobs, so a receiver that sets a cookie
+        # for one job's report would have it sent with every other job's;
+        # sharing only the connector keeps each report as isolated as it has
+        # always been. connector_owner=False so leaving this `async with`
+        # closes the session and leaves the pool open for the next report;
+        # close_webhook_pool closes the pool itself.
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=_webhook_connector(),
+            connector_owner=False,
+        ) as session:
             try:
                 async with session.request(
                     webhook["method"],
@@ -1202,6 +1331,44 @@ def report_config_enabled(report_config: Dict[str, Any]) -> bool:
     # .get, not [], so report dicts predating the push block (older
     # persisted shapes, hand-built test configs) keep working.
     return bool((report_config.get("push") or {}).get("enabled"))
+
+
+#: The key set every reporting context's ``template_vars`` exposes.
+#:
+#: A user-facing contract rather than an implementation detail: operators
+#: write mail/sentry/webhook/shell templates against these names, and
+#: wiki/Reporting.md documents them.  Three classes build the dict and have
+#: to stay key-for-key in step, so that a template written for a job run
+#: renders unchanged on an SLA breach and on a notify event:
+#: :meth:`RunningJob.template_vars` (the real values),
+#: :meth:`SlaBreachContext.template_vars` (a job that did NOT run, plus the
+#: four ``sla_*``/threshold keys) and
+#: :meth:`NotifyEventContext.template_vars` (no job at all, plus ``event``,
+#: ``subject`` and ``message``).  The values differ per context, so each
+#: still builds its own dict; listing the keys here is the single source of
+#: truth all three are checked against.  That check lives in
+#: tests/test_job.py, and it is what catches a key added to one context and
+#: forgotten in the other two: the drift is invisible at runtime, since a
+#: template referencing a missing name renders empty rather than raising.
+STANDARD_TEMPLATE_VARS = (
+    "name",
+    "success",
+    "fail_reason",
+    "stdout",
+    "stderr",
+    "exit_code",
+    "command",
+    "shell",
+    "environment",
+    "host",
+    "schedule",
+    "started_at",
+    "run_id",
+    "cpu_seconds",
+    "cpu_user_seconds",
+    "cpu_system_seconds",
+    "max_rss_bytes",
+)
 
 
 class JobRetryState:
@@ -1422,7 +1589,20 @@ class RunningJob:
                 time.perf_counter() + self.config.executionTimeout
             )
         if self.config.captureStderr or self.config.captureStdout:
-            kwargs["limit"] = self.config.maxLineLength
+            # The pipe's flow-control watermark, NOT the line cap. It used to
+            # be maxLineLength (16 MiB by default) because the reader called
+            # readuntil, which raises once a line outgrows the stream's own
+            # limit; the cap therefore had to live on the transport. The
+            # reader reads in chunks now and enforces maxLineLength by hand
+            # (see StreamReader._read), so the only thing this number still
+            # decides is how much unread output asyncio buffers per pipe
+            # before it pauses the child: at 16 MiB that was up to 32 MiB of
+            # RSS per stream per running job (asyncio pauses at twice the
+            # limit), charged to the daemon for output nobody had asked for
+            # yet. Pinned to the reader's own chunk size, so one full read is
+            # always buffered ahead and a chatty job is backpressured instead
+            # of held in the daemon's memory.
+            kwargs["limit"] = _READ_CHUNK
 
         try:
             # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
@@ -1774,6 +1954,9 @@ class RunningJob:
 
     @property
     def template_vars(self) -> dict:
+        # The reporting contract in full; SlaBreachContext and
+        # NotifyEventContext below mirror these keys, with the run-shaped
+        # ones empty. See STANDARD_TEMPLATE_VARS.
         fail_reason = self.fail_reason
         usage = self.resource_usage
         return {
@@ -1861,6 +2044,8 @@ class SlaBreachContext:
 
     @property
     def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus the
+        # four breach-detail keys.
         return {
             "name": self.config.name,
             "success": False,
@@ -1986,6 +2171,8 @@ class NotifyEventContext:
 
     @property
     def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus the
+        # event detail (and whatever `fields` the event carries).
         base = {
             "name": self.config.name,
             "success": self._success,

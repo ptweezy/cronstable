@@ -12,10 +12,18 @@ the ``test_state_dag_run.py`` harness (real task subprocesses via
 import datetime
 import json
 import sys
+import types
 
 from cronstable import mcp as mcp_mod
 from cronstable.config import _build_mcp_config, parse_config_string
-from cronstable.cron import PAUSE_DEFAULT_SECONDS, Cron, JobRunInfo
+from cronstable.cron import (
+    PAUSE_DEFAULT_SECONDS,
+    WEB_ROUTES,
+    Cron,
+    JobRunInfo,
+    _effective_web_scopes,
+    _required_web_scope,
+)
 from cronstable.job import JobOutputStream
 from cronstable.mcp import MCPHandler
 from cronstable.resources import ResourceUsage
@@ -439,6 +447,72 @@ async def test_query_metrics_match_and_bad_match():
     assert all("cronstable" in s["name"] for s in body["samples"])
     result = await _call(h, "cron_query_metrics", {"match": 7})
     assert result["isError"] is True
+
+
+async def test_query_metrics_walks_the_metric_universe_off_the_loop(
+    monkeypatch,
+):
+    # A metrics query is asked for a handful of samples but must visit every
+    # sample of every family to know which ones match, and it formats each
+    # one on the way. That walk used to run inline, so an agent's query froze
+    # job dispatch for its duration at fleet scale. It now splits the way the
+    # /metrics scrape does: the family build (which reads live scheduler
+    # state) stays on the loop, and the walk over that private snapshot goes
+    # to the default executor at the same resident job count, the one
+    # _METRICS_OFFLOAD_MIN_JOBS sets. An invariant test, not a timing one:
+    # it pins WHICH THREAD each phase runs on, and that the answer is the
+    # same either way.
+    import threading
+
+    h = _handler()
+    cron = h._cron
+    loop_thread = threading.get_ident()
+    real_iter_samples = cron.metrics.iter_samples
+    seen = {}
+
+    def spy(target):
+        # iter_samples reads the live state eagerly and returns a lazy
+        # generator, so these two idents are the two phases: the call itself
+        # is the family build, the first pull is the walk.
+        seen["build"] = threading.get_ident()
+        inner = real_iter_samples(target)
+
+        def walk():
+            seen["walk"] = threading.get_ident()
+            yield from inner
+
+        return walk()
+
+    monkeypatch.setattr(cron.metrics, "iter_samples", spy)
+
+    # a small deployment stays inline: a thread hop costs more than the walk
+    monkeypatch.setattr(mcp_mod, "_METRICS_OFFLOAD_MIN_JOBS", 1000)
+    inline = (await _call(h, "cron_query_metrics", {"limit": 500}))[
+        "structuredContent"
+    ]
+    assert seen["build"] == loop_thread
+    assert seen["walk"] == loop_thread
+
+    seen.clear()
+    monkeypatch.setattr(mcp_mod, "_METRICS_OFFLOAD_MIN_JOBS", 1)
+    offloaded = (await _call(h, "cron_query_metrics", {"limit": 500}))[
+        "structuredContent"
+    ]
+    # the live-state read still belongs to the loop; the walk does not
+    assert seen["build"] == loop_thread
+    assert seen["walk"] != loop_thread, (
+        "the sample walk ran on the event loop despite the job count "
+        "clearing the offload threshold"
+    )
+    # same output shape and the same samples either way: gauge readings can
+    # move between the two calls, names and counts cannot.
+    assert set(offloaded) == {"samples", "totalMatched", "returned", "match"}
+    assert [s["name"] for s in offloaded["samples"]] == [
+        s["name"] for s in inline["samples"]
+    ]
+    assert offloaded["totalMatched"] == inline["totalMatched"]
+    assert offloaded["returned"] == inline["returned"] > 0
+    assert offloaded["match"] is None
 
 
 async def test_get_version_tool():
@@ -1258,3 +1332,143 @@ async def test_decide_gate_enforces_the_approve_scope():
     # no token context (auth off) is unrestricted, exactly like REST
     result = await _call(h, "cron_decide_gate", args)
     assert "scope" not in result["content"][0]["text"]
+
+
+#: The REST route (or routes) each MCP tool is the twin of: same action,
+#: same in-process payload builder, so the same token scope should reach
+#: both. Hand-maintained because the two authorization tables cannot be
+#: joined automatically: mcp._TOOL_SCOPE_OVERRIDES keys on a tool name and
+#: cron._WEB_SCOPE_OVERRIDES on a matched aiohttp resource path, with no
+#: shared identifier between them. A tool with no REST counterpart maps to
+#: None; the guard below fails on an unclassified tool, so a new one cannot
+#: land without someone deciding which it is.
+_TOOL_REST_TWINS = {
+    "cron_get_status": (("GET", "/status"),),
+    "cron_list_jobs": (("GET", "/jobs"),),
+    "cron_get_job": (("GET", "/jobs/{name}"),),
+    "cron_list_runs": (("GET", "/jobs/{name}/runs"),),
+    "cron_get_job_trends": (("GET", "/jobs/{name}/trends"),),
+    "cron_get_job_resources": (("GET", "/jobs/{name}/resources"),),
+    "cron_get_cluster": (("GET", "/cluster"),),
+    "cron_get_fleet": (("GET", "/fleet"),),
+    # the tool's `history` argument folds in the second route
+    "cron_get_node": (("GET", "/node"), ("GET", "/node/history")),
+    "cron_query_metrics": (("GET", "/metrics"),),
+    "cron_get_version": (("GET", "/version"),),
+    "cron_tail_job_logs": (("GET", "/jobs/{name}/logs"),),
+    "cron_schedule_pressure": (("GET", "/schedule/pressure"),),
+    "cron_schedule_duplicates": (("GET", "/schedule/duplicates"),),
+    "cron_suggest_slot": (("GET", "/schedule/suggest"),),
+    # both sandboxes are schedule_preview_payload with a different count
+    "cron_validate_schedule": (("GET", "/schedule/preview"),),
+    "cron_explain_schedule": (("GET", "/schedule/preview"),),
+    "cron_why_no_run": (("GET", "/schedule/why"),),
+    "cron_list_dags": (("GET", "/dags"),),
+    "cron_list_dag_runs": (("GET", "/dags/{name}/runs"),),
+    "cron_get_dag_run": (("GET", "/dags/{name}/runs/{run_key}"),),
+    "cron_get_dag_xcom": (("GET", "/dags/{name}/runs/{run_key}/xcom"),),
+    "cron_tail_dag_task_logs": (
+        ("GET", "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs"),
+    ),
+    # one tool, three modes: overview, one namespace, one stream
+    "cron_inspect_state": (
+        ("GET", "/state"),
+        ("GET", "/state/documents"),
+        ("GET", "/state/records"),
+    ),
+    "cron_run_job": (("POST", "/jobs/{name}/start"),),
+    "cron_cancel_job": (("POST", "/jobs/{name}/cancel"),),
+    "cron_pause_job": (("POST", "/jobs/{name}/pause"),),
+    "cron_resume_job": (("POST", "/jobs/{name}/resume"),),
+    "cron_trigger_dag": (("POST", "/dags/{name}/trigger"),),
+    "cron_backfill_dag": (("POST", "/dags/{name}/backfill"),),
+    "cron_decide_gate": (
+        ("POST", "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision"),
+    ),
+}
+
+
+def _scope_for_route(method, path):
+    """The scope the web layer would demand of ``method path``.
+
+    Asks the production decision function rather than restating its rule, so
+    a change to the safe-method default or to the override table moves this
+    guard with it. The stand-in request carries only what
+    ``_required_web_scope`` reads: the method and the matched resource's
+    canonical path.
+    """
+    resource = types.SimpleNamespace(canonical=path)
+    route = types.SimpleNamespace(resource=resource)
+    return _required_web_scope(
+        types.SimpleNamespace(
+            method=method,
+            match_info=types.SimpleNamespace(route=route),
+        )
+    )
+
+
+def test_tool_scope_overrides_track_the_rest_scope_table():
+    """MCP tool authorization cannot drift below its REST twin's.
+
+    ``POST /mcp`` is gated at `control`, so every tool is reachable by any
+    control-scoped token unless ``mcp._TOOL_SCOPE_OVERRIDES`` promotes it.
+    That makes the table a security-relevant twin of
+    ``cron._WEB_SCOPE_OVERRIDES``: promote a REST route to a scope beyond
+    `control` (as the DAG decision route is promoted to `approve`) and
+    forget the tool, and a token the operator deliberately withheld that
+    scope from takes exactly the withheld action through tools/call. This
+    guard fails on that omission, on an override left behind after REST
+    relaxed, and on an override naming a tool that no longer exists.
+
+    Residual gap, deliberately: the tool -> route correspondence above is
+    hand-written (the tables share no identifier), so a WRONG mapping is
+    invisible here, and a tool mapped to None gets no cross-check. What the
+    machine does check: every registered tool is classified, every route
+    named is really registered, and the scopes agree wherever a mapping
+    exists.
+    """
+    h = _handler()
+    tools = set(h._tool_by_name)
+    assert tools == set(_TOOL_REST_TWINS), (
+        "a tool was added or renamed without recording its REST "
+        "twin: {}".format(
+            sorted(tools.symmetric_difference(_TOOL_REST_TWINS))
+        )
+    )
+    unknown = set(mcp_mod._TOOL_SCOPE_OVERRIDES) - tools
+    assert not unknown, (
+        "_TOOL_SCOPE_OVERRIDES gates tools that do not exist, so the "
+        "promotion binds nothing: {}".format(sorted(unknown))
+    )
+    served = {(method, path) for method, path, _h, _g in WEB_ROUTES}
+    # the floor every tool already sits behind: what POST /mcp demands,
+    # expanded the way a real token's scopes are (control implies view)
+    floor = _effective_web_scopes({_scope_for_route("POST", "/mcp")})
+
+    for tool, twins in sorted(_TOOL_REST_TWINS.items()):
+        override = mcp_mod._TOOL_SCOPE_OVERRIDES.get(tool)
+        if twins is None:
+            continue
+        beyond = set()
+        for method, path in twins:
+            assert (method, path) in served, (
+                "{} is mapped to {} {}, which is not a registered "
+                "route".format(tool, method, path)
+            )
+            scope = _scope_for_route(method, path)
+            if scope not in floor:
+                beyond.add(scope)
+        assert len(beyond) <= 1, (
+            "{} mirrors routes demanding several scopes beyond the /mcp "
+            "floor ({}), which one override string cannot express: split "
+            "the tool or make _TOOL_SCOPE_OVERRIDES hold a set".format(
+                tool, sorted(beyond)
+            )
+        )
+        expected = beyond.pop() if beyond else None
+        assert override == expected, (
+            "{} requires {!r} over MCP but its REST twin {} requires {!r}: "
+            "a scope promoted on one surface and not the other lets a "
+            "token take through tools/call exactly the action REST "
+            "withholds".format(tool, override, list(twins), expected)
+        )

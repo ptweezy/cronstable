@@ -8384,8 +8384,19 @@ var qrcode = function() {
   }
   // Same out-of-order guard as loadCluster: fired without awaiting from the
   // poll path, so a delayed OLDER response must not overwrite a newer one.
+  // The in-flight guard below already rules out an overlap, but the sequence
+  // numbers stay: they keep the APPLY ordered whatever else learns to call
+  // loadFleet, while the guard only stops a second request going out.
   let fleetReqSeq = 0, fleetAppliedSeq = 0;
   async function loadFleet() {
+    // /fleet rides the cluster poll and is fired without awaiting, so a daemon
+    // slower than the poll interval stacked one more overlapping request every
+    // cycle against the browser's ~6-per-origin connection cap (see
+    // secondaryInFlight). A cycle that finds its predecessor still pending
+    // skips /fleet until it settles, and the next cluster poll calls straight
+    // back in.
+    if (secondaryInFlight.fleet) return;
+    secondaryInFlight.fleet = true;
     const seq = ++fleetReqSeq;
     try {
       const r = await apiFetch("/fleet");
@@ -8403,6 +8414,8 @@ var qrcode = function() {
         fleetAppliedSeq = seq;
         console.warn("loadFleet failed:", e);
       }
+    } finally {
+      secondaryInFlight.fleet = false;
     }
   }
   // percent past which a node CPU/memory readout is warn-tinted (either axis)
@@ -8553,7 +8566,7 @@ var qrcode = function() {
   // connection cap (which the held SSE tails already lean on, see TAIL_MAX)
   // exactly when it could least afford them. A poll cycle that finds its
   // predecessor still pending simply skips this endpoint until it settles.
-  const secondaryInFlight = { cluster: false, node: false, dags: false, state: false };
+  const secondaryInFlight = { cluster: false, node: false, dags: false, state: false, fleet: false };
   async function loadJobs() {
     if (refreshing) return;
     refreshing = true;

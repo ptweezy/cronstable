@@ -4563,6 +4563,26 @@ async def test_shutdown_stops_cluster_manager_before_job_drain():
     assert not cron.running_jobs  # ...and the drain then completed
 
 
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_pooled_webhook_connections():
+    # WebhookReporter keeps one connection pool per loop so reports stop
+    # paying a connect and a TLS handshake each. Nothing reclaims that pool
+    # on its own (aiohttp's connector holds the loop it was built on, so the
+    # weak key never expires), which leaves the shutdown sequence to close
+    # it, for the same reason it closes the pooled statsd endpoints beside
+    # it: the sockets are otherwise released only when the loop is
+    # collected, and aiohttp logs "Unclosed connector" on the way out. It
+    # goes last, after _drain_completions has sent the final reports.
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    loop = asyncio.get_running_loop()
+    pooled = cronstable.job._webhook_connector()
+    assert cronstable.job._WEBHOOK_CONNECTORS[loop] is pooled
+    cron.signal_shutdown()
+    await asyncio.wait_for(cron.run(), timeout=10)
+    assert pooled.closed
+    assert loop not in cronstable.job._WEBHOOK_CONNECTORS
+
+
 @pytest.mark.skipif(
     platform.IS_WINDOWS, reason="POSIX signal delivery (SIGTERM)"
 )
@@ -10828,6 +10848,114 @@ async def test_rehydrate_reconcile_inflight_cancelled_propagates(tmp_path):
     cron.state_backend.list_records = _raise_cancelled5
     with pytest.raises(asyncio.CancelledError):
         await cron._reconcile_inflight()
+
+
+def _many_jobs_yaml(count):
+    return "jobs:\n" + "".join(
+        "  - name: j%d\n    command: x\n    schedule: '@reboot'\n" % i
+        for i in range(count)
+    )
+
+
+async def _seed_orphan_open(cron, name):
+    # an open record left by a PREVIOUS daemon on this host (same host, a
+    # different proc token, no pid to probe): exactly what the boot
+    # reconciliation is meant to close.
+    await cron.state_backend.append_record(
+        cron._inflight_stream(name),
+        {
+            "kind": "open",
+            "host": cron._state_host,
+            "proc": "a-dead-daemon",
+            "pid": None,
+            "startedAt": "2026-07-01T10:00:00+00:00",
+        },
+    )
+
+
+async def test_rehydrate_reconcile_inflight_reads_jobs_concurrently(tmp_path):
+    # The boot reconciliation must overlap its per-job in-flight reads: it
+    # sits on the boot path between the history warm-up and the retry
+    # re-arm, both of which already use the worker pool, so a strictly
+    # sequential pass here put back the jobs x per-read latency those two
+    # avoid. The rendezvous below only clears once 4 reads are in flight AT
+    # THE SAME TIME; a sequential pass never gets past its first read and
+    # times out instead. The high-water mark is checked against the pool
+    # bound too: the pool must not degenerate into a task per job, which on
+    # a large crontab would only queue on the store's bulk lane anyway. That
+    # upper bound is why the crontab is seeded with MORE jobs than the pool
+    # has workers; with fewer, the job count itself caps the high-water mark
+    # and a task-per-job implementation passes too.
+    cron = await _rehydrate_state_cron(
+        tmp_path, _many_jobs_yaml(cronstable.cron._REHYDRATE_CONCURRENCY + 4)
+    )
+    need = 4
+    state = {"in_flight": 0, "high": 0}
+    opened = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _list(stream, **kw):
+        state["in_flight"] += 1
+        state["high"] = max(state["high"], state["in_flight"])
+        if state["high"] >= need:
+            opened.set()
+        try:
+            # every read parks here until the test releases it, so the
+            # high-water mark counts workers rather than scheduling luck.
+            # An event that reopened as soon as `need` reads overlapped would
+            # measure nothing: past the first opening, awaiting an already-set
+            # event does not yield, so ONE worker would drain the whole item
+            # iterator without ever letting a second one in, and the bound
+            # below would hold for any implementation, pool or not.
+            await release.wait()
+        finally:
+            state["in_flight"] -= 1
+        return []
+
+    cron.state_backend.list_records = _list
+    pass_ = asyncio.ensure_future(cron._reconcile_inflight())
+    try:
+        # a sequential implementation never gets a second read in flight, so
+        # it fails here rather than hanging the suite.
+        await asyncio.wait_for(opened.wait(), timeout=2.0)
+        # let every worker that is going to start reach its read, so the
+        # plateau below is the real one.
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert state["high"] >= need
+        assert state["high"] <= cronstable.cron._REHYDRATE_CONCURRENCY
+    finally:
+        release.set()
+        await pass_
+
+
+async def test_rehydrate_reconcile_inflight_reconciles_every_job(tmp_path):
+    # The outcome invariant the worker pool must preserve, with more jobs
+    # than workers so the shared item iterator is drawn from several times
+    # per worker: every orphaned run is reconciled, exactly once, whichever
+    # worker happens to draw it. A pool that let two workers draw the same
+    # name would append two synthetic rows for one interrupted run; a pool
+    # that dropped names would leave crashed runs invisible forever, the
+    # whole failure this pass exists to prevent.
+    count = cronstable.cron._REHYDRATE_CONCURRENCY + 4
+    cron = await _rehydrate_state_cron(tmp_path, _many_jobs_yaml(count))
+    for i in range(count):
+        await _seed_orphan_open(cron, "j%d" % i)
+    await cron._reconcile_inflight()
+    for i in range(count):
+        name = "j%d" % i
+        assert [r.outcome for r in cron.run_history[name]] == ["unknown"]
+        assert cron.last_run[name].outcome == "unknown"
+    # drain the fire-and-forget closes/ledger appends the pass queued, then
+    # confirm each job's stream really did get its own single close (the
+    # per-job write chain keeps open/closed ordered).
+    while cron._pending_state_writes:
+        await asyncio.gather(*list(cron._pending_state_writes))
+    for i in range(count):
+        recs = await cron.state_backend.list_records(
+            cron._inflight_stream("j%d" % i)
+        )
+        assert [r["kind"] for r in recs] == ["open", "closed"]
 
 
 # --- takeover reconciliation ------------------------------------------------
