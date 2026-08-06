@@ -155,7 +155,7 @@ def test_client_engine_matches_daemon_engine_over_the_golden_corpus():
         py, js = expected[expr], got[expr]
         if not py["valid"]:
             # The tolerant PARSER may still chew on it (it degrades while
-            # the user is types), but the sandbox must not AFFIRM it: a
+            # the user types), but the sandbox must not AFFIRM it: a
             # fields parse the validity gate does not veto gets confident
             # prose and a green check for a config the daemon refuses to
             # load. parseInt's numeric-prefix salvage shipped exactly

@@ -272,7 +272,7 @@ project, on which cronstable is based.
   machines that changed either engine, so that cell now also proves the
   test passed rather than skipped (a browser-revision skew between the
   two installers would otherwise restore the silent skip). The
-  differential compares validity verdicts too, not just the previews of
+  differential compares validity verdicts as well as the previews of
   mutually-valid expressions: the sandbox's step parsing is strict the
   way the engine's is, where it used to salvage numeric prefixes and
   confidently describe `*/2.5`-style schedules the daemon refuses to
