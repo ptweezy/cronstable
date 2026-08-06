@@ -9,7 +9,7 @@ cronstable is a cron replacement built on asyncio that runs natively on Linux, m
 - [Installation](Installation): Install via Docker, pip, pipx, or the self-contained binary.
 - [Command-Line Reference](CLI-Reference): The `cronstable` command and its flags, config file/directory loading, the `state` administration subcommand, the job-facing state commands, and the `mcp` and `tui` client subcommands.
 - [Production and Container Deployment](Production-Deployment): Running hardened under non-root, read-only-root-filesystem Kubernetes/Docker.
-- [Running on Windows](Running-on-Windows): Installing and running cronstable natively on Windows: config path, default shell, Ctrl-C shutdown, and unsupported features.
+- [Running on Windows](Running-on-Windows): Installing and running cronstable natively on Windows: winget/pip/binary installs, machine-wide and per-user config locations, the default shell, graceful shutdown, running unattended at boot, and the platform differences.
 
 ### Configuration
 

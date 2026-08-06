@@ -71,7 +71,10 @@ def test_quoted_value_preserves_blanks():
     ]
 
 
-def test_shell_assignment_maps_to_shell_setting():
+def test_shell_assignment_maps_to_shell_setting(monkeypatch):
+    # POSIX behavior pinned explicitly (a POSIX shell path is refused on
+    # Windows; see the Windows-guard tests below).
+    monkeypatch.setattr(crontabs.platform, "IS_WINDOWS", False)
     conf = config.parse_crontab_string(
         "SHELL=/bin/bash\n0 4 * * * echo hi\n", "t.crontab"
     )
@@ -79,6 +82,55 @@ def test_shell_assignment_maps_to_shell_setting():
     assert job.shell == "/bin/bash"
     # like cron, the assignment also stays exported to the job.
     assert {"key": "SHELL", "value": "/bin/bash"} in job.environment
+
+
+def test_posix_shell_assignment_refused_on_windows(monkeypatch):
+    # /etc/crontab always carries SHELL=/bin/sh, so on Windows the one
+    # advertised migration path used to produce a config that loads
+    # cleanly and then fails every job at spawn (FileNotFoundError on
+    # /bin/sh). Refused at parse instead, with the assignment's own
+    # file:line, per the module's refuse-rather-than-half-imitate bias.
+    monkeypatch.setattr(crontabs.platform, "IS_WINDOWS", True)
+    with pytest.raises(crontabs.CrontabError) as exc:
+        crontabs.parse_crontab(
+            "SHELL=/bin/sh\n*/15 * * * * echo hi\n", "legacy.crontab"
+        )
+    message = str(exc.value)
+    assert "legacy.crontab:1" in message
+    assert "SHELL=/bin/sh" in message
+    assert "cmd.exe" in message  # the remedy is named, not just the refusal
+    # config integration: surfaces as a ConfigError like every parse error
+    with pytest.raises(ConfigError, match="SHELL=/bin/sh"):
+        config.parse_crontab_string(
+            "SHELL=/bin/sh\n*/15 * * * * echo hi\n", "legacy.crontab"
+        )
+
+
+def test_bare_shell_assignment_kept_on_windows(monkeypatch):
+    # SHELL=powershell (or bash, for a git-bash install) resolves through
+    # PATH and stays a working mapping; only absolute POSIX paths are
+    # unspawnable there.
+    monkeypatch.setattr(crontabs.platform, "IS_WINDOWS", True)
+    jobs = crontabs.parse_crontab(
+        "SHELL=powershell\n0 4 * * * Get-Date\n", "t.crontab"
+    )
+    assert jobs[0]["shell"] == "powershell"
+
+
+def test_posix_path_assignment_warns_on_windows(monkeypatch, caplog):
+    # PATH=/usr/... REPLACES the Windows PATH for the entries below (env
+    # merge semantics), so plain command names stop resolving. Not fatal
+    # (absolute command paths still work), but loudly named at parse.
+    monkeypatch.setattr(crontabs.platform, "IS_WINDOWS", True)
+    with caplog.at_level("WARNING", logger="cronstable"):
+        jobs = crontabs.parse_crontab(
+            "PATH=/usr/local/bin:/usr/bin:/bin\n0 4 * * * backup\n",
+            "legacy.crontab",
+        )
+    assert len(jobs) == 1  # the entry itself is kept
+    warning = "\n".join(r.getMessage() for r in caplog.records)
+    assert "legacy.crontab:1" in warning
+    assert "PATH" in warning
 
 
 def test_cron_tz_sets_schedule_timezone():

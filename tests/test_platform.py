@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 import sys
 import time
 
@@ -40,6 +41,39 @@ def test_default_config_path_matches_platform():
         assert platform.DEFAULT_CONFIG_PATH == "/etc/cronstable.d"
 
 
+def test_windows_config_home_is_per_user_until_machine_wide_exists(tmp_path):
+    # the historical default: roaming AppData, when no machine-wide
+    # directory has been created.
+    env = {
+        "PROGRAMDATA": str(tmp_path / "ProgramData"),
+        "APPDATA": str(tmp_path / "Roaming"),
+    }
+    assert platform._windows_config_home(env) == os.path.join(
+        str(tmp_path / "Roaming"), "cronstable"
+    )
+
+
+def test_windows_config_home_prefers_machine_wide(tmp_path):
+    # %ProgramData%\cronstable is the real analog of /etc/cronstable.d:
+    # once an administrator creates it, every account (interactive or
+    # service, whose APPDATA points into systemprofile) resolves to the
+    # same machine-wide config.
+    machine_wide = tmp_path / "ProgramData" / "cronstable"
+    machine_wide.mkdir(parents=True)
+    env = {
+        "PROGRAMDATA": str(tmp_path / "ProgramData"),
+        "APPDATA": str(tmp_path / "Roaming"),
+    }
+    assert platform._windows_config_home(env) == str(machine_wide)
+
+
+def test_windows_config_home_survives_bare_environments(tmp_path):
+    # no APPDATA (a bare service account): fall back under the profile.
+    got = platform._windows_config_home({})
+    assert got.endswith("cronstable")
+    assert os.path.dirname(got)  # anchored somewhere, never bare
+
+
 def test_supports_unix_sockets_matches_platform():
     assert platform.supports_unix_sockets() == (not platform.IS_WINDOWS)
 
@@ -47,35 +81,74 @@ def test_supports_unix_sockets_matches_platform():
 def test_new_process_group_kwargs_matches_platform():
     kwargs = platform.new_process_group_kwargs()
     if platform.IS_WINDOWS:
-        # no session to create at spawn time; the tree is walked at kill time.
-        assert kwargs == {}
+        # CREATE_NEW_PROCESS_GROUP: shields the job from the daemon
+        # console's Ctrl-C, and makes the pid a CTRL_BREAK target.
+        assert kwargs == {"creationflags": 0x00000200}
     else:
         assert kwargs == {"start_new_session": True}
 
 
 @pytest.mark.asyncio
-async def test_kill_process_group_windows_tree_kills_on_the_graceful_call(
+async def test_kill_process_group_windows_break_first_taskkill_on_force(
     monkeypatch,
 ):
-    # regression: the non-forced Windows call used to report False without
-    # signalling anything, leaving the caller (RunningJob.cancel) to
-    # TerminateProcess the direct child. The LATER forced taskkill /T
-    # then ran against a dead root, whose descendants were no longer in any
-    # walkable tree. String-form commands run via cmd.exe /c, so the actual
-    # workload is always such a descendant and survived every cancel. The
-    # tree kill must therefore happen on the non-forced call itself, while
-    # the root is still alive to anchor the walk.
-    calls = []
+    # the Windows two-step mirrors the POSIX one: the non-forced call
+    # delivers a trappable CTRL_BREAK to the job's process group (spawned
+    # as its own group root by new_process_group_kwargs) and never
+    # taskkills; the forced call is the taskkill /F /T tree kill.
+    taskkills = []
+    breaks = []
 
     async def fake_taskkill(pid):
-        calls.append(pid)
+        taskkills.append(pid)
         return True
+
+    def fake_kill(pid, sig):
+        breaks.append((pid, sig))
 
     monkeypatch.setattr(platform, "IS_WINDOWS", True)
     monkeypatch.setattr(platform, "_taskkill_tree", fake_taskkill)
+    monkeypatch.setattr(
+        platform.signal, "CTRL_BREAK_EVENT", 99, raising=False
+    )
+    monkeypatch.setattr(platform.os, "kill", fake_kill)
     assert await platform.kill_process_group(4242, force=False) is True
+    assert breaks == [(4242, 99)]
+    assert taskkills == []
     assert await platform.kill_process_group(4242, force=True) is True
-    assert calls == [4242, 4242]
+    assert taskkills == [4242]
+
+
+@pytest.mark.asyncio
+async def test_kill_process_group_windows_break_failure_tree_kills(
+    monkeypatch,
+):
+    # regression, carried over from the pre-CTRL_BREAK design: where no
+    # break can be delivered (no shared console, e.g. a service context),
+    # the graceful call must not report False and leave the root to the
+    # caller's direct-child terminate. The forced taskkill /T would then
+    # run against a dead root, whose descendants are no longer in any
+    # walkable tree; string-form commands run via cmd.exe /c, so the
+    # actual workload is always such a descendant. The tree kill therefore
+    # happens on the graceful call itself, while the root is alive to
+    # anchor the walk.
+    taskkills = []
+
+    async def fake_taskkill(pid):
+        taskkills.append(pid)
+        return True
+
+    def fail_kill(pid, sig):
+        raise OSError("the handle is invalid (no console)")
+
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(platform, "_taskkill_tree", fake_taskkill)
+    monkeypatch.setattr(
+        platform.signal, "CTRL_BREAK_EVENT", 99, raising=False
+    )
+    monkeypatch.setattr(platform.os, "kill", fail_kill)
+    assert await platform.kill_process_group(4242, force=False) is True
+    assert taskkills == [4242]
 
 
 def _windows_pid_alive(pid):
@@ -115,13 +188,16 @@ def _windows_terminate(pid):
 
 
 @pytest.mark.skipif(
-    not platform.IS_WINDOWS, reason="taskkill tree kill is Windows-only"
+    not platform.IS_WINDOWS, reason="Windows kill sequence is Windows-only"
 )
 @pytest.mark.asyncio
 async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
-    # end to end on a real tree, the same shape as a string-form `command:`
-    # job (cmd.exe /c means the workload is a grandchild of nothing we hold
-    # a handle to). The non-forced call must take the whole tree down.
+    # end to end on a real tree, spawned exactly as the daemon spawns a
+    # string-form `command:` job (cmd.exe /c in its own process group, so
+    # the workload is a grandchild of nothing we hold a handle to), taken
+    # down with the same two-step sequence RunningJob.cancel runs: the
+    # graceful break first, then the forced tree kill. Whichever step a
+    # process survives, the sequence as a whole must reap the grandchild.
     #
     # The grandchild announces its own pid through a file rather than the
     # test walking the process tree with a Get-CimInstance poll: on a
@@ -141,6 +217,7 @@ async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
         '"{}" "{}"'.format(sys.executable, script),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
+        **platform.new_process_group_kwargs(),
     )
     grandchild = None
     try:
@@ -155,15 +232,25 @@ async def test_kill_process_group_windows_reaches_the_grandchild(tmp_path):
         )
         assert grandchild != proc.pid  # a real descendant, not the shell
 
+        # graceful step: CTRL_BREAK to the group (cmd.exe and a default
+        # python both terminate on it; a process is free to trap it)
         assert await platform.kill_process_group(proc.pid, force=False)
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            pass
+        # forced step: the taskkill /F /T tree kill (reports False when the
+        # break already took the whole tree down, like taskkill's 128)
+        forced = await platform.kill_process_group(proc.pid, force=True)
+        assert forced or proc.returncode is not None
         await asyncio.wait_for(proc.wait(), 10)
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:  # taskkill delivery is async
+        while time.monotonic() < deadline:  # delivery is async either way
             if not _windows_pid_alive(grandchild):
                 break
             await asyncio.sleep(0.1)
         assert not _windows_pid_alive(grandchild), (
-            "descendant %d survived the tree kill" % grandchild
+            "descendant %d survived the kill sequence" % grandchild
         )
     finally:
         if grandchild is not None and _windows_pid_alive(grandchild):
@@ -240,8 +327,9 @@ def test_web_site_from_url_unix_socket():
 
 def test_install_shutdown_handlers_roundtrip():
     # Exercises install + the returned cleanup on both platforms (loop signal
-    # handlers on POSIX; signal.signal + heartbeat on Windows) without firing a
-    # real signal.  Must run on the main thread (signal.signal requires it).
+    # handlers on POSIX; signal.signal + console handler + heartbeat on
+    # Windows) without firing a real signal.  Must run on the main thread
+    # (signal.signal requires it).
     loop = asyncio.new_event_loop()
     try:
         called = []
@@ -252,6 +340,67 @@ def test_install_shutdown_handlers_roundtrip():
         cleanup()
     finally:
         loop.close()
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="Windows signal-delivery path"
+)
+def test_windows_sigint_delivery_reaches_the_callback():
+    # End to end through the signal.signal fallback and its heartbeat: a
+    # real SIGINT raised while the loop is parked must run the callback on
+    # the loop thread (the docs' Ctrl-C promise; the POSIX sibling is
+    # test_cron.py's SIGTERM test). Before this test existed, the only
+    # Windows coverage installed the handlers without ever firing one.
+    loop = asyncio.new_event_loop()
+    called = []
+    cleanup = platform.install_shutdown_handlers(
+        loop, lambda: called.append(1)
+    )
+    try:
+
+        async def fire_and_park():
+            signal.raise_signal(signal.SIGINT)
+            # generous park: the heartbeat only guarantees the pending C
+            # handler is observed within its 0.25s tick.
+            deadline = time.monotonic() + 5
+            while not called and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+
+        loop.run_until_complete(fire_and_park())
+    finally:
+        cleanup()
+        loop.close()
+    assert called == [1]
+
+
+def test_console_events_route_close_logoff_shutdown_to_the_drain():
+    # CTRL_CLOSE / CTRL_LOGOFF / CTRL_SHUTDOWN are the daemon's to drain
+    # on (Python's signal module never surfaces them); CTRL_C (0) and
+    # CTRL_BREAK (1) must pass down the chain to the interpreter's own
+    # handler, which turns them into the Python signals handled above.
+    assert platform._console_event_requests_shutdown(2)  # close
+    assert platform._console_event_requests_shutdown(5)  # logoff
+    assert platform._console_event_requests_shutdown(6)  # shutdown
+    assert not platform._console_event_requests_shutdown(0)  # Ctrl-C
+    assert not platform._console_event_requests_shutdown(1)  # Ctrl-Break
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="GetTickCount64 path is Windows-only"
+)
+def test_os_boot_time_windows_returns_a_plausible_epoch():
+    # The sole boot identity on Windows (there is no /proc boot_id), and
+    # the value the @reboot once-per-boot dedupe compares. It must be a
+    # real epoch in the past, within a plausible uptime, and stable across
+    # calls (up to clock jitter far below the dedupe's 60s tolerance).
+    first = platform.os_boot_time()
+    assert isinstance(first, float)
+    now = time.time()
+    assert first < now  # booted before now
+    assert now - first < 400 * 24 * 3600  # and within a plausible uptime
+    second = platform.os_boot_time()
+    assert second is not None
+    assert abs(second - first) < 5.0
 
 
 def test_nonblocking_lock_raises_on_contention(tmp_path):

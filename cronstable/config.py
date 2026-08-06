@@ -2303,7 +2303,13 @@ def parse_environment_file(path: str) -> Dict[str, str]:
     # `except OSError`, so both would escape parse_config_string entirely.
     # Config parsing must only ever raise ConfigError.
     try:
-        with open(path, "r", encoding="utf-8") as env_file:
+        # utf-8-sig: byte-identical to utf-8 for BOM-less files, and strips
+        # the BOM that Windows editors (Notepad historically, PowerShell
+        # `>` redirects) prepend, which otherwise rides invisibly into the
+        # first variable's NAME: the job then has a variable whose name
+        # starts with U+FEFF set, and the expected one absent, with no
+        # error anywhere.
+        with open(path, "r", encoding="utf-8-sig") as env_file:
             lines = env_file.readlines()
     except ValueError as err:
         raise ConfigError(

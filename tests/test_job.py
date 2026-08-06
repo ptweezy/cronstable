@@ -33,6 +33,114 @@ def _argv(*parts):
     return tuple(parts) if IS_WINDOWS else tuple(p.encode() for p in parts)
 
 
+# ---------------------------------------------------------------------------
+# shell_invocation_flag: the per-shell command-string flag
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "shell, flag",
+    [
+        # cmd.exe takes /c; handed -c it starts an interactive shell,
+        # prints its banner, reads EOF and exits 0 -- the silent-green
+        # failure mode a `shell: cmd` job used to record forever.
+        ("cmd", "/c"),
+        ("cmd.exe", "/c"),
+        ("CMD.EXE", "/c"),
+        (r"C:\Windows\System32\cmd.exe", "/c"),
+        # everything else takes -c (PowerShell reads it as -Command)
+        ("powershell", "-c"),
+        ("pwsh", "-c"),
+        ("/bin/sh", "-c"),
+        ("/bin/bash", "-c"),
+        ("bash", "-c"),
+    ],
+)
+def test_shell_invocation_flag(shell, flag):
+    assert cronstable.job.shell_invocation_flag(shell) == flag
+
+
+@pytest.mark.asyncio
+async def test_string_command_with_cmd_shell_spawns_slash_c(monkeypatch):
+    # the flag actually reaches the spawn: a `shell: cmd` job builds
+    # [cmd, /c, command], never the POSIX [-c] cmd.exe cannot parse.
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: t\n    command: echo hi\n"
+        '    schedule: "* * * * *"\n    shell: cmd\n',
+        "",
+    )
+    seen = {}
+
+    async def fake_exec(*args, **kwargs):
+        seen["args"] = args
+        raise OSError("stop here: the argv is what is under test")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    await job.start()
+    assert job.start_failed is True  # from the deliberate OSError above
+    assert seen["args"] == _argv("cmd", "/c", "echo hi")
+
+
+# ---------------------------------------------------------------------------
+# _decode_output_line: strict UTF-8 with the Windows OEM retry
+# ---------------------------------------------------------------------------
+
+
+def test_decode_output_line_utf8_stays_strict():
+    assert cronstable.job._decode_output_line("é ✓ 中".encode()) == "é ✓ 中"
+
+
+def test_decode_output_line_falls_back_to_replacement_on_posix(monkeypatch):
+    # off Windows there is no OEM code page to consult: undecodable bytes
+    # keep the old errors="replace" behavior and can never raise.
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", False)
+    decoded = cronstable.job._decode_output_line(b"caf\x82 \xf8C")
+    assert "\ufffd" in decoded
+
+
+@pytest.mark.skipif(
+    not IS_WINDOWS, reason="the 'oem' codec only exists on Windows"
+)
+def test_decode_output_line_retries_oem_on_windows():
+    # cmd.exe builtins, `dir` and OS error messages emit the console OEM
+    # code page, not UTF-8; those bytes used to collapse to U+FFFD with the
+    # real text unrecoverable. cp437 "café °C" must now survive intact.
+    cp437 = "caf\x82 \xf8C".encode("latin-1")
+    decoded = cronstable.job._decode_output_line(cp437)
+    assert "\ufffd" not in decoded
+    assert decoded == b"caf\x82 \xf8C".decode("oem")
+
+
+def test_emit_writes_the_streams_own_encoding():
+    # the passthrough mirror encodes with the destination stream's declared
+    # encoding (the ANSI code page for a redirected Windows daemon, UTF-8
+    # elsewhere), replacing what it cannot carry, so the mirrored log is
+    # readable where it lands instead of hardcoded-UTF-8 mojibake.
+    class _Buf:
+        def __init__(self):
+            self.data = b""
+
+        def write(self, chunk):
+            self.data += chunk
+
+    class _Stream:
+        encoding = "cp1252"
+
+        def __init__(self):
+            self.buffer = _Buf()
+
+        def flush(self):
+            pass
+
+        def write(self, text):
+            raise AssertionError("the text-path fallback must not be used")
+
+    stream = _Stream()
+    cronstable.job.StreamReader._emit(stream, "caf\u00e9 \u00b0C \u4e2d\n")
+    assert stream.buffer.data == "caf\u00e9 \u00b0C \u4e2d\n".encode("cp1252", "replace")
+
+
 @pytest.mark.asyncio
 async def test_stream_reader_join_timeout_keeps_partial_output():
     # The read loop only ends at EOF, i.e. once EVERY write-end of the pipe is
@@ -2892,19 +3000,77 @@ async def test_cancel_falls_back_to_direct_kill(monkeypatch):
     assert job._terminated is True
 
 
-async def test_cancel_windows_tree_kill_runs_before_the_root_dies(
+async def test_cancel_windows_graceful_break_then_forced_tree_kill(
     monkeypatch,
 ):
-    # regression: on Windows the old cancel() TerminateProcess'd the direct
-    # child first (the non-forced group call reported False without
-    # signalling anything), then ran taskkill /T against the now-dead pid:
-    # "process not found", no descendant reached, and the job's real work
-    # (a grandchild, for every string-form command routed through
-    # cmd.exe /c) survived executionTimeout, Replace and manual cancel
-    # alike. Windows semantics are simulated so the ordering contract is
-    # enforced on every platform: the tree kill must run while the root is
-    # still alive to anchor the walk, and a root the tree kill took down
-    # must not be separately terminated.
+    # Windows cancel is a real two-step now, mirroring POSIX: the
+    # non-forced call delivers a trappable CTRL_BREAK to the job's process
+    # group, and the forced taskkill /F /T tree kill runs only after
+    # killTimeout. A job that exits on the break is never taskkilled while
+    # alive, and the root is never separately terminated. Windows semantics
+    # are simulated so the contract is enforced on every platform.
+    breaks = []
+    taskkills = []
+
+    async def fake_taskkill(pid):
+        alive = proc.returncode is None
+        taskkills.append((pid, alive))
+        if alive:
+            proc.returncode = 1
+        return alive  # a dead tree reads as not-signalled, like taskkill 128
+
+    def fake_break(pid, sig):
+        breaks.append((pid, sig))
+        proc.returncode = 3  # the job trapped the break and chose its exit
+
+    monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(cronstable.platform, "_taskkill_tree", fake_taskkill)
+    monkeypatch.setattr(
+        cronstable.platform.signal, "CTRL_BREAK_EVENT", 99, raising=False
+    )
+    monkeypatch.setattr(cronstable.platform.os, "kill", fake_break)
+
+    job = _fresh_job()
+    job.config.killTimeout = 5
+
+    touched_root = []
+    proc = Mock()
+    proc.pid = 4321
+    proc.returncode = None
+    proc.terminate = lambda: touched_root.append("terminate")
+    proc.kill = lambda: touched_root.append("kill")
+
+    async def wait():
+        while proc.returncode is None:
+            await asyncio.sleep(0.01)
+        return proc.returncode
+
+    proc.wait = wait
+    job.proc = proc
+
+    await asyncio.wait_for(job.cancel(), 10)
+
+    # the graceful break went to the group, the job exited on it, and the
+    # belt-and-braces forced pass then found the tree already gone.
+    assert breaks == [(4321, 99)]
+    assert taskkills == [(4321, False)]
+    assert touched_root == []
+    assert job._terminated is True
+
+
+async def test_cancel_windows_no_console_tree_kills_before_the_root_dies(
+    monkeypatch,
+):
+    # regression, preserved from the pre-CTRL_BREAK design: where no break
+    # can be delivered (a service context has no shared console), the old
+    # cancel() TerminateProcess'd the direct child first, then ran
+    # taskkill /T against the now-dead pid: "process not found", no
+    # descendant reached, and the job's real work (a grandchild, for every
+    # string-form command routed through cmd.exe /c) survived
+    # executionTimeout, Replace and manual cancel alike. The degraded
+    # graceful step must therefore tree-kill while the root is still alive
+    # to anchor the walk, and a root the tree kill took down must not be
+    # separately terminated.
     taskkills = []
 
     async def fake_taskkill(pid):
@@ -2914,8 +3080,15 @@ async def test_cancel_windows_tree_kill_runs_before_the_root_dies(
             proc.returncode = 1  # the tree kill took the root down too
         return alive  # a second pass finds the tree gone, like taskkill 128
 
+    def no_console(pid, sig):
+        raise OSError("the handle is invalid")
+
     monkeypatch.setattr(cronstable.platform, "IS_WINDOWS", True)
     monkeypatch.setattr(cronstable.platform, "_taskkill_tree", fake_taskkill)
+    monkeypatch.setattr(
+        cronstable.platform.signal, "CTRL_BREAK_EVENT", 99, raising=False
+    )
+    monkeypatch.setattr(cronstable.platform.os, "kill", no_console)
 
     job = _fresh_job()
     job.config.killTimeout = 5

@@ -144,6 +144,7 @@ All routes are registered in `start_stop_web_app`:
 | `POST` | `/push/devices` | `_web_push_pair` | `201` (`200` when an existing public key re-pairs) |
 | `DELETE` | `/push/devices/{id}` | `_web_push_revoke` | `200` |
 | `POST` | `/push/devices/{id}/test` | `_web_push_test` | `200` (`502` when sealing or the relay failed) |
+| `POST` | `/shutdown` | `_web_shutdown` | `200` (`403` unless bearer-token authenticated) |
 | `POST` | `/mcp` | `MCPHandler.handle_http` | `200` (JSON-RPC response; `202` for a notification; omitted unless `mcp.enabled`) |
 | `GET` | `/mcp` | `MCPHandler.handle_http_get` | `405` (always, with `Allow: POST, OPTIONS`; omitted unless `mcp.enabled`) |
 | `OPTIONS` | `/mcp` | `MCPHandler.handle_options` | `204` (CORS preflight for an allow-listed `Origin`; omitted unless `mcp.enabled`) |
@@ -1260,6 +1261,29 @@ $ curl -X POST -H "Authorization: Bearer s3cr3t" \
 {"device": "f1e2d3c4b5a69788", "status": 200, "error": null}
 ```
 
+### `POST /shutdown`
+
+Gracefully stops this daemon: the same drain Ctrl-C / `SIGTERM` trigger
+(stop scheduling new runs, wait for the running jobs to finish, stop the web
+app, exit). This is the stop path for deployments that cannot deliver a
+signal: service wrappers and supervisors, and any console-less Windows
+daemon, where no `SIGTERM` exists. In a cluster it stops only the node
+addressed.
+
+Unlike every other route, `/shutdown` is refused (`403`, with the remedy in
+the body) unless the request was authenticated by a configured bearer token,
+even on a deployment that leaves the rest of the API unauthenticated: an open
+listener must not hand every process that can reach it a stop switch for the
+scheduler. Configure `web.authToken` (or a `web.authTokens` entry whose
+scopes include `control`) and present it. On success the response is
+`{"shuttingDown": true}` and the drain has begun; the connection closes when
+the web app stops.
+
+```shell
+$ curl -X POST -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/shutdown
+{"shuttingDown": true}
+```
+
 ### `GET /job-set-id`
 
 Returns this instance's job-set id: the order-independent fingerprint of every
@@ -1383,12 +1407,16 @@ web:
 ## Authentication
 
 By default the API is unauthenticated; anyone who can reach a `listen` address can
-call every endpoint. Restrict access at the network or socket level, enable
-bearer-token authentication with `web.authToken`, or require a client
+call every endpoint except [`POST /shutdown`](#post-shutdown), which always
+requires a bearer token. Restrict access at the network or socket level,
+enable bearer-token authentication with `web.authToken`, or require a client
 certificate with `web.tls.clientCa` (see
 [Client certificates](#client-certificates-mutual-tls) below). The latter two
 are independent checks and compose: a token authenticates the caller inside
-the request, a client certificate authenticates it at the handshake.
+the request, a client certificate authenticates it at the handshake. Note
+that "reachable" includes every local account on a multi-user host: loopback
+confines the listener to the machine, not to your user, so set a token
+anywhere other local users matter.
 
 `authToken` resolves the token from exactly one source, in this precedence order
 (`_resolve_web_token`):

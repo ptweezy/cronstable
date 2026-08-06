@@ -35,6 +35,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Mapping,
     Optional,
     Union,
 )
@@ -74,14 +75,32 @@ DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
 
 
 # --- Default config location (the ``-c`` default) -------------------------
+def _windows_config_home(environ: Mapping[str, str]) -> str:
+    """The Windows ``-c`` default, resolved against ``environ``.
+
+    Machine-wide first: ``%ProgramData%\\cronstable`` is the actual Windows
+    analog of ``/etc/cronstable.d`` (machine-scoped, shared by every
+    account), so when that directory exists it wins.  It is never created
+    implicitly; ``cronstable init`` or an administrator creates it, and from
+    then on the same command resolves to the same config for an interactive
+    admin and for a service account, whose ``%APPDATA%`` points into an
+    invisible ``systemprofile`` directory nobody edits.  Without it the
+    default stays the historical per-user location: roaming AppData, falling
+    back to the user profile if APPDATA is somehow unset (rare; e.g. a bare
+    service account with no roaming profile).
+    """
+    program_data = environ.get("PROGRAMDATA")
+    if program_data:
+        machine_wide = os.path.join(program_data, "cronstable")
+        if os.path.isdir(machine_wide):
+            return machine_wide
+    base = environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "cronstable")
+
+
 def _default_config_path() -> str:
     if IS_WINDOWS:  # pragma: no cover - Windows-only path
-        # Per-user config under roaming AppData, e.g.
-        # ``C:\Users\<you>\AppData\Roaming\cronstable``.  Falls back to the
-        # user profile if APPDATA is somehow unset (rare; e.g. a bare service
-        # account with no roaming profile).
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "cronstable")
+        return _windows_config_home(os.environ)
     return "/etc/cronstable.d"
 
 
@@ -124,6 +143,12 @@ def encode_argv(argv: List[str]) -> List[Union[str, bytes]]:
 TASKKILL_TIMEOUT = 10.0
 
 
+#: ``subprocess.CREATE_NEW_PROCESS_GROUP``, spelled as a literal so this
+#: module still imports (and type-checks, pinned to ``platform = linux``)
+#: where the ``subprocess`` module does not define the constant.
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+
+
 def new_process_group_kwargs() -> Dict[str, Any]:
     """Subprocess kwargs that isolate a job in its own process group.
 
@@ -137,48 +162,69 @@ def new_process_group_kwargs() -> Dict[str, Any]:
 
     On POSIX ``start_new_session`` puts the child in a brand-new session, so
     it and every descendant share one process-group id (the child's own
-    pid), which :func:`kill_process_group` can then signal as a unit.  Windows
-    has no equivalent at spawn time; descendants are reached through the
-    process tree instead, so no creation flag is needed there.
+    pid), which :func:`kill_process_group` can then signal as a unit.  On
+    Windows ``CREATE_NEW_PROCESS_GROUP`` is the analog, and it earns its
+    keep twice over:
+
+    * the child's group no longer receives the daemon console's own Ctrl-C,
+      so a graceful daemon shutdown actually waits for running jobs instead
+      of the console event killing them first and recording every in-flight
+      run as failed (exit 0xC000013A, STATUS_CONTROL_C_EXIT);
+    * the child's pid becomes a valid ``GenerateConsoleCtrlEvent`` target,
+      which gives :func:`kill_process_group` a *trappable* graceful step
+      (CTRL_BREAK) before the forced ``taskkill /F /T``.
+
+    Standard Windows behavior worth naming: a process created in its own
+    group starts with Ctrl-C delivery disabled (Ctrl-Break is unaffected),
+    which is exactly the console shielding the first bullet describes.
     """
     if IS_WINDOWS:  # pragma: no cover - Windows-only path
-        return {}
+        return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
 
 
 async def kill_process_group(pid: int, *, force: bool) -> bool:
     """Signal the whole process group / tree rooted at ``pid``.
 
-    ``force`` selects an unconditional kill (POSIX ``SIGKILL``) over a
-    graceful request to exit (``SIGTERM``).  Returns whether the group was
-    signalled: ``False`` means the caller should fall back to signalling the
-    direct child on its own (:meth:`asyncio.subprocess.Process.terminate`),
-    which is all this module could do before.
+    ``force`` selects an unconditional kill (POSIX ``SIGKILL``, Windows
+    ``taskkill /F /T``) over a graceful request to exit (POSIX ``SIGTERM``,
+    Windows ``CTRL_BREAK_EVENT``).  Returns whether the group was signalled:
+    ``False`` means the caller should fall back to signalling the direct
+    child on its own (:meth:`asyncio.subprocess.Process.terminate`), which
+    is all this module could do before.
 
     ``pid`` must be the child spawned with :func:`new_process_group_kwargs`,
-    whose pid is by construction its own pgid.  Signalling the *group* rather
-    than the pid is what reaches an orphaned descendant, and it keeps working
-    after the leader itself has exited: a process group lives as long as any
-    member does, and the kernel will not recycle a pid that is still in use as
-    a pgid, so there is no risk of hitting an unrelated group.
+    whose pid is by construction its own pgid (a POSIX session leader, a
+    Windows ``CREATE_NEW_PROCESS_GROUP`` root).  Signalling the *group*
+    rather than the pid is what reaches an orphaned descendant, and it keeps
+    working after the leader itself has exited: a process group lives as
+    long as any member does, and the kernel will not recycle a pid that is
+    still in use as a pgid, so there is no risk of hitting an unrelated
+    group.
 
-    Windows has no process group to signal, and no graceful equivalent at all
-    (``TerminateProcess`` is unconditional), so BOTH calls shell out to
-    ``taskkill /F /T``, which walks the live parent/child tree.  The
-    non-forced call must not report ``False`` and leave the root to the
-    caller's direct-child terminate: ``/T`` resolves descendants through
-    their live parents, so killing the root first (as that fallback does)
-    orphans every descendant beyond the later forced pass's reach.  The
-    string-form ``command:`` runs via ``cmd.exe /c``, so the actual workload
-    is always a grandchild that would survive every cancel.  The tree kill
-    therefore happens HERE, while the root is still alive to anchor the
-    walk.  Honest bound: a descendant already orphaned before this runs (its
-    parent exited mid-run) is no longer in that tree and survives, which is
-    why the stream drain is separately bounded rather than trusting this to
-    always succeed.
+    The Windows sequence mirrors the POSIX one.  The graceful call delivers
+    ``CTRL_BREAK_EVENT`` to the job's process group; that event is trappable
+    (``signal.SIGBREAK`` in Python, ``SetConsoleCtrlHandler`` natively), so
+    a job gets ``killTimeout`` seconds to flush and exit before the forced
+    call escalates to the ``taskkill /F /T`` tree kill.  Delivering a break
+    needs a console shared with the daemon: where there is none (a detached
+    or service context), or ``pid`` is not a group root, delivery fails and
+    the graceful call becomes the tree kill immediately, this function's
+    previous behavior on every call (:func:`_windows_graceful_break`).  The
+    forced tree walk resolves descendants through their live parents, so the
+    root is deliberately never killed first: that would orphan every
+    descendant beyond the walk's reach, and the string-form ``command:``
+    runs via ``cmd.exe /c``, so the actual workload is always a grandchild.
+    Honest bounds: a descendant that moved itself into a new process group
+    (``start /b`` does) never receives the break, and one already orphaned
+    before the tree walk runs is no longer in the walkable tree and survives
+    it, which is why the stream drain is separately bounded rather than
+    trusting this to always succeed.
     """
     if IS_WINDOWS:  # pragma: no cover - Windows-only path
-        return await _taskkill_tree(pid)
+        if force:
+            return await _taskkill_tree(pid)
+        return await _windows_graceful_break(pid)
     sig = signal.SIGKILL if force else signal.SIGTERM
     try:
         os.killpg(pid, sig)
@@ -193,6 +239,34 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
         )
         return False
     return True
+
+
+async def _windows_graceful_break(
+    pid: int,
+) -> bool:  # pragma: no cover - Windows-only
+    """The graceful half of the Windows kill: CTRL_BREAK to ``pid``'s group.
+
+    ``os.kill`` with ``CTRL_BREAK_EVENT`` calls ``GenerateConsoleCtrlEvent``,
+    which can only address a process group sharing the daemon's console;
+    :func:`new_process_group_kwargs` sets exactly that up at spawn.  Where
+    delivery fails (no shared console, or ``pid`` was not spawned as a group
+    root) there is nothing trappable to send, so the graceful step degrades
+    to the immediate tree kill, the pre-CTRL_BREAK behavior of every call.
+    """
+    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+    if ctrl_break is not None:
+        try:
+            os.kill(pid, ctrl_break)
+        except OSError as ex:
+            logger.debug(
+                "could not deliver CTRL_BREAK_EVENT to the process group "
+                "of pid %s (%s); tree-killing it without the graceful step",
+                pid,
+                ex,
+            )
+        else:
+            return True
+    return await _taskkill_tree(pid)
 
 
 async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover - Windows-only
@@ -238,10 +312,14 @@ def install_shutdown_handlers(
     On POSIX this uses the event loop's native signal handling for SIGINT and
     SIGTERM.  On Windows, where ``loop.add_signal_handler`` raises
     ``NotImplementedError`` on the Proactor loop, it falls back to
-    ``signal.signal`` for SIGINT (Ctrl-C) and SIGBREAK (Ctrl-Break / console
-    close), marshalling the callback back onto the loop thread with
+    ``signal.signal`` for SIGINT (Ctrl-C) and SIGBREAK (Ctrl-Break),
+    marshalling the callback back onto the loop thread with
     ``call_soon_threadsafe`` and ticking a short timer so the interpreter runs
-    the pending handler promptly even while the loop is blocked in IOCP.
+    the pending handler promptly even while the loop is blocked in IOCP; a
+    native console-control handler additionally covers the events Python's
+    signal module never surfaces (console close, user logoff, OS shutdown),
+    turning them into the same graceful drain, bounded by the few seconds
+    Windows grants before terminating the process regardless.
     """
     if not IS_WINDOWS:
         sigs = (signal.SIGINT, signal.SIGTERM)
@@ -275,7 +353,7 @@ def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
     win_sigs = [signal.SIGINT]
     sigbreak = getattr(signal, "SIGBREAK", None)
     if sigbreak is not None:
-        win_sigs.append(sigbreak)  # Ctrl-Break / console close (Windows-only)
+        win_sigs.append(sigbreak)  # Ctrl-Break (Windows-only)
     previous = {}
 
     def handler(signum, frame):  # runs in the main thread
@@ -283,6 +361,11 @@ def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
 
     for sig in win_sigs:
         previous[sig] = signal.signal(sig, handler)
+
+    # Console close, logoff and OS shutdown never reach signal.signal (the
+    # interpreter only maps Ctrl-C and Ctrl-Break onto Python signals), so
+    # they get a native console-control handler of their own.
+    remove_console_handler = _install_windows_console_handler(loop, callback)
 
     # A Python signal handler only runs when the main thread returns to the
     # interpreter; while the Proactor loop is blocked in GetQueuedCompletion
@@ -299,10 +382,97 @@ def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
     def restore_signal_handlers() -> None:
         if heartbeat is not None:
             heartbeat.cancel()
+        remove_console_handler()
         for sig, prev in previous.items():
             signal.signal(sig, prev)
 
     return restore_signal_handlers
+
+
+# Windows console-control events beyond the two the interpreter maps onto
+# Python signals (CTRL_C_EVENT -> SIGINT, CTRL_BREAK_EVENT -> SIGBREAK).
+# Closing the console window, logging the user off and an OS shutdown or
+# restart arrive as these; a process without a handler for them is simply
+# terminated, which for a scheduler means jobs truncated mid-write and a
+# reporter storm of "failed" runs on every patch-day restart.
+_CTRL_CLOSE_EVENT = 2
+_CTRL_LOGOFF_EVENT = 5
+_CTRL_SHUTDOWN_EVENT = 6
+
+#: How long the native console-control handler parks its (system-created)
+#: thread after scheduling the graceful shutdown.  The process is terminated
+#: the moment the handler returns, while a parked handler lets the loop keep
+#: draining until Windows' own patience (about five seconds for a closed
+#: window or a logoff, registry-configurable) expires and it terminates the
+#: process regardless; the park only has to outlast every grace period the
+#: OS might grant.
+_CONSOLE_EVENT_HANDLER_PARK = 60.0
+
+
+def _console_event_requests_shutdown(event: int) -> bool:
+    """Whether console-control ``event`` is one the daemon must treat as a
+    shutdown request itself (console close / logoff / OS shutdown), rather
+    than leave to the interpreter's own handler chain, which turns Ctrl-C
+    and Ctrl-Break into the Python-level signals handled above."""
+    return event in (
+        _CTRL_CLOSE_EVENT,
+        _CTRL_LOGOFF_EVENT,
+        _CTRL_SHUTDOWN_EVENT,
+    )
+
+
+def _install_windows_console_handler(  # pragma: no cover - Windows-only
+    loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
+) -> Callable[[], None]:
+    """Catch console close / logoff / OS shutdown and drain gracefully.
+
+    Without this handler those events are a hard kill: in-flight jobs die
+    mid-write and nothing is recorded.  The handler schedules the same
+    graceful-shutdown callback the signal handlers use, then parks its
+    thread: Windows ends the process either when the handler returns or when
+    the OS grace period expires, so parking is what buys the loop its
+    drain time.  Best effort by design; the OS grace period bounds how much
+    draining can happen.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    # The ignore is for the same reason as every windll use in this module:
+    # mypy is pinned to platform = linux, where the Windows-only ctypes
+    # surface does not exist.
+    handler_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+        wintypes.BOOL, wintypes.DWORD
+    )
+
+    def _handle(event: int) -> bool:
+        # Runs on a thread the system creates per event.  Nothing may
+        # escape (an exception would tear through the ctypes callback), and
+        # Ctrl-C / Ctrl-Break must pass to the next handler in the chain,
+        # where the interpreter turns them into Python signals.
+        try:
+            if not _console_event_requests_shutdown(event):
+                return False
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                return False  # loop already closed: nothing left to drain
+            time.sleep(_CONSOLE_EVENT_HANDLER_PARK)
+            return True
+        except Exception:  # noqa: BLE001 - never raise into the OS callback
+            return True
+
+    handler = handler_type(_handle)
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    if not kernel32.SetConsoleCtrlHandler(handler, True):
+        return lambda: None
+
+    def remove() -> None:
+        # This closure keeps ``handler`` (and its ctypes thunk) alive until
+        # removal; without a live reference the thunk would be collected
+        # while still registered with the OS.
+        kernel32.SetConsoleCtrlHandler(handler, False)
+
+    return remove
 
 
 # --- OS boot identity ------------------------------------------------------

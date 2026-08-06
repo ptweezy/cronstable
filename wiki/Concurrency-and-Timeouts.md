@@ -38,11 +38,14 @@ to the job's whole **process group** -- each job is spawned in its own session
 -- so a cancellation takes down the command's descendants too, not just the
 process cronstable spawned.
 
-The SIGTERM-then-SIGKILL escalation is the POSIX behavior. On Windows there
-are no POSIX signals: the graceful step falls back to `TerminateProcess` on
-the direct child (an immediate, ungraceful stop), and the forced step kills
-the live process tree with `taskkill /F /T`; `killTimeout` still bounds the
-wait between the two. See [Running on Windows](Running-on-Windows).
+The SIGTERM-then-SIGKILL escalation is the POSIX spelling. On Windows the
+same two-step runs with the platform's own primitives: the graceful step
+delivers a trappable `CTRL_BREAK_EVENT` to the job's process group (each job
+is spawned in its own group), and the forced step kills the live process
+tree with `taskkill /F /T`; `killTimeout` bounds the wait between the two.
+See [Running on Windows](Running-on-Windows), including the one degradation
+(a daemon with no console cannot deliver the break, so the graceful step
+becomes the tree kill immediately).
 
 ## Option summary
 
@@ -51,7 +54,7 @@ wait between the two. See [Running on Windows](Running-on-Windows).
 | `concurrencyPolicy` | enum: `Allow`, `Forbid`, `Replace` | `Allow` | Behavior when a launch is requested while another instance of the same job is still running. |
 | `concurrencyScope` | enum: `node`, `cluster` | `node` | How far `concurrencyPolicy` reaches: `node` considers only this process's running instances; `cluster` makes `Forbid`/`Replace` also exclude instances on other nodes sharing the [`state` store](Durable-State). See [Concurrency across a cluster](#concurrency-across-a-cluster). |
 | `executionTimeout` | float (seconds, `> 0` when set) | none (`null`) | Maximum wall-clock duration of a single run. On expiry the run is cancelled and assigned return code `-100`. |
-| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after the process-group SIGTERM before the unconditional process-group SIGKILL (POSIX); on Windows, seconds between the direct-child `TerminateProcess` and the `taskkill /F /T` tree kill. See [Running on Windows](Running-on-Windows). |
+| `killTimeout` | float (seconds, `>= 0`) | `30` | When a run is cancelled, seconds to wait after the graceful process-group signal (SIGTERM on POSIX, `CTRL_BREAK_EVENT` on Windows) before the unconditional kill (process-group SIGKILL on POSIX, `taskkill /F /T` tree kill on Windows). See [Running on Windows](Running-on-Windows). |
 
 Types are from the strictyaml schema (`concurrencyPolicy` is
 `Enum(["Allow", "Forbid", "Replace"])`, `concurrencyScope` is
@@ -396,15 +399,17 @@ so the run would never finish draining, its slot would never be released, and
 under `concurrencyPolicy: Forbid` the job would never run again. Killing the
 group takes the helper down with the shell.
 
-On Windows there is no process group to signal and no graceful kill at all,
-so the two steps differ: step 1 falls back to `proc.terminate()` --
-`TerminateProcess` on the direct child, an immediate ungraceful stop the
-child cannot trap -- and step 3 shells out to `taskkill /F /T`, which
-force-kills the live parent/child process tree (the `taskkill` run itself is
-bounded at 10 seconds; on failure the fallback is `proc.kill()` on the direct
-child). The escalation on Windows is therefore one of *scope* (direct child,
-then whole tree), not of gracefulness: the child is never notified to clean
-up. See [Running on Windows](Running-on-Windows).
+On Windows each job is likewise spawned in its own process group
+(`CREATE_NEW_PROCESS_GROUP`), and the steps map onto the platform's own
+primitives: step 1 delivers `CTRL_BREAK_EVENT` to the group, a trappable
+request the job can handle (`signal.SIGBREAK` in Python,
+`SetConsoleCtrlHandler` natively) to flush and exit; step 3 shells out to
+`taskkill /F /T`, which force-kills the live parent/child process tree (the
+`taskkill` run itself is bounded at 10 seconds; on failure the fallback is
+`proc.kill()` on the direct child). One degradation: delivering a break
+needs a console shared with the daemon, so where there is none (a service
+context) step 1 becomes the tree kill immediately and the job gets no
+notice. See [Running on Windows](Running-on-Windows).
 
 `killTimeout` defaults to `30` seconds and must be `>= 0`. A value of `0` is
 valid and means the group SIGKILL follows almost immediately after the group
@@ -413,10 +418,11 @@ essentially no grace period).
 
 `killTimeout` gives a job time to flush buffers and clean up after being asked
 to stop; raise it for jobs that need longer to shut down, lower it for jobs
-that may ignore SIGTERM and must be force-killed quickly. This grace and the
-"ignore SIGTERM" guidance apply only on POSIX; on Windows `TerminateProcess`
-gives the child no chance to flush or clean up and a job cannot trap or ignore
-the stop, so `killTimeout` effectively only delays the tree kill. See
+that may ignore the graceful signal and must be force-killed quickly. The
+guidance applies on both platforms (the graceful signal is SIGTERM on POSIX
+and `CTRL_BREAK_EVENT` on Windows), with one Windows caveat: a daemon
+without a console cannot deliver the break, and there the grace period has
+nothing to bound because the tree kill runs at once. See
 [Running on Windows](Running-on-Windows).
 
 As defense in depth, a descendant that escaped the group entirely (it called
@@ -445,11 +451,12 @@ jobs:
     killTimeout: 0.5   # SIGKILL 0.5s after the (ignored) SIGTERM
 ```
 
-This example demonstrates POSIX-only behavior (a shell trapping SIGTERM). On
-Windows there is no signal to trap; the job would be stopped ungracefully
-regardless (`TerminateProcess`, then the `taskkill /F /T` tree kill), so the
-trap and the SIGTERM/SIGKILL timing it illustrates do not apply. See
-[Running on Windows](Running-on-Windows).
+This example's trap spelling is POSIX (`sh` trapping SIGTERM). The Windows
+equivalent traps `SIGBREAK`: the graceful step there delivers
+`CTRL_BREAK_EVENT` to the job's process group, and the escalation timing
+`killTimeout` illustrates is the same (the forced step is the
+`taskkill /F /T` tree kill). See [Running on Windows](Running-on-Windows),
+including the no-console case where the graceful step cannot be delivered.
 
 ## Scope and interaction
 

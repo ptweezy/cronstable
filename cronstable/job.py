@@ -128,6 +128,51 @@ def loggable_spawn_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 
+def shell_invocation_flag(shell: str) -> str:
+    """The flag that makes ``shell`` execute a command string.
+
+    ``/c`` for cmd.exe, ``-c`` for everything else.  cmd.exe does not
+    understand ``-c``: handed one it starts an interactive shell, prints its
+    version banner, reads EOF on stdin and exits 0, so a ``shell: cmd`` job
+    used to record a clean success without ever running its command.  Every
+    other shell a job realistically names takes ``-c`` (PowerShell reads it
+    as an abbreviation of ``-Command``).  Matched on the basename so
+    ``cmd``, ``cmd.exe`` and a full ``C:\\Windows\\System32\\cmd.exe`` all
+    resolve alike.
+    """
+    name = os.path.basename(shell.replace("\\", "/")).lower()
+    if name in ("cmd", "cmd.exe"):
+        return "/c"
+    return "-c"
+
+
+def _decode_output_line(raw: bytes) -> str:
+    """Decode one captured line (or unterminated tail) of job output.
+
+    UTF-8 first, strictly: the overwhelmingly common case on every
+    platform, and what POSIX tools and PowerShell 7 emit.  On Windows the
+    native console tools (cmd.exe builtins, ``dir``, OS error messages,
+    Windows PowerShell 5) emit the console's OEM code page instead, so a
+    line that is not valid UTF-8 is retried through the Windows-only
+    ``"oem"`` codec, keeping accented output from a non-English install
+    intact rather than collapsing it to U+FFFD.  Anything still undecodable
+    falls back to UTF-8 with replacement (the old unconditional behavior),
+    so the reader task can never die on job-controlled bytes.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if platform.IS_WINDOWS:
+            try:
+                # East Asian OEM code pages are multi-byte and can also
+                # fail to decode; LookupError guards a Python built
+                # without the codec.
+                return raw.decode("oem")
+            except (UnicodeDecodeError, LookupError):
+                pass
+        return raw.decode("utf-8", errors="replace")
+
+
 # How many of the most recent output lines a JobOutputStream retains for the
 # live web log tail. Independent of saveLimit (which bounds the text kept for
 # failure reports); this only bounds the in-memory buffer the UI streams from.
@@ -428,11 +473,19 @@ class StreamReader:
 
     @staticmethod
     def _emit(out_stream, out_line: str) -> None:
-        # Write bytes so we control the encoding; fall back to ASCII with
-        # replacement when the console encoding can't represent the text.
+        # Write bytes so we control the encoding, and use the STREAM'S OWN
+        # encoding, not a hardcoded UTF-8: on POSIX and on a real Windows
+        # console that is UTF-8 anyway, while a Windows daemon whose output
+        # is redirected to a pipe or log file declares the ANSI code page,
+        # and UTF-8 bytes in that file read back as mojibake. Replacement
+        # (not raising) for what the target encoding cannot carry; ASCII
+        # with replacement remains the last-ditch fallback for a stream
+        # with a broken or unknown encoding.
         try:
-            out_stream.buffer.write(out_line.encode())
-        except UnicodeEncodeError:
+            encoding = getattr(out_stream, "encoding", None) or "utf-8"
+            payload = out_line.encode(encoding, errors="replace")
+            out_stream.buffer.write(payload)
+        except (LookupError, UnicodeEncodeError):
             safe = out_line.encode("ascii", "replace").decode("ascii")
             out_stream.write(safe)
         out_stream.flush()
@@ -523,14 +576,12 @@ class StreamReader:
                     # once the buffer itself has passed the cap: one
                     # comparison per chunk instead of one per line.
                     parts = [p for p in parts if not self._too_long(p, cap)]
-                # errors="replace" so a job emitting non-UTF-8 bytes does
-                # not crash the reader task with UnicodeDecodeError.
-                lines = [
-                    raw.decode("utf-8", errors="replace") + "\n"
-                    for raw in parts
-                ]
+                # decoded per line: strict UTF-8 with an OEM-code-page
+                # retry on Windows, never an exception (see
+                # _decode_output_line).
+                lines = [_decode_output_line(raw) + "\n" for raw in parts]
             elif tail and not self._too_long(tail, cap):
-                lines = [tail.decode("utf-8", errors="replace")]
+                lines = [_decode_output_line(tail)]
             else:
                 lines = []
             for line in lines:
@@ -818,7 +869,11 @@ class ShellReporter(Reporter):
         else:
             if shell_config["shell"]:
                 create = asyncio.create_subprocess_exec
-                cmd = [shell_config["shell"], "-c", shell_config["command"]]
+                cmd = [
+                    shell_config["shell"],
+                    shell_invocation_flag(shell_config["shell"]),
+                    shell_config["command"],
+                ]
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [shell_config["command"]]
@@ -1372,7 +1427,11 @@ class RunningJob:
         else:
             if self.config.shell:
                 create = asyncio.create_subprocess_exec
-                cmd = [self.config.shell, "-c", self.config.command]
+                cmd = [
+                    self.config.shell,
+                    shell_invocation_flag(self.config.shell),
+                    self.config.command,
+                ]
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [self.config.command]
@@ -1662,14 +1721,17 @@ class RunningJob:
             )
             return
         self._terminated = True
-        # Graceful first: SIGTERM the group. This reaches the descendants even
-        # once the leader itself has exited, which is exactly the case that
-        # wedges the run. On Windows this step IS the taskkill tree kill:
-        # there is no graceful signal, and the tree walk must run while the
-        # root is still alive to anchor it (killing the root first, as the
-        # fallback below does, would orphan every descendant for good). The
-        # fallback to the direct child remains for a group/tree that could
-        # not be signalled at all.
+        # Graceful first: SIGTERM the group on POSIX, CTRL_BREAK_EVENT to the
+        # group on Windows (both trappable, so the job gets killTimeout
+        # seconds to flush and exit). On POSIX this reaches the descendants
+        # even once the leader itself has exited, which is exactly the case
+        # that wedges the run. On Windows, where the break cannot be
+        # delivered (no shared console, as in a service context), this step
+        # degrades to the immediate taskkill tree kill, which must run while
+        # the root is still alive to anchor its walk (killing the root
+        # first, as the fallback below does, would orphan every descendant
+        # for good). The fallback to the direct child remains for a
+        # group/tree that could not be signalled at all.
         if not await platform.kill_process_group(self.proc.pid, force=False):
             if self.proc.returncode is None:
                 try:

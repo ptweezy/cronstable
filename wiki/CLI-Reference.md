@@ -35,8 +35,13 @@ and [The `tui` subcommand](#the-tui-subcommand).
 `cronstable` runs as a single foreground process. It does not daemonize, does not
 fork, and does not write a PID file. Diagnostics go to stdout/stderr via the
 standard library `logging` module. To run it as a service, place it under a
-process supervisor (systemd, a container runtime, etc.); see
-[Production and Container Deployment](Production-Deployment).
+process supervisor: systemd or a container runtime on POSIX (see
+[Production and Container Deployment](Production-Deployment)), Task Scheduler
+or a service wrapper on Windows (see
+[Running unattended](Running-on-Windows#running-unattended) on
+[Running on Windows](Running-on-Windows)). A supervised daemon is stopped
+gracefully with `SIGTERM` on POSIX or the authenticated `POST /shutdown`
+route on any platform (see the [HTTP Control API](HTTP-API)).
 
 ## Arguments
 
@@ -59,9 +64,11 @@ configured entirely in YAML, not on the command line; see the
 [Configuration Reference](Configuration-Reference).
 
 [^cfgdefault]: The default config path is platform-specific (`DEFAULT_CONFIG_PATH`
-    in `cronstable/platform.py`): `/etc/cronstable.d` on POSIX, and `%APPDATA%\cronstable`
+    in `cronstable/platform.py`): `/etc/cronstable.d` on POSIX; on Windows the
+    machine-wide `%ProgramData%\cronstable` when that directory exists,
+    otherwise the per-user `%APPDATA%\cronstable`
     (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`, falling back to the user
-    profile `~` if `APPDATA` is unset) on Windows. See
+    profile `~` if `APPDATA` is unset). See
     [Running on Windows](Running-on-Windows).
 
 ### `-c` / `--config`
@@ -82,22 +89,34 @@ The argument may be a single file or a directory:
 #### Default-path special case
 
 The default is the platform default config path (`DEFAULT_CONFIG_PATH` from
-`cronstable/platform.py`): `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on
-Windows. The special case is triggered by the condition
+`cronstable/platform.py`; see the footnote above for the per-platform values).
+The special case is triggered by the condition
 `args.config == DEFAULT_CONFIG_PATH and not os.path.exists(args.config)`: if the
 config argument equals the platform default and that path does not exist,
-cronstable prints the following to stderr, prints the usage help, and exits `1`:
+cronstable prints the following to stderr (with the resolved default filled in),
+prints the usage help, and exits `1`:
 
 ```
-cronstable error: configuration file not found, please provide one with the --config option
+cronstable error: configuration file not found at the default location (<default path>). Run `cronstable init` to create a starter configuration there, or point -c/--config at an existing file or directory.
 ```
 
 Because the check compares the argument value (not whether `-c` was supplied),
 it fires both when `-c` is omitted and when you pass `-c` set to the platform
-default explicitly (`-c /etc/cronstable.d` on POSIX, `-c %APPDATA%\cronstable` on
-Windows). For any other non-existent path passed with `-c`, you instead get the
-generic configuration-error path (a logged `Configuration error: ...` and exit
-`1`).
+default explicitly. For any other non-existent path passed with `-c`, you
+instead get the generic configuration-error path (a logged
+`Configuration error: ...` and exit `1`).
+
+#### The `init` subcommand
+
+`cronstable init [DIRECTORY]` writes a commented starter configuration
+(`cronstable.yaml`, one working job plus the most commonly wanted next steps
+left commented out) into `DIRECTORY`, creating the directory when needed.
+With no argument it targets the platform default config path, so
+`cronstable init` followed by `cronstable` is a working first run. It never
+touches an existing setup: a target that is a file, already holds
+`*.yaml`/`*.yml`/crontab config files, or already has a `cronstable.yaml` is
+refused with the reason and exit `1`; success prints the written path and the
+command to start the scheduler, and exits `0`.
 
 ### `-l` / `--log-level`
 
@@ -547,7 +566,9 @@ When started normally (no `--version`, no `--validate-config`, no
 3. Installs shutdown handlers. On POSIX these are bound to `SIGINT` and
    `SIGTERM` on the event loop; on Windows cronstable instead uses `signal.signal`
    for `SIGINT` (Ctrl-C) and `SIGBREAK` (Ctrl-Break) plus a heartbeat timer,
-   because the Proactor loop has no `add_signal_handler`.
+   because the Proactor loop has no `add_signal_handler`, and a native
+   console-control handler that turns console close, logoff, and OS shutdown
+   into the same graceful drain (bounded by the OS's own grace period).
 4. Runs the asyncio scheduler loop in the foreground until shutdown.
 
 The scheduler re-reads the configuration on every loop iteration, so editing the
@@ -570,14 +591,21 @@ jobs finish)...`, and then cronstable:
 cronstable does not force-kill its own running jobs on shutdown. Individual jobs
 have their own kill behavior (`killTimeout`) when they are stopped; see
 [Concurrency and Timeouts](Concurrency-and-Timeouts). Sending a second signal
-does not change the shutdown sequence; if you need an immediate stop, kill the
-process with `SIGKILL` (POSIX-only; there is no Windows equivalent, so use Task
-Manager or `taskkill /F` there).
+does not change the shutdown sequence. A deployment that cannot deliver a
+signal (a supervised or console-less daemon) gets the same graceful drain
+from the authenticated `POST /shutdown` route; see the
+[HTTP Control API](HTTP-API). If you need an immediate, ungraceful stop, kill
+the process with `SIGKILL` on POSIX or Task Manager / `taskkill /F` on
+Windows; either skips the drain, and on Windows also leaves any spawned job
+trees running.
 
-On Windows, press Ctrl-C or Ctrl-Break (`SIGINT`/`SIGBREAK`) to trigger the same
-graceful shutdown: it finishes the currently-running jobs first, exactly as
-`SIGTERM` does on POSIX. The wiring differs only internally: `signal.signal`
-plus a heartbeat timer, because the Proactor loop lacks `add_signal_handler`.
+On Windows, press Ctrl-C (`SIGINT`) to trigger the same graceful shutdown: it
+finishes the currently-running jobs first, exactly as `SIGTERM` does on
+POSIX, and jobs run in their own console process groups so the keystroke
+never reaches them directly. Ctrl-Break (`SIGBREAK`) drains the daemon the
+same way, but a console-generated break also reaches the jobs sharing the
+console, so prefer Ctrl-C. Closing the console window, logging off, and OS
+shutdown trigger the drain too, on the few seconds of grace Windows grants.
 See [Running on Windows](Running-on-Windows).
 
 ### Exit codes
@@ -585,7 +613,7 @@ See [Running on Windows](Running-on-Windows).
 | Code | Condition |
 | --- | --- |
 | `0` | `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
-| `1` | Configuration error (parse/schema/validation failure or unreadable config); the default `-c` path (platform-specific: `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on Windows) does not exist and no `-c` was given; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
+| `1` | Configuration error (parse/schema/validation failure or unreadable config); the default `-c` path (platform-specific; see the footnote under [Arguments](#arguments)) does not exist and no `-c` was given; an `init` refusal; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
 | `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 
 A traceback (non-zero, not the clean `1` path) results from an invalid
@@ -606,15 +634,16 @@ Run against a config directory (the conventional container entrypoint):
 cronstable -c /etc/cronstable.d
 ```
 
-On Windows the config path uses Windows paths and the default is
-`%APPDATA%\cronstable` rather than `/etc/cronstable.d`:
+On Windows the config path uses Windows paths, and the machine-wide default
+directory is `%ProgramData%\cronstable` (falling back to `%APPDATA%\cronstable`
+until it exists):
 
 ```bat
-cronstable.exe -c %APPDATA%\cronstable
+cronstable.exe -c C:\ProgramData\cronstable
 ```
 
 See [Running on Windows](Running-on-Windows) for Windows-specific CLI behavior
-(default config path, default shell, Ctrl-C / Ctrl-Break shutdown).
+(default config path, default shell, shutdown semantics, running unattended).
 
 Validate a config and exit (suitable for CI or a container healthcheck/preflight):
 

@@ -557,6 +557,12 @@ WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
     ("POST", "/push/devices", "_web_push_pair", None),
     ("DELETE", "/push/devices/{id}", "_web_push_revoke", None),
     ("POST", "/push/devices/{id}/test", "_web_push_test", None),
+    # Daemon lifecycle: the graceful stop for deployments with no console
+    # to press Ctrl-C in (service wrappers, supervisors, headless boxes;
+    # on Windows there is no SIGTERM to send). The handler refuses unless
+    # the request was bearer-token authenticated, so an unauthenticated
+    # local listener never hands every local process a stop switch.
+    ("POST", "/shutdown", "_web_shutdown", None),
     # The MCP server rides these same listeners and the auth middleware:
     # /mcp is NEVER in WEB_PUBLIC_PATHS, so it inherits the bearer-token gate
     # (and the `control` scope override above, on every method).
@@ -4823,6 +4829,38 @@ class Cron:
         except ApiActionError as ex:
             raise self._action_http_error(ex) from ex
         return web.Response(headers=self.web_config.get("headers", None))
+
+    async def _web_shutdown(self, request: web.Request) -> web.Response:
+        """Gracefully stop this daemon (`POST /shutdown`).
+
+        The same drain Ctrl-C / SIGTERM trigger: stop scheduling new runs,
+        wait for the running jobs, stop the web app, exit. This is the one
+        graceful stop that needs no console or signal delivery, which is
+        what a service wrapper or supervisor drives, and on Windows the
+        only graceful stop reachable from outside the daemon's own console.
+
+        Refused (403) unless the request was authenticated by a configured
+        bearer token: on an unauthenticated listener this endpoint would
+        otherwise hand every process that can reach it a stop switch for
+        the scheduler, a step beyond what the other control routes can do.
+        In a cluster this stops only the node addressed.
+        """
+        assert self.web_config is not None
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        if matched is None:
+            raise web.HTTPForbidden(
+                text="POST /shutdown requires bearer-token authentication: "
+                "configure web.authToken (or a web.authTokens entry whose "
+                "scopes include `control`) and present it on this request"
+            )
+        logger.info(
+            "shutdown requested via POST /shutdown (token %r)", matched.label
+        )
+        self.signal_shutdown()
+        return _json_response(
+            {"shuttingDown": True},
+            headers=self.web_config.get("headers", None),
+        )
 
     async def _web_pause_job(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
