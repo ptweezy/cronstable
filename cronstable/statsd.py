@@ -194,10 +194,15 @@ class StatsdJobMetricWriter:
             return
         duration_seconds = time.perf_counter() - self.start_time
         duration = int(round(duration_seconds * 1000))
+        # no @rate suffix on the timers: one datagram per run is sent, never
+        # a sample. The yacron-era "@0.1" flag told the server to scale
+        # each observation by 10x as if 90% had been dropped, so timer
+        # counts and percentile weights read 10x reality on servers that
+        # honor sample rates.
         message = (
             "{prefix}.stop:1|g\n"
             "{prefix}.success:{success}|g\n"
-            "{prefix}.duration:{duration}|ms|@0.1\n"
+            "{prefix}.duration:{duration}|ms\n"
         ).format(
             prefix=self.prefix,
             success=0 if self.job.failed else 1,
@@ -210,7 +215,7 @@ class StatsdJobMetricWriter:
         usage = getattr(self.job, "resource_usage", None)
         if usage is not None:
             message += (
-                "{prefix}.cpu:{cpu}|ms|@0.1\n{prefix}.max_rss:{rss}|g\n"
+                "{prefix}.cpu:{cpu}|ms\n{prefix}.max_rss:{rss}|g\n"
             ).format(
                 prefix=self.prefix,
                 cpu=int(round(usage.cpu_total_seconds * 1000)),

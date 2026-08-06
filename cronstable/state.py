@@ -84,11 +84,14 @@ _T = TypeVar("_T")
 logger = logging.getLogger("cronstable.state")
 
 #: Per-record on-disk schema version.  Every record is written wrapped as
-#: ``{"schemaVersion": SCHEME_VERSION, "data": {...}}``; a record whose version
+#: ``{"schemaVersion": SCHEMA_VERSION, "data": {...}}``; a record whose version
 #: this build does not recognise is quarantined on read rather than guessed at.
 #: Bump this when the wrapper (not a caller's ``data``) changes shape, so old
-#: and new records are told apart instead of silently mis-read.
-SCHEME_VERSION = "v1"
+#: and new records are told apart instead of silently mis-read.  Named after
+#: the ``schemaVersion`` key it is written under, NOT after the unrelated
+#: job-set-id ``cronstable.fingerprint.SCHEME_VERSION``, whose name this
+#: constant used to collide with.
+SCHEMA_VERSION = "v1"
 
 # Registry of record-scheme converters for `cronstable state migrate-schema`:
 # maps an OLD wrapper schemaVersion to a callable converting that version's
@@ -290,14 +293,7 @@ def _fs_safe(name: str) -> str:
     4xx.  ``surrogatepass`` maps each such code point to its own distinct
     three-byte sequence, so injectivity is preserved.
     """
-    out: List[str] = []
-    for byte in name.encode("utf-8", "surrogatepass"):
-        char = chr(byte)
-        if char in _FS_SAFE:
-            out.append(char)
-        else:
-            out.append("%{:02X}".format(byte))
-    token = "".join(out) or "_"
+    token = _fs_safe_fragment(name) or "_"
     if token in _WINDOWS_RESERVED:
         token = "%{:02X}".format(ord(token[0])) + token[1:]
     if len(token) > _FS_SAFE_MAX:
@@ -311,8 +307,9 @@ def _fs_safe(name: str) -> str:
 def _fs_safe_fragment(fragment: str) -> str:
     """Per-byte escape of a stream-name PREFIX, for on-disk prefix matching.
 
-    Applies :func:`_fs_safe`'s byte encoding without its whole-token
-    adjustments.  Valid for *prefix* matching because those adjustments only
+    The byte-escape core :func:`_fs_safe` itself builds on, without its
+    whole-token adjustments.  Valid for *prefix* matching because those
+    adjustments only
     ever rewrite a token's FIRST character (reserved device names, which are
     whole-token matches a multi-part prefix can never be) or its over-length
     TAIL (the digest truncation keeps the head intact), so a managed prefix
@@ -1422,7 +1419,7 @@ class FilesystemStateBackend(StateBackend):
                 continue
             if isinstance(obj, dict) and "schemaVersion" in obj:
                 version = obj.get("schemaVersion")
-                if version != SCHEME_VERSION:
+                if version != SCHEMA_VERSION:
                     logger.warning(
                         "state: the store at %s was last stamped by a build "
                         "writing record scheme %r (this build writes %r); "
@@ -1430,11 +1427,11 @@ class FilesystemStateBackend(StateBackend):
                         "consider `cronstable state migrate-schema`",
                         self.base,
                         version,
-                        SCHEME_VERSION,
+                        SCHEMA_VERSION,
                     )
                 return
         with contextlib.suppress(OSError):
-            self._append_sync("meta", {"storeVersion": SCHEME_VERSION})
+            self._append_sync("meta", {"storeVersion": SCHEMA_VERSION})
 
     def _resolve_topology(self) -> str:
         configured = self._configured_topology
@@ -1472,26 +1469,38 @@ class FilesystemStateBackend(StateBackend):
     # --- record store ----------------------------------------------------
 
     @staticmethod
+    def _retry_sharing_violation(op: Callable[[], None]) -> None:
+        """Run ``op``, retrying briefly on a Windows sharing violation.
+
+        The one retry ladder behind :meth:`_replace` and :meth:`_unlink`:
+        such holds are transient by nature (they clear in milliseconds), so
+        a short backoff beats surfacing a spurious error from a healthy
+        store.
+        """
+        for attempt in range(5):
+            try:
+                op()
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+
+    @staticmethod
     def _replace(src: str, dest: str) -> None:
         """``os.replace`` that rides out Windows sharing violations.
 
         On Windows, replacing a file another handle has open (the deliberately
         unlocked ``read_lease``, an antivirus/backup scan) raises
         ``PermissionError`` because CPython opens files without
-        FILE_SHARE_DELETE.  Such holds are transient by nature, so retry
-        briefly before giving up; on POSIX this is a single plain replace.
+        FILE_SHARE_DELETE; on POSIX this is a single plain replace.
         """
         if not IS_WINDOWS:
             os.replace(src, dest)
             return
-        for attempt in range(5):
-            try:
-                os.replace(src, dest)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.02 * (attempt + 1))
+        FilesystemStateBackend._retry_sharing_violation(
+            lambda: os.replace(src, dest)
+        )
 
     @staticmethod
     def _unlink(path: str) -> None:
@@ -1500,22 +1509,15 @@ class FilesystemStateBackend(StateBackend):
         The delete-side twin of :meth:`_replace`: unlinking a file another
         handle transiently has open (a concurrent read/list on another
         worker thread, an antivirus/backup scan) raises ``PermissionError``
-        on Windows because CPython opens files without FILE_SHARE_DELETE.
-        Such holds clear in milliseconds, so retry briefly instead of
-        surfacing a spurious error from a healthy store; on POSIX this is a
-        single plain unlink.
+        on Windows for the same missing-FILE_SHARE_DELETE reason; on POSIX
+        this is a single plain unlink.
         """
         if not IS_WINDOWS:
             os.unlink(path)
             return
-        for attempt in range(5):
-            try:
-                os.unlink(path)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.02 * (attempt + 1))
+        FilesystemStateBackend._retry_sharing_violation(
+            lambda: os.unlink(path)
+        )
 
     def _atomic_write(
         self, dest: str, payload: bytes, *, durable_rename: bool = True
@@ -1636,7 +1638,7 @@ class FilesystemStateBackend(StateBackend):
         # across a backward wall-clock step.
         rec_id = self._next_record_name(token, stream_dir)
         payload = _json.dumps_bytes(
-            {"schemaVersion": SCHEME_VERSION, "data": data}, sort_keys=True
+            {"schemaVersion": SCHEMA_VERSION, "data": data}, sort_keys=True
         )
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
         want_keep = prune_keep is not None and prune_keep > 0
@@ -1901,7 +1903,7 @@ class FilesystemStateBackend(StateBackend):
             # Unrecoverable, so quarantine.
             self._quarantine(path, name, "unknown-schema")
             return None
-        if obj.get("schemaVersion") != SCHEME_VERSION:
+        if obj.get("schemaVersion") != SCHEMA_VERSION:
             # Well-formed, just a schema version this build does not
             # recognise: almost always a NEWER version written by a peer
             # ahead in a rolling upgrade, not corruption. Quarantining (i.e.
@@ -2658,7 +2660,7 @@ class FilesystemStateBackend(StateBackend):
             return None
         if (
             not isinstance(obj, dict)
-            or obj.get("schemaVersion") != SCHEME_VERSION
+            or obj.get("schemaVersion") != SCHEMA_VERSION
             or not isinstance(obj.get("data"), dict)
         ):
             if strict:
@@ -2730,7 +2732,7 @@ class FilesystemStateBackend(StateBackend):
                     "DOC_KEEP or DOC_DELETE"
                 )
             payload = _json.dumps_bytes(
-                {"schemaVersion": SCHEME_VERSION, "data": new_body},
+                {"schemaVersion": SCHEMA_VERSION, "data": new_body},
                 sort_keys=True,
             )
             self._atomic_write(doc_path, payload)
@@ -2754,8 +2756,6 @@ class FilesystemStateBackend(StateBackend):
         )
 
     def _list_document_keys_sync(self, namespace: str) -> Optional[List[str]]:
-        from urllib.parse import unquote
-
         ns_dir = self._doc_dir(namespace)
         try:
             names = os.listdir(ns_dir)
@@ -2775,13 +2775,17 @@ class FilesystemStateBackend(StateBackend):
                 # returning the others would make this one invisible to a
                 # keys-driven scan.
                 return None
-            try:
-                keys.append(unquote(token, errors="strict"))
-            except UnicodeDecodeError:
-                # not a token our encoder produced (foreign/corrupt name):
-                # fall back rather than hand back a garbled key that cannot
-                # address the document.
+            key = _decode_fs_token(token)
+            if key is None:
+                # not a token our encoder produced (foreign/corrupt name,
+                # or one that does not re-encode to this exact spelling):
+                # fall back rather than hand back a garbled key that
+                # addresses a different or nonexistent document.  The
+                # round-trip check is the same one the stream and namespace
+                # listings rely on; a bare unquote here once "successfully"
+                # decoded foreign tokens into wrong keys.
                 return None
+            keys.append(key)
         keys.sort()
         return keys
 
@@ -3493,7 +3497,7 @@ class FilesystemStateBackend(StateBackend):
                 version = (
                     obj.get("schemaVersion") if isinstance(obj, dict) else None
                 )
-                if version == SCHEME_VERSION:
+                if version == SCHEMA_VERSION:
                     current += 1
                     continue
                 convert = RECORD_MIGRATIONS.get(str(version))
@@ -3513,7 +3517,7 @@ class FilesystemStateBackend(StateBackend):
                 if dry_run:
                     continue
                 payload = _json.dumps_bytes(
-                    {"schemaVersion": SCHEME_VERSION, "data": new_data},
+                    {"schemaVersion": SCHEMA_VERSION, "data": new_data},
                     sort_keys=True,
                 )
                 try:

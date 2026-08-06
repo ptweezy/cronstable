@@ -5,6 +5,306 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.38
+
+- `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
+  spread plain-job backfills: the same deterministic per-name offset,
+  slept out on a spawned task so one dag's spread never stalls the
+  scheduler pass. The key was accepted and validated on dag schedules but
+  silently never applied.
+- Every 4xx and 5xx body the web API serves is now one JSON envelope,
+  `{"error": "<reason>"}`, across the job, DAG, schedule, state, and push
+  routes alike (the auth middleware's 401 stays bodyless). Previously the
+  body was JSON on some handler families, plain text on others, and empty
+  on a few, so a client had to sniff per endpoint.
+- `POST /jobs/{name}/start` and `/cancel` answer with the same JSON acks
+  their MCP twins return (`{"started": ...}` and `{"cancelled": ...,
+  "instances": N}`) instead of empty 200s, and the DAG run listing and
+  trigger responses carry the subject under `name` as well as `dag`, the
+  key the job routes use.
+- Every capped listing takes a `limit` query parameter; the old spellings
+  (`count` on the schedule preview, `per_job` on the calendars, `runs` on
+  the resources series) keep working as aliases read when `limit` is
+  absent. `GET /jobs/{name}/runs`, the one run listing without a cap,
+  gained the same clamped `limit` its DAG and MCP twins had; its default
+  still serves the whole retained window.
+- The schedule describers no longer speak confidently about schedules the
+  engine refuses to load. Wrap-around ranges (`fri-mon`), steps that
+  escape their field (`*/12` on months, `59/1` on minutes), and the
+  classic-crontab-only `@midnight` all read as a `Custom schedule:` line
+  now, in the daemon's describer and the dashboard sandbox alike; every
+  engine-legal quirk (`sat-sun`, `0-0`, `30/20`) keeps its prose.
+- The terminal dashboard paints DAG states from an explicit port of the
+  web page's map instead of a spelling-guess ladder, so `upstream_failed`
+  shows fail-red (it painted neutral), `up_for_retry` amber, and
+  `skipped` the neutral off ink; a parity test pins the map to the
+  engine's vocabulary and the web's map both.
+- An operator-configured `web.headers` Content-Type or proxy-buffering
+  override no longer breaks the live log tails: the SSE protocol headers
+  win over the configured map in any spelling, the same guard `/metrics`
+  already had.
+- A state-section reload that swaps in a healthy store clears the @reboot
+  gate's "store timed out, stop probing" latch along with the other
+  per-store verdicts; the latch used to survive for the life of the
+  process, leaving boot-marker dedupe degraded on a healthy replacement
+  store.
+- The mail, Sentry, and webhook reporters resolve their
+  value/fromFile/fromEnvVar secrets through the same shared resolver as
+  everything else, so an unreadable `fromFile` is a clean logged skip
+  instead of a traceback out of the completion path, and none of the
+  three echoes an env var's name to the logs (mail's long-standing rule,
+  now shared).
+- The document-key listing applies the same round-trip check the stream
+  and namespace listings use, so a foreign file in a namespace directory
+  reads as "listing unavailable" instead of decoding into a key that
+  addresses a different or nonexistent document; keys carrying a lone
+  surrogate now list correctly instead of failing the listing.
+- The two mapped fan-in reductions share one absent-instance rule: an
+  entry missing for a run-recorded index holds the run open (it reads as
+  pending), where the run terminaliser used to skip it and could complete
+  a run whose group still read running to every downstream.
+- The `dev` extra installs the same list as `requirements_dev.txt` again
+  (it had drifted, missing orjson, pynacl, and zeroconf, so an
+  extra-based checkout ran the suite with the optional-dependency test
+  arms silently skipping); a new test pins the two lists equal.
+- Reference-doc gaps closed: the configuration reference now covers
+  `notify:`, `push:`, `report.push`, `web.authTokens`, and `web.bonjour`,
+  and the HTTP API page documents the `retry`/`rebootPending`/
+  `concurrencyScope`/`slot` job fields, run records' `ranAt`, the
+  running-row `never_fires` flag, the error envelope, and the new acks.
+  `docs/openapi.yaml` declares the envelope, acks, and `limit`
+  parameters.
+- The statsd timers (`.duration`, plus `.cpu` under `monitorResources`)
+  no longer carry a literal `@0.1` sample-rate flag. Nothing was ever
+  sampled (every run sends exactly one observation), so the flag made
+  rate-honoring statsd servers weight each observation 10x. If your
+  dashboards divided by 10 to compensate, remove that correction when
+  upgrading.
+- A DAG whose catch-up replay hits the 100-run cap now logs the same
+  warning the job engine's cap always logged, naming
+  `startingDeadlineSeconds` and `onMissed: run-once` as the escape
+  hatches; the truncation used to be silent.
+- A DAG task that never started reports `failReason: "launch failed"` on
+  both paths that can get it there; one of the two used to say
+  `"launch error"` for the same situation.
+- `cronstable state` sends its error and refusal messages to stderr, the
+  convention every other cronstable command already follows; success
+  summaries and inventories stay on stdout, so piping them is now clean.
+- A typo'd `--log-level` exits as a normal usage error naming the valid
+  levels instead of an `AttributeError` traceback, and lowercase
+  spellings (`--log-level debug`) now work; `--help` also explains that
+  `-v` is validate-config, not verbose.
+- `tox -e mypy` (the CI type gate) installs the package and drops its
+  global `--ignore-missing-imports`, which had silently typed every
+  third-party surface as `Any`; the deps that legitimately cannot
+  resolve are now enumerated per-module in `pyproject.toml`, so a new
+  unresolvable import fails the gate.
+- Loading a large configuration is much faster, and the cost per job no
+  longer climbs with the size of the file. Parsing scaled with the square
+  of the job count: 1,000 jobs took 0.9 s, 4,000 took 12.5 s, and 8,000
+  took 49.6 s. The cause sat in strictyaml's bundled copy of ruamel, whose
+  sequence deep-copy re-copies the sequence's annotations once per element
+  instead of once in total, and `jobs:` is normally the only long sequence
+  a config has. cronstable now corrects that method at import time when it
+  finds it uncorrected, and the same three files parse in 0.4 s, 1.4 s and
+  2.8 s. Startup, `--validate-config`, `--job-set-id` and every config
+  reload pay the lower cost.
+- A peer that gossips an empty node name can no longer stand the whole
+  cluster down. The empty string passed every validation the peer payload
+  applies (it is printable and well under the length cap) yet sorts below
+  every real name, so one buggy or hostile peer made every node that saw
+  it elect `''` as leader. No node matched that name, every `Leader` job
+  stopped firing cluster-wide, and `/cluster` still reported the cluster
+  quorate and conflict-free. Empty names are now rejected where the peer
+  payload is parsed, and all three places that fold peer names into the
+  election spell the guard the same way.
+- The `quorate_vouched` set a node advertises on `/peer` is capped, like
+  the `@reboot` ran-set beside it. It is the one re-advertised set built
+  entirely from absorbed peer data, so an inflated upstream peer could
+  walk a healthy node's own response past the size cap that honest peers
+  enforce, and they would then record it as an oversized failure and drop
+  it from their quorum. The list is sorted before it is capped, so every
+  node keeps the same prefix and the lowest names, which is what the
+  election reads. As a backstop, a response that exceeds the cap anyway
+  now sheds its observability-only job summaries rather than shipping a
+  body peers will reject.
+- `GET /metrics` is compressed for scrapers that accept gzip, which
+  Prometheus always does. Exposition text is the same metric names and
+  label blocks repeated once per job, so it compresses about 17x: at
+  10,000 jobs a 22.0 MB scrape becomes 1.32 MB for roughly 7 ms of CPU.
+  It was the largest recurring payload the daemon served and the only
+  large one going out uncompressed.
+- `GET /metrics` and `GET /fleet` share one built response across the
+  clients that ask for it within a second, the way `GET /jobs` already
+  did. Several scrapers landing together used to each rebuild the whole
+  metric universe on the event loop, and every open dashboard tab paid a
+  full fleet merge, which is O(nodes x jobs). `/fleet` also gained the
+  ETag and gzip its sibling poll endpoints had; a local change (a run, a
+  launch, a pause, a reload) still busts all three memos so it renders on
+  the very next poll.
+- A DAG task renamed while a run is in flight no longer wedges that run
+  forever. If the renamed task was the one a mapped task fans out from,
+  the run document held an entry under the old name and none under the
+  new one, and the mapped placeholder waited on a task that would never
+  appear. The run never reached a terminal state, so it renewed its
+  advance lease for the life of the daemon, retention never collected it,
+  and every advance pass copied the whole document to change nothing. The
+  placeholder now fails with a reason naming the missing source, which is
+  the rule the dependency and completion checks already applied.
+- A job that emits a very long line without a newline (a progress bar, a
+  binary blob, a stuck writer) no longer stalls the scheduler. The bytes
+  carried between reads were rebuilt on every read, which is quadratic:
+  at the 16 MiB `maxLineLength` default that measured 10.1 s of pure
+  copying on the event loop for one line. The pieces are now carried and
+  joined once, measured at 11 ms, and the length cap is applied without
+  ever assembling the over-long line.
+- Housekeeping is back to at most once per wall-clock minute on
+  deployments that run DAGs. The gate looked only at whether a cron job
+  fires at second granularity, but the DAG orchestrator also shortens the
+  loop's sleep, so a config with DAGs and no second-level job re-ran the
+  whole config reload, cluster, web, push, state and SLA block on every
+  DAG wake.
+- The DAG task log pane in the dashboard is bounded and no longer slows
+  down as it fills. It appended by rebuilding the whole buffer and
+  measured the buffer's height once per line, both of which cost more the
+  more lines were showing, and unlike the job log pane it had no line
+  cap at all. It now uses the same append path as the job log.
+- Container images build their dependency layers from `pyproject.toml`
+  alone, with the source tree copied only at the end, so a commit that
+  touches only source reuses the cached dependency layers instead of
+  recompiling every dependency for every distro and architecture. Release
+  builds deliberately miss that cache so a release still resolves every
+  dependency fresh. The build context also drops the documentation,
+  wiki, benchmark and packaging trees it never read, about 48 MB.
+- The webhook reporter shares one connection pool per daemon instead of
+  opening a fresh connection, and a fresh TLS handshake, for every
+  report. Each report keeps its own session, so its own timeout and
+  cookie jar, while the sockets and the SSL context underneath are
+  pooled and held for 90 seconds, long enough that a minutely job's next
+  report rides the connection its last one opened. The pool is
+  deliberately uncapped and is closed on a graceful stop.
+- The pipes of a capturing job no longer take `maxLineLength` as their
+  flow-control watermark. That number was there for the reader's old
+  `readuntil` call; the chunked reader has enforced the line cap itself for
+  a while, so all the setting still did was let asyncio buffer up to twice
+  `maxLineLength` (32 MiB by default) per stream per running job before it
+  paused the child. The watermark is the reader's own 64 KiB chunk size
+  now, and the cap is unchanged.
+- Boot-time in-flight reconciliation reads jobs sixteen at a time, like the
+  run-history warm-up and the retry re-arm on either side of it. It was
+  the last strictly sequential per-job store read on the startup path, so a
+  large crontab on a network mount paid one full read latency per job
+  before the first scheduling pass, and an unhealthy store cost one read
+  timeout per job instead of one for the pass. Each job is still reconciled
+  exactly once, and its own open and closed writes stay ordered.
+- The terminal dashboard's activity heatmap no longer dies with a
+  `KeyError` when it meets a run outcome its shading ladder does not know.
+  The lookup sat inside the paint loop, so a single unrecognised outcome
+  took the whole running dashboard down once per frame; an unknown outcome
+  now paints in the unknown ink, and a parity test fails the build if the
+  ladder falls behind the outcome vocabulary.
+- The dashboard's fleet view no longer stacks overlapping `/fleet` requests
+  when the daemon answers slower than the poll interval. It was the one
+  secondary poll the earlier in-flight sweep missed, so it added a request
+  per cycle against a per-origin connection budget the held log tails
+  already draw on. A test now holds every secondary poll to the guard, not
+  just this one.
+- The MCP `cron_query_metrics` tool builds and formats the metric universe
+  on the default executor rather than the event loop once the resident job
+  count clears the threshold `GET /metrics` already uses, so an agent
+  polling metrics no longer stalls job dispatch at fleet scale.
+- The three reporting contexts (a job run, an SLA breach, a `notify:`
+  event) name their shared `template_vars` key set once, and a parity test
+  holds all three to it. A template written for `onFailure` is meant to
+  render unchanged on `onLate` and on a notify event, and a missing name
+  renders empty instead of raising, so drift between them was invisible at
+  runtime. No key name or value changed.
+- The cluster's "a peer declared this coordination value and it is not
+  ours" check is one shared predicate now, read by the mutual-agreement
+  exclude set and by both conflict detectors, and the set of declared
+  fields those two halves cover is fenced by a test. A new coordination
+  field can no longer reach the detector without also dropping the
+  diverging peer from the agreeing set we gossip. No behaviour change.
+- What the wheel ships is derived from the source tree and diffed against
+  what `pyproject.toml` declares, so a new subpackage or a new runtime data
+  file that never reached `packages` or `package-data` fails a test instead
+  of shipping a wheel missing the dashboard page or a whole backend.
+  MANIFEST.in's add-backs inside the pruned `docs/` tree are checked to
+  still exist too.
+- Every example config under `example/` is parsed by the real parser,
+  cross-section validation included, so a schema change that leaves the
+  examples teaching an old spelling is caught here instead of by whoever
+  copied one. Compose files and Kubernetes manifests are classified out by
+  rule rather than by a skip list, so a newly added example has to parse.
+- The differential that replays the cron golden corpus through both the
+  dashboard's client-side schedule engine and the daemon's now runs in
+  CI, where playwright is a dev dependency and one matrix cell installs
+  the browser. It had been self-skipping everywhere, including on the
+  machines that changed either engine.
+- A second YAML-parse benchmark, `config.parse_yaml_3k`, gates the config
+  parse at a job count where a complexity regression is visible. The
+  quadratic `Seq` validation fixed above shows up at 300 jobs, the size
+  `config.parse_yaml_300` measures, as a 38% bulge that a loaded runner can
+  argue with; at 3,000 jobs it is 5.3x.
+- The logo engine's four inlined copies (dashboard, demo, logo lab and the
+  comparison page) are pinned identical by a test, where only the
+  dashboard and demo pair had a drift guard before.
+
+Windows fixes and additions from a gap review against Task Scheduler.
+
+- `shell: cmd` actually runs the command. cronstable now passes cmd.exe its
+  `/c` flag (every other shell keeps `-c`); before, cmd.exe was handed the
+  POSIX `-c`, started an interactive shell, printed its banner, read EOF
+  and exited 0, so the job recorded a clean success forever without ever
+  running anything. The shell reporter had the same flaw and the same fix.
+- Jobs are spawned in their own Windows process group. Ctrl-C in the
+  daemon's console no longer kills every in-flight job with 0xC000013A
+  (and then reported each one failed through every configured reporter);
+  a graceful daemon shutdown now genuinely waits for running jobs, as the
+  docs always said.
+- Job termination on Windows is a real two-step: a trappable
+  CTRL_BREAK_EVENT to the job's process group, then, `killTimeout`
+  seconds later, the `taskkill /F /T` tree kill. A job can now catch
+  the break (`signal.SIGBREAK`) and flush before exiting, and
+  `killTimeout` means on Windows what it means on POSIX. Where no
+  console is shared (a service context) the graceful step degrades to
+  the immediate tree kill, as before.
+- Closing the daemon's console window, logging off, and OS shutdown now
+  trigger the graceful drain (a native console-control handler; Python's
+  signal module never surfaces those events), bounded by the few seconds
+  of grace Windows grants.
+- `POST /shutdown`: an authenticated route that runs the same graceful
+  drain as Ctrl-C/SIGTERM, for supervised and console-less deployments.
+  Refused unless the request carries a configured bearer token, even
+  where the rest of the API is open.
+- The Windows default config path prefers the machine-wide
+  `%ProgramData%\cronstable` whenever that directory exists, falling back
+  to the per-user `%APPDATA%\cronstable` as before, so a service account
+  and an interactive administrator resolve the same configuration.
+- `cronstable init` writes a commented starter configuration into the
+  default config directory (or a directory of your choosing), and the
+  config-not-found error now names the path it looked in and suggests it.
+- Captured job output decodes as strict UTF-8 with an OEM-code-page retry
+  on Windows, so `dir` output and localized OS messages keep their
+  accents instead of collapsing to replacement characters; the
+  passthrough mirror writes the daemon's own stream encoding rather than
+  hardcoded UTF-8.
+- A classic crontab assigning `SHELL=` an absolute POSIX path is refused
+  at config load on Windows with the assignment's file:line (every entry
+  below it would otherwise fail at spawn); a POSIX `PATH=` assignment
+  warns. `env_file` files with a UTF-8 BOM no longer corrupt their first
+  variable's name.
+- The Windows executables carry a version resource (product, version,
+  copyright in Properties > Details), and a failed winget manifest update
+  now fails the release instead of warning on a job that could not fail;
+  the manifests had gone two releases stale under the old suppressions.
+- The wiki's Windows pages were corrected to match: the job-termination
+  table described the pre-1.2.36 kill order, killTimeout was documented
+  as bounding a wait that did not exist, and console close was claimed to
+  reach SIGBREAK, which it never did. Running on Windows now also carries
+  a running-unattended section (Task Scheduler recipe, log-file config,
+  stop path, firewall note) and the Fast Startup caveat for `@reboot`.
+
 ## 1.2.37
 
 The top findings of a performance review of the tree the 1.2.36 defect
@@ -85,61 +385,6 @@ review covered.
   inside the poll loop, which froze every panel for the sum of up to 40
   round trips each refresh; entries for jobs removed by a reload are
   pruned.
-
-Windows fixes and additions from a gap review against Task Scheduler.
-
-- `shell: cmd` actually runs the command. cronstable now passes cmd.exe its
-  `/c` flag (every other shell keeps `-c`); before, cmd.exe was handed the
-  POSIX `-c`, started an interactive shell, printed its banner, read EOF
-  and exited 0, so the job recorded a clean success forever without ever
-  running anything. The shell reporter had the same flaw and the same fix.
-- Jobs are spawned in their own Windows process group. Ctrl-C in the
-  daemon's console no longer kills every in-flight job with 0xC000013A
-  (and then reported each one failed through every configured reporter);
-  a graceful daemon shutdown now genuinely waits for running jobs, as the
-  docs always said.
-- Job termination on Windows is a real two-step: a trappable
-  CTRL_BREAK_EVENT to the job's process group, then, `killTimeout`
-  seconds later, the `taskkill /F /T` tree kill. A job can now catch
-  the break (`signal.SIGBREAK`) and flush before exiting, and
-  `killTimeout` means on Windows what it means on POSIX. Where no
-  console is shared (a service context) the graceful step degrades to
-  the immediate tree kill, as before.
-- Closing the daemon's console window, logging off, and OS shutdown now
-  trigger the graceful drain (a native console-control handler; Python's
-  signal module never surfaces those events), bounded by the few seconds
-  of grace Windows grants.
-- `POST /shutdown`: an authenticated route that runs the same graceful
-  drain as Ctrl-C/SIGTERM, for supervised and console-less deployments.
-  Refused unless the request carries a configured bearer token, even
-  where the rest of the API is open.
-- The Windows default config path prefers the machine-wide
-  `%ProgramData%\cronstable` whenever that directory exists, falling back
-  to the per-user `%APPDATA%\cronstable` as before, so a service account
-  and an interactive administrator resolve the same configuration.
-- `cronstable init` writes a commented starter configuration into the
-  default config directory (or a directory of your choosing), and the
-  config-not-found error now names the path it looked in and suggests it.
-- Captured job output decodes as strict UTF-8 with an OEM-code-page retry
-  on Windows, so `dir` output and localized OS messages keep their
-  accents instead of collapsing to replacement characters; the
-  passthrough mirror writes the daemon's own stream encoding rather than
-  hardcoded UTF-8.
-- A classic crontab assigning `SHELL=` an absolute POSIX path is refused
-  at config load on Windows with the assignment's file:line (every entry
-  below it would otherwise fail at spawn); a POSIX `PATH=` assignment
-  warns. `env_file` files with a UTF-8 BOM no longer corrupt their first
-  variable's name.
-- The Windows executables carry a version resource (product, version,
-  copyright in Properties > Details), and a failed winget manifest update
-  now fails the release instead of warning on a job that could not fail;
-  the manifests had gone two releases stale under the old suppressions.
-- The wiki's Windows pages were corrected to match: the job-termination
-  table described the pre-1.2.36 kill order, killTimeout was documented
-  as bounding a wait that did not exist, and console close was claimed to
-  reach SIGBREAK, which it never did. Running on Windows now also carries
-  a running-unattended section (Task Scheduler recipe, log-file config,
-  stop path, firewall note) and the Fast Startup caveat for `@reboot`.
 
 ## 1.2.36 (2026-08-03)
 

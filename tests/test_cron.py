@@ -1424,7 +1424,7 @@ async def test_web_list_jobs_etag_304_and_invalidation():
     cron._next_fire["alpha"] = (
         when or DT(2000, 1, 1, tzinfo=UTC)
     ) + datetime.timedelta(hours=1)
-    cron._bust_jobs_response_cache()
+    cron._bust_response_memos()
     changed = await cron._web_list_jobs(req(etag))
     assert changed.status == 200
     assert changed.headers["ETag"] != etag
@@ -2041,6 +2041,7 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
 
     class Req:
         match_info = {"name": "alpha"}
+        query: dict = {}  # the runs listing reads its `limit` param
 
     resp = await cron._web_job_runs(Req())
     body = json.loads(resp.text)
@@ -2087,6 +2088,7 @@ async def test_web_job_runs_empty_history():
 
     class Req:
         match_info = {"name": "alpha"}
+        query: dict = {}  # the runs listing reads its `limit` param
 
     resp = await cron._web_job_runs(Req())
     body = json.loads(resp.text)
@@ -2094,6 +2096,88 @@ async def test_web_job_runs_empty_history():
     assert body["stats"]["total"] == 0
     assert body["stats"]["success_rate"] is None
     assert body["stats"]["avg_duration"] is None
+
+
+@pytest.mark.asyncio
+async def test_web_job_runs_honours_limit_param():
+    # the one run-listing surface without a cap gained the same clamped
+    # `limit` its DAG and MCP twins always had; the default serves the
+    # whole retained history, exactly the old behavior
+    import json
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+    for n in range(5):
+        cron._record_run("alpha", _mk_run("success", dur=float(n + 1)))
+
+    class Req:
+        match_info = {"name": "alpha"}
+        query = {"limit": "2"}
+
+    resp = await cron._web_job_runs(Req())
+    body = json.loads(resp.text)
+    assert [r["duration"] for r in body["runs"]] == [4.0, 5.0]  # newest kept
+    assert body["stats"]["total"] == 5  # stats keep the whole window
+
+
+def test_web_int_query_reads_limit_before_its_legacy_alias():
+    # count/per_job/runs had grown endpoint by endpoint; every capped
+    # listing reads `limit` first and its original spelling still works
+    query_only_alias = type("Req", (), {"query": {"count": "7"}})()
+    assert (
+        cronstable.cron.Cron._web_int_query(
+            query_only_alias, "limit", default=12, lo=1, hi=60, alias="count"
+        )
+        == 7
+    )
+    both = type("Req", (), {"query": {"count": "7", "limit": "9"}})()
+    assert (
+        cronstable.cron.Cron._web_int_query(
+            both, "limit", default=12, lo=1, hi=60, alias="count"
+        )
+        == 9  # the canonical name wins when both are present
+    )
+
+
+@pytest.mark.asyncio
+async def test_web_errors_carry_the_json_envelope():
+    # every 4xx body on this origin is the ONE envelope {"error": msg}
+    # (matching jobapi and /mcp) instead of per-handler text/plain; the
+    # bare-404 routes carry the reason too
+    import json
+
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    cron.web_config = {}
+
+    class RunsReq:
+        match_info = {"name": "nope"}
+        headers: dict = {}
+        query: dict = {}
+
+    with pytest.raises(web.HTTPNotFound) as raised:
+        await cron._web_job_runs(RunsReq())
+    assert raised.value.content_type == "application/json"
+    assert json.loads(raised.value.text or "") == {
+        "error": "job 'nope' not found"
+    }
+
+    class PauseReq:
+        match_info = {"name": "alpha"}
+        headers: dict = {}
+        can_read_body = True
+
+        @staticmethod
+        async def json():
+            return {"durationSeconds": "soon"}
+
+    with pytest.raises(web.HTTPBadRequest) as raised:
+        await cron._web_pause_job(PauseReq())
+    assert raised.value.content_type == "application/json"
+    assert json.loads(raised.value.text or "") == {
+        "error": "durationSeconds must be an integer"
+    }
 
 
 @pytest.mark.asyncio
@@ -2183,6 +2267,14 @@ async def test_web_cancel_running_job_terminates_and_records():
 
     resp = await cron._web_cancel_job(Req())
     assert resp.status == 200
+    # the MCP cron_cancel_job ack shape (this route once returned an
+    # empty 200 while every sibling action returned JSON)
+    import json as _json_mod
+
+    assert _json_mod.loads(resp.text) == {
+        "cancelled": "test",
+        "instances": 1,
+    }
     assert rj.cancelled is True
     assert rj.proc.returncode is not None  # process actually terminated
 
@@ -3816,6 +3908,10 @@ async def test_web_start_deferred_reboot_without_manager(monkeypatch):
 
     resp = await cron._web_start_job(Req())
     assert resp.status == 200
+    import json as _json_mod
+
+    # the MCP cron_run_job ack shape (was an empty 200)
+    assert _json_mod.loads(resp.text) == {"started": "boot"}
     assert launched == ["boot"]
     assert "boot" not in cron._pending_reboot_jobs
 
@@ -4467,6 +4563,26 @@ async def test_shutdown_stops_cluster_manager_before_job_drain():
     assert not cron.running_jobs  # ...and the drain then completed
 
 
+@pytest.mark.asyncio
+async def test_shutdown_closes_the_pooled_webhook_connections():
+    # WebhookReporter keeps one connection pool per loop so reports stop
+    # paying a connect and a TLS handshake each. Nothing reclaims that pool
+    # on its own (aiohttp's connector holds the loop it was built on, so the
+    # weak key never expires), which leaves the shutdown sequence to close
+    # it, for the same reason it closes the pooled statsd endpoints beside
+    # it: the sockets are otherwise released only when the loop is
+    # collected, and aiohttp logs "Unclosed connector" on the way out. It
+    # goes last, after _drain_completions has sent the final reports.
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    loop = asyncio.get_running_loop()
+    pooled = cronstable.job._webhook_connector()
+    assert cronstable.job._WEBHOOK_CONNECTORS[loop] is pooled
+    cron.signal_shutdown()
+    await asyncio.wait_for(cron.run(), timeout=10)
+    assert pooled.closed
+    assert loop not in cronstable.job._WEBHOOK_CONNECTORS
+
+
 @pytest.mark.skipif(
     platform.IS_WINDOWS, reason="POSIX signal delivery (SIGTERM)"
 )
@@ -4537,13 +4653,17 @@ async def test_web_shutdown_refused_without_authentication():
     # POST /shutdown is fail-closed: with no auth middleware there is no
     # matched token, and an unauthenticated listener must not hand every
     # process that can reach it a stop switch for the scheduler.
+    import json
+
     from aiohttp import web
 
     cron = cronstable.cron.Cron(None)
     cron.web_config = {}
     with pytest.raises(web.HTTPForbidden) as exc:
         await cron._web_shutdown(_ShutdownReq())
-    assert "web.authToken" in exc.value.text  # the remedy is named
+    # the refusal carries the API's one JSON error envelope, remedy named
+    assert exc.value.content_type == "application/json"
+    assert "web.authToken" in json.loads(exc.value.text)["error"]
     assert not cron._stop_event.is_set()
 
 
@@ -8782,6 +8902,51 @@ def test_catchup_sleep_interval_capped_by_dag_wake(monkeypatch):
     assert cron._sleep_interval() == pytest.approx(0.3)
 
 
+def test_dag_wake_counts_as_a_subminute_tick(monkeypatch):
+    # run()'s housekeeping gate consulted only the CRON job set, but
+    # _sleep_interval shortens the sleep for the DAG orchestrator too
+    # (next_wake_delay always carries a 20s schedule check and a 5s approval
+    # poll, and floors at 0.2s while an advance is in flight). A deployment
+    # with DAGs and no second-level cron job therefore woke several times a
+    # minute while answering "not sub-minute", so the gate fell through to its
+    # every-iteration branch and re-ran the whole reload / cluster / web /
+    # push / state / SLA block on every DAG wake, falsifying the "at most
+    # once per wall-clock minute" contract _pause_periodic and _sla_periodic
+    # are documented on.
+    cron = cronstable.cron.Cron(None)
+    assert cron._needs_subminute() is False
+    # nothing has computed a sleep yet, and no DAGs: the pure minute-tick
+    # deployment keeps housekeeping every iteration, exactly as before.
+    assert cron._wakes_subminute() is False
+    monkeypatch.setattr(cron._dag, "next_wake_delay", lambda: 5.0)
+    cron._sleep_interval()
+    assert cron._wakes_subminute() is True
+
+
+def test_dag_wake_that_does_not_shorten_the_sleep_is_not_subminute(
+    monkeypatch,
+):
+    # the flag tracks whether the DAG wake actually WON the min(), not merely
+    # that the orchestrator answered: a hint further out than the next
+    # housekeeping boundary leaves the loop on its minute tick, where
+    # housekeeping every iteration is the documented behaviour.
+    monkeypatch.setattr(
+        "cronstable.cron.next_sleep_interval", lambda *a: 10.0
+    )
+    cron = cronstable.cron.Cron(None)
+    monkeypatch.setattr(cron._dag, "next_wake_delay", lambda: 30.0)
+    assert cron._sleep_interval() == pytest.approx(10.0)
+    assert cron._wakes_subminute() is False
+
+
+def test_subminute_cron_job_still_gates_housekeeping_without_dags():
+    # the original predicate is untouched: a second-level cron job alone still
+    # puts the loop in sub-minute mode with no DAGs in sight.
+    cron = cronstable.cron.Cron(None, config_yaml=_SUBMINUTE_NOFIRE)
+    assert cron._needs_subminute() is True
+    assert cron._wakes_subminute() is True
+
+
 def test_catchup_due_names_dedupes_duplicate_live_entries():
     # a name that somehow holds two live heap entries for the same instant is
     # returned exactly once.
@@ -10761,6 +10926,114 @@ async def test_rehydrate_reconcile_inflight_cancelled_propagates(tmp_path):
     cron.state_backend.list_records = _raise_cancelled5
     with pytest.raises(asyncio.CancelledError):
         await cron._reconcile_inflight()
+
+
+def _many_jobs_yaml(count):
+    return "jobs:\n" + "".join(
+        "  - name: j%d\n    command: x\n    schedule: '@reboot'\n" % i
+        for i in range(count)
+    )
+
+
+async def _seed_orphan_open(cron, name):
+    # an open record left by a PREVIOUS daemon on this host (same host, a
+    # different proc token, no pid to probe): exactly what the boot
+    # reconciliation is meant to close.
+    await cron.state_backend.append_record(
+        cron._inflight_stream(name),
+        {
+            "kind": "open",
+            "host": cron._state_host,
+            "proc": "a-dead-daemon",
+            "pid": None,
+            "startedAt": "2026-07-01T10:00:00+00:00",
+        },
+    )
+
+
+async def test_rehydrate_reconcile_inflight_reads_jobs_concurrently(tmp_path):
+    # The boot reconciliation must overlap its per-job in-flight reads: it
+    # sits on the boot path between the history warm-up and the retry
+    # re-arm, both of which already use the worker pool, so a strictly
+    # sequential pass here put back the jobs x per-read latency those two
+    # avoid. The rendezvous below only clears once 4 reads are in flight AT
+    # THE SAME TIME; a sequential pass never gets past its first read and
+    # times out instead. The high-water mark is checked against the pool
+    # bound too: the pool must not degenerate into a task per job, which on
+    # a large crontab would only queue on the store's bulk lane anyway. That
+    # upper bound is why the crontab is seeded with MORE jobs than the pool
+    # has workers; with fewer, the job count itself caps the high-water mark
+    # and a task-per-job implementation passes too.
+    cron = await _rehydrate_state_cron(
+        tmp_path, _many_jobs_yaml(cronstable.cron._REHYDRATE_CONCURRENCY + 4)
+    )
+    need = 4
+    state = {"in_flight": 0, "high": 0}
+    opened = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _list(stream, **kw):
+        state["in_flight"] += 1
+        state["high"] = max(state["high"], state["in_flight"])
+        if state["high"] >= need:
+            opened.set()
+        try:
+            # every read parks here until the test releases it, so the
+            # high-water mark counts workers rather than scheduling luck.
+            # An event that reopened as soon as `need` reads overlapped would
+            # measure nothing: past the first opening, awaiting an already-set
+            # event does not yield, so ONE worker would drain the whole item
+            # iterator without ever letting a second one in, and the bound
+            # below would hold for any implementation, pool or not.
+            await release.wait()
+        finally:
+            state["in_flight"] -= 1
+        return []
+
+    cron.state_backend.list_records = _list
+    pass_ = asyncio.ensure_future(cron._reconcile_inflight())
+    try:
+        # a sequential implementation never gets a second read in flight, so
+        # it fails here rather than hanging the suite.
+        await asyncio.wait_for(opened.wait(), timeout=2.0)
+        # let every worker that is going to start reach its read, so the
+        # plateau below is the real one.
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert state["high"] >= need
+        assert state["high"] <= cronstable.cron._REHYDRATE_CONCURRENCY
+    finally:
+        release.set()
+        await pass_
+
+
+async def test_rehydrate_reconcile_inflight_reconciles_every_job(tmp_path):
+    # The outcome invariant the worker pool must preserve, with more jobs
+    # than workers so the shared item iterator is drawn from several times
+    # per worker: every orphaned run is reconciled, exactly once, whichever
+    # worker happens to draw it. A pool that let two workers draw the same
+    # name would append two synthetic rows for one interrupted run; a pool
+    # that dropped names would leave crashed runs invisible forever, the
+    # whole failure this pass exists to prevent.
+    count = cronstable.cron._REHYDRATE_CONCURRENCY + 4
+    cron = await _rehydrate_state_cron(tmp_path, _many_jobs_yaml(count))
+    for i in range(count):
+        await _seed_orphan_open(cron, "j%d" % i)
+    await cron._reconcile_inflight()
+    for i in range(count):
+        name = "j%d" % i
+        assert [r.outcome for r in cron.run_history[name]] == ["unknown"]
+        assert cron.last_run[name].outcome == "unknown"
+    # drain the fire-and-forget closes/ledger appends the pass queued, then
+    # confirm each job's stream really did get its own single close (the
+    # per-job write chain keeps open/closed ordered).
+    while cron._pending_state_writes:
+        await asyncio.gather(*list(cron._pending_state_writes))
+    for i in range(count):
+        recs = await cron.state_backend.list_records(
+            cron._inflight_stream("j%d" % i)
+        )
+        assert [r["kind"] for r in recs] == ["open", "closed"]
 
 
 # --- takeover reconciliation ------------------------------------------------

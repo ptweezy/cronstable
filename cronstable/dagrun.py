@@ -235,6 +235,10 @@ class DagScheduler:
         # hold is paired with a drop in a ``finally``, so a failed or
         # cancelled advance cannot leave a run polling forever.
         self._advance_pending: Dict[RunRef, int] = {}
+        # deferred catch-up replays sleeping out their per-dag jitter offset
+        # (see _catch_up); cancelled by shutdown() and forget(), since a
+        # replay must never land on a torn-down or swapped store.
+        self._catchup_tasks: Set[asyncio.Task] = set()
         # dag name -> run keys this node has SEEN terminal.  Terminality is
         # monotonic, so the adopt scan skips re-reading these (see
         # _adopt_one_dag); pruned against each key listing, rebuilt from
@@ -700,13 +704,77 @@ class DagScheduler:
         if not missed:
             return
         targets = missed[-1:] if sched.onMissed == "run-once" else missed
+        if (
+            sched.onMissed != "run-once"
+            and len(missed) >= DAG_MAX_CATCHUP
+            and nxt is not None
+            and nxt <= now_dt
+        ):
+            # the job engine's cap (cron._missed_occurrences) warns when it
+            # drops occurrences; truncating a dag's replay must be exactly
+            # as loud, never silent.
+            logger.warning(
+                "dag catch-up: %s missed at least %d runs; replaying %d "
+                "and dropping the rest (set startingDeadlineSeconds to "
+                "bound the window, or use onMissed: run-once)",
+                dagcfg.name,
+                DAG_MAX_CATCHUP,
+                DAG_MAX_CATCHUP,
+            )
+        # The same deterministic per-name spread the job engine applies
+        # (Cron._catchup_offset, stable across boots and the fleet):
+        # ``catchupJitterSeconds`` is accepted and validated on dag
+        # schedules, so it must spread their replays too, not silently
+        # apply to plain jobs only.
+        offset = self._cron._catchup_offset(
+            dagcfg.name, sched.catchupJitterSeconds
+        )
         logger.info(
-            "dag %s: catch-up replaying %d missed run(s)",
+            "dag %s: catch-up replaying %d missed run(s)%s",
             dagcfg.name,
             len(targets),
+            " after a %.1fs jitter offset" % offset if offset > 0 else "",
         )
-        for when in targets:
-            await self._create_run(dagcfg, when, "catchup")
+        if offset <= 0:
+            for when in targets:
+                await self._create_run(dagcfg, when, "catchup")
+            return
+        # Deferred on a spawned task, like Cron._run_catch_up: the seed and
+        # gap-resume paths run on the service pass, which walks every dag
+        # serially and must not sleep out one dag's offset inline.
+        task = asyncio.create_task(
+            self._replay_catch_up(dagcfg, targets, offset)
+        )
+        self._catchup_tasks.add(task)
+        task.add_done_callback(self._catchup_tasks.discard)
+
+    async def _replay_catch_up(
+        self,
+        dagcfg: Any,
+        targets: List[datetime.datetime],
+        offset: float,
+    ) -> None:
+        """Create ``dagcfg``'s catch-up runs after its jitter offset.
+
+        The dag twin of ``Cron._run_catch_up``'s deferred start.  The dag
+        is re-checked after the sleep: a reload can remove or disable it
+        while the offset elapses, and a replay for a dag that is gone must
+        not write fresh run documents.  (A backend swap cancels this task
+        outright, see :meth:`forget`.)
+        """
+        try:
+            await asyncio.sleep(offset)
+            current = self._dags().get(dagcfg.name)
+            if current is None or not current.enabled:
+                return
+            for when in targets:
+                await self._create_run(dagcfg, when, "catchup")
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - per-dag isolation, like the seed
+            logger.exception(
+                "dag %s: deferred catch-up replay failed", dagcfg.name
+            )
 
     async def _durable_watermark(
         self, dagcfg: Any
@@ -1188,7 +1256,9 @@ class DagScheduler:
                     intent.task_id,
                     success=False,
                     exit_code=127,
-                    fail_reason="launch error",
+                    # the one vocabulary for a task that never started, shared
+                    # with _launch_task's own cleanup path below
+                    fail_reason="launch failed",
                     proc=proc,
                     attempt=intent.attempt,
                     poke=intent.poke_number if intent.is_sensor else None,
@@ -2635,6 +2705,10 @@ class DagScheduler:
         """Release every held advance lease and stop the renewers."""
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
+        for task in list(self._catchup_tasks):
+            if not task.done():
+                task.cancel()
+        self._catchup_tasks.clear()
         for ref in list(self._owned):
             await self._release(ref)
 
@@ -2651,6 +2725,12 @@ class DagScheduler:
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
         self._service_task = None
+        # a deferred catch-up replay sleeping out its jitter targeted the
+        # old store; the new store's own seed pass owes it nothing.
+        for task in list(self._catchup_tasks):
+            if not task.done():
+                task.cancel()
+        self._catchup_tasks.clear()
         for renewer in list(self._renewers.values()):
             if not renewer.done():
                 renewer.cancel()

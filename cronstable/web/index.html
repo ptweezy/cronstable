@@ -5847,6 +5847,59 @@ var qrcode = function() {
     return dedupePhrases(out);
   }
   // plain-English description
+  // The daemon engine's REJECTIONS that the tolerant parsers above accept
+  // while the user types (see the asymmetry note in
+  // tests/test_web_engine_parity.py): wrap-around ranges, out-of-range
+  // endpoints, oversized steps, steps whose first stride escapes the field,
+  // and the classic-crontab-only "@midnight" (the daemon's loader rewrites
+  // it to @daily; the literal is a config parse error).  describeCron gates
+  // its confident prose on this so the sandbox never affirms a schedule the
+  // daemon refuses to load; parseCron and the fire previews stay tolerant
+  // on purpose.  Mirrors cronexpr._parse_field's checks and
+  // croninfo._engine_accepts' role; the Playwright differential pins the
+  // describe output byte-for-byte.
+  function fieldRejected(spec, min, max, stepEnd, names, isDow, specials) {
+    spec = String(spec).trim().toLowerCase();
+    if (spec === "*" || spec === "?") return false;
+    for (const part of spec.split(",")) {
+      // special day forms (L / L-n / nW / LW / d#n) carry their own
+      // validation in the tolerant parsers, matching the engine's
+      if (specials && (/^l/.test(part) || /w$/.test(part) || part.includes("#"))) continue;
+      let body = part, step = null;
+      const slash = part.indexOf("/");
+      if (slash >= 0) { step = parseInt(part.slice(slash + 1), 10); body = part.slice(0, slash); }
+      if (step != null && Number.isFinite(step) && (step < 1 || step > max)) return true;
+      let lo = null, hi = null;
+      const rng = body.match(/^([^-]+)-(.+)$/);
+      if (body === "*") { lo = min; hi = stepEnd; }
+      else if (rng) {
+        lo = nameToNum(rng[1], names); hi = nameToNum(rng[2], names);
+        if (isDow && hi === 0) hi = 7; // dow range ending in 0: end reads as 7
+      } else { lo = nameToNum(body, names); hi = slash >= 0 ? stepEnd : lo; }
+      if (lo == null || hi == null) continue; // malformed: the tolerant parse degrades it
+      if (lo > hi || lo < min || hi > max) return true;
+      if (step != null && Number.isFinite(step) && (lo + step < min || lo + step > max)) return true;
+    }
+    return false;
+  }
+  function cronRejected(expr) {
+    const low = String(expr || "").trim().toLowerCase();
+    if (low === "@midnight") return true;
+    if (MACROS[low]) return false;
+    const f = low.split(/\s+/);
+    let sec = null, yr = null, core;
+    if (f.length === 5) core = f;
+    else if (f.length === 6) { core = f.slice(0, 5); yr = f[5]; }
+    else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
+    else return false; // not field-shaped: the tolerant parse degrades it
+    return (sec != null && fieldRejected(sec, 0, 59, 59, null, false, false))
+      || fieldRejected(core[0], 0, 59, 59, null, false, false)
+      || fieldRejected(core[1], 0, 23, 23, null, false, false)
+      || fieldRejected(core[2], 1, 31, 31, null, false, true)
+      || fieldRejected(core[3], 1, 12, 12, MON_NAMES, false, false)
+      || fieldRejected(core[4], 0, 7, 6, DOW_NAMES, true, true)
+      || (yr != null && yr !== "*" && fieldRejected(yr, 1970, 2099, 2099, null, false, false));
+  }
   function describeCron(expr) {
     expr = String(expr || "").trim();
     const low = expr.toLowerCase();
@@ -5856,10 +5909,13 @@ var qrcode = function() {
       "@annually": "Once a year, at midnight on 1 January",
       "@monthly": "At midnight on the 1st of every month",
       "@weekly": "At midnight every Sunday",
-      "@daily": "Every day at midnight", "@midnight": "Every day at midnight",
+      // no "@midnight" here: classic-crontab-only, the daemon rejects the
+      // literal (cronRejected below sends it to the Custom line)
+      "@daily": "Every day at midnight",
       "@hourly": "Every hour, on the hour",
     };
     if (macroText[low]) return macroText[low];
+    if (cronRejected(expr)) return "Custom schedule: " + expr;
     const p = parseCron(expr);
     if (p.type !== "fields") return "Custom schedule: " + expr;
     const f = (MACROS[low] || expr).split(/\s+/);
@@ -7446,8 +7502,19 @@ var qrcode = function() {
   }
   // Same out-of-order guard as loadCluster: fired without awaiting from the
   // poll path, so a delayed OLDER response must not overwrite a newer one.
+  // The in-flight guard below already rules out an overlap, but the sequence
+  // numbers stay: they keep the APPLY ordered whatever else learns to call
+  // loadFleet, while the guard only stops a second request going out.
   let fleetReqSeq = 0, fleetAppliedSeq = 0;
   async function loadFleet() {
+    // /fleet rides the cluster poll and is fired without awaiting, so a daemon
+    // slower than the poll interval stacked one more overlapping request every
+    // cycle against the browser's ~6-per-origin connection cap (see
+    // secondaryInFlight). A cycle that finds its predecessor still pending
+    // skips /fleet until it settles, and the next cluster poll calls straight
+    // back in.
+    if (secondaryInFlight.fleet) return;
+    secondaryInFlight.fleet = true;
     const seq = ++fleetReqSeq;
     try {
       const r = await apiFetch("/fleet");
@@ -7465,6 +7532,8 @@ var qrcode = function() {
         fleetAppliedSeq = seq;
         console.warn("loadFleet failed:", e);
       }
+    } finally {
+      secondaryInFlight.fleet = false;
     }
   }
   // percent past which a node CPU/memory readout is warn-tinted (either axis)
@@ -7615,7 +7684,7 @@ var qrcode = function() {
   // connection cap (which the held SSE tails already lean on, see TAIL_MAX)
   // exactly when it could least afford them. A poll cycle that finds its
   // predecessor still pending simply skips this endpoint until it settles.
-  const secondaryInFlight = { cluster: false, node: false, dags: false, state: false };
+  const secondaryInFlight = { cluster: false, node: false, dags: false, state: false, fleet: false };
   async function loadJobs() {
     if (refreshing) return;
     refreshing = true;
@@ -10015,13 +10084,35 @@ var qrcode = function() {
     } catch (e) { if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Stream ended: " + e.message); }
   }
   function stopDagTaskLog() { if (state.dagStream) { state.dagStream.abort(); state.dagStream = null; } }
+  // One line into the DAG task-log pane, on the same infrastructure the job
+  // log pane uses. This path used to read scrollHeight (a forced synchronous
+  // layout of the whole buffered block) and then do `textContent += text` per
+  // line (both O(buffer) per line), and applied no MAX_LOG_LINES cap at
+  // all, so a chatty task grew the pane without bound while getting quadratic
+  // on the way there. followBottom keeps the "reader scrolled away" bit from a
+  // passive scroll listener and coalesces the pin into one write per frame,
+  // and the cap trims the oldest NODE rather than rebuilding the view; see
+  // followBottom / appendLine. Per-line spans carry the stream so stderr reads
+  // the same red it does in every other terminal pane.
+  function appendDagLogLine(stream, text) {
+    const t = $("dgTerm"); if (!t) return;
+    // childElementCount is O(1) and self-healing: the pane is rebuilt by
+    // renderDagLogs and cleared on a task switch, so counting the live nodes
+    // beats carrying a counter that can drift out of step with them.
+    if (t.childElementCount >= MAX_LOG_LINES) { const first = t.firstElementChild; if (first) first.remove(); }
+    t.insertAdjacentHTML("beforeend", '<span class="ln ' + escAttr(stream || "") + '">' + esc(text) + "</span>");
+    followBottom(t, true, false);
+  }
   function startDagTaskLog(taskkey) {
     // idempotent: already tailing this exact task on a live stream -> no-op,
     // so a re-render can never blank/reconnect an active tail.
     if (state.dagStream && state.dagDrawer.logTask === taskkey) return;
     stopDagTaskLog();
     state.dagDrawer.logTask = taskkey;
-    const term = $("dgTerm"); if (term) term.textContent = "";
+    // reset the follow bit with the buffer, exactly as renderTerm does: the
+    // pane element can outlive a task switch, and a stale "reader scrolled
+    // away" bit would leave the fresh tail unpinned.
+    const term = $("dgTerm"); if (term) { term.textContent = ""; follower(term).at = true; }
     const note = $("dgLogNote"); if (note) note.textContent = "connecting…";
     const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
     if (!dag || !rk || !taskkey) return;
@@ -10031,10 +10122,7 @@ var qrcode = function() {
     state.dagStream = ctrl;
     readSSE(path, ctrl, {
       line: (stream, text) => {
-        const t = $("dgTerm"); if (!t) return;
-        const atBottom = t.scrollTop + t.clientHeight >= t.scrollHeight - 4;
-        t.textContent += text + "\n";
-        if (atBottom) t.scrollTop = t.scrollHeight;
+        appendDagLogLine(stream, text);
         const n = $("dgLogNote"); if (n) n.textContent = "";
       },
       end: (saw, reason) => { const n = $("dgLogNote"); if (n) n.textContent = saw ? "stream ended" : (reason === "no-output" ? "no live output (task is not running)" : "no output"); },
@@ -10098,7 +10186,13 @@ var qrcode = function() {
         toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + ")" : ""));
         $("dgBackfill").style.display = "none";
         setTimeout(loadDagRuns, 300);
-      } else { const t = await res.text().catch(() => ""); toast("err", "backfill: " + (t || "HTTP " + res.status)); }
+      } else {
+        // 4xx bodies are the uniform JSON envelope {"error": msg}; keep the
+        // raw-text fallback so an older daemon's plain body still shows
+        const t = await res.text().catch(() => "");
+        let msg = t; try { msg = JSON.parse(t).error || t; } catch (_) {}
+        toast("err", "backfill: " + (msg || "HTTP " + res.status));
+      }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
   }
 

@@ -28,10 +28,12 @@ only (no resources/prompts yet), pinned to protocol revision
 2026 revision a near-no-op.
 """
 
+import asyncio
 import json as _stdlib_json
 import logging
 import re
 from contextvars import ContextVar
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -49,7 +51,11 @@ from aiohttp import web
 
 from cronstable import _json
 from cronstable import version as _version
-from cronstable.cron import WEB_TOKEN_REQUEST_KEY, ApiActionError
+from cronstable.cron import (
+    _METRICS_OFFLOAD_MIN_JOBS,
+    WEB_TOKEN_REQUEST_KEY,
+    ApiActionError,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost / no cycle
     from cronstable.cron import Cron
@@ -1159,18 +1165,42 @@ class MCPHandler:
         if match is not None and not isinstance(match, str):
             raise _ToolInputError("`match` must be a string")
         limit = self._clamp_limit(args.get("limit"))
-        samples, total = _filter_metric_samples(
-            self._cron.metrics.iter_samples(self._cron), match, limit
-        )
+        cron = self._cron
+        # Split in two phases exactly the way GET /metrics splits a scrape
+        # (see Cron._web_metrics and Metrics.families), and offload at the
+        # same job count, for the same reason.  A metrics query is asked for
+        # a handful of samples but has to visit the WHOLE metric universe to
+        # know which ones match, and the visit is the expensive half: it
+        # assembles a label block and formats a value for every sample of
+        # every family.  Doing that inline stalled job dispatch and every
+        # other handler for the duration, and at fleet scale that is a
+        # measurable freeze on a tool an agent may poll.
+        #
+        # `iter_samples` reads the live scheduler state EAGERLY (the family
+        # build, which must stay on the loop) and returns a lazy generator
+        # over that freshly built list, which nobody else references.  So the
+        # drain below is pure CPU over a private snapshot and is safe in a
+        # worker thread; the only shared structure it touches is the
+        # label-block memo, where threads race to write equal values, the
+        # same argument `render_prepared` makes for the scrape render.
+        pending = cron.metrics.iter_samples(cron)
+        drain = partial(_filter_metric_samples, pending, match, limit)
+        if len(cron.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+            rows, total = await asyncio.get_running_loop().run_in_executor(
+                None, drain
+            )
+        else:
+            # below the threshold the drain is cheaper than the thread hop
+            rows, total = drain()
         return _result(
             {
-                "samples": samples,
+                "samples": rows,
                 "totalMatched": total,
-                "returned": len(samples),
+                "returned": len(rows),
                 "match": match,
             },
             "{} metric sample(s) matched, {} returned".format(
-                total, len(samples)
+                total, len(rows)
             ),
         )
 

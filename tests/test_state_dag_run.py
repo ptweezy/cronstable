@@ -21,6 +21,7 @@ over the loopback endpoint.
 import asyncio
 import datetime
 import json
+import logging
 import sys
 
 import pytest
@@ -1897,7 +1898,11 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path):
         body = await cron._dag.get_run("lf", run_key)
         assert body["tasks"]["a"]["state"] == dag.FAILED
         assert body["tasks"]["a"]["exitCode"] == 127
-        assert body["tasks"]["a"]["failReason"] == "launch error"
+        # the one never-started vocabulary, shared with the start()-blew-up
+        # path (test_subprocess_start_failure_fails_task_cleanly below);
+        # this arm used to say "launch error" while that one said
+        # "launch failed" for the same operator-visible situation.
+        assert body["tasks"]["a"]["failReason"] == "launch failed"
         # b was still launched (and its pid recorded) despite a's failure
         assert body["tasks"]["b"]["state"] in (dag.RUNNING, dag.SUCCESS)
         cron._dag._launch_task = orig
@@ -2020,6 +2025,104 @@ async def test_catch_up_honours_starting_deadline(tmp_path):
         runs = await cron._dag.list_runs("cu", limit=10)
         # only 03:00 is younger than the 1h deadline window
         assert [r["kind"] for r in runs].count("catchup") == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_cap_truncation_is_loud(tmp_path, monkeypatch, caplog):
+    # DAG_MAX_CATCHUP truncating a run-all replay used to be silent, while
+    # the job engine's twin cap (cron.MAX_CATCHUP_OCCURRENCES) warns and
+    # names the escape hatches; dropping a dag's owed runs must be exactly
+    # as loud.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 2)
+        dagcfg = cron.cron_dags["cu"]
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+            await cron._dag._catch_up(dagcfg, now_dt)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 2
+        warned = [
+            r
+            for r in caplog.records
+            if "missed at least 2 runs" in r.getMessage()
+        ]
+        assert warned, "the truncated replay must warn"
+        # run-once coalesces by design: one launch is the contract, so the
+        # cap dropping the older slots is not a truncation worth warning on.
+        caplog.clear()
+        dagcfg1 = cron.cron_dags["cu1"]
+        await cron._dag._create_run(dagcfg1, base, "scheduled")
+        with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+            await cron._dag._catch_up(dagcfg1, now_dt)
+        assert not [
+            r for r in caplog.records if "missed at least" in r.getMessage()
+        ]
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_applies_the_dag_jitter_offset(tmp_path, monkeypatch):
+    # catchupJitterSeconds is accepted and validated on dag schedules
+    # (config copies it onto the synthetic schedule job), but the DAG
+    # engine used to fire every replayed run inline, jitter or not.  The
+    # replay now defers onto a spawned task by the same deterministic
+    # per-name offset the job engine uses (Cron._catchup_offset).
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        seen = []
+        real_offset = Cron._catchup_offset
+
+        def spy_offset(name, jitter):
+            seen.append((name, jitter, real_offset(name, jitter)))
+            return 0.01  # keep the test fast; the real spread is pinned below
+
+        monkeypatch.setattr(Cron, "_catchup_offset", staticmethod(spy_offset))
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        # deferred onto a spawned task: nothing replayed inline
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
+        assert cron._dag._catchup_tasks
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+        # the offset came from the shared deterministic spread, fed with
+        # the dag's own name and configured jitter
+        assert seen == [("cu", 300, real_offset("cu", 300))]
+        assert 0.0 <= seen[0][2] < 300.0
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_skips_a_dag_removed_meanwhile(
+    tmp_path, monkeypatch
+):
+    # a reload can remove (or disable) the dag while its jitter offset
+    # elapses; the deferred replay must then write nothing.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        del cron.cron_dags["cu"]  # as a reload dropping the dag would
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        cron.cron_dags["cu"] = dagcfg  # restore so list_runs resolves
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
     finally:
         await _teardown(cron)
 

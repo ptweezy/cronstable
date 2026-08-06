@@ -125,6 +125,33 @@ def test_trailing_dashdash_without_lock_run_errors(monkeypatch, capsys):
     assert "only valid before a `lock run`" in capsys.readouterr().err
 
 
+def test_bad_log_level_is_a_clean_usage_error(monkeypatch, capsys):
+    # a typo'd level used to escape as an AttributeError traceback out of a
+    # bare getattr(logging, ...); it must exit as an argparse usage error.
+    monkeypatch.setattr(
+        sys, "argv", ["cronstable", "--log-level", "VERBOSE", "--version"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 2  # argparse's parser.error() exit status
+    assert "invalid --log-level 'VERBOSE'" in capsys.readouterr().err
+
+
+def test_log_level_accepts_any_case_and_aliases(monkeypatch, capsys):
+    # the WARN/FATAL aliases resolved under the old getattr by accident of
+    # the logging module's namespace: keep them working. Lowercase never
+    # worked (getattr found the logging.debug FUNCTION and basicConfig
+    # blew up on it); the lenient upper-casing makes it work now.
+    for spelling in ("debug", "WARN", "Error"):
+        monkeypatch.setattr(
+            sys, "argv", ["cronstable", "-l", spelling, "--version"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            main.main_loop(_loop())
+        assert exc.value.code == 0, spelling
+        capsys.readouterr()
+
+
 def test_state_get_routes_to_jobcli(monkeypatch):
     seen = {}
 

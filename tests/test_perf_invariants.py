@@ -14,6 +14,7 @@ points here.
 """
 
 import os
+import textwrap
 
 import pytest
 
@@ -373,3 +374,145 @@ async def test_lease_write_barrier_follows_the_fence(tmp_path, monkeypatch):
     finally:
         monkeypatch.undo()
         await backend.stop()
+
+
+# --- 7. the strictyaml Seq attribute-copy count ----------------------------
+#
+# strictyaml validates a sequence by deep-copying the ruamel document, and
+# its vendored CommentedSeq.__deepcopy__ calls copy_attributes from INSIDE
+# the element loop -- so an N-element sequence re-copies the sequence's
+# whole attribute set N times and config parsing comes out quadratic in the
+# job count.  cronstable rebinds the method to hoist that call out of the
+# loop (config._patch_strictyaml_seq_deepcopy).  The invariant is a COUNT,
+# not a timing: one copy_attributes call per deepcopy no matter how long
+# the sequence is.  Counting it gates both directions -- a dropped shim and
+# a future re-quadratic regression -- in microseconds, on every platform,
+# where a wall-clock assertion would be noisy and one-directional.
+
+
+def _counting_seq_class():
+    """A CommentedSeq subclass that tallies its own copy_attributes calls."""
+    from strictyaml.ruamel.comments import CommentedSeq
+
+    class Counting(CommentedSeq):
+        calls = 0
+
+        def copy_attributes(self, t, memo=None):
+            Counting.calls += 1
+            super().copy_attributes(t, memo=memo)
+
+    return Counting
+
+
+@pytest.mark.parametrize("length", [1, 2, 8, 64])
+def test_seq_deepcopy_copies_attributes_once_per_copy(length):
+    import copy as copy_mod
+
+    counting = _counting_seq_class()
+    copy_mod.deepcopy(counting(list(range(length))))
+    assert counting.calls == 1, (
+        "CommentedSeq.__deepcopy__ must copy the sequence's attribute set "
+        "once per copy, not once per element: at %d elements it ran %d "
+        "times, which is the quadratic config parse "
+        "config._patch_strictyaml_seq_deepcopy exists to remove"
+        % (length, counting.calls)
+    )
+
+
+def test_seq_deepcopy_leaves_an_empty_sequence_alone():
+    # Deliberate carve-out: upstream never reaches the in-loop call for an
+    # empty sequence, so the hoisted version must not start copying
+    # attributes that the stock implementation left unset.  Keeping this
+    # asymmetry is what makes the rebind a pure cost change.
+    import copy as copy_mod
+
+    counting = _counting_seq_class()
+    copy_mod.deepcopy(counting([]))
+    assert counting.calls == 0
+
+
+def _deep_repr(obj, depth=0):
+    """Structural, address-free rendering of a parsed config."""
+    if depth > 12:
+        return "..."
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        return repr(obj)
+    if isinstance(obj, dict):
+        return "{%s}" % ",".join(
+            "%s:%s" % (_deep_repr(k, depth + 1), _deep_repr(v, depth + 1))
+            for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))
+        )
+    if isinstance(obj, (list, tuple)):
+        return "[%s]" % ",".join(_deep_repr(x, depth + 1) for x in obj)
+    slots = getattr(type(obj), "__slots__", None)
+    if slots:
+        return "%s(%s)" % (
+            type(obj).__name__,
+            ",".join(
+                "%s=%s" % (s, _deep_repr(getattr(obj, s, None), depth + 1))
+                for s in sorted(slots)
+            ),
+        )
+    if hasattr(obj, "__dict__"):
+        return "%s(%s)" % (
+            type(obj).__name__,
+            ",".join(
+                "%s=%s" % (k, _deep_repr(v, depth + 1))
+                for k, v in sorted(obj.__dict__.items())
+            ),
+        )
+    return repr(obj)
+
+
+def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
+    # The count invariants above gate the cost; this one gates the meaning.
+    # Parsing the same text under the stock (in-loop) implementation and the
+    # hoisted one must produce indistinguishable configs -- the rebind is a
+    # pure cost change, so nothing a caller can observe may move.
+    import copy as copy_mod
+    import dataclasses
+
+    from strictyaml.ruamel.comments import CommentedSeq
+
+    from cronstable.config import parse_config_string
+
+    def stock(self, memo):  # verbatim upstream: the call sits in the loop
+        res = self.__class__()
+        memo[id(self)] = res
+        for k in self:
+            res.append(copy_mod.deepcopy(k, memo))
+            self.copy_attributes(res, memo=memo)
+        return res
+
+    text = textwrap.dedent(
+        """\
+        defaults:
+          captureStderr: true
+        jobs:
+          # a comment inside the sequence
+          - name: alpha
+            command: echo alpha
+            schedule: '*/5 * * * *'
+            environment:
+              - key: A
+                value: '1'
+          - name: beta
+            command: echo beta
+            schedule: '0 1 * * *'
+            captureStdout: true
+        """
+    )
+
+    patched = CommentedSeq.__deepcopy__
+    try:
+        CommentedSeq.__deepcopy__ = stock
+        expected = parse_config_string(text, "test")
+        CommentedSeq.__deepcopy__ = patched
+        actual = parse_config_string(text, "test")
+    finally:
+        CommentedSeq.__deepcopy__ = patched
+
+    for field in dataclasses.fields(expected):
+        assert _deep_repr(getattr(actual, field.name)) == _deep_repr(
+            getattr(expected, field.name)
+        ), field.name

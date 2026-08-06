@@ -269,7 +269,7 @@ async def test_records_are_immutable_and_versioned(tmp_path):
     files = [n for n in os.listdir(stream_dir) if n.endswith(".json")]
     assert len(files) == 1
     on_disk = json.loads((open(os.path.join(stream_dir, files[0])).read()))
-    assert on_disk["schemaVersion"] == state.SCHEME_VERSION
+    assert on_disk["schemaVersion"] == state.SCHEMA_VERSION
     assert on_disk["data"] == {"k": "v"}
 
 
@@ -740,7 +740,7 @@ async def test_malformed_record_shape_is_still_quarantined(tmp_path):
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-bad.json"), "w") as fobj:
         json.dump(
-            {"schemaVersion": state.SCHEME_VERSION, "data": "not-a-dict"}, fobj
+            {"schemaVersion": state.SCHEMA_VERSION, "data": "not-a-dict"}, fobj
         )
     assert await backend.list_records("s") == []
     assert "00001-bad.json" not in os.listdir(stream_dir)
@@ -2129,6 +2129,42 @@ async def test_list_document_keys_foreign_filename_reports_unable(tmp_path):
     with open(os.path.join(ns_dir, "%FF.doc"), "wb") as fobj:
         fobj.write(b"{}")
     assert await backend.list_document_keys("ns") is None
+    await backend.stop()
+
+
+async def test_list_document_keys_round_trip_guard(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "real", lambda c: ({"v": 1}, None))
+    ns_dir = backend._doc_dir("ns")
+    # tokens that DECODE cleanly but that the encoder can never have
+    # produced: uppercase letters (which _fs_safe escapes) and a
+    # lowercase-hex alias of an escape.  A bare unquote once returned "KEY"
+    # and "/" for these, keys that address a different (or no) document;
+    # the _decode_fs_token round-trip check reports the listing unable
+    # instead, the same contract as the truncated-token branch.
+    for foreign in ("KEY.doc", "%2f.doc"):
+        with open(os.path.join(ns_dir, foreign), "wb") as fobj:
+            fobj.write(b"{}")
+        assert await backend.list_document_keys("ns") is None
+        os.unlink(os.path.join(ns_dir, foreign))
+    assert await backend.list_document_keys("ns") == ["real"]
+    await backend.stop()
+
+
+async def test_list_document_keys_surrogate_key_round_trips(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    # a key carrying a lone surrogate (names come from os.fsdecode'd
+    # sources elsewhere in the store) encodes via surrogatepass; the
+    # listing must hand back the SAME key, not report unable (the old
+    # strict-utf-8 unquote could not decode it) and never a U+FFFD-mangled
+    # spelling that addresses a nonexistent document.
+    key = "job-\udcff"
+    assert await backend.mutate_document(
+        "ns", key, lambda c: ({"v": 1}, None)
+    )
+    assert await backend.list_document_keys("ns") == [key]
     await backend.stop()
 
 

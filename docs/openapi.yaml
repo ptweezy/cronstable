@@ -204,6 +204,13 @@ paths:
       operationId: getJobRuns
       parameters:
         - $ref: "#/components/parameters/JobName"
+        - name: limit
+          in: query
+          description: >-
+            Max runs to return, newest kept (clamped to the retained
+            history; default serves the whole retained window). `stats`
+            always covers the whole retained window.
+          schema: { type: integer }
       responses:
         "200":
           description: Retained run history and aggregate statistics.
@@ -260,9 +267,13 @@ paths:
       operationId: getJobResources
       parameters:
         - $ref: "#/components/parameters/JobName"
-        - name: runs
+        - name: limit
           in: query
           description: Number of recent monitored runs to include (clamped).
+          schema: { type: integer }
+        - name: runs
+          in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
       responses:
         "200":
@@ -310,11 +321,23 @@ paths:
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
-        "200": { description: Launched (empty body). }
+        "200":
+          description: Launched.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  started: { type: string }
+                required: [started]
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: The job is disabled. }
+        "409":
+          description: The job is disabled (JSON error envelope).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /jobs/{name}/cancel:
     post:
@@ -325,11 +348,24 @@ paths:
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
-        "200": { description: All running instances cancelled (empty body). }
+        "200":
+          description: All running instances cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: { type: string }
+                  instances: { type: integer }
+                required: [cancelled, instances]
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: The job is not running. }
+        "409":
+          description: The job is not running (JSON error envelope).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /jobs/{name}/pause:
     post:
@@ -424,6 +460,9 @@ paths:
                 type: object
                 properties:
                   dag: { type: string }
+                  name:
+                    type: string
+                    description: Same as `dag` (the generic subject key).
                   runs:
                     type: array
                     items: { $ref: "#/components/schemas/DagRunSummary" }
@@ -505,6 +544,9 @@ paths:
                 type: object
                 properties:
                   dag: { type: string }
+                  name:
+                    type: string
+                    description: Same as `dag` (the generic subject key).
                   runKey: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -649,8 +691,13 @@ paths:
         - name: tz
           in: query
           schema: { type: string }
+        - name: limit
+          in: query
+          description: Number of fire instants to preview (clamped).
+          schema: { type: integer }
         - name: count
           in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
         - name: seed
           in: query
@@ -756,8 +803,13 @@ paths:
         - name: days
           in: query
           schema: { type: integer }
+        - name: limit
+          in: query
+          description: Max fire entries per job (clamped).
+          schema: { type: integer }
         - name: per_job
           in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
         - $ref: "#/components/parameters/IcsToken"
       responses:
@@ -782,8 +834,13 @@ paths:
         - name: days
           in: query
           schema: { type: integer }
+        - name: limit
+          in: query
+          description: Max fire entries per job (clamped).
+          schema: { type: integer }
         - name: per_job
           in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
         - $ref: "#/components/parameters/IcsToken"
       responses:
@@ -1218,15 +1275,34 @@ components:
     Unauthorized:
       description: >-
         Missing or unrecognised bearer token (when `web.authToken` or any
-        `web.authTokens` entry is configured).
+        `web.authTokens` entry is configured). The 401 is bodyless, by
+        design the one exception to the JSON error envelope.
     Forbidden:
       description: >-
         The bearer token is valid but lacks the scope this operation requires
         (see `x-required-scope`), or a cross-site `Origin` was refused.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: No such job, DAG, or run.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    Error:
+      type: object
+      description: >-
+        The uniform error envelope. Every 4xx/5xx body this API serves is
+        this object (the bodyless 401 aside), so clients parse failures one
+        way across every endpoint.
+      properties:
+        error:
+          type: string
+          description: Human-readable reason.
+      required: [error]
+
     WhoAmI:
       type: object
       description: The bearer token that authenticated the request.
