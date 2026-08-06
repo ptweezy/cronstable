@@ -2707,7 +2707,11 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
     class SlowBuffer:
         def write(self, data):
             entered.set()
-            release.wait(30.0)
+            # Unbounded on purpose: a timeout here re-opens the swallow
+            # race if a runner stall outlives it.  The finally below always
+            # sets release, and the writer is a daemon thread with a
+            # bounded atexit drain, so this cannot hang the run.
+            release.wait()
 
     class SlowStream:
         buffer = SlowBuffer()
