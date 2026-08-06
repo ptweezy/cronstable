@@ -669,6 +669,11 @@ async def test_list_dags_memoizes_the_keys_listing(tmp_path, monkeypatch):
     # drop out on a local write, and honour its TTL.
     from cronstable import dagrun as dagrun_mod
 
+    # widened so the exact listing counts below cannot be broken by a stall
+    # between awaits (CPU steal on a loaded runner under --cov ages the
+    # memo out past the real 5s TTL); the expiry step at the end pins the
+    # TTL to zero explicitly, so nothing here rides the real value.
+    monkeypatch.setattr(dagrun_mod, "DAG_SUMMARY_LIST_TTL", 3600.0)
     cron = await _make_cron(tmp_path, _LINEAR)
     try:
         _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
@@ -1944,6 +1949,50 @@ async def test_subprocess_start_failure_fails_task_cleanly(
         assert entry["exitCode"] == 127
         assert entry["failReason"] == "launch failed"
         assert entry["pid"] is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_cancelled_launch_is_not_recorded_as_task_failure(
+    tmp_path, monkeypatch
+):
+    # A CancelledError out of the launch (shutdown/restart while queued
+    # behind the daemon-wide spawn gate) is NOT a launch failure: the task
+    # never started, so recording FAILED exit 127 would persist a wrong
+    # terminal state and burn a retry attempt, and swallowing the cancel
+    # would let the launch loop keep launching the rest of the batch
+    # mid-shutdown.  The launch path must clean up and re-raise, like
+    # maybe_launch_job.
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: cl\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+
+        async def cancelled(self):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(RunningJob, "start", cancelled)
+        run_key = None
+        try:
+            run_key = await cron._dag.trigger_run("cl")
+        except asyncio.CancelledError:
+            pass  # propagated out of an inline advance: the fix working
+        monkeypatch.undo()
+        await _drain_pending(cron)
+        if run_key is None:
+            keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+            assert keys
+            run_key = keys[0]["runKey"]
+        body = await cron._dag.get_run("cl", run_key)
+        entry = (body or {}).get("tasks", {}).get("a", {})
+        assert entry.get("failReason") != "launch failed"
+        assert entry.get("state") != dag.FAILED
+        assert (body or {}).get("state") != dag.FAILED
     finally:
         await _teardown(cron)
 

@@ -176,18 +176,39 @@ def test_every_secondary_poll_loader_holds_an_in_flight_guard():
     )
     for fn, key in loaders.items():
         body = re.search(
-            r"async function %s\(.*?\n  \}\n" % fn, web, re.DOTALL
+            r"(?:async )?function %s\(.*?\n  \}\n" % fn, web, re.DOTALL
         )
         assert body, "%s() not found in %s" % (fn, WEB)
         body = body.group(0)
-        assert "if (secondaryInFlight.%s) return;" % key in body, (
-            "%s() no longer skips the cycle while its predecessor is still "
-            "pending; overlapping requests stack up against the browser's "
-            "per-origin connection cap" % fn
-        )
-        assert "secondaryInFlight.%s = true;" % key in body, (
-            "%s() no longer claims its in-flight slot" % fn
-        )
+        if key == "dags":
+            # loadDags guards by handing back the PENDING promise, not a
+            # bare return: the #dag deep link chains loadDags().then(open),
+            # and at bootstrap the poll cycle has always already started
+            # the fetch, so a bare return resolved the chain against a
+            # list that had not arrived and deep links never opened the
+            # drawer. The slot holds the promise itself (truthy), so the
+            # skip-a-cycle behavior below still holds.
+            assert (
+                "if (secondaryInFlight.dags) return secondaryInFlight.dags;"
+                in body
+            ), (
+                "loadDags() no longer returns its in-flight promise; the "
+                "#dag deep link's loadDags().then(open) chain would resolve "
+                "before the list arrives and never open the drawer"
+            )
+            assert "secondaryInFlight.dags = (async () => {" in body, (
+                "loadDags() no longer claims its in-flight slot with the "
+                "pending promise"
+            )
+        else:
+            assert "if (secondaryInFlight.%s) return;" % key in body, (
+                "%s() no longer skips the cycle while its predecessor is "
+                "still pending; overlapping requests stack up against the "
+                "browser's per-origin connection cap" % fn
+            )
+            assert "secondaryInFlight.%s = true;" % key in body, (
+                "%s() no longer claims its in-flight slot" % fn
+            )
         # released from a finally, never from the happy path alone: an early
         # return or a throw would otherwise wedge the slot true and the
         # endpoint would never be polled again for the life of the page.

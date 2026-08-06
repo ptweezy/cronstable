@@ -269,7 +269,14 @@ project, on which cronstable is based.
   dashboard's client-side schedule engine and the daemon's now runs in
   CI, where playwright is a dev dependency and one matrix cell installs
   the browser. It had been self-skipping everywhere, including on the
-  machines that changed either engine.
+  machines that changed either engine, so that cell now also proves the
+  test passed rather than skipped (a browser-revision skew between the
+  two installers would otherwise restore the silent skip). The
+  differential compares validity verdicts too, not just the previews of
+  mutually-valid expressions: the sandbox's step parsing is strict the
+  way the engine's is, where it used to salvage numeric prefixes and
+  confidently describe `*/2.5`-style schedules the daemon refuses to
+  load.
 - A second YAML-parse benchmark, `config.parse_yaml_3k`, gates the config
   parse at a job count where a complexity regression is visible. The
   quadratic `Seq` validation fixed above shows up at 300 jobs, the size

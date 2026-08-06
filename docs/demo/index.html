@@ -6425,7 +6425,15 @@ var qrcode = function() {
     for (const part of spec.split(",")) {
       let body = part, step = 1;
       const slash = part.indexOf("/");
-      if (slash >= 0) { step = parseInt(part.slice(slash + 1), 10); body = part.slice(0, slash); }
+      // strict, like cronexpr._parse_field: int() plus its explicit
+      // embedded-slash check. parseInt salvaged numeric prefixes, so
+      // */2.5, */2x, */2e1 and the double-slash 1/2/3 family all parsed
+      // here while the daemon refuses the config.
+      if (slash >= 0) {
+        const stepStr = part.slice(slash + 1);
+        if (!/^\d+$/.test(stepStr)) throw new Error("bad step: " + part);
+        step = parseInt(stepStr, 10); body = part.slice(0, slash);
+      }
       if (!Number.isFinite(step) || step < 1) throw new Error("bad step: " + part);
       let lo, hi;
       const rng = body.match(/^([^-]+)-(.+)$/);
@@ -6749,7 +6757,16 @@ var qrcode = function() {
       if (specials && (/^l/.test(part) || /w$/.test(part) || part.includes("#"))) continue;
       let body = part, step = null;
       const slash = part.indexOf("/");
-      if (slash >= 0) { step = parseInt(part.slice(slash + 1), 10); body = part.slice(0, slash); }
+      // strict, like cronexpr._parse_field: a step with a non-digit
+      // remainder or an embedded slash (*/2.5, */2x, */2e1, 1/2/3) is a
+      // daemon parse error; parseInt salvaged the numeric prefix, so this
+      // gate affirmed (and describeCron confidently described) schedules
+      // the daemon refuses to load.
+      if (slash >= 0) {
+        const stepStr = part.slice(slash + 1);
+        if (!/^\d+$/.test(stepStr)) return true;
+        step = parseInt(stepStr, 10); body = part.slice(0, slash);
+      }
       if (step != null && Number.isFinite(step) && (step < 1 || step > max)) return true;
       let lo = null, hi = null;
       const rng = body.match(/^([^-]+)-(.+)$/);
@@ -10463,24 +10480,33 @@ var qrcode = function() {
 
   // ---- DAG index card ----
   let dagReqSeq = 0, dagAppliedSeq = 0;
-  async function loadDags() {
-    if (secondaryInFlight.dags) return;
-    secondaryInFlight.dags = true;
+  function loadDags() {
+    // A repeat call while a fetch is in flight hands back THAT fetch's
+    // promise, not undefined: the #dag deep link chains
+    // loadDags().then(open), and at bootstrap the poll cycle has always
+    // already started this fetch, so a bare `return` resolved the chain
+    // immediately, before the list arrived, and deep links never opened
+    // the drawer. The in-flight slot holds the promise itself (truthy,
+    // so the skip-a-cycle poll behavior is unchanged).
+    if (secondaryInFlight.dags) return secondaryInFlight.dags;
     const seq = ++dagReqSeq;
-    try {
-      const r = await apiFetch("/dags");
-      if (seq < dagAppliedSeq) return;
-      if (!r.ok) { dagAppliedSeq = seq; return; }
-      const list = await r.json();
-      if (seq < dagAppliedSeq) return;
-      dagAppliedSeq = seq;
-      state.dags.list = Array.isArray(list) ? list : [];
-      state.dags.byName = {};
-      state.dags.list.forEach((d) => { state.dags.byName[d.name] = d; });
-      renderDagCard();
-      if (state.dagDrawer.dag) renderDagDrawerHead();
-    } catch (e) { if (e.message !== "unauthorized") console.warn("loadDags failed:", e); }
-    finally { secondaryInFlight.dags = false; }
+    secondaryInFlight.dags = (async () => {
+      try {
+        const r = await apiFetch("/dags");
+        if (seq < dagAppliedSeq) return;
+        if (!r.ok) { dagAppliedSeq = seq; return; }
+        const list = await r.json();
+        if (seq < dagAppliedSeq) return;
+        dagAppliedSeq = seq;
+        state.dags.list = Array.isArray(list) ? list : [];
+        state.dags.byName = {};
+        state.dags.list.forEach((d) => { state.dags.byName[d.name] = d; });
+        renderDagCard();
+        if (state.dagDrawer.dag) renderDagDrawerHead();
+      } catch (e) { if (e.message !== "unauthorized") console.warn("loadDags failed:", e); }
+      finally { secondaryInFlight.dags = false; }
+    })();
+    return secondaryInFlight.dags;
   }
   function renderDagCard() {
     const dags = state.dags.list;

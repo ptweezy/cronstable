@@ -172,6 +172,14 @@ KILLED_STREAM_DRAIN_TIMEOUT = 30.0
 # socket released.
 MAIL_REPORT_TIMEOUT = 60.0
 
+# How long _on_stop waits for the spawned job_started emission before giving
+# up on the start/stop pairing. The start telemetry is spawned rather than
+# awaited inside start() (a stalled statsd resolution must not hold the
+# daemon-wide spawn gate), so a completion racing a slow send joins it here,
+# bounded: a host that cannot get the start datagram out inside this window
+# loses the pair, which is the best-effort trade telemetry already makes.
+STATSD_START_FLUSH_TIMEOUT = 2.0
+
 
 class _MirrorWriter:
     """The stdout/stderr passthrough's single daemon-wide writer thread.
@@ -1575,6 +1583,9 @@ class RunningJob:
             )  # type: Optional[StatsdJobMetricWriter]
         else:
             self.statsd_writer = None
+        # the spawned job_started emission (see start()); _on_stop joins it,
+        # bounded, so job_started still precedes job_stopped on the wire.
+        self._start_telemetry = None  # type: Optional[asyncio.Task]
 
     async def _on_start(self) -> None:
         if self.statsd_writer:
@@ -1615,6 +1626,19 @@ class RunningJob:
                 )
             finally:
                 self._resource_monitor = None
+        task = self._start_telemetry
+        self._start_telemetry = None
+        if task is not None and not task.done():
+            # bounded join: with a merely-slow host the start datagram
+            # still goes out before the stop one; a host that cannot
+            # manage it inside the bound loses the pair (wait_for cancels
+            # the task), the trade best-effort telemetry already makes.
+            try:
+                await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - telemetry is best-effort
+                pass
         if self.statsd_writer:
             try:
                 await self.statsd_writer.job_stopped()
@@ -1726,7 +1750,16 @@ class RunningJob:
             self.start_failed = True
             return
 
-        await self._on_start()
+        # Spawned, not awaited: every launch path holds the daemon-wide
+        # spawn gate around start(), and the statsd send can stall
+        # arbitrarily long in endpoint resolution (a dead DNS server, a
+        # black-holed route).  Awaiting it here held one of the gate's
+        # permits for the whole stall, so a dead statsd host drained a
+        # 500-job backlog 16 launches at a time and wedged DAG-task
+        # launches with no statsd config of their own.  _on_stop joins the
+        # task (bounded) so the start/stop pair still orders on the wire.
+        if self.statsd_writer:
+            self._start_telemetry = asyncio.create_task(self._on_start())
 
         if self.config.monitorResources and self.proc.pid is not None:
             # Begin sampling the child's process tree. Best-effort: if psutil

@@ -2002,6 +2002,45 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stalled_statsd_does_not_block_job_launch(monkeypatch):
+    # Launches run under the daemon-wide 16-permit spawn gate; a statsd
+    # host stalled in endpoint resolution (dead DNS, black-holed route)
+    # used to hold a permit for the whole stall because start() awaited
+    # the job_started send inline, so a dead statsd host drained a due-job
+    # backlog 16 launches at a time and wedged DAG-task launches with no
+    # statsd config of their own.  start() must return with the send still
+    # pending; the completion path then joins it, bounded.
+    release = asyncio.Event()
+    sends = []
+
+    async def stalled(*args, **kwargs):
+        sends.append(1)
+        await release.wait()
+
+    monkeypatch.setattr(cronstable.statsd, "send_to_statsd", stalled)
+
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print())
+        + """
+    schedule: "* * * * *"
+    statsd:
+      host: 127.0.0.1
+      port: 9999
+      prefix: the.prefix
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    # generous bound for loaded runners; the pre-fix behavior hangs forever
+    await asyncio.wait_for(job.start(), 30.0)
+    release.set()
+    await job.wait()
+    assert job.retcode == 0
+    assert sends  # the telemetry did go out once the host recovered
+
+
+@pytest.mark.asyncio
 async def test_report_mail_closes_connection_on_error():
     # if sending fails, the SMTP connection must still be closed (no leak).
     conf = cronstable.config.parse_config_string(A_JOB, "")
