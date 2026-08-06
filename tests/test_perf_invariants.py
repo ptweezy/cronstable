@@ -24,6 +24,7 @@ from cronstable.cron import Cron
 from cronstable.jobstate import JobStateError
 from cronstable.state import FilesystemStateBackend
 
+from tests._commands import cmd_print, yaml_command
 from tests.test_state import _drain_state_writes, _state_cfg
 
 
@@ -184,12 +185,17 @@ async def test_oversized_artifact_413s_before_the_blob_is_fetched(tmp_path):
 # ordering rides worker-lane scheduling and is deliberately not pinned.
 
 
-_RUN_JOB = """
-jobs:
-  - name: j
-    command: ls
-    schedule: "0 0 * * *"
-"""
+# This is the one test in the file that actually LAUNCHES its job and
+# asserts the outcome, so the command has to succeed on every platform the
+# suite runs on.  A bare `ls` does not: cmd.exe has no such binary, and a
+# Windows shell without Git's usr\bin on PATH ran it to 'failure' and broke
+# the ledger assertion below.  tests._commands runs the test interpreter
+# instead (see its module docstring).
+_RUN_JOB = (
+    "jobs:\n  - name: j\n"
+    + yaml_command(cmd_print())
+    + '\n    schedule: "0 0 * * *"\n'
+)
 
 
 async def test_one_run_writes_open_record_close_and_nothing_else(tmp_path):
