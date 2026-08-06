@@ -365,8 +365,8 @@ jobs:
       # cell, by design), so THIS cell must prove it actually ran: re-drive it
       # through the tox env's own interpreter (and therefore the env's own
       # resolved playwright, the one that must find the browser fetched above)
-      # and require a pass, not a skip. Cheap (<1s after the suite) and it is
-      # the only thing standing between a pip/uv resolution skew and the
+      # and require a pass, not a skip. Cheap (<1s after the suite), and
+      # without it a pip/uv resolution skew quietly restores the
       # "nothing compares the second engine" state this cell exists to end.
       - name: Enforce the web engine differential ran (no silent skip)
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'

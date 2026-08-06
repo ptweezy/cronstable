@@ -1632,7 +1632,7 @@ class RunningJob:
             # bounded join: with a merely-slow host the start datagram
             # still goes out before the stop one; a host that cannot
             # manage it inside the bound loses the pair (wait_for cancels
-            # the task), the trade best-effort telemetry already makes.
+            # the task). See STATSD_START_FLUSH_TIMEOUT.
             try:
                 await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
             except asyncio.CancelledError:
