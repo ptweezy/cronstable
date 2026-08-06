@@ -2142,6 +2142,19 @@ class Cron:
         # interrupted run. Chaining each job's inflight writes keeps the
         # close after the open.
         self._inflight_write_tail: Dict[str, asyncio.Task] = {}
+        # and the same guard for the run LEDGER (runs/<job>, plus the
+        # logs/<job> archive its task writes second): two completions of one
+        # job close enough to overlap -- a concurrencyPolicy: Allow pair, a
+        # retry firing straight after its parent's failure, a catch-up
+        # burst, or crash reconciliation racing a live completion -- issue
+        # two fire-and-forget appends whose filename sort key is minted on
+        # each write's own worker thread, so they can land filename-inverted
+        # and leave the OLDER run newest in the stream. That is what
+        # rehydration reads back as `last_run`, and what an at-the-bound
+        # prune evicts by, so the newer run can be reported or deleted as
+        # if it were the older. Chaining each job's run writes keeps the
+        # stream's order equal to completion order.
+        self._run_write_tail: Dict[str, asyncio.Task] = {}
         # latched when a @reboot boot-marker store op times out during the
         # startup pass: the remaining @reboot jobs then apply the policy
         # without more I/O instead of serially stalling the first
@@ -11042,6 +11055,37 @@ class Cron:
     def _inflight_stream(name: str) -> str:
         return INFLIGHT_STREAM_PREFIX + name
 
+    def _queue_run_write(
+        self, name: str, coro: Coroutine[Any, Any, None]
+    ) -> asyncio.Task:
+        """Run a run-ledger write ordered behind the job's previous one.
+
+        The :meth:`_queue_inflight_write` idiom, for the same reason and the
+        same failure: ``runs/<job>`` records are appended fire-and-forget on
+        pooled worker threads, and each record's filename sort key (which is
+        what orders the stream, and what both rehydration and the prune read
+        it back by) is minted on the thread that runs the append.  Two
+        completions of one job whose appends overlap can therefore land
+        inverted, leaving the OLDER run newest.  Chaining per job keeps the
+        stream's order equal to completion order; different jobs still write
+        concurrently.  Ordering only, as everywhere else: a predecessor's
+        failure is its own (``_install_tail_task`` waits, it does not
+        propagate), and each write is individually bounded by
+        ``STATE_OP_TIMEOUT``, so a wedged store delays a job's next ledger
+        write rather than stranding the chain.
+
+        Same-node only, by construction: two nodes sharing a mount write
+        through different processes and no local chain can order them, which
+        is exactly why the readers that must not be fooled fold by
+        ``finished_at`` instead of trusting position.
+        """
+        return self._install_tail_task(
+            self._run_write_tail,
+            name,
+            coro,
+            spawn=self._track_state_write,
+        )
+
     def _queue_inflight_write(
         self, name: str, coro: Coroutine[Any, Any, None]
     ) -> asyncio.Task:
@@ -11358,7 +11402,12 @@ class Cron:
         self._queue_inflight_write(
             name, self._persist_inflight_closed(name, reason)
         )
-        self._track_state_write(self._persist_reconciled_record(name, data))
+        # through the same per-job chain as a live completion: reconciliation
+        # runs at boot alongside them, and an unordered pair here would
+        # invert exactly as two completions would.
+        self._queue_run_write(
+            name, self._persist_reconciled_record(name, data)
+        )
         # make it visible on this node's dashboard immediately (bypassing
         # _record_run: no metric emission, no double-persist).
         finished = _parse_iso_utc(started_iso) or get_now(
@@ -11573,8 +11622,8 @@ class Cron:
                 if job is not None and job.archiveOutput
                 else None
             )
-            self._track_state_write(
-                self._persist_run_record(name, info, archive_lines)
+            self._queue_run_write(
+                name, self._persist_run_record(name, info, archive_lines)
             )
         # Release the superseded record's ring buffer. Only the NEWEST
         # finished run's output is ever replayable (_job_output serves
