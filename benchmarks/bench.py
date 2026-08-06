@@ -2305,6 +2305,15 @@ def bench_dag_list_dags_warm():
             await dagsched.list_dags()  # warm any terminal-run cache
             t0 = time.perf_counter()
             for _ in range(5):
+                # Keep measuring the ROLLUP (keys listing + cached
+                # summaries): the short-TTL result memo added on top of the
+                # terminal-run cache would otherwise serve every timed call
+                # from one dict hit and the gate would stop seeing a
+                # regression in the listing it promises to guard.  The
+                # terminal-run cache itself stays warm, which is this
+                # metric's point.  getattr, so a release predating the memo
+                # clears a throwaway dict and changes nothing.
+                getattr(dagsched, "_summaries_memo", {}).clear()
                 await dagsched.list_dags()
             dt = time.perf_counter() - t0
         finally:
@@ -2378,6 +2387,13 @@ def bench_dag_list_runs_warm():
             # effective ~230% against its declared 25%)
             t0 = time.perf_counter()
             for _ in range(60):
+                # Keep measuring the READ-EVERY-BODY path this docstring
+                # promises: the short-TTL summaries memo would otherwise
+                # serve all 60 calls from the untimed warm call's product
+                # and a regression in the real uncached path could no
+                # longer fire the gate.  getattr, so a release predating
+                # the memo clears a throwaway dict and changes nothing.
+                getattr(dagsched, "_summaries_memo", {}).clear()
                 await dagsched.list_runs("benchdag", limit=25)
             dt = time.perf_counter() - t0
         finally:
@@ -4285,11 +4301,19 @@ def bench_loop_stall_jobs():
                     max_gap = gap
                 last = now_t
 
+        async def poll():
+            # Keep the loop actually serving builds (see
+            # webapi.jobs_payload_500): the cross-poller response memo
+            # primed by the untimed spawn call would otherwise serve all
+            # 20 polls from cache and the heartbeat would gauge an idle
+            # loop. A plain attribute write, so on a release predating
+            # the memo it sets an unread attr and changes nothing.
+            cron._jobs_response_cache = None
+            await cron._web_list_jobs(_mocked_get("/jobs"))
+
         beat = asyncio.create_task(heartbeat())
         await asyncio.sleep(0)  # let the heartbeat take its first timestamp
-        await asyncio.gather(
-            *(cron._web_list_jobs(_mocked_get("/jobs")) for _ in range(20))
-        )
+        await asyncio.gather(*(poll() for _ in range(20)))
         stop = True
         await beat
         return max_gap
@@ -4503,6 +4527,12 @@ def bench_loop_stall_metrics():
         beat = asyncio.create_task(heartbeat())
         await asyncio.sleep(0)  # let the heartbeat take its first timestamp
         for _ in range(4):
+            # Keep the loop actually rendering: the cross-scraper response
+            # memo primed by the untimed warm call would otherwise serve
+            # all 4 scrapes from cache and the heartbeat would gauge an
+            # idle loop. getattr, so a release predating the memo clears a
+            # throwaway dict and changes nothing.
+            getattr(cron, "_metrics_response_cache", {}).clear()
             resp = await cron._web_metrics(_mocked_get("/metrics"))
             await asyncio.sleep(0)
         stop = True

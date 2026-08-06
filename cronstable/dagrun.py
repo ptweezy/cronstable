@@ -1745,6 +1745,19 @@ class DagScheduler:
             # (see cron._SPAWN_BURST_LIMIT).
             async with self._cron._spawn_gate:
                 await running.start()
+        except asyncio.CancelledError:
+            # Shutdown/restart while queued behind the spawn gate (the
+            # minute-boundary burst can hold a launch back there for a
+            # while): the task never started, so recording it FAILED would
+            # persist a wrong terminal state and burn a retry attempt, and
+            # swallowing the cancel would let the launch loop keep
+            # launching the rest of the batch mid-shutdown.  Clean up the
+            # run registration and re-raise, like maybe_launch_job; the
+            # claimed slot is protected by reconciliation (proc was set at
+            # claim), so the next owner resumes it.
+            if token is not None and self._cron._job_api is not None:
+                await self._cron._job_api.finish_run(token)
+            raise
         except BaseException:  # noqa: BLE001 - mirror maybe_launch_job cleanup
             if token is not None and self._cron._job_api is not None:
                 await self._cron._job_api.finish_run(token)

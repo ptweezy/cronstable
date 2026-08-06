@@ -1436,6 +1436,10 @@ async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
     # whole point: a wallboard plus tabs used to cost N identical builds
     # per cycle), and a locally recorded run must bust the memo so the
     # next poll sees it immediately.
+    # The TTL is widened so the exact build counts below cannot be broken
+    # by a stall between awaits (CPU steal on a loaded runner under
+    # --cov inserts an extra build past the real 1.0s TTL).
+    monkeypatch.setattr(cronstable.cron, "_JOBS_RESPONSE_TTL", 3600.0)
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     builds = []

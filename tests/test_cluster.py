@@ -970,7 +970,9 @@ async def test_web_fleet_endpoint_passes_through_gossip_view():
 
 
 @pytest.mark.asyncio
-async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized():
+async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized(
+    monkeypatch,
+):
     # /fleet rides the same dashboard poll cadence as /jobs while its build is
     # O(nodes x jobs) with a dict copy per summary entry, so it was the one
     # fan-out leg with no ETag, no gzip and no shared product: every open tab
@@ -980,6 +982,10 @@ async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized():
 
     import cronstable.cron
 
+    # widened so the exact build counts below cannot be broken by a stall
+    # between awaits (CPU steal on a loaded runner under --cov inserts an
+    # extra build past the real 1.0s TTL).
+    monkeypatch.setattr(cronstable.cron, "_FLEET_RESPONSE_TTL", 3600.0)
     builds = []
 
     class StubManager:
@@ -3726,6 +3732,68 @@ async def test_candidate_truncation_is_reported_not_silent(no_tls, caplog):
     # whole fleet down for outgrowing a gossip budget is worse than the
     # residual it would be protecting against.
     assert view["conflict"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
+    # The bridge derive and the advert build report DIFFERENT counts (the
+    # advert is the direct + bridge union, strictly larger whenever any
+    # direct-eligible peer exists). One shared last-logged scalar saw an
+    # alternating value and fired on every derive and every advert build,
+    # roughly twice per poll round for as long as the fleet stayed
+    # oversized: the exact flood the limiter's docstring says it prevents.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
+    }
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        for _ in range(5):
+            # each round re-seeds (a gossip poll landing: the peer-table
+            # generation bumps, the derive memo rolls) then rebuilds both
+            # halves, as a live poll round does
+            _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+            mgr._bridge_candidates()
+            mgr._capped_vouched()
+    warned = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    # once per source (the counts differ, so each deserves its line), NOT
+    # once per build
+    assert len(warned) == 2
+
+
+@pytest.mark.asyncio
+async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
+    # The /cluster view flag rode the same scalar the bridge derive zeroes
+    # when ITS half fits, and view_dict cascades into that derive, so the
+    # operator's own /cluster read blanked the truncation the advert build
+    # had just observed on the strictly larger union.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
+    }
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    # the bridge half fits the cap exactly; the union (node-b plus the
+    # bridge set) does not
+    assert len(mgr._bridge_candidates()) == MAX_ADVERTISED_CANDIDATE_NAMES
+    assert len(mgr._capped_vouched()) == MAX_ADVERTISED_CANDIDATE_NAMES
+    over = MAX_ADVERTISED_CANDIDATE_NAMES + 1
+    assert mgr._candidates_truncated == over
+    # a fresh peer write rolls the derive memo, and the derive re-runs on
+    # the next read (what any /cluster view build cascades into); its
+    # fits-branch must not blank the advert's observation
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    mgr._bridge_candidates()
+    assert mgr._candidates_truncated == over
+    assert mgr.view_dict()["candidates_truncated"] == over
 
 
 @pytest.mark.asyncio

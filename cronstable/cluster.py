@@ -1633,12 +1633,24 @@ class ClusterManager(LeadershipBackend):
         self._peer_response_cache: Optional[
             "tuple[Any, float, str, bytes]"
         ] = None
-        # How many bridge-confirmed candidates the last derive found when it
-        # had to truncate, else 0. It is both the log's rate-limit key and the
-        # /cluster view's `candidates_truncated` flag.
-        # MAX_ADVERTISED_CANDIDATE_NAMES says why this truncation is logged
-        # where the summaries one only marks the view.
-        self._candidates_truncated = 0
+        # Per-source oversize observations from the last derive / advert
+        # build ("bridge": the transitive-confirmation derive, "advert": the
+        # quorate_vouched union): the full candidate count when that source
+        # last overflowed the advertisement cap, else 0.  Kept per source
+        # because the two report DIFFERENT counts (the union is strictly
+        # larger whenever any direct-eligible peer exists); the old single
+        # scalar both flooded the log (each caller saw the other's value as
+        # "new") and let the operator's own /cluster read cascade into the
+        # derive and zero the flag the advert build had just set.  The
+        # /cluster `candidates_truncated` flag reads the max (see the
+        # _candidates_truncated property).  MAX_ADVERTISED_CANDIDATE_NAMES
+        # says why this truncation is logged where the summaries one only
+        # marks the view.
+        self._candidates_trunc_seen: Dict[str, int] = {}
+        # last-logged oversize count per source: the warning's rate limiter,
+        # deliberately distinct from the view cells above (see
+        # _note_candidates_truncated).
+        self._candidates_trunc_logged: Dict[str, int] = {}
 
     def _derived_state_key(self) -> "tuple":
         """The key every memoized election-derived result is valid under.
@@ -3149,9 +3161,12 @@ class ClusterManager(LeadershipBackend):
             # operator should not have to infer a cluster-wide double-run
             # from run history. The summaries cap reports its own (milder,
             # view-only) truncation the same way.
-            self._note_candidates_truncated(len(confirmed))
+            self._note_candidates_truncated("bridge", len(confirmed))
             return confirmed[:MAX_ADVERTISED_CANDIDATE_NAMES]
-        self._candidates_truncated = 0
+        # clears this source's cell ONLY: the advert build owns its own,
+        # so a /cluster read cascading into this derive can no longer
+        # blank a truncation the advert side just observed.
+        self._candidates_trunc_seen["bridge"] = 0
         return confirmed
 
     def _capped_vouched(self) -> List[str]:
@@ -3165,32 +3180,62 @@ class ClusterManager(LeadershipBackend):
         """
         vouched = sorted(self._eligible_candidates())
         if len(vouched) > MAX_ADVERTISED_CANDIDATE_NAMES:
-            self._note_candidates_truncated(len(vouched))
+            self._note_candidates_truncated("advert", len(vouched))
             return vouched[:MAX_ADVERTISED_CANDIDATE_NAMES]
+        self._candidates_trunc_seen["advert"] = 0
         return vouched
 
-    def _note_candidates_truncated(self, seen: int) -> None:
+    @property
+    def _candidates_truncated(self) -> int:
+        """The /cluster ``candidates_truncated`` flag.
+
+        The largest full count any source last saw overflow the
+        advertisement cap, 0 when every source last fit.  A max over the
+        per-source cells rather than one shared scalar, so the bridge
+        derive clearing ITS observation (which every /cluster read can
+        trigger, since view_dict cascades into the derives) cannot blank a
+        truncation the advert build observed on the larger union.
+        """
+        return max(self._candidates_trunc_seen.values(), default=0)
+
+    def _note_candidates_truncated(self, source: str, seen: int) -> None:
         """Record and log a candidate-set truncation (rate-limited).
 
-        Logged once per distinct oversize count rather than once per derive:
-        this runs on every view rebuild, so an unconditional warning would
-        fill the log at the poll cadence for as long as the fleet stays that
-        large, and a fleet that keeps growing still reports each new size.
+        ``source`` is ``"bridge"`` (the transitive-confirmation derive) or
+        ``"advert"`` (the quorate_vouched union build).  Both the view cell
+        and the log limiter are per source: the two sources report
+        different counts (the union is strictly larger whenever any
+        direct-eligible peer exists), so one shared last-logged scalar saw
+        an alternating value and fired on every derive and every advert
+        build, precisely the flood this limiter exists to prevent.  Logged
+        once per distinct oversize count per source rather than once per
+        build: this runs on every view rebuild, so an unconditional
+        warning would fill the log at the poll cadence for as long as the
+        fleet stays that large, and a fleet that keeps growing still
+        reports each new size.
         """
-        if self._candidates_truncated != seen:
-            self._candidates_truncated = seen
-            logger.warning(
-                "cluster: %d bridge-confirmed candidates exceed the %d-name "
-                "advertisement cap; the %d lowest names are gossiped and the "
-                "rest are dropped, so a `spread` job whose owner falls in the "
-                "dropped tail may run on more than one node. Reduce the "
-                "fleet's bridge-discovered size, or raise "
-                "MAX_ADVERTISED_CANDIDATE_NAMES and re-check the /peer body "
-                "against MAX_PEER_RESPONSE_BYTES.",
-                seen,
-                MAX_ADVERTISED_CANDIDATE_NAMES,
-                MAX_ADVERTISED_CANDIDATE_NAMES,
-            )
+        self._candidates_trunc_seen[source] = seen
+        if self._candidates_trunc_logged.get(source) == seen:
+            return
+        self._candidates_trunc_logged[source] = seen
+        what = (
+            "bridge-confirmed candidates"
+            if source == "bridge"
+            else "advertised candidates (direct-eligible plus "
+            "bridge-confirmed)"
+        )
+        logger.warning(
+            "cluster: %d %s exceed the %d-name advertisement cap; the %d "
+            "lowest names are gossiped and the rest are dropped, so a "
+            "`spread` job whose owner falls in the dropped tail may run on "
+            "more than one node. Reduce the fleet's bridge-discovered size, "
+            "or raise MAX_ADVERTISED_CANDIDATE_NAMES and re-check the /peer "
+            "body against MAX_PEER_RESPONSE_BYTES.",
+            seen,
+            what,
+            MAX_ADVERTISED_CANDIDATE_NAMES,
+            MAX_ADVERTISED_CANDIDATE_NAMES,
+        )
 
     @_memoized_derived
     def _eligible_candidates(self) -> List[str]:

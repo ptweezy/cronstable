@@ -4576,6 +4576,11 @@ class Cron:
         self.metrics.job_pause_state(name, False)
         self._persist_resume(name, by, channel)
         if was is not None:
+            # like the pause set: the dashboard refetches 300ms after the
+            # Resume click, well inside the memo TTL, so without the bust
+            # the UI keeps showing the job paused (button included) for up
+            # to the TTL plus a poll cycle.
+            self._bust_response_memos()
             self._sla_bank_pause(name, was, get_now(datetime.timezone.utc))
             logger.info("Job %s resumed by %s (%s)", name, by, channel)
 
@@ -4766,6 +4771,9 @@ class Cron:
             else:
                 was = self._paused.pop(name, None)
                 if was is not None:
+                    # a peer's resume must render on this node's next poll,
+                    # exactly as the pause set above busts.
+                    self._bust_response_memos()
                     self._sla_bank_pause(name, was, now)
                     self.metrics.job_pause_state(name, False)
                     logger.info(
@@ -11570,6 +11578,10 @@ class Cron:
         )
         self.run_history[name].append(info)
         self.last_run[name] = info
+        # every other run_history/last_run write busts the response memos;
+        # without it a boot-time reconciliation can serve the pre-crash
+        # last-run block for up to the TTL.
+        self._bust_response_memos()
         # a takeover can reconcile a foreign record older than a run this
         # node already recorded, so advance the supersede watermark rather
         # than assigning it (the durable side is a derive_max, i.e. already
