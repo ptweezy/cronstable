@@ -700,9 +700,20 @@ def main_loop(loop=None):
         help="configuration file, or directory containing configuration "
         "files (default: %(default)s)",
     )
-    parser.add_argument("-l", "--log-level", default="INFO")
     parser.add_argument(
-        "-v", "--validate-config", default=False, action="store_true"
+        "-l",
+        "--log-level",
+        default="INFO",
+        metavar="LEVEL",
+        help="logging level: DEBUG, INFO, WARNING, ERROR or CRITICAL "
+        "(default: INFO)",
+    )
+    parser.add_argument(
+        "-v",
+        "--validate-config",
+        default=False,
+        action="store_true",
+        help="validate the configuration and exit (-v is NOT verbose)",
     )
     parser.add_argument(
         "--job-set-id",
@@ -743,7 +754,16 @@ def main_loop(loop=None):
         else:
             parser.error("`--` is only valid before a `lock run` command")
 
-    logging.basicConfig(level=getattr(logging, args.log_level))
+    # resolve the level name leniently (any case, plus aliases like WARN)
+    # but fail a typo as a clean usage error, not an AttributeError
+    # traceback out of a bare getattr(logging, ...).
+    log_level = logging.getLevelName(str(args.log_level).upper())
+    if not isinstance(log_level, int):
+        parser.error(
+            "invalid --log-level {!r} (use DEBUG, INFO, WARNING, ERROR "
+            "or CRITICAL)".format(args.log_level)
+        )
+    logging.basicConfig(level=log_level)
     # logging.getLogger("asyncio").setLevel(logging.WARNING)
     logger = logging.getLogger("cronstable")
 

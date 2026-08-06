@@ -781,7 +781,7 @@ operator/scheduler-initiated replacement from an actual job failure. See
 When a job has a `statsd` config, `RunningJob` builds a
 `StatsdJobMetricWriter`. `_on_start` sends `{prefix}.start:1|g`; `_on_stop`
 sends `{prefix}.stop:1|g`, `{prefix}.success:{0|1}|g`, and
-`{prefix}.duration:{ms}|ms|@0.1`, where success is `0 if self.job.failed else 1`
+`{prefix}.duration:{ms}|ms`, where success is `0 if self.job.failed else 1`
 and duration is wall time between start and stop in milliseconds. Each
 `send_to_statsd` call is one fire-and-forget UDP datagram, so there are two
 datagrams per run: `job_started` sends the single `.start` line, and

@@ -410,7 +410,7 @@ def test_cli_backup_restore_roundtrip(tmp_path, monkeypatch, capsys):
     assert (
         _cli(monkeypatch, ["state", "restore", "-c", config2, archive]) == 1
     )
-    assert "refusing" in capsys.readouterr().out
+    assert "refusing" in capsys.readouterr().err
     # ... and proceeds with it
     assert (
         _cli(
@@ -812,12 +812,12 @@ def test_cli_migrate_schema(tmp_path, monkeypatch, capsys):
 def test_cli_requires_state_section(tmp_path, monkeypatch, capsys):
     config = _write_config(tmp_path, tmp_path / "store", state=False)
     assert _cli(monkeypatch, ["state", "check", "-c", config]) == 1
-    assert "no `state:` section" in capsys.readouterr().out
+    assert "no `state:` section" in capsys.readouterr().err
 
 
 def test_cli_state_without_action(tmp_path, monkeypatch, capsys):
     assert _cli(monkeypatch, ["state"]) == 2
-    assert "no action" in capsys.readouterr().out
+    assert "no action" in capsys.readouterr().err
 
 
 def test_cli_root_config_position_also_works(tmp_path, monkeypatch, capsys):
@@ -861,7 +861,7 @@ def test_backup_without_store_reports_nothing_to_do(
     archive = str(tmp_path / "b.tar.gz")
     code = _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
     assert code == 1
-    assert "nothing to back up" in capsys.readouterr().out
+    assert "nothing to back up" in capsys.readouterr().err
 
 
 def test_backup_into_unwritable_output_is_clean_error(
@@ -873,7 +873,7 @@ def test_backup_into_unwritable_output_is_clean_error(
     archive = str(tmp_path / "no-such-dir" / "b.tar.gz")
     code = _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
     assert code == 1
-    assert "cronstable state error" in capsys.readouterr().out
+    assert "cronstable state error" in capsys.readouterr().err
 
 
 def test_migrate_without_store_reports_nothing_to_do(
@@ -885,7 +885,7 @@ def test_migrate_without_store_reports_nothing_to_do(
         ["state", "migrate", "-c", config, "--dest", str(tmp_path / "d")],
     )
     assert code == 1
-    assert "nothing to migrate" in capsys.readouterr().out
+    assert "nothing to migrate" in capsys.readouterr().err
 
 
 def test_migrate_refuses_populated_dest_without_force(
@@ -900,7 +900,7 @@ def test_migrate_refuses_populated_dest_without_force(
         monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
     )
     assert code == 1
-    assert "--force" in capsys.readouterr().out
+    assert "--force" in capsys.readouterr().err
 
 
 def test_migrate_with_dest_deployment_id(tmp_path, monkeypatch, capsys):
@@ -936,8 +936,8 @@ def test_migrate_blocked_destination_path(tmp_path, monkeypatch, capsys):
         monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
     )
     assert code == 1
-    out = capsys.readouterr().out
-    assert "failed to copy" in out or "cronstable state error" in out
+    err = capsys.readouterr().err
+    assert "failed to copy" in err or "cronstable state error" in err
 
 
 def test_restore_blocked_destination_path(tmp_path, monkeypatch, capsys):
@@ -957,8 +957,8 @@ def test_restore_blocked_destination_path(tmp_path, monkeypatch, capsys):
         monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
     )
     assert code == 1
-    out = capsys.readouterr().out
-    assert "failed to restore" in out or "cronstable state error" in out
+    err = capsys.readouterr().err
+    assert "failed to restore" in err or "cronstable state error" in err
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +973,7 @@ def test_gc_requires_grace_window(tmp_path, monkeypatch, capsys):
     _seed_store(store)
     code = _cli(monkeypatch, ["state", "gc", "-c", config])
     assert code == 1
-    assert "gcGraceSeconds" in capsys.readouterr().out
+    assert "gcGraceSeconds" in capsys.readouterr().err
 
 
 def test_gc_dry_run_with_dag_config(tmp_path, monkeypatch, capsys):
@@ -1261,9 +1261,9 @@ def test_restore_reports_failure_when_target_is_a_directory(
         monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
     )
     assert code == 1
-    out = capsys.readouterr().out
-    assert "failed to restore" in out
-    assert member.name in out
+    err = capsys.readouterr().err
+    assert "failed to restore" in err
+    assert member.name in err
     assert os.path.isdir(blocker)  # still a directory; nothing clobbered it
 
 
@@ -1338,8 +1338,7 @@ def test_migrate_reports_copy_failure_when_target_is_a_directory(
         ["state", "migrate", "-c", config, "--dest", str(dest), "--force"],
     )
     assert code == 1
-    out = capsys.readouterr().out
-    assert "failed to copy" in out
+    assert "failed to copy" in capsys.readouterr().err
     assert os.path.isdir(blocker)
 
 
@@ -1565,7 +1564,7 @@ def test_restore_swallows_temp_cleanup_failure(
         monkeypatch, ["state", "restore", "-c", config2, archive]
     )
     assert code == 1
-    assert "failed to restore" in capsys.readouterr().out
+    assert "failed to restore" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -1598,7 +1597,7 @@ def test_migrate_swallows_temp_cleanup_failure(
         monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
     )
     assert code == 1
-    assert "failed to copy" in capsys.readouterr().out
+    assert "failed to copy" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

@@ -192,6 +192,7 @@ from typing import (
     Optional,
     Set,
     Tuple,
+    TypeGuard,
     TypeVar,
     cast,
 )
@@ -272,6 +273,23 @@ MAX_ADVERTISED_REBOOT_JOBS = 512  # ran-set cardinality stored + re-advertised
 MAX_JOB_SUMMARY_NAME_LEN = 128  # a single job name in job_summaries
 MAX_ADVERTISED_JOB_SUMMARIES = 512  # per-node job_summaries cardinality
 MAX_JOB_SUMMARY_TS_LEN = 64  # an ISO-8601 finished_at timestamp
+
+# Cap on the transitively-discovered candidate names this node derives and
+# re-advertises (_bridge_candidates, and the quorate_vouched set built on it).
+# This set is the one re-broadcast path that is NOT bounded by our own config:
+# it is folded entirely out of absorbed peer mutual_agreeing sets, which
+# _poll_peer parses at MAX_MEMBER_ENTRIES x MAX_PEER_FIELD_LEN, about 1 MB,
+# four times MAX_PEER_RESPONSE_BYTES. Uncapped, one inflated upstream peer
+# therefore pushes OUR /peer body past the cap, honest peers record us as
+# oversized and drop us from their agreeing sets, and the cluster loses quorum:
+# exactly the re-advertised-set DoS the ran_reboot_jobs cap above exists to
+# stop. The lists are sorted ASCENDING before slicing, so the surviving prefix
+# is the same on every node (the election needs one shared view) and holds the
+# lowest names, which is what elect_leader's ``min`` reads, so truncation
+# cannot change a single-leader election at all. The residual is the same class
+# as the summaries cap: a fleet with more than this many bridge-discovered
+# nodes may drop a ``spread`` co-owner from the tail and double-run its jobs.
+MAX_ADVERTISED_CANDIDATE_NAMES = 256
 
 # the only run outcomes a peer summary may carry (mirrors JobRunInfo.outcome)
 _SUMMARY_OUTCOMES = frozenset({"success", "failure", "cancelled"})
@@ -391,6 +409,12 @@ def _parse_members(
             and isinstance(instance, str)
             and isinstance(agreed, bool)
         ):
+            # Drop empty names/instances for the reason _parse_str_list does:
+            # '' clears every other guard yet sorts below every real name, so
+            # a member entry carrying one can reach the election as a
+            # candidate no node can match.
+            if not (name and instance):
+                continue
             if max_len is not None and (
                 len(name) > max_len or len(instance) > max_len
             ):
@@ -430,6 +454,15 @@ def _parse_str_list(
     out: "set[str]" = set()
     for item in raw:
         if not isinstance(item, str):
+            continue
+        # Drop the empty string. It passes every other guard below
+        # (``"".isprintable()`` is True and its length is under any cap) but is
+        # not a name any node can hold, and it sorts BELOW every real one: fold
+        # it into mutual_agreeing and elect_leader's ``min`` picks '' as leader
+        # cluster-wide, so no node matches it, every Leader job stops firing,
+        # and the view still reports quorate with no conflict. See
+        # _bridge_candidates / elect_leader.
+        if not item:
             continue
         if max_len is not None and len(item) > max_len:
             continue
@@ -626,6 +659,39 @@ def _peer_sees_me_agreed(
         if agreed and instance == my_instance:
             return True
     return False
+
+
+# the type of one peer-declared coordination value (see _declares_divergent);
+# carrying it through the guard lets a caller keep the non-optional value.
+_DeclaredT = TypeVar("_DeclaredT")
+
+
+def _declares_divergent(
+    declared: Optional[_DeclaredT], ours: Any
+) -> TypeGuard[_DeclaredT]:
+    """Whether a peer *declared* a coordination value and it is not ours.
+
+    The one spelling of the divergence test every gate in this module runs:
+    the :meth:`ClusterManager._agreeing_peers` exclude set, and the two
+    detectors it is paired with, :meth:`ClusterManager.conflicting_sizes` and
+    :meth:`ClusterManager.conflicting_policies`.  Those three are one safety
+    invariant, not three independent checks: a peer the detectors name as a
+    first-class conflict MUST also be dropped from the mutually agreeing set
+    we gossip, or a third node that reaches the divergent peer only across a
+    bridge (and so never sees the divergence itself) would bridge-confirm it
+    as quorate on *our* vouch and coordinate across a node running by
+    different rules, the very double-run / silent-skip the detectors exist to
+    prevent.  Both halves reading one predicate means a change to what counts
+    as divergence cannot land on one gate and quietly miss another; the field
+    SETS the gates cover are fenced together by
+    ``test_declared_fields_gate_both_agreement_and_conflict``.
+
+    ``None`` means the peer is too old to declare this field, and never
+    diverges: an absent declaration is no evidence of a conflict, and the safe
+    direction is to keep counting such a peer rather than fail a whole cluster
+    of legacy builds closed for the length of a rolling upgrade.
+    """
+    return declared is not None and declared != ours
 
 
 async def _read_capped(resp: Any, limit: int) -> "tuple[bytes, bool]":
@@ -1707,7 +1773,14 @@ class ClusterManager(LeadershipBackend):
             # quorate_vouched / _unconfirmed_contenders). Stronger than
             # mutual_agreeing, which lists every two-way edge including
             # ones to sub-quorum nodes that stand a deferred job down.
-            "quorate_vouched": sorted(self._eligible_candidates()),
+            # Capped for the same reason ran_reboot_jobs is: the bridge half
+            # of this set is folded from absorbed peer data and re-broadcast,
+            # so without a bound an inflated upstream peer walks our own body
+            # past MAX_PEER_RESPONSE_BYTES and honest peers reject us as
+            # oversized (see MAX_ADVERTISED_CANDIDATE_NAMES).
+            "quorate_vouched": sorted(self._eligible_candidates())[
+                :MAX_ADVERTISED_CANDIDATE_NAMES
+            ],
             # this node's per-job run summaries (the scheduler's snapshot:
             # running/enabled/next-fire plus the last finished run), for
             # the polling peer's fleet view. Observability only -- a peer
@@ -1754,6 +1827,22 @@ class ClusterManager(LeadershipBackend):
             }
             for name, entry in job_summaries.items()
         }
+
+    @staticmethod
+    def _encode_peer_body(payload: Dict[str, Any]) -> bytes:
+        """Serialise a /peer payload to the bytes we will send.
+
+        Uses the orjson-accelerated encoder (compact, and several times faster
+        than aiohttp's default ``json.dumps``), falling back to the stdlib for
+        the value shapes it declines.  The ETag is a hash of a canonical
+        projection of the payload (see :meth:`_peer_etag`), NOT of these bytes,
+        so the encoder choice cannot affect 304 matching; peers parse the body
+        back through ``_json.loads``.
+        """
+        try:
+            return _json.dumps_bytes(payload)
+        except _json.UnsupportedValue:
+            return json.dumps(payload).encode("utf-8")
 
     @staticmethod
     def _peer_etag(
@@ -1858,12 +1947,42 @@ class ClusterManager(LeadershipBackend):
             etag, body_bytes = cached[2], cached[3]
         else:
             payload = self._peer_payload()
+            body_bytes = self._encode_peer_body(payload)
+            if len(body_bytes) > MAX_PEER_RESPONSE_BYTES:
+                # Last-resort degradation. Every re-advertised set is capped
+                # individually, so this should be unreachable; if it is ever
+                # reached, shipping the body anyway is the worst outcome --
+                # honest pollers cap the read (_read_capped), record us as an
+                # oversized failure and drop us from their agreeing sets, so
+                # one over-budget field costs this node its place in the
+                # quorum. Drop the job_summaries block instead: it is the
+                # largest field and the only observability-only one, so the
+                # fleet view degrades to "truncated" (a shape the dashboard
+                # already renders) while every election-relevant field still
+                # travels. Compare the UNCOMPRESSED length; the poller's cap
+                # applies to the decompressed stream.
+                oversized = len(body_bytes)
+                payload = dict(payload)
+                payload["job_summaries"] = {}
+                payload["job_summaries_truncated"] = True
+                body_bytes = self._encode_peer_body(payload)
+                logger.warning(
+                    "/peer response was %d bytes, over the %d byte cap peers "
+                    "enforce: dropped job_summaries from the fleet view (now "
+                    "%d bytes)",
+                    oversized,
+                    MAX_PEER_RESPONSE_BYTES,
+                    len(body_bytes),
+                )
             now_epoch = datetime.datetime.now(
                 datetime.timezone.utc
             ).timestamp()
             # normalise the summaries block once and hand it to the etag
             # computation, instead of _peer_etag re-deriving it from the
-            # payload (see _stable_job_summaries).
+            # payload (see _stable_job_summaries). Computed on the payload we
+            # actually send, so a degraded body never carries the full body's
+            # tag (which would 304 a poller into replaying a body it never
+            # received).
             etag = self._peer_etag(
                 payload,
                 now_epoch,
@@ -1871,16 +1990,6 @@ class ClusterManager(LeadershipBackend):
                     payload["job_summaries"], now_epoch
                 ),
             )
-            # Serialize with the orjson-accelerated encoder (compact, and
-            # several times faster than aiohttp's default json.dumps). The
-            # ETag above is a hash of a canonical projection of the payload
-            # (see _peer_etag), NOT of these body bytes, so the encoder choice
-            # cannot affect 304 matching; peers parse the body back through
-            # _json.loads.
-            try:
-                body_bytes = _json.dumps_bytes(payload)
-            except _json.UnsupportedValue:
-                body_bytes = json.dumps(payload).encode("utf-8")
             self._peer_response_cache = (state_key, now_mono, etag, body_bytes)
         headers = {"ETag": etag}
         # The node-stats sidecar: a live reading (when sharing) travels as a
@@ -2812,6 +2921,34 @@ class ClusterManager(LeadershipBackend):
     def quorum(self) -> int:
         return quorum_size(self.cluster_size())
 
+    def _our_declarations(self) -> Dict[str, Any]:
+        """Our own value for every coordination field a divergence gate reads.
+
+        Keyed by the :class:`PeerState` attribute a peer's declaration of that
+        field lands in, so a gate can pair "theirs" with "ours" by name.  This
+        is the single definition of *which* fields are divergence-gated: the
+        :meth:`_agreeing_peers` exclude set iterates it, so adding a field
+        here excludes a peer that diverges on it from the mutually agreeing
+        set we gossip.  That is the half of the gate that stops a third node
+        reaching such a peer only across a bridge from confirming it quorate
+        on *our* vouch (see :func:`_declares_divergent` for why the two
+        halves must move together).  The detectors that *name* the conflict
+        for the operator (:meth:`conflicting_sizes`,
+        :meth:`conflicting_policies`) still spell their own fields, since
+        each reports a different shape; the test
+        ``test_declared_fields_gate_both_agreement_and_conflict`` fences their
+        coverage against these keys and against ``PeerState`` itself, so a
+        fourth declared field cannot be wired into one side only.
+
+        Not memoized: it is three attribute reads over an already-memoized
+        :meth:`cluster_size`, and every caller hoists it out of its peer loop.
+        """
+        return {
+            "declared_size": self.cluster_size(),
+            "declared_distribution": self.distribution,
+            "declared_elect_leader": bool(self.config.get("electLeader")),
+        }
+
     @_memoized_derived
     def _agreeing_peers(self) -> List[PeerState]:
         """Peers we *mutually* agree with on our job-set id *and* cluster size.
@@ -2855,8 +2992,9 @@ class ClusterManager(LeadershipBackend):
         too old to declare a policy field (``None``) contributes no divergence
         evidence and is not excluded -- the safe direction.
         """
-        my_size = self.cluster_size()
-        my_elect = bool(self.config.get("electLeader"))
+        # our side of every divergence-gated field, hoisted out of the loop
+        # (see _our_declarations: its key set IS the exclude set below).
+        my_declarations = self._our_declarations()
         agreeing: List[PeerState] = []
         # Dedup by per-process instance_id: a node reachable at two listed
         # addresses answers both with one identity and must count ONCE toward
@@ -2882,17 +3020,13 @@ class ClusterManager(LeadershipBackend):
                     _peer_sees_me_agreed(peer.members, self.instance_id)
                     or not peer.reports_members
                 )
-                and not (
-                    peer.declared_size is not None
-                    and peer.declared_size != my_size
-                )
-                and not (
-                    peer.declared_distribution is not None
-                    and peer.declared_distribution != self.distribution
-                )
-                and not (
-                    peer.declared_elect_leader is not None
-                    and peer.declared_elect_leader != my_elect
+                # size / policy exclusion: a peer that declares ANY gated
+                # field differently is dropped from the set; the gated
+                # fields are exactly the ones conflicting_sizes and
+                # conflicting_policies detect.
+                and not any(
+                    _declares_divergent(getattr(peer, field), mine)
+                    for field, mine in my_declarations.items()
                 )
             ):
                 continue
@@ -2972,13 +3106,22 @@ class ClusterManager(LeadershipBackend):
             if witness is None:  # _agreeing_peers filters these out already
                 continue
             for name in peer.mutual_agreeing or ():
-                if name not in direct:
+                # ``name and`` matches _unconfirmed_contenders /
+                # _available_contenders: an empty name is rejected at the parse
+                # boundary now, but all three folds spell the guard the same
+                # way so a future parser change cannot single this one out.
+                if name and name not in direct:
                     witnesses[name].add(witness)
         # confirmed quorate iff we witness >= quorum mutual agreers of it
-        # (the witnessing peers plus the node itself).
+        # (the witnessing peers plus the node itself).  Sorted then capped:
+        # this set is re-advertised as quorate_vouched and is built purely
+        # from absorbed peer data, so it is the one unbounded re-broadcast
+        # path (see MAX_ADVERTISED_CANDIDATE_NAMES); slicing a sorted list
+        # keeps the same prefix on every node and keeps the lowest names,
+        # which is what the election reads.
         return sorted(
             name for name, seen in witnesses.items() if len(seen) + 1 >= quorum
-        )
+        )[:MAX_ADVERTISED_CANDIDATE_NAMES]
 
     @_memoized_derived
     def _eligible_candidates(self) -> List[str]:
@@ -3248,14 +3391,13 @@ class ClusterManager(LeadershipBackend):
         proof for a window that does not survive release).  Change membership /
         upgrade one node at a time, as above.
         """
-        my_size = self.cluster_size()
+        my_size = self._our_declarations()["declared_size"]
         return sorted(
             {
                 peer.declared_size
                 for peer in self.view.peers.values()
                 if peer.status == STATUS_AGREED
-                and peer.declared_size is not None
-                and peer.declared_size != my_size
+                and _declares_divergent(peer.declared_size, my_size)
             }
         )
 
@@ -3286,24 +3428,22 @@ class ClusterManager(LeadershipBackend):
         direction).  Returns human-readable ``"field theirs != ours"``
         descriptors, sorted and de-duplicated, for the dashboard / view.
         """
-        my_elect = bool(self.config.get("electLeader"))
+        my_declarations = self._our_declarations()
+        my_distribution = my_declarations["declared_distribution"]
+        my_elect = my_declarations["declared_elect_leader"]
         conflicts: Set[str] = set()
         for peer in self.view.peers.values():
             if peer.status != STATUS_AGREED:
                 continue
-            if (
-                peer.declared_distribution is not None
-                and peer.declared_distribution != self.distribution
+            if _declares_divergent(
+                peer.declared_distribution, my_distribution
             ):
                 conflicts.add(
                     "distribution {!r} != {!r}".format(
-                        peer.declared_distribution, self.distribution
+                        peer.declared_distribution, my_distribution
                     )
                 )
-            if (
-                peer.declared_elect_leader is not None
-                and peer.declared_elect_leader != my_elect
-            ):
+            if _declares_divergent(peer.declared_elect_leader, my_elect):
                 conflicts.add(
                     "electLeader {!r} != {!r}".format(
                         peer.declared_elect_leader, my_elect

@@ -161,6 +161,12 @@ all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
 bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. The `404` (unknown
 job) and `401` (authentication failure) responses are raised without it.
 
+Every error body on this API is one JSON envelope: `{"error": "<reason>"}`
+(`Content-Type: application/json`), across the job, DAG, schedule, state, and
+push routes alike. The one exception is the `401` from the auth middleware,
+which is bodyless. `docs/openapi.yaml` declares the same envelope as the
+`Error` schema.
+
 > The same interface serves the **[Web Dashboard](Web-Dashboard)** at `/`; that
 > page is the visual tour of the UI these endpoints feed.
 
@@ -203,7 +209,9 @@ schedule, `scheduled_in` is the literal string `"@reboot"`.
 A `scheduled` job whose crontab has **no future occurrence** (a fixed past
 year, an impossible date) reports `scheduled_in: null` plus `never_fires:
 true`, and the text form says `never fires (schedule has no future
-occurrence)`; see [Schedule Linting](Schedule-Linting).
+occurrence)`; see [Schedule Linting](Schedule-Linting). A `running` row for
+such a job carries the same `never_fires: true` flag, so the dead schedule
+stays visible while an instance is in flight.
 
 The `disabled` status is reported honestly instead of an inapplicable
 `scheduled (in N seconds)`.
@@ -288,7 +296,7 @@ Query parameters:
 | --- | --- |
 | `expr` | **Required.** The expression to decode (URL-encoded). `400` when missing or blank. |
 | `tz` | Optional IANA zone for the preview frame and the DST lint checks (default `UTC`). `400` for an unknown name. |
-| `count` | Optional number of upcoming fires to return, clamped to 1–60 (default 12). |
+| `limit` | Optional number of upcoming fires to return, clamped to 1–60 (default 12). `count` is its legacy alias, read when `limit` is absent (every capped listing on this API takes `limit`). |
 | `seed` | Optional hash key (a job name, real or prospective) that resolves [`H` items](Hashed-Schedules). Without it an `H` expression comes back `valid: false` with the engine's own error; with it the response echoes `seed` and adds `resolved`, the expression with every `H` replaced by its hashed values. |
 
 For an expression the engine accepts, the response carries `valid: true`,
@@ -391,9 +399,9 @@ The upcoming fires as a standard iCalendar (RFC 5545) feed, fleet-wide or
 per job, `Content-Type: text/calendar`: one `VEVENT` per fire, enumerated by
 the scheduler's own engine in each job's resolved timezone and emitted as
 UTC instants with stable UIDs, so subscribed calendar apps update in place.
-Query parameters `days` (window, default 14, clamped 1 to 60) and `per_job`
-(event cap per job, default 100, clamped 1 to 1000) are clamped rather than
-erroring. Disabled and `@reboot` jobs carry no events; an unknown job name
+Query parameters `days` (window, default 14, clamped 1 to 60) and `limit`
+(event cap per job, default 100, clamped 1 to 1000; `per_job` is its legacy
+alias, read when `limit` is absent) are clamped rather than erroring. Disabled and `@reboot` jobs carry no events; an unknown job name
 on the per-job route is a `404`.
 
 With [`web.authToken`](#authentication) set, the `.ics`
@@ -651,9 +659,9 @@ job's `name`.
 
 | Condition | Response |
 | --- | --- |
-| No job with that name. | `404 Not Found`. |
-| The job exists but has `enabled: false`. | `409 Conflict`, body `job '<name>' is disabled`. |
-| Otherwise. | `200 OK`, empty body; the job is launched via the normal launch path. |
+| No job with that name. | `404 Not Found`, body `{"error": "job '<name>' not found"}`. |
+| The job exists but has `enabled: false`. | `409 Conflict`, body `{"error": "job '<name>' is disabled"}`. |
+| Otherwise. | `200 OK`, body `{"started": "<name>"}` (the `cron_run_job` [MCP tool](MCP)'s ack shape); the job is launched via the normal launch path. |
 
 The `409` is deliberate: a disabled job behaves as if it is not there,
 so the API refuses to launch it manually rather than overriding the config.
@@ -666,7 +674,8 @@ instance(s) first. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 ```shell
 $ http post http://127.0.0.1:8080/jobs/test-02/start
 HTTP/1.1 200 OK
-Content-Length: 0
+
+{"started": "test-02"}
 ```
 
 ### `POST /jobs/{name}/cancel`
@@ -679,9 +688,9 @@ costs at most one `killTimeout`, not one per instance.
 
 | Condition | Response |
 | --- | --- |
-| No job with that name. | `404 Not Found`. |
-| The job exists but no instance is running. | `409 Conflict`, body `job '<name>' is not running`. |
-| Otherwise. | `200 OK`, empty body; all running instances are cancelled. |
+| No job with that name. | `404 Not Found`, body `{"error": "job '<name>' not found"}`. |
+| The job exists but no instance is running. | `409 Conflict`, body `{"error": "job '<name>' is not running"}`. |
+| Otherwise. | `200 OK`, body `{"cancelled": "<name>", "instances": <count>}` (the `cron_cancel_job` [MCP tool](MCP)'s ack shape); all running instances are cancelled. |
 
 A run cancelled this way is recorded in the job's history with the outcome
 `cancelled`. Cancellation is a deliberate operator action, not a job failure,
@@ -691,6 +700,8 @@ retries.
 ```shell
 $ http post http://127.0.0.1:8080/jobs/test-03/cancel
 HTTP/1.1 200 OK
+
+{"cancelled": "test-03", "instances": 1}
 ```
 
 ### `POST /jobs/{name}/pause`
@@ -774,6 +785,9 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
+| `retry` | Present only while a [retry ladder](Failure-Detection-and-Retries) is armed for the job: `{attempt, maxAttempts, nextRetryAt, delaySeconds}`. `maxAttempts` is `null` for an unlimited ladder (`maximumRetries: -1`). |
+| `rebootPending` | Present (as `true`) only for a deferred `@reboot` one-shot still awaiting its boot run (the cluster had not elected an owner at boot, or a pause is holding it), so a client can tell "pending boot run" from "already ran". |
+| `concurrencyScope`, `slot` | Present only for `concurrencyScope: cluster` jobs: the literal scope, and `slot` as `{held, holder, refs}`: whether this node holds the job's [cluster-wide concurrency slot](Clustering-and-Leader-Election) lease, the holding node's name (`null` when unheld), and how many live instances reference it. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
 
 ```shell
@@ -840,11 +854,16 @@ $ http get http://127.0.0.1:8080/jobs/test-01
 Returns the job's retained run history (oldest first, bounded, and held in
 memory -- though with a [durable state store](Durable-State) configured it is
 rehydrated from the durable run ledger after a restart) together with
-aggregate statistics. Returns `404 Not Found` for an unknown job.
+aggregate statistics. Returns `404 Not Found` for an unknown job. An optional
+`?limit=` query caps the `runs` array (newest kept, clamped to the retained
+window; the default serves the whole window); `stats` always covers the whole
+retained window regardless of `limit`.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
-`fail_reason`, and `resources`). `resources` is `null` unless the job opted
+`fail_reason`, and `resources`), plus `ranAt` on every entry whose outcome is
+not `skipped`: the same instant as `finished_at`, under the key the run
+ledger uses, so ledger-derived and in-memory records read alike. `resources` is `null` unless the job opted
 into [`monitorResources`](Resource-Monitoring), in which case it is
 `{cpu_user_seconds, cpu_system_seconds, cpu_total_seconds, max_rss_bytes,
 samples}` for that run. Besides `success`, `failure`, and `cancelled`, `outcome` can
@@ -948,8 +967,9 @@ CPU%, **peak** RSS per merged bucket, so spikes survive), so a series is
 bounded no matter how long the run. `live` carries the run-so-far series of
 each currently-running monitored instance plus its `current` instantaneous
 readings; `runs` the recorded series of recent finished **monitored** runs
-(oldest first, unmonitored runs are omitted), capped by the `runs` query
-parameter (default 20, clamped to the retained history). With a
+(oldest first, unmonitored runs are omitted), capped by the `limit` query
+parameter (default 20, clamped to the retained history; `runs` is its
+legacy alias, read when `limit` is absent). With a
 [durable state store](Durable-State), run series survive restarts inside the
 run ledger records. `monitored: false` with empty lists means the job never
 opted into `monitorResources` — distinguishable from "monitored but no data
@@ -1068,10 +1088,11 @@ The configured DAGs and their tasks:
 
 #### `GET /dags/{name}/runs`
 
-Recent dag_runs (newest first), each with its state and a per-state task count:
+Recent dag_runs (newest first), each with its state and a per-state task
+count. `name` duplicates `dag` (the generic subject key the job routes use):
 
 ```json
-{"dag": "nightly-etl", "runs": [
+{"dag": "nightly-etl", "name": "nightly-etl", "runs": [
   {"runKey": "2026-07-04T02:00:00_00:00", "runId": "…", "state": "success",
    "kind": "scheduled", "logicalDate": "2026-07-04T02:00:00+00:00",
    "taskStates": {"success": 3}}]}
@@ -1088,8 +1109,9 @@ expansion (`mapped`), and approval decisions. `404` if the run is unknown.
 
 #### `POST /dags/{name}/trigger`
 
-Create and start a manual run now; returns `{"dag": …, "runKey": …}`. `404`
-if the DAG is not configured; a run that could not be durably recorded (the
+Create and start a manual run now; returns `{"dag": …, "name": …, "runKey":
+…}` (`name` duplicates `dag`, the generic subject key the job routes use).
+`404` if the DAG is not configured; a run that could not be durably recorded (the
 state backend is unavailable) surfaces as a `500` error rather than a
 `runKey` for a run that does not exist.
 

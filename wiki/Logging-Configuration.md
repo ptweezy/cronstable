@@ -13,7 +13,7 @@ When the configuration contains no `logging:` section, cronstable's log output i
 governed entirely by the CLI. At startup, `__main__.py` calls:
 
 ```python
-logging.basicConfig(level=getattr(logging, args.log_level))
+logging.basicConfig(level=log_level)
 ```
 
 The level comes from `-l/--log-level` (default `INFO`). `logging.basicConfig`
@@ -21,9 +21,9 @@ installs a single `StreamHandler` on the root logger that writes to **stderr**
 with the standard library default format
 (`LEVEL:logger_name:message`). There is no timestamp in this default format.
 
-`-l/--log-level` is passed through `getattr(logging, ...)` unchanged, so its
-value must be a valid uppercase Python level name (`DEBUG`, `INFO`, `WARNING`,
-`ERROR`, `CRITICAL`); any other value raises `AttributeError` at startup. See
+`-l/--log-level` is upper-cased and resolved against the standard level names
+(`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, plus the `logging` module's
+aliases such as `WARN`); an unknown value exits `2` as a usage error. See
 [Command-Line Reference](CLI-Reference) for the full CLI.
 
 This default applies whether or not the run later loads a `logging:` section:

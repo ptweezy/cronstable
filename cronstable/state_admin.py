@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import socket
+import sys
 import tarfile
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -106,7 +107,10 @@ def cmd_backup(config_arg: str, output: str) -> int:
     backend = _load_state_backend(config_arg)
     base = backend.base
     if not os.path.isdir(base):
-        print("state: nothing to back up: {} does not exist".format(base))
+        print(
+            "state: nothing to back up: {} does not exist".format(base),
+            file=sys.stderr,
+        )
         return 1
     count = 0
     # The archive gets the store's own 0o600, not the default 0o644: it
@@ -196,7 +200,8 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
         print(
             "state: refusing to restore into the non-empty store at {} "
             "(pass --force to merge into it; NOT safe while a daemon "
-            "uses it)".format(base)
+            "uses it)".format(base),
+            file=sys.stderr,
         )
         return 1
     os.makedirs(base, mode=0o700, exist_ok=True)
@@ -245,7 +250,8 @@ def cmd_restore(config_arg: str, archive: str, force: bool) -> int:
                 FilesystemStateBackend._replace(tmp, target)
             except OSError as ex:
                 print(
-                    "state: failed to restore {}: {}".format(member.name, ex)
+                    "state: failed to restore {}: {}".format(member.name, ex),
+                    file=sys.stderr,
                 )
                 try:
                     os.unlink(tmp)
@@ -288,7 +294,10 @@ def cmd_migrate(
     backend = _load_state_backend(config_arg)
     src_base = backend.base
     if not os.path.isdir(src_base):
-        print("state: nothing to migrate: {} does not exist".format(src_base))
+        print(
+            "state: nothing to migrate: {} does not exist".format(src_base),
+            file=sys.stderr,
+        )
         return 1
     dest_cfg = dict(backend.config)
     dest_cfg["path"] = dest_path
@@ -304,7 +313,10 @@ def cmd_migrate(
     if real_dest == real_src or real_dest.startswith(real_src + os.sep):
         # identical stores, or a destination nested INSIDE the source --
         # the copy walk would start finding its own output.
-        print("state: destination must be a store outside the source")
+        print(
+            "state: destination must be a store outside the source",
+            file=sys.stderr,
+        )
         return 1
     populated = any(
         os.path.isdir(os.path.join(dest_base, sub))
@@ -315,7 +327,8 @@ def cmd_migrate(
         print(
             "state: refusing to migrate into the non-empty store at {} "
             "(pass --force to overwrite; NOT safe while a daemon uses "
-            "it)".format(dest_base)
+            "it)".format(dest_base),
+            file=sys.stderr,
         )
         return 1
     count = 0
@@ -329,7 +342,10 @@ def cmd_migrate(
             # transient Windows sharing violations (AV scans, readers).
             FilesystemStateBackend._replace(tmp, target)
         except OSError as ex:
-            print("state: failed to copy {}: {}".format(arcname, ex))
+            print(
+                "state: failed to copy {}: {}".format(arcname, ex),
+                file=sys.stderr,
+            )
             try:
                 os.unlink(tmp)
             except OSError:
@@ -657,10 +673,15 @@ def dispatch(args: Any) -> int:
         if action == "migrate-schema":
             return cmd_migrate_schema(args.config, args.dry_run)
     except ConfigError as ex:
-        print("cronstable state error: {}".format(ex))
+        # errors go to stderr, the jobcli/mcpcli/tui convention; success
+        # summaries and inventories stay on stdout for piping.
+        print("cronstable state error: {}".format(ex), file=sys.stderr)
         return 1
     except OSError as ex:
-        print("cronstable state error: {}".format(ex))
+        print("cronstable state error: {}".format(ex), file=sys.stderr)
         return 1
-    print("cronstable state: no action given (see `cronstable state --help`)")
+    print(
+        "cronstable state: no action given (see `cronstable state --help`)",
+        file=sys.stderr,
+    )
     return 2

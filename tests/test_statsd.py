@@ -72,7 +72,10 @@ async def test_job_stopped_appends_cpu_and_rss_when_resource_monitored(
     message = recorder.calls[-1][2]
     assert "app.job.stop:1|g" in message
     assert "app.job.success:1|g" in message
-    assert "app.job.cpu:1500|ms|@0.1" in message  # 1.5s -> 1500ms
+    assert "app.job.cpu:1500|ms\n" in message  # 1.5s -> 1500ms
+    # unsampled timers must carry no @rate flag: every run sends one
+    # datagram, and "@0.1" made servers weight each observation 10x
+    assert "@0.1" not in message
     assert "app.job.max_rss:1048576|g" in message
 
 

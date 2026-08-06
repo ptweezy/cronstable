@@ -89,7 +89,10 @@ permissions:
 # interpreter rather than fetching a managed one. The emulated foreign-arch
 # binary jobs stay on pip inside their `docker run` containers (uv's official
 # image is amd64/arm64 only and lacks musl ppc64le/s390x wheels) and read
-# PIP_RETRIES/PIP_TIMEOUT, forwarded into `docker run` with `-e`.
+# PIP_RETRIES/PIP_TIMEOUT, forwarded into `docker run` with `-e`. They also
+# forward PIP_CACHE_DIR, pointed at an actions/cache-persisted directory in
+# the mounted checkout, so the wheels pip compiles under QEMU carry over
+# between runs instead of being rebuilt on every push.
 env:
   PIP_RETRIES: "5"
   PIP_TIMEOUT: "60"
@@ -330,6 +333,26 @@ jobs:
           python-version: ${{ matrix.python }}
           allow-prereleases: true
       - run: pip install tox tox-uv
+      # requirements_dev.txt installs the playwright LIBRARY into the tox env,
+      # but pip cannot fetch a browser, and without one the client/daemon cron
+      # engine differential (tests/test_web_engine_parity.py) self-skips, which
+      # is why it used to run nowhere at all: the dashboard ships a SECOND
+      # implementation of the schedule dialect, and nothing compared it against
+      # the daemon's outside a dev machine where someone had run
+      # `playwright install`.
+      #
+      # Only this cell: the download is ~150 MB and the differential is
+      # platform-independent (it replays the same golden corpus through the
+      # same two engines), so a second OS or Python row buys no signal and
+      # costs a browser fetch per row. The other cells keep self-skipping.
+      # Install with the version requirements_dev.txt pins, so the build the
+      # tox env looks for is the one in the shared ms-playwright cache.
+      - name: Install Chromium for the web engine differential
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        run: |
+          set -euo pipefail
+          pip install "$(grep -E '^playwright' requirements_dev.txt)"
+          python -m playwright install --with-deps chromium
       - run: tox -e py
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
       # flag into one combined number. fail_ci_if_error stays false so a Codecov
@@ -350,9 +373,10 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
@@ -417,9 +441,10 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
@@ -526,9 +551,35 @@ jobs:
             qemu: true            # no native armv6 on the runners -> emulate
     runs-on: ${{ matrix.runner }}
     steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
+      # Persist pip's cache (otherwise lost with the runner) in the workspace,
+      # where the build container sees it at /src/.pip-cache via the bind
+      # mount and the PIP_CACHE_DIR forwarded below. pip keeps the wheels it
+      # BUILDS from sdists in this cache, so the slow QEMU compiles (uvloop,
+      # orjson's Rust build, pynacl's bundled libsodium, the musl aiohttp
+      # stack, PyInstaller's own bootloader) happen once per dependency bump
+      # instead of on every push; install_orjson.sh's plain-pip first attempt
+      # then finds the cached wheel and skips the rustup toolchain entirely.
+      # Resolution still queries the index every run, so which VERSIONS
+      # install is unchanged, and every verify script still runs against the
+      # installed result; the cache only skips re-downloading and re-compiling
+      # artifacts pip validates by hash. Keyed per arch AND libc (glibc gets
+      # its own prefix in the job below): a wheel source-built on glibc and
+      # one built on musl both carry the plain linux_<arch> tag, so a shared
+      # cache could hand one lane the other's ABI-incompatible build. The
+      # key's hashFiles covers pyproject.toml and this workflow, where the dep
+      # floors and the pyinstaller pin live; restore-keys seeds the rebuild
+      # from the previous cache when either file changes.
+      - name: Restore pip cache (QEMU-built wheels)
+        uses: actions/cache@v6.1.0
         with:
-          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+          path: .pip-cache
+          key: pip-musl-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+          restore-keys: |
+            pip-musl-${{ matrix.arch }}-
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
       # container. amd64/arm64/i686 run natively and skip this.
       - if: ${{ matrix.qemu }}
@@ -554,6 +605,7 @@ jobs:
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
             -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e PIP_CACHE_DIR=/src/.pip-cache \
             -v "$PWD:/src" -w /src \
             python:3.14-alpine sh -euc '
               # The checkout is mounted at /src, so the runner-side retry helper
@@ -650,9 +702,20 @@ jobs:
             qemu: true
     runs-on: ${{ matrix.runner }}
     steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
+      # Same persisted pip cache as binaries-musl (see that job's comment for
+      # the full story), under its own glibc prefix: source-built wheels from
+      # the two libcs share the linux_<arch> tag and must never mix.
+      - name: Restore pip cache (QEMU-built wheels)
+        uses: actions/cache@v6.1.0
         with:
-          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
+          path: .pip-cache
+          key: pip-glibc-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+          restore-keys: |
+            pip-glibc-${{ matrix.arch }}-
       - if: ${{ matrix.qemu }}
         uses: docker/setup-qemu-action@v4.2.0
       # Same retried, mirror-backstopped pull as binaries-musl: the registry
@@ -671,6 +734,7 @@ jobs:
           docker run --rm --platform ${{ matrix.platform }} \
             -e SETUPTOOLS_SCM_PRETEND_VERSION \
             -e PIP_RETRIES -e PIP_TIMEOUT \
+            -e PIP_CACHE_DIR=/src/.pip-cache \
             -v "$PWD:/src" -w /src \
             python:3.14-slim sh -euc '
               # The checkout is mounted at /src, so the runner-side retry helper
@@ -766,9 +830,10 @@ jobs:
     # The macOS 26 rows are coverage-only: never let them gate a release.
     continue-on-error: ${{ !matrix.ship }}
     steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
@@ -902,9 +967,10 @@ jobs:
       run:
         shell: bash
     steps:
+      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
+      # setuptools_scm never walks history here, and its git file-finder (which
+      # the wheel/sdist build does use) only needs the checked-out tree.
       - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0  # full history so setuptools_scm has a base (version is pinned below)
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.14'
@@ -991,9 +1057,10 @@ jobs:
             dockerfile: docker/Dockerfile.distroless
             platforms: "linux/amd64,linux/arm64"
     steps:
+      # Shallow on purpose: CI always passes the VERSION build-arg, so
+      # setuptools_scm never walks history inside the build (only a plain
+      # local `docker build .` does, and that uses the builder's own git).
       - uses: actions/checkout@v7.0.1
-        with:
-          fetch-depth: 0  # full history so setuptools_scm can resolve a version
       - uses: docker/setup-qemu-action@v4.2.0
       - uses: docker/setup-buildx-action@v4.2.0
       - name: Build image (build-only gate)
@@ -1004,8 +1071,18 @@ jobs:
           platforms: ${{ matrix.platforms }}
           push: false
           tags: cronstable:ci-${{ matrix.distro }}
+          # DEPS_REFRESH: every Dockerfile keeps its toolchain + dependency
+          # layers independent of the source tree (keyed on pyproject.toml
+          # alone), so on an ordinary commit the QEMU-expensive dependency
+          # compiles come out of the layer cache and only the project install
+          # rebuilds. On a RELEASE this arg (the run id) misses those layers
+          # on purpose: a release re-resolves every dependency fresh from the
+          # index, exactly the freshness releases had when each push rebuilt
+          # the whole builder stage, and `docker-push` below (same run, same
+          # arg) then reuses these fresh layers instead of rebuilding them.
           build-args: |
             VERSION=${{ needs.version.outputs.new }}
+            DEPS_REFRESH=${{ needs.version.outputs.release == 'true' && github.run_id || '' }}
           provenance: false
           # Scope the GHA cache per distro so the builds don't clobber each
           # other's layers (and warm the cache for the release `docker-push`).
@@ -1020,6 +1097,12 @@ jobs:
           # `not_found`, after every layer has already built successfully. A
           # branch that writes nothing still reads, falling back to the default
           # branch's entries, so the only thing given up here is the quota.
+          #
+          # The Dockerfiles' layer split (dependencies keyed on pyproject.toml,
+          # source copied only at the bottom) also calms the quota: the fat
+          # dependency layers are stable across commits, so an export mostly
+          # re-references blobs that are already stored instead of writing a
+          # fresh multi-GB set per push the way the old source-first layout did.
           #
           # ignore-error is the second line of defence. A cache export is an
           # optimization; it must never be able to red a build that succeeded.
@@ -1583,10 +1666,11 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # Shallow on purpose: the VERSION build-arg pins the version, so
+      # setuptools_scm never walks history inside the build.
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.version.outputs.new }}  # the tag `release` just pushed
-          fetch-depth: 0 # full history so setuptools_scm can resolve a version
 
       - name: Docker metadata
         id: meta
@@ -1632,8 +1716,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # DEPS_REFRESH matches the gate `docker` job's release-run value
+          # (this job only runs on releases, where the gate passed the run
+          # id), so the freshly resolved dependency layers built minutes ago
+          # in this same run are what get pushed, not older cached ones.
           build-args: |
             VERSION=${{ needs.version.outputs.new }}
+            DEPS_REFRESH=${{ github.run_id }}
           provenance: false
           # Reuse the layers the gate `docker` job just cached (same per-distro
           # scope), so this is mostly manifest assembly + push.

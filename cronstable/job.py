@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -27,7 +28,12 @@ from typing import (
 from urllib.parse import urlsplit, urlunsplit
 
 from cronstable import platform, push
-from cronstable.config import JobConfig, schedule_object_to_crontab
+from cronstable.config import (
+    ConfigError,
+    JobConfig,
+    _resolve_secret,
+    schedule_object_to_crontab,
+)
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
 
@@ -57,7 +63,11 @@ def _compiled_template(source: str) -> "jinja2.Template":
     # import statement is only reached on the first distinct template anyway.
     import jinja2
 
-    return jinja2.Template(source)
+    # assigned through a typed local because jinja2.Template.__new__ is
+    # typed Any-returning (template construction can yield a subclass), and
+    # warn_return_any would flag returning the call directly.
+    template: "jinja2.Template" = jinja2.Template(source)
+    return template
 
 
 if "HOSTNAME" not in os.environ:
@@ -452,10 +462,12 @@ class StreamReader:
         # Longest line kept, in BYTES before decoding.  Reading in chunks
         # means asyncio's own StreamReader limit no longer bounds a line
         # (that bound came from readuntil, which _read no longer calls), so
-        # the cap is enforced by hand below.  Defaulting to the stream's
-        # own limit leaves the cap exactly where it was for a caller that
-        # passes none; the daemon passes maxLineLength explicitly, which is
-        # the same number it hands the subprocess pipe.
+        # the cap is enforced by hand below.  The daemon always passes
+        # maxLineLength explicitly; the fallback is for a caller (a test, a
+        # benchmark) that passes none, and reading the stream's own limit
+        # leaves that caller's cap exactly where it was.  That limit is NOT
+        # the pipe's watermark any more: RunningJob.start pins the watermark
+        # to the read chunk size, a buffering choice rather than a line cap.
         if max_line_length is None:
             max_line_length = getattr(
                 stream, "_limit", DEFAULT_MAX_LINE_LENGTH
@@ -561,16 +573,36 @@ class StreamReader:
         save_bottom = self.save_bottom
         discarded = self.discarded_lines
         # Bytes after the last newline seen: not a line until the next
-        # chunk (or EOF) terminates it.
-        tail = b""
+        # chunk (or EOF) terminates it.  Held as the LIST of chunks that have
+        # gone by unterminated, plus their running length, and joined exactly
+        # once, when a newline finally terminates it or at EOF.  It used
+        # to be one bytes object rebuilt as `tail + chunk` per read, which
+        # made an unterminated run quadratic on the event-loop thread: with
+        # _READ_CHUNK at 64 KiB and maxLineLength defaulting to 16 MiB, a job
+        # emitting a progress bar, a binary blob or a stuck writer's output
+        # paid ~256 growing memcpys, each up to the full cap, before the
+        # over-cap drop below could even look at it.
+        tail_parts: List[bytes] = []
+        tail_len = 0
         while True:
             chunk = await stream.read(_READ_CHUNK)
             if chunk:
-                if tail:
-                    chunk = tail + chunk
+                buffered = tail_len + len(chunk)
                 parts = chunk.split(b"\n")
-                tail = parts.pop()
-                if len(chunk) > cap:
+                rest = parts.pop()
+                if parts:
+                    # a newline in this chunk terminates the carried tail:
+                    # join it onto the first segment, once.
+                    if tail_parts:
+                        parts[0] = b"".join(tail_parts) + parts[0]
+                    tail_parts = [rest]
+                    tail_len = len(rest)
+                else:
+                    # no newline at all: carry the chunk without copying
+                    # anything that came before it.
+                    tail_parts.append(rest)
+                    tail_len = buffered
+                if buffered > cap:
                     # A segment can never be longer than the buffer it was
                     # cut from, so the per-line cap check is only reachable
                     # once the buffer itself has passed the cap: one
@@ -580,8 +612,8 @@ class StreamReader:
                 # retry on Windows, never an exception (see
                 # _decode_output_line).
                 lines = [_decode_output_line(raw) + "\n" for raw in parts]
-            elif tail and not self._too_long(tail, cap):
-                lines = [_decode_output_line(tail)]
+            elif tail_len and not self._over_cap(tail_len, cap):
+                lines = [_decode_output_line(b"".join(tail_parts))]
             else:
                 lines = []
             for line in lines:
@@ -610,15 +642,22 @@ class StreamReader:
                 # already-scheduled callback then finds an empty buffer).
                 self._flush_emit_buffer()
                 return
-            if self._too_long(tail, cap):
+            if self._over_cap(tail_len, cap):
                 # An unterminated run past the cap. Drop what has piled up
                 # and keep reading: the readuntil limit cleared its buffer
-                # and carried on in exactly the same way.
-                tail = b""
+                # and carried on in exactly the same way.  Measured on the
+                # running length, so an over-cap run is dropped without ever
+                # being joined into one buffer.
+                tail_parts = []
+                tail_len = 0
 
     def _too_long(self, raw: bytes, cap: int) -> bool:
         """Whether ``raw`` breaks the line cap, warning once when it does."""
-        if len(raw) <= cap:
+        return self._over_cap(len(raw), cap)
+
+    def _over_cap(self, size: int, cap: int) -> bool:
+        """:meth:`_too_long` on a length alone, for the unjoined tail."""
+        if size <= cap:
             return False
         logger.warning("job %s: ignored a very long line", self.job_name)
         return True
@@ -683,21 +722,20 @@ class SentryReporter(Reporter):
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
         config = config["sentry"]
-        if config["dsn"]["value"]:
-            dsn = config["dsn"]["value"]
-        elif config["dsn"]["fromFile"]:
-            with open(config["dsn"]["fromFile"], "rt") as dsn_file:
-                dsn = dsn_file.read().strip()
-        elif config["dsn"]["fromEnvVar"]:
-            env_var = config["dsn"]["fromEnvVar"]
-            dsn = os.environ.get(env_var, "")
-            if not dsn:
-                logger.error(
-                    "sentry: dsn env var %r is not set; not reporting",
-                    env_var,
-                )
-                return
-        else:
+        try:
+            # One resolver for every value/fromFile/fromEnvVar triple
+            # (config._resolve_secret, shared with the cluster/push/job-API
+            # secrets): an unreadable fromFile or an unset env var is a
+            # clean skip, never a traceback out of the completion path.
+            # Its messages name the config key, not the env var name; the
+            # name is config-derived and tied to a secret, so it stays out
+            # of the logs (the rule MailReporter always had, now shared by
+            # all three reporters).
+            dsn = _resolve_secret(config["dsn"], "sentry.dsn")
+        except ConfigError as ex:
+            logger.error("sentry: %s; not reporting", ex)
+            return
+        if dsn is None:
             return  # sentry disabled: early return
 
         # Imported here, past the disabled/no-DSN early returns, so the ~130ms
@@ -759,26 +797,14 @@ class MailReporter(Reporter):
         smtp_host = mail["smtpHost"]
         smtp_port = mail["smtpPort"]
 
-        password = None  # type: Optional[str]
-        username = None  # type: Optional[str]
-
-        if mail["password"]["value"]:
-            password = mail["password"]["value"]
-        elif mail["password"]["fromFile"]:
-            with open(mail["password"]["fromFile"], "rt") as pass_file:
-                password = pass_file.read().strip()
-        elif mail["password"]["fromEnvVar"]:
-            env_var = mail["password"]["fromEnvVar"]
-            password = os.environ.get(env_var)
-            if not password:
-                # The env var *name* is config-derived and tied to a secret,
-                # so we don't echo it to the logs.
-                logger.error(
-                    "mail: password env var is not set; not sending email"
-                )
-                return
-        else:
-            password = None
+        try:
+            # Shared secret resolver; see SentryReporter for the rationale
+            # (clean skip on a bad source, env var names stay out of logs).
+            # None (no source configured) means unauthenticated SMTP.
+            password = _resolve_secret(mail["password"], "mail.password")
+        except ConfigError as ex:
+            logger.error("mail: %s; not sending email", ex)
+            return
         username = mail.get("username")
 
         tmpl_vars = job.template_vars
@@ -1057,28 +1083,134 @@ def _scrub_url_in(text: str, url: str) -> str:
     return out
 
 
+#: How long an idle webhook connection is kept in the pool waiting for the
+#: next report.  aiohttp's own default is 15 seconds, which is shorter than
+#: the gap between two runs of a minutely job: the pool would then be empty
+#: exactly when the next report arrives and every report would pay a fresh
+#: connect (and, on https, a fresh TLS handshake).  90 seconds covers
+#: minutely reporting with margin while still letting a socket to a webhook
+#: receiver go away promptly once the jobs that used it stop failing.
+WEBHOOK_KEEPALIVE_SECONDS = 90
+
+#: One connection pool per event loop for :class:`WebhookReporter`, the same
+#: shape as the pooled statsd endpoints in cronstable.statsd.  The reporter
+#: used to build its own ClientSession per report, which cost a TCP connect,
+#: a TLS handshake and an SSL context per reported run: on a fleet where every
+#: job reports, that is the dominant cost of reporting, paid on the reaper,
+#: the one loop that handles every job's completion.
+#:
+#: Weak keys match that shape but reclaim nothing: aiohttp's connector stores
+#: the loop it was built on, so the value holds its own key alive and an entry
+#: never expires by itself.  The daemon releases its pool through
+#: :func:`close_webhook_pool` on shutdown, and any other loop's is swept by
+#: :func:`_drop_dead_webhook_pools` on the next report.
+_WEBHOOK_CONNECTORS: "weakref.WeakKeyDictionary[Any, Any]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _drop_dead_webhook_pools() -> None:
+    """Release the pools of loops that have gone away.
+
+    The entries cannot expire on their own, for the reason given above the
+    dict: the value holds its own key alive.  The daemon runs one loop and
+    closes its pool on the way out, so this sweep is for processes that build
+    a loop per unit of work.  The test suite builds one per test, and every
+    loop that reported was left holding a connector and its idle sockets,
+    which aiohttp announces as an "Unclosed connector" at exit.
+
+    The async close needs a running loop, so it is no use here.  The
+    synchronous half does the transport teardown that matters, returning
+    waiters for handshakes that will never happen.  It is a private aiohttp
+    API, so a version without it degrades to merely forgetting the connector.
+
+    One pool always survives, since the loop that reported last has no later
+    report to clear it.  In the daemon that one is closed by
+    :func:`close_webhook_pool` on a graceful stop, so the leftover belongs to
+    processes that report and then exit, and it costs a line on stderr rather
+    than a socket held past the process.
+    """
+    for dead in [lp for lp in list(_WEBHOOK_CONNECTORS) if lp.is_closed()]:
+        stale = _WEBHOOK_CONNECTORS.pop(dead, None)
+        closer = getattr(stale, "_close", None)
+        if closer is None:
+            continue
+        try:
+            closer()
+        except Exception as ex:  # noqa: BLE001 - degrade, never crash
+            logger.debug("cannot close a stale webhook pool: %s", ex)
+
+
+def _webhook_connector() -> Any:
+    """The pooled connector for this loop's webhook reports."""
+    # Re-imported per call rather than passed in by the caller: past the
+    # first report this is a sys.modules hit, nothing next to the request
+    # that follows, and it keeps this helper usable without a module-scope
+    # aiohttp (WebhookReporter.report says why that import is deferred at
+    # all).
+    import aiohttp
+
+    loop = asyncio.get_running_loop()
+    _drop_dead_webhook_pools()
+    connector = _WEBHOOK_CONNECTORS.get(loop)
+    # `closed` covers the shutdown-then-report order: close_webhook_pool
+    # drops the entry, but a connector someone else closed must be replaced
+    # too rather than handed out dead, which would fail every later report.
+    if connector is None or connector.closed:
+        # limit=0 (unlimited) rather than aiohttp's default of 100.  That
+        # default is a per-connector cap, and before pooling every report
+        # built its own connector, so reports never queued on each other.
+        # One shared pool with the default would cap the whole daemon at 100
+        # webhook reports in flight across every job and every receiver, and
+        # the wait for a slot happens inside each report's own ClientTimeout:
+        # a fleet-wide burst of completions at :00 could time reports out on
+        # connection acquisition alone, and a job with a long webhook.timeout
+        # could hold a slot while short-timeout reports expire behind it.
+        connector = aiohttp.TCPConnector(
+            keepalive_timeout=WEBHOOK_KEEPALIVE_SECONDS, limit=0
+        )
+        _WEBHOOK_CONNECTORS[loop] = connector
+    return connector
+
+
+async def close_webhook_pool() -> None:
+    """Close this loop's pooled webhook connections (daemon shutdown).
+
+    Safe to call more than once and outside a loop; the next report opens a
+    fresh pool.  Without it the idle keepalive sockets are released only when
+    the loop is garbage collected, which logs aiohttp's "Unclosed connector"
+    on teardown, the same noise :func:`cronstable.statsd.close_endpoints`
+    exists to avoid.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    connector = _WEBHOOK_CONNECTORS.pop(loop, None)
+    if connector is not None:
+        # awaited, not fired and forgotten: close() shuts the transports
+        # down synchronously but returns a waiter for the TLS shutdown
+        # handshakes, and dropping that waiter unawaited earns a
+        # DeprecationWarning from aiohttp.
+        await connector.close()
+
+
 class WebhookReporter(Reporter):
     async def report(
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
         webhook = config["webhook"]
 
-        url_config = webhook["url"]
-        if url_config["value"]:
-            url = url_config["value"]
-        elif url_config["fromFile"]:
-            with open(url_config["fromFile"], "rt") as url_file:
-                url = url_file.read().strip()
-        elif url_config["fromEnvVar"]:
-            env_var = url_config["fromEnvVar"]
-            url = os.environ.get(env_var, "")
-            if not url:
-                logger.error(
-                    "webhook: url env var %r is not set; not reporting",
-                    env_var,
-                )
-                return
-        else:
+        try:
+            # Shared secret resolver; see SentryReporter for the rationale
+            # (clean skip on a bad source, env var names stay out of logs;
+            # webhook.url's secret part IS the URL, so that rule matters
+            # here most of all).
+            url = _resolve_secret(webhook["url"], "webhook.url")
+        except ConfigError as ex:
+            logger.error("webhook: %s; not reporting", ex)
+            return
+        if url is None:
             return  # webhook disabled: early return
 
         template = _compiled_template(webhook["body"])
@@ -1104,7 +1236,21 @@ class WebhookReporter(Reporter):
         # worth _report_common's traceback, not a "check webhook.url and
         # the network" line about a request that was never attempted.
         data = body.encode("utf-8")
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # A fresh session per report, over a SHARED connector: the session is
+        # bookkeeping (cookie jar, default headers, this report's timeout)
+        # and costs nothing to build, while the connector owns the sockets,
+        # the pool and the SSL context. Sharing the session instead would
+        # share its cookie jar across jobs, so a receiver that sets a cookie
+        # for one job's report would have it sent with every other job's;
+        # sharing only the connector keeps each report as isolated as it has
+        # always been. connector_owner=False so leaving this `async with`
+        # closes the session and leaves the pool open for the next report;
+        # close_webhook_pool closes the pool itself.
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=_webhook_connector(),
+            connector_owner=False,
+        ) as session:
             try:
                 async with session.request(
                     webhook["method"],
@@ -1238,6 +1384,44 @@ def report_config_enabled(report_config: Dict[str, Any]) -> bool:
     # .get, not [], so report dicts predating the push block (older
     # persisted shapes, hand-built test configs) keep working.
     return bool((report_config.get("push") or {}).get("enabled"))
+
+
+#: The key set every reporting context's ``template_vars`` exposes.
+#:
+#: A user-facing contract rather than an implementation detail: operators
+#: write mail/sentry/webhook/shell templates against these names, and
+#: wiki/Reporting.md documents them.  Three classes build the dict and have
+#: to stay key-for-key in step, so that a template written for a job run
+#: renders unchanged on an SLA breach and on a notify event:
+#: :meth:`RunningJob.template_vars` (the real values),
+#: :meth:`SlaBreachContext.template_vars` (a job that did NOT run, plus the
+#: four ``sla_*``/threshold keys) and
+#: :meth:`NotifyEventContext.template_vars` (no job at all, plus ``event``,
+#: ``subject`` and ``message``).  The values differ per context, so each
+#: still builds its own dict; listing the keys here is the single source of
+#: truth all three are checked against.  That check lives in
+#: tests/test_job.py, and it is what catches a key added to one context and
+#: forgotten in the other two: the drift is invisible at runtime, since a
+#: template referencing a missing name renders empty rather than raising.
+STANDARD_TEMPLATE_VARS = (
+    "name",
+    "success",
+    "fail_reason",
+    "stdout",
+    "stderr",
+    "exit_code",
+    "command",
+    "shell",
+    "environment",
+    "host",
+    "schedule",
+    "started_at",
+    "run_id",
+    "cpu_seconds",
+    "cpu_user_seconds",
+    "cpu_system_seconds",
+    "max_rss_bytes",
+)
 
 
 class JobRetryState:
@@ -1462,7 +1646,20 @@ class RunningJob:
                 time.perf_counter() + self.config.executionTimeout
             )
         if self.config.captureStderr or self.config.captureStdout:
-            kwargs["limit"] = self.config.maxLineLength
+            # The pipe's flow-control watermark, NOT the line cap. It used to
+            # be maxLineLength (16 MiB by default) because the reader called
+            # readuntil, which raises once a line outgrows the stream's own
+            # limit; the cap therefore had to live on the transport. The
+            # reader reads in chunks now and enforces maxLineLength by hand
+            # (see StreamReader._read), so the only thing this number still
+            # decides is how much unread output asyncio buffers per pipe
+            # before it pauses the child: at 16 MiB that was up to 32 MiB of
+            # RSS per stream per running job (asyncio pauses at twice the
+            # limit), charged to the daemon for output nobody had asked for
+            # yet. Pinned to the reader's own chunk size, so one full read is
+            # always buffered ahead and a chatty job is backpressured instead
+            # of held in the daemon's memory.
+            kwargs["limit"] = _READ_CHUNK
 
         try:
             # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
@@ -1817,6 +2014,9 @@ class RunningJob:
 
     @property
     def template_vars(self) -> dict:
+        # The reporting contract in full; SlaBreachContext and
+        # NotifyEventContext below mirror these keys, with the run-shaped
+        # ones empty. See STANDARD_TEMPLATE_VARS.
         fail_reason = self.fail_reason
         usage = self.resource_usage
         return {
@@ -1893,7 +2093,7 @@ class SlaBreachContext:
         self.stdout_discarded = 0
         self.stderr_discarded = 0
         self.resource_usage = None  # type: Optional[ResourceUsage]
-        self.env = {"HOSTNAME": os.environ.get("HOSTNAME", "")}
+        self.env = {"HOSTNAME": report_hostname()}
         # read by ShellReporter for the CRONSTABLE_SLA_* exports.
         self.sla_vars = {
             "sla_check": check,
@@ -1904,6 +2104,8 @@ class SlaBreachContext:
 
     @property
     def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus the
+        # four breach-detail keys.
         return {
             "name": self.config.name,
             "success": False,
@@ -1934,7 +2136,7 @@ class SlaBreachContext:
 async def report_sla_breach(
     ctx: SlaBreachContext, report_config: dict
 ) -> None:
-    """Fan one SLA breach out to all four reporters (the onLate hook).
+    """Fan one SLA breach out to every reporter (the onLate hook).
 
     The ``_report_common`` gather idiom with ``success=False``
     throughout: an overdue job is bad news, so MailReporter's empty-body
@@ -1990,7 +2192,7 @@ class NotifyEventContext:
     block): a DAG run failure, an approval gate awaiting a decision, or a
     leadership / quorum change; none of which is a job run.
 
-    Quacks like a :class:`RunningJob` exactly as far as the four reporters read
+    Quacks like a :class:`RunningJob` exactly as far as the reporters read
     one (a minimal :class:`_NotifyJobShim` ``config``, the run-shaped fields
     empty, and a ``template_vars`` carrying the standard key set so operator
     templates written for a job render unchanged), plus the event detail:
@@ -2029,6 +2231,8 @@ class NotifyEventContext:
 
     @property
     def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus the
+        # event detail (and whatever `fields` the event carries).
         base = {
             "name": self.config.name,
             "success": self._success,

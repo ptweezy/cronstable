@@ -366,10 +366,31 @@ OUTCOME_COLOR = {
     "skipped": "off",
 }
 
+#: Theme colour for each key :func:`health` can return, shared by the jobs
+#: table, the wallboard tiles and the job drawer header.  The
+#: :data:`OUTCOME_KEY` lesson again: three hand-rolled copies of this dict
+#: used to live inline in those panels, one drifted arm away from a job
+#: painting a different verdict per panel.
+HEALTH_COLOR = {
+    "ok": "ok",
+    "fail": "fail",
+    "run": "run",
+    "pending": "pending",
+    "disabled": "off",
+    "paused": "off",
+    "cancelled": "off",
+    "unknown": "pending",
+}
+
 #: Heatmap bucket precedence. "skipped" seeds the bucket and ranks below
 #: "ok": an hour that only ever held slots back for a pause must not shade
 #: green, but one real success in it outranks any number of holds.  An
-#: empty bucket paints a blank shade, so its seed never shows.
+#: empty bucket paints a blank shade, so its seed never shows.  One rank
+#: per key :func:`outcome_key` can return, test-enforced
+#: (tests/test_tui.py): the heatmap paint loop subscripts this map bare,
+#: so a key it had never heard of cost a ``KeyError`` every frame, the
+#: whole dashboard rather than one mis-shaded cell.  Parsing clamps such a
+#: key to "unknown" first (:meth:`AppOverlays._heat_runs`).
 HEAT_RANK = {
     "skipped": 0,
     "ok": 1,
@@ -384,6 +405,28 @@ def outcome_key(outcome: Optional[str]) -> str:
     ``skipped``, else ``ok``. Anything painting a run goes through here
     so a sixth copy of the ladder cannot drift again."""
     return OUTCOME_KEY.get(outcome or "", "ok")
+
+
+#: Theme colour for each DAG run/task state, the port of the web page's
+#: ``dstVar``.  An explicit map over dag.py's state vocabulary (plus the
+#: run-level "scheduled"), replacing a spelling-guess ladder that handled
+#: six strings the engine never emits while ``upstream_failed`` (a failure
+#: state, fail-red on the web) fell through to neutral "dim".  The web's
+#: dedicated --unknown ink has no TUI palette twin, so "dim" stands in for
+#: it and for the web's fg-faint fallback.  Coverage of dag.py's vocabulary
+#: is test-enforced (tests/test_tui.py).
+DAG_STATE_COLOR = {
+    "pending": "pending",
+    "running": "run",
+    "up_for_retry": "pending",
+    "success": "ok",
+    "failed": "fail",
+    "skipped": "off",
+    "upstream_failed": "fail",
+    "expanded": "dim",
+    "scheduled": "pending",  # run-level: created, awaiting its slot
+    "unknown": "dim",
+}
 
 
 def outcome_color(outcome: Optional[str]) -> str:
@@ -3127,17 +3170,13 @@ class App:
 
     @staticmethod
     def _dag_state_color(state: str) -> str:
-        """Theme colour key for a DAG run/task state string."""
-        low = state.lower()
-        if low in ("success", "succeeded", "done"):
-            return "ok"
-        if low in ("failed", "failure", "error"):
-            return "fail"
-        if low in ("running", "launched"):
-            return "run"
-        if low in ("awaiting", "waiting", "queued", "pending", "scheduled"):
-            return "pending"
-        return "dim"
+        """Theme colour key for a DAG run/task state string.
+
+        Reads the explicit :data:`DAG_STATE_COLOR` port of the web page's
+        ``dstVar``; anything outside the known vocabulary paints "dim",
+        matching the web's fg-faint fallback.
+        """
+        return DAG_STATE_COLOR.get(state.lower(), "dim")
 
     # ---- implemented by the mixin layers below (one concrete class,
     #      :class:`TuiApp`; the stubs keep each layer type-checkable) ----
@@ -4918,16 +4957,7 @@ class AppRender(AppKeys):
     ) -> str:
         key, label = health(job)
         ascii_mode = bool(self.prefs["ascii"])
-        color = {
-            "ok": "ok",
-            "fail": "fail",
-            "run": "run",
-            "pending": "pending",
-            "disabled": "off",
-            "paused": "off",
-            "cancelled": "off",
-            "unknown": "pending",
-        }[key]
+        color = HEALTH_COLOR[key]
         last = job.get("last_run") or {}
         cells: List[str] = []
         bg = "sel" if selected else None
@@ -5138,16 +5168,7 @@ class AppRender(AppKeys):
             chunk = shown[chunk_start : chunk_start + per_row]
             lines3: List[List[str]] = [[], [], []]
             for key, job in chunk:
-                color = {
-                    "ok": "ok",
-                    "fail": "fail",
-                    "run": "run",
-                    "pending": "pending",
-                    "disabled": "off",
-                    "paused": "off",
-                    "cancelled": "off",
-                    "unknown": "pending",
-                }[key]
+                color = HEALTH_COLOR[key]
                 last = job.get("last_run") or {}
                 name = truncate(str(job.get("name", "")), tile_w - 4)
                 head = "%s %s" % (paint.glyph(key, ascii_mode), name)
@@ -6095,6 +6116,20 @@ class AppOverlays(AppRender):
         ``.timestamp()`` per run per frame.  The cache is keyed on the run
         list object ``_load_heat`` swaps in, so it is exactly as large as
         the payload it mirrors and cannot outlive it.
+
+        The clamp to :data:`HEAT_RANK`'s vocabulary lives here rather than
+        at the two bare subscripts that read the key (``render_heat``'s
+        precedence compare and its ``OUTCOME_COLOR`` lookup): this parse
+        runs once per payload, that loop once per run per row per frame.
+        A key neither map knows can only turn up when someone grows
+        :data:`OUTCOME_KEY` an arm and misses a downstream map, and in the
+        loop that miss is a ``KeyError`` every frame; one cell in the wrong
+        shade is the cheaper failure, so an unheard-of key lands in
+        "unknown", which every downstream map already carries.  The clamp
+        is a fallback, not the guard: a parity test (tests/test_tui.py)
+        fails the build the moment HEAT_RANK drifts from what
+        ``outcome_key`` can return, so nobody has to find the drift by
+        spotting a grey cell.
         """
         runs = self.heat_data.get(name) or []
         cached = self._heat_parsed.get(name)
@@ -6112,9 +6147,8 @@ class AppOverlays(AppRender):
         for run in runs:
             epoch = parse_iso(run.get("finished_at"))
             if epoch is not None:
-                parsed.append(
-                    (epoch, outcome_key(str(run.get("outcome", ""))))
-                )
+                key = outcome_key(str(run.get("outcome", "")))
+                parsed.append((epoch, key if key in HEAT_RANK else "unknown"))
         self._heat_parsed[name] = (runs, parsed)
         return parsed
 
@@ -6548,16 +6582,7 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         key, label = health(job) if job else ("unknown", "?")
-        color = {
-            "ok": "ok",
-            "fail": "fail",
-            "run": "run",
-            "pending": "pending",
-            "disabled": "off",
-            "paused": "off",
-            "cancelled": "off",
-            "unknown": "pending",
-        }[key]
+        color = HEALTH_COLOR[key]
         ascii_mode = bool(self.prefs["ascii"])
         rows = [
             " "

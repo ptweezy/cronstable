@@ -27,9 +27,17 @@
   "recorded here are the developer-machine measurements the proposals were",
   "derived from (max ~= 1.7x local, the same headroom the armed ceilings",
   "carry) and exist only to make the later sizing decision auditable.  They",
-  "were taken on the post-audit tree, so they already price in the fixes."
+  "were taken on the post-audit tree, so they already price in the fixes.",
+  "",
+  "config.parse_yaml_3k is there for more than drift: it catches a return",
+  "of the quadratic Seq validation, which cost 6.27s locally at 3k jobs",
+  "against 1.18s linear.  Its 2.0s ceiling is the usual ~1.7x of the local",
+  "figure and sits far under that 6.27s, so the absolute check fires on a",
+  "reintroduction even if the relative gate is waived.  Raising it past",
+  "~3s gives that up, so say why in the commit message if you ever do."
  ],
  "proposed": {
+  "config.parse_yaml_3k": {"max": 2.0, "unit": "s", "local": 1.176},
   "config.reload_gc_100k": {"max": 2.2, "unit": "s", "local": 1.305},
   "mem.gc_pause_100k": {"max": 0.11, "unit": "s", "local": 0.065},
   "loop.idle_wake_rate": {"max": 0.045, "unit": "s", "local": 0.0266},
