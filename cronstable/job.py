@@ -1071,21 +1071,55 @@ def _drop_dead_webhook_pools() -> None:
     waiters for handshakes that will never happen.  It is a private aiohttp
     API, so a version without it degrades to merely forgetting the connector.
 
-    One pool always survives, since the loop that reported last has no later
-    report to clear it.  In the daemon that one is closed by
-    :func:`close_webhook_pool` on a graceful stop, so the leftover belongs to
-    processes that report and then exit, and it costs a line on stderr rather
-    than a socket held past the process.
+    One pool would otherwise always survive, since the loop that reported
+    last has no later report to clear it.  In the daemon that one is closed
+    by :func:`close_webhook_pool` on a graceful stop; for processes that
+    report and then exit (the test suite, an embedder, a one-shot script)
+    :func:`_close_webhook_pools_atexit` sweeps whatever is left, so pooling
+    does not trade per-report connector churn for an "Unclosed connector"
+    line the un-pooled code never printed.
     """
     for dead in [lp for lp in list(_WEBHOOK_CONNECTORS) if lp.is_closed()]:
-        stale = _WEBHOOK_CONNECTORS.pop(dead, None)
-        closer = getattr(stale, "_close", None)
-        if closer is None:
-            continue
+        _sync_close_webhook_pool(_WEBHOOK_CONNECTORS.pop(dead, None))
+
+
+def _sync_close_webhook_pool(stale: Any) -> None:
+    """Tear a connector's transports down without a running loop.
+
+    ``close()`` is a coroutine and needs a loop, which neither the dead-loop
+    sweep nor the interpreter-exit hook has.  The private synchronous half
+    does the part that matters (closing the transports and returning the
+    waiters for handshakes that will never happen); a version of aiohttp
+    without it degrades to merely forgetting the connector, which is what
+    the code did before this existed.
+    """
+    closer = getattr(stale, "_close", None)
+    if closer is None:
+        return
+    try:
+        closer()
+    except Exception as ex:  # noqa: BLE001 - degrade, never crash
+        logger.debug("cannot close a stale webhook pool: %s", ex)
+
+
+@atexit.register
+def _close_webhook_pools_atexit() -> None:
+    """Release every webhook pool still held at interpreter exit.
+
+    The backstop for the last loop's pool, which no later report can sweep
+    and no :func:`close_webhook_pool` reaches in a process that never shuts
+    the daemon down gracefully.  Registered rather than left to the garbage
+    collector because that is precisely what emits aiohttp's "Unclosed
+    connector" warning: the object is collected during interpreter teardown
+    with its transports still open.  Runs before that teardown, so the
+    sockets are released and the warning has nothing to report.
+    """
+    while _WEBHOOK_CONNECTORS:
         try:
-            closer()
-        except Exception as ex:  # noqa: BLE001 - degrade, never crash
-            logger.debug("cannot close a stale webhook pool: %s", ex)
+            _, stale = _WEBHOOK_CONNECTORS.popitem()
+        except KeyError:  # pragma: no cover - emptied under us
+            return
+        _sync_close_webhook_pool(stale)
 
 
 def _webhook_connector() -> Any:

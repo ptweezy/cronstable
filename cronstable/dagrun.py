@@ -756,11 +756,16 @@ class DagScheduler:
     ) -> None:
         """Create ``dagcfg``'s catch-up runs after its jitter offset.
 
-        The dag twin of ``Cron._run_catch_up``'s deferred start.  The dag
-        is re-checked after the sleep: a reload can remove or disable it
-        while the offset elapses, and a replay for a dag that is gone must
-        not write fresh run documents.  (A backend swap cancels this task
-        outright, see :meth:`forget`.)
+        The dag twin of ``Cron._run_catch_up``'s deferred start.  The dag is
+        re-read after the sleep, and the run documents are materialised from
+        THAT object, not the one captured when the offset was scheduled: a
+        reload during the offset can remove the dag or disable it (either
+        way there is nothing to replay), and it can equally well rewrite the
+        task graph, in which case creating from the captured config would
+        seed runs against a spec the daemon no longer has.  The missed
+        INSTANTS still come from the original computation, which is correct:
+        the schedule they were derived from is what was actually missed.
+        (A backend swap cancels this task outright, see :meth:`forget`.)
         """
         try:
             await asyncio.sleep(offset)
@@ -768,7 +773,7 @@ class DagScheduler:
             if current is None or not current.enabled:
                 return
             for when in targets:
-                await self._create_run(dagcfg, when, "catchup")
+                await self._create_run(current, when, "catchup")
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - per-dag isolation, like the seed

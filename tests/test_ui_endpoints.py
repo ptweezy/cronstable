@@ -20,8 +20,10 @@ from aiohttp import web
 
 from cronstable.config import ConfigError
 from cronstable.cron import (
+    ApiActionError,
     Cron,
     JobRunInfo,
+    _http_for_action_error,
     _job_run_info_from_dict,
     _run_stats,
 )
@@ -1589,6 +1591,27 @@ def test_sse_protocol_headers_win_over_operator_overrides():
                 "x-accel-buffering": "X-Accel-Buffering",
             }[name]
         ]
+
+
+@pytest.mark.parametrize("spelling", ["Content-Type", "content-type"])
+def test_api_error_survives_a_web_headers_content_type(spelling):
+    # The same rule as the SSE tails above, on the error envelope. aiohttp
+    # REFUSES content_type= outright when the headers mapping already carries
+    # a Content-Type, so leaving an operator's spelling in place turned the
+    # one error path that carries these headers (the start/cancel 409) into a
+    # 500 instead of the conflict the caller asked about.
+    ex = ApiActionError("job x is disabled")
+    ex.status = 409
+    resp = _http_for_action_error(
+        ex, {spelling: "text/plain", "X-Custom": "yes"}
+    )
+    assert resp.status == 409
+    assert json.loads(resp.text) == {"error": "job x is disabled"}
+    assert resp.headers["X-Custom"] == "yes"  # non-protocol headers ride
+    assert [k for k in resp.headers if k.lower() == "content-type"] == [
+        "Content-Type"
+    ]
+    assert resp.headers["Content-Type"].startswith("application/json")
 
 
 # ---------------------------------------------------------------------------

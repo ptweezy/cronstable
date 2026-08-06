@@ -19,6 +19,7 @@ over the loopback endpoint.
 """
 
 import asyncio
+import copy
 import datetime
 import json
 import logging
@@ -2123,6 +2124,48 @@ async def test_deferred_catch_up_skips_a_dag_removed_meanwhile(
         cron.cron_dags["cu"] = dagcfg  # restore so list_runs resolves
         runs = await cron._dag.list_runs("cu", limit=10)
         assert [r["kind"] for r in runs].count("catchup") == 0
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_replays_the_reloaded_dag(
+    tmp_path, monkeypatch
+):
+    # A reload during the jitter offset can rewrite the graph as well as
+    # remove the dag. The replay re-reads the dag after the sleep and
+    # materialises runs from THAT object, so it cannot seed runs against a
+    # spec the daemon no longer has. The missed instants still come from the
+    # original computation: that is the schedule that was actually missed.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+
+        seen = []
+        real_create = cron._dag._create_run
+
+        async def spy_create(cfg, when, kind):
+            seen.append(cfg)
+            return await real_create(cfg, when, kind)
+
+        monkeypatch.setattr(cron._dag, "_create_run", spy_create)
+        # as a reload swapping the definition would
+        replacement = copy.copy(dagcfg)  # a distinct object, same definition
+        cron.cron_dags["cu"] = replacement
+        await asyncio.gather(*cron._dag._catchup_tasks)
+
+        assert seen  # the replay did run
+        assert all(cfg is replacement for cfg in seen)
+        assert not any(cfg is dagcfg for cfg in seen)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
     finally:
         await _teardown(cron)
 
