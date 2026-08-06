@@ -80,6 +80,21 @@ APPROVAL_POLL_INTERVAL = 5.0
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
 
+# Durable checkpoint stream for a dag's catch-up cycles, the dag twin of the
+# job engine's ``catchup/<job>`` stream (cron.CATCHUP_STREAM_PREFIX; a
+# distinct prefix because dag and job names would otherwise share one stream
+# namespace).  An ``open`` record persists the owed watermark BEFORE the
+# jitter sleeper is spawned: the replay targets live only in task memory
+# across the sleep, while the scheduled path (and _fire_past_gap's
+# current-slot create) keeps landing NEWER run documents, so a restart
+# mid-jitter would otherwise recompute "nothing missed" from the advanced
+# document watermark and the backfill would vanish without a log line.  The
+# boot-time _catch_up hoists its watermark back to an open checkpoint's,
+# exactly as Cron._missed_occurrences does.  Keep depth mirrors
+# cron.CATCHUP_STREAM_KEEP.
+DAG_CATCHUP_STREAM_PREFIX = "catchup-dag/"
+DAG_CATCHUP_STREAM_KEEP = 8
+
 # The furthest back _fire_forward will retroactively replay occurrence by
 # occurrence, mirroring cron.CATCHUP_LIMIT for jobs: a gap within this bound
 # is tick overhead (a slow advance pass, many simultaneous fires) and every
@@ -687,8 +702,21 @@ class DagScheduler:
     async def _catch_up(self, dagcfg: Any, now_dt: datetime.datetime) -> None:
         sched = dagcfg.schedule_job
         after = await self._durable_watermark(dagcfg)
+        # Hoist back to an open checkpoint's (older) watermark when a
+        # previous deferred replay never closed (a restart mid-jitter, here
+        # or on a crashed node): ordinary scheduled fires landing after that
+        # cycle opened have advanced the document-derived watermark past the
+        # still-unreplayed slots.  Mirrors Cron._missed_occurrences.
+        pending = await self._pending_catchup_watermark(dagcfg.name)
+        pending_dt = _parse_iso(pending) if pending else None
+        if pending_dt is not None and (after is None or pending_dt < after):
+            after = pending_dt
         if after is None:
             return  # never ran: nothing missed to replay
+        # The cycle's reference watermark: pre-deadline-cutoff, like the job
+        # engine's (the cutoff moves with the clock, so recomputation on
+        # resume re-applies it against the resume-time now).
+        watermark = after.isoformat()
         deadline = sched.startingDeadlineSeconds
         if deadline:
             cutoff = now_dt - datetime.timedelta(seconds=deadline)
@@ -702,6 +730,11 @@ class DagScheduler:
             missed.append(nxt)
             nxt = self._next_fire(sched, nxt)
         if not missed:
+            if pending is not None:
+                # the open cycle was covered meanwhile (another node, or the
+                # deadline expired the slots): close it so restarts stop
+                # resuming it.
+                await self._checkpoint_catchup(dagcfg.name, "close", watermark)
             return
         targets = missed[-1:] if sched.onMissed == "run-once" else missed
         if (
@@ -736,14 +769,26 @@ class DagScheduler:
             " after a %.1fs jitter offset" % offset if offset > 0 else "",
         )
         if offset <= 0:
+            # Inline, on the service pass: no checkpoint needed for a fresh
+            # cycle (creates ascend, so a crash mid-loop leaves the document
+            # watermark at the last created target and the next boot's
+            # recompute covers the remainder), but a RESUMED cycle must
+            # close its checkpoint once the targets have all landed.
             for when in targets:
                 await self._create_run(dagcfg, when, "catchup")
+            if pending is not None:
+                await self._checkpoint_catchup(dagcfg.name, "close", watermark)
             return
         # Deferred on a spawned task, like Cron._run_catch_up: the seed and
         # gap-resume paths run on the service pass, which walks every dag
         # serially and must not sleep out one dag's offset inline.
+        # Checkpoint the intent BEFORE spawning the sleeper (the job twin's
+        # rule, cron._evaluate_catch_up): a crash/restart mid-jitter then
+        # resumes from `watermark` instead of losing the owed slots to the
+        # advancing run-document ledger.
+        await self._checkpoint_catchup(dagcfg.name, "open", watermark)
         task = asyncio.create_task(
-            self._replay_catch_up(dagcfg, targets, offset)
+            self._replay_catch_up(dagcfg, targets, offset, watermark)
         )
         self._catchup_tasks.add(task)
         task.add_done_callback(self._catchup_tasks.discard)
@@ -753,27 +798,56 @@ class DagScheduler:
         dagcfg: Any,
         targets: List[datetime.datetime],
         offset: float,
+        watermark: str,
     ) -> None:
         """Create ``dagcfg``'s catch-up runs after its jitter offset.
 
         The dag twin of ``Cron._run_catch_up``'s deferred start.  The dag is
-        re-read after the sleep, and the run documents are materialised from
-        THAT object, not the one captured when the offset was scheduled: a
-        reload during the offset can remove the dag or disable it (either
-        way there is nothing to replay), and it can equally well rewrite the
-        task graph, in which case creating from the captured config would
-        seed runs against a spec the daemon no longer has.  The missed
-        INSTANTS still come from the original computation, which is correct:
-        the schedule they were derived from is what was actually missed.
+        re-read after the sleep and REVALIDATED like the job twin: a reload
+        during the offset can remove or disable the dag, drop its schedule,
+        or flip ``onMissed`` to ``skip`` (the operator saying "do not
+        backfill"), and cluster ownership can move, in which case the new
+        owner resumes from the open checkpoint and creating here too would
+        double-run the backfill.  The run documents are materialised from
+        the re-read object, not the one captured when the offset was
+        scheduled: a reload can equally well rewrite the task graph, and
+        creating from the captured config would seed runs against a spec the
+        daemon no longer has.  The missed INSTANTS still come from the
+        original computation, which is correct: the schedule they were
+        derived from is what was actually missed.  The cycle's checkpoint is
+        closed only after the last ``_create_run`` lands; every early return
+        leaves it open on purpose, so a restart (or the new owner, or a
+        re-enable) resumes the still-owed slots instead of losing them.
         (A backend swap cancels this task outright, see :meth:`forget`.)
         """
         try:
             await asyncio.sleep(offset)
             current = self._dags().get(dagcfg.name)
-            if current is None or not current.enabled:
+            sched = current.schedule_job if current is not None else None
+            if (
+                current is None
+                or not current.enabled
+                or sched is None
+                or sched.onMissed == "skip"
+                or not isinstance(sched.schedule, CronTab)
+            ):
+                logger.info(
+                    "dag %s: removed or disabled during its catch-up jitter "
+                    "window; dropping the backfill",
+                    dagcfg.name,
+                )
+                return
+            if not self._cron._cluster_allows(sched):
+                logger.info(
+                    "dag %s: ownership moved during its catch-up jitter "
+                    "window; leaving the backfill to the new owner (which "
+                    "resumes from the open checkpoint)",
+                    dagcfg.name,
+                )
                 return
             for when in targets:
                 await self._create_run(current, when, "catchup")
+            await self._checkpoint_catchup(dagcfg.name, "close", watermark)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - per-dag isolation, like the seed
@@ -798,6 +872,73 @@ class DagScheduler:
             if when is not None and (latest is None or when > latest):
                 latest = when
         return latest
+
+    @staticmethod
+    def _catchup_stream(dag_name: str) -> str:
+        """The durable checkpoint stream for a dag's catch-up cycles."""
+        return DAG_CATCHUP_STREAM_PREFIX + dag_name
+
+    async def _pending_catchup_watermark(self, dag_name: str) -> Optional[str]:
+        """The watermark of an unfinished backfill cycle, if one is open.
+
+        The dag twin of ``Cron._pending_catchup_watermark``: an ``open``
+        without a following ``close`` means a previous deferred replay (here
+        or on a crashed node) never completed, and catch-up should resume
+        from ITS watermark rather than the run documents': scheduled fires
+        landing after that boot advanced the derived watermark past the
+        still-unreplayed slots.
+        """
+        backend = self._backend()
+        if backend is None:
+            return None
+        recs = await asyncio.wait_for(
+            backend.list_records(
+                self._catchup_stream(dag_name), limit=1, newest_first=True
+            ),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        if recs and recs[0].get("kind") == "open":
+            watermark = recs[0].get("watermark")
+            if isinstance(watermark, str) and watermark:
+                return watermark
+        return None
+
+    async def _checkpoint_catchup(
+        self, dag_name: str, kind: str, watermark: str
+    ) -> None:
+        """Append an ``open``/``close`` catch-up checkpoint (best-effort).
+
+        The dag twin of ``Cron._checkpoint_catchup``, with the same
+        contract: a failure to checkpoint must never block the backfill
+        itself (it only costs crash-resume fidelity, which is logged), and
+        the stream is at-least-once by design; a resumed cycle merely
+        re-creates run documents the create-if-absent dedup already has.
+        """
+        backend = self._backend()
+        if backend is None:
+            return
+        record = {
+            "kind": kind,
+            "watermark": watermark,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        try:
+            await asyncio.wait_for(
+                backend.append_record(
+                    self._catchup_stream(dag_name),
+                    record,
+                    prune_keep=DAG_CATCHUP_STREAM_KEEP,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except Exception as ex:  # noqa: BLE001 - checkpoint is best-effort
+            logger.warning(
+                "dag %s: could not checkpoint catch-up %r (%s); a restart "
+                "mid-backfill may not resume it",
+                dag_name,
+                kind,
+                ex,
+            )
 
     async def _create_run(
         self, dagcfg: Any, logical_dt: datetime.datetime, kind: str

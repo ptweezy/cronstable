@@ -11,16 +11,25 @@ project, on which cronstable is based.
   spread plain-job backfills: the same deterministic per-name offset,
   slept out on a spawned task so one dag's spread never stalls the
   scheduler pass. The key was accepted and validated on dag schedules but
-  silently never applied.
+  silently never applied. The deferred replay also checkpoints the
+  watermark it owes (a `catchup-dag/<dag>` stream, the twin of the job
+  engine's `catchup/<job>`) before the sleeper spawns and closes the
+  cycle after the last run document lands. A restart during the offset
+  used to lose the backfill to run documents created meanwhile; now it
+  resumes from the checkpoint. And after the sleep the replay re-checks
+  `onMissed`, the schedule type, and cluster ownership, as the job
+  backfill always has.
 - Every 4xx and 5xx body the web API serves is now one JSON envelope,
   `{"error": "<reason>"}`, across the job, DAG, schedule, state, and push
-  routes alike (the auth middleware's 401 stays bodyless). Previously the
-  body was JSON on some handler families, plain text on others, and empty
-  on a few, so a client had to sniff per endpoint. The envelope's own
-  content type wins over a `web.headers` one in any spelling, the rule
-  `/metrics` and the live tails already followed; a deployment that set a
-  content type there would otherwise have seen the start/cancel 409 come
-  back as a 500.
+  routes alike, including the auth middleware's 401 and the router's own
+  405 (wrong method) and 404 (unmatched path). Previously the body was
+  JSON on some handler families, plain text on others, and empty on a
+  few, so a client had to sniff per endpoint. The envelope's own content
+  type wins over a `web.headers` one in any spelling, the rule `/metrics`
+  and the live tails already followed, and every other endpoint now keeps
+  its own content type the same way, whether it serves JSON, the
+  dashboard page, or a calendar feed. A deployment that set a content
+  type there used to see those routes come back as 500s.
 - `GET /metrics` shares one build across the scrapers that arrive while it
   is rendering, instead of only across those that arrive after it finishes.
   On a large job set the render runs on a worker thread, and every scraper
@@ -316,8 +325,8 @@ project, on which cronstable is based.
   dedicated thread with a bounded queue. The write used to run on the
   event loop, so a consumer that stopped reading (a stopped
   `docker logs`, a suspended console) froze the entire daemon; now it
-  wedges only the mirror, which sheds oldest batches until the consumer
-  drains.
+  wedges only the mirror, which sheds its oldest batches (the queue is
+  bounded in both count and bytes) until the consumer drains.
 - Dashboard: the header mark's glow is applied per drawn primitive
   instead of on the whole svg, whose animated geometry forced a
   near-half-viewport filter re-raster every frame; the per-second

@@ -4326,6 +4326,83 @@ async def test_web_app_ui_path_public_but_data_paths_require_auth():
 
 
 @pytest.mark.asyncio
+async def test_web_json_endpoints_tolerate_operator_content_type():
+    # aiohttp refuses content_type= when the headers mapping already
+    # carries a Content-Type, so an operator-configured web.headers
+    # Content-Type used to 500 every route built by _json_response,
+    # _cachable_json_response, and the /fleet inline constructor.  The
+    # endpoint's own Content-Type wins, in any spelling (the _api_error
+    # rule).
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "headers": {"content-type": "text/plain; charset=utf-8"},
+            "ui": True,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        expected = {
+            "/jobs": "application/json",
+            "/fleet": "application/json",
+            "/cluster": "application/json",
+            "/dags": "application/json",
+            "/": "text/html",
+            "/calendar.ics": "text/calendar",
+        }
+        async with aiohttp.ClientSession() as session:
+            for path, ctype in expected.items():
+                async with session.get(base + path) as resp:
+                    assert resp.status == 200, path
+                    assert resp.content_type == ctype, path
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+@pytest.mark.asyncio
+async def test_web_errors_carry_the_json_envelope():
+    # every error body is one JSON envelope, including the three families
+    # that used to escape as aiohttp's text/plain defaults: the auth
+    # middleware's 401, the router's 404 on an unmatched path, and the
+    # router's 405 on a wrong method (whose Allow header must survive the
+    # rewrap).
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+            "ui": False,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        auth = {"Authorization": "Bearer secret"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 401
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+            async with session.get(base + "/no-such-route", headers=auth) as resp:
+                assert resp.status == 404
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+            async with session.delete(base + "/jobs", headers=auth) as resp:
+                assert resp.status == 405
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+                assert "GET" in resp.headers.get("Allow", "")
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+@pytest.mark.asyncio
 async def test_web_app_restarts_on_config_change(monkeypatch):
     # changing the web config replaces the running server with a new one;
     # clearing it stops the server entirely. web_site_from_url is faked so no

@@ -82,7 +82,7 @@ from cronstable.croninfo import (
     suggest_slot,
     why_no_run,
 )
-from cronstable.dagrun import DagScheduler
+from cronstable.dagrun import DAG_CATCHUP_STREAM_PREFIX, DagScheduler
 from cronstable.fingerprint import job_digest_cached, job_set_id
 from cronstable.ical import CalendarEntry, render_calendar
 from cronstable.job import (
@@ -698,10 +698,12 @@ def _error_body(message: str) -> str:
 
     Every 4xx/5xx body this origin serves carries it (the raise-style
     handlers via :func:`_api_error`, the return-style ones via
-    ``_json_response({"error": ...})``), matching the jobapi and MCP
+    ``_json_response({"error": ...})``, and everything that escapes as a
+    default text/plain body, bare-404 raises and the auth middleware's 401s
+    and the router's own 404/405 included, via
+    :func:`_error_envelope_middleware`), matching the jobapi and MCP
     surfaces, so a client parses failures one way instead of sniffing
-    text/plain per handler.  The auth middleware's bare 401 stays bodyless
-    by design.
+    text/plain per handler.
     """
     return json.dumps({"error": message})
 
@@ -755,6 +757,39 @@ def _http_for_action_error(
     }
     factory = status_map.get(ex.status, web.HTTPBadRequest)
     return _api_error(factory, ex.message, headers)
+
+
+@web.middleware
+async def _error_envelope_middleware(request, handler):
+    """Give every escaping HTTP error the one JSON envelope.
+
+    The raise-style handlers wrap their errors via :func:`_api_error`, but
+    three families used to escape as aiohttp's default text/plain bodies:
+    the handlers' bare ``HTTPNotFound()`` raises, the auth middleware's
+    401s, and the router's own errors (405 on a wrong method, 404 on an
+    unmatched path).  Each falsified the documented "every error body is
+    one JSON envelope" contract, so a client had to sniff text/plain per
+    handler after all.  Installed outermost, so it sees them all.  An error
+    already carrying the envelope passes through untouched, and headers the
+    error legitimately owns (a 405's ``Allow``) are preserved; only the
+    body-describing pair is replaced along with the body.
+    """
+    try:
+        return await handler(request)
+    except web.HTTPException as ex:
+        if ex.status < 400 or ex.content_type == "application/json":
+            raise
+        headers = {
+            key: value
+            for key, value in ex.headers.items()
+            if key.lower() not in ("content-type", "content-length")
+        }
+        return web.Response(
+            text=_error_body(ex.text or ex.reason),
+            status=ex.status,
+            headers=headers,
+            content_type="application/json",
+        )
 
 
 # Defense-in-depth security headers for the dashboard HTML document. The
@@ -1189,11 +1224,23 @@ def _json_response(
     ``orjson.dumps`` itself and still falls back; the stdlib flavour keeps
     ``allow_nan=False`` and raises a bare ``ValueError``, which is why the
     except clause is wider than ``UnsupportedValue``.
+
+    The endpoint's own Content-Type wins over an operator-configured
+    ``web.headers`` one, in ANY spelling: the :func:`_api_error` rule.
+    aiohttp refuses ``content_type=`` outright when the headers mapping
+    already carries a Content-Type, so without the strip a deployment that
+    sets one turned every JSON data endpoint into a 500.
     """
     try:
         body = _json.dumps_bytes(payload, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
+    if headers is not None:
+        headers = {
+            key: value
+            for key, value in dict(headers).items()
+            if key.lower() != "content-type"
+        }
     return web.Response(
         body=body,
         status=status,
@@ -1425,7 +1472,18 @@ def _cachable_json_response(
         body = _json.dumps_bytes(payload, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
-    hdrs: Dict[str, str] = dict(headers) if headers else {}
+    # the endpoint's own Content-Type wins over an operator-configured one,
+    # in any spelling: the _json_response/_api_error rule (aiohttp refuses
+    # content_type= when the mapping already carries a Content-Type).
+    hdrs: Dict[str, str] = (
+        {
+            key: value
+            for key, value in dict(headers).items()
+            if key.lower() != "content-type"
+        }
+        if headers
+        else {}
+    )
     hdrs["Vary"] = "Accept-Encoding"
     if use_etag:
         etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
@@ -2972,7 +3030,18 @@ class Cron:
             self._fleet_response_cache = cache
         _mono, etag, body, gz = cache
         base = self._web_headers()
-        headers: Dict[str, str] = dict(base) if base else {}
+        # the endpoint's own Content-Type wins over an operator-configured
+        # one, in any spelling: the _json_response/_api_error rule (aiohttp
+        # refuses content_type= when the mapping already carries one).
+        headers: Dict[str, str] = (
+            {
+                key: value
+                for key, value in dict(base).items()
+                if key.lower() != "content-type"
+            }
+            if base
+            else {}
+        )
         headers["ETag"] = etag
         # on EVERY representation, compressed or not: a shared cache that
         # missed this would hand a gzipped body to a client that cannot read
@@ -4286,7 +4355,16 @@ class Cron:
                 self.calendar_payload, name, days, per_job, entries=entries
             ),
         )
-        headers = dict(self.web_config.get("headers") or {})
+        # minus any operator-configured Content-Type, in any spelling: the
+        # feed's own wins (the _json_response/_api_error rule; aiohttp
+        # refuses content_type= when the mapping already carries one).
+        headers = {
+            key: value
+            for key, value in dict(
+                self.web_config.get("headers") or {}
+            ).items()
+            if key.lower() != "content-type"
+        }
         headers["Content-Disposition"] = 'inline; filename="cronstable.ics"'
         return web.Response(
             text=text,
@@ -5245,7 +5323,14 @@ class Cron:
     async def _web_index(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         raw, etag = _index_document()
-        headers = self._security_headers()
+        # minus any operator-configured Content-Type, in any spelling: the
+        # page's own wins (the _json_response/_api_error rule; aiohttp
+        # refuses content_type= when the mapping already carries one).
+        headers = {
+            key: value
+            for key, value in self._security_headers().items()
+            if key.lower() != "content-type"
+        }
         # a validator a cache or proxy can revalidate against; stable for the
         # life of the process, since the document is package data.
         headers["ETag"] = etag
@@ -5696,10 +5781,23 @@ class Cron:
         self._fleet_response_cache = None
 
     def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
-        """The configured web response headers plus the ``/jobs`` ETag."""
+        """The configured web response headers plus the ``/jobs`` ETag.
+
+        Minus any operator-configured Content-Type, in any spelling: the
+        endpoint's own wins (the _json_response/_api_error rule; aiohttp
+        refuses ``content_type=`` when the mapping already carries one).
+        """
         assert self.web_config is not None
         base = self._web_headers()
-        headers: Dict[str, str] = dict(base) if base else {}
+        headers: Dict[str, str] = (
+            {
+                key: value
+                for key, value in dict(base).items()
+                if key.lower() != "content-type"
+            }
+            if base
+            else {}
+        )
         headers["ETag"] = etag
         return headers
 
@@ -6682,7 +6780,10 @@ class Cron:
         if start_wanted and not tls_failed and web_config is not None:
             ui_enabled = web_config.get("ui", True)
             metrics_config = resolve_metrics_config(web_config)
-            middlewares = []
+            # Envelope first, so it is outermost and wraps the errors the
+            # origin/auth middlewares below raise as well as the router's
+            # own 404/405 (see _error_envelope_middleware).
+            middlewares = [_error_envelope_middleware]
             # Cross-site request defense for the mutating endpoints, ALWAYS
             # installed: with authToken unset this is the only thing between
             # a localhost-bound daemon and any web page the operator visits
@@ -7938,6 +8039,9 @@ class Cron:
             INFLIGHT_STREAM_PREFIX: names,
             SLOT_STREAM_PREFIX: names,
             PAUSE_STREAM_PREFIX: pause_keep,
+            # the dag catch-up checkpoint streams age out with their dag,
+            # exactly as a removed job's catchup/<job> stream does above.
+            DAG_CATCHUP_STREAM_PREFIX: live_dags,
             # a host that stops writing (scaled down, renamed) leaves its own
             # manifests/<host> stream behind forever otherwise; sweeping it
             # once it is not among the currently-seen hosts and has aged past

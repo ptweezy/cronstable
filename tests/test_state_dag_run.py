@@ -2170,6 +2170,104 @@ async def test_deferred_catch_up_replays_the_reloaded_dag(
         await _teardown(cron)
 
 
+async def test_deferred_catch_up_checkpoint_survives_a_restart(
+    tmp_path, monkeypatch
+):
+    # The replay targets live only in task memory across the jitter sleep
+    # while the scheduled path keeps landing NEWER run documents.  A restart
+    # mid-sleep used to recompute "nothing missed" from the advanced
+    # document watermark and silently lose the whole backfill; the open
+    # checkpoint (written BEFORE the sleeper spawns, like the job engine's)
+    # now pins the owed watermark durably, and the next boot's catch-up
+    # hoists back to it.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron,
+            "_catchup_offset",
+            staticmethod(lambda name, jitter: 3600.0 if jitter else 0.0),
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        # the intent is durable before the sleeper has done anything
+        assert await cron._dag._pending_catchup_watermark("cu") is not None
+        # the restart: the sleeper dies mid-jitter...
+        for task in list(cron._dag._catchup_tasks):
+            task.cancel()
+        await asyncio.gather(
+            *cron._dag._catchup_tasks, return_exceptions=True
+        )
+        cron._dag._catchup_tasks.clear()
+        # ...and a scheduled fire leapfrogs the un-replayed slots, advancing
+        # the document-derived watermark past them
+        leap = datetime.datetime(2026, 1, 1, 4, 0, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, leap, "scheduled")
+        # next boot, no jitter: the recompute must resume from the
+        # checkpoint, not trust the leapfrogged document watermark
+        dagcfg.schedule_job.catchupJitterSeconds = 0
+        await cron._dag._catch_up(
+            dagcfg, datetime.datetime(2026, 1, 1, 4, 30, tzinfo=_UTC)
+        )
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+        # the resumed cycle closed its checkpoint: nothing left to resume
+        assert await cron._dag._pending_catchup_watermark("cu") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_closes_its_checkpoint(tmp_path, monkeypatch):
+    # a replay that runs to completion must close the cycle it opened, or
+    # every later boot would re-walk (and re-dedup) the same slots forever.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+        assert await cron._dag._pending_catchup_watermark("cu") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_honours_onmissed_flipped_to_skip(
+    tmp_path, monkeypatch
+):
+    # a reload can flip onMissed to "skip" (the operator saying "do not
+    # backfill") while the jitter elapses; the old revalidation checked only
+    # removed/disabled, so the replay fired anyway.  The job twin has always
+    # dropped here (Cron._run_catch_up); the dag replay must too.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        dagcfg.schedule_job.onMissed = "skip"  # as a reload edit would
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
+    finally:
+        await _teardown(cron)
+
+
 async def test_catch_up_without_prior_run_is_noop(tmp_path):
     cron = await _make_cron(tmp_path, _HOURLY)
     try:

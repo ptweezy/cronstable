@@ -2750,6 +2750,142 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
     await reader.join()
 
 
+async def test_mirror_shed_warning_never_logs_on_the_submit_thread(
+    monkeypatch, caplog
+):
+    # The shed warning used to be logged from submit(), on the event-loop
+    # thread, while holding the mirror lock.  In the exact scenario the
+    # mirror exists for (a wedged shared-fd consumer, where stderr IS the
+    # wedged fd) that synchronous root-handler write re-froze the whole
+    # daemon.  The submit path now only flags the shed; the writer thread
+    # logs it once a write has succeeded, i.e. once the consumer drains.
+    import sys
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class SlowBuffer:
+        def write(self, data):
+            entered.set()
+            release.wait()
+
+    class SlowStream:
+        buffer = SlowBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", SlowStream())
+    # a fresh writer, not the process singleton: its once-per-process
+    # warn latch may already be spent by earlier tests
+    mirror = cronstable.job._MirrorWriter()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        mirror.submit("j", "stdout", "prime\n")
+        assert entered.wait(10.0)
+        for i in range(mirror.MAX_PENDING_BATCHES + 8):
+            mirror.submit("j", "stdout", "x%d\n" % i)
+        assert mirror.dropped_batches >= 1
+        # nothing logged yet: the consumer is still wedged, and a log write
+        # from the submit thread here is exactly the freeze being prevented
+        assert not [
+            r for r in caplog.records if "backed up" in r.getMessage()
+        ]
+        release.set()
+        assert mirror.drain(10.0)
+    # once the consumer drained, the writer thread reported the shed
+    assert any("backed up" in r.getMessage() for r in caplog.records)
+
+
+async def test_wedged_mirror_consumer_sheds_on_bytes_not_just_count(
+    monkeypatch,
+):
+    # The count cap alone bounds nothing when batches are large (one batch
+    # can carry a multi-megabyte line): a dozen 1 MiB batches sit far below
+    # MAX_PENDING_BATCHES yet must still shed past the byte ceiling.
+    import sys
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class SlowBuffer:
+        def write(self, data):
+            entered.set()
+            release.wait()
+
+    class SlowStream:
+        buffer = SlowBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", SlowStream())
+    mirror = cronstable.job._MirrorWriter()
+    big = "x" * (1024 * 1024)
+    try:
+        mirror.submit("j", "stdout", "prime\n")
+        assert entered.wait(10.0)
+        batches = mirror.MAX_PENDING_BYTES // len(big) + 4
+        for _ in range(batches):
+            mirror.submit("j", "stdout", big)
+        assert mirror.dropped_batches >= 1
+        with mirror._lock:
+            assert mirror._pending_bytes <= mirror.MAX_PENDING_BYTES
+            assert len(mirror._batches) < batches
+    finally:
+        release.set()
+        assert mirror.drain(10.0)
+
+
+async def test_mirror_thread_survives_unexpected_emit_errors(
+    monkeypatch, caplog
+):
+    # _emit can raise more than (OSError, ValueError): an exotic replacement
+    # stream can raise anything, and this is the process's ONE mirror
+    # thread; an escaping exception killed it silently and ended the
+    # passthrough for the daemon's life.  It must log and keep writing.
+    import sys
+
+    class BoomOnceBuffer:
+        def __init__(self):
+            self.wrote = []
+
+        def write(self, data):
+            if not self.wrote:
+                self.wrote.append(b"")
+                raise RuntimeError("exotic replacement stream")
+            self.wrote.append(data)
+
+    class Stream:
+        buffer = BoomOnceBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    stream = Stream()
+    monkeypatch.setattr(sys, "stdout", stream)
+    mirror = cronstable.job._MirrorWriter()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        mirror.submit("j", "stdout", "first\n")
+        assert mirror.drain(10.0)  # the thread survived the RuntimeError
+        mirror.submit("j", "stdout", "second\n")
+        assert mirror.drain(10.0)
+    assert any(
+        "could not mirror" in rec.getMessage() for rec in caplog.records
+    )
+    assert b"second\n" in Stream.buffer.wrote
+
+
 # ---------------------------------------------------------------------------
 # JobOutputStream teardown edges
 # ---------------------------------------------------------------------------
