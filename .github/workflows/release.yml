@@ -345,8 +345,11 @@ jobs:
       # platform-independent (it replays the same golden corpus through the
       # same two engines), so a second OS or Python row buys no signal and
       # costs a browser fetch per row. The other cells keep self-skipping.
-      # Install with the version requirements_dev.txt pins, so the build the
-      # tox env looks for is the one in the shared ms-playwright cache.
+      # Installed from the requirements_dev.txt line verbatim, so this step and
+      # the tox env resolve the same release and the browser downloaded here is
+      # the build that env goes looking for in the shared ms-playwright cache.
+      # (The line carries no version pin; what matters is that both installs
+      # read it, not which release they land on.)
       - name: Install Chromium for the web engine differential
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
