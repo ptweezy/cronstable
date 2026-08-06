@@ -286,10 +286,24 @@ MAX_JOB_SUMMARY_TS_LEN = 64  # an ISO-8601 finished_at timestamp
 # stop. The lists are sorted ASCENDING before slicing, so the surviving prefix
 # is the same on every node (the election needs one shared view) and holds the
 # lowest names, which is what elect_leader's ``min`` reads, so truncation
-# cannot change a single-leader election at all. The residual is the same class
-# as the summaries cap: a fleet with more than this many bridge-discovered
-# nodes may drop a ``spread`` co-owner from the tail and double-run its jobs.
-MAX_ADVERTISED_CANDIDATE_NAMES = 256
+# cannot change a single-leader election at all.
+#
+# The number comes from the response budget. Worst case is every name at
+# MAX_PEER_FIELD_LEN (256 B), so this cap costs 128 KiB of the 256 KiB
+# MAX_PEER_RESPONSE_BYTES: half the body, leaving the other half for the
+# election fields (members, mutual_agreeing), with the _peer_response oversize
+# fallback behind it to drop job_summaries if even that runs out. Real node
+# names run 20-40 B, so the practical cost is ~10-20 KiB. Matching
+# MAX_ADVERTISED_JOB_SUMMARIES keeps ONE fleet-cardinality number to reason
+# about instead of two that disagree about how big a cluster may be.
+#
+# A truncation here is reported, because its residual is a CORRECTNESS one
+# where the summaries cap's is only a degraded view: a fleet with more
+# bridge-discovered nodes than this may drop a ``spread`` co-owner from the
+# tail and double-run its jobs. The operator gets a logged warning and a
+# `candidates_truncated` flag in /cluster. See
+# ClusterManager._bridge_candidates.
+MAX_ADVERTISED_CANDIDATE_NAMES = 512
 
 # the only run outcomes a peer summary may carry (mirrors JobRunInfo.outcome)
 _SUMMARY_OUTCOMES = frozenset({"success", "failure", "cancelled"})
@@ -1619,6 +1633,12 @@ class ClusterManager(LeadershipBackend):
         self._peer_response_cache: Optional[
             "tuple[Any, float, str, bytes]"
         ] = None
+        # How many bridge-confirmed candidates the last derive found when it
+        # had to truncate, else 0. It is both the log's rate-limit key and the
+        # /cluster view's `candidates_truncated` flag.
+        # MAX_ADVERTISED_CANDIDATE_NAMES says why this truncation is logged
+        # where the summaries one only marks the view.
+        self._candidates_truncated = 0
 
     def _derived_state_key(self) -> "tuple":
         """The key every memoized election-derived result is valid under.
@@ -1777,10 +1797,12 @@ class ClusterManager(LeadershipBackend):
             # of this set is folded from absorbed peer data and re-broadcast,
             # so without a bound an inflated upstream peer walks our own body
             # past MAX_PEER_RESPONSE_BYTES and honest peers reject us as
-            # oversized (see MAX_ADVERTISED_CANDIDATE_NAMES).
-            "quorate_vouched": sorted(self._eligible_candidates())[
-                :MAX_ADVERTISED_CANDIDATE_NAMES
-            ],
+            # oversized (see MAX_ADVERTISED_CANDIDATE_NAMES).  The bridge half
+            # is already capped where it is derived; this second slice bounds
+            # the UNION with the direct half (bounded by our own config, so a
+            # combined overflow is the operator's own node list plus bridges)
+            # and reports through the same channel when it fires.
+            "quorate_vouched": self._capped_vouched(),
             # this node's per-job run summaries (the scheduler's snapshot:
             # running/enabled/next-fire plus the last finished run), for
             # the polling peer's fleet view. Observability only -- a peer
@@ -3119,9 +3141,56 @@ class ClusterManager(LeadershipBackend):
         # path (see MAX_ADVERTISED_CANDIDATE_NAMES); slicing a sorted list
         # keeps the same prefix on every node and keeps the lowest names,
         # which is what the election reads.
-        return sorted(
+        confirmed = sorted(
             name for name, seen in witnesses.items() if len(seen) + 1 >= quorum
-        )[:MAX_ADVERTISED_CANDIDATE_NAMES]
+        )
+        if len(confirmed) > MAX_ADVERTISED_CANDIDATE_NAMES:
+            # Dropping a tail name costs a ``spread`` co-owner, and an
+            # operator should not have to infer a cluster-wide double-run
+            # from run history. The summaries cap reports its own (milder,
+            # view-only) truncation the same way.
+            self._note_candidates_truncated(len(confirmed))
+            return confirmed[:MAX_ADVERTISED_CANDIDATE_NAMES]
+        self._candidates_truncated = 0
+        return confirmed
+
+    def _capped_vouched(self) -> List[str]:
+        """The ``quorate_vouched`` set as advertised: sorted, then capped.
+
+        The union of the direct and bridge halves of
+        :meth:`_eligible_candidates` can exceed the cap even though the
+        bridge half was capped where it was derived, so the advert slices
+        again.  It reports through the same channel, so this truncation is
+        logged like the one below it.
+        """
+        vouched = sorted(self._eligible_candidates())
+        if len(vouched) > MAX_ADVERTISED_CANDIDATE_NAMES:
+            self._note_candidates_truncated(len(vouched))
+            return vouched[:MAX_ADVERTISED_CANDIDATE_NAMES]
+        return vouched
+
+    def _note_candidates_truncated(self, seen: int) -> None:
+        """Record and log a candidate-set truncation (rate-limited).
+
+        Logged once per distinct oversize count rather than once per derive:
+        this runs on every view rebuild, so an unconditional warning would
+        fill the log at the poll cadence for as long as the fleet stays that
+        large, and a fleet that keeps growing still reports each new size.
+        """
+        if self._candidates_truncated != seen:
+            self._candidates_truncated = seen
+            logger.warning(
+                "cluster: %d bridge-confirmed candidates exceed the %d-name "
+                "advertisement cap; the %d lowest names are gossiped and the "
+                "rest are dropped, so a `spread` job whose owner falls in the "
+                "dropped tail may run on more than one node. Reduce the "
+                "fleet's bridge-discovered size, or raise "
+                "MAX_ADVERTISED_CANDIDATE_NAMES and re-check the /peer body "
+                "against MAX_PEER_RESPONSE_BYTES.",
+                seen,
+                MAX_ADVERTISED_CANDIDATE_NAMES,
+                MAX_ADVERTISED_CANDIDATE_NAMES,
+            )
 
     @_memoized_derived
     def _eligible_candidates(self) -> List[str]:
@@ -3975,6 +4044,14 @@ class ClusterManager(LeadershipBackend):
             # (independent owner selectors -> double-run or lost-run)
             "policy_conflict": bool(policy_conflicts),
             "conflicting_policies": policy_conflicts,
+            # the bridge-confirmed candidate set outgrew its advertisement
+            # cap, so a `spread` owner in the dropped tail may double-run
+            # (see MAX_ADVERTISED_CANDIDATE_NAMES). Zero when it fits; the
+            # full count when it does not, so the operator can size the gap.
+            # NOT folded into "conflict": that flag fails Leader jobs closed,
+            # and standing a whole fleet down because it grew past a
+            # gossip-budget cap would be a worse outcome than the residual.
+            "candidates_truncated": self._candidates_truncated,
             "quorate": leader is not None,
             # In spread mode there is no single leader: ownership is per job,
             # so leader/is_leader are not meaningful (reported null/false).
