@@ -5,7 +5,7 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## 1.2.38
+## 1.2.37
 
 - `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
   spread plain-job backfills: the same deterministic per-name offset,
@@ -269,12 +269,6 @@ project, on which cronstable is based.
 - The logo engine's four inlined copies (dashboard, demo, logo lab and the
   comparison page) are pinned identical by a test, where only the
   dashboard and demo pair had a drift guard before.
-
-## 1.2.37
-
-The top findings of a performance review of the tree the 1.2.36 defect
-review covered.
-
 - A finished run's live-log ring buffer is released once a newer run
   supersedes it. Only the newest run's logs are replayable, but every
   retained history entry kept its full ring in memory anyway, so a
