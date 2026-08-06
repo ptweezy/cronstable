@@ -250,6 +250,20 @@ project, on which cronstable is based.
   comparison page) are pinned identical by a test, where only the
   dashboard and demo pair had a drift guard before.
 
+- Each job's run-ledger writes are chained, so two completions close
+  enough to overlap (a `concurrencyPolicy: Allow` pair, a retry firing
+  straight after its parent's failure, a catch-up burst, crash
+  reconciliation racing a live completion) can no longer land in
+  `runs/<job>` out of order. The record filename that orders the stream is
+  minted inside the append, on whichever pooled worker thread runs it, so
+  an unordered pair inverted often (measured 28 of 60 back-to-back pairs
+  against the real filesystem store) and left the OLDER run newest: the
+  run a restart then restored as `last_run`, and the one an at-the-bound
+  prune kept while deleting the newer. Chaining is per job, so unrelated
+  jobs still write concurrently, and it is the same guard the in-flight,
+  retry-ladder and pause streams already used against the identical
+  hazard.
+
 Windows fixes and additions from a gap review against Task Scheduler.
 
 - `shell: cmd` actually runs the command. cronstable now passes cmd.exe its
