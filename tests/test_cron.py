@@ -1782,9 +1782,14 @@ async def test_archive_snapshots_lines_at_record_time():
     archived = [
         rec for stream, rec in backend.appends if stream == log_stream
     ]
-    assert [
+    # Order is not pinned. Both persist tasks suspend on the executor hop in
+    # _archive_output (redact_lines) before their append, so which one lands
+    # first rides thread scheduling, and delaying the first redact_lines call
+    # inverts the pair. Each record must still hold its own record-time
+    # snapshot, not the ring the newer completion already released.
+    assert sorted(
         [entry["line"] for entry in rec["lines"]] for rec in archived
-    ] == [["one", "two"], ["three"]]
+    ) == [["one", "two"], ["three"]]
     # nothing was double-counted as evicted: the snapshot held every line
     assert [rec["dropped_lines"] for rec in archived] == [0, 0]
 
