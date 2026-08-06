@@ -2702,10 +2702,12 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
     import threading
 
     release = threading.Event()
+    entered = threading.Event()
 
     class SlowBuffer:
         def write(self, data):
-            release.wait(2.0)
+            entered.set()
+            release.wait(30.0)
 
     class SlowStream:
         buffer = SlowBuffer()
@@ -2723,6 +2725,15 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
     fake.feed_eof()
     reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
     try:
+        # Prime one batch and wait until the writer thread is provably
+        # parked inside the wedged write.  Without this the storm below
+        # races the writer's wake-up: _run drains the WHOLE deque in one
+        # lock hold, so a writer that wins the GIL mid-storm (a loaded
+        # runner does this) swallows everything queued so far, the deque
+        # never reaches the cap, and nothing is shed.
+        reader._emit_buffer = ["prime\n"]
+        reader._flush_emit_buffer()
+        assert entered.wait(10.0)
         for i in range(mirror.MAX_PENDING_BATCHES + 8):
             reader._emit_buffer = ["x%d\n" % i]
             reader._flush_emit_buffer()  # pure enqueue: returns at once
