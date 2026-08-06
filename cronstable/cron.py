@@ -717,12 +717,29 @@ def _api_error(
     message: str,
     headers: Optional[Any] = None,
 ) -> web.HTTPException:
-    """An aiohttp error response carrying the uniform JSON envelope."""
+    """An aiohttp error response carrying the uniform JSON envelope.
+
+    The envelope's own Content-Type wins over an operator-configured
+    ``web.headers`` one, in ANY spelling, the same rule ``/metrics`` and the
+    SSE tails apply.  aiohttp refuses ``content_type=`` outright when the
+    headers mapping already carries a Content-Type (``ValueError: passing
+    both Content-Type header and content_type or charset params is
+    forbidden``), so without the strip a deployment that sets one turned the
+    start/cancel 409 into a 500; that is the one error path these headers
+    ride.  Header names are case-insensitive on the wire but the mapping is
+    not, so a case-variant leftover would be emitted as a second,
+    conflicting header even where aiohttp did not refuse.
+    """
     if headers is not None:
+        clean = {
+            key: value
+            for key, value in dict(headers).items()
+            if key.lower() != "content-type"
+        }
         return factory(
             text=_error_body(message),
             content_type="application/json",
-            headers=headers,
+            headers=clean,
         )
     return factory(text=_error_body(message), content_type="application/json")
 
@@ -1811,11 +1828,25 @@ class Cron:
         self._metrics_response_cache: Dict[
             bool, Tuple[float, bytes, Optional[bytes]]
         ] = {}
+        # in-flight /metrics builds, per exposition format: the single-flight
+        # gate the memo above needs once the build is offloaded. See
+        # _metrics_product.
+        self._metrics_build_inflight: Dict[
+            bool, "asyncio.Future[Optional[Tuple[bytes, Optional[bytes]]]]"
+        ] = {}
         # the shared GET /fleet product: (loop.time stamp, etag, body, gz).
         # See _FLEET_RESPONSE_TTL.
         self._fleet_response_cache: Optional[
             Tuple[float, str, bytes, Optional[bytes]]
         ] = None
+        # Bumped by every _bust_response_memos call. A memo build that spans
+        # an await (the offloaded /jobs and /metrics renders) reads it before
+        # starting and re-checks it before storing, so a bust that lands
+        # DURING the build cannot be undone by the pre-bust product arriving
+        # late. Without it a busted change fails to render on the very next
+        # poll exactly when the fleet is large enough for the build to be
+        # slow.
+        self._memo_gen = 0
         # active runtime pauses by job name (POST /jobs/{name}/pause). The
         # fire path consults ONLY this map (never store I/O there); it is
         # rehydrated from the durable paused/ streams at boot and refreshed
@@ -3064,6 +3095,93 @@ class Cron:
             headers=self._web_headers(),
         )
 
+    async def _metrics_product(
+        self, openmetrics: bool
+    ) -> Tuple[bytes, Optional[bytes]]:
+        """Build (or join a build of) one ``/metrics`` product, and memoize it.
+
+        Single-flight, because the memo alone is not enough on the path it
+        was written for.  Above :data:`_METRICS_OFFLOAD_MIN_JOBS` the build
+        spans an executor hop, and a plain check-then-store memo leaves that
+        await between the miss and the store: every scraper landing while the
+        first one renders misses too, so N simultaneous scrapers cost N full
+        family renders and N gzips of a body that reaches tens of megabytes
+        at fleet scale, which is the pile-up
+        :data:`_METRICS_RESPONSE_TTL` exists to prevent.  A follower awaits
+        the leader's future instead, so the window costs one build however
+        many scrapers land in it.
+
+        ``asyncio.shield`` on that wait: a follower whose client hangs up
+        must not cancel the build every other follower is waiting on.  A
+        failed build resolves the future to ``None`` rather than an
+        exception, so followers fall through and build their own, and
+        nothing is left holding an exception nobody retrieves; the failure
+        still propagates to the scraper that caused it.
+
+        The generation check is the other half: a
+        :meth:`_bust_response_memos` landing DURING the build would
+        otherwise be undone by this pre-bust product arriving late and
+        re-populating the slot, leaving a pause an operator just applied
+        invisible to a scrape for a further TTL.
+        """
+        loop = asyncio.get_running_loop()
+        pending = self._metrics_build_inflight.get(openmetrics)
+        if pending is not None:
+            shared = await asyncio.shield(pending)
+            if shared is not None:
+                return shared
+            # the leader's build failed; fall through and run our own
+        fut: "asyncio.Future[Optional[Tuple[bytes, Optional[bytes]]]]" = (
+            loop.create_future()
+        )
+        self._metrics_build_inflight[openmetrics] = fut
+        gen = self._memo_gen
+        try:
+            # The family build reads live scheduler state, so it stays on the
+            # loop; the render and the compression are pure over that
+            # freshly-built list, so a large job set does both on the executor
+            # (see _METRICS_OFFLOAD_MIN_JOBS), like the calendar builder.
+            families = self.metrics.families(self)
+            if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+                product = await loop.run_in_executor(
+                    None,
+                    partial(
+                        _metrics_response_product,
+                        self.metrics.render_prepared,
+                        families,
+                        openmetrics,
+                    ),
+                )
+            else:
+                product = _metrics_response_product(
+                    self.metrics.render_prepared, families, openmetrics
+                )
+        except BaseException:
+            self._finish_metrics_build(openmetrics, fut, None)
+            raise
+        if gen == self._memo_gen:
+            self._metrics_response_cache[openmetrics] = (loop.time(), *product)
+        self._finish_metrics_build(openmetrics, fut, product)
+        return product
+
+    def _finish_metrics_build(
+        self,
+        openmetrics: bool,
+        fut: "asyncio.Future[Optional[Tuple[bytes, Optional[bytes]]]]",
+        product: Optional[Tuple[bytes, Optional[bytes]]],
+    ) -> None:
+        """Release the single-flight slot and wake this build's followers.
+
+        It deregisters only while the slot is still ours, the same rule
+        :meth:`_install_tail_task`'s done-callback follows, so a build
+        started after ours (possible once ours has failed) is never evicted
+        by our cleanup.
+        """
+        if self._metrics_build_inflight.get(openmetrics) is fut:
+            del self._metrics_build_inflight[openmetrics]
+        if not fut.done():
+            fut.set_result(product)
+
     async def _web_metrics(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         accept = request.headers.get("Accept", "")
@@ -3076,28 +3194,9 @@ class Cron:
         now = loop.time()
         cache = self._metrics_response_cache.get(openmetrics)
         if cache is None or now - cache[0] >= _METRICS_RESPONSE_TTL:
-            # The family build reads live scheduler state, so it stays on the
-            # loop; the render and the compression are pure over that
-            # freshly-built list, so a large job set does both on the executor
-            # (see _METRICS_OFFLOAD_MIN_JOBS), like the calendar builder.
-            families = self.metrics.families(self)
-            if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
-                body, gz = await loop.run_in_executor(
-                    None,
-                    partial(
-                        _metrics_response_product,
-                        self.metrics.render_prepared,
-                        families,
-                        openmetrics,
-                    ),
-                )
-            else:
-                body, gz = _metrics_response_product(
-                    self.metrics.render_prepared, families, openmetrics
-                )
-            cache = (now, body, gz)
-            self._metrics_response_cache[openmetrics] = cache
-        _mono, body, gz = cache
+            body, gz = await self._metrics_product(openmetrics)
+        else:
+            _mono, body, gz = cache
         headers = {}  # type: Dict[str, str]
         custom = self._web_headers()
         if custom:
@@ -4946,12 +5045,12 @@ class Cron:
         self,
         tail: Dict[str, asyncio.Task],
         name: str,
-        body: Coroutine[Any, Any, None],
+        body: Callable[[], Coroutine[Any, Any, None]],
         *,
         spawn: Callable[[Coroutine[Any, Any, None]], asyncio.Task],
         after: Optional[Iterable[Optional[asyncio.Task]]] = None,
     ) -> asyncio.Task:
-        """Spawn ``body`` behind ``name``'s current tail and become the tail.
+        """Spawn ``body()`` behind ``name``'s current tail and become the tail.
 
         The ONE implementation of the per-name chained-tail idiom, which
         used to be pasted five times (the completion, SLA-report, inflight,
@@ -4965,6 +5064,16 @@ class Cron:
         :meth:`_spawn_completion` for report sequences).  The
         done-callback drops the registration only while it is still this
         task's, so a successor installed meanwhile is never clobbered.
+
+        ``body`` is a FACTORY, not a coroutine, and it is called inside the
+        ordered wrapper rather than at the call site.  The wrapper is what
+        :meth:`_track_state_write` closes when it sheds a write under
+        overload (``MAX_PENDING_STATE_WRITES``), and a coroutine built
+        eagerly by the caller would then never be awaited nor closed: a
+        ``RuntimeWarning`` per shed write, raised outright under ``-W
+        error``, at exactly the moment the store is already in trouble.
+        Building it here means the shed closes the only coroutine that was
+        ever created.
         """
         earlier = list(after) if after is not None else [tail.get(name)]
 
@@ -4972,7 +5081,7 @@ class Cron:
             for prev in earlier:
                 if prev is not None and not prev.done():
                     await asyncio.wait({prev})
-            await body
+            await body()
 
         task = spawn(_ordered())
         tail[name] = task
@@ -5041,7 +5150,7 @@ class Cron:
         self._install_tail_task(
             self._sla_report_tail,
             name,
-            _report(),
+            _report,
             spawn=self._spawn_completion,
             after=[
                 self._completion_tail.get(name),
@@ -5570,6 +5679,11 @@ class Cron:
             # serialize off it for a large fleet.  The tag is keyed on the
             # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
             # put while the countdown ticks and moves when a fire lands.
+            # The generation is read BEFORE the build for the reason
+            # _bust_response_memos gives: on the offloaded branch the build
+            # spans an await, and a bust landing inside it must not be undone
+            # by this now-stale product being stored on the way out.
+            gen = self._memo_gen
             payload = self.jobs_payload()
             # A plain snapshot of the index, NOT a per-job isoformat sweep:
             # the instants change at most once per job per fire. The
@@ -5584,7 +5698,8 @@ class Cron:
             else:
                 etag, body, gz = _jobs_response_product(payload, next_fire)
             cache = (now, etag, body, gz)
-            self._jobs_response_cache = cache
+            if gen == self._memo_gen:
+                self._jobs_response_cache = cache
         _mono, etag, body, gz = cache
         headers = self._web_jobs_headers(etag)
         # on EVERY representation, compressed or not: a shared cache that
@@ -5619,7 +5734,16 @@ class Cron:
         summaries alongside its peers'.  Busting only one would leave an
         operator watching a dashboard and a scrape that disagree about a
         pause they just applied.
+
+        The generation bump closes the window a bust cannot otherwise cover:
+        the offloaded ``/jobs`` and ``/metrics`` builds span an await, so one
+        that STARTED before this call can still be holding a pre-bust product
+        and would re-populate the slot with it moments later.  Both re-check
+        the counter before storing (see :attr:`_memo_gen`), so a bust that
+        lands mid-build makes that product non-cacheable rather than
+        silently reinstating it for another TTL.
         """
+        self._memo_gen += 1
         self._jobs_response_cache = None
         self._metrics_response_cache.clear()
         self._fleet_response_cache = None
@@ -10436,7 +10560,8 @@ class Cron:
             # the LAST instance finishes (see _handle_finished_job). Ordered
             # via the per-job inflight tail so the close cannot sort ahead.
             self._queue_inflight_write(
-                job.name, self._persist_inflight_open(job, running_job)
+                job.name,
+                lambda: self._persist_inflight_open(job, running_job),
             )
         logger.info("Job %s spawned", job.name)
         self._jobs_running.set()
@@ -11056,7 +11181,7 @@ class Cron:
         return INFLIGHT_STREAM_PREFIX + name
 
     def _queue_run_write(
-        self, name: str, coro: Coroutine[Any, Any, None]
+        self, name: str, make_coro: Callable[[], Coroutine[Any, Any, None]]
     ) -> asyncio.Task:
         """Run a run-ledger write ordered behind the job's previous one.
 
@@ -11078,16 +11203,21 @@ class Cron:
         through different processes and no local chain can order them, which
         is exactly why the readers that must not be fooled fold by
         ``finished_at`` instead of trusting position.
+
+        Takes a factory rather than a coroutine, for the reason
+        :meth:`_install_tail_task` gives: a write shed under overload closes
+        the ordered wrapper, and an eagerly-built inner coroutine would be
+        left neither awaited nor closed.
         """
         return self._install_tail_task(
             self._run_write_tail,
             name,
-            coro,
+            make_coro,
             spawn=self._track_state_write,
         )
 
     def _queue_inflight_write(
-        self, name: str, coro: Coroutine[Any, Any, None]
+        self, name: str, make_coro: Callable[[], Coroutine[Any, Any, None]]
     ) -> asyncio.Task:
         """Run an inflight-stream write ordered behind the job's previous one.
 
@@ -11098,11 +11228,16 @@ class Cron:
         run on the next restart.  Chaining each job's inflight writes (the
         same idiom as :meth:`_queue_retry_write`) keeps the stream's order
         equal to the launch/finish order.
+
+        Takes a factory rather than a coroutine, for the reason
+        :meth:`_install_tail_task` gives: a write shed under overload closes
+        the ordered wrapper, and an eagerly-built inner coroutine would be
+        left neither awaited nor closed.
         """
         return self._install_tail_task(
             self._inflight_write_tail,
             name,
-            coro,
+            make_coro,
             spawn=self._track_state_write,
         )
 
@@ -11400,13 +11535,13 @@ class Cron:
         else:
             data["interruptedAt"] = started_iso
         self._queue_inflight_write(
-            name, self._persist_inflight_closed(name, reason)
+            name, lambda: self._persist_inflight_closed(name, reason)
         )
         # through the same per-job chain as a live completion: reconciliation
         # runs at boot alongside them, and an unordered pair here would
         # invert exactly as two completions would.
         self._queue_run_write(
-            name, self._persist_reconciled_record(name, data)
+            name, lambda: self._persist_reconciled_record(name, data)
         )
         # make it visible on this node's dashboard immediately (bypassing
         # _record_run: no metric emission, no double-persist).
@@ -11623,7 +11758,8 @@ class Cron:
                 else None
             )
             self._queue_run_write(
-                name, self._persist_run_record(name, info, archive_lines)
+                name,
+                lambda: self._persist_run_record(name, info, archive_lines),
             )
         # Release the superseded record's ring buffer. Only the NEWEST
         # finished run's output is ever replayable (_job_output serves
@@ -12658,7 +12794,7 @@ class Cron:
             # sort ahead of it (see _inflight_write_tail).
             self._queue_inflight_write(
                 job.config.name,
-                self._persist_inflight_closed(job.config.name),
+                lambda: self._persist_inflight_closed(job.config.name),
             )
         if job.config.concurrencyScope == "cluster":
             # every claimed launch pairs with exactly one finish here; the
@@ -12770,7 +12906,7 @@ class Cron:
         self._install_tail_task(
             self._completion_tail,
             name,
-            _handle(),
+            _handle,
             spawn=self._spawn_completion,
         )
 
@@ -13138,7 +13274,7 @@ class Cron:
         return self._install_tail_task(
             self._retry_write_tail,
             name,
-            self._append_retry_record(name, record),
+            lambda: self._append_retry_record(name, record),
             spawn=self._track_state_write,
         )
 
@@ -13272,7 +13408,7 @@ class Cron:
         return self._install_tail_task(
             self._pause_write_tail,
             name,
-            self._append_pause_record(name, record),
+            lambda: self._append_pause_record(name, record),
             spawn=self._track_state_write,
         )
 

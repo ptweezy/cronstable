@@ -93,6 +93,13 @@ logger = logging.getLogger("cronstable.state")
 #: constant used to collide with.
 SCHEMA_VERSION = "v1"
 
+#: The name this constant carried before it was renamed off its collision
+#: with :data:`cronstable.fingerprint.SCHEME_VERSION`.  Kept for the same
+#: reason :func:`cronstable.tui.describe_cron` keeps its old spelling: it is
+#: a module-level name an operator's script or a downstream tool may import,
+#: and a rename that costs nothing to alias should not break one.
+SCHEME_VERSION = SCHEMA_VERSION
+
 # Registry of record-scheme converters for `cronstable state migrate-schema`:
 # maps an OLD wrapper schemaVersion to a callable converting that version's
 # ``data`` dict to the CURRENT version's shape (return ``None`` to declare

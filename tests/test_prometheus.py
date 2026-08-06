@@ -6,6 +6,7 @@ calls with a hand-rolled fake request, and real-HTTP tests that stand the
 server up via start_stop_web_app and scrape it like Prometheus would.
 """
 
+import asyncio
 import datetime
 import math
 
@@ -2132,3 +2133,95 @@ def test_render_is_stable_when_the_memo_overflows(monkeypatch):
     cron.metrics._label_blocks.clear()
     monkeypatch.setattr(cronstable.prometheus, "LABEL_BLOCK_CACHE_MAX", 3)
     assert cron.metrics.render(cron) == uncapped
+
+
+# ---------------------------------------------------------------------------
+# the /metrics response memo: single-flight, and bust-during-build
+
+
+def _memo_cron(monkeypatch):
+    """A pinned cron forced onto the offloaded (executor) build path.
+
+    The threshold is dropped rather than the job set padded: it is the
+    executor hop that opens the check-then-store window these tests are
+    about, and a real 250-job config would cost seconds per test to build
+    for no extra coverage.
+    """
+    monkeypatch.setattr(cronstable.cron, "_METRICS_OFFLOAD_MIN_JOBS", 0)
+    return _pinned_cron()
+
+
+@pytest.mark.asyncio
+async def test_metrics_memo_builds_once_for_concurrent_scrapers(monkeypatch):
+    # The memo's whole point. Above the offload threshold the build spans an
+    # executor hop, so a plain check-then-store memo lets every scraper that
+    # lands during the render miss as well: N scrapers, N full family renders
+    # and N gzips of a body that runs to tens of megabytes at fleet scale.
+    cron = _memo_cron(monkeypatch)
+    renders = []
+    inner = cron.metrics.render_prepared
+
+    def counted(families, openmetrics=False):
+        renders.append(openmetrics)
+        return inner(families, openmetrics=openmetrics)
+
+    cron.metrics.render_prepared = counted
+    await asyncio.sleep(0)  # let the loop settle so the eight really overlap
+    products = await asyncio.gather(
+        *(cron._metrics_product(False) for _ in range(8))
+    )
+    assert len(renders) == 1
+    assert all(p == products[0] for p in products)
+    assert cron._metrics_build_inflight == {}  # slot released
+    assert False in cron._metrics_response_cache
+
+
+@pytest.mark.asyncio
+async def test_metrics_memo_keeps_the_two_exposition_formats_apart(
+    monkeypatch,
+):
+    # one slot per format, so a fleet scraped in both memoizes both rather
+    # than thrashing a single slot.
+    cron = _memo_cron(monkeypatch)
+    plain, openmetrics = await asyncio.gather(
+        cron._metrics_product(False), cron._metrics_product(True)
+    )
+    assert plain != openmetrics
+    assert set(cron._metrics_response_cache) == {False, True}
+
+
+@pytest.mark.asyncio
+async def test_a_bust_during_a_build_is_not_undone_by_the_late_product(
+    monkeypatch,
+):
+    # _bust_response_memos promises a local change renders on the very next
+    # poll. A build that started before the bust is holding a pre-bust
+    # product, so storing it on the way out would reinstate exactly what the
+    # bust dropped, for a further TTL.
+    cron = _memo_cron(monkeypatch)
+
+    async def bust():
+        await asyncio.sleep(0)
+        cron._bust_response_memos()
+
+    await asyncio.gather(cron._metrics_product(False), bust())
+    assert cron._metrics_response_cache == {}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_lets_the_followers_build_their_own(monkeypatch):
+    # the follower path must not inherit the leader's failure as its own
+    # cancellation, nor leave an exception nobody retrieves.
+    cron = _memo_cron(monkeypatch)
+    calls = []
+
+    def boom(families, openmetrics=False):
+        calls.append(1)
+        raise RuntimeError("render exploded")
+
+    cron.metrics.render_prepared = boom
+    with pytest.raises(RuntimeError):
+        await cron._metrics_product(False)
+    assert cron._metrics_build_inflight == {}
+    assert cron._metrics_response_cache == {}
+    assert calls == [1]

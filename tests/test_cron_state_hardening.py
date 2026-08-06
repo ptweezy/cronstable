@@ -16,7 +16,9 @@ fixes regresses, the matching test here must fail.  Covered:
 
 import asyncio
 import datetime
+import gc
 import os
+import warnings
 
 from cronstable import cron as cron_mod
 from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
@@ -1136,3 +1138,38 @@ async def test_run_writes_chain_per_job_not_across_jobs(tmp_path):
         assert cron._run_write_tail == {}
     finally:
         await cron.start_stop_state(None)
+
+
+async def test_a_shed_chained_write_leaves_no_unawaited_coroutine(monkeypatch):
+    # The chained-tail helper builds its body INSIDE the ordered wrapper, so
+    # that shedding closes the only coroutine that was ever created. Built at
+    # the call site instead, the shed closes the wrapper and the inner
+    # coroutine is left neither awaited nor closed: a RuntimeWarning per shed
+    # write, and an outright error under -W error, at exactly the moment the
+    # store is already in trouble.
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    monkeypatch.setattr(cron_mod, "MAX_PENDING_STATE_WRITES", 0)
+    appended = []
+    monkeypatch.setattr(
+        Cron,
+        "_append_retry_record",
+        lambda self, name, record: appended.append(name),
+    )
+    persisted = []
+    monkeypatch.setattr(
+        Cron,
+        "_persist_run_record",
+        lambda self, name, info, lines=None: persisted.append(name),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # every chained-write entry point, through its real caller
+        await cron._queue_retry_write("alpha", {"kind": "armed"})
+        await cron._queue_pause_write("alpha", {"kind": "paused"})
+        await cron._queue_run_write(
+            "alpha", lambda: cron._persist_run_record("alpha", None, None)
+        )
+        gc.collect()
+    assert appended == []  # shed, as the cap demands
+    assert persisted == []
+    assert [w for w in caught if "never awaited" in str(w.message)] == []
