@@ -273,6 +273,13 @@ async def test_records_are_immutable_and_versioned(tmp_path):
     assert on_disk["data"] == {"k": "v"}
 
 
+def test_the_old_scheme_version_spelling_still_resolves():
+    # SCHEMA_VERSION was renamed off its collision with the unrelated
+    # fingerprint.SCHEME_VERSION. The old spelling is a module-level name a
+    # downstream script may import, so it stays as an alias.
+    assert state.SCHEME_VERSION == state.SCHEMA_VERSION
+
+
 async def test_derive_max_is_order_independent(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()

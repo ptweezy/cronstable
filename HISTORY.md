@@ -16,7 +16,27 @@ project, on which cronstable is based.
   `{"error": "<reason>"}`, across the job, DAG, schedule, state, and push
   routes alike (the auth middleware's 401 stays bodyless). Previously the
   body was JSON on some handler families, plain text on others, and empty
-  on a few, so a client had to sniff per endpoint.
+  on a few, so a client had to sniff per endpoint. The envelope's own
+  content type wins over a `web.headers` one in any spelling, the rule
+  `/metrics` and the live tails already followed; a deployment that set a
+  content type there would otherwise have seen the start/cancel 409 come
+  back as a 500.
+- `GET /metrics` shares one build across the scrapers that arrive while it
+  is rendering, instead of only across those that arrive after it finishes.
+  On a large job set the render runs on a worker thread, and every scraper
+  landing during it used to start a render of its own: a Prometheus pair
+  plus an agent and a federation puller hitting the same second paid four
+  full builds of a body that runs to tens of megabytes. A local change
+  (a run, a launch, a pause, a reload) that lands mid-render also no longer
+  loses its cache invalidation to the older build finishing afterwards, on
+  `/metrics` and `/jobs` alike.
+- `/cluster` reports `candidates_truncated`, and the daemon logs a warning,
+  when the bridge-discovered candidate set outgrows what a node may
+  advertise. Past that point a `spread` job whose owner falls in the
+  dropped tail can run on more than one node, which is not something an
+  operator should have to infer from run history. The cap itself moved from
+  256 names to 512, matching the per-node job-summary cap, which is still
+  half the peer response budget in the worst case.
 - `POST /jobs/{name}/start` and `/cancel` answer with the same JSON acks
   their MCP twins return (`{"started": ...}` and `{"cancelled": ...,
   "instances": N}`) instead of empty 200s, and the DAG run listing and

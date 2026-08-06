@@ -3691,6 +3691,52 @@ async def test_handle_peer_caps_quorate_vouched(no_tls):
     payload = json.loads(resp.text)
     assert len(payload["quorate_vouched"]) <= MAX_ADVERTISED_CANDIDATE_NAMES
     assert len(resp.body) <= MAX_PEER_RESPONSE_BYTES
+    # the worst case the cap is sized against still leaves room for the rest
+    # of the body (see MAX_ADVERTISED_CANDIDATE_NAMES): every surviving name
+    # is at the field-length cap here.
+    assert len(resp.body) <= MAX_PEER_RESPONSE_BYTES // 2 + 8192
+
+
+@pytest.mark.asyncio
+async def test_candidate_truncation_is_reported_not_silent(no_tls, caplog):
+    # Unlike the summaries cap, whose residual is a degraded VIEW, dropping a
+    # candidate from the tail costs a `spread` co-owner and double-runs its
+    # jobs. An operator must not have to infer that from run history, so the
+    # truncation logs and rides /cluster as `candidates_truncated`.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
+    }
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        assert len(mgr._bridge_candidates()) == MAX_ADVERTISED_CANDIDATE_NAMES
+    warned = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    assert len(warned) == 1
+    assert str(len(flood)) in warned[0].getMessage()
+    assert mgr._candidates_truncated == len(flood)
+    view = mgr.view_dict()
+    assert view["candidates_truncated"] == len(flood)
+    # NOT a conflict: that flag fails Leader jobs closed, and standing a
+    # whole fleet down for outgrowing a gossip budget is worse than the
+    # residual it would be protecting against.
+    assert view["conflict"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidates_truncated_is_zero_for_an_ordinary_fleet(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
+    mgr._bridge_candidates()
+    assert mgr._candidates_truncated == 0
+    assert mgr.view_dict()["candidates_truncated"] == 0
 
 
 @pytest.mark.asyncio
