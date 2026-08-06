@@ -4491,6 +4491,80 @@ def test_sigterm_triggers_graceful_shutdown():
         loop.close()
 
 
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS,
+    reason="Windows console-signal delivery (SIGINT fallback + heartbeat)",
+)
+def test_sigint_triggers_graceful_shutdown_on_windows():
+    # End-to-end of the documented Windows Ctrl-C path, the sibling of the
+    # SIGTERM test above: a real SIGINT through the signal.signal fallback
+    # (whose heartbeat is what makes it observable while the Proactor loop
+    # is parked in IOCP) must drive run() to a clean return. Before this
+    # test existed the Windows handlers were installed but never fired.
+    loop = asyncio.new_event_loop()
+    try:
+        cron = cronstable.cron.Cron(
+            None
+        )  # no jobs: run() idles until signalled
+        remove = platform.install_shutdown_handlers(loop, cron.signal_shutdown)
+        try:
+            loop.call_later(
+                0.05, lambda: signal.raise_signal(signal.SIGINT)
+            )
+            loop.run_until_complete(asyncio.wait_for(cron.run(), timeout=10))
+            assert cron._stop_event.is_set()
+        finally:
+            remove()
+    finally:
+        loop.close()
+
+
+class _ShutdownReq:
+    """The slice of aiohttp's Request _web_shutdown reads: the token the
+    auth middleware filed (or nothing, when no auth is configured)."""
+
+    def __init__(self, token=None):
+        self._store = {}
+        if token is not None:
+            self._store[cronstable.cron.WEB_TOKEN_REQUEST_KEY] = token
+
+    def get(self, key, default=None):
+        return self._store.get(key, default)
+
+
+@pytest.mark.asyncio
+async def test_web_shutdown_refused_without_authentication():
+    # POST /shutdown is fail-closed: with no auth middleware there is no
+    # matched token, and an unauthenticated listener must not hand every
+    # process that can reach it a stop switch for the scheduler.
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    with pytest.raises(web.HTTPForbidden) as exc:
+        await cron._web_shutdown(_ShutdownReq())
+    assert "web.authToken" in exc.value.text  # the remedy is named
+    assert not cron._stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_web_shutdown_with_a_token_signals_the_drain():
+    # an authenticated caller gets the same graceful drain Ctrl-C/SIGTERM
+    # trigger; this is the stop path for service wrappers and supervisors
+    # (and the only graceful stop a console-less Windows daemon has).
+    import json
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    token = cronstable.cron._WebToken(
+        b"t", frozenset({"view", "control"}), "supervisor"
+    )
+    resp = await cron._web_shutdown(_ShutdownReq(token=token))
+    assert resp.status == 200
+    assert json.loads(resp.body) == {"shuttingDown": True}
+    assert cron._stop_event.is_set()
+
+
 @pytest.mark.asyncio
 async def test_fleet_job_summaries_snapshot():
     # the compact per-job snapshot gossiped to peers for the fleet view:

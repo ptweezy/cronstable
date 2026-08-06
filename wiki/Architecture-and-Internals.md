@@ -540,18 +540,21 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
 
 1. **`start()`** chooses the spawn function from the command form:
    `create_subprocess_exec` for a list command, or when `shell` is set the
-   command is run as `[shell, "-c", command]` via `exec`; a string command with
-   no `shell` uses `create_subprocess_shell`. The default `shell` is
-   platform-specific (via `platform.DEFAULT_SHELL`): POSIX defaults to `/bin/sh`,
-   so a string command runs as `["/bin/sh", "-c", command]`; on Windows the
-   default is empty, so a string command with no shell goes through
-   `create_subprocess_shell` to the native command processor `%ComSpec%`
-   (cmd.exe). A list command bypasses the shell on every platform. The spawn
-   kwargs start from `platform.new_process_group_kwargs()`: on POSIX
-   `start_new_session=True` puts the job in a fresh session/process group
-   (the child's pid is the pgid), so `cancel()` can take the whole descendant
-   tree down as a unit; on Windows no creation flag is needed (descendants
-   are reached later via the `taskkill` tree walk, see `cancel()` below). It
+   command is run as `[shell, <flag>, command]` via `exec`, where the flag is
+   per-shell (`/c` for cmd.exe, `-c` otherwise; `shell_invocation_flag`); a
+   string command with no `shell` uses `create_subprocess_shell`. The default
+   `shell` is platform-specific (via `platform.DEFAULT_SHELL`): POSIX
+   defaults to `/bin/sh`, so a string command runs as
+   `["/bin/sh", "-c", command]`; on Windows the default is empty, so a
+   string command with no shell goes through `create_subprocess_shell` to the
+   native command processor `%ComSpec%` (cmd.exe). A list command bypasses
+   the shell on every platform. The spawn kwargs start from
+   `platform.new_process_group_kwargs()`: on POSIX `start_new_session=True`
+   puts the job in a fresh session/process group (the child's pid is the
+   pgid), so `cancel()` can take the whole descendant tree down as a unit;
+   on Windows `CREATE_NEW_PROCESS_GROUP` does the same for console process
+   groups, which both shields the job from the daemon console's Ctrl-C and
+   makes it a `CTRL_BREAK_EVENT` target for `cancel()`. It
    assembles `env` (only when the job has `environment` entries, layering them over
    `os.environ` after `fixup_pyinstaller_env`), sets `preexec_fn=self._demote`
    when a uid/gid is configured, requests `stdout`/`stderr` PIPEs per
@@ -599,11 +602,13 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
    unconditionally, even when the child exited in time, because descendants
    sharing its group are what hold the job's stdout/stderr pipes open
    (fallback: `proc.kill()` on the direct child). On POSIX both group signals
-   are `os.killpg` (SIGTERM, then SIGKILL). On Windows a non-forced call
-   always reports "not signalled" (there is no process group and no graceful
-   kill), so the graceful step is the direct-child `TerminateProcess`
-   fallback, and the forced step shells out to `taskkill /F /T`, which walks
-   the live process tree (the `taskkill` run is bounded at 10s). A run whose
+   are `os.killpg` (SIGTERM, then SIGKILL). On Windows the graceful call
+   delivers `CTRL_BREAK_EVENT` to the job's process group (trappable as
+   `SIGBREAK`); where the break cannot be delivered (no shared console, as
+   in a service context) that call degrades to the tree kill immediately,
+   while the root is still alive to anchor the walk. The forced call shells
+   out to `taskkill /F /T`, which walks the live process tree (the
+   `taskkill` run is bounded at 10s). A run whose
    spawn failed (`proc is None`) makes `cancel()` a logged no-op rather than
    an error, since callers (the `Replace` branch, the cluster slot-renewer)
    run outside the scheduler loop's try/except. On a killed run the stream

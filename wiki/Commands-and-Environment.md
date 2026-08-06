@@ -37,16 +37,18 @@ how the process is launched (`RunningJob.start` in `cronstable/job.py`):
 
 - **String**: run through a shell.
   - If `shell` is set, cronstable launches `asyncio.create_subprocess_exec` with
-    argv `[shell, "-c", command]`. With the default `shell` on POSIX, that is
-    `["/bin/sh", "-c", command]`.
+    argv `[shell, <flag>, command]`, where the flag is per-shell: `/c` for
+    `cmd`/`cmd.exe` and `-c` for everything else
+    (`shell_invocation_flag` in `cronstable/job.py`). With the default `shell`
+    on POSIX, that is `["/bin/sh", "-c", command]`.
   - If `shell` is falsy, cronstable instead uses `asyncio.create_subprocess_shell`
     with the bare command string. On POSIX the default `/bin/sh` makes the
-    `exec`-with-`-c` path the one that runs; on Windows the default `shell` is
+    `exec`-with-flag path the one that runs; on Windows the default `shell` is
     empty (`DEFAULT_SHELL` in `cronstable/platform.py`), so the
     `create_subprocess_shell` path is the default: the command is handed to the
     native command processor `cmd.exe` via `%ComSpec%`. Setting `shell:`
-    explicitly on Windows takes the `exec`-with-`-c` path with that interpreter.
-    See [Running on Windows](Running-on-Windows).
+    explicitly on Windows takes the `exec`-with-flag path with that
+    interpreter. See [Running on Windows](Running-on-Windows).
 - **List**: executed directly with `asyncio.create_subprocess_exec`, with no
   shell involved. The argv is taken verbatim from the list; no word splitting,
   globbing, quoting, or `$VAR` expansion is performed.

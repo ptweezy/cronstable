@@ -235,7 +235,59 @@ def test_missing_default_config_exits_1(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         main.main_loop(_loop())
     assert exc.value.code == 1
-    assert "configuration file not found" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "configuration file not found" in err
+    # the error names the path it looked in and the way out; before it did
+    # neither, and the reader had to find the default in the wiki.
+    assert main.CONFIG_DEFAULT in err
+    assert "cronstable init" in err
+
+
+def test_init_writes_a_starter_the_daemon_can_load(
+    monkeypatch, tmp_path, capsys
+):
+    target = tmp_path / "confdir"
+    monkeypatch.setattr(sys, "argv", ["cronstable", "init", str(target)])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    written = target / "cronstable.yaml"
+    assert written.is_file()
+    out = capsys.readouterr().out
+    assert str(written) in out
+    assert "cronstable -c" in out  # a non-default target needs the flag
+    # the starter is a real, loadable config carrying the hello job
+    conf = parse_config(str(target))
+    assert [job.name for job in conf.jobs] == ["hello"]
+
+
+def test_init_refuses_a_directory_with_existing_config(
+    monkeypatch, tmp_path, capsys
+):
+    target = tmp_path / "confdir"
+    target.mkdir()
+    (target / "live.yaml").write_text("jobs: []\n")
+    monkeypatch.setattr(sys, "argv", ["cronstable", "init", str(target)])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 1
+    assert "live.yaml" in capsys.readouterr().err
+    assert not (target / "cronstable.yaml").exists()
+
+
+def test_init_defaults_to_the_platform_config_directory(
+    monkeypatch, tmp_path, capsys
+):
+    fake_default = str(tmp_path / "default-confdir")
+    monkeypatch.setattr(main, "CONFIG_DEFAULT", fake_default)
+    monkeypatch.setattr(sys, "argv", ["cronstable", "init"])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    assert (tmp_path / "default-confdir" / "cronstable.yaml").is_file()
+    # the default location needs no -c to start
+    out = capsys.readouterr().out
+    assert "start the scheduler with: cronstable\n" in out
 
 
 def test_config_error_exits_1(monkeypatch):

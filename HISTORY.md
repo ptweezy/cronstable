@@ -86,6 +86,61 @@ review covered.
   round trips each refresh; entries for jobs removed by a reload are
   pruned.
 
+Windows fixes and additions from a gap review against Task Scheduler.
+
+- `shell: cmd` actually runs the command. cronstable now passes cmd.exe its
+  `/c` flag (every other shell keeps `-c`); before, cmd.exe was handed the
+  POSIX `-c`, started an interactive shell, printed its banner, read EOF
+  and exited 0, so the job recorded a clean success forever without ever
+  running anything. The shell reporter had the same flaw and the same fix.
+- Jobs are spawned in their own Windows process group. Ctrl-C in the
+  daemon's console no longer kills every in-flight job with 0xC000013A
+  (and then reported each one failed through every configured reporter);
+  a graceful daemon shutdown now genuinely waits for running jobs, as the
+  docs always said.
+- Job termination on Windows is a real two-step: a trappable
+  CTRL_BREAK_EVENT to the job's process group, then, `killTimeout`
+  seconds later, the `taskkill /F /T` tree kill. A job can now catch
+  the break (`signal.SIGBREAK`) and flush before exiting, and
+  `killTimeout` means on Windows what it means on POSIX. Where no
+  console is shared (a service context) the graceful step degrades to
+  the immediate tree kill, as before.
+- Closing the daemon's console window, logging off, and OS shutdown now
+  trigger the graceful drain (a native console-control handler; Python's
+  signal module never surfaces those events), bounded by the few seconds
+  of grace Windows grants.
+- `POST /shutdown`: an authenticated route that runs the same graceful
+  drain as Ctrl-C/SIGTERM, for supervised and console-less deployments.
+  Refused unless the request carries a configured bearer token, even
+  where the rest of the API is open.
+- The Windows default config path prefers the machine-wide
+  `%ProgramData%\cronstable` whenever that directory exists, falling back
+  to the per-user `%APPDATA%\cronstable` as before, so a service account
+  and an interactive administrator resolve the same configuration.
+- `cronstable init` writes a commented starter configuration into the
+  default config directory (or a directory of your choosing), and the
+  config-not-found error now names the path it looked in and suggests it.
+- Captured job output decodes as strict UTF-8 with an OEM-code-page retry
+  on Windows, so `dir` output and localized OS messages keep their
+  accents instead of collapsing to replacement characters; the
+  passthrough mirror writes the daemon's own stream encoding rather than
+  hardcoded UTF-8.
+- A classic crontab assigning `SHELL=` an absolute POSIX path is refused
+  at config load on Windows with the assignment's file:line (every entry
+  below it would otherwise fail at spawn); a POSIX `PATH=` assignment
+  warns. `env_file` files with a UTF-8 BOM no longer corrupt their first
+  variable's name.
+- The Windows executables carry a version resource (product, version,
+  copyright in Properties > Details), and a failed winget manifest update
+  now fails the release instead of warning on a job that could not fail;
+  the manifests had gone two releases stale under the old suppressions.
+- The wiki's Windows pages were corrected to match: the job-termination
+  table described the pre-1.2.36 kill order, killTimeout was documented
+  as bounding a wait that did not exist, and console close was claimed to
+  reach SIGBREAK, which it never did. Running on Windows now also carries
+  a running-unattended section (Task Scheduler recipe, log-file config,
+  stop path, firewall note) and the Fast Startup caveat for `@reboot`.
+
 ## 1.2.36 (2026-08-03)
 
 Defect fixes from a full-application review.

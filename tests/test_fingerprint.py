@@ -536,9 +536,32 @@ def test_job_set_id_golden_value():
     assert job_digest(jobs[0]) == GOLDEN_ALPHA_DIGEST
 
 
-# The golden above is the strongest tripwire for an accidental identity change,
-# but it is POSIX-only (the report block's default shell is platform-scoped), so
-# a Windows-only test run reports green while CI's Linux row fails. These lock
+# The Windows sibling of the golden above; the two literals differ only
+# because the report block's default shell is platform-scoped ("" vs
+# /bin/sh). Until this existed, an identity change that was Windows-specific
+# repointed the persisted retry ladders and @reboot markers keyed by
+# job_digest with every CI row green (the POSIX golden is skipped there).
+# Same regen recipe as the POSIX one, run on a Windows box.
+GOLDEN_JOB_SET_ID_WINDOWS = (
+    "v1:f36bac1e7475f81db604725ccb1c142ec26154698889c8f55da4c0bb38f66219"
+)
+GOLDEN_ALPHA_DIGEST_WINDOWS = (
+    "1f2f088b39c6eaab3358167b302042beead3c386673e47b5910ef1bf333f11f9"
+)
+
+
+@pytest.mark.skipif(
+    not IS_WINDOWS,
+    reason="golden digest for the Windows report-shell default",
+)
+def test_job_set_id_golden_value_windows():
+    jobs = _jobs(GOLDEN_CONFIG)
+    assert job_set_id(jobs) == GOLDEN_JOB_SET_ID_WINDOWS
+    assert job_digest(jobs[0]) == GOLDEN_ALPHA_DIGEST_WINDOWS
+
+
+# The goldens above are the strongest tripwire for an accidental identity
+# change, one per platform-scoped report-shell default. These additionally lock
 # the omit-when-default rule for the *nested* report keys on every platform:
 # they assert on the presence/absence of the key and on relative digests, never
 # on a platform-scoped literal. A new entry in config._REPORT_DEFAULTS merges

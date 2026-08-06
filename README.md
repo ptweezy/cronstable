@@ -17,7 +17,7 @@
 # cronstable™
 / kraahn-stuh-bl /
 
-A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-inlcuded, security-hardened, production-ready cron replacement.
+A stability-focused, container-friendly, optionally-distributed, fault-tolerant, highly-available, leader-electing, configurable, precompiled, multi-architecture, portable, batteries-included, security-hardened, production-ready cron replacement.
 
 ## Why cronstable?
 
@@ -209,8 +209,10 @@ these is a few lines of config away:
   ([example gallery](#example-gallery)).
 
 Already have a crontab? You don't have to translate it:
-`cronstable -c /etc/crontab` runs the classic format as-is (see
-[Classic crontab files](#classic-crontab-files)).
+`cronstable -c my.crontab` (a `crontab -l` export) runs the classic format
+as-is (see [Classic crontab files](#classic-crontab-files); the six-field
+*system* format of `/etc/crontab` carries an extra user column that has to
+come out first).
 
 ## Installation
 
@@ -393,9 +395,13 @@ required). Everything else, like the YAML crontab, scheduling, reporting, retrie
 the HTTP API and the [web dashboard](#web-dashboard), works the same as on
 POSIX. A few platform details differ:
 
-* **Default config location.** When `-c` is omitted, cronstable looks in
-  `%APPDATA%\cronstable` (e.g. `C:\Users\you\AppData\Roaming\cronstable`), the
-  Windows analog of `/etc/cronstable.d`. Point it anywhere with `-c`:
+* **Default config location.** When `-c` is omitted, cronstable looks in the
+  machine-wide `%ProgramData%\cronstable` (the Windows analog of
+  `/etc/cronstable.d`) whenever that directory exists, and otherwise in the
+  per-user `%APPDATA%\cronstable`
+  (e.g. `C:\Users\you\AppData\Roaming\cronstable`). `cronstable init` writes a
+  commented starter configuration into the default location, and `-c` points
+  anywhere:
 
   ```shell
   cronstable -c C:\path\to\cronstable.yaml
@@ -403,8 +409,10 @@ POSIX. A few platform details differ:
 
 * **Default shell.** A string `command` with no explicit `shell` runs through
   the native command processor (`%ComSpec%`, i.e. `cmd.exe`), mirroring the
-  `/bin/sh` default on POSIX. For PowerShell, or any other interpreter, set
-  `shell:` or pass `command` as a list (which bypasses the shell entirely):
+  `/bin/sh` default on POSIX. `shell: cmd` and `shell: powershell` both work
+  as written (cronstable passes cmd.exe its `/c` flag and every other shell
+  `-c`). For PowerShell, or any other interpreter, set `shell:` or pass
+  `command` as a list (which bypasses the shell entirely):
 
   ```yaml
   jobs:
@@ -417,9 +425,18 @@ POSIX. A few platform details differ:
       captureStdout: true
   ```
 
-* **Graceful shutdown.** Press `Ctrl-C` (or `Ctrl-Break`) to stop cronstable; it
-  shuts down after the currently running jobs finish, just as `SIGTERM` does on
-  POSIX.
+* **Graceful shutdown.** Press `Ctrl-C` to stop cronstable; it shuts down after
+  the currently running jobs finish, just as `SIGTERM` does on POSIX (each
+  job runs in its own console process group, so the keystroke never reaches
+  the jobs themselves). Closing the console window, logging off, and OS
+  shutdown trigger the same drain on the OS's few seconds of grace, and the
+  authenticated `POST /shutdown` route stops a console-less daemon.
+
+* **Running unattended.** Register cronstable as a boot-time Task Scheduler task
+  (or under a service wrapper) with the machine-wide config; the wiki's
+  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows)
+  page carries the copy-paste `schtasks` recipe, a rotating-log config, and
+  the stop path.
 
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,

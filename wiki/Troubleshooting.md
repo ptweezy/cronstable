@@ -9,32 +9,32 @@ for deployment specifics see [Production and Container Deployment](Production-De
 
 ### "configuration file not found"
 
-**Symptom.** cronstable exits immediately with:
+**Symptom.** cronstable exits immediately with (the resolved default path filled
+in):
 
 ```text
-cronstable error: configuration file not found, please provide one with the --config option
+cronstable error: configuration file not found at the default location (<default path>). Run `cronstable init` to create a starter configuration there, or point -c/--config at an existing file or directory.
 ```
 
 followed by the argument help, and exit code `1`.
 
 **Cause.** `__main__.py` defaults `-c`/`--config` to a platform-specific
-`CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH`: `/etc/cronstable.d` on POSIX, or
-`%APPDATA%\cronstable` on Windows (for example `C:\Users\<you>\AppData\Roaming\cronstable`,
+`CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH`: `/etc/cronstable.d` on POSIX; on
+Windows `%ProgramData%\cronstable` when that directory exists, otherwise
+`%APPDATA%\cronstable` (for example `C:\Users\<you>\AppData\Roaming\cronstable`,
 falling back to the user profile `~` if `APPDATA` is unset). When that default is in
 effect *and* the path does not exist
 (`args.config == CONFIG_DEFAULT and not os.path.exists(args.config)`), cronstable
 prints the error and exits before constructing the scheduler. The not-found special
-case keys off the *platform default value*, not the literal string `/etc/cronstable.d`,
-so on Windows it fires when `-c` is left at `%APPDATA%\cronstable` and that path does not
-exist. See [Running on Windows](Running-on-Windows).
+case keys off the *platform default value*, not the literal string `/etc/cronstable.d`.
+See [Running on Windows](Running-on-Windows).
 
-**Fix.** Create `/etc/cronstable.d/` and place `*.yaml`/`*.yml` files in it, or pass an
-explicit path with `-c FILE-OR-DIR` (a single file or a directory). On Windows the
-default location to create and populate is `%APPDATA%\cronstable` rather than
-`/etc/cronstable.d`; see [Running on Windows](Running-on-Windows). Note the error
-text is only emitted for the *default* path; an explicit `-c` pointing at a missing
-file instead surfaces as a `ConfigError` (see below). See the
-[Command-Line Reference](CLI-Reference).
+**Fix.** Run `cronstable init` (optionally with a target directory) to create the
+directory with a commented starter file, or create it yourself and place
+`*.yaml`/`*.yml` files in it, or pass an explicit path with `-c FILE-OR-DIR` (a
+single file or a directory). Note the error text is only emitted for the
+*default* path; an explicit `-c` pointing at a missing file instead surfaces as
+a `ConfigError` (see below). See the [Command-Line Reference](CLI-Reference).
 
 ### "Configuration error" / a missing or unreadable explicit config file
 
@@ -608,14 +608,17 @@ after `killTimeout` seconds (default `30`) an unconditional `SIGKILL` to the gro
 sent even if the main process already exited, so background helpers the command left
 behind go down with it.
 
-**Windows note.** The group signalling is POSIX behavior. Windows has no POSIX
-signals and no process group: the graceful step is `TerminateProcess` on the direct
-child (immediate, not trappable), and the forced step is a `taskkill /F /T` kill of
-the job's live process tree. `killTimeout` still bounds the wait between the two.
-See [Running on Windows](Running-on-Windows).
+**Windows note.** The same two-step runs with Windows primitives: the graceful
+step is a trappable `CTRL_BREAK_EVENT` to the job's process group
+(`signal.SIGBREAK` in Python), and the forced step is a `taskkill /F /T` kill
+of the job's live process tree, `killTimeout` seconds later. A daemon with no
+console (a service context) cannot deliver the break; there the graceful step
+becomes the tree kill immediately and `killTimeout` adds nothing. See
+[Running on Windows](Running-on-Windows).
 
 **Fix.** Raise `executionTimeout`, or give the process more graceful-shutdown time via
-`killTimeout`. See
+`killTimeout` (have the job handle `SIGTERM` on POSIX / `SIGBREAK` on Windows to
+use that grace). See
 [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
 on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
@@ -625,6 +628,12 @@ on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 | ------ | ------------------------------------------------------------------- |
 | `127`  | Command could not be launched (e.g. executable not found)           |
 | `-100` | Job cancelled because it exceeded `executionTimeout`                |
+
+Two Windows codes worth recognizing in run history: `1` is what
+`taskkill /F` leaves behind (a run reaped by the forced tree kill reports it,
+indistinguishable from a job's own `exit 1`), and `3221225786` (`0xC000013A`,
+`STATUS_CONTROL_C_EXIT`) means the process was ended by a console control
+event, typically a job that received the graceful break and did not trap it.
 
 These appear in logs and in report template `exit_code`. See
 [Architecture and Internals](Architecture-and-Internals) for the scheduler and
