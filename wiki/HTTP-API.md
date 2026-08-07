@@ -163,9 +163,9 @@ job) and `401` (authentication failure) responses are raised without it.
 
 Every error body on this API is one JSON envelope: `{"error": "<reason>"}`
 (`Content-Type: application/json`), across the job, DAG, schedule, state, and
-push routes alike. The one exception is the `401` from the auth middleware,
-which is bodyless. `docs/openapi.yaml` declares the same envelope as the
-`Error` schema.
+push routes alike. That includes the `401` from the auth middleware and the
+router's own responses (`405` on a wrong method, `404` on an unmatched path).
+`docs/openapi.yaml` declares the same envelope as the `Error` schema.
 
 > The same interface serves the **[Web Dashboard](Web-Dashboard)** at `/`; that
 > page is the visual tour of the UI these endpoints feed.

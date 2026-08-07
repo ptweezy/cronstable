@@ -344,6 +344,8 @@ How the evaluation works:
   mid-backfill (or mid-jitter) resumes from the open checkpoint's watermark
   instead of silently forfeiting the owed runs. The trade is at-least-once: a
   crash between the last backfill launch and the `close` record replays.
+  Scheduled [DAGs](Orchestration-and-DAGs) keep the same discipline in their
+  own `catchup-dag/<dag>` streams.
 * **Backfills are plain runs, minus the ladder.** Each backfilled launch
   respects `concurrencyPolicy` (serialized, waiting for the job to go idle;
   `Forbid` waits unbounded) but launches *without* the retry ladder, so a

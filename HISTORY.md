@@ -5,22 +5,31 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
-## 1.2.38
+## 1.2.37
 
 - `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
   spread plain-job backfills: the same deterministic per-name offset,
   slept out on a spawned task so one dag's spread never stalls the
   scheduler pass. The key was accepted and validated on dag schedules but
-  silently never applied.
+  silently never applied. The deferred replay also checkpoints the
+  watermark it owes (a `catchup-dag/<dag>` stream, the twin of the job
+  engine's `catchup/<job>`) before the sleeper spawns and closes the
+  cycle after the last run document lands. A restart during the offset
+  used to lose the backfill to run documents created meanwhile; now it
+  resumes from the checkpoint. And after the sleep the replay re-checks
+  `onMissed`, the schedule type, and cluster ownership, as the job
+  backfill always has.
 - Every 4xx and 5xx body the web API serves is now one JSON envelope,
   `{"error": "<reason>"}`, across the job, DAG, schedule, state, and push
-  routes alike (the auth middleware's 401 stays bodyless). Previously the
-  body was JSON on some handler families, plain text on others, and empty
-  on a few, so a client had to sniff per endpoint. The envelope's own
-  content type wins over a `web.headers` one in any spelling, the rule
-  `/metrics` and the live tails already followed; a deployment that set a
-  content type there would otherwise have seen the start/cancel 409 come
-  back as a 500.
+  routes alike, including the auth middleware's 401 and the router's own
+  405 (wrong method) and 404 (unmatched path). Previously the body was
+  JSON on some handler families, plain text on others, and empty on a
+  few, so a client had to sniff per endpoint. The envelope's own content
+  type wins over a `web.headers` one in any spelling, the rule `/metrics`
+  and the live tails already followed, and every other endpoint now keeps
+  its own content type the same way, whether it serves JSON, the
+  dashboard page, or a calendar feed. A deployment that set a content
+  type there used to see those routes come back as 500s.
 - `GET /metrics` shares one build across the scrapers that arrive while it
   is rendering, instead of only across those that arrive after it finishes.
   On a large job set the render runs on a worker thread, and every scraper
@@ -260,7 +269,14 @@ project, on which cronstable is based.
   dashboard's client-side schedule engine and the daemon's now runs in
   CI, where playwright is a dev dependency and one matrix cell installs
   the browser. It had been self-skipping everywhere, including on the
-  machines that changed either engine.
+  machines that changed either engine, so that cell now also proves the
+  test passed rather than skipped (a browser-revision skew between the
+  two installers would otherwise restore the silent skip). The
+  differential compares validity verdicts as well as the previews of
+  mutually-valid expressions: the sandbox's step parsing is strict the
+  way the engine's is, where it used to salvage numeric prefixes and
+  confidently describe `*/2.5`-style schedules the daemon refuses to
+  load.
 - A second YAML-parse benchmark, `config.parse_yaml_3k`, gates the config
   parse at a job count where a complexity regression is visible. The
   quadratic `Seq` validation fixed above shows up at 300 jobs, the size
@@ -269,7 +285,81 @@ project, on which cronstable is based.
 - The logo engine's four inlined copies (dashboard, demo, logo lab and the
   comparison page) are pinned identical by a test, where only the
   dashboard and demo pair had a drift guard before.
-
+- A finished run's live-log ring buffer is released once a newer run
+  supersedes it. Only the newest run's logs are replayable, but every
+  retained history entry kept its full ring in memory anyway, so a
+  long-running daemon with chatty jobs slowly pinned unservable log
+  buffers, up to fifty rings per job.
+- Lease heartbeats skip the directory flush. A renew or release only moves
+  the expiry of a lease whose fence it keeps, and losing such a write to a
+  crash just means the lease expires a little earlier, so an idle HA pair
+  no longer spends tens of thousands of directory flushes a day
+  maintaining its election. Writes that issue or bump a fence keep the
+  full crash-durability barrier, and every lease write still flushes its
+  own bytes before the rename.
+- `GET /dags` answers an unchanged conditional poll with `304 Not
+  Modified` and compresses large bodies for clients that accept gzip;
+  `GET /cluster` compresses too. The per-dag run listing behind the
+  `/dags` rollup and the run drawer is additionally served from a short
+  memo between local changes, so dashboard polling of a quiet store no
+  longer performs one store listing per dag per poll per viewer.
+- A mapped task's fan-out list is parsed from the artifact's bytes
+  directly (no decoded second copy) and, past 64 KiB, on a worker thread.
+  Parsing a multi-MB XCom inline used to stall the scheduler loop for
+  tens of milliseconds per expansion.
+- `fromFile` secrets are read on a worker thread when a run is staged.
+  The read sits inside the launch chain, so a slow or hung secret mount
+  (a Kubernetes secret volume, NFS) used to stall the event loop itself
+  rather than just that launch.
+- Boot rehydration reads the ledger sixteen jobs at a time instead of one
+  by one. Warm-up ran before the first scheduling pass, so its wall clock
+  was pure boot delay: seconds at fleet scale on local disk, minutes on a
+  network mount, and a hung mount now costs one read timeout, not one per
+  job.
+- Subprocess spawns are gated sixteen at a time when one slot launches
+  many jobs. The fork/exec setup is synchronous work on the event loop,
+  and an ungated 500-job burst occupied it for up to a second each minute
+  boundary while web requests and cluster heartbeats waited.
+- One built `GET /jobs` response (payload, ETag, body, gzip) is shared
+  across every poller for up to a second, and locally recorded runs,
+  launches, pauses and reloads rebuild it immediately. A wallboard plus N
+  dashboard tabs used to cost N identical builds per poll cycle.
+- The state garbage collector sweeps idempotency documents whose TTL
+  lapsed a whole grace window ago. An expired claim is already
+  re-winnable, but its document stayed on disk forever, so the documented
+  per-event dedupe pattern grew a flat directory without bound.
+- Job output mirrored to the daemon's own stdout/stderr is written by a
+  dedicated thread with a bounded queue. The write used to run on the
+  event loop, so a consumer that stopped reading (a stopped
+  `docker logs`, a suspended console) froze the entire daemon; now it
+  wedges only the mirror, which sheds its oldest batches (the queue is
+  bounded in both count and bytes) until the consumer drains.
+- Dashboard: the header mark's glow is applied per drawn primitive
+  instead of on the whole svg, whose animated geometry forced a
+  near-half-viewport filter re-raster every frame; the per-second
+  relative-time sweep skips cells whose text did not change; the
+  secondary poll fetches (`/cluster`, `/node`, `/dags`, `/state`) skip a
+  cycle while their previous request is still in flight instead of
+  stacking connections against the browser's per-origin cap; and the
+  balance-recovery planner skips a frame after any pass that overran its
+  budget, so weak machines drop to half-rate planning instead of dropped
+  frames (validated by a knockover Monte Carlo: 24 of 24 seeds caught
+  and held at forced half rate; `planBudgetMs: 0` pins the budget off
+  for deterministic captures).
+- A live SSE log tail delivers a burst of lines as one joined write per
+  wake instead of one timer task, one frame build and one transport
+  write per line per viewer, which cost the scheduler's loop thousands
+  of coroutine steps a second under a chatty job. The framing benchmark
+  moved with the code: `webapi.sse_burst_20k` times the burst path and
+  retires `webapi.sse_frame_20k`, whose per-line seam no longer exists.
+  The smoke test's never-skip net is now derived from
+  `benchmarks/expected_gated.txt` instead of hand-copied from it, which
+  is the gap that had let the old metric die silently.
+- TUI: the heat overlay's per-job run fetches run as a background task
+  with a few requests in flight, instead of strictly one at a time
+  inside the poll loop, which froze every panel for the sum of up to 40
+  round trips each refresh; entries for jobs removed by a reload are
+  pruned.
 - Each job's run-ledger writes are chained, so two completions close
   enough to overlap (a `concurrencyPolicy: Allow` pair, a retry firing
   straight after its parent's failure, a catch-up burst, crash
@@ -338,87 +428,6 @@ Windows fixes and additions from a gap review against Task Scheduler.
   reach SIGBREAK, which it never did. Running on Windows now also carries
   a running-unattended section (Task Scheduler recipe, log-file config,
   stop path, firewall note) and the Fast Startup caveat for `@reboot`.
-
-## 1.2.37
-
-The top findings of a performance review of the tree the 1.2.36 defect
-review covered.
-
-- A finished run's live-log ring buffer is released once a newer run
-  supersedes it. Only the newest run's logs are replayable, but every
-  retained history entry kept its full ring in memory anyway, so a
-  long-running daemon with chatty jobs slowly pinned unservable log
-  buffers, up to fifty rings per job.
-- Lease heartbeats skip the directory flush. A renew or release only moves
-  the expiry of a lease whose fence it keeps, and losing such a write to a
-  crash just means the lease expires a little earlier, so an idle HA pair
-  no longer spends tens of thousands of directory flushes a day
-  maintaining its election. Writes that issue or bump a fence keep the
-  full crash-durability barrier, and every lease write still flushes its
-  own bytes before the rename.
-- `GET /dags` answers an unchanged conditional poll with `304 Not
-  Modified` and compresses large bodies for clients that accept gzip;
-  `GET /cluster` compresses too. The per-dag run listing behind the
-  `/dags` rollup and the run drawer is additionally served from a short
-  memo between local changes, so dashboard polling of a quiet store no
-  longer performs one store listing per dag per poll per viewer.
-- A mapped task's fan-out list is parsed from the artifact's bytes
-  directly (no decoded second copy) and, past 64 KiB, on a worker thread.
-  Parsing a multi-MB XCom inline used to stall the scheduler loop for
-  tens of milliseconds per expansion.
-- `fromFile` secrets are read on a worker thread when a run is staged.
-  The read sits inside the launch chain, so a slow or hung secret mount
-  (a Kubernetes secret volume, NFS) used to stall the event loop itself
-  rather than just that launch.
-- Boot rehydration reads the ledger sixteen jobs at a time instead of one
-  by one. Warm-up ran before the first scheduling pass, so its wall clock
-  was pure boot delay: seconds at fleet scale on local disk, minutes on a
-  network mount, and a hung mount now costs one read timeout, not one per
-  job.
-- Subprocess spawns are gated sixteen at a time when one slot launches
-  many jobs. The fork/exec setup is synchronous work on the event loop,
-  and an ungated 500-job burst occupied it for up to a second each minute
-  boundary while web requests and cluster heartbeats waited.
-- One built `GET /jobs` response (payload, ETag, body, gzip) is shared
-  across every poller for up to a second, and locally recorded runs,
-  launches, pauses and reloads rebuild it immediately. A wallboard plus N
-  dashboard tabs used to cost N identical builds per poll cycle.
-- The state garbage collector sweeps idempotency documents whose TTL
-  lapsed a whole grace window ago. An expired claim is already
-  re-winnable, but its document stayed on disk forever, so the documented
-  per-event dedupe pattern grew a flat directory without bound.
-- Job output mirrored to the daemon's own stdout/stderr is written by a
-  dedicated thread with a bounded queue. The write used to run on the
-  event loop, so a consumer that stopped reading (a stopped
-  `docker logs`, a suspended console) froze the entire daemon; now it
-  wedges only the mirror, which sheds oldest batches until the consumer
-  drains.
-- Dashboard: the header mark's glow is applied per drawn primitive
-  instead of on the whole svg, whose animated geometry forced a
-  near-half-viewport filter re-raster every frame; the per-second
-  relative-time sweep skips cells whose text did not change; the
-  secondary poll fetches (`/cluster`, `/node`, `/dags`, `/state`) skip a
-  cycle while their previous request is still in flight instead of
-  stacking connections against the browser's per-origin cap; and the
-  balance-recovery planner skips a frame after any pass that overran its
-  budget, so weak machines drop to half-rate planning instead of dropped
-  frames (validated by a knockover Monte Carlo: 24 of 24 seeds caught
-  and held at forced half rate; `planBudgetMs: 0` pins the budget off
-  for deterministic captures).
-- A live SSE log tail delivers a burst of lines as one joined write per
-  wake instead of one timer task, one frame build and one transport
-  write per line per viewer, which cost the scheduler's loop thousands
-  of coroutine steps a second under a chatty job. The framing benchmark
-  moved with the code: `webapi.sse_burst_20k` times the burst path and
-  retires `webapi.sse_frame_20k`, whose per-line seam no longer exists.
-  The smoke test's never-skip net is now derived from
-  `benchmarks/expected_gated.txt` instead of hand-copied from it, which
-  is the gap that had let the old metric die silently.
-- TUI: the heat overlay's per-job run fetches run as a background task
-  with a few requests in flight, instead of strictly one at a time
-  inside the poll loop, which froze every panel for the sum of up to 40
-  round trips each refresh; entries for jobs removed by a reload are
-  pruned.
 
 ## 1.2.36 (2026-08-03)
 

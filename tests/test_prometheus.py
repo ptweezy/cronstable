@@ -978,10 +978,18 @@ async def test_web_metrics_gzip_declined_when_client_says_q0():
 
 
 @pytest.mark.asyncio
-async def test_web_metrics_shares_one_build_across_simultaneous_scrapers():
+async def test_web_metrics_shares_one_build_across_simultaneous_scrapers(
+    monkeypatch,
+):
     # N scrapers landing together used to each rebuild the whole metric
     # universe on the event loop. One build is shared for the memo window;
     # a local change busts it (see _bust_response_memos).
+    import cronstable.cron
+
+    # widened so the exact build counts below cannot be broken by a stall
+    # between awaits (CPU steal on a loaded runner under --cov inserts an
+    # extra build past the real 1.0s TTL).
+    monkeypatch.setattr(cronstable.cron, "_METRICS_RESPONSE_TTL", 3600.0)
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {}
     builds = []
