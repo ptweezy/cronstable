@@ -75,7 +75,10 @@ from typing import (
 # once per FILENAME per directory listing, and at that rate the
 # IMPORT_NAME/IMPORT_FROM pair a function-local import compiles to is
 # measurable.  It costs nothing at import time either way, since importing
-# this module already pulls urllib.parse in through cronstable._json.
+# this module already pulls urllib.parse in through cronstable.config (whose
+# own `from urllib.parse import ParseResult, urlparse` is the real provider;
+# check before deferring THAT one, because this line sits above the config
+# import and would then become the thing putting urllib.parse on the graph).
 from urllib.parse import unquote_to_bytes
 
 from cronstable import _json
@@ -387,15 +390,19 @@ def _decode_fs_token(token: str) -> Optional[str]:
     prefix ends in ``/`` (``runs/``, ``manifests/``, ``dagrun/``), and a
     scheduled DAG run key is an ISO instant, so the ordinary on-disk token is
     heavily escaped (``2026-08-07%5412%3A00%3A00_00%3A00``) and goes the slow
-    way; manual run keys and plain document keys are what hit.  That is why
-    the ``"%"`` test comes first, and its job is to make the MISS cheap: it
-    scans without allocating, where the character test allocates, and leading
-    with the character test measured 21% to 42% slower per escaped listing
-    than carrying no fast path at all.  As ordered here, escaped listings run
-    7% to 10% cheaper than with no fast path (all of that the module-scope
-    ``unquote_to_bytes``, not this branch) and unescaped ones ~80% cheaper.
-    On escaped names the win that matters is :data:`_FS_BYTE_ESCAPE`, in the
-    re-encode above.
+    way; manual run keys and plain document keys are what hit.  So the branch
+    is a trade.  Against carrying no fast path at all, a 50-entry listing of
+    escaped names costs 2% to 9% more, and one of unescaped names costs ~75%
+    less, which is the figure it is kept for.
+
+    The ``"%"`` test comes first to hold that first cost down: it scans
+    without allocating, where the character test allocates, so leading with
+    the character test instead costs 13% to 20% on those same escaped
+    listings.  Ordering it this way is worth 3% to 16% of an escaped listing.
+
+    Escaped names got faster elsewhere, in :data:`_FS_BYTE_ESCAPE` in the
+    re-encode above and in the module-scope ``unquote_to_bytes``.  Both apply
+    whether or not this branch exists.
     """
     if (
         "%" not in token

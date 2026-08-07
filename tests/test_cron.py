@@ -4535,7 +4535,6 @@ async def test_web_json_endpoints_tolerate_operator_content_type():
         await cron.start_stop_web_app(None)
 
 
-@pytest.mark.asyncio
 def test_error_envelope_middleware_carries_the_new_style_marker():
     # An UNMARKED middleware is not refused: aiohttp reads it as a pre-3.0
     # middleware FACTORY, calls it as m(app, handler), and every request 500s
@@ -4557,6 +4556,7 @@ def test_error_envelope_middleware_carries_the_new_style_marker():
     )
 
 
+@pytest.mark.asyncio
 async def test_web_errors_carry_the_json_envelope():
     # every error body is one JSON envelope, including the three families
     # that used to escape as aiohttp's text/plain defaults: the auth
