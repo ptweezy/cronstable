@@ -57,6 +57,13 @@ def _read(path):
         return fh.read()
 
 
+def _fn_body(html, name, path):
+    """Slice a top-level function body out of the page's app script."""
+    m = re.search(r"(?:async )?function %s\(.*?\n  \}\n" % name, html, re.DOTALL)
+    assert m, "%s() not found in %s" % (name, path)
+    return m.group(0)
+
+
 def test_demo_is_the_dashboard_plus_only_its_fake_backend():
     web = _read(WEB)
     demo = _read(DEMO)
@@ -145,78 +152,94 @@ def test_no_streamed_log_pane_measures_the_buffer_per_line():
     ), "appendDagLogLine no longer bounds the pane / follows the shared way"
 
 
-def test_every_secondary_poll_loader_holds_an_in_flight_guard():
-    """No secondary poll can launch a second request over its own first.
+def test_every_secondary_poll_loader_is_single_flight():
+    """Every secondary poll loader routes its fetch through singleFlight().
 
-    Every one of these is fired without awaiting, from the jobs poll
-    (loadJobs) or from the cluster poll, so a daemon slower than the poll
-    interval used to add one more overlapping request per cycle against the
-    browser's ~6-per-origin connection cap, which the held SSE tails already
-    lean on.  The per-loader sequence numbers only order the APPLY; they never
-    stopped the launch.  /fleet was the loader the earlier guard sweep missed,
-    which is what makes this a guard on the whole set rather than on one call
-    site.
+    Each of these is fired without awaiting, from the jobs poll (loadJobs)
+    or from the cluster poll, so a daemon slower than the poll interval
+    used to add one more overlapping request per cycle against the
+    browser's ~6-per-origin connection cap, which the held SSE tails
+    already lean on.  singleFlight() is now the one mechanism: a repeat
+    caller joins the pending request and gets its promise back, and the
+    slot clears when it settles, so overlap is impossible and responses
+    apply in request order.  The loader list is derived from the poll
+    fan-out rather than hardcoded, so a new loader fired from the poll
+    path is picked up automatically and must arrive wrapped.
+
+    The honest boundary of that derivation: direct calls inside
+    loadJobs, loadCluster and loadClusterLease are derived, with or
+    without arguments; a loader fired through an intermediate helper is
+    not.  And the wrap demand applies to the derived callees that issue
+    a request of their own; a load-named helper that only renders data
+    the poll already fetched (loadCell, loadClusterLease itself) has
+    nothing to serialise.
     """
     web = _read(WEB)
-    loaders = {
-        "loadCluster": "cluster",
-        "loadNode": "node",
-        "loadDags": "dags",
-        "loadState": "state",
-        "loadFleet": "fleet",
-    }
-    decl = re.search(r"const secondaryInFlight = \{(.*?)\};", web)
-    assert decl, "the secondaryInFlight registry is gone from %s" % WEB
-    keys = set(re.findall(r"(\w+): false", decl.group(1)))
-    assert keys == set(loaders.values()), (
-        "secondaryInFlight declares %s but this test knows %s. A new "
-        "secondary poll endpoint belongs in the loaders map above, with "
-        "its guard."
-        % (sorted(keys), sorted(loaders.values()))
+
+    # the helper itself: join, promise return, clear on settle
+    h = _fn_body(web, "singleFlight", WEB)
+    assert "if (secondaryInFlight[key]) return secondaryInFlight[key];" in h, (
+        "singleFlight() no longer hands repeat callers the pending promise; "
+        "the #dag deep link's loadDags().then(open) chain would resolve "
+        "before the list arrives and never open the drawer"
     )
-    for fn, key in loaders.items():
-        body = re.search(
-            r"(?:async )?function %s\(.*?\n  \}\n" % fn, web, re.DOTALL
+    assert re.search(
+        r"\.finally\(\(\) => \{ secondaryInFlight\[key\] = null; \}\)", h
+    ), (
+        "singleFlight() no longer clears its slot when the request settles; "
+        "one failed request would stop the endpoint from ever polling again"
+    )
+
+    # Derive the fan-out: every direct loadX( call, with or without
+    # arguments, reachable from the jobs poll (loadJobs) or the cluster
+    # poll's two render branches, so a loader that grows a parameter
+    # cannot slip out of the derived set.  Comments are stripped first:
+    # loadClusterLease's comment mentions loadFleet() in prose.
+    fanout = set()
+    for fn in ("loadJobs", "loadCluster", "loadClusterLease"):
+        body = re.sub(r"(?m)^\s*//.*$", "", _fn_body(web, fn, WEB))
+        fanout |= set(re.findall(r"\b(load[A-Z]\w*)\(", body))
+    fanout.discard("loadJobs")
+    # Only the callees that issue a request of their own can overlap
+    # against the connection cap; a load-named helper that renders data
+    # already fetched (loadCell's table cell, loadClusterLease's lease
+    # branch) has nothing to serialise.
+    fetchers = {
+        fn
+        for fn in fanout
+        if re.search(
+            r"\b(?:apiFetch|fetch)\(",
+            re.sub(r"(?m)^\s*//.*$", "", _fn_body(web, fn, WEB)),
         )
-        assert body, "%s() not found in %s" % (fn, WEB)
-        body = body.group(0)
-        if key == "dags":
-            # loadDags guards by handing back the PENDING promise, not a
-            # bare return: the #dag deep link chains loadDags().then(open),
-            # and at bootstrap the poll cycle has always already started
-            # the fetch, so a bare return resolved the chain against a
-            # list that had not arrived and deep links never opened the
-            # drawer. The slot holds the promise itself (truthy), so the
-            # skip-a-cycle behavior below still holds.
-            assert (
-                "if (secondaryInFlight.dags) return secondaryInFlight.dags;"
-                in body
-            ), (
-                "loadDags() no longer returns its in-flight promise; the "
-                "#dag deep link's loadDags().then(open) chain would resolve "
-                "before the list arrives and never open the drawer"
-            )
-            assert "secondaryInFlight.dags = (async () => {" in body, (
-                "loadDags() no longer claims its in-flight slot with the "
-                "pending promise"
-            )
-        else:
-            assert "if (secondaryInFlight.%s) return;" % key in body, (
-                "%s() no longer skips the cycle while its predecessor is "
-                "still pending; overlapping requests stack up against the "
-                "browser's per-origin connection cap" % fn
-            )
-            assert "secondaryInFlight.%s = true;" % key in body, (
-                "%s() no longer claims its in-flight slot" % fn
-            )
-        # released from a finally, never from the happy path alone: an early
-        # return or a throw would otherwise wedge the slot true and the
-        # endpoint would never be polled again for the life of the page.
-        assert re.search(
-            r"finally\s*\{[^}]*secondaryInFlight\.%s = false;" % key, body
-        ), (
-            "%s() must clear its in-flight slot in a finally block, or one "
-            "failed request stops the endpoint from ever polling again" % fn
+    }
+    # sanity floor: a broken derivation must fail loudly, not pass vacuously
+    assert {"loadCluster", "loadNode", "loadDags", "loadState", "loadFleet"} <= fetchers, (
+        "derived only %s as fetching poll loaders; the derivation no longer "
+        "sees the known ones" % sorted(fetchers)
+    )
+
+    # every derived loader wraps its fetch, and under its own key
+    keys = {}
+    for fn in sorted(fetchers):
+        m = re.search(
+            r'return singleFlight\("(\w+)", async \(\) => \{',
+            _fn_body(web, fn, WEB),
+        )
+        assert m, (
+            "%s() is fired from the poll fan-out but does not wrap its "
+            "fetch in singleFlight" % fn
+        )
+        keys[fn] = m.group(1)
+    assert len(set(keys.values())) == len(keys), (
+        "two loaders share a singleFlight key and would join each other's "
+        "fetches: %s" % keys
+    )
+
+    # the retired seq counters stay retired: with overlap impossible,
+    # responses apply in request order and nothing needs to order the APPLY
+    for relic in ("ReqSeq", "AppliedSeq", "stateSeq", "stateApplied"):
+        assert relic not in web, (
+            "the per-loader seq counter relic %r is back in %s" % (relic, WEB)
         )
 
 

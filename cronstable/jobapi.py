@@ -44,7 +44,7 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from cronstable import _json, jobstate, tlsutil
-from cronstable.config import _is_wildcard_host
+from cronstable.config import ConfigError, _is_wildcard_host, _resolve_secret
 from cronstable.jobstate import GLOBAL_SCOPE, JobStateError
 from cronstable.state import Lease, StateBackend, _DocumentUnreadable
 
@@ -221,6 +221,54 @@ def run_environment(
     if cacert:
         env[ENV_CACERT] = cacert
     return env
+
+
+def _stage_secrets_sync(
+    specs: List[Dict[str, Any]], owner: str
+) -> Dict[str, str]:
+    """Resolve ``secrets`` blocks into a fresh in-memory map, synchronously.
+
+    The ONE staging implementation shared by job launches and DAG task
+    launches (``owner`` is the ``_resolve_secret`` "what" label, e.g.
+    ``"job X"`` or ``"dag D task T"``).  Pure sync (``fromFile`` opens and
+    reads), so :func:`stage_secrets` can push it to the default executor
+    when a file read is involved.
+    """
+    # unified semantics: a secret that cannot be resolved right now (an
+    # unreadable fromFile, an unset fromEnvVar) is skipped WITH a warning,
+    # never fatal: the run sees a 404 for it and fails as it sees fit.
+    # _resolve_secret wraps every plausible resolution error in
+    # ConfigError, so ConfigError is the whole expected surface.
+    secrets: Dict[str, str] = {}
+    for spec in specs:
+        name = spec.get("name")
+        try:
+            value = _resolve_secret(spec, "{} secret {}".format(owner, name))
+        except ConfigError as ex:
+            logger.warning(
+                "%s: could not stage secret %r: %s", owner, name, ex
+            )
+            continue
+        if name and value is not None:
+            secrets[name] = value
+    return secrets
+
+
+async def stage_secrets(
+    specs: List[Dict[str, Any]], owner: str
+) -> Dict[str, str]:
+    """Stage a run's secrets, off the event loop when files are involved.
+
+    The offload rule both callers used: any ``fromFile`` secret stages on
+    the default executor (a slow or hung secret mount must stall a worker
+    thread, never the event loop); value/env secrets stay inline where the
+    thread hop costs more than the dict it builds.
+    """
+    if any(spec.get("fromFile") for spec in specs):
+        return await asyncio.get_running_loop().run_in_executor(
+            None, _stage_secrets_sync, specs, owner
+        )
+    return _stage_secrets_sync(specs, owner)
 
 
 class JobLockManager:

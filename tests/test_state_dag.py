@@ -2538,8 +2538,8 @@ def test_renamed_expand_source_does_not_wedge_an_inflight_run():
 
 
 def test_unmaterialised_expand_source_leaves_downstreams_resolvable():
-    # the resolution must also unblock what waits on the mapped task, not just
-    # the placeholder itself: a downstream all_success task sees the group as
+    # the resolution must unblock the placeholder and whatever waits on the
+    # mapped task: a downstream all_success task sees the group as
     # upstream_failed and terminalises rather than pending forever.
     renamed = _spec(
         TaskSpec("generate"),

@@ -1628,7 +1628,19 @@ class RunningJob:
                 self._resource_monitor = None
         task = self._start_telemetry
         self._start_telemetry = None
-        if task is not None and not task.done():
+        if task is not None and task.done():
+            # already finished: retrieve the outcome anyway, or an exception
+            # that escaped _on_start's OSError net (the statsd endpoint
+            # machinery raises RuntimeError on a closing transport) surfaces
+            # at GC time as an asyncio "Task exception was never retrieved"
+            # error. Cancelled tasks carry no outcome to retrieve.
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "Job %s: failed to send statsd job_started metric",
+                    self.config.name,
+                    exc_info=task.exception(),
+                )
+        elif task is not None:
             # bounded join: with a merely-slow host the start datagram
             # still goes out before the stop one; a host that cannot
             # manage it inside the bound loses the pair (wait_for cancels
@@ -1640,9 +1652,13 @@ class RunningJob:
             except Exception:  # noqa: BLE001 - telemetry is best-effort
                 pass
         if self.statsd_writer:
+            # best-effort like the start datagram: the statsd machinery can
+            # raise beyond OSError (RuntimeError on a closing transport),
+            # and a telemetry failure must never break the completion
+            # accounting every run funnels through here.
             try:
                 await self.statsd_writer.job_stopped()
-            except OSError:
+            except Exception:  # noqa: BLE001 - telemetry is best-effort
                 logger.warning(
                     "Job %s: failed to send statsd job_stopped metric",
                     self.config.name,

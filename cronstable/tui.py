@@ -2768,29 +2768,41 @@ class App:
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
         # in the base class (not AppActions) because the poll loop's fanout
-        # spawns the heat load through it too, not only user actions.
+        # spawns the heat load through it as well as user actions.
         task: "asyncio.Task[None]" = asyncio.get_running_loop().create_task(
             coro
         )
-        task.add_done_callback(lambda t: t.exception())
+        # retrieve the exception so a failed task never logs "exception
+        # was never retrieved"; a cancelled task is skipped, because
+        # Task.exception() RAISES CancelledError there and the callback's
+        # own traceback would land on the restored terminal after quit
+        # tears the loop down mid-fetch.
+        task.add_done_callback(
+            lambda t: None if t.cancelled() else t.exception()
+        )
 
     async def _fanout(self) -> None:
-        with contextlib.suppress(Exception):
-            self.cluster = await self.api.get_json("/cluster")
-        with contextlib.suppress(Exception):
-            self.node = await self.api.get_json("/node")
+        # the secondary GETs are independent of one another, so they go
+        # out together: awaited back to back, every poll cycle paid the
+        # sum of the round trips (up to four serial timeouts against a
+        # stalled daemon) where one round trip covers the whole batch
+        async def leg(attr: str, path: str) -> None:
+            with contextlib.suppress(Exception):
+                setattr(self, attr, await self.api.get_json(path))
+
+        legs = [leg("cluster", "/cluster"), leg("node", "/node")]
         if self.is_open("fleet"):
-            with contextlib.suppress(Exception):
-                self.fleet = await self.api.get_json("/fleet")
+            legs.append(leg("fleet", "/fleet"))
         if self.is_open("state") and self.state_tab == "view":
-            with contextlib.suppress(Exception):
-                self.state_data = await self.api.get_json("/state")
+            legs.append(leg("state_data", "/state"))
+        await asyncio.gather(*legs)
         if self.is_open("heat") and (time.monotonic() - self.heat_loaded > 60):
-            # spawned, never awaited: this fans out one /runs request per
-            # visible job, and awaiting it inline froze the whole poll
-            # pipeline (jobs table, verdict, header) for the sum of the
-            # round trips whenever the overlay was open. The busy flag
-            # covers the window where a slow load outlives the 60s gate.
+            # spawned, never awaited: this issues one batched /activity
+            # fetch (a per-job /runs fan-out against a daemon without it),
+            # and awaiting it inline froze the whole poll pipeline (jobs
+            # table, verdict, header) for the sum of the round trips
+            # whenever the overlay was open. The busy flag covers the
+            # window where a slow load outlives the 60s gate.
             if not self._heat_busy:
                 self._heat_busy = True
                 self._spawn(self._load_heat())
@@ -2890,36 +2902,68 @@ class App:
             self.dags = data if isinstance(data, list) else []
 
     async def _load_heat(self) -> None:
-        """Batch /jobs/{name}/runs for the punchcard (capped, cached).
-
-        Runs as a spawned task (see _fanout) with a few requests in
-        flight at a time: strictly sequential awaits cost sum-of-RTTs
-        (seconds against a remote daemon), while an unbounded gather
-        would slam the daemon with the whole burst at once.
-        """
+        """One batched /activity fetch for the punchcard, memoized
+        daemon-side; the per-job fan-out is kept as the fallback against
+        a daemon that predates the endpoint. Runs as a spawned task (see
+        _fanout)."""
         try:
             self.heat_loaded = time.monotonic()
-            gate = asyncio.Semaphore(5)
-
-            async def fetch(job: Dict[str, Any]) -> None:
-                name = job.get("name", "")
-                async with gate:
-                    with contextlib.suppress(Exception):
-                        data = await self.api.get_json(
-                            "/jobs/%s/runs" % _quote(name)
-                        )
-                        self.heat_data[name] = data.get("runs", [])
-
-            # same spirit as the web page's cap
-            await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
-            # a job removed (or renamed) by a reload never refreshes its
-            # entry again; without this prune a long session with name
-            # churn accretes one dead run-list payload per old name.
-            for stale in [k for k in self.heat_data if k not in self.by_name]:
-                del self.heat_data[stale]
+            if not await self._load_heat_batched():
+                await self._load_heat_fanout()
             self.mark()
         finally:
             self._heat_busy = False
+
+    async def _load_heat_batched(self) -> bool:
+        # Only a 404 (the old-daemon signature: aiohttp answers unmatched
+        # paths 404) reports the batch unavailable and triggers the
+        # fan-out, so a transient 500 or timeout on a new daemon never
+        # launches a 40-request burst; the stale card just survives until
+        # the next window.
+        try:
+            data = await self.api.get_json("/activity")
+        except ApiError as exc:
+            return exc.status != 404
+        except Exception:  # noqa: BLE001 - transient; keep the stale card
+            return True
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if isinstance(jobs, dict):
+            # wholesale replacement, so the fan-out path's prune of
+            # removed names is implicit here and _heat_parsed's orphan
+            # sweep covers the shrinkage
+            self.heat_data = {
+                str(name): rows if isinstance(rows, list) else []
+                for name, rows in jobs.items()
+            }
+        return True
+
+    async def _load_heat_fanout(self) -> None:
+        """Batch /jobs/{name}/runs for the punchcard (capped, cached):
+        the fallback against a daemon that predates /activity.
+
+        A few requests in flight at a time: strictly sequential awaits
+        cost sum-of-RTTs (seconds against a remote daemon), while an
+        unbounded gather would slam the daemon with the whole burst at
+        once.
+        """
+        gate = asyncio.Semaphore(5)
+
+        async def fetch(job: Dict[str, Any]) -> None:
+            name = job.get("name", "")
+            async with gate:
+                with contextlib.suppress(Exception):
+                    data = await self.api.get_json(
+                        "/jobs/%s/runs" % _quote(name)
+                    )
+                    self.heat_data[name] = data.get("runs", [])
+
+        # same spirit as the web page's cap
+        await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
+        # a job removed (or renamed) by a reload never refreshes its
+        # entry again; without this prune a long session with name
+        # churn accretes one dead run-list payload per old name.
+        for stale in [k for k in self.heat_data if k not in self.by_name]:
+            del self.heat_data[stale]
 
     def _pressure_entries(self) -> List[ScheduleEntry]:
         """Analyzable rows from the /jobs and /dags snapshots.

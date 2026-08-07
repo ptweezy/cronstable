@@ -1643,7 +1643,9 @@ class ClusterManager(LeadershipBackend):
         # "new") and let the operator's own /cluster read cascade into the
         # derive and zero the flag the advert build had just set.  The
         # /cluster `candidates_truncated` flag reads the max (see the
-        # _candidates_truncated property).  MAX_ADVERTISED_CANDIDATE_NAMES
+        # _candidates_truncated property; that read also zeroes a stale
+        # advert cell once the union fits again, since only a /peer poll
+        # rebuilds it).  MAX_ADVERTISED_CANDIDATE_NAMES
         # says why this truncation is logged where the summaries one only
         # marks the view.
         self._candidates_trunc_seen: Dict[str, int] = {}
@@ -1985,7 +1987,7 @@ class ClusterManager(LeadershipBackend):
             if len(body_bytes) > MAX_PEER_RESPONSE_BYTES:
                 # Last-resort degradation. Every re-advertised set is capped
                 # individually, so this should be unreachable; if it is ever
-                # reached, shipping the body anyway is the worst outcome --
+                # reached, shipping the body anyway is the worst outcome:
                 # honest pollers cap the read (_read_capped), record us as an
                 # oversized failure and drop us from their agreeing sets, so
                 # one over-budget field costs this node its place in the
@@ -3196,6 +3198,20 @@ class ClusterManager(LeadershipBackend):
         trigger, since view_dict cascades into the derives) cannot blank a
         truncation the advert build observed on the larger union.
         """
+        # The advert cell is only rewritten when a /peer poll rebuilds the
+        # response body (_capped_vouched), so on a node nobody polls any
+        # more a latched overflow would report forever. The bridge cell
+        # cannot go stale that way (the derive below refreshes it), so
+        # re-check just the advert side here: apply the cap exactly as
+        # _capped_vouched does to the current union and zero the cell when
+        # it fits again, leaving a still-oversized union's latched count
+        # for the next advert build to refresh.
+        if (
+            self._candidates_trunc_seen.get("advert")
+            and len(self._eligible_candidates())
+            <= MAX_ADVERTISED_CANDIDATE_NAMES
+        ):
+            self._candidates_trunc_seen["advert"] = 0
         return max(self._candidates_trunc_seen.values(), default=0)
 
     def _note_candidates_truncated(self, source: str, seen: int) -> None:

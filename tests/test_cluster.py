@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import socket
+import threading
 
 import aiohttp
 import pytest
@@ -1045,6 +1046,165 @@ async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized(
     cron._bust_response_memos()
     await cron._web_get_fleet(_Req())
     assert len(builds) == 2
+
+
+async def _wait_until(pred, tries=300, interval=0.01):
+    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
+    # and do not flake under CI load. Bounded so a never-true predicate fails
+    # cleanly instead of hanging.
+    for _ in range(tries):
+        if pred():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError("condition not met within {} tries".format(tries))
+
+
+def _fat_fleet_view(builds=None):
+    # the 4x20 (80 summary entries) shape the memoized-endpoint test uses
+    if builds is not None:
+        builds.append(1)
+    return {
+        "enabled": True,
+        "backend": "gossip",
+        "node_name": "n",
+        "nodes": [
+            {
+                "node_name": "n{}".format(i),
+                "self": i == 0,
+                "status": "agreed",
+                "as_of": "2026-01-01T00:00:00+00:00",
+                "jobs": {
+                    "job-{}".format(j): {
+                        "running": False,
+                        "enabled": True,
+                        "scheduled_in": 30.0,
+                        "last": None,
+                    }
+                    for j in range(20)
+                },
+            }
+            for i in range(4)
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_single_flight_shares_one_build(monkeypatch):
+    # Concurrent pollers must JOIN one merge+serialize while it is in
+    # flight; sharing a product that already landed in the memo proves
+    # nothing. Above the offload gate the build spans an executor hop,
+    # and a plain check-then-store memo let every poller landing inside
+    # that await miss too and run its own full build.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_FLEET_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 0)
+    builds = []
+
+    class StubManager:
+        def fleet_view(self):
+            return _fat_fleet_view(builds)
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    responses = await asyncio.gather(
+        *(cron._web_get_fleet(_Req()) for _ in range(6))
+    )
+    assert len(builds) == 1
+    first = responses[0]
+    assert all(r.status == 200 for r in responses)
+    assert all(r.headers["ETag"] == first.headers["ETag"] for r in responses)
+    assert cron._fleet_response_memo.inflight is None
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_offloads_only_a_large_serialize(monkeypatch):
+    # the merge reads live gossip state so it stays on the loop; the
+    # serialize/hash/gzip over the merged dict offloads only at
+    # _FLEET_SERIALIZE_OFFLOAD_MIN summary entries, below which the
+    # thread hop costs more than the encode.
+    import cronstable.cron
+
+    idents = []
+    real_product = cronstable.cron._cachable_json_product
+
+    def recording_product(payload):
+        idents.append(threading.get_ident())
+        return real_product(payload)
+
+    monkeypatch.setattr(
+        cronstable.cron, "_cachable_json_product", recording_product
+    )
+
+    class StubManager:
+        def fleet_view(self):
+            return _fat_fleet_view()
+
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 1)
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    resp = await cron._web_get_fleet(_Req())
+    assert resp.status == 200 and resp.headers["ETag"]
+    assert idents[-1] != threading.get_ident()  # built on an executor thread
+
+    # a fresh cron at the default threshold: the 4x20 stub is 80 entries,
+    # under the gate, so the product is built inline on the loop thread
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 200)
+    small = cronstable.cron.Cron(None)
+    small.web_config = {}
+    small.cluster_manager = StubManager()
+    resp = await small._web_get_fleet(_Req())
+    assert resp.status == 200 and resp.headers["ETag"]
+    assert idents[-1] == threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_bust_mid_build_is_not_stored(monkeypatch):
+    # A bust landing while the build is on the executor must not be undone
+    # by that pre-bust product being stored on the way out: the leader
+    # still serves its own product to its own caller, but the next poll
+    # rebuilds instead of inheriting the stale product.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_FLEET_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 0)
+    calls = []
+    release = threading.Event()
+    real_product = cronstable.cron._cachable_json_product
+
+    def gated_product(payload):
+        calls.append(1)
+        release.wait(5)
+        return real_product(payload)
+
+    monkeypatch.setattr(
+        cronstable.cron, "_cachable_json_product", gated_product
+    )
+
+    class StubManager:
+        def fleet_view(self):
+            return _fat_fleet_view()
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    task = asyncio.create_task(cron._web_get_fleet(_Req()))
+    try:
+        await _wait_until(lambda: calls)
+        cron._bust_response_memos()
+        release.set()
+        resp = await task
+        assert resp.status == 200
+        assert cron._fleet_response_memo.cached is None
+        follow_up = await cron._web_get_fleet(_Req())
+        assert follow_up.status == 200
+        assert len(calls) == 2
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
 
 
 def test_lease_backend_seam_defaults_for_fleet():
@@ -3805,6 +3965,42 @@ async def test_candidates_truncated_is_zero_for_an_ordinary_fleet(no_tls):
     mgr._bridge_candidates()
     assert mgr._candidates_truncated == 0
     assert mgr.view_dict()["candidates_truncated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
+    # The advert cell is rewritten only when a /peer poll rebuilds the
+    # response body, so a node whose pollers were all decommissioned kept
+    # a latched overflow and warned about a truncation no longer
+    # happening. The /cluster read must re-check the current union
+    # against the cap instead of trusting the last advert build.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
+    }
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    # a peer poll rebuilds the body: the bridge half fits the cap exactly,
+    # the union (node-b plus the bridge set) does not, so only the advert
+    # cell latches
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(payload["quorate_vouched"]) == MAX_ADVERTISED_CANDIDATE_NAMES
+    over = MAX_ADVERTISED_CANDIDATE_NAMES + 1
+    assert mgr._candidates_truncated == over
+    # still oversized: a peer-table write rolls the derive memo, and with
+    # no /peer rebuild since, the read must keep reporting the latched
+    # count
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    assert mgr.view_dict()["candidates_truncated"] == over
+    # the fleet shrinks under the cap with NO further /peer rebuild
+    # (nobody polls this node any more): the read re-checks and reports 0
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
+    assert mgr.view_dict()["candidates_truncated"] == 0
+    assert mgr._candidates_truncated == 0
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ server up via start_stop_web_app and scrape it like Prometheus would.
 import asyncio
 import datetime
 import math
+import threading
 
 import pytest
 
@@ -956,12 +957,13 @@ async def test_web_metrics_gzips_for_a_capable_scraper():
     cron.web_config = {}
     plain = await cron._web_metrics(FakeRequest())
     assert "Content-Encoding" not in plain.headers
-    assert plain.headers["Vary"] == "Accept-Encoding"  # on both representations
+    # on both representations
+    assert plain.headers["Vary"] == "Accept, Accept-Encoding"
     zipped = await cron._web_metrics(
         FakeRequest({"Accept-Encoding": "gzip, deflate"})
     )
     assert zipped.headers["Content-Encoding"] == "gzip"
-    assert zipped.headers["Vary"] == "Accept-Encoding"
+    assert zipped.headers["Vary"] == "Accept, Accept-Encoding"
     assert zipped.headers["Content-Type"] == CONTENT_TYPE_TEXT
     assert len(zipped.body) < len(plain.body)
     assert gzip.decompress(zipped.body) == plain.body
@@ -975,6 +977,21 @@ async def test_web_metrics_gzip_declined_when_client_says_q0():
     cron.web_config = {}
     resp = await cron._web_metrics(FakeRequest({"Accept-Encoding": "gzip;q=0"}))
     assert "Content-Encoding" not in resp.headers
+
+
+@pytest.mark.asyncio
+async def test_web_metrics_vary_lists_both_negotiated_axes():
+    # the endpoint negotiates the exposition format on Accept and the
+    # coding on Accept-Encoding; a shared cache keyed only on the
+    # encoding would hand an openmetrics body to a text scraper.
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    cron.web_config = {}
+    plain = await cron._web_metrics(FakeRequest())
+    assert plain.headers["Vary"] == "Accept, Accept-Encoding"
+    openmetrics = await cron._web_metrics(
+        FakeRequest({"Accept": "application/openmetrics-text"})
+    )
+    assert openmetrics.headers["Vary"] == "Accept, Accept-Encoding"
 
 
 @pytest.mark.asyncio
@@ -2180,8 +2197,8 @@ async def test_metrics_memo_builds_once_for_concurrent_scrapers(monkeypatch):
     )
     assert len(renders) == 1
     assert all(p == products[0] for p in products)
-    assert cron._metrics_build_inflight == {}  # slot released
-    assert False in cron._metrics_response_cache
+    assert cron._metrics_response_memo[False].inflight is None  # released
+    assert cron._metrics_response_memo[False].cached is not None
 
 
 @pytest.mark.asyncio
@@ -2195,7 +2212,8 @@ async def test_metrics_memo_keeps_the_two_exposition_formats_apart(
         cron._metrics_product(False), cron._metrics_product(True)
     )
     assert plain != openmetrics
-    assert set(cron._metrics_response_cache) == {False, True}
+    assert cron._metrics_response_memo[False].cached is not None
+    assert cron._metrics_response_memo[True].cached is not None
 
 
 @pytest.mark.asyncio
@@ -2213,7 +2231,7 @@ async def test_a_bust_during_a_build_is_not_undone_by_the_late_product(
         cron._bust_response_memos()
 
     await asyncio.gather(cron._metrics_product(False), bust())
-    assert cron._metrics_response_cache == {}
+    assert cron._metrics_response_memo[False].cached is None
 
 
 @pytest.mark.asyncio
@@ -2230,6 +2248,149 @@ async def test_a_failed_build_lets_the_followers_build_their_own(monkeypatch):
     cron.metrics.render_prepared = boom
     with pytest.raises(RuntimeError):
         await cron._metrics_product(False)
-    assert cron._metrics_build_inflight == {}
-    assert cron._metrics_response_cache == {}
+    assert cron._metrics_response_memo[False].inflight is None
+    assert cron._metrics_response_memo[False].cached is None
     assert calls == [1]
+
+
+async def _wait_until(pred, tries=300, interval=0.01):
+    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
+    # and do not flake under CI load. Bounded so a never-true predicate fails
+    # cleanly instead of hanging.
+    for _ in range(tries):
+        if pred():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError("condition not met within {} tries".format(tries))
+
+
+@pytest.mark.asyncio
+async def test_a_scrape_arriving_after_a_bust_gets_a_fresh_product(
+    monkeypatch,
+):
+    # A joiner compares the generation recorded with the leader's future
+    # against the current one: without that, a scrape arriving AFTER a
+    # bust could be served the pre-bust exposition the bust just declared
+    # stale. Both interleavings (joining the stale future, or arriving
+    # after it resolved) must end in a rebuild.
+    cron = _memo_cron(monkeypatch)
+    attempts = []
+    release = threading.Event()
+    inner = cron.metrics.render_prepared
+
+    def gated(families, openmetrics=False):
+        attempts.append(1)
+        if len(attempts) == 1:
+            release.wait(5)
+        return inner(families, openmetrics=openmetrics)
+
+    cron.metrics.render_prepared = gated
+    leader = asyncio.create_task(cron._metrics_product(False))
+    t2 = None
+    try:
+        await _wait_until(lambda: attempts)
+        cron._bust_response_memos()
+        t2 = asyncio.create_task(cron._metrics_product(False))
+        release.set()
+        await leader
+        await t2
+        assert len(attempts) == 2  # t2 rebuilt, not the pre-bust body
+        assert cron._metrics_response_memo[False].cached is not None
+        assert cron._metrics_response_memo[False].inflight is None
+    finally:
+        release.set()
+        for task in (leader, t2):
+            if task is not None and not task.done():
+                task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_build_promotes_exactly_one_follower(monkeypatch):
+    # After a failed build resolves the shared future to None, exactly one
+    # waiter self-promotes and the rest join ITS build: the old fall
+    # through let every follower stampede into a build of its own.
+    cron = _memo_cron(monkeypatch)
+    attempts = []
+    release = threading.Event()
+    inner = cron.metrics.render_prepared
+
+    def gated(families, openmetrics=False):
+        attempts.append(1)
+        if len(attempts) == 1:
+            release.wait(5)
+            raise RuntimeError("render exploded")
+        return inner(families, openmetrics=openmetrics)
+
+    cron.metrics.render_prepared = gated
+    leader = asyncio.create_task(cron._metrics_product(False))
+    followers = []
+    started = []
+    try:
+        await _wait_until(lambda: attempts)
+
+        async def follow():
+            # runs synchronously from the append to the shield await, so
+            # len(started) == 4 proves all four are joined on the leader
+            started.append(1)
+            return await cron._metrics_product(False)
+
+        followers = [asyncio.create_task(follow()) for _ in range(4)]
+        await _wait_until(lambda: len(started) == 4)
+        release.set()
+        results = await asyncio.gather(*followers)
+        with pytest.raises(RuntimeError):
+            await leader
+        # one failed leader plus exactly one self-promoted follower
+        assert len(attempts) == 2
+        assert all(r == results[0] for r in results)
+        assert cron._metrics_response_memo[False].inflight is None
+    finally:
+        release.set()
+        for task in [leader] + list(followers):
+            if not task.done():
+                task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_follower_does_not_cancel_the_shared_build(
+    monkeypatch,
+):
+    # asyncio.shield: a follower whose client hangs up must not cancel the
+    # build every other waiter shares, nor leave an unretrieved exception
+    # on the future (it only ever carries results).
+    cron = _memo_cron(monkeypatch)
+    attempts = []
+    release = threading.Event()
+    inner = cron.metrics.render_prepared
+
+    def gated(families, openmetrics=False):
+        attempts.append(1)
+        release.wait(5)
+        return inner(families, openmetrics=openmetrics)
+
+    cron.metrics.render_prepared = gated
+    leader = asyncio.create_task(cron._metrics_product(False))
+    follower = None
+    started = []
+    try:
+        await _wait_until(lambda: attempts)
+
+        async def follow():
+            started.append(1)
+            return await cron._metrics_product(False)
+
+        follower = asyncio.create_task(follow())
+        await _wait_until(lambda: started)
+        follower.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await follower
+        release.set()
+        body, _gz = await leader
+        assert body  # the shared build completed despite the cancellation
+        assert cron._metrics_response_memo[False].cached is not None
+        assert cron._metrics_response_memo[False].inflight is None
+    finally:
+        release.set()
+        for task in (leader, follower):
+            if task is not None and not task.done():
+                task.cancel()

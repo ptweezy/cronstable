@@ -2895,6 +2895,10 @@ async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
 
     class FakeApi:
         async def get_json(self, path):
+            if path == "/activity":
+                # an old daemon: the batch probe 404s (uncounted), and
+                # the per-job fan-out below is the path under test
+                raise tui.ApiError(404)
             state["calls"] += 1
             state["in_flight"] += 1
             state["high"] = max(state["high"], state["in_flight"])
@@ -2910,6 +2914,147 @@ async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
     assert "gone" not in app.heat_data
     assert app.heat_data["j00"] == [{"outcome": "success"}]
     assert app._heat_busy is False  # the 60s gate can spawn again
+
+
+async def test_load_heat_prefers_the_batched_endpoint(tmp_path):
+    # One /activity fetch replaces the per-job storm. The payload lands
+    # wholesale, so a removed job's relic entry disappears without an
+    # explicit prune and an empty history renders as an empty row.
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j00"}, {"name": "j01"}]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.heat_data["gone"] = [{"outcome": "success"}]  # a removed job's relic
+    row = {"outcome": "success", "finished_at": _iso_ago(60)}
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            assert path == "/activity", "unexpected fan-out to %s" % path
+            return {"jobs": {"j00": [row], "j01": []}}
+
+    app.api = FakeApi()
+    app._heat_busy = True  # exactly as _fanout sets it before spawning
+    await app._load_heat()
+    assert calls == ["/activity"]
+    assert "gone" not in app.heat_data
+    assert app.heat_data["j00"] == [row]
+    assert app.heat_data["j01"] == []
+    assert app._heat_busy is False
+
+
+async def test_load_heat_falls_back_per_job_on_404(tmp_path):
+    # only the old-daemon signature (a 404: aiohttp answers unmatched
+    # paths with one) may launch the per-job fan-out
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j%02d" % i} for i in range(12)]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            if path == "/activity":
+                raise tui.ApiError(404)
+            return {"runs": [{"outcome": "success"}]}
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert calls[0] == "/activity"
+    assert len(calls) == 13  # the probe plus one /runs per job
+    assert app.heat_data["j00"] == [{"outcome": "success"}]
+    assert app._heat_busy is False
+
+
+async def test_load_heat_transient_batch_failure_keeps_stale_data(tmp_path):
+    # a flaky NEW daemon (a 500, a timeout) must not trigger the fan-out
+    # storm; the stale card simply survives until the next window
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j00"}]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    stale = [{"outcome": "failure", "finished_at": _iso_ago(120)}]
+    app.heat_data["j00"] = list(stale)
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            raise tui.ApiError(500)
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert calls == ["/activity"]  # no per-job fan-out
+    assert app.heat_data["j00"] == stale
+    assert app._heat_busy is False
+
+
+async def test_fanout_secondary_legs_overlap(tmp_path):
+    # The fan-out used to await /cluster, /node, /fleet and /state one
+    # after another, paying the sum of the round trips every poll cycle
+    # (up to four serial timeouts against a stalled daemon). The legs are
+    # independent, so they must be in flight together.
+    app = _bare_app(tmp_path)
+    app.open("fleet")
+    app.open("state")
+    app.state_tab = "view"
+    state = {"in_flight": 0, "high": 0, "paths": []}
+
+    class FakeApi:
+        async def get_json(self, path):
+            state["paths"].append(path)
+            state["in_flight"] += 1
+            state["high"] = max(state["high"], state["in_flight"])
+            await asyncio.sleep(0.01)
+            state["in_flight"] -= 1
+            return {"from": path}
+
+    app.api = FakeApi()
+    await app._fanout()
+    assert sorted(state["paths"]) == ["/cluster", "/fleet", "/node", "/state"]
+    assert state["high"] > 1  # concurrent, not serial
+    # every leg still lands on its own attribute
+    assert app.cluster == {"from": "/cluster"}
+    assert app.node == {"from": "/node"}
+    assert app.fleet == {"from": "/fleet"}
+    assert app.state_data == {"from": "/state"}
+
+
+async def test_spawn_swallows_cancellation_in_its_done_callback(tmp_path):
+    # A spawned task still pending at quit is cancelled by asyncio.run's
+    # teardown, and Task.exception() raises CancelledError on a cancelled
+    # task; the old retrieve-always callback therefore blew up itself and
+    # printed an "Exception in callback" traceback over the restored
+    # terminal. The loop's exception handler sees such a callback crash,
+    # so capture through it and assert silence.
+    app = _bare_app(tmp_path)
+    loop = asyncio.get_running_loop()
+    captured: List[Dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda lp, ctx: captured.append(ctx))
+    try:
+        holder: Dict[str, Any] = {}
+
+        async def park() -> None:
+            holder["task"] = asyncio.current_task()
+            await asyncio.Event().wait()  # parked until cancelled
+
+        app._spawn(park())
+        deadline = time.monotonic() + 5.0
+        while "task" not in holder and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+        task = holder["task"]
+        # fires strictly after _spawn's own callback, so once this lands
+        # any crash in that callback has already reached the handler
+        settled = asyncio.Event()
+        task.add_done_callback(lambda t: settled.set())
+        task.cancel()
+        await asyncio.wait_for(settled.wait(), 5.0)
+        assert task.cancelled()
+        assert not captured, captured
+    finally:
+        loop.set_exception_handler(previous)
 
 
 def test_render_heat_future_run_lands_in_newest_bucket(tmp_path):

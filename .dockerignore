@@ -23,6 +23,10 @@ __pycache__
 .claude
 .github
 docker
+# except the shared requirement-extraction helper, which every Dockerfile
+# COPYs into its dependency layer beside pyproject.toml (the negation must
+# follow the exclusion it carves out)
+!docker/extract_deps.py
 example
 scripts
 target

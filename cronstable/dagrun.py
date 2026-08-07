@@ -282,6 +282,15 @@ class DagScheduler:
         self._summaries_memo: Dict[
             str, Tuple[float, List[Dict[str, Any]]]
         ] = {}
+        # Bumped whenever the memo above is popped or cleared. The pop alone
+        # cannot uphold the pop-on-local-write contract: an uncached rebuild
+        # spans awaits, and a write landing in that window pops an entry that
+        # does not exist yet, so the rebuild would memoize its pre-write
+        # reads under a fresh stamp. _run_summaries samples this before its
+        # first await and skips the store when it moved (the same guard as
+        # Cron._memo_gen). One counter for the whole memo: a cross-dag write
+        # costing one extra rebuild is cheap.
+        self._summaries_gen = 0
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
@@ -365,8 +374,11 @@ class DagScheduler:
         )
         # every local run-doc write funnels through here: pop the summary
         # memo so this node's own changes (create, advance, finish, adopt)
-        # render on the very next poll instead of aging out by TTL.
+        # render on the very next poll instead of aging out by TTL. The bump
+        # is the half the pop cannot cover: it voids a rebuild already in
+        # flight, whose entry is not there to pop yet (see _summaries_gen).
         self._summaries_memo.pop(dag_name, None)
+        self._summaries_gen += 1
         return result
 
     async def _read(self, dag_name: str, key: str) -> Optional[Dict[str, Any]]:
@@ -1567,7 +1579,7 @@ class DagScheduler:
             # the 64-bit window, a non-finite float): embedding it in the
             # run document would make _json.dumps_bytes raise on EVERY
             # advance, wedging the run forever. Treat a mis-published
-            # upstream like the not-a-list case -- warn and map to empty.
+            # upstream like the not-a-list case: warn and map to empty.
             # (Ordered before ValueError: UnsupportedValue subclasses it.)
             logger.warning(
                 "dag %s: xcom %r from %r contains a non-portable value "
@@ -1774,7 +1786,7 @@ class DagScheduler:
                 poke=dref.poke,
             )
             return None
-        self._cron.running_jobs[template.name].append(running)
+        self._cron._add_running_instance(running)
         self._cron._jobs_running.set()
         pid = running.proc.pid if running.proc is not None else None
         # the pid is NOT stamped here: the caller collects every launched
@@ -1786,32 +1798,6 @@ class DagScheduler:
         # pid), and the reaper will record its completion.
         return (taskkey, dref.proc, pid, dref.attempt)
 
-    @staticmethod
-    def _stage_task_secrets(dagcfg: Any, intent, template) -> Dict[str, str]:
-        """Resolve a task template's ``secrets`` blocks into a fresh map.
-
-        Pure sync (``fromFile`` opens and reads), so the launch loop can
-        push it to the default executor when a file read is involved; see
-        :meth:`_prepare_task_run`.
-        """
-        from cronstable.config import _resolve_secret
-
-        secrets: Dict[str, str] = {}
-        for spec in template.secrets:
-            name = spec.get("name")
-            try:
-                value = _resolve_secret(
-                    spec,
-                    "dag {} task {} secret {}".format(
-                        dagcfg.name, intent.task_id, name
-                    ),
-                )
-            except Exception:  # noqa: BLE001 - a bad secret is skipped, 404s
-                continue
-            if name and value is not None:
-                secrets[name] = value
-        return secrets
-
     async def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
     ) -> Tuple[Optional[str], Dict[str, str]]:
@@ -1821,10 +1807,8 @@ class DagScheduler:
         namespace to the DAG run's XCom scope and injects the
         ``CRONSTABLE_DAG_*``
         vars, so ``cronstable xcom`` / ``artifact`` land in the run scope.
-        Like the mirror, ``fromFile`` secrets are staged on the default
-        executor so a slow secret mount stalls only this launch, never the
-        event loop; a mapped fan-out launches many instances back to back,
-        which is exactly where an inline blocking read would compound.
+        Secret staging (including the fromFile executor offload) lives in
+        :func:`cronstable.jobapi.stage_secrets`.
         """
         scope = dag.xcom_scope(dagcfg.name, run_id)
         dag_env = {
@@ -1844,14 +1828,16 @@ class DagScheduler:
         api = self._cron._job_api
         if api is None or api.base_url is None:
             return None, dag_env
-        from cronstable.jobapi import RunContext, run_environment
+        from cronstable.jobapi import (
+            RunContext,
+            run_environment,
+            stage_secrets,
+        )
 
-        if any(spec.get("fromFile") for spec in template.secrets):
-            secrets = await asyncio.get_running_loop().run_in_executor(
-                None, self._stage_task_secrets, dagcfg, intent, template
-            )
-        else:
-            secrets = self._stage_task_secrets(dagcfg, intent, template)
+        secrets = await stage_secrets(
+            template.secrets,
+            "dag {} task {}".format(dagcfg.name, intent.task_id),
+        )
         ctx = RunContext(
             token=os.urandom(32).hex(),
             run_id=os.urandom(16).hex(),
@@ -2536,9 +2522,16 @@ class DagScheduler:
             and time.monotonic() - memo[0] < DAG_SUMMARY_LIST_TTL
         ):
             return list(memo[1])
+        # sampled before the rebuild's first await: a local write landing
+        # mid-rebuild pops a memo entry that does not exist yet, so only a
+        # moved generation can flag that the rebuild below saw pre-write
+        # state which must not be memoized, or the pop-on-local-write
+        # contract breaks for a full TTL (see _summaries_gen).
+        gen = self._summaries_gen
         summaries = await self._run_summaries_uncached(backend, name)
         if summaries is not None:
-            self._summaries_memo[name] = (time.monotonic(), summaries)
+            if gen == self._summaries_gen:
+                self._summaries_memo[name] = (time.monotonic(), summaries)
             return list(summaries)
         return None
 
@@ -2785,8 +2778,10 @@ class DagScheduler:
             timeout=STATE_OP_TIMEOUT,
         )
         # the other local write shape (_mutate covers the rest): the memo
-        # must not keep serving a run the GC just deleted.
+        # must not keep serving a run the GC just deleted, and the bump
+        # voids a rebuild in flight, same as _mutate's.
         self._summaries_memo.pop(name, None)
+        self._summaries_gen += 1
         known = self._terminal_run_keys.get(name)
         if known is not None:
             # the key may legitimately come back (an operator backfill of the
@@ -2917,6 +2912,9 @@ class DagScheduler:
         # so drop it here and bring that pass forward to now.
         self._dag_summary_cache.clear()
         self._summaries_memo.clear()
+        # a rebuild in flight across the swap read the OLD store; void it
+        # (see _summaries_gen).
+        self._summaries_gen += 1
         self._terminal_run_keys.clear()
         self._advance_again.clear()
         self._next_sched_check = 0.0
