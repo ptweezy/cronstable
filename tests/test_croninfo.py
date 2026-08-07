@@ -853,3 +853,34 @@ def test_describe_seconds_every_second_and_explicit_second_list():
     assert describe_cron("5,10 30 4 * * * *") == (
         "At 04:30, every day, at seconds 05, 10"
     )
+
+
+def test_describe_degrades_when_the_engine_rejects():
+    # the tolerant field parsers accept a superset of the engine
+    # (wrap-around ranges, steps whose first stride escapes the field,
+    # the classic-crontab-only @midnight); the confident prose is gated
+    # on the engine's own verdict, per the module contract ("text the
+    # engine rejects degrades to a Custom schedule phrase").  It used to
+    # affirm every one of these while the daemon refused to load them.
+    for expr in (
+        "0 0 * * fri-mon",  # wrap-around range
+        "0 0 1 */12 *",  # month step escapes [1, 12]
+        "*/60 0 * * *",  # step larger than the field
+        "59/1 * * * *",  # first stride escapes the field
+        "0 0 31-1 * *",
+        "0 0 * nov-feb *",
+        "@midnight",  # classic-crontab-only; the loader rewrites it
+    ):
+        with pytest.raises(ValueError):
+            CronTab(expr)
+        assert describe_cron(expr) == "Custom schedule: %s" % expr, expr
+    # ...while every engine-legal quirk keeps its prose
+    for expr in (
+        "0 0 * * sat-sun",  # dow range ending in 0: end reads as 7
+        "0 0 * * 0-0",  # the preserved every-day quirk
+        "30/20 * * * *",  # bare start with a step, in range
+        "0 0 * * */7",
+        "@daily",
+    ):
+        CronTab(expr)  # engine-valid by definition of this arm
+        assert not describe_cron(expr).startswith("Custom schedule"), expr

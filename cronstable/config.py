@@ -47,6 +47,72 @@ from cronstable import crontabs, dag, platform
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import Finding, lint_schedule
 
+
+def _patch_strictyaml_seq_deepcopy() -> None:
+    """Make strictyaml ``Seq`` validation linear in the number of elements.
+
+    strictyaml validates a sequence by deep-copying the ruamel document, and
+    its vendored ``CommentedSeq.__deepcopy__`` calls ``copy_attributes``
+    INSIDE the element loop rather than after it, so an N-element sequence
+    re-copies the sequence's whole Comment/Format/LineCol/Anchor/Tag/merge
+    attribute set N times.  The ``CommentedMap`` twin 470 lines below it in
+    the same file makes the identical call from outside its loop, which is
+    what marks this an indentation slip rather than intent.
+
+    ``jobs:`` is the only large sequence in a normal config, so it pays the
+    entire bill and config parsing comes out quadratic.  Measured here:
+    1k jobs 0.90s, 2k 3.06s, 4k 12.54s, 8k 49.61s, roughly 4x per doubling.
+    With the call hoisted: 0.37s, 0.87s, 1.73s, 3.66s, roughly 2x per
+    doubling, which is the linear shape the parse should have had.  It lands
+    on every boot parse, every --validate-config, every --job-set-id and
+    every reload that touches a file.
+
+    The rebinding is a pure cost change.  ``copy_attributes`` reads only
+    ``self``, which the loop never mutates, and it overwrites the same six
+    attributes on every call, so only the last call's objects ever survive;
+    running it once after the loop installs the same result.  The
+    empty-sequence case deliberately keeps upstream's behaviour (no call at
+    all) rather than the Map twin's, so the call COUNT is the only thing
+    this changes.
+
+    Only ``strictyaml.ruamel`` is touched: strictyaml vendors its own copy of
+    ruamel, so a separately installed ``ruamel.yaml`` is unaffected.  A probe
+    decides whether the slip is still present, so a strictyaml that ships the
+    fix (or a second import of this module) is left alone.
+    """
+    try:
+        from strictyaml.ruamel.comments import CommentedSeq
+    except Exception:  # pragma: no cover - vendored layout changed
+        return
+
+    class _Probe(CommentedSeq):  # type: ignore[misc,valid-type]
+        calls = 0
+
+        def copy_attributes(self, t: Any, memo: Any = None) -> None:
+            _Probe.calls += 1
+            super().copy_attributes(t, memo=memo)
+
+    try:
+        copy.deepcopy(_Probe([0, 1, 2, 3]))
+    except Exception:  # pragma: no cover - vendored layout changed
+        return
+    if _Probe.calls <= 1:
+        return
+
+    def _linear_deepcopy(self: Any, memo: Any) -> Any:
+        res = self.__class__()
+        memo[id(self)] = res
+        for k in self:
+            res.append(copy.deepcopy(k, memo))
+        if len(self):
+            self.copy_attributes(res, memo=memo)
+        return res
+
+    CommentedSeq.__deepcopy__ = _linear_deepcopy
+
+
+_patch_strictyaml_seq_deepcopy()
+
 logger = logging.getLogger("cronstable.config")
 WebConfig = NewType("WebConfig", Dict[str, Any])
 ClusterConfig = NewType("ClusterConfig", Dict[str, Any])

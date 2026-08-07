@@ -20,8 +20,10 @@ from aiohttp import web
 
 from cronstable.config import ConfigError
 from cronstable.cron import (
+    ApiActionError,
     Cron,
     JobRunInfo,
+    _http_for_action_error,
     _job_run_info_from_dict,
     _run_stats,
 )
@@ -1562,6 +1564,56 @@ def test_security_and_sse_headers_merge_custom():
     assert sse["X-Custom"] == "yes"
 
 
+def test_sse_protocol_headers_win_over_operator_overrides():
+    # the stream framing is the endpoint's contract (mirrors /metrics): a
+    # global web.headers Content-Type / cache policy / proxy-buffering
+    # override must not break every live tail, and a case-variant spelling
+    # must not survive as a second, conflicting header on the wire.
+    cron = _cron(_RES_YAML)
+    cron.web_config = {
+        "headers": {
+            "content-type": "text/html",
+            "Cache-Control": "public, max-age=60",
+            "X-ACCEL-BUFFERING": "yes",
+            "X-Custom": "yes",
+        }
+    }
+    sse = cron._sse_headers()
+    assert sse["Content-Type"] == "text/event-stream"
+    assert sse["Cache-Control"] == "no-cache"
+    assert sse["X-Accel-Buffering"] == "no"
+    assert sse["X-Custom"] == "yes"  # non-protocol headers still ride
+    for name in ("content-type", "cache-control", "x-accel-buffering"):
+        assert [k for k in sse if k.lower() == name] == [
+            {
+                "content-type": "Content-Type",
+                "cache-control": "Cache-Control",
+                "x-accel-buffering": "X-Accel-Buffering",
+            }[name]
+        ]
+
+
+@pytest.mark.parametrize("spelling", ["Content-Type", "content-type"])
+def test_api_error_survives_a_web_headers_content_type(spelling):
+    # The same rule as the SSE tails above, on the error envelope. aiohttp
+    # REFUSES content_type= outright when the headers mapping already carries
+    # a Content-Type, so leaving an operator's spelling in place turned the
+    # one error path that carries these headers (the start/cancel 409) into a
+    # 500 instead of the conflict the caller asked about.
+    ex = ApiActionError("job x is disabled")
+    ex.status = 409
+    resp = _http_for_action_error(
+        ex, {spelling: "text/plain", "X-Custom": "yes"}
+    )
+    assert resp.status == 409
+    assert json.loads(resp.text) == {"error": "job x is disabled"}
+    assert resp.headers["X-Custom"] == "yes"  # non-protocol headers ride
+    assert [k for k in resp.headers if k.lower() == "content-type"] == [
+        "Content-Type"
+    ]
+    assert resp.headers["Content-Type"].startswith("application/json")
+
+
 # ---------------------------------------------------------------------------
 # _resolve_web_token: the fromFile read-error path
 # ---------------------------------------------------------------------------
@@ -1830,3 +1882,176 @@ def test_artifact_scope_names_unions_all_sources(tmp_path):
     assert GLOBAL_SCOPE in scopes  # the shared scope is always present
     assert "shared-a" in scopes  # from the job
     assert "shared-b" in scopes  # from the dag task template
+
+
+# ---------------------------------------------------------------------------
+# GET /activity: the heatmap's batched feed
+# ---------------------------------------------------------------------------
+
+_ACTIVITY_YAML = """
+jobs:
+  - name: a
+    command: echo hi
+    schedule: "*/5 * * * *"
+  - name: b
+    command: echo hi
+    schedule: "*/5 * * * *"
+"""
+
+# three jobs, so ten runs each clears _GZIP_MIN_BYTES for the gzip arm
+_ACTIVITY_HEAVY_YAML = "jobs:\n" + "".join(
+    "  - name: h%d\n    command: echo hi\n    schedule: '*/5 * * * *'\n" % i
+    for i in range(3)
+)
+
+
+def _heat_run(outcome, finished_ago, *, started=True):
+    now = datetime.datetime.now(_UTC)
+    finished = now - datetime.timedelta(seconds=finished_ago)
+    return JobRunInfo(
+        outcome=outcome,
+        exit_code=0 if outcome == "success" else 1,
+        started_at=(
+            finished - datetime.timedelta(seconds=1) if started else None
+        ),
+        finished_at=finished,
+        fail_reason=None,
+        output=JobOutputStream(),
+    )
+
+
+def test_activity_payload_slim_rows_and_empty_jobs():
+    cron = _cron(_ACTIVITY_YAML)
+    cron.run_history["a"].append(_heat_run("success", 300))
+    cron.run_history["a"].append(_heat_run("unknown", 200, started=False))
+    cron.run_history["a"].append(_heat_run("failure", 100))
+    payload = cron.activity_payload()
+    assert set(payload["jobs"]) == {"a", "b"}
+    rows = payload["jobs"]["a"]
+    # exactly the three plotted fields per row: no exit_code, duration,
+    # fail_reason, resources or stats riding a polled payload
+    assert [set(r) for r in rows] == [
+        {"started_at", "finished_at", "outcome"}
+    ] * 3
+    # oldest first, the run_history order both clients bucket from
+    assert [r["outcome"] for r in rows] == ["success", "unknown", "failure"]
+    finished = [r["finished_at"] for r in rows]
+    assert finished == sorted(finished)
+    assert rows[1]["started_at"] is None  # a never-started row stays null
+    assert payload["jobs"]["b"] == []  # present, so "no runs" != "unknown"
+    # the read did not grow the run_history defaultdict a deque for "b"
+    assert "b" not in cron.run_history
+
+
+async def test_web_activity_endpoint_is_conditional_gzipped_and_memoized(
+    monkeypatch,
+):
+    # /activity is the punchcard's whole feed in one response, polled by
+    # every viewer with the overlay open: it must ride the same memo, ETag
+    # and gzip scaffold as the other poll legs, so N viewers refreshing
+    # together cost one build, one digest and one compression.
+    import gzip
+
+    import cronstable.cron
+
+    # widened so the exact build counts below cannot be broken by a stall
+    # between awaits (CPU steal on a loaded runner under --cov inserts an
+    # extra build past the real 1.0s TTL).
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_HEAVY_YAML)
+    for name in ("h0", "h1", "h2"):
+        for i in range(10):
+            cron.run_history[name].append(_heat_run("success", 60 * i + 60))
+    builds = []
+    real_payload = cron.activity_payload
+
+    def counting_payload():
+        builds.append(1)
+        return real_payload()
+
+    monkeypatch.setattr(cron, "activity_payload", counting_payload)
+    first = await cron._web_get_activity(Req())
+    assert first.headers["Vary"] == "Accept-Encoding"
+    etag = first.headers["ETag"]
+    # one product shared across the pollers in the window
+    second = await cron._web_get_activity(Req())
+    assert len(builds) == 1
+    assert second.body == first.body
+    # a matching validator -> bodyless 304, headers only
+    not_modified = await cron._web_get_activity(
+        Req(headers={"If-None-Match": etag})
+    )
+    assert not_modified.status == 304
+    assert not_modified.headers["ETag"] == etag
+    # ... and a weak validator or a list still matches (_etag_matches)
+    weak = await cron._web_get_activity(
+        Req(headers={"If-None-Match": 'W/{}, "other"'.format(etag)})
+    )
+    assert weak.status == 304
+    # gzip for a capable client, same JSON underneath
+    zipped = await cron._web_get_activity(
+        Req(headers={"Accept-Encoding": "gzip"})
+    )
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert len(zipped.body) < len(first.body)
+    assert json.loads(gzip.decompress(zipped.body)) == json.loads(first.body)
+    # a local change renders on the next poll rather than out-waiting the TTL
+    cron._bust_response_memos()
+    await cron._web_get_activity(Req())
+    assert len(builds) == 2
+
+
+async def test_web_activity_memo_not_reinstated_over_a_bust(monkeypatch):
+    # a bust landing DURING the first build must not be undone by that
+    # pre-bust product being stored on the way out (the _memo_gen
+    # re-check in _shared_response_product)
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_ACTIVITY_RESPONSE_TTL", 3600.0)
+    cron = _cron(_ACTIVITY_YAML)
+    cron.run_history["a"].append(_heat_run("success", 60))
+    builds = []
+    real_payload = cron.activity_payload
+
+    def busting_payload():
+        builds.append(1)
+        if len(builds) == 1:
+            cron._bust_response_memos()
+        return real_payload()
+
+    monkeypatch.setattr(cron, "activity_payload", busting_payload)
+    first = await cron._web_get_activity(Req())
+    assert first.status == 200  # the leader still serves its own caller
+    assert cron._activity_response_memo.cached is None  # but never stores
+    second = await cron._web_get_activity(Req())
+    assert second.status == 200
+    assert len(builds) == 2  # rebuilt, not the pre-bust product
+    third = await cron._web_get_activity(Req())
+    assert third.status == 200
+    assert len(builds) == 2  # no bust this time: the second build is shared
+
+
+async def test_web_activity_offloaded_build_same_product(monkeypatch):
+    # past the offload gate the serialize/hash/gzip run on the executor;
+    # the bytes must match the inline build, only the thread differs
+    import threading
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_JOBS_SERIALIZE_OFFLOAD_MIN", 1)
+    cron = _cron(_ACTIVITY_YAML)
+    cron.run_history["a"].append(_heat_run("failure", 60))
+    idents = []
+    real_product = cronstable.cron._cachable_json_product
+
+    def recording_product(payload):
+        idents.append(threading.get_ident())
+        return real_product(payload)
+
+    monkeypatch.setattr(
+        cronstable.cron, "_cachable_json_product", recording_product
+    )
+    resp = await cron._web_get_activity(Req())
+    assert resp.status == 200
+    assert idents and idents[-1] != threading.get_ident()  # executor thread
+    assert resp.body == real_product(cron.activity_payload())[1]

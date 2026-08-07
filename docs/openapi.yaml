@@ -202,6 +202,13 @@ paths:
       operationId: getJobRuns
       parameters:
         - $ref: "#/components/parameters/JobName"
+        - name: limit
+          in: query
+          description: >-
+            Max runs to return, newest kept (clamped to the retained
+            history; default serves the whole retained window). `stats`
+            always covers the whole retained window.
+          schema: { type: integer }
       responses:
         "200":
           description: Retained run history and aggregate statistics.
@@ -210,6 +217,38 @@ paths:
               schema: { $ref: "#/components/schemas/JobRuns" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /activity:
+    get:
+      tags: [jobs]
+      summary: Batched recent run outcomes for every job
+      operationId: getActivity
+      description: >-
+        The activity heatmap's feed: the same records as
+        `GET /jobs/{name}/runs`, for every job at once, without the per-job
+        fan-out. `jobs` maps each job name to its retained runs, oldest
+        first, each reduced to the three plotted fields; a job that has
+        never run maps to an empty array. Supports `ETag` / `If-None-Match`
+        (304).
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: Recent run outcomes, per job.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items: { $ref: "#/components/schemas/ActivityRun" }
+        "304": { description: Not modified (matching `If-None-Match`). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
 
   /jobs/{name}/trends:
     get:
@@ -258,9 +297,13 @@ paths:
       operationId: getJobResources
       parameters:
         - $ref: "#/components/parameters/JobName"
-        - name: runs
+        - name: limit
           in: query
           description: Number of recent monitored runs to include (clamped).
+          schema: { type: integer }
+        - name: runs
+          in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
       responses:
         "200":
@@ -308,11 +351,23 @@ paths:
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
-        "200": { description: Launched (empty body). }
+        "200":
+          description: Launched.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  started: { type: string }
+                required: [started]
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: The job is disabled. }
+        "409":
+          description: The job is disabled (JSON error envelope).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /jobs/{name}/cancel:
     post:
@@ -323,11 +378,24 @@ paths:
       parameters:
         - $ref: "#/components/parameters/JobName"
       responses:
-        "200": { description: All running instances cancelled (empty body). }
+        "200":
+          description: All running instances cancelled.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: { type: string }
+                  instances: { type: integer }
+                required: [cancelled, instances]
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: The job is not running. }
+        "409":
+          description: The job is not running (JSON error envelope).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /jobs/{name}/pause:
     post:
@@ -422,6 +490,9 @@ paths:
                 type: object
                 properties:
                   dag: { type: string }
+                  name:
+                    type: string
+                    description: Same as `dag` (the generic subject key).
                   runs:
                     type: array
                     items: { $ref: "#/components/schemas/DagRunSummary" }
@@ -503,6 +574,9 @@ paths:
                 type: object
                 properties:
                   dag: { type: string }
+                  name:
+                    type: string
+                    description: Same as `dag` (the generic subject key).
                   runKey: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -647,8 +721,13 @@ paths:
         - name: tz
           in: query
           schema: { type: string }
+        - name: limit
+          in: query
+          description: Number of fire instants to preview (clamped).
+          schema: { type: integer }
         - name: count
           in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
         - name: seed
           in: query
@@ -754,8 +833,13 @@ paths:
         - name: days
           in: query
           schema: { type: integer }
+        - name: limit
+          in: query
+          description: Max fire entries per job (clamped).
+          schema: { type: integer }
         - name: per_job
           in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
         - $ref: "#/components/parameters/IcsToken"
       responses:
@@ -780,8 +864,13 @@ paths:
         - name: days
           in: query
           schema: { type: integer }
+        - name: limit
+          in: query
+          description: Max fire entries per job (clamped).
+          schema: { type: integer }
         - name: per_job
           in: query
+          description: Legacy alias of `limit` (read when `limit` is absent).
           schema: { type: integer }
         - $ref: "#/components/parameters/IcsToken"
       responses:
@@ -1188,15 +1277,37 @@ components:
     Unauthorized:
       description: >-
         Missing or unrecognised bearer token (when `web.authToken` or any
-        `web.authTokens` entry is configured).
+        `web.authTokens` entry is configured). The body is the same JSON
+        error envelope every other error response carries.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     Forbidden:
       description: >-
         The bearer token is valid but lacks the scope this operation requires
         (see `x-required-scope`), or a cross-site `Origin` was refused.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: No such job, DAG, or run.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
 
   schemas:
+    Error:
+      type: object
+      description: >-
+        The uniform error envelope. Every 4xx/5xx body this API serves is
+        this object (the bodyless 401 aside), so clients parse failures one
+        way across every endpoint.
+      properties:
+        error:
+          type: string
+          description: Human-readable reason.
+      required: [error]
+
     WhoAmI:
       type: object
       description: The bearer token that authenticated the request.
@@ -1388,6 +1499,26 @@ components:
           type: array
           items: { $ref: "#/components/schemas/JobRun" }
         stats: { $ref: "#/components/schemas/RunStats" }
+      additionalProperties: true
+
+    ActivityRun:
+      type: object
+      description: One retained run, reduced to the fields the heatmap plots.
+      properties:
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time }
+        outcome:
+          # Open enum (enum + bare string under anyOf, like JobRun.outcome),
+          # so generated clients keep decoding a newer daemon's outcomes.
+          description: >-
+            Run outcome. Known values: success, failure, cancelled, unknown,
+            skipped. The list is open: a newer daemon may send a value that
+            is not on it, and clients must keep decoding and render the
+            unknown value neutrally.
+          anyOf:
+            - type: string
+              enum: [success, failure, cancelled, unknown, skipped]
+            - type: string
       additionalProperties: true
 
     RunStats:

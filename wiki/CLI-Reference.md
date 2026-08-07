@@ -43,7 +43,7 @@ process supervisor (systemd, a container runtime, etc.); see
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `-c`, `--config` | path (file or directory) | platform default[^cfgdefault] | Configuration file, or a directory containing configuration files. When a directory, every `*.yml`/`*.yaml` file, plus every classic crontab (`*.crontab`, `*.cron`, or a file named `crontab`), is loaded (entries whose name starts with `_` or `.` are skipped). See [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) and [Classic Crontabs](Classic-Crontabs). |
-| `-l`, `--log-level` | string | `INFO` | Root log level. Passed to `logging.basicConfig(level=getattr(logging, LOG_LEVEL))`, so the value must name an attribute of the `logging` module (e.g. `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`). |
+| `-l`, `--log-level` | string | `INFO` | Root log level: `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`, upper or lower case (aliases the `logging` module knows, such as `WARN` and `FATAL`, also resolve). An unknown name exits `2` as a usage error. |
 | `-v`, `--validate-config` | flag | off | Parse and validate the configuration, then exit. Exits `0` if valid, `1` on a configuration error. Does not start the scheduler or web server. |
 | `--job-set-id` | flag | off | Parse the configuration, print the [job-set id](Job-Set-ID) (an order-independent hash of every job's effective configuration) to stdout, and exit `0`. Identical across instances running the same set of jobs. Exits `1` on a configuration error. |
 | `--version` | flag | off | Print the cronstable version to stdout and exit `0`. |
@@ -103,10 +103,10 @@ generic configuration-error path (a logged `Configuration error: ...` and exit
 
 The log level is applied with `logging.basicConfig` before the configuration is
 loaded, so it governs cronstable's own startup and runtime logging. The value is
-resolved with `getattr(logging, args.log_level)`; an unknown name (e.g. a
-lowercase or misspelled level) raises `AttributeError` and the process aborts
-with a traceback rather than a clean error. Use a canonical level name such as
-`DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
+upper-cased and resolved against the standard level names: `DEBUG`, `INFO`,
+`WARNING`, `ERROR`, and `CRITICAL` work in upper or lower case, as do the
+aliases the `logging` module defines (`WARN`, `FATAL`). A misspelled level
+exits `2` with a usage error naming the valid choices.
 
 A `logging:` section in the configuration can reconfigure logging after startup
 via `logging.config.dictConfig`; see [Logging Configuration](Logging-Configuration).
@@ -170,7 +170,7 @@ as the daemon flag, so both positions work: `cronstable -c /etc/cronstable.d sta
 and `cronstable state gc -c /etc/cronstable.d` are equivalent. (`-c` between `state`
 and the action name is not accepted.) If the resolved configuration has no
 `state:` section, or cannot be read, the action prints
-`cronstable state error: <detail>` to stdout and exits `1`; the
+`cronstable state error: <detail>` to stderr and exits `1`; the
 [default-path special case](#default-path-special-case) does not apply here.
 
 | Action | Description |
@@ -296,7 +296,9 @@ quarantine-on-read handling. `--dry-run` counts without rewriting.
 Every action exits `0` on success and `1` on any error: a missing or invalid
 configuration, no `state:` section, an I/O failure, or a refusal (restoring
 into a non-empty store without `--force`, migrating a store onto itself, GC
-with `gcGraceSeconds` disabled). Errors print `cronstable state error: <detail>`.
+with `gcGraceSeconds` disabled). Error and refusal messages go to stderr;
+configuration and I/O errors print as `cronstable state error: <detail>`.
+Success summaries and inventories stay on stdout, so piped output is clean.
 `cronstable state` with no action prints a pointer to `cronstable state --help` and
 exits `2`, the same code argparse itself uses for usage errors (an unknown
 option, or a missing required one such as `backup` without `-o`).
@@ -586,11 +588,7 @@ See [Running on Windows](Running-on-Windows).
 | --- | --- |
 | `0` | `--version` printed; `--validate-config` succeeded; `--job-set-id` printed; `--help`; a `state` action succeeded; or normal shutdown after a signal. |
 | `1` | Configuration error (parse/schema/validation failure or unreadable config); the default `-c` path (platform-specific: `/etc/cronstable.d` on POSIX, `%APPDATA%\cronstable` on Windows) does not exist and no `-c` was given; or a `state` action failed (see [`state` exit codes](#state-exit-codes)). |
-| `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
-
-A traceback (non-zero, not the clean `1` path) results from an invalid
-`--log-level` value, since the level is resolved before error handling is in
-place.
+| `2` | Usage error (argparse builtin): unknown option or missing required option (e.g. `state backup` without `-o`); an invalid `--log-level` value; `cronstable state` invoked with no action; or a `--` separator in any invocation other than `lock run` (see [`lock`](#lock-acquirereleaserun-distributed-mutexsemaphore)). |
 
 ## Examples
 

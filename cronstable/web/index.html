@@ -5543,7 +5543,15 @@ var qrcode = function() {
     for (const part of spec.split(",")) {
       let body = part, step = 1;
       const slash = part.indexOf("/");
-      if (slash >= 0) { step = parseInt(part.slice(slash + 1), 10); body = part.slice(0, slash); }
+      // strict, like cronexpr._parse_field: int() plus its explicit
+      // embedded-slash check. parseInt salvaged numeric prefixes, so
+      // */2.5, */2x, */2e1 and the double-slash 1/2/3 family all parsed
+      // here while the daemon refuses the config.
+      if (slash >= 0) {
+        const stepStr = part.slice(slash + 1);
+        if (!/^\d+$/.test(stepStr)) throw new Error("bad step: " + part);
+        step = parseInt(stepStr, 10); body = part.slice(0, slash);
+      }
       if (!Number.isFinite(step) || step < 1) throw new Error("bad step: " + part);
       let lo, hi;
       const rng = body.match(/^([^-]+)-(.+)$/);
@@ -5847,6 +5855,68 @@ var qrcode = function() {
     return dedupePhrases(out);
   }
   // plain-English description
+  // The daemon engine's REJECTIONS that the tolerant parsers above accept
+  // while the user types (see the asymmetry note in
+  // tests/test_web_engine_parity.py): wrap-around ranges, out-of-range
+  // endpoints, oversized steps, steps whose first stride escapes the field,
+  // and the classic-crontab-only "@midnight" (the daemon's loader rewrites
+  // it to @daily; the literal is a config parse error).  describeCron gates
+  // its confident prose on this so the sandbox never affirms a schedule the
+  // daemon refuses to load; parseCron and the fire previews stay tolerant
+  // on purpose.  Mirrors cronexpr._parse_field's checks and
+  // croninfo._engine_accepts' role; the Playwright differential pins the
+  // describe output byte-for-byte.
+  function fieldRejected(spec, min, max, stepEnd, names, isDow, specials) {
+    spec = String(spec).trim().toLowerCase();
+    if (spec === "*" || spec === "?") return false;
+    for (const part of spec.split(",")) {
+      // special day forms (L / L-n / nW / LW / d#n) carry their own
+      // validation in the tolerant parsers, matching the engine's
+      if (specials && (/^l/.test(part) || /w$/.test(part) || part.includes("#"))) continue;
+      let body = part, step = null;
+      const slash = part.indexOf("/");
+      // strict, like cronexpr._parse_field: a step with a non-digit
+      // remainder or an embedded slash (*/2.5, */2x, */2e1, 1/2/3) is a
+      // daemon parse error; parseInt salvaged the numeric prefix, so this
+      // gate affirmed (and describeCron confidently described) schedules
+      // the daemon refuses to load.
+      if (slash >= 0) {
+        const stepStr = part.slice(slash + 1);
+        if (!/^\d+$/.test(stepStr)) return true;
+        step = parseInt(stepStr, 10); body = part.slice(0, slash);
+      }
+      if (step != null && Number.isFinite(step) && (step < 1 || step > max)) return true;
+      let lo = null, hi = null;
+      const rng = body.match(/^([^-]+)-(.+)$/);
+      if (body === "*") { lo = min; hi = stepEnd; }
+      else if (rng) {
+        lo = nameToNum(rng[1], names); hi = nameToNum(rng[2], names);
+        if (isDow && hi === 0) hi = 7; // dow range ending in 0: end reads as 7
+      } else { lo = nameToNum(body, names); hi = slash >= 0 ? stepEnd : lo; }
+      if (lo == null || hi == null) continue; // malformed: the tolerant parse degrades it
+      if (lo > hi || lo < min || hi > max) return true;
+      if (step != null && Number.isFinite(step) && (lo + step < min || lo + step > max)) return true;
+    }
+    return false;
+  }
+  function cronRejected(expr) {
+    const low = String(expr || "").trim().toLowerCase();
+    if (low === "@midnight") return true;
+    if (MACROS[low]) return false;
+    const f = low.split(/\s+/);
+    let sec = null, yr = null, core;
+    if (f.length === 5) core = f;
+    else if (f.length === 6) { core = f.slice(0, 5); yr = f[5]; }
+    else if (f.length === 7) { sec = f[0]; core = f.slice(1, 6); yr = f[6]; }
+    else return false; // not field-shaped: the tolerant parse degrades it
+    return (sec != null && fieldRejected(sec, 0, 59, 59, null, false, false))
+      || fieldRejected(core[0], 0, 59, 59, null, false, false)
+      || fieldRejected(core[1], 0, 23, 23, null, false, false)
+      || fieldRejected(core[2], 1, 31, 31, null, false, true)
+      || fieldRejected(core[3], 1, 12, 12, MON_NAMES, false, false)
+      || fieldRejected(core[4], 0, 7, 6, DOW_NAMES, true, true)
+      || (yr != null && yr !== "*" && fieldRejected(yr, 1970, 2099, 2099, null, false, false));
+  }
   function describeCron(expr) {
     expr = String(expr || "").trim();
     const low = expr.toLowerCase();
@@ -5856,10 +5926,13 @@ var qrcode = function() {
       "@annually": "Once a year, at midnight on 1 January",
       "@monthly": "At midnight on the 1st of every month",
       "@weekly": "At midnight every Sunday",
-      "@daily": "Every day at midnight", "@midnight": "Every day at midnight",
+      // no "@midnight" here: classic-crontab-only, the daemon rejects the
+      // literal (cronRejected below sends it to the Custom line)
+      "@daily": "Every day at midnight",
       "@hourly": "Every hour, on the hour",
     };
     if (macroText[low]) return macroText[low];
+    if (cronRejected(expr)) return "Custom schedule: " + expr;
     const p = parseCron(expr);
     if (p.type !== "fields") return "Custom schedule: " + expr;
     const f = (MACROS[low] || expr).split(/\s+/);
@@ -6366,7 +6439,7 @@ var qrcode = function() {
     // Compare before writing, in every sweep below: most relative strings
     // ("5m ago") change once a minute or slower, yet an unconditional
     // assignment replaces the text node and dirties layout every second
-    // for every cell — 1000+ writes/s on a large fleet, forever. An equal
+    // for every cell (1000+ writes/s on a large fleet, forever). An equal
     // string skips the write and the browser does nothing at all.
     const put = (e, s) => { if (e.textContent !== s) e.textContent = s; };
     document.querySelectorAll("[data-ago]").forEach((e) => { put(e, fmtAgo(e.getAttribute("data-ago"))); });
@@ -7065,31 +7138,54 @@ var qrcode = function() {
   // ===================================================================
   //  activity heatmap — per-job run-outcome punchcard
   // ===================================================================
-  const HEAT_MAX_JOBS = 80;                  // cap the per-job fan-out
-  const HEAT_TTL = 45 * 1000;                // re-fetch a job's runs at most this often
+  const HEAT_MAX_JOBS = 80;                  // cap rendered rows and the fallback fan-out
+  const HEAT_TTL = 45 * 1000;                // fallback loop: re-fetch a job's runs at most this often
   const HEAT_COLS = 24;
   const HEAT_WINDOWS = { "6h": 6 * 3600e3, "24h": 24 * 3600e3, "7d": 7 * 86400e3 };
-  // Lazily fetch each job's /runs (sequentially, to avoid a request storm),
-  // cached with a TTL. Only ever runs while the panel is open.
+  // One batched /activity fetch fills the whole cache; against a daemon
+  // without the endpoint (404) it falls back to the lazy sequential
+  // per-job /runs loop. Only ever runs while the panel is open.
   async function loadHeatmap(force) {
     if (!prefs.heat || state.heat.loading) return;
     state.heat.loading = true;
     try {
-      const jobs = state.jobs.slice(0, HEAT_MAX_JOBS);
-      for (const j of jobs) {
-        if (!prefs.heat) break;                    // panel closed mid-fetch
-        const c = state.heat.cache[j.name];
-        if (!force && c && (performance.now() - c.at) < HEAT_TTL) continue;
-        try {
-          const r = await apiFetch("/jobs/" + encodeURIComponent(j.name) + "/runs");
-          if (r.ok) {
-            const d = await r.json();
-            state.heat.cache[j.name] = { at: performance.now(), runs: (d.runs || []).map((x) => ({ t: x.started_at, o: x.outcome })) };
-          }
-        } catch (e) { if (e.message === "unauthorized") return; }
+      const batched = await loadHeatmapBatch();
+      if (batched === null) return;              // unauthorized: modal is up
+      if (batched === false) {
+        const jobs = state.jobs.slice(0, HEAT_MAX_JOBS);
+        for (const j of jobs) {
+          if (!prefs.heat) break;                    // panel closed mid-fetch
+          const c = state.heat.cache[j.name];
+          if (!force && c && (performance.now() - c.at) < HEAT_TTL) continue;
+          try {
+            const r = await apiFetch("/jobs/" + encodeURIComponent(j.name) + "/runs");
+            if (r.ok) {
+              const d = await r.json();
+              state.heat.cache[j.name] = { at: performance.now(), runs: (d.runs || []).map((x) => ({ t: x.started_at, o: x.outcome })) };
+            }
+          } catch (e) { if (e.message === "unauthorized") return; }
+        }
       }
       renderHeatmap();
     } finally { state.heat.loading = false; }
+  }
+  // The whole punchcard in one request, served from the daemon's shared
+  // response memo. false only on 404 (an older daemon: fan out per job);
+  // any other failure keeps the cells already drawn. The tri-state
+  // preserves the old unauthorized behavior exactly (null: abort without
+  // rendering, the token modal is up).
+  async function loadHeatmapBatch() {
+    try {
+      const r = await apiFetch("/activity");
+      if (r.status === 404) return false;
+      if (r.ok) {
+        const d = await r.json();
+        const cache = {};
+        for (const name of Object.keys(d.jobs || {})) cache[name] = { at: performance.now(), runs: (d.jobs[name] || []).map((x) => ({ t: x.started_at, o: x.outcome })) };
+        state.heat.cache = cache;
+      }
+      return true;
+    } catch (e) { return e.message === "unauthorized" ? null : true; }
   }
   function relLabel(msAgo) {
     const s = Math.round(msAgo / 1000);
@@ -7444,28 +7540,25 @@ var qrcode = function() {
     if (v && !state.fleet.data) { loadFleet(); return; }
     renderFleet();
   }
-  // Same out-of-order guard as loadCluster: fired without awaiting from the
-  // poll path, so a delayed OLDER response must not overwrite a newer one.
-  let fleetReqSeq = 0, fleetAppliedSeq = 0;
-  async function loadFleet() {
-    const seq = ++fleetReqSeq;
-    try {
-      const r = await apiFetch("/fleet");
-      if (seq < fleetAppliedSeq) return;
-      if (!r.ok) { fleetAppliedSeq = seq; console.warn("loadFleet failed: HTTP " + r.status); return; }
-      const data = await r.json();
-      if (seq < fleetAppliedSeq) return;
-      fleetAppliedSeq = seq;
-      state.fleet.data = data.enabled ? data : null;
-      renderFleet();
-    } catch (e) {
-      // a 401 drives the re-auth flow elsewhere; anything else leaves the
-      // last frame on screen (its ages keep growing, which reads as stale)
-      if (e.message !== "unauthorized" && seq >= fleetAppliedSeq) {
-        fleetAppliedSeq = seq;
-        console.warn("loadFleet failed:", e);
+  // /fleet rides the cluster poll and is fired without awaiting, so a daemon
+  // slower than the poll interval stacked one more overlapping request every
+  // cycle against the browser's ~6-per-origin connection cap (see
+  // singleFlight). A cycle that finds its predecessor still pending joins it,
+  // and the next cluster poll calls straight back in.
+  function loadFleet() {
+    return singleFlight("fleet", async () => {
+      try {
+        const r = await apiFetch("/fleet");
+        if (!r.ok) { console.warn("loadFleet failed: HTTP " + r.status); return; }
+        const data = await r.json();
+        state.fleet.data = data.enabled ? data : null;
+        renderFleet();
+      } catch (e) {
+        // a 401 drives the re-auth flow elsewhere; anything else leaves the
+        // last frame on screen (its ages keep growing, which reads as stale)
+        if (e.message !== "unauthorized") console.warn("loadFleet failed:", e);
       }
-    }
+    });
   }
   // percent past which a node CPU/memory readout is warn-tinted (either axis)
   const LOAD_WARN_PCT = 85;
@@ -7608,14 +7701,28 @@ var qrcode = function() {
   //  data loading + notifications
   // ===================================================================
   let refreshing = false;
-  // One in-flight request per secondary poll endpoint. The seq counters in
-  // each loader already keep out-of-order APPLIES safe, but nothing stopped
-  // LAUNCHING a new fetch while the last still ran, so a slow daemon
-  // accumulated overlapping requests against the browser's ~6-per-origin
-  // connection cap (which the held SSE tails already lean on, see TAIL_MAX)
-  // exactly when it could least afford them. A poll cycle that finds its
-  // predecessor still pending simply skips this endpoint until it settles.
-  const secondaryInFlight = { cluster: false, node: false, dags: false, state: false };
+  // One in-flight request per secondary poll endpoint. Every secondary
+  // loader is fired without awaiting, so a daemon slower than the poll
+  // interval accumulated one more overlapping request per cycle against
+  // the browser's ~6-per-origin connection cap (which the held SSE tails
+  // already lean on, see TAIL_MAX) exactly when it could least afford
+  // them. singleFlight makes a cycle that finds its predecessor still
+  // pending JOIN it: every caller gets the same pending promise (the #dag
+  // deep link chains loadDags().then(open) and must wait for the fetch
+  // the poll already started), and the slot clears when it settles, on
+  // success, failure, or throw alike. With overlap impossible, responses
+  // apply in request order, which is what retired the per-loader seq
+  // counters that used to order the APPLY.
+  const secondaryInFlight = {};   // endpoint key -> pending promise
+  function singleFlight(key, fn) {
+    if (secondaryInFlight[key]) return secondaryInFlight[key];
+    // start fn in a microtask, strictly after the slot is claimed below: a
+    // fn that threw synchronously would otherwise run its clear first and
+    // wedge the slot for the life of the page
+    const p = Promise.resolve().then(fn).finally(() => { secondaryInFlight[key] = null; });
+    secondaryInFlight[key] = p;
+    return p;
+  }
   async function loadJobs() {
     if (refreshing) return;
     refreshing = true;
@@ -7658,19 +7765,17 @@ var qrcode = function() {
   }
   // Live node CPU/memory meter in the header (GET /node). Best-effort: a
   // failed fetch or a node without psutil just leaves the meter empty (hidden).
-  async function loadNode() {
-    if (secondaryInFlight.node) return;
-    secondaryInFlight.node = true;
-    try {
-      const res = await apiFetch("/node");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
-      renderNodeMeter(data.resources);
-    } catch (e) {
-      if (e.message !== "unauthorized") $("nodeMeter").innerHTML = "";
-    } finally {
-      secondaryInFlight.node = false;
-    }
+  function loadNode() {
+    return singleFlight("node", async () => {
+      try {
+        const res = await apiFetch("/node");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        renderNodeMeter(data.resources);
+      } catch (e) {
+        if (e.message !== "unauthorized") $("nodeMeter").innerHTML = "";
+      }
+    });
   }
   function renderNodeMeter(r) {
     const el = $("nodeMeter");
@@ -9511,25 +9616,25 @@ var qrcode = function() {
   function haChips(job) { return retryChip(job) + slotChip(job) + rebootChip(job) + reconChip(job) + liveResChip(job) + overdueChip(job) + pausedChip(job); }
 
   // ---- DAG index card ----
-  let dagReqSeq = 0, dagAppliedSeq = 0;
-  async function loadDags() {
-    if (secondaryInFlight.dags) return;
-    secondaryInFlight.dags = true;
-    const seq = ++dagReqSeq;
-    try {
-      const r = await apiFetch("/dags");
-      if (seq < dagAppliedSeq) return;
-      if (!r.ok) { dagAppliedSeq = seq; return; }
-      const list = await r.json();
-      if (seq < dagAppliedSeq) return;
-      dagAppliedSeq = seq;
-      state.dags.list = Array.isArray(list) ? list : [];
-      state.dags.byName = {};
-      state.dags.list.forEach((d) => { state.dags.byName[d.name] = d; });
-      renderDagCard();
-      if (state.dagDrawer.dag) renderDagDrawerHead();
-    } catch (e) { if (e.message !== "unauthorized") console.warn("loadDags failed:", e); }
-    finally { secondaryInFlight.dags = false; }
+  function loadDags() {
+    // A repeat call while a fetch is in flight hands back THAT fetch's
+    // promise, not undefined: the #dag deep link chains
+    // loadDags().then(open), and at bootstrap the poll cycle has always
+    // already started this fetch, so resolving early meant the list had
+    // not arrived and deep links never opened the drawer. singleFlight
+    // returns the pending promise for exactly this.
+    return singleFlight("dags", async () => {
+      try {
+        const r = await apiFetch("/dags");
+        if (!r.ok) return;
+        const list = await r.json();
+        state.dags.list = Array.isArray(list) ? list : [];
+        state.dags.byName = {};
+        state.dags.list.forEach((d) => { state.dags.byName[d.name] = d; });
+        renderDagCard();
+        if (state.dagDrawer.dag) renderDagDrawerHead();
+      } catch (e) { if (e.message !== "unauthorized") console.warn("loadDags failed:", e); }
+    });
   }
   function renderDagCard() {
     const dags = state.dags.list;
@@ -10015,13 +10120,35 @@ var qrcode = function() {
     } catch (e) { if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Stream ended: " + e.message); }
   }
   function stopDagTaskLog() { if (state.dagStream) { state.dagStream.abort(); state.dagStream = null; } }
+  // One line into the DAG task-log pane, on the same infrastructure the job
+  // log pane uses. This path used to read scrollHeight (a forced synchronous
+  // layout of the whole buffered block) and then do `textContent += text` per
+  // line (both O(buffer) per line), and applied no MAX_LOG_LINES cap at
+  // all, so a chatty task grew the pane without bound while getting quadratic
+  // on the way there. followBottom keeps the "reader scrolled away" bit from a
+  // passive scroll listener and coalesces the pin into one write per frame,
+  // and the cap trims the oldest NODE rather than rebuilding the view; see
+  // followBottom / appendLine. Per-line spans carry the stream so stderr reads
+  // the same red it does in every other terminal pane.
+  function appendDagLogLine(stream, text) {
+    const t = $("dgTerm"); if (!t) return;
+    // childElementCount is O(1) and self-healing: the pane is rebuilt by
+    // renderDagLogs and cleared on a task switch, so counting the live nodes
+    // beats carrying a counter that can drift out of step with them.
+    if (t.childElementCount >= MAX_LOG_LINES) { const first = t.firstElementChild; if (first) first.remove(); }
+    t.insertAdjacentHTML("beforeend", '<span class="ln ' + escAttr(stream || "") + '">' + esc(text) + "</span>");
+    followBottom(t, true, false);
+  }
   function startDagTaskLog(taskkey) {
     // idempotent: already tailing this exact task on a live stream -> no-op,
     // so a re-render can never blank/reconnect an active tail.
     if (state.dagStream && state.dagDrawer.logTask === taskkey) return;
     stopDagTaskLog();
     state.dagDrawer.logTask = taskkey;
-    const term = $("dgTerm"); if (term) term.textContent = "";
+    // reset the follow bit with the buffer, exactly as renderTerm does: the
+    // pane element can outlive a task switch, and a stale "reader scrolled
+    // away" bit would leave the fresh tail unpinned.
+    const term = $("dgTerm"); if (term) { term.textContent = ""; follower(term).at = true; }
     const note = $("dgLogNote"); if (note) note.textContent = "connecting…";
     const dag = state.dagDrawer.dag, rk = state.dagDrawer.runKey;
     if (!dag || !rk || !taskkey) return;
@@ -10031,10 +10158,7 @@ var qrcode = function() {
     state.dagStream = ctrl;
     readSSE(path, ctrl, {
       line: (stream, text) => {
-        const t = $("dgTerm"); if (!t) return;
-        const atBottom = t.scrollTop + t.clientHeight >= t.scrollHeight - 4;
-        t.textContent += text + "\n";
-        if (atBottom) t.scrollTop = t.scrollHeight;
+        appendDagLogLine(stream, text);
         const n = $("dgLogNote"); if (n) n.textContent = "";
       },
       end: (saw, reason) => { const n = $("dgLogNote"); if (n) n.textContent = saw ? "stream ended" : (reason === "no-output" ? "no live output (task is not running)" : "no output"); },
@@ -10098,34 +10222,34 @@ var qrcode = function() {
         toast("ok", "▦ backfill queued" + (created != null ? " (" + created + " run" + (created === 1 ? "" : "s") + ")" : ""));
         $("dgBackfill").style.display = "none";
         setTimeout(loadDagRuns, 300);
-      } else { const t = await res.text().catch(() => ""); toast("err", "backfill: " + (t || "HTTP " + res.status)); }
+      } else {
+        // 4xx bodies are the uniform JSON envelope {"error": msg}; keep the
+        // raw-text fallback so an older daemon's plain body still shows
+        const t = await res.text().catch(() => "");
+        let msg = t; try { msg = JSON.parse(t).error || t; } catch (_) {}
+        toast("err", "backfill: " + (msg || "HTTP " + res.status));
+      }
     } catch (e) { if (e.message !== "unauthorized") toast("err", "backfill failed"); }
   }
 
   // ===================================================================
   //  durable state inspector  (metadata-only)
   // ===================================================================
-  let stateSeq = 0, stateApplied = 0;
-  async function loadState() {
+  function loadState() {
     // Probe once even while closed so the ⛁ toggle can appear when a state
     // backend exists; after that, only poll while the inspector is open (the
     // inventory walk is not free).
     if (!prefs.stateInsp && state.stateInsp.probed) return;
-    if (secondaryInFlight.state) return;
-    secondaryInFlight.state = true;
-    const seq = ++stateSeq;
-    try {
-      const r = await apiFetch("/state");
-      if (seq < stateApplied) return;
-      if (!r.ok) { stateApplied = seq; state.stateInsp.probed = true; return; }
-      const data = await r.json();
-      if (seq < stateApplied) return;
-      stateApplied = seq;
-      state.stateInsp.probed = true;
-      state.stateInsp.data = data;
-      renderStateCard();
-    } catch (e) { if (e.message !== "unauthorized") console.warn("loadState failed:", e); }
-    finally { secondaryInFlight.state = false; }
+    return singleFlight("state", async () => {
+      try {
+        const r = await apiFetch("/state");
+        if (!r.ok) { state.stateInsp.probed = true; return; }
+        const data = await r.json();
+        state.stateInsp.probed = true;
+        state.stateInsp.data = data;
+        renderStateCard();
+      } catch (e) { if (e.message !== "unauthorized") console.warn("loadState failed:", e); }
+    });
   }
   function renderStateCard() {
     const data = state.stateInsp.data;
@@ -10771,172 +10895,161 @@ var qrcode = function() {
     const sum = $("clusterSummary");
     if (sum) sum.textContent = "cluster status unavailable" + (why ? " (" + why + ")" : "");
   }
-  // loadCluster() is fired without awaiting (from loadJobs' success path), so
-  // overlapping /cluster requests can resolve out of order -- and a delayed
-  // OLDER response would regress the leader/quorum badge and append a stale
-  // snapshot to the swimlane with a newer timestamp (failover history recorded
-  // backwards). Stamp each request with a sequence number and drop, whole, any
-  // response older than the newest one already applied (UI, alert, swimlane).
-  let clusterReqSeq = 0, clusterAppliedSeq = 0;
-  async function loadCluster() {
-    if (secondaryInFlight.cluster) return;
-    secondaryInFlight.cluster = true;
-    const seq = ++clusterReqSeq;
-    try {
-      const r = await apiFetch("/cluster");
-      if (seq < clusterAppliedSeq) return;   // a newer response already applied
-      if (!r.ok) { clusterAppliedSeq = seq; console.warn("loadCluster failed: HTTP " + r.status); clusterStale("HTTP " + r.status); return; }
-      const data = await r.json();
-      if (seq < clusterAppliedSeq) return;   // overtaken while reading the body
-      clusterAppliedSeq = seq;
-      const card = $("clusterCard");
-      // a fresh, successful read clears any prior staleness signal.
-      card.classList.remove("stale");
-      // feed the incident verdict bar the cluster's health signal every poll
-      setClusterAlert(data);
-      renderVerdict();
-      if (!data.enabled) {
-        card.style.display = "none";
-        setClusterMeta(null, false);
-        state.clusterLine = null;
-        $("swimBtn").style.display = "none";
-        $("swimPanel").style.display = "none";
-        state.fleet.data = null;
-        $("fleetBtn").style.display = "none";
-        $("fleetPanel").style.display = "none";
-        return;
-      }
-      card.style.display = "";
-      // spread is per-job ownership and only meaningful with election on; this
-      // mirrors the daemon's own gate for emitting clusterOwner in /jobs.
-      const spread = !!data.elect_leader && data.distribution === "spread";
-      setClusterMeta(data.node_name || null, spread);
-      // Lease backends (kubernetes/etcd) have no static peer set: the lease
-      // store is authoritative. Render the lease/role detail instead of a peer
-      // tally. (They are always single-leader, so spread is false above.)
-      if (data.backend && data.backend !== "gossip") {
-        loadClusterLease(data);
-        return;
-      }
-      $("clusterTable").style.display = "";
-      $("clusterLease").style.display = "none";
-      const peers = data.peers || [];
-      // Per-node ownership counts need the /jobs payload. loadCluster() now
-      // fires only from loadJobs' success path (state.jobs already set), but
-      // keep the state.fetchedAt > 0 guard so a caller added ahead of the
-      // first /jobs payload renders neutral placeholders rather than a bogus
-      // 0. Computed once and reused by the summary and the per-peer Owns
-      // column.
-      const ownsCounts = (spread && state.fetchedAt > 0) ? ownerCounts() : null;
-      // "self" entries are this node listed in its own peers; exclude from the
-      // agreement tally.
-      const counted = peers.filter((p) => p.status !== "self");
-      const agreed = counted.filter((p) => p.status === "agreed").length;
-      let summary =
-        (data.node_name || "?") + " · " + agreed + "/" + counted.length + " agreed";
-      if (data.elect_leader) {
-        // Quorum is authoritative from the backend: data.quorate is the gate's
-        // own is_quorate() (leader_name() is not None). The directional "agreed"
-        // tally above cannot reproduce it — it ignores mutual agreement, bridge
-        // candidates, and per-process dedup — so trust the backend rather than
-        // recomputing a number that both over- and under-counts.
-        const quorate = !!data.quorate;
-        // Any conflict (duplicate nodeName / size / coordination policy) fails
-        // the Leader gate closed regardless of leader/quorum, so it dominates
-        // the role: rendering "leader" while jobs are actually paused is
-        // self-contradictory. The detailed ⚠ lines below name the conflict.
-        const conflict = !!data.conflict;
-        let role;
-        if (conflict) {
-          role = "standing down (conflict)";
-        } else if (data.distribution === "spread") {
-          // no single leader: per-job ownership, gated on quorum
-          role = quorate ? "spread (per-job owner)" : "spread (no quorum)";
-        } else {
-          role = data.is_leader
-            ? "leader"
-            : data.leader
-              ? "follower (leader: " + data.leader + ")"
-              : quorate ? "follower" : "no quorum";
+  // loadCluster() is fired without awaiting (from loadJobs' success path);
+  // singleFlight keeps a second /cluster request from ever overlapping the
+  // first, so a delayed OLDER response can no longer overwrite a newer one,
+  // regress the leader/quorum badge, or append a stale snapshot to the
+  // swimlane with a newer timestamp (failover history recorded backwards).
+  function loadCluster() {
+    return singleFlight("cluster", async () => {
+      try {
+        const r = await apiFetch("/cluster");
+        if (!r.ok) { console.warn("loadCluster failed: HTTP " + r.status); clusterStale("HTTP " + r.status); return; }
+        const data = await r.json();
+        const card = $("clusterCard");
+        // a fresh, successful read clears any prior staleness signal.
+        card.classList.remove("stale");
+        // feed the incident verdict bar the cluster's health signal every poll
+        setClusterAlert(data);
+        renderVerdict();
+        if (!data.enabled) {
+          card.style.display = "none";
+          setClusterMeta(null, false);
+          state.clusterLine = null;
+          $("swimBtn").style.display = "none";
+          $("swimPanel").style.display = "none";
+          state.fleet.data = null;
+          $("fleetBtn").style.display = "none";
+          $("fleetPanel").style.display = "none";
+          return;
         }
-        summary +=
-          " · quorum " + (quorate ? "ok" : "lost") +
-          " (need " + (data.quorum || "?") + ")" +
-          " · " + role;
-        // under spread, how many jobs this node itself currently owns (omitted
-        // until the jobs payload is known — see ownsCounts above)
-        if (ownsCounts) summary += " · owns " + (ownsCounts[data.node_name] || 0);
+        card.style.display = "";
+        // spread is per-job ownership and only meaningful with election on; this
+        // mirrors the daemon's own gate for emitting clusterOwner in /jobs.
+        const spread = !!data.elect_leader && data.distribution === "spread";
+        setClusterMeta(data.node_name || null, spread);
+        // Lease backends (kubernetes/etcd) have no static peer set: the lease
+        // store is authoritative. Render the lease/role detail instead of a peer
+        // tally. (They are always single-leader, so spread is false above.)
+        if (data.backend && data.backend !== "gossip") {
+          loadClusterLease(data);
+          return;
+        }
+        $("clusterTable").style.display = "";
+        $("clusterLease").style.display = "none";
+        const peers = data.peers || [];
+        // Per-node ownership counts need the /jobs payload. loadCluster() now
+        // fires only from loadJobs' success path (state.jobs already set), but
+        // keep the state.fetchedAt > 0 guard so a caller added ahead of the
+        // first /jobs payload renders neutral placeholders rather than a bogus
+        // 0. Computed once and reused by the summary and the per-peer Owns
+        // column.
+        const ownsCounts = (spread && state.fetchedAt > 0) ? ownerCounts() : null;
+        // "self" entries are this node listed in its own peers; exclude from the
+        // agreement tally.
+        const counted = peers.filter((p) => p.status !== "self");
+        const agreed = counted.filter((p) => p.status === "agreed").length;
+        let summary =
+          (data.node_name || "?") + " · " + agreed + "/" + counted.length + " agreed";
+        if (data.elect_leader) {
+          // Quorum is authoritative from the backend: data.quorate is the gate's
+          // own is_quorate() (leader_name() is not None). The directional "agreed"
+          // tally above cannot reproduce it — it ignores mutual agreement, bridge
+          // candidates, and per-process dedup — so trust the backend rather than
+          // recomputing a number that both over- and under-counts.
+          const quorate = !!data.quorate;
+          // Any conflict (duplicate nodeName / size / coordination policy) fails
+          // the Leader gate closed regardless of leader/quorum, so it dominates
+          // the role: rendering "leader" while jobs are actually paused is
+          // self-contradictory. The detailed ⚠ lines below name the conflict.
+          const conflict = !!data.conflict;
+          let role;
+          if (conflict) {
+            role = "standing down (conflict)";
+          } else if (data.distribution === "spread") {
+            // no single leader: per-job ownership, gated on quorum
+            role = quorate ? "spread (per-job owner)" : "spread (no quorum)";
+          } else {
+            role = data.is_leader
+              ? "leader"
+              : data.leader
+                ? "follower (leader: " + data.leader + ")"
+                : quorate ? "follower" : "no quorum";
+          }
+          summary +=
+            " · quorum " + (quorate ? "ok" : "lost") +
+            " (need " + (data.quorum || "?") + ")" +
+            " · " + role;
+          // under spread, how many jobs this node itself currently owns (omitted
+          // until the jobs payload is known — see ownsCounts above)
+          if (ownsCounts) summary += " · owns " + (ownsCounts[data.node_name] || 0);
+        }
+        // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
+        if (data.conflict_names && data.conflict_names.length) {
+          summary +=
+            " · ⚠ duplicate nodeName (" + data.conflict_names.join(", ") +
+            ") — Leader jobs paused";
+        }
+        // a cluster-size disagreement (divergent peer lists, e.g. mid-resize)
+        // breaks the quorum proof the same way; surface it just as loudly.
+        if (data.size_conflict) {
+          var sizes = (data.conflicting_sizes || []).join(", ");
+          summary +=
+            " · ⚠ cluster size mismatch" +
+            (sizes ? " (peers declare " + sizes + " vs our " +
+              (data.cluster_size || "?") + ")" : "") +
+            " — Leader jobs paused";
+        }
+        // a coordination-policy mismatch (a peer running a different
+        // distribution / electLeader) picks different owners and would
+        // double-run or drop Leader jobs; surface it just as loudly.
+        if (data.policy_conflict) {
+          var policies = (data.conflicting_policies || []).join("; ");
+          summary +=
+            " · ⚠ coordination policy mismatch" +
+            (policies ? " (" + policies + ")" : "") +
+            " — Leader jobs paused";
+        }
+        // this node's own live load in the summary (always available, local)
+        if (data.node_stats) {
+          summary += " · this node " + fmtPercent(data.node_stats.cpu_percent) +
+            " cpu / " + fmtPercent(data.node_stats.mem_percent) + " mem";
+        }
+        $("clusterSummary").textContent = summary;
+        state.clusterLine = summary;
+        // the Owns column lists each peer's job count; reveal it only under spread
+        $("clusterTable").classList.toggle("show-owns", spread);
+        // the Load column appears only when peers actually share node stats
+        // (cluster.observability); otherwise those cells would be a wall of "—"
+        const anyPeerLoad = peers.some((p) => p.node_stats);
+        $("clusterTable").classList.toggle("show-load", anyPeerLoad);
+        $("clusterRows").innerHTML = peers.map((p) =>
+          '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
+          "<td>" + esc(p.node_name || "—") + "</td>" +
+          loadCell(p.node_stats) +
+          '<td class="col-owns">' + (ownsCounts && p.node_name ? esc(ownsCounts[p.node_name] || 0) : "—") + "</td>" +
+          "<td>" + esc(p.status) + "</td>" +
+          '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
+        ).join("");
+        // accumulate this snapshot into the peer swimlane and (re)draw it
+        $("swimBtn").style.display = "";
+        recordSwim(data, peers);
+        renderSwim();
+        // the fleet view rides the same poll; /fleet is answered from state
+        // the daemon already holds, but there is no need to read it while the
+        // panel is closed (renderFleet then just keeps everything hidden)
+        $("fleetBtn").style.display = "";
+        if (prefs.fleet) loadFleet(); else renderFleet();
+      } catch (e) {
+        // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
+        // flow (openModal) elsewhere; don't mask it as "unavailable". Any other
+        // throw (fetch/parse/render) leaves the panel stale rather than frozen.
+        if (e.message !== "unauthorized") {
+          console.warn("loadCluster failed:", e);
+          clusterStale();
+        }
       }
-      // a duplicate nodeName pauses Leader jobs cluster-wide; surface it loudly
-      if (data.conflict_names && data.conflict_names.length) {
-        summary +=
-          " · ⚠ duplicate nodeName (" + data.conflict_names.join(", ") +
-          ") — Leader jobs paused";
-      }
-      // a cluster-size disagreement (divergent peer lists, e.g. mid-resize)
-      // breaks the quorum proof the same way; surface it just as loudly.
-      if (data.size_conflict) {
-        var sizes = (data.conflicting_sizes || []).join(", ");
-        summary +=
-          " · ⚠ cluster size mismatch" +
-          (sizes ? " (peers declare " + sizes + " vs our " +
-            (data.cluster_size || "?") + ")" : "") +
-          " — Leader jobs paused";
-      }
-      // a coordination-policy mismatch (a peer running a different
-      // distribution / electLeader) picks different owners and would
-      // double-run or drop Leader jobs; surface it just as loudly.
-      if (data.policy_conflict) {
-        var policies = (data.conflicting_policies || []).join("; ");
-        summary +=
-          " · ⚠ coordination policy mismatch" +
-          (policies ? " (" + policies + ")" : "") +
-          " — Leader jobs paused";
-      }
-      // this node's own live load in the summary (always available, local)
-      if (data.node_stats) {
-        summary += " · this node " + fmtPercent(data.node_stats.cpu_percent) +
-          " cpu / " + fmtPercent(data.node_stats.mem_percent) + " mem";
-      }
-      $("clusterSummary").textContent = summary;
-      state.clusterLine = summary;
-      // the Owns column lists each peer's job count; reveal it only under spread
-      $("clusterTable").classList.toggle("show-owns", spread);
-      // the Load column appears only when peers actually share node stats
-      // (cluster.observability); otherwise those cells would be a wall of "—"
-      const anyPeerLoad = peers.some((p) => p.node_stats);
-      $("clusterTable").classList.toggle("show-load", anyPeerLoad);
-      $("clusterRows").innerHTML = peers.map((p) =>
-        '<tr><td><span class="cdot ' + esc(p.status) + '"></span>' + esc(p.host) + "</td>" +
-        "<td>" + esc(p.node_name || "—") + "</td>" +
-        loadCell(p.node_stats) +
-        '<td class="col-owns">' + (ownsCounts && p.node_name ? esc(ownsCounts[p.node_name] || 0) : "—") + "</td>" +
-        "<td>" + esc(p.status) + "</td>" +
-        '<td title="' + esc(p.job_set_id || "") + '">' + esc(shortId(p.job_set_id)) + "</td></tr>"
-      ).join("");
-      // accumulate this snapshot into the peer swimlane and (re)draw it
-      $("swimBtn").style.display = "";
-      recordSwim(data, peers);
-      renderSwim();
-      // the fleet view rides the same poll; /fleet is answered from state
-      // the daemon already holds, but there is no need to read it while the
-      // panel is closed (renderFleet then just keeps everything hidden)
-      $("fleetBtn").style.display = "";
-      if (prefs.fleet) loadFleet(); else renderFleet();
-    } catch (e) {
-      // a 401 is rethrown by apiFetch and drives the normal re-auth/connection
-      // flow (openModal) elsewhere; don't mask it as "unavailable". Any other
-      // throw (fetch/parse/render) leaves the panel stale rather than frozen --
-      // unless a newer response already applied, in which case this failure is
-      // old news and must not stamp "stale" over fresh data.
-      if (e.message !== "unauthorized" && seq >= clusterAppliedSeq) {
-        clusterAppliedSeq = seq;
-        console.warn("loadCluster failed:", e);
-        clusterStale();
-      }
-    } finally {
-      secondaryInFlight.cluster = false;
-    }
+    });
   }
 
   // ===================================================================
