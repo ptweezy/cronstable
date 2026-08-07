@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import logging
 import os
 import signal
@@ -2149,6 +2150,108 @@ async def test_stalled_statsd_does_not_block_job_launch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_finished_telemetry_task_exception_is_retrieved(
+    monkeypatch, caplog
+):
+    # _on_start's net only catches OSError, but the statsd endpoint machinery
+    # can raise RuntimeError (e.g. a closing transport). When that lands in
+    # the spawned job_started task and the task finishes before _on_stop
+    # runs, the already-done path must still retrieve the outcome and log
+    # it; otherwise asyncio reports "Task exception was never retrieved"
+    # through the loop exception handler at GC time, once per affected run.
+    async def boom(host, port, message):
+        if ".start:" in message:
+            raise RuntimeError("transport is closing")
+
+    monkeypatch.setattr(cronstable.statsd, "send_to_statsd", boom)
+
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print())
+        + """
+    schedule: "* * * * *"
+    statsd:
+      host: 127.0.0.1
+      port: 9999
+      prefix: the.prefix
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda lp, ctx: unhandled.append(ctx))
+    try:
+        with caplog.at_level(logging.WARNING, logger="cronstable"):
+            await job.start()
+            task = job._start_telemetry
+            assert task is not None
+            # let the emission fail before the job completes, so _on_stop
+            # takes the already-done branch. asyncio.wait joins WITHOUT
+            # retrieving the exception, which is the point under test.
+            done, _ = await asyncio.wait({task}, timeout=5)
+            assert task in done
+            await job.wait()
+        assert job.retcode == 0
+        assert "failed to send statsd job_started metric" in caplog.text
+
+        # drop the last reference and force finalization now, while our
+        # handler is still installed: an unretrieved exception would be
+        # reported from the task's destructor
+        del task
+        gc.collect()
+        await asyncio.sleep(0)
+        leaks = [
+            ctx
+            for ctx in unhandled
+            if "never retrieved" in str(ctx.get("message", ""))
+        ]
+        assert not leaks
+    finally:
+        loop.set_exception_handler(old_handler)
+
+
+@pytest.mark.asyncio
+async def test_stop_telemetry_runtime_error_does_not_propagate(
+    monkeypatch, caplog
+):
+    # The stop-side sibling of the retrieval test above: the statsd
+    # machinery can raise RuntimeError (a closing transport) from the
+    # job_stopped send too, and _on_stop is the choke point every
+    # completion path funnels through, so anything escaping its net
+    # would break the finished-run accounting rather than just lose a
+    # datagram. The send must be best-effort: log the warning, finish
+    # the run normally.
+    async def boom(host, port, message):
+        if ".stop:" in message:
+            raise RuntimeError("transport is closing")
+
+    monkeypatch.setattr(cronstable.statsd, "send_to_statsd", boom)
+
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print())
+        + """
+    schedule: "* * * * *"
+    statsd:
+      host: 127.0.0.1
+      port: 9999
+      prefix: the.prefix
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await job.start()
+        await job.wait()  # _on_stop must swallow the RuntimeError
+    assert job.retcode == 0
+    assert "failed to send statsd job_stopped metric" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_report_mail_closes_connection_on_error():
     # if sending fails, the SMTP connection must still be closed (no leak).
     conf = cronstable.config.parse_config_string(A_JOB, "")
@@ -2770,7 +2873,7 @@ async def test_flush_emit_buffer_survives_broken_daemon_stream(
     caplog, monkeypatch
 ):
     # If the daemon's own stdout is a dead pipe, the mirror's writer thread
-    # must swallow the OSError and log a warning -- the job's capture is
+    # must swallow the OSError and log a warning: the job's capture is
     # unaffected, so the reader keeps going.
     import sys
 

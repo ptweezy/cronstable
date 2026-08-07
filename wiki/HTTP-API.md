@@ -118,6 +118,7 @@ All routes are registered in `start_stop_web_app`:
 | `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
 | `GET` | `/calendar.ics` | `_web_calendar` | `200` (`text/calendar`) |
 | `GET` | `/jobs` | `_web_list_jobs` | `200` |
+| `GET` | `/activity` | `_web_get_activity` | `200` |
 | `GET` | `/jobs/{name}` | `_web_get_job` | `200` (`404` for an unknown job) |
 | `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
 | `GET` | `/jobs/{name}/calendar.ics` | `_web_job_calendar` | `200` (`text/calendar`; `404` for an unknown job) |
@@ -908,6 +909,35 @@ $ http get http://127.0.0.1:8080/jobs/test-01/runs
         "min_duration": 1.02,
         "max_duration": 1.02,
         "last_duration": 1.02
+    }
+}
+```
+
+### `GET /activity`
+
+The feed behind the activity heatmap on the
+[web dashboard](Web-Dashboard#activity-heatmap) and the
+[terminal dashboard](Terminal-Dashboard). `jobs` maps each job name to its
+retained runs, oldest first, each reduced to the three fields the heatmap
+plots (`started_at`, `finished_at`, `outcome`); a job that has never run maps
+to `[]`, so a client can tell "no runs" from "unknown job". The records, the
+bounds, and the restart behavior are exactly those of
+[`GET /jobs/{name}/runs`](#get-jobsnameruns), without the per-job fan-out,
+and one built response is shared across every viewer polling it (with
+`ETag` / `If-None-Match` and gzip, like `GET /jobs`).
+
+```shell
+$ http get http://127.0.0.1:8080/activity
+{
+    "jobs": {
+        "test-01": [
+            {
+                "started_at": "2026-06-21T12:00:00+00:00",
+                "finished_at": "2026-06-21T12:00:01+00:00",
+                "outcome": "success"
+            }
+        ],
+        "never-ran": []
     }
 }
 ```

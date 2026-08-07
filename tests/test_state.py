@@ -1054,6 +1054,56 @@ def test_fs_safe_is_injective_and_portable():
     assert _fs_safe("") == "_"
 
 
+def test_decode_fs_token_inverts_fs_safe_including_every_escape_hatch():
+    # _decode_fs_token has a fast path that hands an all-_FS_SAFE token back
+    # unchanged, which is only sound because _fs_safe would re-emit such a
+    # name verbatim. _fs_safe has three escape hatches that break that, and
+    # the fast path spends one guard on each; with no coverage a guard can be
+    # deleted with the whole suite green, and the function then returns names
+    # the encoder cannot have produced. state_admin's GC keep-set re-encodes
+    # every decoded name, so such a name reads an absent directory and the
+    # live state behind it is collected as garbage.
+    #
+    # One case per hatch, asserted against _fs_safe rather than a literal, so
+    # the test follows the encoder if its spelling ever changes.
+    for hatch, name in [
+        ("empty name", ""),
+        ("reserved device", "con"),
+        ("over length", "a" * (state._FS_SAFE_MAX + 1)),
+    ]:
+        assert _fs_safe(name) != name, hatch  # the hatch really did rewrite it
+        # the RAW name is not a token the encoder can emit, so decoding it
+        # must refuse rather than hand it straight back.
+        assert state._decode_fs_token(name) is None, hatch
+
+    # a truncated token is unrecoverable by design (its tail became a digest),
+    # so even the encoder's own output is refused for the over-length case.
+    assert (
+        state._decode_fs_token(_fs_safe("a" * (state._FS_SAFE_MAX + 1)))
+        is None
+    )
+
+    # everything else round-trips exactly, escaped or not.
+    for name in [
+        "plain-name_1",
+        "manual-9f2c1ab4",
+        "runs/nightly-backup",
+        "2026-08-07T12:00:00+00:00",
+        "Backup",
+        "a/b c",
+        chr(0xDCFF),  # lone surrogate, as os.fsdecode can produce
+        "n" + chr(0x00EF) + "code",
+        "con-x",
+        "a" * state._FS_SAFE_MAX,
+    ]:
+        assert state._decode_fs_token(_fs_safe(name)) == name, name
+
+    # a token the encoder cannot have produced is refused, never mangled:
+    # lowercase-hex aliases and foreign filenames re-encode differently.
+    assert state._decode_fs_token("%2f") is None  # the encoder emits %2F
+    assert state._decode_fs_token("Backup") is None  # uppercase is escaped
+
+
 def test_fs_safe_case_insensitive_injectivity():
     # NTFS/APFS resolve names case-insensitively: two jobs differing only by
     # case must not share one on-disk stream (merged ledgers -> wrong
@@ -2769,6 +2819,62 @@ async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
             ]
             == 0
         )
+    finally:
+        await backend.stop()
+
+
+async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(tmp_path):
+    # REGRESSION: the idem-doc sweep used to take each candidate's flock
+    # with the blocking _locked, so on a shared store one peer wedged
+    # mid-claim stalled the entire gc() call (and its worker slot) behind
+    # that single doc. The sweep now try-locks: a held lock skips the doc
+    # for this pass and a later pass collects it once released. Both
+    # platforms' lock primitives conflict across two descriptors of one
+    # file inside a single process (POSIX flock is per-open-file-
+    # description, Windows byte-range locks are per-handle; pinned by
+    # test_platform.test_nonblocking_lock_raises_on_contention), so a
+    # plain second fd stands in for the wedged peer and no subprocess or
+    # platform gate is needed.
+    from cronstable import jobstate
+    from cronstable.platform import exclusive_file_lock
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "held", ttl=5.0)
+        await jobstate.idempotency_claim(backend, "scope", "free", ttl=5.0)
+        cutoff = time.time() + 4000.0  # both claims lapsed vs this cutoff
+
+        held_lock, held_doc = backend._doc_paths("idem/scope", "held")
+        _free_lock, free_doc = backend._doc_paths("idem/scope", "free")
+
+        result = {}
+
+        def _sweep():
+            result["removed"] = backend._gc_idem_docs_sync(cutoff, False)
+
+        fd = os.open(held_lock, os.O_RDWR)
+        try:
+            with exclusive_file_lock(fd, blocking=False):
+                # daemon so a regression (the sweep blocking forever on
+                # the held flock) fails the join assert instead of
+                # hanging the whole run.
+                worker = threading.Thread(target=_sweep, daemon=True)
+                worker.start()
+                worker.join(timeout=30.0)
+                assert not worker.is_alive(), (
+                    "gc stalled behind a held idempotency-doc lock"
+                )
+        finally:
+            os.close(fd)
+
+        assert result["removed"] == 1  # the uncontended doc only
+        assert os.path.exists(held_doc)
+        assert not os.path.exists(free_doc)
+
+        # lock released: the next pass collects the skipped doc.
+        assert backend._gc_idem_docs_sync(cutoff, False) == 1
+        assert not os.path.exists(held_doc)
     finally:
         await backend.stop()
 

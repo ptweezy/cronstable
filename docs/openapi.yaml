@@ -220,6 +220,38 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /activity:
+    get:
+      tags: [jobs]
+      summary: Batched recent run outcomes for every job
+      operationId: getActivity
+      description: >-
+        The activity heatmap's feed: the same records as
+        `GET /jobs/{name}/runs`, for every job at once, without the per-job
+        fan-out. `jobs` maps each job name to its retained runs, oldest
+        first, each reduced to the three plotted fields; a job that has
+        never run maps to an empty array. Supports `ETag` / `If-None-Match`
+        (304).
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+      responses:
+        "200":
+          description: Recent run outcomes, per job.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: object
+                    additionalProperties:
+                      type: array
+                      items: { $ref: "#/components/schemas/ActivityRun" }
+        "304": { description: Not modified (matching `If-None-Match`). }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /jobs/{name}/trends:
     get:
       tags: [jobs]
@@ -1497,6 +1529,26 @@ components:
           type: array
           items: { $ref: "#/components/schemas/JobRun" }
         stats: { $ref: "#/components/schemas/RunStats" }
+      additionalProperties: true
+
+    ActivityRun:
+      type: object
+      description: One retained run, reduced to the fields the heatmap plots.
+      properties:
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time }
+        outcome:
+          # Open enum (enum + bare string under anyOf, like JobRun.outcome),
+          # so generated clients keep decoding a newer daemon's outcomes.
+          description: >-
+            Run outcome. Known values: success, failure, cancelled, unknown,
+            skipped. The list is open: a newer daemon may send a value that
+            is not on it, and clients must keep decoding and render the
+            unknown value neutrally.
+          anyOf:
+            - type: string
+              enum: [success, failure, cancelled, unknown, skipped]
+            - type: string
       additionalProperties: true
 
     RunStats:

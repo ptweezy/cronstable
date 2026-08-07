@@ -50,7 +50,7 @@ from urllib.parse import urlparse
 if TYPE_CHECKING:
     # aiohttp is the relay client, and nothing else here touches it.  Importing
     # it at module scope taxed every daemon start (cron.py imports this module
-    # unconditionally) with ~155 ms and ~21 MB of RSS for a reporter that only
+    # unconditionally) with ~144 ms and ~14 MB of RSS for a reporter that only
     # a paired deployment ever uses, so the real import lives at the two send
     # sites and this block exists only to resolve the ClientSession annotation
     # under the type checker.
