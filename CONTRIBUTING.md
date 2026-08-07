@@ -36,12 +36,13 @@ git push --force-with-lease
 
 ## Development setup
 
-cronstable targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13 and 3.14 are tested)
+cronstable targets **Python 3.10+** (3.10, 3.11, 3.12, 3.13, 3.14 and 3.15 are
+tested)
 and runs on **Linux, macOS and Windows** (the test suite runs on all three in
 CI, including Windows ARM64).
 
 cronstable uses [uv](https://docs.astral.sh/uv/) for a fast dev loop (`tox` also
-runs through uv via `tox-uv`, and uv can fetch the 3.10–3.14 interpreters the
+runs through uv via `tox-uv`, and uv can fetch the 3.10–3.15 interpreters the
 test matrix needs). With uv installed:
 
 ```sh
@@ -71,7 +72,7 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 Everything CI runs is driven by `tox`:
 
 ```sh
-tox            # all envs: py310, py311, py312, py313, py314, lint, mypy, bandit
+tox            # all envs: py310-py315, lint, mypy, bandit, openapi
 tox -e lint    # ruff check + ruff format --check
 tox -e mypy    # mypy
 tox -e bandit  # bandit security lint (medium+ severity)
@@ -151,7 +152,7 @@ wiki](#editing-the-wiki)). On a release it, in order:
    which only fires on a push to `main` or a manual dispatch);
 2. **computes** the next version from the latest `X.Y.Z` tag (refusing if that
    tag already exists);
-3. **builds and tests everything in parallel** — `tox` (py310–py314, lint,
+3. **builds and tests everything in parallel** — `tox` (py310–py315, lint,
    mypy), the wheel + sdist, the self-contained PyInstaller binaries for Linux
    (`amd64`, `arm64`, `i686`, `armv7`, `armv6`, `ppc64le`, `s390x` and
    `riscv64`, glibc and musl), macOS (`arm64` + `amd64`) and Windows (`amd64` +

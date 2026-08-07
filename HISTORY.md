@@ -367,6 +367,16 @@ project, on which cronstable is based.
   inside the poll loop, which froze every panel for the sum of up to 40
   round trips each refresh; entries for jobs removed by a reload are
   pruned.
+- Python 3.15 is supported and tested. It gates in CI on both Linux and
+  Windows, and it has a PyPI classifier, a `py315` tox env and matching
+  docs. Windows is covered as widely as Linux because 3.15 makes UTF-8 the
+  default encoding (PEP 686) and the Linux runners were already UTF-8, so
+  a regression from that change could only ever surface on Windows. Two
+  things still wait on upstream wheels: orjson publishes none for 3.15, so
+  the optional `speedups` extra leaves it out there and JSON falls back to
+  the standard library, and aiohttp publishes none for `win_arm64`, so
+  Windows on ARM64 stays on 3.14. Nothing changes for 3.10 through 3.14,
+  and the released binaries and Docker images are still built on 3.14.
 
 ## 1.2.36 (2026-08-03)
 
