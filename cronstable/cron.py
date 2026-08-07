@@ -119,8 +119,9 @@ from cronstable.state import Lease, StateBackend, make_state_backend
 class _AiohttpDoor:
     """Stand-in for ``aiohttp`` / ``aiohttp.web`` that imports on first touch.
 
-    aiohttp is 144 ms and 14 MB of RSS, roughly half of what importing this
-    module costs, and every one of its consumers here is optional: the web
+    aiohttp is 144 ms and 14 MB of RSS, roughly half the TIME of importing
+    this module and a bit under a third of its memory, and every one of its
+    consumers here is optional: the web
     listener, the cluster gossip client, the push relay. A daemon with none of
     them configured used to pay for the web stack anyway, and so did every
     offline caller that merely reaches into this module for a constant or a
@@ -136,8 +137,16 @@ class _AiohttpDoor:
     The first attribute access rebinds BOTH globals to the real modules, so the
     proxy is passed exactly once per process: after that ``web.Response`` is an
     ordinary module attribute lookup with no indirection, which matters because
-    it sits on every request path. ``__slots__`` keeps ``_target`` a real class
-    attribute so looking it up inside ``__getattr__`` cannot recurse.
+    it sits on every request path. ``__slots__`` is here to keep the proxy
+    small, NOT to stop recursion: what stops it is that ``__init__`` always
+    binds ``_target``, since an unset slot falls into ``__getattr__``, which
+    reads ``self._target``, which falls into ``__getattr__``. Any path that
+    builds one of these without running ``__init__`` therefore recurses;
+    ``__new__``, ``copy.copy``, ``copy.deepcopy`` and ``pickle.loads`` all do
+    (verified). Nothing copies or pickles these globals today, so this is a
+    constraint on future edits rather than a live bug: adding a second slot,
+    a ``__reduce__``, or anything that reconstructs the proxy needs the
+    ``_target`` lookup made recursion-proof first.
 
     The two figures above are the marginal cost of opening this door, measured
     in CI (run 31170258121, which compared a door-open tree against a

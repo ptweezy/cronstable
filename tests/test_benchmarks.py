@@ -7,6 +7,7 @@ gate down with it.  These tests run the suite in its minimal --smoke mode and
 exercise compare.py's merge, chart, and gate logic on synthetic inputs.
 """
 
+import datetime
 import json
 import os
 import statistics
@@ -54,15 +55,21 @@ def _importable(module):
 
 # --- the checked-in budgets.json ------------------------------------------
 #
-# Every other budget test below builds a synthetic document in tmp_path, so
-# until this one the REAL file had no consumer test at all, and compare.py
-# reads it with a bare doc.get("budgets", {}).  A renamed section, or an
-# entry left behind under "proposed", therefore disarms ceilings with the
-# perf job exiting 0 and printing nothing: the disarmed state is
-# indistinguishable from the intended one by inspection.  That is also the
-# mechanism behind the stale stamps this file was re-sized to fix, where
-# ceilings had drifted to as much as 8.3x the measured value while every
-# run stayed green.
+# Every other budget test in this file builds a synthetic document in
+# tmp_path, so these two are the only ones that read the shipped file.  It
+# needs reading: compare.py takes it with a bare doc.get("budgets", {}), so a
+# renamed section, or an entry left behind under "proposed", disarms ceilings
+# with the perf job exiting 0 and printing nothing.  A disarmed file is
+# indistinguishable from an intended one by inspection.
+#
+# The limit of these checks, so they are not mistaken for cover: they cannot
+# detect a stale stamp.  max/observed is scale-invariant and a maintainer
+# writes both numbers in one edit, so a ceiling and an observation that are
+# equally out of date score the same ~1.6x forever.  The nine entries as they
+# stood before the 2026-08-07 re-stamp all pass, including the one then
+# sitting at 8.3x the value CI measured.  'set' is where staleness shows, and
+# reading it means comparing against a fresh CI number, which no offline test
+# has.  What is covered below is shape and arming.
 
 
 def _real_budgets_doc():
@@ -87,17 +94,37 @@ def test_checked_in_budgets_are_armed_and_sized_against_observed_values():
         # a ceiling that only ever reports "was not measured this run".
         assert name in gated, (
             "%s carries an absolute budget but is not in expected_gated.txt, "
-            "so nothing guarantees it is measured" % name
+            "so no run is required to measure it" % name
         )
+        # 'observed' specifically, never 'local': an armed ceiling sized off a
+        # developer machine is what produced the config.parse_yaml_3k false
+        # red (max 2.0 from a 1.176 local figure, 2.164 on the runner). This
+        # required-field loop is the check that would have caught it.
         for field in ("max", "unit", "observed", "set"):
             assert field in spec, "%s is missing %r" % (name, field)
+        # 'set' is the only staleness evidence in the entry, so it has to be
+        # a date rather than any truthy string.
+        try:
+            datetime.date.fromisoformat(str(spec["set"]))
+        except (TypeError, ValueError):
+            raise AssertionError(
+                "%s has set=%r, which is not an ISO date; 'set' is the only "
+                "record of how old the observation is" % (name, spec["set"])
+            ) from None
+        # compare.py prints the unit straight into the breach message, so a
+        # wrong one misreports an MB ceiling as seconds to whoever triages it.
+        want_unit = "MB" if name.startswith("mem.") else "s"
+        assert spec["unit"] == want_unit, (
+            "%s has unit=%r, expected %r" % (name, spec["unit"], want_unit)
+        )
         headroom = spec["max"] / spec["observed"]
         assert 1.2 <= headroom <= 2.5, (
             "%s sits at %.2fx its observed value (%s vs %s); the file sizes "
             "ceilings at roughly +60%%. Under 1.2x false-reds on runner "
-            "variance; over 2.5x caps nothing, which is what a stamp left "
-            "behind by an optimization looks like. Re-measure, update "
-            "'observed' and 'set', and re-size 'max'."
+            "variance, and a ceiling at or below its own observation reds "
+            "immediately. Over 2.5x the drift it permits is larger than any "
+            "regression worth catching. Re-measure, update 'observed' and "
+            "'set', and re-size 'max'."
             % (name, headroom, spec["max"], spec["observed"])
         )
 
@@ -110,15 +137,15 @@ def test_checked_in_budgets_are_armed_and_sized_against_observed_values():
     )
 
 
-def test_compare_actually_loads_every_checked_in_budget(tmp_path):
+def test_compare_actually_loads_every_checked_in_budget():
     # the assertions above read the file directly; this one reads it THROUGH
     # compare.py, so a change to how the document is shaped or loaded cannot
-    # pass the structural check and still arm nothing.
-    sys.path.insert(0, os.path.join(REPO_ROOT, "benchmarks"))
-    try:
-        import compare as compare_mod
-    finally:
-        sys.path.pop(0)
+    # pass the structural check above and still leave the ceilings inert.
+    # _load_compare() is this file's one loader: importing
+    # benchmarks/compare.py a second time under the bare name `compare` would
+    # squat that name for the session and hand the other tests a different
+    # module object with its own state.
+    compare_mod = _load_compare()
     loaded = compare_mod._load_budgets(
         os.path.join(REPO_ROOT, "benchmarks", "budgets.json")
     )
