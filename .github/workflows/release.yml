@@ -314,12 +314,35 @@ jobs:
           - os: windows-11-arm
             python: '3.14'
             experimental: false
-          # Python 3.15 is in beta. Run it for early signal, but never let it
-          # gate CI -> continue-on-error. allow-prereleases lets setup-python
-          # pick up the beta (a no-op for the stable rows).
+          # Python 3.15 (3.15.0rc1 since 2026-08-04, final 2026-10-01). Run it
+          # for early signal, but never let it gate CI -> continue-on-error.
+          # allow-prereleases below lets setup-python pick the rc up (a no-op
+          # for the stable rows). Promote these to the matrix above when 3.15
+          # ships, and start a 3.16 row here in their place.
+          #
+          # Note what these cells install: there is no aiohttp cp315 wheel yet,
+          # so it (and zeroconf) compile from sdist here, which is why the rows
+          # are slower than the stable ones. orjson cannot: it needs a Rust
+          # toolchain, so requirements_dev.txt excludes it on 3.15 and the
+          # orjson tests self-skip. See tests/test_json_portability.py.
           - os: ubuntu-latest
             python: '3.15'
             experimental: true
+          # Windows too, and NOT redundant with the ubuntu row: 3.15 turns
+          # UTF-8 mode on by default (PEP 686), which changes what an open()
+          # with no explicit encoding does, but only where the locale was not
+          # already UTF-8. The Linux runners always are, so the ubuntu row
+          # is structurally incapable of catching a regression there, while
+          # Windows moves from the ANSI code page to UTF-8. It is also the
+          # only 3.15 coverage of the Proactor loop, the taskkill process-tree
+          # path and the SIGBREAK fallback in cronstable/platform.py.
+          - os: windows-latest
+            python: '3.15'
+            experimental: true
+          # windows-11-arm deliberately stays on 3.14 (the gating row above):
+          # aiohttp publishes win_arm64 wheels only through cp314, and that
+          # runner has no toolchain to build the sdist. Move it once aiohttp
+          # ships cp315.
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     # The suite runs in 2-9 min per cell (Windows is the slow end); 30 still
@@ -361,6 +384,21 @@ jobs:
           pip install "$(grep -E '^playwright' requirements_dev.txt)"
           python -m playwright install --with-deps chromium
       - run: tox -e py
+        # Prerelease cells only, so no gating cell gains a new way to fail and
+        # the stable rows keep their current output byte for byte. GitHub
+        # renders the false branch as an empty string, which CPython reads the
+        # same as unset. tox forwards the name; see `passenv` in tox.ini.
+        #
+        # Without this a new interpreter's deprecations are invisible: pytest
+        # installs its own filters per test, so anything raised while modules
+        # import never reaches the summary. Warnings only print here; nothing
+        # turns them into errors, so read them in the cell's pytest output.
+        #
+        # Deliberately NOT also setting PYTHONWARNDEFAULTENCODING (the PEP 686
+        # encoding audit): it fires on ~130 test fixtures that write ASCII and
+        # would bury this signal. tox.ini documents it as a manual sweep.
+        env:
+          PYTHONWARNINGS: ${{ matrix.experimental && 'default::DeprecationWarning' || '' }}
       # The differential self-skips wherever Chromium is missing (every other
       # cell, by design), so THIS cell must prove it actually ran: re-drive it
       # through the tox env's own interpreter (and therefore the env's own

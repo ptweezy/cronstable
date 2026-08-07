@@ -200,7 +200,22 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[tuple[str, str, str, str]] = []
     denied: list[tuple[str, str]] = []
     for dist in metadata.distributions():
-        name = (dist.metadata.get("Name") or "").strip()
+        try:
+            name = (dist.metadata.get("Name") or "").strip()
+            version = dist.version or "?"
+        # Same intent as the gather() guard below, one step earlier: these
+        # two reads sat outside it, so the "never let odd metadata crash the
+        # gate" promise did not actually cover them.  A dist-info directory
+        # with no METADATA file handed back empty metadata through 3.14 and
+        # raises MetadataNotFound (a FileNotFoundError, so no existing
+        # except clause catches it) from 3.15.  dist.version reads the same
+        # file, so it is exposed too.  One half-installed package in the
+        # environment now costs one UNKNOWN row, not the whole run.
+        except Exception as exc:
+            rows.append(
+                (UNKNOWN, "<unreadable>", "?", "unreadable metadata: %s" % exc)
+            )
+            continue
         if not name or name.lower() in SELF:
             continue
         try:
@@ -210,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
             verdict, label = UNKNOWN, "unreadable metadata: %s" % exc
         if name.lower() in ACKNOWLEDGED and verdict != OK:
             verdict = OK
-        rows.append((verdict, name, dist.version or "?", label))
+        rows.append((verdict, name, version, label))
         if verdict == DENY or (args.strict and verdict == WEAK):
             denied.append((name, label))
 

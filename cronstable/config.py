@@ -3072,7 +3072,16 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
         secret = str(spec["value"])
     elif spec.get("fromFile"):
         try:
-            with open(spec["fromFile"], "rt") as secret_file:
+            # Explicit encoding, like every other read in this module: the
+            # default is the locale's through 3.14 and UTF-8 from 3.15 (PEP
+            # 686), so an unqualified open() would decode one secret file two
+            # different ways across that upgrade.  A non-ASCII credential
+            # written in the Windows ANSI code page would resolve to a
+            # different string with no error at all; pinning utf-8 keeps the
+            # bytes-to-secret mapping identical on every interpreter, and
+            # turns a genuinely undecodable file into the UnicodeDecodeError
+            # the handler below already fails closed on.
+            with open(spec["fromFile"], "rt", encoding="utf-8") as secret_file:
                 secret = secret_file.read().strip()
         # Broad on purpose: callers only handle ConfigError -- on the
         # job-secret staging path (cron._prepare_job_api_run) anything else
