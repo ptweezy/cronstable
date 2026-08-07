@@ -18,10 +18,11 @@ WORKDIR /src
 
 # Layer contract, load-bearing for CI speed: everything from here through the
 # orjson step reads nothing from the source tree except pyproject.toml and
-# never references the per-commit VERSION arg, so buildx's GHA cache reuses
-# these expensive layers (toolchain plus every dependency, source-compiled
-# under QEMU on the wheel-less arches) across source-only commits; a typical
-# push rebuilds only the cheap project install at the bottom of this stage.
+# docker/extract_deps.py and never references the per-commit VERSION arg, so
+# buildx's GHA cache reuses these expensive layers (toolchain plus every
+# dependency, source-compiled under QEMU on the wheel-less arches) across
+# source-only commits; a typical push rebuilds only the cheap project
+# install at the bottom of this stage.
 # CI sets DEPS_REFRESH to the run id on a RELEASE so a release re-resolves
 # every dependency fresh; ordinary pushes leave it "" and ride the cache.
 ARG DEPS_REFRESH=""
@@ -45,18 +46,21 @@ RUN set -eux; \
     retry zypper --non-interactive install python313 python313-devel gcc make libffi-devel libsodium-devel git; \
     zypper clean --all
 
-# Only pyproject.toml reaches the dependency layer: its cache key is the
-# dependency metadata alone, never the rest of the tree.
+# Only pyproject.toml and the shared extraction helper reach the dependency
+# layer: its cache key is the dependency metadata plus the small script that
+# reads it, never the rest of the tree.
 COPY pyproject.toml /tmp/deps/pyproject.toml
+COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 
 # Install the third-party dependencies into the venv the runtime stage will
-# copy. The requirement strings are read straight out of pyproject.toml (core
-# dependencies plus the push and discovery extras), the exact strings
-# `pip install ".[push,discovery]"` would resolve, so the two can never drift
-# and a renamed extra fails the build loudly (KeyError). The build backend
-# (build-system.requires) goes into a throwaway venv, /tmp/deps/buildenv: the
-# project install below uses it to build the wheel without network access,
-# and it never pollutes the shipped /opt/venv.
+# copy. The requirement strings are read out of pyproject.toml by the COPYd
+# extract_deps.py helper (core dependencies plus the push and discovery
+# extras), the exact strings `pip install ".[push,discovery]"` would
+# resolve, so the two can never drift and a renamed extra fails the build
+# loudly (KeyError). The build backend (build-system.requires) goes into a
+# throwaway venv, /tmp/deps/buildenv: the project install below uses it to
+# build the wheel without network access, and it never pollutes the shipped
+# /opt/venv.
 #
 # libsodium-devel + SODIUM_INSTALL=system: on the archs with no PyNaCl wheel
 # (ppc64le/s390x) pip builds PyNaCl from its sdist, and with SODIUM_INSTALL
@@ -75,9 +79,7 @@ RUN set -eux; \
     export SODIUM_INSTALL=system; \
     python3.13 -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/python -c 'import tomllib; p = tomllib.load(open("/tmp/deps/pyproject.toml", "rb"))["project"]; print("\n".join(p["dependencies"] + p["optional-dependencies"]["push"] + p["optional-dependencies"]["discovery"]))' > /tmp/deps/requirements.txt; \
-    /opt/venv/bin/python -c 'import tomllib; print("\n".join(tomllib.load(open("/tmp/deps/pyproject.toml", "rb"))["build-system"]["requires"]))' > /tmp/deps/build-requires.txt; \
-    cat /tmp/deps/requirements.txt /tmp/deps/build-requires.txt; \
+    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/requirements.txt; \
     python3.13 -m venv /tmp/deps/buildenv; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt

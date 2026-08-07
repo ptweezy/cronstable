@@ -14,11 +14,12 @@ WORKDIR /src
 
 # Layer contract, load-bearing for CI speed: everything from here through the
 # orjson step reads nothing from the source tree except pyproject.toml and
-# never references the per-commit VERSION arg. These are the expensive layers
-# (toolchain plus every third-party dependency, source-compiled under QEMU on
-# the wheel-less arches), and keeping per-commit inputs out of them lets
-# buildx's GHA cache reuse them across source-only commits; a typical push
-# rebuilds only the cheap project install at the bottom of this stage.
+# docker/extract_deps.py and never references the per-commit VERSION arg.
+# These are the expensive layers (toolchain plus every third-party
+# dependency, source-compiled under QEMU on the wheel-less arches), and
+# keeping per-commit inputs out of them lets buildx's GHA cache reuse them
+# across source-only commits; a typical push rebuilds only the cheap project
+# install at the bottom of this stage.
 #
 # CI sets DEPS_REFRESH to the workflow run id on a RELEASE, deliberately
 # missing the cache so a release re-resolves every dependency fresh from the
@@ -46,30 +47,30 @@ RUN set -eux; \
     retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev git; \
     rm -rf /var/lib/apt/lists/*
 
-# Only pyproject.toml reaches the dependency layer: its cache key is the
-# dependency metadata alone, never the rest of the tree.
+# Only pyproject.toml and the shared extraction helper reach the dependency
+# layer: its cache key is the dependency metadata plus the small script that
+# reads it, never the rest of the tree.
 COPY pyproject.toml /tmp/deps/pyproject.toml
+COPY docker/extract_deps.py /tmp/deps/extract_deps.py
 
 # Install the third-party dependencies into a self-contained venv so the
 # runtime stage can copy just that, leaving the build toolchain behind. The
 # venv lives at the same path in both stages (both are python:3.14-slim), so
 # its interpreter symlinks stay valid.
 #
-# The requirement strings are read straight out of pyproject.toml (the core
-# dependencies plus the push and discovery extras), the exact strings
-# `pip install ".[push,discovery]"` would resolve, so the two can never
-# drift, and a renamed extra fails the build loudly (KeyError) instead of
-# silently shipping without it. The build backend (build-system.requires)
-# goes into a separate throwaway venv, /tmp/deps/buildenv: the project
-# install below uses it to build the wheel without network access, and it
-# never pollutes the shipped /opt/venv.
+# The requirement strings are read out of pyproject.toml by the COPYd
+# extract_deps.py helper (the core dependencies plus the push and discovery
+# extras), the exact strings `pip install ".[push,discovery]"` would
+# resolve, so the two can never drift, and a renamed extra fails the build
+# loudly (KeyError) instead of silently shipping without it. The build
+# backend (build-system.requires) goes into a separate throwaway venv,
+# /tmp/deps/buildenv: the project install below uses it to build the wheel
+# without network access, and it never pollutes the shipped /opt/venv.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     python -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    /opt/venv/bin/python -c 'import tomllib; p = tomllib.load(open("/tmp/deps/pyproject.toml", "rb"))["project"]; print("\n".join(p["dependencies"] + p["optional-dependencies"]["push"] + p["optional-dependencies"]["discovery"]))' > /tmp/deps/requirements.txt; \
-    /opt/venv/bin/python -c 'import tomllib; print("\n".join(tomllib.load(open("/tmp/deps/pyproject.toml", "rb"))["build-system"]["requires"]))' > /tmp/deps/build-requires.txt; \
-    cat /tmp/deps/requirements.txt /tmp/deps/build-requires.txt; \
+    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml; \
     retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/requirements.txt; \
     python -m venv /tmp/deps/buildenv; \
     retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt

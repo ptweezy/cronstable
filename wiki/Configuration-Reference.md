@@ -560,7 +560,7 @@ See [Failure Detection and Retries](Failure-Detection-and-Retries).
 ### Retries and reporting hooks
 
 Three lifecycle hooks each carry a `report` block (mail, sentry, shell,
-webhook, push); `onFailure` additionally carries a `retry` block. The `report`
+webhook, push); `onFailure` also carries a `retry` block. The `report`
 blocks all share the same `_report_schema` and the same `_REPORT_DEFAULTS`
 (deep-copied so the three blocks do not alias one another).
 

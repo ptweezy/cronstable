@@ -455,6 +455,25 @@ async def test_secret_is_run_scoped(tmp_path):
         await backend.stop()
 
 
+async def test_stage_secrets_warns_and_skips_unresolvable(
+    monkeypatch, caplog
+):
+    # direct unit test of the shared stager (jobs and dag tasks both call
+    # it): an unresolvable secret is skipped with a warning, never fatal;
+    # the run sees a 404 for it and fails as it sees fit.
+    monkeypatch.delenv("JOBAPI_UNSET_SECRET", raising=False)
+    specs = [
+        {"name": "good", "value": "v"},
+        {"name": "bad", "fromEnvVar": "JOBAPI_UNSET_SECRET"},
+    ]
+    with caplog.at_level(logging.WARNING, logger="cronstable.jobapi"):
+        staged = await jobapi.stage_secrets(specs, "job x")
+    assert staged == {"good": "v"}
+    assert any(
+        "could not stage secret" in r.message for r in caplog.records
+    )
+
+
 # --------------------------------------------------------------------------
 # Locks (mutex / semaphore) over HTTP
 # --------------------------------------------------------------------------

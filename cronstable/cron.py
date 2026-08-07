@@ -34,6 +34,7 @@ from typing import (  # noqa
     Deque,
     Dict,
     FrozenSet,
+    Generic,
     Iterable,
     List,
     NamedTuple,
@@ -41,6 +42,7 @@ from typing import (  # noqa
     Set,
     Tuple,
     Type,
+    TypeVar,
     Union,
 )
 from urllib.parse import urlparse
@@ -117,8 +119,9 @@ from cronstable.state import Lease, StateBackend, make_state_backend
 class _AiohttpDoor:
     """Stand-in for ``aiohttp`` / ``aiohttp.web`` that imports on first touch.
 
-    aiohttp is 155 ms and 21 MB of RSS, roughly half of what importing this
-    module costs, and every one of its consumers here is optional: the web
+    aiohttp is 144 ms and 14 MB of RSS, roughly half the TIME of importing
+    this module and a bit under a third of its memory, and every one of its
+    consumers here is optional: the web
     listener, the cluster gossip client, the push relay. A daemon with none of
     them configured used to pay for the web stack anyway, and so did every
     offline caller that merely reaches into this module for a constant or a
@@ -134,8 +137,25 @@ class _AiohttpDoor:
     The first attribute access rebinds BOTH globals to the real modules, so the
     proxy is passed exactly once per process: after that ``web.Response`` is an
     ordinary module attribute lookup with no indirection, which matters because
-    it sits on every request path. ``__slots__`` keeps ``_target`` a real class
-    attribute so looking it up inside ``__getattr__`` cannot recurse.
+    it sits on every request path. ``__slots__`` is here to keep the proxy
+    small, NOT to stop recursion: what stops it is that ``__init__`` always
+    binds ``_target``, since an unset slot falls into ``__getattr__``, which
+    reads ``self._target``, which falls into ``__getattr__``. Any path that
+    builds one of these without running ``__init__`` therefore recurses;
+    ``__new__``, ``copy.copy``, ``copy.deepcopy`` and ``pickle.loads`` all do
+    (verified). Nothing copies or pickles these globals today, so this is a
+    constraint on future edits rather than a live bug: adding a second slot,
+    a ``__reduce__``, or anything that reconstructs the proxy needs the
+    ``_target`` lookup made recursion-proof first.
+
+    The two figures above are the marginal cost of opening this door, measured
+    in CI (run 31170258121, which compared a door-open tree against a
+    door-closed one): ``startup.import_daemon`` 179 ms to 323 ms and
+    ``mem.rss_daemon_import`` 35.4 MB to 49.1 MB. They are quoted again at the
+    other deferral sites (:func:`_access_log_class`, ``job.py``'s webhook
+    reporter, ``push.py``'s relay client) and gated as a COUNT by
+    ``tests/test_perf_invariants.py``, which fails if importing this module
+    loads any aiohttp at all.
     """
 
     __slots__ = ("_target",)
@@ -515,6 +535,11 @@ WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
     ("GET", "/schedule/why", "_web_schedule_why", None),
     ("GET", "/calendar.ics", "_web_calendar", None),
     ("GET", "/jobs", "_web_list_jobs", None),
+    # the activity heatmap's batched feed: every job's retained run
+    # outcomes in one memoized product (see _web_get_activity). A fixed
+    # top-level path on purpose: /jobs/activity would shadow a job
+    # literally named "activity" under the /jobs/{name} dynamic route.
+    ("GET", "/activity", "_web_get_activity", None),
     ("GET", "/jobs/{name}", "_web_get_job", None),
     ("GET", "/jobs/{name}/runs", "_web_job_runs", None),
     ("GET", "/jobs/{name}/calendar.ics", "_web_job_calendar", None),
@@ -699,6 +724,35 @@ class ApiActionError(Exception):
         self.status = status
 
 
+def _strip_headers(headers: Optional[Any], *names: str) -> Dict[str, str]:
+    """A fresh dict of ``headers`` minus ``names``, case-insensitively.
+
+    ``names`` must be given lowercase.  ``None`` or an empty mapping
+    yields an empty dict, so callers may mutate the result freely.
+    """
+    if not headers:
+        return {}
+    return {
+        key: value
+        for key, value in dict(headers).items()
+        if key.lower() not in names
+    }
+
+
+def _strip_content_type(headers: Optional[Any]) -> Dict[str, str]:
+    """The mapping minus any Content-Type, in any spelling.
+
+    The canonical home of the rule every JSON/data endpoint applies: the
+    endpoint's own Content-Type wins over an operator-configured
+    ``web.headers`` one.  aiohttp refuses ``content_type=`` when the
+    mapping already carries a Content-Type, and header names are
+    case-insensitive on the wire while these dicts are not, so a
+    case-variant leftover would be emitted as a second, conflicting
+    header.
+    """
+    return _strip_headers(headers, "content-type")
+
+
 def _error_body(message: str) -> str:
     """The web API's ONE error envelope: a JSON object ``{"error": msg}``.
 
@@ -733,11 +787,9 @@ def _api_error(
     conflicting header even where aiohttp did not refuse.
     """
     if headers is not None:
-        clean = {
-            key: value
-            for key, value in dict(headers).items()
-            if key.lower() != "content-type"
-        }
+        # the envelope's own Content-Type wins, in any spelling: see
+        # _strip_content_type
+        clean = _strip_content_type(headers)
         return factory(
             text=_error_body(message),
             content_type="application/json",
@@ -765,7 +817,6 @@ def _http_for_action_error(
     return _api_error(factory, ex.message, headers)
 
 
-@web.middleware
 async def _error_envelope_middleware(request, handler):
     """Give every escaping HTTP error the one JSON envelope.
 
@@ -779,23 +830,38 @@ async def _error_envelope_middleware(request, handler):
     already carrying the envelope passes through untouched, and headers the
     error legitimately owns (a 405's ``Allow``) are preserved; only the
     body-describing pair is replaced along with the body.
+
+    Marked new-style below rather than with ``@web.middleware`` here.  The
+    decorator reads an attribute off the lazy aiohttp door above while this
+    module's body is still executing, which drags the whole web stack into
+    every offline caller: 144 ms and 14 MB of RSS on an import that needs
+    none of it (measured, and gated by
+    ``tests/test_perf_invariants.py``).  The marker itself must stay at
+    module scope, because an UNMARKED middleware is not refused: aiohttp
+    reads it as a pre-3.0 middleware FACTORY, calls it as ``m(app,
+    handler)``, and every request 500s behind nothing louder than a
+    DeprecationWarning.  Applying the marker at the one construction site
+    would leave that trap armed for the next one.
     """
     try:
         return await handler(request)
     except web.HTTPException as ex:
         if ex.status < 400 or ex.content_type == "application/json":
             raise
-        headers = {
-            key: value
-            for key, value in ex.headers.items()
-            if key.lower() not in ("content-type", "content-length")
-        }
+        headers = _strip_headers(ex.headers, "content-type", "content-length")
         return web.Response(
             text=_error_body(ex.text or ex.reason),
             status=ex.status,
             headers=headers,
             content_type="application/json",
         )
+
+
+# aiohttp's decorator is this assignment plus a return, so this is the same
+# marker without the attribute read that would open the door.  Pinned by
+# tests/test_cron.py, so an aiohttp release that moves the marker cannot
+# silently demote the envelope to an old-style factory.
+_error_envelope_middleware.__middleware_version__ = 1  # type: ignore[attr-defined]
 
 
 # Defense-in-depth security headers for the dashboard HTML document. The
@@ -1242,11 +1308,7 @@ def _json_response(
     except (_json.UnsupportedValue, ValueError, TypeError):
         body = json.dumps(payload, default=str).encode("utf-8")
     if headers is not None:
-        headers = {
-            key: value
-            for key, value in dict(headers).items()
-            if key.lower() != "content-type"
-        }
+        headers = _strip_content_type(headers)
     return web.Response(
         body=body,
         status=status,
@@ -1319,6 +1381,62 @@ _METRICS_RESPONSE_TTL = 1.0
 #: old by the time it reaches us, so a further second of sharing changes
 #: nothing a viewer can observe.
 _FLEET_RESPONSE_TTL = 1.0
+
+#: Per-node job-summary entry count at or above which the /fleet
+#: serialize, hash and gzip run on the default executor instead of
+#: inline.  The merge itself stays on the loop (it reads live gossip
+#: state), but the product over the merged dict is pure CPU, the same
+#: split /jobs makes at _JOBS_SERIALIZE_OFFLOAD_MIN.
+_FLEET_SERIALIZE_OFFLOAD_MIN = 200
+
+#: How long one built ``GET /activity`` product is shared across viewers.
+#: The payload is a pure projection of the run histories, which change
+#: only on events that already bust the memo (a run recorded, a reload),
+#: so the TTL is a safety net; 1s keeps it uniform with the /jobs and
+#: /fleet windows.  A heat overlay refreshes at most once a minute per
+#: viewer, so the memo pays off exactly when several viewers land
+#: together.
+_ACTIVITY_RESPONSE_TTL = 1.0
+
+
+_ProductT = TypeVar("_ProductT")
+
+
+class _ResponseMemo(Generic[_ProductT]):
+    """State for one memoized endpoint product, and nothing else.
+
+    A plain holder: the policy (TTL, single flight, the generation guard)
+    lives in :meth:`Cron._shared_response_product`, the only writer besides
+    :meth:`Cron._bust_response_memos` clearing ``cached``.
+    """
+
+    __slots__ = ("cached", "inflight", "inflight_gen")
+
+    def __init__(self) -> None:
+        # (loop.time stamp, product) of the newest stored build, or None
+        self.cached: Optional[Tuple[float, _ProductT]] = None
+        # the in-flight build's future, for followers to join
+        self.inflight: Optional["asyncio.Future[Optional[_ProductT]]"] = None
+        # the _memo_gen the in-flight build registered under; a joiner
+        # compares it against the current one before trusting the product
+        self.inflight_gen = 0
+
+    def finish(
+        self,
+        fut: "asyncio.Future[Optional[_ProductT]]",
+        product: Optional[_ProductT],
+    ) -> None:
+        """Release the single-flight slot and wake this build's followers.
+
+        It deregisters only while the slot is still ours, the same rule
+        :meth:`Cron._install_tail_task`'s done-callback follows, so a
+        build started after ours (possible once ours has failed) is never
+        evicted by our cleanup.
+        """
+        if self.inflight is fut:
+            self.inflight = None
+        if not fut.done():
+            fut.set_result(product)
 
 
 def _etag_matches(header: Optional[str], etag: str) -> bool:
@@ -1449,6 +1567,43 @@ def _jobs_response_product(
     return etag, body, None
 
 
+def _conditional_response(
+    etag: Optional[str],
+    body: bytes,
+    gz: Optional[bytes],
+    *,
+    if_none_match: Optional[str],
+    gzip_ok: bool,
+    headers: Optional[Any] = None,
+) -> web.Response:
+    """The ONE conditional-serve tail for the memoized JSON endpoints.
+
+    Strip the operator Content-Type, tag, ``Vary``, the If-None-Match
+    compare, then the gzip pick: shared by ``/jobs``, ``/fleet`` and
+    everything built on :func:`_cachable_json_response`, so the steps
+    cannot drift apart per endpoint.  ``etag=None`` means never tag and
+    never 304 (the ``/cluster`` case, whose payload changes every poll).
+    """
+    hdrs = _strip_content_type(headers)
+    # on EVERY representation, compressed or not: a shared cache that
+    # missed this would hand a gzipped body to a client that cannot read
+    # one.
+    hdrs["Vary"] = "Accept-Encoding"
+    if etag is not None:
+        hdrs["ETag"] = etag
+        if _etag_matches(if_none_match, etag):
+            return web.Response(status=304, headers=hdrs)
+    if gzip_ok and gz is not None:
+        hdrs["Content-Encoding"] = "gzip"
+        body = gz
+    return web.Response(
+        body=body,
+        status=200,
+        headers=hdrs,
+        content_type="application/json",
+    )
+
+
 def _cachable_json_response(
     payload: Any,
     *,
@@ -1464,46 +1619,22 @@ def _cachable_json_response(
     because its payload carries a per-poll relative countdown); this is the
     plain-shaped sibling for the OTHER polled endpoints, whose serialized
     body already changes exactly when the displayed data does, so the tag
-    can simply hash the body bytes.  ``use_etag=False`` is for a payload
-    that legitimately changes on every request (``/cluster`` embeds this
-    node's freshly sampled CPU/memory), where a tag would be computed per
-    poll and never match; such a response still negotiates gzip.  ``Vary:
-    Accept-Encoding`` rides every response either way, compressed or not: a
-    shared cache that missed it would hand a gzipped body to a client that
-    cannot read one.  Serialization stays inline: these payloads are tens
-    of KB at the scales the endpoints see (dozens of dags, not thousands of
-    jobs), well under where /jobs' executor hop starts paying for itself.
+    can simply hash the body bytes.  The serialize/sha256[:32]/gzip-floor
+    core lives only in :func:`_cachable_json_product`, and the serve tail
+    in :func:`_conditional_response`; this is the unmemoized composition of
+    the two.  ``use_etag=False`` is for a payload that legitimately changes
+    on every request (``/cluster`` embeds this node's freshly sampled
+    CPU/memory), where a tag would be computed per poll and never match;
+    such a response still negotiates gzip.
     """
-    try:
-        body = _json.dumps_bytes(payload, trusted=True)
-    except (_json.UnsupportedValue, ValueError, TypeError):
-        body = json.dumps(payload, default=str).encode("utf-8")
-    # the endpoint's own Content-Type wins over an operator-configured one,
-    # in any spelling: the _json_response/_api_error rule (aiohttp refuses
-    # content_type= when the mapping already carries a Content-Type).
-    hdrs: Dict[str, str] = (
-        {
-            key: value
-            for key, value in dict(headers).items()
-            if key.lower() != "content-type"
-        }
-        if headers
-        else {}
-    )
-    hdrs["Vary"] = "Accept-Encoding"
-    if use_etag:
-        etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
-        hdrs["ETag"] = etag
-        if _etag_matches(if_none_match, etag):
-            return web.Response(status=304, headers=hdrs)
-    if gzip_ok and len(body) >= _GZIP_MIN_BYTES:
-        hdrs["Content-Encoding"] = "gzip"
-        body = _gzip_body(body)
-    return web.Response(
-        body=body,
-        status=200,
-        headers=hdrs,
-        content_type="application/json",
+    etag, body, gz = _cachable_json_product(payload)
+    return _conditional_response(
+        etag if use_etag else None,
+        body,
+        gz,
+        if_none_match=if_none_match,
+        gzip_ok=gzip_ok,
+        headers=headers,
     )
 
 
@@ -1708,8 +1839,8 @@ def _access_log_class() -> type:
     """aiohttp's access logger, with the feed token redacted.
 
     Built lazily and cached: importing ``aiohttp.web_log`` at module scope
-    would defeat the lazy aiohttp door above, which exists to keep 155 ms
-    and 21 MB of RSS off every daemon start.
+    would defeat the lazy aiohttp door above, which exists to keep 144 ms
+    and 14 MB of RSS off every daemon start.
 
     The hook is ``log``, the one method
     :class:`aiohttp.abc.AbstractAccessLogger` actually declares.  The
@@ -1874,36 +2005,35 @@ class Cron:
         # bounds concurrently-executing subprocess spawns (job and DAG-task
         # launches share it); see _SPAWN_BURST_LIMIT for the why.
         self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
-        # the shared GET /jobs product: (loop.time stamp, etag, body, gz).
-        # See _JOBS_RESPONSE_TTL and _bust_response_memos.
-        self._jobs_response_cache: Optional[
-            Tuple[float, str, bytes, Optional[bytes]]
-        ] = None
-        # the shared GET /metrics product, per exposition format:
-        # openmetrics flag -> (loop.time stamp, body, gz). Two entries at
-        # most, so a deployment scraped in both formats memoizes both rather
-        # than thrashing one slot. See _METRICS_RESPONSE_TTL.
-        self._metrics_response_cache: Dict[
-            bool, Tuple[float, bytes, Optional[bytes]]
-        ] = {}
-        # in-flight /metrics builds, per exposition format: the single-flight
-        # gate the memo above needs once the build is offloaded. See
-        # _metrics_product.
-        self._metrics_build_inflight: Dict[
-            bool, "asyncio.Future[Optional[Tuple[bytes, Optional[bytes]]]]"
-        ] = {}
-        # the shared GET /fleet product: (loop.time stamp, etag, body, gz).
-        # See _FLEET_RESPONSE_TTL.
-        self._fleet_response_cache: Optional[
-            Tuple[float, str, bytes, Optional[bytes]]
-        ] = None
-        # Bumped by every _bust_response_memos call. A memo build that spans
-        # an await (the offloaded /jobs and /metrics renders) reads it before
-        # starting and re-checks it before storing, so a bust that lands
-        # DURING the build cannot be undone by the pre-bust product arriving
-        # late. Without it a busted change fails to render on the very next
-        # poll exactly when the fleet is large enough for the build to be
-        # slow.
+        # the shared GET /jobs product memo, holding (etag, body, gz). See
+        # _JOBS_RESPONSE_TTL and _bust_response_memos.
+        self._jobs_response_memo: _ResponseMemo[
+            Tuple[str, bytes, Optional[bytes]]
+        ] = _ResponseMemo()
+        # the shared GET /metrics product memos, one per exposition format
+        # (each holding (body, gz)), so a deployment scraped in both formats
+        # memoizes both rather than thrashing one slot. See
+        # _METRICS_RESPONSE_TTL and _bust_response_memos.
+        self._metrics_response_memo: Dict[
+            bool, "_ResponseMemo[Tuple[bytes, Optional[bytes]]]"
+        ] = {False: _ResponseMemo(), True: _ResponseMemo()}
+        # the shared GET /fleet product memo, holding (etag, body, gz). See
+        # _FLEET_RESPONSE_TTL and _bust_response_memos.
+        self._fleet_response_memo: _ResponseMemo[
+            Tuple[str, bytes, Optional[bytes]]
+        ] = _ResponseMemo()
+        # the shared GET /activity product memo, holding (etag, body, gz).
+        # See _ACTIVITY_RESPONSE_TTL and _bust_response_memos.
+        self._activity_response_memo: _ResponseMemo[
+            Tuple[str, bytes, Optional[bytes]]
+        ] = _ResponseMemo()
+        # Bumped by every _bust_response_memos call. Every scaffold build
+        # reads it before starting and re-checks it before storing, and a
+        # joiner re-checks it too before trusting a shared product (see
+        # _shared_response_product), so a bust that lands DURING a build
+        # cannot be undone by the pre-bust product arriving late. Without it
+        # a busted change fails to render on the very next poll exactly when
+        # the fleet is large enough for the build to be slow.
         self._memo_gen = 0
         # active runtime pauses by job name (POST /jobs/{name}/pause). The
         # fire path consults ONLY this map (never store I/O there); it is
@@ -3037,45 +3167,18 @@ class Cron:
         (:data:`_FLEET_RESPONSE_TTL`); the ETag hashes the bytes actually
         sent, so a 304 fires only when the representation is byte-identical
         and a live per-node reading can never freeze behind a stale tag.
+        Above :data:`_FLEET_SERIALIZE_OFFLOAD_MIN` summary entries the
+        serialize, hash and gzip run on the default executor.
         """
         assert self.web_config is not None
-        inm = request.headers.get("If-None-Match")
-        gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
-        loop = asyncio.get_running_loop()
-        now = loop.time()
-        cache = self._fleet_response_cache
-        if cache is None or now - cache[0] >= _FLEET_RESPONSE_TTL:
-            cache = (now, *_cachable_json_product(self.fleet_payload()))
-            self._fleet_response_cache = cache
-        _mono, etag, body, gz = cache
-        base = self._web_headers()
-        # the endpoint's own Content-Type wins over an operator-configured
-        # one, in any spelling: the _json_response/_api_error rule (aiohttp
-        # refuses content_type= when the mapping already carries one).
-        headers: Dict[str, str] = (
-            {
-                key: value
-                for key, value in dict(base).items()
-                if key.lower() != "content-type"
-            }
-            if base
-            else {}
-        )
-        headers["ETag"] = etag
-        # on EVERY representation, compressed or not: a shared cache that
-        # missed this would hand a gzipped body to a client that cannot read
-        # one.
-        headers["Vary"] = "Accept-Encoding"
-        if _etag_matches(inm, etag):
-            return web.Response(status=304, headers=headers)
-        if gzip_ok and gz is not None:
-            headers["Content-Encoding"] = "gzip"
-            body = gz
-        return web.Response(
-            body=body,
-            status=200,
-            headers=headers,
-            content_type="application/json",
+        etag, body, gz = await self._fleet_product()
+        return _conditional_response(
+            etag,
+            body,
+            gz,
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=self._web_headers(),
         )
 
     def fleet_payload(self) -> Dict[str, Any]:
@@ -3093,6 +3196,34 @@ class Cron:
         if fleet is None:
             return {"enabled": False, "nodes": []}
         return fleet
+
+    async def _fleet_product(self) -> Tuple[str, bytes, Optional[bytes]]:
+        """One shared ``/fleet`` product (etag, body, gz).
+
+        The TTL global is read at call time, like the ``/metrics`` and
+        ``/jobs`` wrappers.
+        """
+        return await self._shared_response_product(
+            self._fleet_response_memo,
+            _FLEET_RESPONSE_TTL,
+            self._build_fleet_product,
+        )
+
+    async def _build_fleet_product(
+        self,
+    ) -> Tuple[str, bytes, Optional[bytes]]:
+        # the merge reads live gossip state so it stays on the loop; the
+        # product over the merged dict is pure and offloads for a large
+        # fleet (see _FLEET_SERIALIZE_OFFLOAD_MIN).
+        payload = self.fleet_payload()
+        entries = sum(
+            len(node.get("jobs") or {}) for node in payload.get("nodes") or []
+        )
+        if entries >= _FLEET_SERIALIZE_OFFLOAD_MIN:
+            return await asyncio.get_running_loop().run_in_executor(
+                None, _cachable_json_product, payload
+            )
+        return _cachable_json_product(payload)
 
     async def _web_get_node(self, request: web.Request) -> web.Response:
         """This node's live CPU/memory (the dashboard's node readout).
@@ -3164,92 +3295,119 @@ class Cron:
             headers=self._web_headers(),
         )
 
-    async def _metrics_product(
-        self, openmetrics: bool
-    ) -> Tuple[bytes, Optional[bytes]]:
-        """Build (or join a build of) one ``/metrics`` product, and memoize it.
+    async def _shared_response_product(
+        self,
+        memo: "_ResponseMemo[_ProductT]",
+        ttl: float,
+        build: Callable[[], Awaitable[_ProductT]],
+    ) -> _ProductT:
+        """Serve ``memo``'s product, building (or joining a build) on a miss.
 
-        Single-flight, because the memo alone is not enough on the path it
-        was written for.  Above :data:`_METRICS_OFFLOAD_MIN_JOBS` the build
-        spans an executor hop, and a plain check-then-store memo leaves that
-        await between the miss and the store: every scraper landing while the
-        first one renders misses too, so N simultaneous scrapers cost N full
-        family renders and N gzips of a body that reaches tens of megabytes
-        at fleet scale, which is the pile-up
-        :data:`_METRICS_RESPONSE_TTL` exists to prevent.  A follower awaits
-        the leader's future instead, so the window costs one build however
-        many scrapers land in it.
+        The ONE memoized-response scaffold, shared by ``/jobs``,
+        ``/metrics``, ``/fleet`` and ``/activity``.  Memoization alone is
+        not enough on the path it was written for: above their offload
+        thresholds the builds span an executor hop, and a plain
+        check-then-store memo leaves that await between the miss and the
+        store, so every caller landing while the first one builds misses
+        too and N simultaneous pollers cost N full builds, which is the
+        pile-up the TTLs exist to prevent.  A follower awaits the
+        leader's future instead, so the window costs one build however
+        many callers land in it.
 
         ``asyncio.shield`` on that wait: a follower whose client hangs up
         must not cancel the build every other follower is waiting on.  A
         failed build resolves the future to ``None`` rather than an
-        exception, so followers fall through and build their own, and
-        nothing is left holding an exception nobody retrieves; the failure
-        still propagates to the scraper that caused it.
+        exception, so nothing is left holding an exception nobody
+        retrieves; the failure still propagates to the caller that built.
 
-        The generation check is the other half: a
-        :meth:`_bust_response_memos` landing DURING the build would
-        otherwise be undone by this pre-bust product arriving late and
-        re-populating the slot, leaving a pause an operator just applied
-        invisible to a scrape for a further TTL.
+        The generation guard closes the two bust races.  The leader reads
+        :attr:`_memo_gen` before ``build()`` first touches live state and
+        re-checks it before storing, so a :meth:`_bust_response_memos`
+        landing DURING the build cannot be undone by the pre-bust product
+        arriving late (the leader still serves that product to its own
+        caller, exactly as a request answered a moment before the bust
+        would have been).  A joiner compares the generation recorded with
+        the future against the current one and treats a mismatch as a
+        miss, so a request arriving AFTER a bust is never served the
+        pre-bust product the bust just declared stale.
+
+        On a miss after a failed or invalidated shared build the waiter
+        loops rather than falling through: exactly one (the first to see
+        the free slot) self-promotes to leader and the rest join ITS
+        build, instead of every follower stampeding into a build of its
+        own.  There is no await between the cache check, the inflight
+        check and the registration, so leadership is decided atomically on
+        the loop.  Invariants: the future only ever gets ``set_result``
+        (``None`` or a product), never ``set_exception``; the registered
+        generation is read BEFORE the build; the store happens before
+        :meth:`_ResponseMemo.finish`, so woken followers find the cache
+        warm.
         """
         loop = asyncio.get_running_loop()
-        pending = self._metrics_build_inflight.get(openmetrics)
-        if pending is not None:
+        while True:
+            cached = memo.cached
+            if cached is not None and loop.time() - cached[0] < ttl:
+                return cached[1]
+            pending = memo.inflight
+            if pending is None:
+                break
+            pending_gen = memo.inflight_gen
             shared = await asyncio.shield(pending)
-            if shared is not None:
+            if shared is not None and pending_gen == self._memo_gen:
                 return shared
-            # the leader's build failed; fall through and run our own
-        fut: "asyncio.Future[Optional[Tuple[bytes, Optional[bytes]]]]" = (
-            loop.create_future()
-        )
-        self._metrics_build_inflight[openmetrics] = fut
+            # the leader failed, or a bust invalidated its product: loop,
+            # so exactly one waiter (the first to see the free slot)
+            # self-promotes and the rest join its build
         gen = self._memo_gen
+        fut: "asyncio.Future[Optional[_ProductT]]" = loop.create_future()
+        memo.inflight = fut
+        memo.inflight_gen = gen
         try:
-            # The family build reads live scheduler state, so it stays on the
-            # loop; the render and the compression are pure over that
-            # freshly-built list, so a large job set does both on the executor
-            # (see _METRICS_OFFLOAD_MIN_JOBS), like the calendar builder.
-            families = self.metrics.families(self)
-            if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
-                product = await loop.run_in_executor(
-                    None,
-                    partial(
-                        _metrics_response_product,
-                        self.metrics.render_prepared,
-                        families,
-                        openmetrics,
-                    ),
-                )
-            else:
-                product = _metrics_response_product(
-                    self.metrics.render_prepared, families, openmetrics
-                )
+            product = await build()
         except BaseException:
-            self._finish_metrics_build(openmetrics, fut, None)
+            memo.finish(fut, None)
             raise
         if gen == self._memo_gen:
-            self._metrics_response_cache[openmetrics] = (loop.time(), *product)
-        self._finish_metrics_build(openmetrics, fut, product)
+            memo.cached = (loop.time(), product)
+        memo.finish(fut, product)
         return product
 
-    def _finish_metrics_build(
-        self,
-        openmetrics: bool,
-        fut: "asyncio.Future[Optional[Tuple[bytes, Optional[bytes]]]]",
-        product: Optional[Tuple[bytes, Optional[bytes]]],
-    ) -> None:
-        """Release the single-flight slot and wake this build's followers.
+    async def _metrics_product(
+        self, openmetrics: bool
+    ) -> Tuple[bytes, Optional[bytes]]:
+        """One shared ``/metrics`` product (body, gz) per exposition format.
 
-        It deregisters only while the slot is still ours, the same rule
-        :meth:`_install_tail_task`'s done-callback follows, so a build
-        started after ours (possible once ours has failed) is never evicted
-        by our cleanup.
+        The TTL global is read at call time, not bound at definition, so a
+        deployment-wide tweak (or a test monkeypatch) takes effect on the
+        next scrape.
         """
-        if self._metrics_build_inflight.get(openmetrics) is fut:
-            del self._metrics_build_inflight[openmetrics]
-        if not fut.done():
-            fut.set_result(product)
+        return await self._shared_response_product(
+            self._metrics_response_memo[openmetrics],
+            _METRICS_RESPONSE_TTL,
+            partial(self._build_metrics_product, openmetrics),
+        )
+
+    async def _build_metrics_product(
+        self, openmetrics: bool
+    ) -> Tuple[bytes, Optional[bytes]]:
+        # The family build reads live scheduler state, so it stays on the
+        # loop; the render and the compression are pure over that
+        # freshly-built list, so a large job set does both on the executor
+        # (see _METRICS_OFFLOAD_MIN_JOBS), like the calendar builder.
+        families = self.metrics.families(self)
+        if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+            return await asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(
+                    _metrics_response_product,
+                    self.metrics.render_prepared,
+                    families,
+                    openmetrics,
+                ),
+            )
+        return _metrics_response_product(
+            self.metrics.render_prepared, families, openmetrics
+        )
 
     async def _web_metrics(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
@@ -3257,34 +3415,24 @@ class Cron:
         openmetrics = "application/openmetrics-text" in accept
         gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
         # One product (family build + render + gzip) is shared across every
-        # scraper for _METRICS_RESPONSE_TTL, per exposition format. Only the
+        # scraper for _METRICS_RESPONSE_TTL, per exposition format (the
+        # scaffold owns the memo and the single flight). Only the
         # representation pick below is per-request.
-        loop = asyncio.get_running_loop()
-        now = loop.time()
-        cache = self._metrics_response_cache.get(openmetrics)
-        if cache is None or now - cache[0] >= _METRICS_RESPONSE_TTL:
-            body, gz = await self._metrics_product(openmetrics)
-        else:
-            _mono, body, gz = cache
-        headers = {}  # type: Dict[str, str]
-        custom = self._web_headers()
-        if custom:
-            headers.update(custom)
-            # Unlike the other handlers, the Content-Type is the endpoint's
-            # contract (scrapers parse it for the format version), so it
-            # wins over an operator-configured web.headers Content-Type,
-            # in ANY spelling: header names are case-insensitive on the
-            # wire but this dict is not, and a case-variant leftover would
-            # be emitted as a second, conflicting Content-Type header.
-            for key in [k for k in headers if k.lower() == "content-type"]:
-                del headers[key]
+        body, gz = await self._metrics_product(openmetrics)
+        # Unlike the other handlers, the Content-Type is the endpoint's
+        # contract (scrapers parse it for the format version), so it wins
+        # over an operator-configured web.headers one, in any spelling:
+        # see _strip_content_type.
+        headers = _strip_content_type(self._web_headers())
         headers["Content-Type"] = (
             CONTENT_TYPE_OPENMETRICS if openmetrics else CONTENT_TYPE_TEXT
         )
         # on EVERY representation, compressed or not: a shared cache that
-        # missed this would hand a gzipped body to a client that cannot read
-        # one.
-        headers["Vary"] = "Accept-Encoding"
+        # missed this would hand a gzipped body to a client that cannot
+        # read one, and the endpoint negotiates the exposition format on
+        # Accept too, so a cache keyed only on the coding would hand an
+        # openmetrics body to a text scraper.
+        headers["Vary"] = "Accept, Accept-Encoding"
         if gzip_ok and gz is not None:
             headers["Content-Encoding"] = "gzip"
             body = gz
@@ -4374,16 +4522,9 @@ class Cron:
                 self.calendar_payload, name, days, per_job, entries=entries
             ),
         )
-        # minus any operator-configured Content-Type, in any spelling: the
-        # feed's own wins (the _json_response/_api_error rule; aiohttp
-        # refuses content_type= when the mapping already carries one).
-        headers = {
-            key: value
-            for key, value in dict(
-                self.web_config.get("headers") or {}
-            ).items()
-            if key.lower() != "content-type"
-        }
+        # the feed's own Content-Type wins, in any spelling: see
+        # _strip_content_type
+        headers = _strip_content_type(self._web_headers())
         headers["Content-Disposition"] = 'inline; filename="cronstable.ics"'
         return web.Response(
             text=text,
@@ -4488,6 +4629,31 @@ class Cron:
         )
         return len(running)
 
+    def _set_pause(self, name: str, info: PauseInfo) -> None:
+        """Install a pause window; the ONE writer that adds to ``_paused``.
+
+        Every install (except ``_apply_reload``'s bulk prune and the ctor)
+        funnels through here so the memo bust can never be forgotten: the
+        pause must render on the next poll instead of aging out by TTL,
+        the same discipline dagrun's ``_mutate`` applies to its summary
+        memo.  The source-shape test pins the funnel.
+        """
+        self._paused[name] = info
+        self._bust_response_memos()
+
+    def _clear_pause(self, name: str) -> Optional[PauseInfo]:
+        """Drop a pause window; the ONE writer that removes from ``_paused``.
+
+        The removing half of :meth:`_set_pause`, under the same funnel
+        discipline and the same source-shape pin.
+        """
+        # busts only when a window was actually dropped: popping an absent
+        # entry changes no payload
+        was = self._paused.pop(name, None)
+        if was is not None:
+            self._bust_response_memos()
+        return was
+
     async def pause_job_by_name(
         self,
         name: str,
@@ -4559,8 +4725,7 @@ class Cron:
             # out at `now` so the time it already held is still credited, and
             # so the stretch the two windows share is not credited twice.
             self._sla_bank_pause(name, replaced, now)
-        self._paused[name] = info
-        self._bust_response_memos()
+        self._set_pause(name, info)
         # the job is excused from here on: drop any breach it latched while it
         # was still being evaluated, so the late gauge, the /jobs sla block and
         # the OVERDUE chip clear on this response rather than a minute later.
@@ -4591,15 +4756,10 @@ class Cron:
         """
         if name not in self.cron_jobs:
             raise ApiActionError("job {!r} not found".format(name), status=404)
-        was = self._paused.pop(name, None)
+        was = self._clear_pause(name)
         self.metrics.job_pause_state(name, False)
         self._persist_resume(name, by, channel)
         if was is not None:
-            # like the pause set: the dashboard refetches 300ms after the
-            # Resume click, well inside the memo TTL, so without the bust
-            # the UI keeps showing the job paused (button included) for up
-            # to the TTL plus a poll cycle.
-            self._bust_response_memos()
             self._sla_bank_pause(name, was, get_now(datetime.timezone.utc))
             logger.info("Job %s resumed by %s (%s)", name, by, channel)
 
@@ -4666,8 +4826,7 @@ class Cron:
         now = get_now(datetime.timezone.utc)
         for name, info in list(self._paused.items()):
             if info.until <= now:
-                del self._paused[name]
-                self._bust_response_memos()
+                self._clear_pause(name)
                 self._sla_bank_pause(name, info, info.until)
                 self.metrics.job_pause_state(name, False)
                 logger.info(
@@ -4778,8 +4937,7 @@ class Cron:
                     # a different window replaces the known one: bank what
                     # the old one already held (see _sla_bank_pause).
                     self._sla_bank_pause(name, known, now)
-                self._paused[name] = info
-                self._bust_response_memos()
+                self._set_pause(name, info)
                 self.metrics.job_pause_state(name, True)
                 if known is None or known.until != info.until:
                     logger.info(
@@ -4788,11 +4946,8 @@ class Cron:
                         info.until.isoformat(),
                     )
             else:
-                was = self._paused.pop(name, None)
+                was = self._clear_pause(name)
                 if was is not None:
-                    # a peer's resume must render on this node's next poll,
-                    # exactly as the pause set above busts.
-                    self._bust_response_memos()
                     self._sla_bank_pause(name, was, now)
                     self.metrics.job_pause_state(name, False)
                     logger.info(
@@ -5384,14 +5539,9 @@ class Cron:
     async def _web_index(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
         raw, etag = _index_document()
-        # minus any operator-configured Content-Type, in any spelling: the
-        # page's own wins (the _json_response/_api_error rule; aiohttp
-        # refuses content_type= when the mapping already carries one).
-        headers = {
-            key: value
-            for key, value in self._security_headers().items()
-            if key.lower() != "content-type"
-        }
+        # the page's own Content-Type wins, in any spelling: see
+        # _strip_content_type
+        headers = _strip_content_type(self._security_headers())
         # a validator a cache or proxy can revalidate against; stable for the
         # life of the process, since the document is package data.
         headers["ETag"] = etag
@@ -5757,59 +5907,52 @@ class Cron:
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
         assert self.web_config is not None
-        inm = request.headers.get("If-None-Match")
-        gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
         # One product (payload build + ETag + body + gzip) is shared across
         # every poller for _JOBS_RESPONSE_TTL, busted by the local events
-        # that change the payload (_bust_response_memos): N dashboard
-        # tabs used to cost N identical builds per poll cycle. Only the
+        # that change the payload (_bust_response_memos): N dashboard tabs
+        # used to cost N identical builds per poll cycle. Only the
         # If-None-Match compare and the representation pick are per-request.
-        loop = asyncio.get_running_loop()
-        now = loop.time()
-        cache = self._jobs_response_cache
-        if cache is None or now - cache[0] >= _JOBS_RESPONSE_TTL:
-            # Build on the loop (it reads live scheduler state), then hash +
-            # serialize off it for a large fleet.  The tag is keyed on the
-            # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
-            # put while the countdown ticks and moves when a fire lands.
-            # The generation is read BEFORE the build for the reason
-            # _bust_response_memos gives: on the offloaded branch the build
-            # spans an await, and a bust landing inside it must not be undone
-            # by this now-stale product being stored on the way out.
-            gen = self._memo_gen
-            payload = self.jobs_payload()
-            # A plain snapshot of the index, NOT a per-job isoformat sweep:
-            # the instants change at most once per job per fire. The
-            # canonical dump renders them itself, inside the executor.
-            # Snapshotted rather than passed by reference so the product
-            # stays free of scheduler state in the executor branch.
-            next_fire = dict(self._next_fire)
-            if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
-                etag, body, gz = await loop.run_in_executor(
-                    None, _jobs_response_product, payload, next_fire
-                )
-            else:
-                etag, body, gz = _jobs_response_product(payload, next_fire)
-            cache = (now, etag, body, gz)
-            if gen == self._memo_gen:
-                self._jobs_response_cache = cache
-        _mono, etag, body, gz = cache
-        headers = self._web_jobs_headers(etag)
-        # on EVERY representation, compressed or not: a shared cache that
-        # missed this would hand a gzipped body to a client that cannot read
-        # one.
-        headers["Vary"] = "Accept-Encoding"
-        if _etag_matches(inm, etag):
-            return web.Response(status=304, headers=headers)
-        if gzip_ok and gz is not None:
-            headers["Content-Encoding"] = "gzip"
-            body = gz
-        return web.Response(
-            body=body,
-            status=200,
-            headers=headers,
-            content_type="application/json",
+        etag, body, gz = await self._jobs_product()
+        return _conditional_response(
+            etag,
+            body,
+            gz,
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=self._web_headers(),
         )
+
+    async def _jobs_product(self) -> Tuple[str, bytes, Optional[bytes]]:
+        """One shared ``/jobs`` product (etag, body, gz).
+
+        The TTL global is read at call time, like the ``/metrics`` and
+        ``/fleet`` wrappers.
+        """
+        return await self._shared_response_product(
+            self._jobs_response_memo,
+            _JOBS_RESPONSE_TTL,
+            self._build_jobs_product,
+        )
+
+    async def _build_jobs_product(
+        self,
+    ) -> Tuple[str, bytes, Optional[bytes]]:
+        # Build on the loop (it reads live scheduler state), then hash +
+        # serialize off it for a large fleet.  The tag is keyed on the
+        # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
+        # put while the countdown ticks and moves when a fire lands.
+        payload = self.jobs_payload()
+        # A plain snapshot of the index, NOT a per-job isoformat sweep:
+        # the instants change at most once per job per fire. The
+        # canonical dump renders them itself, inside the executor.
+        # Snapshotted rather than passed by reference so the product
+        # stays free of scheduler state in the executor branch.
+        next_fire = dict(self._next_fire)
+        if len(payload) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+            return await asyncio.get_running_loop().run_in_executor(
+                None, _jobs_response_product, payload, next_fire
+            )
+        return _jobs_response_product(payload, next_fire)
 
     def _bust_response_memos(self) -> None:
         """Drop the shared endpoint products so a local change renders now.
@@ -5820,47 +5963,31 @@ class Cron:
         a fire advancing, a counter ticking) ages out within the respective
         TTL.
 
-        All three memoized read endpoints are busted together because all
-        three render the same local facts: ``/jobs`` shows the run and pause
+        All four memoized read endpoints are busted together because all
+        four render the same local facts: ``/jobs`` shows the run and pause
         state directly, ``/metrics`` exports it as ``cronstable_job_paused``
-        and the run counters, and ``/fleet`` carries this node's own job
-        summaries alongside its peers'.  Busting only one would leave an
-        operator watching a dashboard and a scrape that disagree about a
-        pause they just applied.
+        and the run counters, ``/fleet`` carries this node's own job
+        summaries alongside its peers', and ``/activity`` renders the same
+        run records again, batched for the heatmap.  Busting only one would
+        leave an operator watching a dashboard and a scrape that disagree
+        about a pause they just applied.
 
         The generation bump closes the window a bust cannot otherwise cover:
-        the offloaded ``/jobs`` and ``/metrics`` builds span an await, so one
-        that STARTED before this call can still be holding a pre-bust product
-        and would re-populate the slot with it moments later.  Both re-check
-        the counter before storing (see :attr:`_memo_gen`), so a bust that
+        all four scaffold builds (``/jobs``, ``/metrics``, ``/fleet``,
+        ``/activity``) can span an await, so one that STARTED before this
+        call can still be holding a pre-bust product and would re-populate
+        the slot with it moments later.  Each re-checks the counter before
+        storing, and a joiner re-checks it before trusting a shared
+        product (see :meth:`_shared_response_product`), so a bust that
         lands mid-build makes that product non-cacheable rather than
         silently reinstating it for another TTL.
         """
         self._memo_gen += 1
-        self._jobs_response_cache = None
-        self._metrics_response_cache.clear()
-        self._fleet_response_cache = None
-
-    def _web_jobs_headers(self, etag: str) -> Dict[str, str]:
-        """The configured web response headers plus the ``/jobs`` ETag.
-
-        Minus any operator-configured Content-Type, in any spelling: the
-        endpoint's own wins (the _json_response/_api_error rule; aiohttp
-        refuses ``content_type=`` when the mapping already carries one).
-        """
-        assert self.web_config is not None
-        base = self._web_headers()
-        headers: Dict[str, str] = (
-            {
-                key: value
-                for key, value in dict(base).items()
-                if key.lower() != "content-type"
-            }
-            if base
-            else {}
-        )
-        headers["ETag"] = etag
-        return headers
+        self._jobs_response_memo.cached = None
+        for memo in self._metrics_response_memo.values():
+            memo.cached = None
+        self._fleet_response_memo.cached = None
+        self._activity_response_memo.cached = None
 
     async def _web_get_job(self, request: web.Request) -> web.Response:
         """One job's full detail dict (``GET /jobs/{name}``).
@@ -6254,6 +6381,80 @@ class Cron:
             payload["runs"] = payload["runs"][-limit:]  # newest retained
         return _json_response(payload, headers=self._web_headers())
 
+    def activity_payload(self) -> Dict[str, Any]:
+        """Every job's retained runs, cut down to what the heatmap plots.
+
+        Behind ``GET /activity``: ``jobs`` maps each job name to its
+        retained runs oldest first, each row exactly ``{started_at,
+        finished_at, outcome}``.  Every configured job is present (``[]``
+        for one with no history) so a client can tell "no runs" from
+        "unknown job".
+        """
+        jobs: Dict[str, List[Dict[str, Any]]] = {}
+        for name in self.cron_jobs:
+            # .get, never a subscript: run_history is a defaultdict and a
+            # read must not grow it one empty deque per never-run job
+            history = self.run_history.get(name)
+            jobs[name] = [
+                {
+                    "started_at": (
+                        r.started_at.isoformat()
+                        if r.started_at is not None
+                        else None
+                    ),
+                    "finished_at": r.finished_at.isoformat(),
+                    "outcome": r.outcome,
+                }
+                for r in (history or ())
+            ]
+        return {"jobs": jobs}
+
+    async def _web_get_activity(self, request: web.Request) -> web.Response:
+        """Batched recent run outcomes for every job (the heatmap's feed).
+
+        Both dashboards used to assemble the activity punchcard from one
+        ``GET /jobs/{name}/runs`` per job per refresh, storm-controlled
+        client-side (a TUI semaphore, a sequential web loop).  This serves
+        the same records once, reduced to the three fields the overlay
+        plots, on the same memo, ETag and gzip scaffold as the other poll
+        legs, busted by the same local events that change run history.
+        """
+        assert self.web_config is not None
+        etag, body, gz = await self._activity_product()
+        return _conditional_response(
+            etag,
+            body,
+            gz,
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=self._web_headers(),
+        )
+
+    async def _activity_product(self) -> Tuple[str, bytes, Optional[bytes]]:
+        """One shared ``/activity`` product (etag, body, gz).
+
+        The TTL global is read at call time, like the ``/jobs`` and
+        ``/fleet`` wrappers.
+        """
+        return await self._shared_response_product(
+            self._activity_response_memo,
+            _ACTIVITY_RESPONSE_TTL,
+            self._build_activity_product,
+        )
+
+    async def _build_activity_product(
+        self,
+    ) -> Tuple[str, bytes, Optional[bytes]]:
+        # the projection reads the live run histories so it stays on the
+        # loop; the serialize/hash/gzip over it is pure CPU and offloads
+        # for a large fleet, at the same gate as /jobs.
+        payload = self.activity_payload()
+        if len(payload["jobs"]) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+            return await asyncio.get_running_loop().run_in_executor(
+                None, _cachable_json_product, payload
+            )
+        return _cachable_json_product(payload)
+
     async def _web_job_resources(self, request: web.Request) -> web.Response:
         """Chart-grade CPU/RSS series for one job (monitorResources jobs).
 
@@ -6516,20 +6717,16 @@ class Cron:
 
     def _sse_headers(self) -> Dict[str, str]:
         assert self.web_config is not None
-        headers: Dict[str, str] = {}
-        custom = self._web_headers()
-        if custom:
-            headers.update(custom)
-            # Like /metrics, the stream framing is this endpoint's contract:
-            # an operator-configured Content-Type, cache policy, or proxy
-            # buffering override in web.headers would silently break every
-            # live tail, so the protocol headers win, in ANY spelling:
-            # header names are case-insensitive on the wire but this dict is
-            # not, and a case-variant leftover would be emitted as a second,
-            # conflicting header.
-            protocol = ("content-type", "cache-control", "x-accel-buffering")
-            for key in [k for k in headers if k.lower() in protocol]:
-                del headers[key]
+        # Like /metrics, the stream framing is this endpoint's contract: an
+        # operator-configured Content-Type, cache policy, or proxy buffering
+        # override in web.headers would silently break every live tail, so
+        # the protocol headers win, in any spelling: see _strip_headers.
+        headers = _strip_headers(
+            self._web_headers(),
+            "content-type",
+            "cache-control",
+            "x-accel-buffering",
+        )
         headers["Content-Type"] = "text/event-stream"
         headers["Cache-Control"] = "no-cache"
         # tell reverse proxies (nginx) not to buffer the event stream
@@ -6843,7 +7040,8 @@ class Cron:
             metrics_config = resolve_metrics_config(web_config)
             # Envelope first, so it is outermost and wraps the errors the
             # origin/auth middlewares below raise as well as the router's
-            # own 404/405 (see _error_envelope_middleware).
+            # own 404/405 (see _error_envelope_middleware, which carries its
+            # own new-style marker).
             middlewares = [_error_envelope_middleware]
             # Cross-site request defense for the mutating endpoints, ALWAYS
             # installed: with authToken unset this is the only thing between
@@ -8100,9 +8298,6 @@ class Cron:
             INFLIGHT_STREAM_PREFIX: names,
             SLOT_STREAM_PREFIX: names,
             PAUSE_STREAM_PREFIX: pause_keep,
-            # the dag catch-up checkpoint streams age out with their dag,
-            # exactly as a removed job's catchup/<job> stream does above.
-            DAG_CATCHUP_STREAM_PREFIX: live_dags,
             # a host that stops writing (scaled down, renamed) leaves its own
             # manifests/<host> stream behind forever otherwise; sweeping it
             # once it is not among the currently-seen hosts and has aged past
@@ -8111,6 +8306,14 @@ class Cron:
             MANIFEST_STREAM_PREFIX: hosts,
         }
         if scopes_covered:
+            # the dag catch-up checkpoint streams age out with their dag,
+            # exactly as a removed job's catchup/<job> stream does above,
+            # but only under this guard: live_dags is complete only once
+            # every recent manifest advertises its dags, and gating a
+            # peer's rarely-written checkpoint stream on a partial view
+            # would collect it live and re-run work the checkpoint exists
+            # to fence.
+            keep[DAG_CATCHUP_STREAM_PREFIX] = live_dags
             # folds artifacts/<scope> into ``keep`` (so a removed scope's
             # stream ages out like any other) and collects removed dags' run
             # documents; skipped entirely (everything kept) while any
@@ -8120,10 +8323,10 @@ class Cron:
             )
         else:
             logger.info(
-                "state: leaving artifact streams and dag-run documents "
-                "unmanaged this GC pass: a recent manifest does not "
-                "advertise its scopes/dags (a node predating them, or the "
-                "first grace window after upgrading)"
+                "state: leaving artifact streams, dag catch-up checkpoints "
+                "and dag-run documents unmanaged this GC pass: a recent "
+                "manifest does not advertise its scopes/dags (a node "
+                "predating them, or the first grace window after upgrading)"
             )
         from cronstable.dag import DAG_LEASE_PREFIX
 
@@ -8609,7 +8812,7 @@ class Cron:
         A deployment with DAGs and no second-level cron job therefore woke
         several times a minute while answering "not sub-minute", so the gate
         fell through to its every-iteration branch and the whole reload /
-        cluster / web / push / state / SLA block ran on every DAG wake --
+        cluster / web / push / state / SLA block ran on every DAG wake,
         falsifying the "at most once per wall-clock minute" contract
         :meth:`_pause_periodic` and :meth:`_sla_periodic` are documented on.
 
@@ -10659,10 +10862,7 @@ class Cron:
             if run_token is not None and self._job_api is not None:
                 await self._job_api.finish_run(run_token)
             raise
-        first_instance = not self.running_jobs.get(job.name)
-        self.running_jobs[job.name].append(running_job)
-        # the payload's `running` flag just flipped on this node
-        self._bust_response_memos()
+        first_instance = self._add_running_instance(running_job)
         # every actual launch (scheduled, manual, catch-up, retry) clears
         # the lateAfter breach condition (see _sla_periodic).
         self._sla_last_start[job.name] = get_now(datetime.timezone.utc)
@@ -10690,38 +10890,6 @@ class Cron:
         """
         return "{}#{}".format(self._state_host, self._proc_token)
 
-    def _stage_job_secrets(self, job: JobConfig) -> Dict[str, str]:
-        """Resolve a job's run-scoped ``secrets`` blocks into a fresh map.
-
-        Pure sync (it may open and read ``fromFile`` targets), so the launch
-        path can push it to the default executor when any file read is
-        involved; see :meth:`_prepare_job_api_run`.
-        """
-        from cronstable.config import _resolve_secret
-
-        secrets: Dict[str, str] = {}
-        for spec in job.secrets:
-            name = spec.get("name")
-            try:
-                value = _resolve_secret(
-                    spec, "job {} secret {}".format(job.name, name)
-                )
-            except ConfigError as ex:
-                # a secret that cannot be resolved right now (an unreadable
-                # fromFile, an unset fromEnvVar) is skipped, not fatal: the
-                # job sees a 404 for it and fails as it sees fit, rather than
-                # the whole launch dying over one secret.
-                logger.warning(
-                    "job %s: could not stage secret %r: %s",
-                    job.name,
-                    name,
-                    ex,
-                )
-                continue
-            if name and value is not None:
-                secrets[name] = value
-        return secrets
-
     async def _prepare_job_api_run(
         self, job: JobConfig, retry_state: Optional[JobRetryState]
     ) -> Tuple[Optional[str], Dict[str, str]]:
@@ -10735,25 +10903,19 @@ class Cron:
         no job API is running (no ``state`` section, or jobApi disabled), so
         the classic no-endpoint path is byte-identical.
 
-        A job with any ``fromFile`` secret stages them on the default
-        executor: the read runs inside the awaited launch chain, and a
-        Kubernetes secret mount or NFS target that is slow (or hung) would
-        otherwise stall the event loop itself, delaying every same-slot
-        launch, web response and cluster heartbeat with it.  Value/env
-        secrets stay inline, where the thread hop would cost more than the
-        dict they build.
+        Secret staging (including the fromFile executor offload) lives in
+        :func:`cronstable.jobapi.stage_secrets`.
         """
         api = self._job_api
         if api is None or api.base_url is None:
             return None, {}
-        from cronstable.jobapi import RunContext, run_environment
+        from cronstable.jobapi import (
+            RunContext,
+            run_environment,
+            stage_secrets,
+        )
 
-        if any(spec.get("fromFile") for spec in job.secrets):
-            secrets = await asyncio.get_running_loop().run_in_executor(
-                None, self._stage_job_secrets, job
-            )
-        else:
-            secrets = self._stage_job_secrets(job)
+        secrets = await stage_secrets(job.secrets, "job {}".format(job.name))
         slot = self._last_run_slot.get(job.name)
         ctx = RunContext(
             token=os.urandom(32).hex(),
@@ -11420,6 +11582,52 @@ class Cron:
                 ex,
             )
 
+    async def _bounded_boot_scan(
+        self,
+        items: List[Tuple[str, JobConfig]],
+        step: Callable[[str, JobConfig], Awaitable[Optional[str]]],
+        timeout_message: str,
+    ) -> int:
+        """Run ``step`` over ``items`` behind a small bounded worker pool.
+
+        The ONE implementation of the bounded boot-scan worker pool, which
+        used to be pasted three times (the history warm-up, the in-flight
+        reconciliation and the retry re-arm).  A small worker pool over one
+        shared item iterator, not a task per item: ``next()`` on the shared
+        iterator is synchronous, so the workers partition the items
+        race-free and each item is drawn exactly once, while a task per
+        item would only materialise coroutines that queue on the store's
+        16-slot bulk lane anyway.  ``step`` returns ``"timeout"`` to
+        abandon the pass (a store that cannot serve one read in
+        STATE_OP_TIMEOUT is unhealthy, and stalling boot for items x
+        timeout helps nobody): ``timeout_message`` is logged ONCE, by
+        whichever worker reports first with its item's name interpolated,
+        and every other worker breaks at its next loop top while one
+        mid-await finishes its current item.  ``"counted"`` adds one to
+        the returned tally; ``None`` counts nothing.
+        """
+        it = iter(items)
+        aborted = False
+        counted = 0
+
+        async def _worker() -> None:
+            nonlocal aborted, counted
+            for name, job in it:
+                if aborted:
+                    break
+                outcome = await step(name, job)
+                if outcome == "timeout":
+                    if not aborted:
+                        aborted = True
+                        logger.warning(timeout_message, name)
+                    break
+                if outcome == "counted":
+                    counted += 1
+
+        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(items)))
+        await asyncio.gather(*(_worker() for _ in range(workers)))
+        return counted
+
     async def _reconcile_inflight(self) -> None:
         """Close runs the PREVIOUS daemon on this host left in flight.
 
@@ -11451,41 +11659,12 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        # A small worker pool over one shared item iterator, not a task per
-        # job: the same idiom (and the same reasoning) as the two scans that
-        # bracket this one. next() on the shared iterator is synchronous, so
-        # the workers partition the items race-free and every job is drawn
-        # exactly once, while a task per job would only materialise
-        # coroutines that queue on the store's 16-slot bulk lane anyway.
-        items = iter(list(self.cron_jobs.items()))
-        aborted = False
-
-        async def _reconcile_worker() -> None:
-            nonlocal aborted
-            for name, job in items:
-                if aborted:
-                    break
-                outcome = await self._reconcile_one_inflight(name, job)
-                if outcome == "timeout":
-                    # a store that cannot serve one read in STATE_OP_TIMEOUT
-                    # is unhealthy (hung mount): abandon the rest of the pass
-                    # rather than stalling boot for jobs x timeout. The
-                    # unreconciled runs are picked up by the next restart
-                    # that finds a healthy store. Guarded so the warning is
-                    # logged once for the pass, not once per worker that
-                    # happened to be mid-read when the mount went away.
-                    if not aborted:
-                        aborted = True
-                        logger.warning(
-                            "state: in-flight reconciliation timed out "
-                            "reading %s; skipping the rest (store "
-                            "unhealthy?)",
-                            name,
-                        )
-                    break
-
-        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
-        await asyncio.gather(*(_reconcile_worker() for _ in range(workers)))
+        await self._bounded_boot_scan(
+            list(self.cron_jobs.items()),
+            self._reconcile_one_inflight,
+            "state: in-flight reconciliation timed out reading %s; "
+            "skipping the rest (store unhealthy?)",
+        )
 
     async def _reconcile_one_inflight(
         self, name: str, job: JobConfig
@@ -11670,12 +11849,7 @@ class Cron:
             fail_reason=fail_reason,
             output=output,
         )
-        self.run_history[name].append(info)
-        self.last_run[name] = info
-        # every other run_history/last_run write busts the response memos;
-        # without it a boot-time reconciliation can serve the pre-crash
-        # last-run block for up to the TTL.
-        self._bust_response_memos()
+        self._install_run_info(name, info)
         # a takeover can reconcile a foreign record older than a run this
         # node already recorded, so advance the supersede watermark rather
         # than assigning it (the durable side is a derive_max, i.e. already
@@ -11817,17 +11991,78 @@ class Cron:
             if event_wait is not None and not event_wait.done():
                 event_wait.cancel()
 
+    def _add_running_instance(self, running_job: RunningJob) -> bool:
+        """Register a launched instance; the ONE writer adding to
+        ``running_jobs``.
+
+        Every launch (scheduled job and DAG task alike) funnels through
+        here so the memo bust can never be forgotten: the payload's
+        ``running`` flag must flip on the next poll instead of aging out
+        by TTL, the same discipline dagrun's ``_mutate`` applies to its
+        summary memo.  The source-shape test pins the funnel.
+        """
+        # returns True when this is the job's first live instance
+        name = running_job.config.name
+        first = not self.running_jobs.get(name)
+        self.running_jobs[name].append(running_job)
+        self._bust_response_memos()
+        return first
+
+    def _remove_running_instance(
+        self, running_job: RunningJob, *, missing_ok: bool = False
+    ) -> bool:
+        """Drop a finished instance; the ONE writer removing from
+        ``running_jobs``.
+
+        The removing half of :meth:`_add_running_instance`, under the same
+        funnel discipline and the same source-shape pin.
+        """
+        # returns True when it was the last live instance. missing_ok is the
+        # DAG reaper's defensive shape; the default keeps
+        # _handle_finished_job's strict KeyError/ValueError crash-on-bug
+        # behavior
+        name = running_job.config.name
+        if missing_ok:
+            jobs_list = self.running_jobs.get(name)
+            if jobs_list is None:
+                return False
+            try:
+                jobs_list.remove(running_job)
+            except ValueError:  # pragma: no cover - defensive
+                return False
+        else:
+            jobs_list = self.running_jobs[name]
+            jobs_list.remove(running_job)
+        last = not jobs_list
+        if last:
+            del self.running_jobs[name]
+        self._bust_response_memos()
+        return last
+
+    def _install_run_info(self, name: str, info: JobRunInfo) -> None:
+        """Record one finished-run row; the ONE writer of ``run_history``
+        and ``last_run``.
+
+        Every recording path (the reaper via ``_record_run``, boot
+        reconciliation, the ledger warm-up) funnels through here so the
+        memo bust can never be forgotten: the shared /jobs product folds
+        over last_run and the history slice, and a row that does not bust
+        would serve stale out to the TTL, the same discipline dagrun's
+        ``_mutate`` applies to its summary memo.  The source-shape test
+        pins the funnel.
+        """
+        self.run_history[name].append(info)
+        self.last_run[name] = info
+        self._bust_response_memos()
+
     def _record_run(self, name: str, info: JobRunInfo) -> None:
         # the latest finished run (for status/log replay) plus the bounded
         # history (for the dashboard's history/stats view); in-memory only.
         prev = self.last_run.get(name)
-        self.last_run[name] = info
-        self.run_history[name].append(info)
+        self._install_run_info(name, info)
         # this run changes the trends aggregate, so drop any cached payload
-        # for the job rather than serve it stale out to the TTL; same for
-        # the shared /jobs product (last_run and the history slice moved).
+        # for the job rather than serve it stale out to the TTL.
         self._trends_cache.pop(name, None)
-        self._bust_response_memos()
         # every recorded run also feeds the Prometheus counters/histogram,
         # so /metrics and the run-history API always agree on outcomes.
         self.metrics.job_run_recorded(
@@ -12200,28 +12435,8 @@ class Cron:
         if backend is None or self._state_rehydrated:
             return
         self._state_rehydrated = True
-        # A small worker pool over one shared name iterator, not a task per
-        # job: the strictly sequential loop this replaces paid jobs x
-        # per-read latency of boot delay, while a task per job would
-        # materialise 100k coroutines on a large crontab only to queue on
-        # the store's 16-slot bulk lane anyway. next() on the shared
-        # iterator is synchronous, so the workers partition the names
-        # race-free, and every per-job mutation below touches only that
-        # job's own keys.
-        names = iter(list(self.cron_jobs))
-        aborted = False
 
-        async def _warm_worker() -> int:
-            nonlocal aborted
-            count = 0
-            for name in names:
-                if aborted:
-                    break
-                count += await _warm_one(name)
-            return count
-
-        async def _warm_one(name: str) -> int:
-            nonlocal aborted
+        async def _warm_one(name: str, _job: JobConfig) -> Optional[str]:
             # a job that already accumulated in-memory history this process
             # (unusual at boot) is left as the live source of truth, but the
             # staleness reference is still seeded from that history, so a job
@@ -12229,7 +12444,7 @@ class Cron:
             # maxTimeSinceSuccess on process start when the store returns.
             if self.run_history.get(name):
                 await self._seed_stale_reference(name, self.run_history[name])
-                return 0
+                return None
             try:
                 recs = await asyncio.wait_for(
                     backend.list_records(
@@ -12240,23 +12455,14 @@ class Cron:
                     timeout=STATE_OP_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                # a store that cannot serve one read in STATE_OP_TIMEOUT is
-                # unhealthy (hung mount): abandon the whole warm-up rather
-                # than stalling boot for jobs x timeout. The dashboard fills
+                # abandoning the warm-up costs little: the dashboard fills
                 # in as jobs run, exactly as with no rehydration.
-                if not aborted:
-                    aborted = True
-                    logger.warning(
-                        "state: rehydration timed out reading %s; skipping "
-                        "the rest of the warm-up (store unhealthy?)",
-                        name,
-                    )
-                return 0
+                return "timeout"
             except OSError as ex:
                 logger.warning(
                     "state: failed to rehydrate history for %s: %s", name, ex
                 )
-                return 0
+                return None
             if self.run_history.get(name):
                 # a run finished while we awaited the read (the await above
                 # yields): the live run is fresher than anything in the
@@ -12265,16 +12471,15 @@ class Cron:
                 # staleness reference is still seeded from that live history
                 # (setdefault, so a fresher live success is never clobbered).
                 await self._seed_stale_reference(name, self.run_history[name])
-                return 0
+                return None
             recs.reverse()  # oldest-first, to match the append order
             for rec in recs:
                 restored = _job_run_info_from_dict(rec)
                 if restored is not None:
-                    self.run_history[name].append(restored)
+                    self._install_run_info(name, restored)
             history = self.run_history.get(name)
             if not history:
-                return 0
-            self.last_run[name] = history[-1]
+                return None
             # warm the staleness reference too: with a durable ledger
             # the maxTimeSinceSuccess check must page from the REAL last
             # success after a restart, not re-baseline on process start
@@ -12315,11 +12520,13 @@ class Cron:
                         name, restored.finished_at
                     )
                     break
-            return 1
+            return "counted"
 
-        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
-        warmed = sum(
-            await asyncio.gather(*(_warm_worker() for _ in range(workers)))
+        warmed = await self._bounded_boot_scan(
+            list(self.cron_jobs.items()),
+            _warm_one,
+            "state: rehydration timed out reading %s; skipping the rest "
+            "of the warm-up (store unhealthy?)",
         )
         if warmed:
             logger.info(
@@ -12422,31 +12629,12 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        # the same bounded worker pool as the history warm-up above, for the
-        # same reason: one read per job, strictly sequential, multiplied
-        # boot latency by job count for a scan whose per-job work is
-        # independent.
-        items = iter(list(self.cron_jobs.items()))
-        aborted = False
-
-        async def _rearm_worker() -> None:
-            nonlocal aborted
-            for name, job in items:
-                if aborted:
-                    break
-                outcome = await self._rearm_pending_retry(name, job)
-                if outcome == "timeout":
-                    if not aborted:
-                        aborted = True
-                        logger.warning(
-                            "state: retry re-arm timed out reading %s; "
-                            "skipping the rest (store unhealthy?)",
-                            name,
-                        )
-                    break
-
-        workers = min(_REHYDRATE_CONCURRENCY, max(1, len(self.cron_jobs)))
-        await asyncio.gather(*(_rearm_worker() for _ in range(workers)))
+        await self._bounded_boot_scan(
+            list(self.cron_jobs.items()),
+            self._rearm_pending_retry,
+            "state: retry re-arm timed out reading %s; "
+            "skipping the rest (store unhealthy?)",
+        )
 
     async def _rearm_pending_retry(
         self, name: str, job: JobConfig
@@ -12896,11 +13084,7 @@ class Cron:
             # lives in its dag_run document, not the job streams.
             await self._handle_finished_dag_task(job)
             return
-        jobs_list = self.running_jobs[job.config.name]
-        jobs_list.remove(job)
-        last_instance = not jobs_list
-        if not jobs_list:
-            del self.running_jobs[job.config.name]
+        last_instance = self._remove_running_instance(job)
         if last_instance and self.state_backend is not None:
             # the job went 1 -> 0 live instances here: close the in-flight
             # record. Fire-and-forget; runs before the replaced/cancelled
@@ -13046,14 +13230,7 @@ class Cron:
         Writes no ``runs/`` / ``retries/`` / ``inflight/`` records: a DAG
         task's whole lifecycle lives in its ``dag_run`` document.
         """
-        jobs_list = self.running_jobs.get(job.config.name)
-        if jobs_list is not None:
-            try:
-                jobs_list.remove(job)
-            except ValueError:  # pragma: no cover - defensive
-                pass
-            if not jobs_list:
-                del self.running_jobs[job.config.name]
+        self._remove_running_instance(job, missing_ok=True)
         if self._job_api is not None and job.state_token is not None:
             await self._job_api.finish_run(job.state_token)
         try:

@@ -3004,6 +3004,57 @@ async def test_dag_run_rollup_missing_body_is_skipped(tmp_path, monkeypatch):
         await _teardown(cron)
 
 
+async def test_run_summaries_mid_rebuild_write_is_not_memoized(
+    tmp_path, monkeypatch
+):
+    # The uncached rebuild spans awaits, so a local write can land between
+    # two of them: its _mutate pop finds no memo entry (a no-op) and, without
+    # the generation guard, the rebuild would memoize its pre-write reads
+    # under a fresh stamp, hiding the write until the TTL aged it out.
+    #
+    # The TTL is widened so a wrongly-stored entry cannot expire on its own
+    # and mask the regression: the second call below must rebuild because
+    # nothing was memoized, not because the TTL ran out.
+    monkeypatch.setattr(dagrun, "DAG_SUMMARY_LIST_TTL", 3600.0)
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        backend = cron.state_backend
+        real_read = backend.read_document
+        fired = []
+
+        def _finish(body):
+            body["state"] = dag.SUCCESS
+            return body, None
+
+        async def racing_read(ns, key):
+            body = await real_read(ns, key)
+            if not fired:
+                fired.append(key)
+                # the run finishes mid-rebuild through the real _mutate path
+                # (pop + generation bump); ``body`` above is the pre-write
+                # read the rebuild goes on to summarize.
+                await cron._dag._mutate("xc", "r1", _finish)
+            return body
+
+        backend.read_document = racing_read
+
+        # the racing rebuild still returns its (pre-write) result to the
+        # caller...
+        first = await cron._dag._run_summaries(backend, "xc")
+        assert fired == ["r1"]
+        assert [s["state"] for s in first] == [dag.RUNNING]
+        # ...but must not memoize it under a fresh stamp
+        assert "xc" not in cron._dag._summaries_memo
+        # so the very next call rebuilds and reflects the write at once,
+        # without waiting out the (here: huge) TTL.
+        second = await cron._dag._run_summaries(backend, "xc")
+        assert [s["state"] for s in second] == [dag.SUCCESS]
+    finally:
+        await _teardown(cron)
+
+
 # --------------------------------------------------------------------------
 # forget() on a backend swap: every per-store cache is dropped, so /dags stops
 # serving the OLD store's finished run for the NEW store's live one.
@@ -3340,7 +3391,7 @@ async def test_lease_usable_live_stale_and_taken_over(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-async def test_prepare_task_run_env_and_secrets(tmp_path):
+async def test_prepare_task_run_env_and_secrets(tmp_path, caplog):
     missing = tmp_path / "nope.secret"  # never created -> fromFile raises
     yaml = (
         "dags:\n  - name: sec\n    tasks:\n"
@@ -3377,9 +3428,14 @@ async def test_prepare_task_run_env_and_secrets(tmp_path):
         cron._job_api = api
 
         # With the API up, the secret loop stages GOOD and skips the broken
-        # BAD (its fromFile cannot be read) rather than failing the launch.
-        token, env = await cron._dag._prepare_task_run(
-            dagcfg, run_id, "manual-1", intent, template
+        # BAD (its fromFile cannot be read) rather than failing the launch,
+        # and the skip is logged rather than silent.
+        with caplog.at_level(logging.WARNING, logger="cronstable.jobapi"):
+            token, env = await cron._dag._prepare_task_run(
+                dagcfg, run_id, "manual-1", intent, template
+            )
+        assert any(
+            "could not stage secret" in r.message for r in caplog.records
         )
         assert token is not None
         ctx = cron._job_api._runs[token]
