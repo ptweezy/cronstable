@@ -8,10 +8,12 @@ functions are extracted from the page and driven in a real Chromium via
 Playwright, and every mutually-valid expression must agree on the next
 eight fire instants and on the plain-English description, byte for byte.
 
-Runs only where Playwright and its Chromium build are installed (a dev
-machine after ``pip install playwright && playwright install chromium``,
-never CI), exactly like the legacy-library differential in
-``test_cronexpr.py``: CI relies on the committed vectors and unit suites.
+Runs wherever Playwright and its Chromium build are both present.
+``requirements_dev.txt`` installs the library (fenced by
+``test_playwright_is_installed_where_a_wheel_exists``); the browser is a
+separate download that pip does not do, so CI fetches it in one matrix cell
+and this differential self-skips in the rest, like the legacy-library
+differential in ``test_cronexpr.py`` without its optional library.
 
 One asymmetry is deliberate and asserted AS an asymmetry: the client
 parser is tolerant of out-of-range values and steps (it degrades while
@@ -61,7 +63,8 @@ def _engine_script() -> str:
     return (
         'const pad2 = (n) => String(n).padStart(2, "0");\n'
         + html[start:end]
-        + "\nwindow.__engine = { parseCron, nextRuns, describeCron };"
+        + "\nwindow.__engine = "
+        "{ parseCron, nextRuns, describeCron, cronRejected };"
     )
 
 
@@ -87,9 +90,23 @@ def _python_side(exprs):
     return out
 
 
+#: daemon-rejected step spellings the client's parseInt salvage used to
+#: affirm (numeric-prefix salvage: */2.5 read as */2, the double slash of
+#: 1/2/3 read as step 2). Kept here rather than in the golden corpus,
+#: which the other engine differentials consume as valid-vector input.
+_STEP_REJECTS = [
+    "*/2.5 * * * *",
+    "*/2x * * * *",
+    "*/2e1 * * * *",
+    "1/2/3 * * * *",
+    "* */1.5 * * *",
+    "0 0 * * */2.5",
+]
+
+
 def test_client_engine_matches_daemon_engine_over_the_golden_corpus():
     with open(GOLDEN, encoding="utf-8") as f:
-        exprs = sorted(json.load(f)["exprs"])
+        exprs = sorted(set(json.load(f)["exprs"]) | set(_STEP_REJECTS))
     expected = _python_side(exprs)
 
     with playwright_api.sync_playwright() as p:
@@ -107,14 +124,22 @@ def test_client_engine_matches_daemon_engine_over_the_golden_corpus():
                 const out = {};
                 for (const expr of args.exprs) {
                     const p = window.__engine.parseCron(expr);
+                    // what the schedule sandbox affirms: a fields-typed
+                    // parse the validity gate does not veto (describeCron
+                    // gates its confident prose on exactly this pair)
+                    const affirmed = p.type === "fields" &&
+                        !window.__engine.cronRejected(expr);
                     if (p.type !== "fields") {
-                        out[expr] = { valid: false, type: p.type };
+                        out[expr] = {
+                            valid: false, type: p.type, affirmed
+                        };
                         continue;
                     }
                     const runs = window.__engine.nextRuns(
                         p, args.count, "UTC", args.fromMs);
                     out[expr] = {
                         valid: true,
+                        affirmed,
                         fires: runs.map((x) => x.t),
                         describe: window.__engine.describeCron(expr),
                     };
@@ -129,7 +154,18 @@ def test_client_engine_matches_daemon_engine_over_the_golden_corpus():
     for expr in exprs:
         py, js = expected[expr], got[expr]
         if not py["valid"]:
-            # the client MAY be more tolerant; never assert it rejects
+            # The tolerant PARSER may still chew on it (it degrades while
+            # the user types), but the sandbox must not AFFIRM it: a
+            # fields parse the validity gate does not veto gets confident
+            # prose and a green check for a config the daemon refuses to
+            # load. parseInt's numeric-prefix salvage shipped exactly
+            # that for the */2.5, */2x and 1/2/3 step families, and the
+            # old skip here made the differential structurally blind to
+            # it.
+            assert not js["affirmed"], (
+                "client affirmed a daemon-rejected expression: "
+                "{!r}".format(expr)
+            )
             continue
         if not js["valid"]:
             # @reboot and unkeyed H forms never reach here (the daemon
@@ -139,5 +175,9 @@ def test_client_engine_matches_daemon_engine_over_the_golden_corpus():
                 "client rejected a daemon-valid expression: "
                 "{!r}".format(expr)
             )
+        assert js["affirmed"], (
+            "the validity gate vetoed a daemon-valid expression: "
+            "{!r}".format(expr)
+        )
         assert py["fires"] == js["fires"], expr
         assert py["describe"] == js["describe"], expr

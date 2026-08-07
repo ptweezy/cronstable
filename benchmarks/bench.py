@@ -677,6 +677,46 @@ def bench_parse_yaml():
     return time.perf_counter() - t0
 
 
+# The complexity tripwire for the YAML parse, and the reason a second size of
+# the same call is worth its CI minutes.  strictyaml's vendored
+# CommentedSeq.__deepcopy__ ran copy_attributes INSIDE its element loop, which
+# made every Seq validation quadratic in the number of jobs; the whole bill
+# lands on the one big sequence a config has, jobs:.  Measured on the
+# developer machine, 3k jobs: 6.27s with the slip, 1.18s with the call hoisted
+# (config._patch_strictyaml_seq_deepcopy).  At the 300 jobs parse_yaml_300
+# uses, the same slip is only 0.161s against 0.117s, a 38% bulge any loaded
+# runner can argue with, so the metric that was supposed to be watching this
+# call had almost no signal: 5.3x here against 1.4x there.  Sizes below
+# roughly 3k stay in the regime where the linear term dominates and hide it.
+#
+# repeats=1 in full mode, the only benchmark in the suite that measures once,
+# because the BASELINE side of the CI pairing runs the RELEASED parser and so
+# still pays the quadratic cost until a fixed release is the baseline.  Per
+# round per side the harness pays one untimed warm-up plus the repeats: a
+# round costs 14.8s on the quadratic side and 2.3s here, so across the 5
+# in-process rounds this metric is roughly 3 CI minutes for one release cycle
+# and under a minute after that.  Measuring once loses nothing the gate uses:
+# compare.py's noise band is round-to-round scatter (_rel_cov reads
+# round_values, one value per round) and its reported figure is the
+# best-of-rounds minimum, so the 5 CI rounds already supply both; the repeats
+# only sharpen a single round's own estimate.
+@bench(
+    "config.parse_yaml_3k",
+    "config",
+    detail="parse_config_string, 3k-job YAML (parse-complexity tripwire)",
+    repeats=(1, 1, 1),
+)
+def bench_parse_yaml_3k():
+    try:
+        from cronstable.config import parse_config_string
+    except ImportError as exc:
+        raise Skip("parse_config_string unavailable: %r" % exc) from None
+    text = fixture("yaml_3k", lambda: _config_yaml(_n(3000)))
+    t0 = time.perf_counter()
+    parse_config_string(text, "")
+    return time.perf_counter() - t0
+
+
 @bench(
     "config.jobconfig_3k",
     "config",
@@ -1293,7 +1333,9 @@ def bench_schedule_due_pass():
     _spawn_due_jobs walks the ENTIRE cron_jobs dict per pass to preserve
     config order, and cold_build/reseed never construct a Cron at all.  The
     100k jobs are injected straight into cron_jobs/_next_fire/_fire_heap (a
-    100k-job YAML parse costs tens of seconds and is config.py's business).
+    100k-job YAML parse costs tens of seconds even now that it is linear, and
+    parsing is config.py's business: config.parse_yaml_300 and
+    config.parse_yaml_3k gate it at sizes CI can afford).
 
     Two corrections this spec was vetted into: the pass instants sit NINE
     seconds past each minute boundary -- CATCHUP_LIMIT is 10s, and anything
@@ -2263,6 +2305,15 @@ def bench_dag_list_dags_warm():
             await dagsched.list_dags()  # warm any terminal-run cache
             t0 = time.perf_counter()
             for _ in range(5):
+                # Keep measuring the ROLLUP (keys listing + cached
+                # summaries): the short-TTL result memo added on top of the
+                # terminal-run cache would otherwise serve every timed call
+                # from one dict hit and the gate would stop seeing a
+                # regression in the listing it promises to guard.  The
+                # terminal-run cache itself stays warm, which is this
+                # metric's point.  getattr, so a release predating the memo
+                # clears a throwaway dict and changes nothing.
+                getattr(dagsched, "_summaries_memo", {}).clear()
                 await dagsched.list_dags()
             dt = time.perf_counter() - t0
         finally:
@@ -2336,6 +2387,13 @@ def bench_dag_list_runs_warm():
             # effective ~230% against its declared 25%)
             t0 = time.perf_counter()
             for _ in range(60):
+                # Keep measuring the READ-EVERY-BODY path this docstring
+                # promises: the short-TTL summaries memo would otherwise
+                # serve all 60 calls from the untimed warm call's product
+                # and a regression in the real uncached path could no
+                # longer fire the gate.  getattr, so a release predating
+                # the memo clears a throwaway dict and changes nothing.
+                getattr(dagsched, "_summaries_memo", {}).clear()
                 await dagsched.list_runs("benchdag", limit=25)
             dt = time.perf_counter() - t0
         finally:
@@ -4243,11 +4301,25 @@ def bench_loop_stall_jobs():
                     max_gap = gap
                 last = now_t
 
+        async def poll():
+            # Keep the loop actually serving builds (see
+            # webapi.jobs_payload_500): the cross-poller response memo
+            # primed by the untimed spawn call would otherwise serve all
+            # 20 polls from cache and the heartbeat would gauge an idle
+            # loop. The memo has two spellings across releases
+            # (_jobs_response_memo since the scaffold,
+            # _jobs_response_cache before it): clear whichever exists;
+            # the plain write is the documented no-op on releases with
+            # neither.
+            memo = getattr(cron, "_jobs_response_memo", None)
+            if memo is not None:
+                memo.cached = None
+            cron._jobs_response_cache = None
+            await cron._web_list_jobs(_mocked_get("/jobs"))
+
         beat = asyncio.create_task(heartbeat())
         await asyncio.sleep(0)  # let the heartbeat take its first timestamp
-        await asyncio.gather(
-            *(cron._web_list_jobs(_mocked_get("/jobs")) for _ in range(20))
-        )
+        await asyncio.gather(*(poll() for _ in range(20)))
         stop = True
         await beat
         return max_gap
@@ -4461,6 +4533,17 @@ def bench_loop_stall_metrics():
         beat = asyncio.create_task(heartbeat())
         await asyncio.sleep(0)  # let the heartbeat take its first timestamp
         for _ in range(4):
+            # Keep the loop actually rendering: the cross-scraper response
+            # memo primed by the untimed warm call would otherwise serve
+            # all 4 scrapes from cache and the heartbeat would gauge an
+            # idle loop. The memo has two spellings across releases
+            # (_metrics_response_memo since the scaffold,
+            # _metrics_response_cache before it): getattr both, so a
+            # release with either (or neither) clears what it has and
+            # changes nothing else.
+            for memo in getattr(cron, "_metrics_response_memo", {}).values():
+                memo.cached = None
+            getattr(cron, "_metrics_response_cache", {}).clear()
             resp = await cron._web_metrics(_mocked_get("/metrics"))
             await asyncio.sleep(0)
         stop = True
@@ -4630,8 +4713,14 @@ def bench_webapi_jobs_payload():
             # Keep measuring the BUILD: the cross-poller response memo
             # would otherwise serve 19 of these 20 straight from cache and
             # the metric would stop gating the payload/encode cost its id
-            # promises. A plain attribute write, so on a release predating
-            # the memo it sets an unread attr and changes nothing.
+            # promises. The memo has two spellings across releases
+            # (_jobs_response_memo since the scaffold,
+            # _jobs_response_cache before it): clear whichever exists;
+            # the plain write is the documented no-op on releases with
+            # neither.
+            memo = getattr(cron, "_jobs_response_memo", None)
+            if memo is not None:
+                memo.cached = None
             cron._jobs_response_cache = None
             await cron._web_list_jobs(request)
         return time.perf_counter() - t0
@@ -5321,7 +5410,7 @@ def bench_statsd_emit():
         message = (
             "cronstable.bench.stop:1|g\n"
             "cronstable.bench.success:1|g\n"
-            "cronstable.bench.duration:1250|ms|@0.1\n"
+            "cronstable.bench.duration:1250|ms\n"
         )
 
         async def run():

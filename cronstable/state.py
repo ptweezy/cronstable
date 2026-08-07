@@ -71,6 +71,16 @@ from typing import (
     cast,
 )
 
+# Module scope on purpose, though only _decode_fs_token uses it: that runs
+# once per FILENAME per directory listing, and at that rate the
+# IMPORT_NAME/IMPORT_FROM pair a function-local import compiles to is
+# measurable.  It costs nothing at import time either way, since importing
+# this module already pulls urllib.parse in through cronstable.config (whose
+# own `from urllib.parse import ParseResult, urlparse` is the real provider;
+# check before deferring THAT one, because this line sits above the config
+# import and would then become the thing putting urllib.parse on the graph).
+from urllib.parse import unquote_to_bytes
+
 from cronstable import _json
 from cronstable.config import ConfigError, StateConfig
 from cronstable.platform import (
@@ -84,11 +94,21 @@ _T = TypeVar("_T")
 logger = logging.getLogger("cronstable.state")
 
 #: Per-record on-disk schema version.  Every record is written wrapped as
-#: ``{"schemaVersion": SCHEME_VERSION, "data": {...}}``; a record whose version
+#: ``{"schemaVersion": SCHEMA_VERSION, "data": {...}}``; a record whose version
 #: this build does not recognise is quarantined on read rather than guessed at.
 #: Bump this when the wrapper (not a caller's ``data``) changes shape, so old
-#: and new records are told apart instead of silently mis-read.
-SCHEME_VERSION = "v1"
+#: and new records are told apart instead of silently mis-read.  Named after
+#: the ``schemaVersion`` key it is written under, NOT after the unrelated
+#: job-set-id ``cronstable.fingerprint.SCHEME_VERSION``, whose name this
+#: constant used to collide with.
+SCHEMA_VERSION = "v1"
+
+#: The name this constant carried before it was renamed off its collision
+#: with :data:`cronstable.fingerprint.SCHEME_VERSION`.  Kept for the same
+#: reason :func:`cronstable.tui.describe_cron` keeps its old spelling: it is
+#: a module-level name an operator's script or a downstream tool may import,
+#: and a rename that costs nothing to alias should not break one.
+SCHEME_VERSION = SCHEMA_VERSION
 
 # Registry of record-scheme converters for `cronstable state migrate-schema`:
 # maps an OLD wrapper schemaVersion to a callable converting that version's
@@ -218,6 +238,25 @@ _SHARED_FSTYPES = frozenset(
 # aliases Windows strips.
 _FS_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 
+# Per-byte escape table for _fs_safe_fragment, and the deletion table its
+# inverse uses to recognise an already-canonical token.  Both are derived from
+# _FS_SAFE so neither can drift from it.
+#
+# The escape table carries the weight, because encoding sits inside DECODING:
+# _decode_fs_token re-encodes each candidate name to prove it round-trips, and
+# _list_document_keys_sync decodes every filename on every keys-only listing,
+# one of which the DAG run-summary cache takes per dag per /dags poll.  At that
+# rate a table lookup per byte beats a Python conditional per byte by 43% of
+# the decode cost of a 50-entry listing of escaped names, measured.
+#
+# _FS_SAFE_DELETE serves only _decode_fs_token's fast path, a much narrower
+# win: see the note there on which token shapes reach it.
+_FS_BYTE_ESCAPE = [
+    chr(byte) if chr(byte) in _FS_SAFE else "%{:02X}".format(byte)
+    for byte in range(256)
+]
+_FS_SAFE_DELETE = str.maketrans("", "", "".join(sorted(_FS_SAFE)))
+
 # Windows device names, reserved in every directory (case-insensitively).  A
 # lowercase job name could otherwise pass through _fs_safe verbatim and make
 # every open/mkdir under it fail (or hit the console device) on Windows.
@@ -290,14 +329,7 @@ def _fs_safe(name: str) -> str:
     4xx.  ``surrogatepass`` maps each such code point to its own distinct
     three-byte sequence, so injectivity is preserved.
     """
-    out: List[str] = []
-    for byte in name.encode("utf-8", "surrogatepass"):
-        char = chr(byte)
-        if char in _FS_SAFE:
-            out.append(char)
-        else:
-            out.append("%{:02X}".format(byte))
-    token = "".join(out) or "_"
+    token = _fs_safe_fragment(name) or "_"
     if token in _WINDOWS_RESERVED:
         token = "%{:02X}".format(ord(token[0])) + token[1:]
     if len(token) > _FS_SAFE_MAX:
@@ -311,22 +343,21 @@ def _fs_safe(name: str) -> str:
 def _fs_safe_fragment(fragment: str) -> str:
     """Per-byte escape of a stream-name PREFIX, for on-disk prefix matching.
 
-    Applies :func:`_fs_safe`'s byte encoding without its whole-token
-    adjustments.  Valid for *prefix* matching because those adjustments only
+    The byte-escape core :func:`_fs_safe` itself builds on, without its
+    whole-token adjustments.  Valid for *prefix* matching because those
+    adjustments only
     ever rewrite a token's FIRST character (reserved device names, which are
     whole-token matches a multi-part prefix can never be) or its over-length
     TAIL (the digest truncation keeps the head intact), so a managed prefix
     like ``runs/`` always survives verbatim at the front of the
     stream's encoded directory name.
     """
-    out: List[str] = []
-    for byte in fragment.encode("utf-8", "surrogatepass"):
-        char = chr(byte)
-        if char in _FS_SAFE:
-            out.append(char)
-        else:
-            out.append("%{:02X}".format(byte))
-    return "".join(out)
+    return "".join(
+        map(
+            _FS_BYTE_ESCAPE.__getitem__,
+            fragment.encode("utf-8", "surrogatepass"),
+        )
+    )
 
 
 def _decode_fs_token(token: str) -> Optional[str]:
@@ -344,9 +375,43 @@ def _decode_fs_token(token: str) -> Optional[str]:
     that does not re-encode to this exact token, e.g. a lowercase-hex
     alias): the caller must report the entry unnameable, never act on a
     mangled name.
-    """
-    from urllib.parse import unquote_to_bytes
 
+    A token already made entirely of :data:`_FS_SAFE` characters answers
+    itself, with neither half of the round trip run: there is no ``%`` for the
+    unquote to undo, and :func:`_fs_safe` would re-emit such a name verbatim,
+    because each of its three escape hatches is ruled out by one of the guards
+    standing beside the character test.  Each guard earns its place:
+    ``_fs_safe("")`` is ``"_"``, ``_fs_safe("con")`` is ``"%63on"``, and an
+    over-long name comes back as head + digest, so dropping any one of them
+    hands back a name the encoder cannot have produced.
+    ``tests/test_state.py`` carries one token per hatch.
+
+    Fewer tokens reach the fast path than it looks.  Every managed stream
+    prefix ends in ``/`` (``runs/``, ``manifests/``, ``dagrun/``), and a
+    scheduled DAG run key is an ISO instant, so the ordinary on-disk token is
+    heavily escaped (``2026-08-07%5412%3A00%3A00_00%3A00``) and goes the slow
+    way; manual run keys and plain document keys are what hit.  So the branch
+    is a trade.  Against carrying no fast path at all, a 50-entry listing of
+    escaped names costs 2% to 9% more, and one of unescaped names costs ~75%
+    less, which is the figure it is kept for.
+
+    The ``"%"`` test comes first to hold that first cost down: it scans
+    without allocating, where the character test allocates, so leading with
+    the character test instead costs 13% to 20% on those same escaped
+    listings.  Ordering it this way is worth 3% to 16% of an escaped listing.
+
+    Escaped names got faster elsewhere, in :data:`_FS_BYTE_ESCAPE` in the
+    re-encode above and in the module-scope ``unquote_to_bytes``.  Both apply
+    whether or not this branch exists.
+    """
+    if (
+        "%" not in token
+        and token
+        and not token.translate(_FS_SAFE_DELETE)
+        and len(token) <= _FS_SAFE_MAX
+        and token not in _WINDOWS_RESERVED
+    ):
+        return token
     try:
         name = unquote_to_bytes(token).decode("utf-8", "surrogatepass")
     except UnicodeError:
@@ -1422,7 +1487,7 @@ class FilesystemStateBackend(StateBackend):
                 continue
             if isinstance(obj, dict) and "schemaVersion" in obj:
                 version = obj.get("schemaVersion")
-                if version != SCHEME_VERSION:
+                if version != SCHEMA_VERSION:
                     logger.warning(
                         "state: the store at %s was last stamped by a build "
                         "writing record scheme %r (this build writes %r); "
@@ -1430,11 +1495,11 @@ class FilesystemStateBackend(StateBackend):
                         "consider `cronstable state migrate-schema`",
                         self.base,
                         version,
-                        SCHEME_VERSION,
+                        SCHEMA_VERSION,
                     )
                 return
         with contextlib.suppress(OSError):
-            self._append_sync("meta", {"storeVersion": SCHEME_VERSION})
+            self._append_sync("meta", {"storeVersion": SCHEMA_VERSION})
 
     def _resolve_topology(self) -> str:
         configured = self._configured_topology
@@ -1472,26 +1537,38 @@ class FilesystemStateBackend(StateBackend):
     # --- record store ----------------------------------------------------
 
     @staticmethod
+    def _retry_sharing_violation(op: Callable[[], None]) -> None:
+        """Run ``op``, retrying briefly on a Windows sharing violation.
+
+        The one retry ladder behind :meth:`_replace` and :meth:`_unlink`:
+        such holds are transient by nature (they clear in milliseconds), so
+        a short backoff beats surfacing a spurious error from a healthy
+        store.
+        """
+        for attempt in range(5):
+            try:
+                op()
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+
+    @staticmethod
     def _replace(src: str, dest: str) -> None:
         """``os.replace`` that rides out Windows sharing violations.
 
         On Windows, replacing a file another handle has open (the deliberately
         unlocked ``read_lease``, an antivirus/backup scan) raises
         ``PermissionError`` because CPython opens files without
-        FILE_SHARE_DELETE.  Such holds are transient by nature, so retry
-        briefly before giving up; on POSIX this is a single plain replace.
+        FILE_SHARE_DELETE; on POSIX this is a single plain replace.
         """
         if not IS_WINDOWS:
             os.replace(src, dest)
             return
-        for attempt in range(5):
-            try:
-                os.replace(src, dest)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.02 * (attempt + 1))
+        FilesystemStateBackend._retry_sharing_violation(
+            lambda: os.replace(src, dest)
+        )
 
     @staticmethod
     def _unlink(path: str) -> None:
@@ -1500,22 +1577,15 @@ class FilesystemStateBackend(StateBackend):
         The delete-side twin of :meth:`_replace`: unlinking a file another
         handle transiently has open (a concurrent read/list on another
         worker thread, an antivirus/backup scan) raises ``PermissionError``
-        on Windows because CPython opens files without FILE_SHARE_DELETE.
-        Such holds clear in milliseconds, so retry briefly instead of
-        surfacing a spurious error from a healthy store; on POSIX this is a
-        single plain unlink.
+        on Windows for the same missing-FILE_SHARE_DELETE reason; on POSIX
+        this is a single plain unlink.
         """
         if not IS_WINDOWS:
             os.unlink(path)
             return
-        for attempt in range(5):
-            try:
-                os.unlink(path)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.02 * (attempt + 1))
+        FilesystemStateBackend._retry_sharing_violation(
+            lambda: os.unlink(path)
+        )
 
     def _atomic_write(
         self, dest: str, payload: bytes, *, durable_rename: bool = True
@@ -1636,7 +1706,7 @@ class FilesystemStateBackend(StateBackend):
         # across a backward wall-clock step.
         rec_id = self._next_record_name(token, stream_dir)
         payload = _json.dumps_bytes(
-            {"schemaVersion": SCHEME_VERSION, "data": data}, sort_keys=True
+            {"schemaVersion": SCHEMA_VERSION, "data": data}, sort_keys=True
         )
         self._atomic_write(os.path.join(stream_dir, rec_id + ".json"), payload)
         want_keep = prune_keep is not None and prune_keep > 0
@@ -1901,7 +1971,7 @@ class FilesystemStateBackend(StateBackend):
             # Unrecoverable, so quarantine.
             self._quarantine(path, name, "unknown-schema")
             return None
-        if obj.get("schemaVersion") != SCHEME_VERSION:
+        if obj.get("schemaVersion") != SCHEMA_VERSION:
             # Well-formed, just a schema version this build does not
             # recognise: almost always a NEWER version written by a peer
             # ahead in a rolling upgrade, not corruption. Quarantining (i.e.
@@ -2401,6 +2471,48 @@ class FilesystemStateBackend(StateBackend):
             finally:
                 os.close(fdesc)
 
+    @contextlib.contextmanager
+    def _try_locked(self, lock_path: str) -> Iterator[None]:
+        """Non-blocking :meth:`_locked`: contention raises ``OSError``.
+
+        The GC sweep's lane.  On a shared mount a peer wedged mid-claim
+        can hold a document flock indefinitely, and a blocking acquire
+        would park the whole ``gc()`` call (and the worker thread it
+        occupies) behind that single entry.  A sweep, unlike a mutator,
+        can always skip an entry and let a later pass retry it, so this
+        variant refuses to wait (``LOCK_NB`` on POSIX, ``LK_NBLCK`` on
+        Windows; see :func:`exclusive_file_lock`).  Same ghost-inode
+        re-verify and handle hygiene as :meth:`_locked`; no wait-time
+        stats, because a try-lock never waits and its zero-length
+        acquisitions would only dilute the contention signal.
+        """
+        self._makedirs_durable(os.path.dirname(lock_path))
+        while True:
+            fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                # msvcrt.locking needs a byte present to lock; guarantee one.
+                if os.fstat(fdesc).st_size == 0:
+                    try:
+                        os.write(fdesc, b"\0")
+                    except PermissionError:
+                        # Windows: a rival holds the byte-range lock over
+                        # the bootstrap byte; the non-blocking attempt
+                        # below reports that contention as ``OSError``.
+                        pass
+                with exclusive_file_lock(fdesc, blocking=False):
+                    try:
+                        same = os.path.samestat(
+                            os.fstat(fdesc), os.stat(lock_path)
+                        )
+                    except OSError:
+                        same = False
+                    if not same:
+                        continue  # ghost inode: re-open and try afresh
+                    yield
+                    return
+            finally:
+                os.close(fdesc)
+
     def _read_lease_file(
         self, lease_path: str, *, strict: bool = False
     ) -> Optional[Lease]:
@@ -2658,7 +2770,7 @@ class FilesystemStateBackend(StateBackend):
             return None
         if (
             not isinstance(obj, dict)
-            or obj.get("schemaVersion") != SCHEME_VERSION
+            or obj.get("schemaVersion") != SCHEMA_VERSION
             or not isinstance(obj.get("data"), dict)
         ):
             if strict:
@@ -2730,7 +2842,7 @@ class FilesystemStateBackend(StateBackend):
                     "DOC_KEEP or DOC_DELETE"
                 )
             payload = _json.dumps_bytes(
-                {"schemaVersion": SCHEME_VERSION, "data": new_body},
+                {"schemaVersion": SCHEMA_VERSION, "data": new_body},
                 sort_keys=True,
             )
             self._atomic_write(doc_path, payload)
@@ -2754,8 +2866,6 @@ class FilesystemStateBackend(StateBackend):
         )
 
     def _list_document_keys_sync(self, namespace: str) -> Optional[List[str]]:
-        from urllib.parse import unquote
-
         ns_dir = self._doc_dir(namespace)
         try:
             names = os.listdir(ns_dir)
@@ -2775,13 +2885,17 @@ class FilesystemStateBackend(StateBackend):
                 # returning the others would make this one invisible to a
                 # keys-driven scan.
                 return None
-            try:
-                keys.append(unquote(token, errors="strict"))
-            except UnicodeDecodeError:
-                # not a token our encoder produced (foreign/corrupt name):
-                # fall back rather than hand back a garbled key that cannot
-                # address the document.
+            key = _decode_fs_token(token)
+            if key is None:
+                # not a token our encoder produced (foreign/corrupt name,
+                # or one that does not re-encode to this exact spelling):
+                # fall back rather than hand back a garbled key that
+                # addresses a different or nonexistent document.  The
+                # round-trip check is the same one the stream and namespace
+                # listings rely on; a bare unquote here once "successfully"
+                # decoded foreign tokens into wrong keys.
                 return None
+            keys.append(key)
         keys.sort()
         return keys
 
@@ -3133,7 +3247,10 @@ class FilesystemStateBackend(StateBackend):
         permanent claims (``ttl == 0``, no ``expiresAt``) and anything
         unreadable (unclassifiable) are kept.  Each candidate is re-judged
         under its own document flock so a claim re-won between the free
-        pre-check and the delete is never lost.  No per-file directory
+        pre-check and the delete is never lost; the flock is a try-lock
+        (:meth:`_try_locked`), so a doc whose lock a peer holds is
+        skipped for this pass (the next pass retries it) instead of
+        stalling the sweep behind one wedged claim.  No per-file directory
         fsync: a deletion resurrected by a power loss brings back an
         EXPIRED doc, which is still re-winnable and gets re-deleted next
         pass, unlike the active-claim DOC_DELETE whose loss un-does a
@@ -3169,7 +3286,7 @@ class FilesystemStateBackend(StateBackend):
                     continue
                 lock_path = doc_path[: -len(".doc")] + ".lock"
                 try:
-                    with self._locked(lock_path):
+                    with self._try_locked(lock_path):
                         body = self._read_doc_file(doc_path)
                         if not self._idem_doc_expired(body, cutoff):
                             continue  # re-won since the free pre-check
@@ -3177,7 +3294,9 @@ class FilesystemStateBackend(StateBackend):
                             self._unlink(doc_path)
                         removed += 1
                 except OSError:
-                    continue  # a held or unopenable lock: next pass
+                    # held (a peer mid-claim; the try-lock never waits)
+                    # or unopenable: skip this doc now, next pass retries.
+                    continue
         return removed
 
     @staticmethod
@@ -3493,7 +3612,7 @@ class FilesystemStateBackend(StateBackend):
                 version = (
                     obj.get("schemaVersion") if isinstance(obj, dict) else None
                 )
-                if version == SCHEME_VERSION:
+                if version == SCHEMA_VERSION:
                     current += 1
                     continue
                 convert = RECORD_MIGRATIONS.get(str(version))
@@ -3513,7 +3632,7 @@ class FilesystemStateBackend(StateBackend):
                 if dry_run:
                     continue
                 payload = _json.dumps_bytes(
-                    {"schemaVersion": SCHEME_VERSION, "data": new_data},
+                    {"schemaVersion": SCHEMA_VERSION, "data": new_data},
                     sort_keys=True,
                 )
                 try:

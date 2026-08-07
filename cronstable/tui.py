@@ -366,10 +366,31 @@ OUTCOME_COLOR = {
     "skipped": "off",
 }
 
+#: Theme colour for each key :func:`health` can return, shared by the jobs
+#: table, the wallboard tiles and the job drawer header.  The
+#: :data:`OUTCOME_KEY` lesson again: three hand-rolled copies of this dict
+#: used to live inline in those panels, one drifted arm away from a job
+#: painting a different verdict per panel.
+HEALTH_COLOR = {
+    "ok": "ok",
+    "fail": "fail",
+    "run": "run",
+    "pending": "pending",
+    "disabled": "off",
+    "paused": "off",
+    "cancelled": "off",
+    "unknown": "pending",
+}
+
 #: Heatmap bucket precedence. "skipped" seeds the bucket and ranks below
 #: "ok": an hour that only ever held slots back for a pause must not shade
 #: green, but one real success in it outranks any number of holds.  An
-#: empty bucket paints a blank shade, so its seed never shows.
+#: empty bucket paints a blank shade, so its seed never shows.  One rank
+#: per key :func:`outcome_key` can return, test-enforced
+#: (tests/test_tui.py): the heatmap paint loop subscripts this map bare,
+#: so a key it had never heard of cost a ``KeyError`` every frame, the
+#: whole dashboard rather than one mis-shaded cell.  Parsing clamps such a
+#: key to "unknown" first (:meth:`AppOverlays._heat_runs`).
 HEAT_RANK = {
     "skipped": 0,
     "ok": 1,
@@ -384,6 +405,28 @@ def outcome_key(outcome: Optional[str]) -> str:
     ``skipped``, else ``ok``. Anything painting a run goes through here
     so a sixth copy of the ladder cannot drift again."""
     return OUTCOME_KEY.get(outcome or "", "ok")
+
+
+#: Theme colour for each DAG run/task state, the port of the web page's
+#: ``dstVar``.  An explicit map over dag.py's state vocabulary (plus the
+#: run-level "scheduled"), replacing a spelling-guess ladder that handled
+#: six strings the engine never emits while ``upstream_failed`` (a failure
+#: state, fail-red on the web) fell through to neutral "dim".  The web's
+#: dedicated --unknown ink has no TUI palette twin, so "dim" stands in for
+#: it and for the web's fg-faint fallback.  Coverage of dag.py's vocabulary
+#: is test-enforced (tests/test_tui.py).
+DAG_STATE_COLOR = {
+    "pending": "pending",
+    "running": "run",
+    "up_for_retry": "pending",
+    "success": "ok",
+    "failed": "fail",
+    "skipped": "off",
+    "upstream_failed": "fail",
+    "expanded": "dim",
+    "scheduled": "pending",  # run-level: created, awaiting its slot
+    "unknown": "dim",
+}
 
 
 def outcome_color(outcome: Optional[str]) -> str:
@@ -2725,29 +2768,41 @@ class App:
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
         # in the base class (not AppActions) because the poll loop's fanout
-        # spawns the heat load through it too, not only user actions.
+        # spawns the heat load through it as well as user actions.
         task: "asyncio.Task[None]" = asyncio.get_running_loop().create_task(
             coro
         )
-        task.add_done_callback(lambda t: t.exception())
+        # retrieve the exception so a failed task never logs "exception
+        # was never retrieved"; a cancelled task is skipped, because
+        # Task.exception() RAISES CancelledError there and the callback's
+        # own traceback would land on the restored terminal after quit
+        # tears the loop down mid-fetch.
+        task.add_done_callback(
+            lambda t: None if t.cancelled() else t.exception()
+        )
 
     async def _fanout(self) -> None:
-        with contextlib.suppress(Exception):
-            self.cluster = await self.api.get_json("/cluster")
-        with contextlib.suppress(Exception):
-            self.node = await self.api.get_json("/node")
+        # the secondary GETs are independent of one another, so they go
+        # out together: awaited back to back, every poll cycle paid the
+        # sum of the round trips (up to four serial timeouts against a
+        # stalled daemon) where one round trip covers the whole batch
+        async def leg(attr: str, path: str) -> None:
+            with contextlib.suppress(Exception):
+                setattr(self, attr, await self.api.get_json(path))
+
+        legs = [leg("cluster", "/cluster"), leg("node", "/node")]
         if self.is_open("fleet"):
-            with contextlib.suppress(Exception):
-                self.fleet = await self.api.get_json("/fleet")
+            legs.append(leg("fleet", "/fleet"))
         if self.is_open("state") and self.state_tab == "view":
-            with contextlib.suppress(Exception):
-                self.state_data = await self.api.get_json("/state")
+            legs.append(leg("state_data", "/state"))
+        await asyncio.gather(*legs)
         if self.is_open("heat") and (time.monotonic() - self.heat_loaded > 60):
-            # spawned, never awaited: this fans out one /runs request per
-            # visible job, and awaiting it inline froze the whole poll
-            # pipeline (jobs table, verdict, header) for the sum of the
-            # round trips whenever the overlay was open. The busy flag
-            # covers the window where a slow load outlives the 60s gate.
+            # spawned, never awaited: this issues one batched /activity
+            # fetch (a per-job /runs fan-out against a daemon without it),
+            # and awaiting it inline froze the whole poll pipeline (jobs
+            # table, verdict, header) for the sum of the round trips
+            # whenever the overlay was open. The busy flag covers the
+            # window where a slow load outlives the 60s gate.
             if not self._heat_busy:
                 self._heat_busy = True
                 self._spawn(self._load_heat())
@@ -2847,36 +2902,68 @@ class App:
             self.dags = data if isinstance(data, list) else []
 
     async def _load_heat(self) -> None:
-        """Batch /jobs/{name}/runs for the punchcard (capped, cached).
-
-        Runs as a spawned task (see _fanout) with a few requests in
-        flight at a time: strictly sequential awaits cost sum-of-RTTs
-        (seconds against a remote daemon), while an unbounded gather
-        would slam the daemon with the whole burst at once.
-        """
+        """One batched /activity fetch for the punchcard, memoized
+        daemon-side; the per-job fan-out is kept as the fallback against
+        a daemon that predates the endpoint. Runs as a spawned task (see
+        _fanout)."""
         try:
             self.heat_loaded = time.monotonic()
-            gate = asyncio.Semaphore(5)
-
-            async def fetch(job: Dict[str, Any]) -> None:
-                name = job.get("name", "")
-                async with gate:
-                    with contextlib.suppress(Exception):
-                        data = await self.api.get_json(
-                            "/jobs/%s/runs" % _quote(name)
-                        )
-                        self.heat_data[name] = data.get("runs", [])
-
-            # same spirit as the web page's cap
-            await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
-            # a job removed (or renamed) by a reload never refreshes its
-            # entry again; without this prune a long session with name
-            # churn accretes one dead run-list payload per old name.
-            for stale in [k for k in self.heat_data if k not in self.by_name]:
-                del self.heat_data[stale]
+            if not await self._load_heat_batched():
+                await self._load_heat_fanout()
             self.mark()
         finally:
             self._heat_busy = False
+
+    async def _load_heat_batched(self) -> bool:
+        # Only a 404 (the old-daemon signature: aiohttp answers unmatched
+        # paths 404) reports the batch unavailable and triggers the
+        # fan-out, so a transient 500 or timeout on a new daemon never
+        # launches a 40-request burst; the stale card just survives until
+        # the next window.
+        try:
+            data = await self.api.get_json("/activity")
+        except ApiError as exc:
+            return exc.status != 404
+        except Exception:  # noqa: BLE001 - transient; keep the stale card
+            return True
+        jobs = data.get("jobs") if isinstance(data, dict) else None
+        if isinstance(jobs, dict):
+            # wholesale replacement, so the fan-out path's prune of
+            # removed names is implicit here and _heat_parsed's orphan
+            # sweep covers the shrinkage
+            self.heat_data = {
+                str(name): rows if isinstance(rows, list) else []
+                for name, rows in jobs.items()
+            }
+        return True
+
+    async def _load_heat_fanout(self) -> None:
+        """Batch /jobs/{name}/runs for the punchcard (capped, cached):
+        the fallback against a daemon that predates /activity.
+
+        A few requests in flight at a time: strictly sequential awaits
+        cost sum-of-RTTs (seconds against a remote daemon), while an
+        unbounded gather would slam the daemon with the whole burst at
+        once.
+        """
+        gate = asyncio.Semaphore(5)
+
+        async def fetch(job: Dict[str, Any]) -> None:
+            name = job.get("name", "")
+            async with gate:
+                with contextlib.suppress(Exception):
+                    data = await self.api.get_json(
+                        "/jobs/%s/runs" % _quote(name)
+                    )
+                    self.heat_data[name] = data.get("runs", [])
+
+        # same spirit as the web page's cap
+        await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
+        # a job removed (or renamed) by a reload never refreshes its
+        # entry again; without this prune a long session with name
+        # churn accretes one dead run-list payload per old name.
+        for stale in [k for k in self.heat_data if k not in self.by_name]:
+            del self.heat_data[stale]
 
     def _pressure_entries(self) -> List[ScheduleEntry]:
         """Analyzable rows from the /jobs and /dags snapshots.
@@ -3127,17 +3214,13 @@ class App:
 
     @staticmethod
     def _dag_state_color(state: str) -> str:
-        """Theme colour key for a DAG run/task state string."""
-        low = state.lower()
-        if low in ("success", "succeeded", "done"):
-            return "ok"
-        if low in ("failed", "failure", "error"):
-            return "fail"
-        if low in ("running", "launched"):
-            return "run"
-        if low in ("awaiting", "waiting", "queued", "pending", "scheduled"):
-            return "pending"
-        return "dim"
+        """Theme colour key for a DAG run/task state string.
+
+        Reads the explicit :data:`DAG_STATE_COLOR` port of the web page's
+        ``dstVar``; anything outside the known vocabulary paints "dim",
+        matching the web's fg-faint fallback.
+        """
+        return DAG_STATE_COLOR.get(state.lower(), "dim")
 
     # ---- implemented by the mixin layers below (one concrete class,
     #      :class:`TuiApp`; the stubs keep each layer type-checkable) ----
@@ -4918,16 +5001,7 @@ class AppRender(AppKeys):
     ) -> str:
         key, label = health(job)
         ascii_mode = bool(self.prefs["ascii"])
-        color = {
-            "ok": "ok",
-            "fail": "fail",
-            "run": "run",
-            "pending": "pending",
-            "disabled": "off",
-            "paused": "off",
-            "cancelled": "off",
-            "unknown": "pending",
-        }[key]
+        color = HEALTH_COLOR[key]
         last = job.get("last_run") or {}
         cells: List[str] = []
         bg = "sel" if selected else None
@@ -5138,16 +5212,7 @@ class AppRender(AppKeys):
             chunk = shown[chunk_start : chunk_start + per_row]
             lines3: List[List[str]] = [[], [], []]
             for key, job in chunk:
-                color = {
-                    "ok": "ok",
-                    "fail": "fail",
-                    "run": "run",
-                    "pending": "pending",
-                    "disabled": "off",
-                    "paused": "off",
-                    "cancelled": "off",
-                    "unknown": "pending",
-                }[key]
+                color = HEALTH_COLOR[key]
                 last = job.get("last_run") or {}
                 name = truncate(str(job.get("name", "")), tile_w - 4)
                 head = "%s %s" % (paint.glyph(key, ascii_mode), name)
@@ -6095,6 +6160,20 @@ class AppOverlays(AppRender):
         ``.timestamp()`` per run per frame.  The cache is keyed on the run
         list object ``_load_heat`` swaps in, so it is exactly as large as
         the payload it mirrors and cannot outlive it.
+
+        The clamp to :data:`HEAT_RANK`'s vocabulary lives here rather than
+        at the two bare subscripts that read the key (``render_heat``'s
+        precedence compare and its ``OUTCOME_COLOR`` lookup): this parse
+        runs once per payload, that loop once per run per row per frame.
+        A key neither map knows can only turn up when someone grows
+        :data:`OUTCOME_KEY` an arm and misses a downstream map, and in the
+        loop that miss is a ``KeyError`` every frame; one cell in the wrong
+        shade is the cheaper failure, so an unheard-of key lands in
+        "unknown", which every downstream map already carries.  The clamp
+        is a fallback, not the guard: a parity test (tests/test_tui.py)
+        fails the build the moment HEAT_RANK drifts from what
+        ``outcome_key`` can return, so nobody has to find the drift by
+        spotting a grey cell.
         """
         runs = self.heat_data.get(name) or []
         cached = self._heat_parsed.get(name)
@@ -6112,9 +6191,8 @@ class AppOverlays(AppRender):
         for run in runs:
             epoch = parse_iso(run.get("finished_at"))
             if epoch is not None:
-                parsed.append(
-                    (epoch, outcome_key(str(run.get("outcome", ""))))
-                )
+                key = outcome_key(str(run.get("outcome", "")))
+                parsed.append((epoch, key if key in HEAT_RANK else "unknown"))
         self._heat_parsed[name] = (runs, parsed)
         return parsed
 
@@ -6548,16 +6626,7 @@ class AppDrawers(AppOverlays):
     ) -> List[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         key, label = health(job) if job else ("unknown", "?")
-        color = {
-            "ok": "ok",
-            "fail": "fail",
-            "run": "run",
-            "pending": "pending",
-            "disabled": "off",
-            "paused": "off",
-            "cancelled": "off",
-            "unknown": "pending",
-        }[key]
+        color = HEALTH_COLOR[key]
         ascii_mode = bool(self.prefs["ascii"])
         rows = [
             " "

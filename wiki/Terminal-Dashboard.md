@@ -224,11 +224,12 @@ needed.
 The same endpoints, on the same cadence model, as the web page: `GET
 /jobs` on the refresh interval (1s–10s or paused, default 3s), with
 `/cluster` and `/node` riding each successful poll; `/fleet`, `/state`,
-and the heatmap's batched `/jobs/{name}/runs` only while their panels
-are open; `GET /jobs/{name}/logs` as a Server-Sent-Events stream while
-a Logs tab or multi-tail pane is attached (replay-then-follow, with the
-page's same reconnect throttle). Run `cronstable tui` against any
-daemon you can `curl`.
+and the heatmap's one-request `/activity` batch (with the per-job
+`/jobs/{name}/runs` fan-out kept as the fallback against a daemon
+without it) only while their panels are open; `GET /jobs/{name}/logs`
+as a Server-Sent-Events stream while a Logs tab or multi-tail pane is
+attached (replay-then-follow, with the page's same reconnect throttle).
+Run `cronstable tui` against any daemon you can `curl`.
 
 ## See also
 
