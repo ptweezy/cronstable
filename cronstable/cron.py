@@ -119,7 +119,7 @@ from cronstable.state import Lease, StateBackend, make_state_backend
 class _AiohttpDoor:
     """Stand-in for ``aiohttp`` / ``aiohttp.web`` that imports on first touch.
 
-    aiohttp is 155 ms and 21 MB of RSS, roughly half of what importing this
+    aiohttp is 144 ms and 14 MB of RSS, roughly half of what importing this
     module costs, and every one of its consumers here is optional: the web
     listener, the cluster gossip client, the push relay. A daemon with none of
     them configured used to pay for the web stack anyway, and so did every
@@ -138,6 +138,15 @@ class _AiohttpDoor:
     ordinary module attribute lookup with no indirection, which matters because
     it sits on every request path. ``__slots__`` keeps ``_target`` a real class
     attribute so looking it up inside ``__getattr__`` cannot recurse.
+
+    The two figures above are the marginal cost of opening this door, measured
+    in CI (run 31170258121, which compared a door-open tree against a
+    door-closed one): ``startup.import_daemon`` 179 ms to 323 ms and
+    ``mem.rss_daemon_import`` 35.4 MB to 49.1 MB. They are quoted again at the
+    other deferral sites (:func:`_access_log_class`, ``job.py``'s webhook
+    reporter, ``push.py``'s relay client) and gated as a COUNT by
+    ``tests/test_perf_invariants.py``, which fails if importing this module
+    loads any aiohttp at all.
     """
 
     __slots__ = ("_target",)
@@ -807,14 +816,17 @@ async def _error_envelope_middleware(request, handler):
     error legitimately owns (a 405's ``Allow``) are preserved; only the
     body-describing pair is replaced along with the body.
 
-    Deliberately NOT decorated with ``@web.middleware`` here: a decorator at
-    module scope touches the lazy aiohttp door above while this module's body
-    is still executing, which imports the whole web stack into every offline
-    caller and costs 144 ms and 15 MB of RSS on an import that needs none of
-    it. ``start_stop_web_app`` applies the marker instead, on the one path
-    that has aiohttp loaded anyway. ``web.middleware`` only stamps
-    ``__middleware_version__`` onto the function and hands it back, so where
-    it is applied changes nothing but the import graph.
+    Marked new-style below rather than with ``@web.middleware`` here.  The
+    decorator reads an attribute off the lazy aiohttp door above while this
+    module's body is still executing, which drags the whole web stack into
+    every offline caller: 144 ms and 14 MB of RSS on an import that needs
+    none of it (measured, and gated by
+    ``tests/test_perf_invariants.py``).  The marker itself must stay at
+    module scope, because an UNMARKED middleware is not refused: aiohttp
+    reads it as a pre-3.0 middleware FACTORY, calls it as ``m(app,
+    handler)``, and every request 500s behind nothing louder than a
+    DeprecationWarning.  Applying the marker at the one construction site
+    would leave that trap armed for the next one.
     """
     try:
         return await handler(request)
@@ -828,6 +840,13 @@ async def _error_envelope_middleware(request, handler):
             headers=headers,
             content_type="application/json",
         )
+
+
+# aiohttp's decorator is this assignment plus a return, so this is the same
+# marker without the attribute read that would open the door.  Pinned by
+# tests/test_cron.py, so an aiohttp release that moves the marker cannot
+# silently demote the envelope to an old-style factory.
+_error_envelope_middleware.__middleware_version__ = 1  # type: ignore[attr-defined]
 
 
 # Defense-in-depth security headers for the dashboard HTML document. The
@@ -1805,8 +1824,8 @@ def _access_log_class() -> type:
     """aiohttp's access logger, with the feed token redacted.
 
     Built lazily and cached: importing ``aiohttp.web_log`` at module scope
-    would defeat the lazy aiohttp door above, which exists to keep 155 ms
-    and 21 MB of RSS off every daemon start.
+    would defeat the lazy aiohttp door above, which exists to keep 144 ms
+    and 14 MB of RSS off every daemon start.
 
     The hook is ``log``, the one method
     :class:`aiohttp.abc.AbstractAccessLogger` actually declares.  The
@@ -6959,10 +6978,9 @@ class Cron:
             metrics_config = resolve_metrics_config(web_config)
             # Envelope first, so it is outermost and wraps the errors the
             # origin/auth middlewares below raise as well as the router's
-            # own 404/405 (see _error_envelope_middleware). The marker goes
-            # on here rather than as a module-scope decorator so importing
-            # this module does not open the lazy aiohttp door.
-            middlewares = [web.middleware(_error_envelope_middleware)]
+            # own 404/405 (see _error_envelope_middleware, which carries its
+            # own new-style marker).
+            middlewares = [_error_envelope_middleware]
             # Cross-site request defense for the mutating endpoints, ALWAYS
             # installed: with authToken unset this is the only thing between
             # a localhost-bound daemon and any web page the operator visits

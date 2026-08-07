@@ -71,6 +71,13 @@ from typing import (
     cast,
 )
 
+# Module scope on purpose, though only _decode_fs_token uses it: that runs
+# once per FILENAME per directory listing, and at that rate the
+# IMPORT_NAME/IMPORT_FROM pair a function-local import compiles to is
+# measurable.  It costs nothing at import time either way, since importing
+# this module already pulls urllib.parse in through cronstable._json.
+from urllib.parse import unquote_to_bytes
+
 from cronstable import _json
 from cronstable.config import ConfigError, StateConfig
 from cronstable.platform import (
@@ -230,11 +237,17 @@ _FS_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 
 # Per-byte escape table for _fs_safe_fragment, and the deletion table its
 # inverse uses to recognise an already-canonical token.  Both are derived from
-# _FS_SAFE so neither can drift from it.  They exist because the encode and the
-# decode both sit inside directory listings: _list_document_keys_sync decodes
-# every filename on every keys-only listing, and the DAG run-summary cache
-# takes one such listing per /dags poll per dag, so a per-byte Python loop
-# there was 30% of the whole listing (see _decode_fs_token's fast path).
+# _FS_SAFE so neither can drift from it.
+#
+# The escape table carries the weight, because encoding sits inside DECODING:
+# _decode_fs_token re-encodes each candidate name to prove it round-trips, and
+# _list_document_keys_sync decodes every filename on every keys-only listing,
+# one of which the DAG run-summary cache takes per dag per /dags poll.  At that
+# rate a table lookup per byte beats a Python conditional per byte by 43% of
+# the decode cost of a 50-entry listing of escaped names, measured.
+#
+# _FS_SAFE_DELETE serves only _decode_fs_token's fast path, a much narrower
+# win: see the note there on which token shapes reach it.
 _FS_BYTE_ESCAPE = [
     chr(byte) if chr(byte) in _FS_SAFE else "%{:02X}".format(byte)
     for byte in range(256)
@@ -360,22 +373,33 @@ def _decode_fs_token(token: str) -> Optional[str]:
     alias): the caller must report the entry unnameable, never act on a
     mangled name.
 
-    The fast path takes the overwhelmingly common token, one already made
-    entirely of :data:`_FS_SAFE` characters, without touching either half of
-    the round trip: with no ``%`` to undo the unquote is the identity, and
-    :func:`_fs_safe` on the result re-emits the token verbatim, since its only
-    two rewrites (the reserved-device prefix and the over-length digest) are
-    ruled out by the two guards beside the character test.  So the fast path
-    answers exactly what the slow path would, and the slow path still runs for
-    every token that carries an escape.  It is worth having because both
-    halves are otherwise paid per FILENAME per directory listing: encoding a
-    name is a per-byte walk, and the DAG run-summary cache takes one keys-only
-    listing per dag per /dags poll.
-    """
-    from urllib.parse import unquote_to_bytes
+    A token already made entirely of :data:`_FS_SAFE` characters answers
+    itself, with neither half of the round trip run: there is no ``%`` for the
+    unquote to undo, and :func:`_fs_safe` would re-emit such a name verbatim,
+    because each of its three escape hatches is ruled out by one of the guards
+    standing beside the character test.  Each guard earns its place:
+    ``_fs_safe("")`` is ``"_"``, ``_fs_safe("con")`` is ``"%63on"``, and an
+    over-long name comes back as head + digest, so dropping any one of them
+    hands back a name the encoder cannot have produced.
+    ``tests/test_state.py`` carries one token per hatch.
 
+    Fewer tokens reach the fast path than it looks.  Every managed stream
+    prefix ends in ``/`` (``runs/``, ``manifests/``, ``dagrun/``), and a
+    scheduled DAG run key is an ISO instant, so the ordinary on-disk token is
+    heavily escaped (``2026-08-07%5412%3A00%3A00_00%3A00``) and goes the slow
+    way; manual run keys and plain document keys are what hit.  That is why
+    the ``"%"`` test comes first, and its job is to make the MISS cheap: it
+    scans without allocating, where the character test allocates, and leading
+    with the character test measured 21% to 42% slower per escaped listing
+    than carrying no fast path at all.  As ordered here, escaped listings run
+    7% to 10% cheaper than with no fast path (all of that the module-scope
+    ``unquote_to_bytes``, not this branch) and unescaped ones ~80% cheaper.
+    On escaped names the win that matters is :data:`_FS_BYTE_ESCAPE`, in the
+    re-encode above.
+    """
     if (
-        token
+        "%" not in token
+        and token
         and not token.translate(_FS_SAFE_DELETE)
         and len(token) <= _FS_SAFE_MAX
         and token not in _WINDOWS_RESERVED

@@ -52,6 +52,82 @@ def _importable(module):
     return importlib.util.find_spec(module) is not None
 
 
+# --- the checked-in budgets.json ------------------------------------------
+#
+# Every other budget test below builds a synthetic document in tmp_path, so
+# until this one the REAL file had no consumer test at all, and compare.py
+# reads it with a bare doc.get("budgets", {}).  A renamed section, or an
+# entry left behind under "proposed", therefore disarms ceilings with the
+# perf job exiting 0 and printing nothing: the disarmed state is
+# indistinguishable from the intended one by inspection.  That is also the
+# mechanism behind the stale stamps this file was re-sized to fix, where
+# ceilings had drifted to as much as 8.3x the measured value while every
+# run stayed green.
+
+
+def _real_budgets_doc():
+    path = os.path.join(REPO_ROOT, "benchmarks", "budgets.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_checked_in_budgets_are_armed_and_sized_against_observed_values():
+    doc = _real_budgets_doc()
+    # compare.py reads exactly this key. A typo here is silent.
+    assert "budgets" in doc, (
+        "benchmarks/budgets.json has no 'budgets' section, so compare.py "
+        "arms NOTHING and the perf job still exits 0"
+    )
+    armed = doc["budgets"]
+    assert armed, "the 'budgets' section is empty: every ceiling is disarmed"
+
+    gated = set(_expected_gated_names())
+    for name, spec in sorted(armed.items()):
+        # a budget on a metric the comparison does not measure every run is
+        # a ceiling that only ever reports "was not measured this run".
+        assert name in gated, (
+            "%s carries an absolute budget but is not in expected_gated.txt, "
+            "so nothing guarantees it is measured" % name
+        )
+        for field in ("max", "unit", "observed", "set"):
+            assert field in spec, "%s is missing %r" % (name, field)
+        headroom = spec["max"] / spec["observed"]
+        assert 1.2 <= headroom <= 2.5, (
+            "%s sits at %.2fx its observed value (%s vs %s); the file sizes "
+            "ceilings at roughly +60%%. Under 1.2x false-reds on runner "
+            "variance; over 2.5x caps nothing, which is what a stamp left "
+            "behind by an optimization looks like. Re-measure, update "
+            "'observed' and 'set', and re-size 'max'."
+            % (name, headroom, spec["max"], spec["observed"])
+        )
+
+    # an entry parked in 'proposed' is NOT read by compare.py, so a promotion
+    # that forgets to move it leaves the ceiling inert while reading as live.
+    overlap = set(doc.get("proposed", {})) & set(armed)
+    assert not overlap, (
+        "%s appear in both 'proposed' and 'budgets'; only 'budgets' is read"
+        % sorted(overlap)
+    )
+
+
+def test_compare_actually_loads_every_checked_in_budget(tmp_path):
+    # the assertions above read the file directly; this one reads it THROUGH
+    # compare.py, so a change to how the document is shaped or loaded cannot
+    # pass the structural check and still arm nothing.
+    sys.path.insert(0, os.path.join(REPO_ROOT, "benchmarks"))
+    try:
+        import compare as compare_mod
+    finally:
+        sys.path.pop(0)
+    loaded = compare_mod._load_budgets(
+        os.path.join(REPO_ROOT, "benchmarks", "budgets.json")
+    )
+    assert set(loaded) == set(_real_budgets_doc()["budgets"]), (
+        "compare.py loaded %d of %d checked-in ceilings"
+        % (len(loaded), len(_real_budgets_doc()["budgets"]))
+    )
+
+
 def test_bench_smoke_produces_results(tmp_path):
     out = tmp_path / "smoke.json"
     proc = _run([BENCH, "--smoke", "--json", str(out)])
