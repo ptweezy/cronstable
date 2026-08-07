@@ -4,7 +4,7 @@ This page covers the cronstable developer workflow (environment, tests, linters,
 
 ## Development environment
 
-cronstable targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13 and 3.14 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.14).
+cronstable targets **Python 3.10+**; 3.10, 3.11, 3.12, 3.13, 3.14 and 3.15 are the tested interpreters (`pyproject.toml` `requires-python = ">=3.10"`, classifiers for 3.10 through 3.15).
 
 cronstable runs **natively on Windows, Linux, and macOS** (WSL is not required). All OS-specific behavior is isolated in `cronstable/platform.py` (`grp`/`pwd` are guarded there, not imported unconditionally at load time on Windows), so the package and its full test suite run natively on every supported OS, and `pip install cronstable` works on Windows. See [Running on Windows](Running-on-Windows) for the platform-specific details.
 
@@ -12,7 +12,7 @@ Linting and type checking do not import the package and run on any platform. myp
 
 Clone and install the editable package with the `dev` extra. cronstable uses
 [uv](https://docs.astral.sh/uv/) for a fast dev loop (`tox` also runs through uv
-via `tox-uv`, and uv can fetch the 3.10–3.14 interpreters the matrix needs):
+via `tox-uv`, and uv can fetch the 3.10–3.15 interpreters the matrix needs):
 
 ```sh
 git clone https://github.com/ptweezy/cronstable
@@ -34,10 +34,10 @@ The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requi
 
 ## Running the checks
 
-All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py310, py311, py312, py313, py314, lint, mypy, bandit`.
+All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py310, py311, py312, py313, py314, py315, lint, mypy, bandit, openapi`.
 
 ```sh
-tox            # all envs: py310-py314, lint, mypy, bandit
+tox            # all envs: py310-py315, lint, mypy, bandit, openapi
 tox -e lint    # ruff check + ruff format --check
 tox -e mypy    # mypy
 tox -e bandit  # bandit security lint (medium+ severity)
@@ -46,7 +46,7 @@ tox -e py      # pytest on the current interpreter
 
 | Env | Installs package | What it runs |
 | --- | --- | --- |
-| `py313`, `py314` | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` |
+| `py310`–`py315` | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` |
 | `lint` | no (`skip_install = true`) | `ruff check cronstable` then `ruff format --check cronstable` |
 | `mypy` | yes | `mypy -p cronstable` |
 | `bandit` | no (`skip_install = true`) | `bandit -c pyproject.toml -r cronstable --severity-level=medium` |
@@ -66,7 +66,7 @@ The `lint` and `bandit` envs deliberately skip installing the package: ruff and 
 
 ### CI for every commit
 
-There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is a `tox-static` job (`tox -e lint,mypy,bandit`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**.
+There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is a `tox-static` job (`tox -e lint,mypy,bandit`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.15`, plus a `windows-11-arm`/`3.14` row for **Windows ARM64** (that row stays on 3.14 because aiohttp publishes `win_arm64` wheels only through cp314). Every row gates.
 
 Alongside the tests, the same run builds every release artifact at the computed version (all the PyInstaller binaries, the wheel + sdist) and does a **build-only pass over every Docker image** (the `docker` job — all 8 distros at their full published arch sets, no push), so a broken `Dockerfile` fails CI before a release. On an ordinary commit the version is the natural `setuptools_scm` dev version; no **software** is published, pushed, tagged, or signed. The lone exception is documentation: the `wiki` job publishes `wiki/` to the GitHub wiki whenever it changes on `develop` (see [Editing the wiki](#editing-the-wiki)). See [Production and Container Deployment](Production-Deployment).
 
