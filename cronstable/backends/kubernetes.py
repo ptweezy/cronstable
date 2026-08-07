@@ -978,7 +978,14 @@ class KubernetesBackend(LeaseBackend):
 
 def _incluster_namespace() -> Optional[str]:  # pragma: no cover - file I/O
     try:
-        with open(os.path.join(_SA_DIR, "namespace")) as ns_file:
+        # utf-8 stated rather than inherited here and at the other three
+        # reads in this module (the token and the two kubeconfigs): the
+        # kubelet writes all of them as UTF-8, and the interpreter default
+        # they used to ride on is the locale's through 3.14 but UTF-8 from
+        # 3.15 (PEP 686).  Naming it keeps the decode identical either way.
+        with open(
+            os.path.join(_SA_DIR, "namespace"), encoding="utf-8"
+        ) as ns_file:
             return ns_file.read().strip()
     except OSError:
         return None
@@ -1027,7 +1034,7 @@ def _kubeconfig_cert_files(path: str) -> List[Optional[str]]:
     from strictyaml.ruamel.error import YAMLError, YAMLFutureWarning
 
     try:
-        with open(path) as cfg_file:
+        with open(path, encoding="utf-8") as cfg_file:
             data = YAML(typ="safe").load(cfg_file)
         contexts = {c["name"]: c["context"] for c in data.get("contexts", [])}
         ctx = contexts[data["current-context"]]
@@ -1115,7 +1122,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
 
     @staticmethod
     def _read_token(path: str) -> str:
-        with open(path) as token_file:
+        with open(path, encoding="utf-8") as token_file:
             return token_file.read().strip()
 
     def _auth_headers(self) -> Dict[str, str]:
@@ -1219,7 +1226,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         # bad kubeconfig is logged as "cluster: failed to start" and the
         # daemon survives, mirroring the native transport's _setup_sync.
         try:
-            with open(path) as cfg_file:
+            with open(path, encoding="utf-8") as cfg_file:
                 data = YAML(typ="safe").load(cfg_file)
             contexts = {
                 c["name"]: c["context"] for c in data.get("contexts", [])

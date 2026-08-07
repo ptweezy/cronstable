@@ -8423,7 +8423,14 @@ class Cron:
             token = str(spec["value"])
         elif spec.get("fromFile"):
             try:
-                with open(spec["fromFile"], "rt") as token_file:
+                # encoding pinned for the reason config._resolve_secret
+                # spells out: the default flips from the locale's to UTF-8
+                # in 3.15 (PEP 686), and a bearer token that decodes
+                # differently before and after an upgrade fails
+                # authentication with nothing to show for it.
+                with open(
+                    spec["fromFile"], "rt", encoding="utf-8"
+                ) as token_file:
                     token = token_file.read().strip()
             # UnicodeDecodeError alongside OSError: a binary token file
             # raises it from read(), and only ConfigError gets the clean
