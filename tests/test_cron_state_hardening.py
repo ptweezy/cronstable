@@ -968,6 +968,71 @@ async def test_gc_leaves_artifacts_unmanaged_without_scope_manifests(
         cron.state_backend = None
 
 
+async def test_gc_keeps_catchup_dag_streams_without_dag_manifests(
+    tmp_path, monkeypatch
+):
+    # rolling-upgrade safety, the dag catch-up twin of the artifact test
+    # above: while any recent manifest predates dag advertising, live_dags
+    # is a partial view, so a peer's rarely-written catchup-dag/ checkpoint
+    # stream must stay unmanaged (kept) while ordinary job streams still
+    # collect; deleting it live would re-run the work it exists to fence.
+    import cronstable.state as state_mod
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            await backend.append_record(
+                "catchup-dag/peerdag", {"watermark": "x"}
+            )
+            await backend.append_record("runs/orphan", {"finished_at": "x"})
+        finally:
+            monkeypatch.undo()
+        await _seed_gc_anchor(cron, covered=False)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        # the orphan run stream collected, proving the pass really ran...
+        assert await backend.list_records("runs/orphan") == []
+        # ...while the aged peer checkpoint survived the partial view.
+        assert len(await backend.list_records("catchup-dag/peerdag")) == 1
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_gc_collects_removed_dag_catchup_streams_when_covered(
+    tmp_path, monkeypatch
+):
+    # the guard must not overcorrect into never managing the prefix: once
+    # every recent manifest advertises its dags, an aged checkpoint stream
+    # for a dag no config or manifest knows ages out exactly as a removed
+    # job's catchup/<job> stream does.
+    import cronstable.state as state_mod
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            await backend.append_record(
+                "catchup-dag/peerdag", {"watermark": "x"}
+            )
+        finally:
+            monkeypatch.undo()
+        await _seed_gc_anchor(cron, covered=True)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        assert await backend.list_records("catchup-dag/peerdag") == []
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
 async def test_gc_pass_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
     # the daemon pass wires the ephemeral-lease prefix through to the
     # backend: a dead-past-grace dagadvance/ per-run lease is reclaimed

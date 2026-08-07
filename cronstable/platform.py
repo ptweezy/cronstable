@@ -435,10 +435,14 @@ def exclusive_file_lock(
 
     With ``blocking=False`` a contended lock raises ``OSError`` immediately
     instead of waiting (``EWOULDBLOCK``/``EAGAIN`` on POSIX, ``EACCES`` on
-    Windows).  Used by the lock-fidelity probe
+    Windows).  Two callers want that: the lock-fidelity probe
     (:meth:`cronstable.state.FilesystemStateBackend.verify_locking`), whose
     whole point is observing that a second lock attempt on an already-locked
-    file *fails*: a mount whose locks are silent no-ops would grant it.
+    file *fails* (a mount whose locks are silent no-ops would grant it), and
+    the state GC sweep's try-lock
+    (:meth:`cronstable.state.FilesystemStateBackend._try_locked`), which
+    skips a contended document rather than park the whole sweep behind one
+    wedged holder.
     """
     if sys.platform == "win32":  # pragma: no cover - Windows-only path
         # msvcrt.locking locks ``nbytes`` from the current file position; lock

@@ -4306,8 +4306,14 @@ def bench_loop_stall_jobs():
             # webapi.jobs_payload_500): the cross-poller response memo
             # primed by the untimed spawn call would otherwise serve all
             # 20 polls from cache and the heartbeat would gauge an idle
-            # loop. A plain attribute write, so on a release predating
-            # the memo it sets an unread attr and changes nothing.
+            # loop. The memo has two spellings across releases
+            # (_jobs_response_memo since the scaffold,
+            # _jobs_response_cache before it): clear whichever exists;
+            # the plain write is the documented no-op on releases with
+            # neither.
+            memo = getattr(cron, "_jobs_response_memo", None)
+            if memo is not None:
+                memo.cached = None
             cron._jobs_response_cache = None
             await cron._web_list_jobs(_mocked_get("/jobs"))
 
@@ -4530,8 +4536,13 @@ def bench_loop_stall_metrics():
             # Keep the loop actually rendering: the cross-scraper response
             # memo primed by the untimed warm call would otherwise serve
             # all 4 scrapes from cache and the heartbeat would gauge an
-            # idle loop. getattr, so a release predating the memo clears a
-            # throwaway dict and changes nothing.
+            # idle loop. The memo has two spellings across releases
+            # (_metrics_response_memo since the scaffold,
+            # _metrics_response_cache before it): getattr both, so a
+            # release with either (or neither) clears what it has and
+            # changes nothing else.
+            for memo in getattr(cron, "_metrics_response_memo", {}).values():
+                memo.cached = None
             getattr(cron, "_metrics_response_cache", {}).clear()
             resp = await cron._web_metrics(_mocked_get("/metrics"))
             await asyncio.sleep(0)
@@ -4702,8 +4713,14 @@ def bench_webapi_jobs_payload():
             # Keep measuring the BUILD: the cross-poller response memo
             # would otherwise serve 19 of these 20 straight from cache and
             # the metric would stop gating the payload/encode cost its id
-            # promises. A plain attribute write, so on a release predating
-            # the memo it sets an unread attr and changes nothing.
+            # promises. The memo has two spellings across releases
+            # (_jobs_response_memo since the scaffold,
+            # _jobs_response_cache before it): clear whichever exists;
+            # the plain write is the documented no-op on releases with
+            # neither.
+            memo = getattr(cron, "_jobs_response_memo", None)
+            if memo is not None:
+                memo.cached = None
             cron._jobs_response_cache = None
             await cron._web_list_jobs(request)
         return time.perf_counter() - t0

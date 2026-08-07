@@ -2410,6 +2410,48 @@ class FilesystemStateBackend(StateBackend):
             finally:
                 os.close(fdesc)
 
+    @contextlib.contextmanager
+    def _try_locked(self, lock_path: str) -> Iterator[None]:
+        """Non-blocking :meth:`_locked`: contention raises ``OSError``.
+
+        The GC sweep's lane.  On a shared mount a peer wedged mid-claim
+        can hold a document flock indefinitely, and a blocking acquire
+        would park the whole ``gc()`` call (and the worker thread it
+        occupies) behind that single entry.  A sweep, unlike a mutator,
+        can always skip an entry and let a later pass retry it, so this
+        variant refuses to wait (``LOCK_NB`` on POSIX, ``LK_NBLCK`` on
+        Windows; see :func:`exclusive_file_lock`).  Same ghost-inode
+        re-verify and handle hygiene as :meth:`_locked`; no wait-time
+        stats, because a try-lock never waits and its zero-length
+        acquisitions would only dilute the contention signal.
+        """
+        self._makedirs_durable(os.path.dirname(lock_path))
+        while True:
+            fdesc = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                # msvcrt.locking needs a byte present to lock; guarantee one.
+                if os.fstat(fdesc).st_size == 0:
+                    try:
+                        os.write(fdesc, b"\0")
+                    except PermissionError:
+                        # Windows: a rival holds the byte-range lock over
+                        # the bootstrap byte; the non-blocking attempt
+                        # below reports that contention as ``OSError``.
+                        pass
+                with exclusive_file_lock(fdesc, blocking=False):
+                    try:
+                        same = os.path.samestat(
+                            os.fstat(fdesc), os.stat(lock_path)
+                        )
+                    except OSError:
+                        same = False
+                    if not same:
+                        continue  # ghost inode: re-open and try afresh
+                    yield
+                    return
+            finally:
+                os.close(fdesc)
+
     def _read_lease_file(
         self, lease_path: str, *, strict: bool = False
     ) -> Optional[Lease]:
@@ -3144,7 +3186,10 @@ class FilesystemStateBackend(StateBackend):
         permanent claims (``ttl == 0``, no ``expiresAt``) and anything
         unreadable (unclassifiable) are kept.  Each candidate is re-judged
         under its own document flock so a claim re-won between the free
-        pre-check and the delete is never lost.  No per-file directory
+        pre-check and the delete is never lost; the flock is a try-lock
+        (:meth:`_try_locked`), so a doc whose lock a peer holds is
+        skipped for this pass (the next pass retries it) instead of
+        stalling the sweep behind one wedged claim.  No per-file directory
         fsync: a deletion resurrected by a power loss brings back an
         EXPIRED doc, which is still re-winnable and gets re-deleted next
         pass, unlike the active-claim DOC_DELETE whose loss un-does a
@@ -3180,7 +3225,7 @@ class FilesystemStateBackend(StateBackend):
                     continue
                 lock_path = doc_path[: -len(".doc")] + ".lock"
                 try:
-                    with self._locked(lock_path):
+                    with self._try_locked(lock_path):
                         body = self._read_doc_file(doc_path)
                         if not self._idem_doc_expired(body, cutoff):
                             continue  # re-won since the free pre-check
@@ -3188,7 +3233,9 @@ class FilesystemStateBackend(StateBackend):
                             self._unlink(doc_path)
                         removed += 1
                 except OSError:
-                    continue  # a held or unopenable lock: next pass
+                    # held (a peer mid-claim; the try-lock never waits)
+                    # or unopenable: skip this doc now, next pass retries.
+                    continue
         return removed
 
     @staticmethod

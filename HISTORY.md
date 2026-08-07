@@ -30,6 +30,13 @@ project, on which cronstable is based.
   its own content type the same way, whether it serves JSON, the
   dashboard page, or a calendar feed. A deployment that set a content
   type there used to see those routes come back as 500s.
+- The activity heatmap on both dashboards fills from one `GET /activity`
+  request instead of a `GET /jobs/{name}/runs` per job per refresh. The
+  endpoint serves every job's retained runs reduced to the three plotted
+  fields, on the same shared-product machinery as `/jobs` and `/fleet`
+  (ETag, gzip, busted by the local events that change run history), and
+  both clients keep the per-job fan-out as a fallback against a daemon
+  that predates it.
 - `GET /metrics` shares one build across the scrapers that arrive while it
   is rendering, instead of only across those that arrive after it finishes.
   On a large job set the render runs on a worker thread, and every scraper
@@ -300,7 +307,7 @@ project, on which cronstable is based.
 - `GET /dags` answers an unchanged conditional poll with `304 Not
   Modified` and compresses large bodies for clients that accept gzip;
   `GET /cluster` compresses too. The per-dag run listing behind the
-  `/dags` rollup and the run drawer is additionally served from a short
+  `/dags` rollup and the run drawer is also served from a short
   memo between local changes, so dashboard polling of a quiet store no
   longer performs one store listing per dag per poll per viewer.
 - A mapped task's fan-out list is parsed from the artifact's bytes

@@ -2773,6 +2773,62 @@ async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
         await backend.stop()
 
 
+async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(tmp_path):
+    # REGRESSION: the idem-doc sweep used to take each candidate's flock
+    # with the blocking _locked, so on a shared store one peer wedged
+    # mid-claim stalled the entire gc() call (and its worker slot) behind
+    # that single doc. The sweep now try-locks: a held lock skips the doc
+    # for this pass and a later pass collects it once released. Both
+    # platforms' lock primitives conflict across two descriptors of one
+    # file inside a single process (POSIX flock is per-open-file-
+    # description, Windows byte-range locks are per-handle; pinned by
+    # test_platform.test_nonblocking_lock_raises_on_contention), so a
+    # plain second fd stands in for the wedged peer and no subprocess or
+    # platform gate is needed.
+    from cronstable import jobstate
+    from cronstable.platform import exclusive_file_lock
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "held", ttl=5.0)
+        await jobstate.idempotency_claim(backend, "scope", "free", ttl=5.0)
+        cutoff = time.time() + 4000.0  # both claims lapsed vs this cutoff
+
+        held_lock, held_doc = backend._doc_paths("idem/scope", "held")
+        _free_lock, free_doc = backend._doc_paths("idem/scope", "free")
+
+        result = {}
+
+        def _sweep():
+            result["removed"] = backend._gc_idem_docs_sync(cutoff, False)
+
+        fd = os.open(held_lock, os.O_RDWR)
+        try:
+            with exclusive_file_lock(fd, blocking=False):
+                # daemon so a regression (the sweep blocking forever on
+                # the held flock) fails the join assert instead of
+                # hanging the whole run.
+                worker = threading.Thread(target=_sweep, daemon=True)
+                worker.start()
+                worker.join(timeout=30.0)
+                assert not worker.is_alive(), (
+                    "gc stalled behind a held idempotency-doc lock"
+                )
+        finally:
+            os.close(fd)
+
+        assert result["removed"] == 1  # the uncontended doc only
+        assert os.path.exists(held_doc)
+        assert not os.path.exists(free_doc)
+
+        # lock released: the next pass collects the skipped doc.
+        assert backend._gc_idem_docs_sync(cutoff, False) == 1
+        assert not os.path.exists(held_doc)
+    finally:
+        await backend.stop()
+
+
 def test_idem_prefix_mirror_stays_in_sync():
     # state cannot import jobstate (layering), so the GC recognises the
     # idempotency namespaces by a mirrored prefix constant; this pin is

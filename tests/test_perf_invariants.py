@@ -386,13 +386,13 @@ async def test_lease_write_barrier_follows_the_fence(tmp_path, monkeypatch):
 #
 # strictyaml validates a sequence by deep-copying the ruamel document, and
 # its vendored CommentedSeq.__deepcopy__ calls copy_attributes from INSIDE
-# the element loop -- so an N-element sequence re-copies the sequence's
+# the element loop, so an N-element sequence re-copies the sequence's
 # whole attribute set N times and config parsing comes out quadratic in the
 # job count.  cronstable rebinds the method to hoist that call out of the
 # loop (config._patch_strictyaml_seq_deepcopy).  The invariant is a COUNT,
 # not a timing: one copy_attributes call per deepcopy no matter how long
-# the sequence is.  Counting it gates both directions -- a dropped shim and
-# a future re-quadratic regression -- in microseconds, on every platform,
+# the sequence is.  Counting it gates both directions (a dropped shim and
+# a future re-quadratic regression) in microseconds, on every platform,
 # where a wall-clock assertion would be noisy and one-directional.
 
 
@@ -473,7 +473,7 @@ def _deep_repr(obj, depth=0):
 def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
     # The count invariants above gate the cost; this one gates the meaning.
     # Parsing the same text under the stock (in-loop) implementation and the
-    # hoisted one must produce indistinguishable configs -- the rebind is a
+    # hoisted one must produce indistinguishable configs: the rebind is a
     # pure cost change, so nothing a caller can observe may move.
     import copy as copy_mod
     import dataclasses

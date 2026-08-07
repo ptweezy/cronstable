@@ -368,13 +368,30 @@ jobs:
       # and require a pass, not a skip. Cheap (<1s after the suite), and
       # without it a pip/uv resolution skew quietly restores the
       # "nothing compares the second engine" state this cell exists to end.
+      # The check reads pytest's junitxml counts (at least one test, zero
+      # failures, zero errors, zero skips) rather than grepping stdout for a
+      # literal "1 passed", which a second test in the file would flip to a
+      # false red.
       - name: Enforce the web engine differential ran (no silent skip)
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
           set -euo pipefail
           .tox/py/bin/python -m pytest tests/test_web_engine_parity.py \
-            -v -rs | tee parity-enforce.out
-          grep -q "1 passed" parity-enforce.out
+            -v -rs --junitxml=parity-enforce.xml
+          .tox/py/bin/python - <<'EOF'
+          import xml.etree.ElementTree as ET
+          totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
+          for suite in ET.parse("parity-enforce.xml").getroot().iter("testsuite"):
+              for key in totals:
+                  totals[key] += int(suite.get(key, 0))
+          print("parity differential:", totals)
+          assert totals["tests"] >= 1, "no parity test was collected"
+          assert totals["failures"] == 0 and totals["errors"] == 0
+          assert totals["skipped"] == 0, (
+              "a parity test skipped in the one cell that provisions "
+              "Chromium: the browser install or resolution went stale"
+          )
+          EOF
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
       # flag into one combined number. fail_ci_if_error stays false so a Codecov
       # outage never reds the build (and fork PRs with no token still pass).
@@ -1094,13 +1111,14 @@ jobs:
           tags: cronstable:ci-${{ matrix.distro }}
           # DEPS_REFRESH: every Dockerfile keeps its toolchain + dependency
           # layers independent of the source tree (keyed on pyproject.toml
-          # alone), so on an ordinary commit the QEMU-expensive dependency
-          # compiles come out of the layer cache and only the project install
-          # rebuilds. On a RELEASE this arg (the run id) misses those layers
-          # on purpose: a release re-resolves every dependency fresh from the
-          # index, exactly the freshness releases had when each push rebuilt
-          # the whole builder stage, and `docker-push` below (same run, same
-          # arg) then reuses these fresh layers instead of rebuilding them.
+          # plus the shared extraction helper), so on an ordinary commit the
+          # QEMU-expensive dependency compiles come out of the layer cache
+          # and only the project install rebuilds. On a RELEASE this arg (the
+          # run id) misses those layers on purpose: a release re-resolves
+          # every dependency fresh from the index, exactly the freshness
+          # releases had when each push rebuilt the whole builder stage, and
+          # `docker-push` below (same run, same arg) then reuses these fresh
+          # layers instead of rebuilding them.
           build-args: |
             VERSION=${{ needs.version.outputs.new }}
             DEPS_REFRESH=${{ needs.version.outputs.release == 'true' && github.run_id || '' }}
@@ -1119,11 +1137,12 @@ jobs:
           # branch that writes nothing still reads, falling back to the default
           # branch's entries, so the only thing given up here is the quota.
           #
-          # The Dockerfiles' layer split (dependencies keyed on pyproject.toml,
-          # source copied only at the bottom) also calms the quota: the fat
-          # dependency layers are stable across commits, so an export mostly
-          # re-references blobs that are already stored instead of writing a
-          # fresh multi-GB set per push the way the old source-first layout did.
+          # The Dockerfiles' layer split (dependencies keyed on pyproject.toml
+          # plus the shared extraction helper, source copied only at the
+          # bottom) also calms the quota: the fat dependency layers are stable
+          # across commits, so an export mostly re-references blobs that are
+          # already stored instead of writing a fresh multi-GB set per push
+          # the way the old source-first layout did.
           #
           # ignore-error is the second line of defence. A cache export is an
           # optimization; it must never be able to red a build that succeeded.
