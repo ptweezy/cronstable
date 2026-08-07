@@ -228,6 +228,19 @@ _SHARED_FSTYPES = frozenset(
 # aliases Windows strips.
 _FS_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 
+# Per-byte escape table for _fs_safe_fragment, and the deletion table its
+# inverse uses to recognise an already-canonical token.  Both are derived from
+# _FS_SAFE so neither can drift from it.  They exist because the encode and the
+# decode both sit inside directory listings: _list_document_keys_sync decodes
+# every filename on every keys-only listing, and the DAG run-summary cache
+# takes one such listing per /dags poll per dag, so a per-byte Python loop
+# there was 30% of the whole listing (see _decode_fs_token's fast path).
+_FS_BYTE_ESCAPE = [
+    chr(byte) if chr(byte) in _FS_SAFE else "%{:02X}".format(byte)
+    for byte in range(256)
+]
+_FS_SAFE_DELETE = str.maketrans("", "", "".join(sorted(_FS_SAFE)))
+
 # Windows device names, reserved in every directory (case-insensitively).  A
 # lowercase job name could otherwise pass through _fs_safe verbatim and make
 # every open/mkdir under it fail (or hit the console device) on Windows.
@@ -323,14 +336,12 @@ def _fs_safe_fragment(fragment: str) -> str:
     like ``runs/`` always survives verbatim at the front of the
     stream's encoded directory name.
     """
-    out: List[str] = []
-    for byte in fragment.encode("utf-8", "surrogatepass"):
-        char = chr(byte)
-        if char in _FS_SAFE:
-            out.append(char)
-        else:
-            out.append("%{:02X}".format(byte))
-    return "".join(out)
+    return "".join(
+        map(
+            _FS_BYTE_ESCAPE.__getitem__,
+            fragment.encode("utf-8", "surrogatepass"),
+        )
+    )
 
 
 def _decode_fs_token(token: str) -> Optional[str]:
@@ -348,9 +359,28 @@ def _decode_fs_token(token: str) -> Optional[str]:
     that does not re-encode to this exact token, e.g. a lowercase-hex
     alias): the caller must report the entry unnameable, never act on a
     mangled name.
+
+    The fast path takes the overwhelmingly common token, one already made
+    entirely of :data:`_FS_SAFE` characters, without touching either half of
+    the round trip: with no ``%`` to undo the unquote is the identity, and
+    :func:`_fs_safe` on the result re-emits the token verbatim, since its only
+    two rewrites (the reserved-device prefix and the over-length digest) are
+    ruled out by the two guards beside the character test.  So the fast path
+    answers exactly what the slow path would, and the slow path still runs for
+    every token that carries an escape.  It is worth having because both
+    halves are otherwise paid per FILENAME per directory listing: encoding a
+    name is a per-byte walk, and the DAG run-summary cache takes one keys-only
+    listing per dag per /dags poll.
     """
     from urllib.parse import unquote_to_bytes
 
+    if (
+        token
+        and not token.translate(_FS_SAFE_DELETE)
+        and len(token) <= _FS_SAFE_MAX
+        and token not in _WINDOWS_RESERVED
+    ):
+        return token
     try:
         name = unquote_to_bytes(token).decode("utf-8", "surrogatepass")
     except UnicodeError:

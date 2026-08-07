@@ -14,6 +14,8 @@ points here.
 """
 
 import os
+import subprocess
+import sys
 import textwrap
 
 import pytest
@@ -522,3 +524,76 @@ def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
         assert _deep_repr(getattr(actual, field.name)) == _deep_repr(
             getattr(expected, field.name)
         ), field.name
+
+
+# --- 8. the lazy aiohttp door stays shut -----------------------------------
+#
+# cron.py binds `web` and `aiohttp` to a _AiohttpDoor proxy that imports the
+# real modules on first attribute access, because every consumer of them (the
+# web listener, cluster gossip, the push relay) is optional while the module
+# itself is imported by state_admin, the CLIs and the MCP surface.  Opening
+# that door costs 144 ms and 15 MB of RSS, measured, so the invariant is a
+# COUNT: importing cronstable.cron loads ZERO aiohttp modules.  A test rather
+# than a timing because the failure is binary and platform-independent, and
+# because the only two metrics that saw it (startup.import_daemon and
+# mem.rss_daemon_import) live in the subprocess tier of a Linux-only perf
+# job, which means a branch can carry the regression for days.
+#
+# The regression this gates shipped exactly once: a module-scope
+# `@web.middleware` decorator, which reads an attribute off the proxy while
+# the module body is still running.  Anything evaluated at import time does
+# it: a decorator, a base class, a default argument, a module constant.
+#
+# Gated in both directions.  The door must still OPEN on first touch, or a
+# future "fix" that deletes the proxy's consumers would pass the first half
+# while breaking the web listener.
+
+
+def _daemon_import_probe():
+    """Run the door probe in a child, since this module already opened it."""
+    code = textwrap.dedent(
+        """
+        import sys
+
+        import cronstable.cron as cron
+
+        def loaded():
+            return sorted(
+                m for m in sys.modules
+                if m == "aiohttp" or m.startswith("aiohttp.")
+            )
+
+        print("AFTER-IMPORT", len(loaded()))
+        cron.web.Response  # first touch: this is what opens the door
+        print("AFTER-TOUCH", len(loaded()))
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    counts = {}
+    for line in done.stdout.split("\n"):
+        if line.startswith("AFTER-"):
+            stage, _, count = line.partition(" ")
+            counts[stage] = int(count)
+    return counts
+
+
+def test_importing_the_daemon_loads_no_aiohttp_and_first_touch_loads_it():
+    counts = _daemon_import_probe()
+    assert counts["AFTER-IMPORT"] == 0, (
+        "importing cronstable.cron pulled in aiohttp, so the lazy door is "
+        "open at import time: something in the module body reads an "
+        "attribute off the `web`/`aiohttp` proxy (a decorator, a base "
+        "class, a default argument, a module-level constant). Move it onto "
+        "a runtime path. This costs every offline caller 144 ms and 15 MB "
+        "of RSS, and gates startup.import_daemon / mem.rss_daemon_import."
+    )
+    assert counts["AFTER-TOUCH"] > 0, (
+        "touching cron.web did not import aiohttp: the door no longer "
+        "resolves the real module, which breaks every web/cluster/push "
+        "path at runtime."
+    )

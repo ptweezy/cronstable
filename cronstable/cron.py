@@ -793,7 +793,6 @@ def _http_for_action_error(
     return _api_error(factory, ex.message, headers)
 
 
-@web.middleware
 async def _error_envelope_middleware(request, handler):
     """Give every escaping HTTP error the one JSON envelope.
 
@@ -807,6 +806,15 @@ async def _error_envelope_middleware(request, handler):
     already carrying the envelope passes through untouched, and headers the
     error legitimately owns (a 405's ``Allow``) are preserved; only the
     body-describing pair is replaced along with the body.
+
+    Deliberately NOT decorated with ``@web.middleware`` here: a decorator at
+    module scope touches the lazy aiohttp door above while this module's body
+    is still executing, which imports the whole web stack into every offline
+    caller and costs 144 ms and 15 MB of RSS on an import that needs none of
+    it. ``start_stop_web_app`` applies the marker instead, on the one path
+    that has aiohttp loaded anyway. ``web.middleware`` only stamps
+    ``__middleware_version__`` onto the function and hands it back, so where
+    it is applied changes nothing but the import graph.
     """
     try:
         return await handler(request)
@@ -6951,8 +6959,10 @@ class Cron:
             metrics_config = resolve_metrics_config(web_config)
             # Envelope first, so it is outermost and wraps the errors the
             # origin/auth middlewares below raise as well as the router's
-            # own 404/405 (see _error_envelope_middleware).
-            middlewares = [_error_envelope_middleware]
+            # own 404/405 (see _error_envelope_middleware). The marker goes
+            # on here rather than as a module-scope decorator so importing
+            # this module does not open the lazy aiohttp door.
+            middlewares = [web.middleware(_error_envelope_middleware)]
             # Cross-site request defense for the mutating endpoints, ALWAYS
             # installed: with authToken unset this is the only thing between
             # a localhost-bound daemon and any web page the operator visits
