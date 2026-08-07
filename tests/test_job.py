@@ -2110,6 +2110,45 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stalled_statsd_does_not_block_job_launch(monkeypatch):
+    # Launches run under the daemon-wide 16-permit spawn gate; a statsd
+    # host stalled in endpoint resolution (dead DNS, black-holed route)
+    # used to hold a permit for the whole stall because start() awaited
+    # the job_started send inline, so a dead statsd host drained a due-job
+    # backlog 16 launches at a time and wedged DAG-task launches with no
+    # statsd config of their own.  start() must return with the send still
+    # pending; the completion path then joins it, bounded.
+    release = asyncio.Event()
+    sends = []
+
+    async def stalled(*args, **kwargs):
+        sends.append(1)
+        await release.wait()
+
+    monkeypatch.setattr(cronstable.statsd, "send_to_statsd", stalled)
+
+    conf = cronstable.config.parse_config_string(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print())
+        + """
+    schedule: "* * * * *"
+    statsd:
+      host: 127.0.0.1
+      port: 9999
+      prefix: the.prefix
+""",
+        "",
+    )
+    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    # generous bound for loaded runners; the pre-fix behavior hangs forever
+    await asyncio.wait_for(job.start(), 30.0)
+    release.set()
+    await job.wait()
+    assert job.retcode == 0
+    assert sends  # the telemetry did go out once the host recovered
+
+
+@pytest.mark.asyncio
 async def test_report_mail_closes_connection_on_error():
     # if sending fails, the SMTP connection must still be closed (no leak).
     conf = cronstable.config.parse_config_string(A_JOB, "")
@@ -2810,10 +2849,16 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
     import threading
 
     release = threading.Event()
+    entered = threading.Event()
 
     class SlowBuffer:
         def write(self, data):
-            release.wait(2.0)
+            entered.set()
+            # Unbounded on purpose: a timeout here re-opens the swallow
+            # race if a runner stall outlives it.  The finally below always
+            # sets release, and the writer is a daemon thread with a
+            # bounded atexit drain, so this cannot hang the run.
+            release.wait()
 
     class SlowStream:
         buffer = SlowBuffer()
@@ -2831,6 +2876,15 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
     fake.feed_eof()
     reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
     try:
+        # Prime one batch and wait until the writer thread is provably
+        # parked inside the wedged write.  Without this the storm below
+        # races the writer's wake-up: _run drains the WHOLE deque in one
+        # lock hold, so a writer that wins the GIL mid-storm (a loaded
+        # runner does this) swallows everything queued so far, the deque
+        # never reaches the cap, and nothing is shed.
+        reader._emit_buffer = ["prime\n"]
+        reader._flush_emit_buffer()
+        assert entered.wait(10.0)
         for i in range(mirror.MAX_PENDING_BATCHES + 8):
             reader._emit_buffer = ["x%d\n" % i]
             reader._flush_emit_buffer()  # pure enqueue: returns at once
@@ -2841,6 +2895,142 @@ async def test_wedged_mirror_consumer_sheds_oldest_batches(monkeypatch):
         release.set()
         assert mirror.drain(10.0)
     await reader.join()
+
+
+async def test_mirror_shed_warning_never_logs_on_the_submit_thread(
+    monkeypatch, caplog
+):
+    # The shed warning used to be logged from submit(), on the event-loop
+    # thread, while holding the mirror lock.  In the exact scenario the
+    # mirror exists for (a wedged shared-fd consumer, where stderr IS the
+    # wedged fd) that synchronous root-handler write re-froze the whole
+    # daemon.  The submit path now only flags the shed; the writer thread
+    # logs it once a write has succeeded, i.e. once the consumer drains.
+    import sys
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class SlowBuffer:
+        def write(self, data):
+            entered.set()
+            release.wait()
+
+    class SlowStream:
+        buffer = SlowBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", SlowStream())
+    # a fresh writer, not the process singleton: its once-per-process
+    # warn latch may already be spent by earlier tests
+    mirror = cronstable.job._MirrorWriter()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        mirror.submit("j", "stdout", "prime\n")
+        assert entered.wait(10.0)
+        for i in range(mirror.MAX_PENDING_BATCHES + 8):
+            mirror.submit("j", "stdout", "x%d\n" % i)
+        assert mirror.dropped_batches >= 1
+        # nothing logged yet: the consumer is still wedged, and a log write
+        # from the submit thread here is exactly the freeze being prevented
+        assert not [
+            r for r in caplog.records if "backed up" in r.getMessage()
+        ]
+        release.set()
+        assert mirror.drain(10.0)
+    # once the consumer drained, the writer thread reported the shed
+    assert any("backed up" in r.getMessage() for r in caplog.records)
+
+
+async def test_wedged_mirror_consumer_sheds_on_bytes_not_just_count(
+    monkeypatch,
+):
+    # The count cap alone bounds nothing when batches are large (one batch
+    # can carry a multi-megabyte line): a dozen 1 MiB batches sit far below
+    # MAX_PENDING_BATCHES yet must still shed past the byte ceiling.
+    import sys
+    import threading
+
+    release = threading.Event()
+    entered = threading.Event()
+
+    class SlowBuffer:
+        def write(self, data):
+            entered.set()
+            release.wait()
+
+    class SlowStream:
+        buffer = SlowBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", SlowStream())
+    mirror = cronstable.job._MirrorWriter()
+    big = "x" * (1024 * 1024)
+    try:
+        mirror.submit("j", "stdout", "prime\n")
+        assert entered.wait(10.0)
+        batches = mirror.MAX_PENDING_BYTES // len(big) + 4
+        for _ in range(batches):
+            mirror.submit("j", "stdout", big)
+        assert mirror.dropped_batches >= 1
+        with mirror._lock:
+            assert mirror._pending_bytes <= mirror.MAX_PENDING_BYTES
+            assert len(mirror._batches) < batches
+    finally:
+        release.set()
+        assert mirror.drain(10.0)
+
+
+async def test_mirror_thread_survives_unexpected_emit_errors(
+    monkeypatch, caplog
+):
+    # _emit can raise more than (OSError, ValueError): an exotic replacement
+    # stream can raise anything, and this is the process's ONE mirror
+    # thread; an escaping exception killed it silently and ended the
+    # passthrough for the daemon's life.  It must log and keep writing.
+    import sys
+
+    class BoomOnceBuffer:
+        def __init__(self):
+            self.wrote = []
+
+        def write(self, data):
+            if not self.wrote:
+                self.wrote.append(b"")
+                raise RuntimeError("exotic replacement stream")
+            self.wrote.append(data)
+
+    class Stream:
+        buffer = BoomOnceBuffer()
+
+        def write(self, text):
+            pass
+
+        def flush(self):
+            pass
+
+    stream = Stream()
+    monkeypatch.setattr(sys, "stdout", stream)
+    mirror = cronstable.job._MirrorWriter()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        mirror.submit("j", "stdout", "first\n")
+        assert mirror.drain(10.0)  # the thread survived the RuntimeError
+        mirror.submit("j", "stdout", "second\n")
+        assert mirror.drain(10.0)
+    assert any(
+        "could not mirror" in rec.getMessage() for rec in caplog.records
+    )
+    assert b"second\n" in Stream.buffer.wrote
 
 
 # ---------------------------------------------------------------------------

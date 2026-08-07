@@ -29,15 +29,19 @@
   "carry) and exist only to make the later sizing decision auditable.  They",
   "were taken on the post-audit tree, so they already price in the fixes.",
   "",
-  "config.parse_yaml_3k is there for more than drift: it catches a return",
-  "of the quadratic Seq validation, which cost 6.27s locally at 3k jobs",
-  "against 1.18s linear.  Its 2.0s ceiling is the usual ~1.7x of the local",
-  "figure and sits far under that 6.27s, so the absolute check fires on a",
-  "reintroduction even if the relative gate is waived.  Raising it past",
-  "~3s gives that up, so say why in the commit message if you ever do."
+  "config.parse_yaml_3k is armed already, one release ahead of the ritual,",
+  "because it exists for more than drift: it catches a return of the",
+  "quadratic Seq validation, which cost 6.27s locally at 3k jobs against",
+  "1.18s linear.  A re-vendor of upstream strictyaml plus a trusting",
+  "[perf:accept] would otherwise ship the quadratic parse with every gate",
+  "green.  Its 2.0s ceiling is the usual ~1.7x of the local figure and",
+  "sits far under that 6.27s, so a runner-variance false red is unlikely",
+  "and a reintroduction fires even if the relative gate is waived.",
+  "Raising it past ~3s gives that up, so say why in the commit message if",
+  "you ever do.  Replace 'local' with 'observed' once the first release",
+  "publishes a CI value."
  ],
  "proposed": {
-  "config.parse_yaml_3k": {"max": 2.0, "unit": "s", "local": 1.176},
   "config.reload_gc_100k": {"max": 2.2, "unit": "s", "local": 1.305},
   "mem.gc_pause_100k": {"max": 0.11, "unit": "s", "local": 0.065},
   "loop.idle_wake_rate": {"max": 0.045, "unit": "s", "local": 0.0266},
@@ -45,6 +49,7 @@
   "webui.render_term_5k": {"max": 0.115, "unit": "s", "local": 0.0690}
  },
  "budgets": {
+  "config.parse_yaml_3k": {"max": 2.0, "unit": "s", "local": 1.176, "set": "2026-08-06"},
   "startup.import_daemon": {"max": 0.50, "unit": "s", "observed": 0.309, "set": "2026-07-24"},
   "schedule.cold_build_100k": {"max": 4.0, "unit": "s", "observed": 2.586, "set": "2026-07-24"},
   "schedule.reseed_100k": {"max": 1.0, "unit": "s", "observed": 0.621, "set": "2026-07-24"},

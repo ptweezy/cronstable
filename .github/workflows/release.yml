@@ -346,10 +346,14 @@ jobs:
       # same two engines), so a second OS or Python row buys no signal and
       # costs a browser fetch per row. The other cells keep self-skipping.
       # Installed from the requirements_dev.txt line verbatim, so this step and
-      # the tox env resolve the same release and the browser downloaded here is
-      # the build that env goes looking for in the shared ms-playwright cache.
-      # (The line carries no version pin; what matters is that both installs
-      # read it, not which release they land on.)
+      # the tox env normally resolve the same release and the browser
+      # downloaded here is the build that env goes looking for in the shared
+      # ms-playwright cache. The line carries no version pin, and the two
+      # installs resolve independently (pip here, uv inside tox), so on a skew
+      # the env's playwright wants a browser revision this step did not fetch,
+      # chromium.launch() raises, and the differential self-skips: silently
+      # green, with nothing comparing the second engine again. The enforcement
+      # step below turns that silence into a red cell.
       - name: Install Chromium for the web engine differential
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
@@ -357,6 +361,20 @@ jobs:
           pip install "$(grep -E '^playwright' requirements_dev.txt)"
           python -m playwright install --with-deps chromium
       - run: tox -e py
+      # The differential self-skips wherever Chromium is missing (every other
+      # cell, by design), so THIS cell must prove it actually ran: re-drive it
+      # through the tox env's own interpreter (and therefore the env's own
+      # resolved playwright, the one that must find the browser fetched above)
+      # and require a pass, not a skip. Cheap (<1s after the suite), and
+      # without it a pip/uv resolution skew quietly restores the
+      # "nothing compares the second engine" state this cell exists to end.
+      - name: Enforce the web engine differential ran (no silent skip)
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        run: |
+          set -euo pipefail
+          .tox/py/bin/python -m pytest tests/test_web_engine_parity.py \
+            -v -rs | tee parity-enforce.out
+          grep -q "1 passed" parity-enforce.out
       # Every matrix cell uploads its own coverage.xml; Codecov merges them by
       # flag into one combined number. fail_ci_if_error stays false so a Codecov
       # outage never reds the build (and fork PRs with no token still pass).

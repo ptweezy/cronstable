@@ -1275,8 +1275,11 @@ components:
     Unauthorized:
       description: >-
         Missing or unrecognised bearer token (when `web.authToken` or any
-        `web.authTokens` entry is configured). The 401 is bodyless, by
-        design the one exception to the JSON error envelope.
+        `web.authTokens` entry is configured). The body is the same JSON
+        error envelope every other error response carries.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     Forbidden:
       description: >-
         The bearer token is valid but lacks the scope this operation requires

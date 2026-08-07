@@ -1436,6 +1436,10 @@ async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
     # whole point: a wallboard plus tabs used to cost N identical builds
     # per cycle), and a locally recorded run must bust the memo so the
     # next poll sees it immediately.
+    # The TTL is widened so the exact build counts below cannot be broken
+    # by a stall between awaits (CPU steal on a loaded runner under
+    # --cov inserts an extra build past the real 1.0s TTL).
+    monkeypatch.setattr(cronstable.cron, "_JOBS_RESPONSE_TTL", 3600.0)
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {}
     builds = []
@@ -1782,9 +1786,14 @@ async def test_archive_snapshots_lines_at_record_time():
     archived = [
         rec for stream, rec in backend.appends if stream == log_stream
     ]
-    assert [
+    # Order is not pinned. Both persist tasks suspend on the executor hop in
+    # _archive_output (redact_lines) before their append, so which one lands
+    # first rides thread scheduling, and delaying the first redact_lines call
+    # inverts the pair. Each record must still hold its own record-time
+    # snapshot, not the ring the newer completion already released.
+    assert sorted(
         [entry["line"] for entry in rec["lines"]] for rec in archived
-    ] == [["one", "two"], ["three"]]
+    ) == [["one", "two"], ["three"]]
     # nothing was double-counted as evicted: the snapshot held every line
     assert [rec["dropped_lines"] for rec in archived] == [0, 0]
 
@@ -4316,6 +4325,83 @@ async def test_web_app_ui_path_public_but_data_paths_require_auth():
             # a data endpoint still requires the token even with the UI enabled
             async with session.get(base + "/jobs") as resp:
                 assert resp.status == 401
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+@pytest.mark.asyncio
+async def test_web_json_endpoints_tolerate_operator_content_type():
+    # aiohttp refuses content_type= when the headers mapping already
+    # carries a Content-Type, so an operator-configured web.headers
+    # Content-Type used to 500 every route built by _json_response,
+    # _cachable_json_response, and the /fleet inline constructor.  The
+    # endpoint's own Content-Type wins, in any spelling (the _api_error
+    # rule).
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "headers": {"content-type": "text/plain; charset=utf-8"},
+            "ui": True,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        expected = {
+            "/jobs": "application/json",
+            "/fleet": "application/json",
+            "/cluster": "application/json",
+            "/dags": "application/json",
+            "/": "text/html",
+            "/calendar.ics": "text/calendar",
+        }
+        async with aiohttp.ClientSession() as session:
+            for path, ctype in expected.items():
+                async with session.get(base + path) as resp:
+                    assert resp.status == 200, path
+                    assert resp.content_type == ctype, path
+    finally:
+        await cron.start_stop_web_app(None)
+
+
+@pytest.mark.asyncio
+async def test_web_errors_carry_the_json_envelope():
+    # every error body is one JSON envelope, including the three families
+    # that used to escape as aiohttp's text/plain defaults: the auth
+    # middleware's 401, the router's 404 on an unmatched path, and the
+    # router's 405 on a wrong method (whose Allow header must survive the
+    # rewrap).
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await cron.start_stop_web_app(
+        {
+            "listen": ["http://127.0.0.1:0"],
+            "authToken": {"value": "secret"},
+            "ui": False,
+        }
+    )
+    try:
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        auth = {"Authorization": "Bearer secret"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 401
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+            async with session.get(base + "/no-such-route", headers=auth) as resp:
+                assert resp.status == 404
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+            async with session.delete(base + "/jobs", headers=auth) as resp:
+                assert resp.status == 405
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+                assert "GET" in resp.headers.get("Allow", "")
     finally:
         await cron.start_stop_web_app(None)
 

@@ -217,6 +217,14 @@ KILLED_STREAM_DRAIN_TIMEOUT = 30.0
 # socket released.
 MAIL_REPORT_TIMEOUT = 60.0
 
+# How long _on_stop waits for the spawned job_started emission before giving
+# up on the start/stop pairing. The start telemetry is spawned rather than
+# awaited inside start() (a stalled statsd resolution must not hold the
+# daemon-wide spawn gate), so a completion racing a slow send joins it here,
+# bounded: a host that cannot get the start datagram out inside this window
+# loses the pair, which is the best-effort trade telemetry already makes.
+STATSD_START_FLUSH_TIMEOUT = 2.0
+
 
 class _MirrorWriter:
     """The stdout/stderr passthrough's single daemon-wide writer thread.
@@ -229,8 +237,19 @@ class _MirrorWriter:
     loop indefinitely and the whole daemon, scheduling included, froze
     behind one wedged log consumer.  Now batches queue here and one
     daemon thread writes them; a wedged consumer wedges only this thread,
-    and the bounded queue sheds the OLDEST batch (counted, warned once)
-    so memory stays flat however long the consumer sleeps.
+    and the bounded queue (by batch count AND by retained bytes: one
+    batch can carry a multi-megabyte line) sheds the OLDEST batches so
+    memory stays flat however long the consumer sleeps.
+
+    The submit path NEVER logs, and especially never under the lock: it
+    runs on the event-loop thread, and in the exact scenario the shed
+    warning fires for (a wedged shared-fd consumer, where stderr IS the
+    wedged fd) a synchronous root-handler write would park the loop on
+    that same fd, with the lock held so the writer thread could not take
+    its next snapshot either.  So submit only flags the shed, and the
+    writer thread logs it AFTER it has successfully written a batch, i.e.
+    once the consumer is provably draining again and the log write cannot
+    block behind it while holding the logging handler lock.
 
     One thread for both streams on purpose: it preserves the enqueue
     order across stdout and stderr, exactly what the inline writes gave.
@@ -245,8 +264,18 @@ class _MirrorWriter:
     #: fully wedged consumer to a few MB, not the run's whole output.
     MAX_PENDING_BATCHES = 512
 
+    #: Byte ceiling over the same queue.  The batch count alone bounds
+    #: nothing when batches are large (``maxLineLength`` is configurable
+    #: up to 16 MiB, so 512 retained batches could pin gigabytes); the
+    #: shed also triggers once the retained bytes would exceed this.  A
+    #: single batch larger than the whole ceiling is still queued alone
+    #: (newest output wins, exactly as the count shed keeps the newest),
+    #: so the true bound is this plus one batch.
+    MAX_PENDING_BYTES = 8 * 1024 * 1024
+
     def __init__(self) -> None:
         self._batches: Deque[Tuple[str, str, str]] = deque()
+        self._pending_bytes = 0
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._idle = threading.Event()
@@ -254,10 +283,12 @@ class _MirrorWriter:
         self._thread: Optional[threading.Thread] = None
         self.dropped_batches = 0
         self._drop_logged = False
+        self._drop_warn_pending = False
 
     def submit(self, job_name: str, stream_name: str, text: str) -> None:
         """Queue one passthrough batch; never blocks, sheds when full."""
         start = False
+        size = len(text)
         with self._lock:
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -266,17 +297,22 @@ class _MirrorWriter:
                     daemon=True,
                 )
                 start = True
-            if len(self._batches) >= self.MAX_PENDING_BATCHES:
-                self._batches.popleft()
+            while self._batches and (
+                len(self._batches) >= self.MAX_PENDING_BATCHES
+                or self._pending_bytes + size > self.MAX_PENDING_BYTES
+            ):
+                shed = self._batches.popleft()
+                self._pending_bytes -= len(shed[2])
                 self.dropped_batches += 1
                 if not self._drop_logged:
+                    # flag only; the writer thread logs it outside the lock
+                    # (see the class docstring for why logging here would
+                    # re-freeze the daemon in the mirror's own flagship
+                    # scenario).
                     self._drop_logged = True
-                    logger.warning(
-                        "passthrough mirror is backed up (its consumer is "
-                        "not reading the daemon's output); shedding oldest "
-                        "batches until it drains"
-                    )
+                    self._drop_warn_pending = True
             self._batches.append((job_name, stream_name, text))
+            self._pending_bytes += size
             self._idle.clear()
             self._wake.set()
         if start:
@@ -295,22 +331,41 @@ class _MirrorWriter:
             with self._lock:
                 batch = list(self._batches)
                 self._batches.clear()
+                self._pending_bytes = 0
                 self._wake.clear()
+            wrote = False
             for job_name, stream_name, text in batch:
                 out = sys.stdout if stream_name == "stdout" else sys.stderr
                 try:
                     StreamReader._emit(out, text)
-                except (OSError, ValueError):
-                    # The daemon's own stdout/stderr is broken or closed (a
-                    # dead pipe consumer). The passthrough copy is
-                    # best-effort; the capture buffers and live-tail publish
-                    # are unaffected, so log per batch and keep going.
+                    wrote = True
+                except Exception:  # noqa: BLE001 - this thread must survive
+                    # The daemon's own stdout/stderr is broken, closed, or
+                    # rejecting the payload (a dead pipe consumer raises
+                    # OSError/ValueError; an exotic replacement stream can
+                    # raise anything).  The passthrough copy is best-effort
+                    # and this is the process's ONE mirror thread: any
+                    # escaping exception would kill it silently and end the
+                    # passthrough for the daemon's life, so log per batch
+                    # and keep going, whatever the type.
                     logger.warning(
                         "job %s: could not mirror %s to the daemon's own "
                         "stream",
                         job_name,
                         stream_name,
                         exc_info=True,
+                    )
+            if wrote:
+                # a write just succeeded, so the consumer is draining and
+                # this cannot block behind a wedged fd (see class docstring)
+                with self._lock:
+                    warn = self._drop_warn_pending
+                    self._drop_warn_pending = False
+                if warn:
+                    logger.warning(
+                        "passthrough mirror is backed up (its consumer is "
+                        "not reading the daemon's output); shedding oldest "
+                        "batches until it drains"
                     )
             with self._lock:
                 if not self._batches:
@@ -1581,6 +1636,9 @@ class RunningJob:
             )  # type: Optional[StatsdJobMetricWriter]
         else:
             self.statsd_writer = None
+        # the spawned job_started emission (see start()); _on_stop joins it,
+        # bounded, so job_started still precedes job_stopped on the wire.
+        self._start_telemetry = None  # type: Optional[asyncio.Task]
 
     async def _on_start(self) -> None:
         if self.statsd_writer:
@@ -1621,6 +1679,19 @@ class RunningJob:
                 )
             finally:
                 self._resource_monitor = None
+        task = self._start_telemetry
+        self._start_telemetry = None
+        if task is not None and not task.done():
+            # bounded join: with a merely-slow host the start datagram
+            # still goes out before the stop one; a host that cannot
+            # manage it inside the bound loses the pair (wait_for cancels
+            # the task). See STATSD_START_FLUSH_TIMEOUT.
+            try:
+                await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - telemetry is best-effort
+                pass
         if self.statsd_writer:
             try:
                 await self.statsd_writer.job_stopped()
@@ -1736,7 +1807,16 @@ class RunningJob:
             self.start_failed = True
             return
 
-        await self._on_start()
+        # Spawned, not awaited: every launch path holds the daemon-wide
+        # spawn gate around start(), and the statsd send can stall
+        # arbitrarily long in endpoint resolution (a dead DNS server, a
+        # black-holed route).  Awaiting it here held one of the gate's
+        # permits for the whole stall, so a dead statsd host drained a
+        # 500-job backlog 16 launches at a time and wedged DAG-task
+        # launches with no statsd config of their own.  _on_stop joins the
+        # task (bounded) so the start/stop pair still orders on the wire.
+        if self.statsd_writer:
+            self._start_telemetry = asyncio.create_task(self._on_start())
 
         if self.config.monitorResources and self.proc.pid is not None:
             # Begin sampling the child's process tree. Best-effort: if psutil
