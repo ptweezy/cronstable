@@ -79,7 +79,7 @@ project, on which cronstable is based.
   override no longer breaks the live log tails: the SSE protocol headers
   win over the configured map in any spelling, the same guard `/metrics`
   already had.
-- A state-section reload that swaps in a healthy store clears the @reboot
+- A state-section reload that swaps in a healthy store clears the `@reboot`
   gate's "store timed out, stop probing" latch along with the other
   per-store verdicts; the latch used to survive for the life of the
   process, leaving boot-marker dedupe degraded on a healthy replacement
@@ -2165,7 +2165,7 @@ also the working idiom for parking a job).
   scheduler's own engine (timezone- and DST-exact, sub-minute schedules
   weighted, DAG schedules included) and bucketed into an hour-by-minute
   grid with per-minute histograms, the busiest-minute headline, the empty
-  minutes, and the heaviest cells with their jobs.  Disabled and @reboot
+  minutes, and the heaviest cells with their jobs.  Disabled and `@reboot`
   jobs are excluded and counted.  The walk runs on a worker thread over
   an immutable snapshot, so a big fleet's enumeration cannot stall the
   scheduler loop.
