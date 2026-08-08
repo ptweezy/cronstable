@@ -1,8 +1,8 @@
 """Tests for the native Prometheus metrics endpoint (cronstable.prometheus).
 
-Three tiers, mirroring the web-API tests in test_cron.py: pure unit tests
-for the exposition renderer and the accumulator registry, direct handler
-calls with a hand-rolled fake request, and real-HTTP tests that stand the
+Three tiers, mirroring the web-API tests in test_cron_web.py: pure unit
+tests for the exposition renderer and the accumulator registry, direct
+handler calls with a fake request, and real-HTTP tests that stand the
 server up via start_stop_web_app and scrape it like Prometheus would.
 """
 
@@ -10,6 +10,7 @@ import asyncio
 import datetime
 import math
 import threading
+from functools import partial
 
 import pytest
 
@@ -28,6 +29,8 @@ from cronstable.prometheus import (
     resolve_metrics_config,
 )
 from tests._commands import cmd_print, cmd_sleep, yaml_command
+from tests._helpers import _wait_until
+from tests.conftest import Req, _cron
 
 
 def sample_value(text, name, **labels):
@@ -52,6 +55,106 @@ def sample_value(text, name, **labels):
         elif rest.startswith(" ") and not labels:
             return float(rest.strip())
     return None
+
+
+# ---------------------------------------------------------------------------
+# metric readers: ``sample_value`` with the family name pre-bound (B5).
+# Call as ``_job_runs(text, job_name="j", status="success")``; the exposition
+# text stays a per-call argument because most tests re-render between
+# asserts.
+# ---------------------------------------------------------------------------
+
+_job_runs = partial(sample_value, name="cronstable_job_runs_total")
+_last_success_ts = partial(
+    sample_value, name="cronstable_job_last_success_timestamp_seconds"
+)
+_last_failure_ts = partial(
+    sample_value, name="cronstable_job_last_failure_timestamp_seconds"
+)
+_duration_bucket = partial(
+    sample_value, name="cronstable_job_duration_seconds_bucket"
+)
+_duration_sum = partial(
+    sample_value, name="cronstable_job_duration_seconds_sum"
+)
+_duration_count = partial(
+    sample_value, name="cronstable_job_duration_seconds_count"
+)
+_cpu_seconds = partial(sample_value, name="cronstable_job_cpu_seconds_total")
+_peak_rss = partial(sample_value, name="cronstable_job_peak_rss_bytes")
+_sla_breaches = partial(
+    sample_value, name="cronstable_job_sla_breaches_total"
+)
+_paused = partial(sample_value, name="cronstable_job_paused")
+_late = partial(sample_value, name="cronstable_job_late")
+_start_failures = partial(
+    sample_value, name="cronstable_job_start_failures_total"
+)
+_retries = partial(sample_value, name="cronstable_job_retries_total")
+_permanent_failures = partial(
+    sample_value, name="cronstable_job_permanent_failures_total"
+)
+_reload_ok = partial(
+    sample_value, name="cronstable_config_last_reload_successful"
+)
+_reload_ok_ts = partial(
+    sample_value,
+    name="cronstable_config_last_reload_success_timestamp_seconds",
+)
+_jobs_by_state = partial(sample_value, name="cronstable_jobs")
+_job_enabled = partial(sample_value, name="cronstable_job_enabled")
+_job_running = partial(sample_value, name="cronstable_job_running")
+_next_run_ts = partial(
+    sample_value, name="cronstable_job_next_run_timestamp_seconds"
+)
+_last_run_success = partial(
+    sample_value, name="cronstable_job_last_run_success"
+)
+_last_run_exit_code = partial(
+    sample_value, name="cronstable_job_last_run_exit_code"
+)
+_last_run_duration = partial(
+    sample_value, name="cronstable_job_last_run_duration_seconds"
+)
+_last_run_cpu = partial(
+    sample_value, name="cronstable_job_last_run_cpu_seconds"
+)
+_last_run_rss = partial(
+    sample_value, name="cronstable_job_last_run_max_rss_bytes"
+)
+_job_info = partial(sample_value, name="cronstable_job_info")
+_cluster_enabled = partial(sample_value, name="cronstable_cluster_enabled")
+_cluster_info = partial(sample_value, name="cronstable_cluster_info")
+_cluster_size = partial(sample_value, name="cronstable_cluster_size")
+_cluster_quorum = partial(sample_value, name="cronstable_cluster_quorum")
+_cluster_quorate = partial(sample_value, name="cronstable_cluster_quorate")
+_cluster_is_leader = partial(
+    sample_value, name="cronstable_cluster_is_leader"
+)
+_cluster_leader_info = partial(
+    sample_value, name="cronstable_cluster_leader_info"
+)
+_cluster_conflict = partial(sample_value, name="cronstable_cluster_conflict")
+_cluster_peers = partial(sample_value, name="cronstable_cluster_peers")
+_leader_transitions = partial(
+    sample_value, name="cronstable_cluster_leader_transitions_total"
+)
+_quorum_transitions = partial(
+    sample_value, name="cronstable_cluster_quorum_transitions_total"
+)
+_lock_acquisitions = partial(
+    sample_value, name="cronstable_state_lock_acquisitions_total"
+)
+_lock_wait = partial(
+    sample_value, name="cronstable_state_lock_wait_seconds_total"
+)
+_throttled_ops = partial(
+    sample_value, name="cronstable_state_throttled_ops_total"
+)
+_throttle_wait = partial(
+    sample_value, name="cronstable_state_throttle_wait_seconds_total"
+)
+_state_ops = partial(sample_value, name="cronstable_state_ops_total")
 
 
 # ---------------------------------------------------------------------------
@@ -198,58 +301,20 @@ def test_registry_counts_runs_and_outcome_timestamps():
     metrics.job_run_recorded("j", "failure", 400.0)
     metrics.job_run_recorded("j", "cancelled", None)
     text = _registry_text(metrics)
-    assert sample_value(
-        text, "cronstable_job_runs_total", job_name="j", status="success"
-    ) == 1
-    assert sample_value(
-        text, "cronstable_job_runs_total", job_name="j", status="failure"
-    ) == 1
-    assert sample_value(
-        text, "cronstable_job_runs_total", job_name="j", status="cancelled"
-    ) == 1
+    assert _job_runs(text, job_name="j", status="success") == 1
+    assert _job_runs(text, job_name="j", status="failure") == 1
+    assert _job_runs(text, job_name="j", status="cancelled") == 1
     # both last-outcome timestamps were stamped
-    assert sample_value(
-        text, "cronstable_job_last_success_timestamp_seconds", job_name="j"
-    ) is not None
-    assert sample_value(
-        text, "cronstable_job_last_failure_timestamp_seconds", job_name="j"
-    ) is not None
+    assert _last_success_ts(text, job_name="j") is not None
+    assert _last_failure_ts(text, job_name="j") is not None
     # histogram: 2.0 lands in le=5.0 and later, 400.0 only from le=900;
     # the cancelled run carried no duration.
-    assert sample_value(
-        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="1.0"
-    ) == 0
-    assert sample_value(
-        text, "cronstable_job_duration_seconds_bucket", job_name="j", le="5.0"
-    ) == 1
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_duration_seconds_bucket",
-            job_name="j",
-            le="900.0",
-        )
-        == 2
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_duration_seconds_bucket",
-            job_name="j",
-            le="+Inf",
-        )
-        == 2
-    )
-    assert (
-        sample_value(text, "cronstable_job_duration_seconds_sum", job_name="j")
-        == 402.0
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 2
-    )
+    assert _duration_bucket(text, job_name="j", le="1.0") == 0
+    assert _duration_bucket(text, job_name="j", le="5.0") == 1
+    assert _duration_bucket(text, job_name="j", le="900.0") == 2
+    assert _duration_bucket(text, job_name="j", le="+Inf") == 2
+    assert _duration_sum(text, job_name="j") == 402.0
+    assert _duration_count(text, job_name="j") == 2
 
 
 def test_registry_counts_skipped_runs_neutrally():
@@ -259,34 +324,11 @@ def test_registry_counts_skipped_runs_neutrally():
     metrics.job_run_recorded("j", "skipped", None)
     metrics.job_run_recorded("other", "success", 1.0)
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="j", status="skipped"
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_success_timestamp_seconds", job_name="j"
-        )
-        is None
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_failure_timestamp_seconds", job_name="j"
-        )
-        is None
-    )
+    assert _job_runs(text, job_name="j", status="skipped") == 1
+    assert _last_success_ts(text, job_name="j") is None
+    assert _last_failure_ts(text, job_name="j") is None
     # jobs that never skipped still export the series, zero-filled
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="other",
-            status="skipped",
-        )
-        == 0
-    )
+    assert _job_runs(text, job_name="other", status="skipped") == 0
 
 
 def test_registry_accumulates_cpu_and_peak_rss():
@@ -301,26 +343,10 @@ def test_registry_accumulates_cpu_and_peak_rss():
     )
     text = _registry_text(metrics)
     # user/system CPU accumulate as a per-mode counter
-    assert (
-        sample_value(
-            text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
-        )
-        == 3.0
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_cpu_seconds_total",
-            job_name="j",
-            mode="system",
-        )
-        == 1.5
-    )
+    assert _cpu_seconds(text, job_name="j", mode="user") == 3.0
+    assert _cpu_seconds(text, job_name="j", mode="system") == 1.5
     # peak RSS is a high-water mark across runs, not a sum
-    assert (
-        sample_value(text, "cronstable_job_peak_rss_bytes", job_name="j")
-        == 4000
-    )
+    assert _peak_rss(text, job_name="j") == 4000
 
 
 def test_registry_cpu_absent_for_unmonitored_job():
@@ -328,16 +354,8 @@ def test_registry_cpu_absent_for_unmonitored_job():
     metrics.job_run_recorded("j", "success", 2.0)  # no resources
     text = _registry_text(metrics)
     # an unmonitored job exports no CPU counter / peak-RSS gauge at all
-    assert (
-        sample_value(
-            text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
-        )
-        is None
-    )
-    assert (
-        sample_value(text, "cronstable_job_peak_rss_bytes", job_name="j")
-        is None
-    )
+    assert _cpu_seconds(text, job_name="j", mode="user") is None
+    assert _peak_rss(text, job_name="j") is None
 
 
 def test_counter_snapshot_round_trip_seeds_cpu():
@@ -353,16 +371,8 @@ def test_counter_snapshot_round_trip_seeds_cpu():
     seeded = restored.seed_counters(snap, keep=["j"])
     assert seeded == 1
     text = _registry_text(restored)
-    assert (
-        sample_value(
-            text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
-        )
-        == 1.0
-    )
-    assert (
-        sample_value(text, "cronstable_job_peak_rss_bytes", job_name="j")
-        == 8000
-    )
+    assert _cpu_seconds(text, job_name="j", mode="user") == 1.0
+    assert _peak_rss(text, job_name="j") == 8000
 
 
 def test_seed_counters_skips_corrupt_cpu_sums():
@@ -383,24 +393,8 @@ def test_seed_counters_skips_corrupt_cpu_sums():
         )
         metrics.seed_counters(snapshot_with(bad), keep=["j"])
         text = _registry_text(metrics)
-        assert (
-            sample_value(
-                text,
-                "cronstable_job_cpu_seconds_total",
-                job_name="j",
-                mode="user",
-            )
-            == 1.0
-        )
-        assert (
-            sample_value(
-                text,
-                "cronstable_job_cpu_seconds_total",
-                job_name="j",
-                mode="system",
-            )
-            == 0.5
-        )
+        assert _cpu_seconds(text, job_name="j", mode="user") == 1.0
+        assert _cpu_seconds(text, job_name="j", mode="system") == 0.5
 
     # a normal positive value still seeds (added to the live accumulator)
     metrics = PrometheusMetrics()
@@ -409,21 +403,8 @@ def test_seed_counters_skips_corrupt_cpu_sums():
     )
     metrics.seed_counters(snapshot_with(2.5), keep=["j"])
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_cpu_seconds_total", job_name="j", mode="user"
-        )
-        == 3.5
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_cpu_seconds_total",
-            job_name="j",
-            mode="system",
-        )
-        == 3.0
-    )
+    assert _cpu_seconds(text, job_name="j", mode="user") == 3.5
+    assert _cpu_seconds(text, job_name="j", mode="system") == 3.0
 
 
 def test_counter_snapshot_round_trip_seeds_sla_breaches():
@@ -438,24 +419,8 @@ def test_counter_snapshot_round_trip_seeds_sla_breaches():
     restored.job_sla_breach("j", "lateAfter")
     assert restored.seed_counters(snap, keep=["j"]) == 1
     text = _registry_text(restored)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_sla_breaches_total",
-            job_name="j",
-            check="lateAfter",
-        )
-        == 3
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_sla_breaches_total",
-            job_name="j",
-            check="maxRuntime",
-        )
-        == 1
-    )
+    assert _sla_breaches(text, job_name="j", check="lateAfter") == 3
+    assert _sla_breaches(text, job_name="j", check="maxRuntime") == 1
 
 
 def test_seed_counters_skips_corrupt_sla_breaches():
@@ -477,15 +442,7 @@ def test_seed_counters_skips_corrupt_sla_breaches():
         metrics.job_sla_breach("j", "lateAfter")
         metrics.seed_counters(snapshot_with(bad), keep=["j"])
         text = _registry_text(metrics)
-        assert (
-            sample_value(
-                text,
-                "cronstable_job_sla_breaches_total",
-                job_name="j",
-                check="lateAfter",
-            )
-            == 1
-        )
+        assert _sla_breaches(text, job_name="j", check="lateAfter") == 1
 
 
 def test_registry_prune_drops_removed_jobs():
@@ -507,29 +464,11 @@ def test_registry_prune_drops_pause_and_sla_series():
     metrics.job_sla_breach("gone", "lateAfter")
     metrics.prune(["keep"])
     text = _registry_text(metrics)
-    assert sample_value(text, "cronstable_job_paused", job_name="keep") == 1
-    assert (
-        sample_value(
-            text, "cronstable_job_late", job_name="keep", check="lateAfter"
-        )
-        == 1
-    )
-    assert sample_value(text, "cronstable_job_paused", job_name="gone") is None
-    assert (
-        sample_value(
-            text, "cronstable_job_late", job_name="gone", check="lateAfter"
-        )
-        is None
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_sla_breaches_total",
-            job_name="gone",
-            check="lateAfter",
-        )
-        is None
-    )
+    assert _paused(text, job_name="keep") == 1
+    assert _late(text, job_name="keep", check="lateAfter") == 1
+    assert _paused(text, job_name="gone") is None
+    assert _late(text, job_name="gone", check="lateAfter") is None
+    assert _sla_breaches(text, job_name="gone", check="lateAfter") is None
 
 
 def test_registry_bucket_change_resets_histograms_not_counters():
@@ -538,38 +477,15 @@ def test_registry_bucket_change_resets_histograms_not_counters():
     metrics.set_duration_buckets((1.0, 10.0))
     text = _registry_text(metrics)
     # the histogram restarted under the new bounds...
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 0
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_duration_seconds_bucket",
-            job_name="j",
-            le="10.0",
-        )
-        == 0
-    )
+    assert _duration_count(text, job_name="j") == 0
+    assert _duration_bucket(text, job_name="j", le="10.0") == 0
     # ...but the outcome counter kept its value
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="j", status="success"
-        )
-        == 1
-    )
+    assert _job_runs(text, job_name="j", status="success") == 1
     # setting the same buckets again is a no-op (no reset)
     metrics.job_run_recorded("j", "success", 0.5)
     metrics.set_duration_buckets((1.0, 10.0))
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 1
-    )
+    assert _duration_count(text, job_name="j") == 1
 
 
 def test_registry_failure_counters():
@@ -579,19 +495,9 @@ def test_registry_failure_counters():
     metrics.job_retry_launched("j")
     metrics.job_permanent_failure("j")
     text = _registry_text(metrics)
-    assert (
-        sample_value(text, "cronstable_job_start_failures_total", job_name="j")
-        == 1
-    )
-    assert (
-        sample_value(text, "cronstable_job_retries_total", job_name="j") == 2
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_permanent_failures_total", job_name="j"
-        )
-        == 1
-    )
+    assert _start_failures(text, job_name="j") == 1
+    assert _retries(text, job_name="j") == 2
+    assert _permanent_failures(text, job_name="j") == 1
 
 
 def test_registry_pause_gauge_set_clear_and_default():
@@ -599,12 +505,12 @@ def test_registry_pause_gauge_set_clear_and_default():
     metrics.job_pause_state("p", True)
     metrics.job_run_recorded("q", "success", 1.0)
     text = _registry_text(metrics)
-    assert sample_value(text, "cronstable_job_paused", job_name="p") == 1
+    assert _paused(text, job_name="p") == 1
     # a job never paused still exports the gauge, at 0 (fleet-visible state)
-    assert sample_value(text, "cronstable_job_paused", job_name="q") == 0
+    assert _paused(text, job_name="q") == 0
     metrics.job_pause_state("p", False)
     text = _registry_text(metrics)
-    assert sample_value(text, "cronstable_job_paused", job_name="p") == 0
+    assert _paused(text, job_name="p") == 0
 
 
 def test_registry_sla_late_gauge_and_breach_counter():
@@ -613,64 +519,20 @@ def test_registry_sla_late_gauge_and_breach_counter():
     text = _registry_text(metrics)
     # tracking a check emits both series from the first scrape, zero-valued,
     # so increase() on the counter works before the first breach
-    assert (
-        sample_value(
-            text, "cronstable_job_late", job_name="j", check="lateAfter"
-        )
-        == 0
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_sla_breaches_total",
-            job_name="j",
-            check="lateAfter",
-        )
-        == 0
-    )
+    assert _late(text, job_name="j", check="lateAfter") == 0
+    assert _sla_breaches(text, job_name="j", check="lateAfter") == 0
     # no series for a check the monitor never tracked
-    assert (
-        sample_value(
-            text, "cronstable_job_late", job_name="j", check="maxRuntime"
-        )
-        is None
-    )
+    assert _late(text, job_name="j", check="maxRuntime") is None
     metrics.job_sla_late("j", "lateAfter", True)
     metrics.job_sla_breach("j", "lateAfter")
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_late", job_name="j", check="lateAfter"
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_sla_breaches_total",
-            job_name="j",
-            check="lateAfter",
-        )
-        == 1
-    )
+    assert _late(text, job_name="j", check="lateAfter") == 1
+    assert _sla_breaches(text, job_name="j", check="lateAfter") == 1
     # recovery clears the latch gauge but never the breach counter
     metrics.job_sla_late("j", "lateAfter", False)
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_late", job_name="j", check="lateAfter"
-        )
-        == 0
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_sla_breaches_total",
-            job_name="j",
-            check="lateAfter",
-        )
-        == 1
-    )
+    assert _late(text, job_name="j", check="lateAfter") == 0
+    assert _sla_breaches(text, job_name="j", check="lateAfter") == 1
 
 
 def test_registry_sla_series_absent_without_sla():
@@ -689,21 +551,14 @@ def test_registry_config_parse_tracking():
     assert "cronstable_config_last_reload_successful" not in text
     metrics.config_parse(True)
     text = _registry_text(metrics)
-    assert sample_value(text, "cronstable_config_last_reload_successful") == 1
-    ok_time = sample_value(
-        text, "cronstable_config_last_reload_success_timestamp_seconds"
-    )
+    assert _reload_ok(text) == 1
+    ok_time = _reload_ok_ts(text)
     assert ok_time is not None
     metrics.config_parse(False)
     text = _registry_text(metrics)
-    assert sample_value(text, "cronstable_config_last_reload_successful") == 0
+    assert _reload_ok(text) == 0
     # the success timestamp still reports the last GOOD parse
-    assert (
-        sample_value(
-            text, "cronstable_config_last_reload_success_timestamp_seconds"
-        )
-        == ok_time
-    )
+    assert _reload_ok_ts(text) == ok_time
 
 
 # ---------------------------------------------------------------------------
@@ -728,15 +583,9 @@ def _closed_output():
     return output
 
 
-class FakeRequest:
-    def __init__(self, headers=None):
-        self.headers = headers or {}
-
-
 @pytest.mark.asyncio
 async def test_web_metrics_handler_reports_job_state():
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(_TWO_JOBS)
     now = datetime.datetime.now(datetime.timezone.utc)
     cron._record_run(
         "alpha",
@@ -749,68 +598,33 @@ async def test_web_metrics_handler_reports_job_state():
             output=_closed_output(),
         ),
     )
-    resp = await cron._web_metrics(FakeRequest())
+    resp = await cron._web_metrics(Req())
     assert resp.headers["Content-Type"] == CONTENT_TYPE_TEXT
     text = resp.body.decode("utf-8")
-    assert sample_value(text, "cronstable_jobs", state="enabled") == 1
-    assert sample_value(text, "cronstable_jobs", state="disabled") == 1
-    assert sample_value(text, "cronstable_job_enabled", job_name="alpha") == 1
-    assert sample_value(text, "cronstable_job_enabled", job_name="beta") == 0
-    assert sample_value(text, "cronstable_job_running", job_name="alpha") == 0
+    assert _jobs_by_state(text, state="enabled") == 1
+    assert _jobs_by_state(text, state="disabled") == 1
+    assert _job_enabled(text, job_name="alpha") == 1
+    assert _job_enabled(text, job_name="beta") == 0
+    assert _job_running(text, job_name="alpha") == 0
     # a cron schedule gets a next-run timestamp; @reboot/disabled does not
-    assert (
-        sample_value(
-            text, "cronstable_job_next_run_timestamp_seconds", job_name="alpha"
-        )
-        is not None
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_next_run_timestamp_seconds", job_name="beta"
-        )
-        is None
-    )
+    assert _next_run_ts(text, job_name="alpha") is not None
+    assert _next_run_ts(text, job_name="beta") is None
     # the recorded run feeds both the counters and the last-run gauges
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="alpha",
-            status="failure",
-        )
-        == 1
-    )
-    assert (
-        sample_value(text, "cronstable_job_last_run_success", job_name="alpha")
-        == 0
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_exit_code", job_name="alpha"
-        )
-        == 3
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_duration_seconds", job_name="alpha"
-        )
-        == 7
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_info",
-            job_name="alpha",
-            schedule="*/5 * * * *",
-            cluster_policy="Leader",
-        )
-        == 1
-    )
+    assert _job_runs(text, job_name="alpha", status="failure") == 1
+    assert _last_run_success(text, job_name="alpha") == 0
+    assert _last_run_exit_code(text, job_name="alpha") == 3
+    assert _last_run_duration(text, job_name="alpha") == 7
+    assert _job_info(
+        text,
+        job_name="alpha",
+        schedule="*/5 * * * *",
+        cluster_policy="Leader",
+    ) == 1
     # build info and job-set fingerprint are present
     assert "cronstable_info{version=" in text
     assert 'cronstable_job_set_info{job_set_id="v1:' in text
     # no cluster configured
-    assert sample_value(text, "cronstable_cluster_enabled") == 0
+    assert _cluster_enabled(text) == 0
 
 
 _NEXT_RUN_GATE = """
@@ -836,30 +650,9 @@ async def test_next_run_gate_checks_enabled_and_schedule_independently():
     # once would leave the enabled check unpinned).
     cron = Cron(None, config_yaml=_NEXT_RUN_GATE)
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_next_run_timestamp_seconds",
-            job_name="cron-on",
-        )
-        is not None
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_next_run_timestamp_seconds",
-            job_name="cron-off",
-        )
-        is None
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_next_run_timestamp_seconds",
-            job_name="boot-on",
-        )
-        is None
-    )
+    assert _next_run_ts(text, job_name="cron-on") is not None
+    assert _next_run_ts(text, job_name="cron-off") is None
+    assert _next_run_ts(text, job_name="boot-on") is None
 
 
 @pytest.mark.asyncio
@@ -875,24 +668,10 @@ async def test_next_run_reads_seeded_next_fire_index():
     when = datetime.datetime(2099, 1, 1, 0, 2, 3, tzinfo=datetime.timezone.utc)
     cron._next_fire["cron-on"] = when
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_next_run_timestamp_seconds",
-            job_name="cron-on",
-        )
-        == when.timestamp()
-    )
+    assert _next_run_ts(text, job_name="cron-on") == when.timestamp()
     # a disabled job never enters the index, so it still gets no sample even
     # when an enabled sibling is served from it.
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_next_run_timestamp_seconds",
-            job_name="cron-off",
-        )
-        is None
-    )
+    assert _next_run_ts(text, job_name="cron-off") is None
 
 
 @pytest.mark.asyncio
@@ -900,12 +679,11 @@ async def test_web_metrics_handler_reports_pause_state():
     # the configured-job warm-up gives every job a paused sample from the
     # first scrape (0 until the scheduler pushes a pause), and no SLA
     # series exist for jobs without an sla block
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
-    resp = await cron._web_metrics(FakeRequest())
+    cron = _cron(_TWO_JOBS)
+    resp = await cron._web_metrics(Req())
     text = resp.body.decode("utf-8")
-    assert sample_value(text, "cronstable_job_paused", job_name="alpha") == 0
-    assert sample_value(text, "cronstable_job_paused", job_name="beta") == 0
+    assert _paused(text, job_name="alpha") == 0
+    assert _paused(text, job_name="beta") == 0
     assert "cronstable_job_late" not in text
     assert "cronstable_job_sla_breaches" not in text
     cron.metrics.job_pause_state("alpha", True)
@@ -914,18 +692,17 @@ async def test_web_metrics_handler_reports_pause_state():
     # _bust_response_memos), which is what makes a pause render on the very
     # next scrape rather than up to a second later.
     cron._bust_response_memos()
-    resp = await cron._web_metrics(FakeRequest())
+    resp = await cron._web_metrics(Req())
     text = resp.body.decode("utf-8")
-    assert sample_value(text, "cronstable_job_paused", job_name="alpha") == 1
-    assert sample_value(text, "cronstable_job_paused", job_name="beta") == 0
+    assert _paused(text, job_name="alpha") == 1
+    assert _paused(text, job_name="beta") == 0
 
 
 @pytest.mark.asyncio
 async def test_web_metrics_handler_openmetrics_negotiation():
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(_TWO_JOBS)
     resp = await cron._web_metrics(
-        FakeRequest({"Accept": "application/openmetrics-text; version=1.0.0"})
+        Req(headers={"Accept": "application/openmetrics-text; version=1.0.0"})
     )
     assert resp.headers["Content-Type"] == CONTENT_TYPE_OPENMETRICS
     text = resp.body.decode("utf-8")
@@ -939,7 +716,7 @@ async def test_web_metrics_handler_merges_operator_headers():
     cron.web_config = {
         "headers": {"X-Custom": "yes", "Content-Type": "text/bogus"}
     }
-    resp = await cron._web_metrics(FakeRequest())
+    resp = await cron._web_metrics(Req())
     assert resp.headers["X-Custom"] == "yes"
     # the exposition content type is the endpoint's contract: it wins over
     # an operator-configured Content-Type (unlike the other handlers).
@@ -953,14 +730,13 @@ async def test_web_metrics_gzips_for_a_capable_scraper():
     # every scrape and this was the only large endpoint shipping uncompressed.
     import gzip
 
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
-    plain = await cron._web_metrics(FakeRequest())
+    cron = _cron(_TWO_JOBS)
+    plain = await cron._web_metrics(Req())
     assert "Content-Encoding" not in plain.headers
     # on both representations
     assert plain.headers["Vary"] == "Accept, Accept-Encoding"
     zipped = await cron._web_metrics(
-        FakeRequest({"Accept-Encoding": "gzip, deflate"})
+        Req(headers={"Accept-Encoding": "gzip, deflate"})
     )
     assert zipped.headers["Content-Encoding"] == "gzip"
     assert zipped.headers["Vary"] == "Accept, Accept-Encoding"
@@ -973,9 +749,10 @@ async def test_web_metrics_gzips_for_a_capable_scraper():
 async def test_web_metrics_gzip_declined_when_client_says_q0():
     # "gzip;q=0" is the wire spelling for "explicitly NOT gzip"; a substring
     # test would compress for a client that cannot read it.
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
-    resp = await cron._web_metrics(FakeRequest({"Accept-Encoding": "gzip;q=0"}))
+    cron = _cron(_TWO_JOBS)
+    resp = await cron._web_metrics(
+        Req(headers={"Accept-Encoding": "gzip;q=0"})
+    )
     assert "Content-Encoding" not in resp.headers
 
 
@@ -984,12 +761,11 @@ async def test_web_metrics_vary_lists_both_negotiated_axes():
     # the endpoint negotiates the exposition format on Accept and the
     # coding on Accept-Encoding; a shared cache keyed only on the
     # encoding would hand an openmetrics body to a text scraper.
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
-    plain = await cron._web_metrics(FakeRequest())
+    cron = _cron(_TWO_JOBS)
+    plain = await cron._web_metrics(Req())
     assert plain.headers["Vary"] == "Accept, Accept-Encoding"
     openmetrics = await cron._web_metrics(
-        FakeRequest({"Accept": "application/openmetrics-text"})
+        Req(headers={"Accept": "application/openmetrics-text"})
     )
     assert openmetrics.headers["Vary"] == "Accept, Accept-Encoding"
 
@@ -1007,8 +783,7 @@ async def test_web_metrics_shares_one_build_across_simultaneous_scrapers(
     # between awaits (CPU steal on a loaded runner under --cov inserts an
     # extra build past the real 1.0s TTL).
     monkeypatch.setattr(cronstable.cron, "_METRICS_RESPONSE_TTL", 3600.0)
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(_TWO_JOBS)
     builds = []
     real = cron.metrics.families
 
@@ -1017,22 +792,22 @@ async def test_web_metrics_shares_one_build_across_simultaneous_scrapers(
         return real(target)
 
     cron.metrics.families = counting
-    first = await cron._web_metrics(FakeRequest())
-    second = await cron._web_metrics(FakeRequest())
+    first = await cron._web_metrics(Req())
+    second = await cron._web_metrics(Req())
     assert len(builds) == 1
     assert first.body == second.body
     # the two exposition formats are memoized independently rather than
     # thrashing one slot.
     await cron._web_metrics(
-        FakeRequest({"Accept": "application/openmetrics-text"})
+        Req(headers={"Accept": "application/openmetrics-text"})
     )
     assert len(builds) == 2
     await cron._web_metrics(
-        FakeRequest({"Accept": "application/openmetrics-text"})
+        Req(headers={"Accept": "application/openmetrics-text"})
     )
     assert len(builds) == 2
     cron._bust_response_memos()
-    await cron._web_metrics(FakeRequest())
+    await cron._web_metrics(Req())
     assert len(builds) == 3
 
 
@@ -1043,7 +818,7 @@ async def test_web_metrics_content_type_override_is_case_insensitive():
     # conflicting Content-Type header (scrapers read the first one).
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.web_config = {"headers": {"content-type": "text/bogus"}}
-    resp = await cron._web_metrics(FakeRequest())
+    resp = await cron._web_metrics(Req())
     assert resp.headers.getall("Content-Type") == [CONTENT_TYPE_TEXT]
 
 
@@ -1078,45 +853,14 @@ async def test_metrics_after_successful_and_failed_runs():
     await cron.maybe_launch_job(cron.cron_jobs["bad"])
     await _run_to_completion(cron, "bad")
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="ok", status="success"
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="bad", status="failure"
-        )
-        == 1
-    )
-    assert (
-        sample_value(text, "cronstable_job_last_run_success", job_name="ok")
-        == 1
-    )
-    assert (
-        sample_value(text, "cronstable_job_last_run_exit_code", job_name="bad")
-        == 3
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="ok"
-        )
-        == 1
-    )
+    assert _job_runs(text, job_name="ok", status="success") == 1
+    assert _job_runs(text, job_name="bad", status="failure") == 1
+    assert _last_run_success(text, job_name="ok") == 1
+    assert _last_run_exit_code(text, job_name="bad") == 3
+    assert _duration_count(text, job_name="ok") == 1
     # no retries were configured, so the failure is immediately permanent
-    assert (
-        sample_value(
-            text, "cronstable_job_permanent_failures_total", job_name="bad"
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_permanent_failures_total", job_name="ok"
-        )
-        == 0
-    )
+    assert _permanent_failures(text, job_name="bad") == 1
+    assert _permanent_failures(text, job_name="ok") == 0
 
 
 @pytest.mark.asyncio
@@ -1141,26 +885,10 @@ async def test_metrics_count_retries_and_permanent_failure():
     await state.task
     await _run_to_completion(cron, "flaky")
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="flaky",
-            status="failure",
-        )
-        == 2
-    )
-    assert (
-        sample_value(text, "cronstable_job_retries_total", job_name="flaky")
-        == 1
-    )
+    assert _job_runs(text, job_name="flaky", status="failure") == 2
+    assert _retries(text, job_name="flaky") == 1
     # retries exhausted -> exactly one permanent failure
-    assert (
-        sample_value(
-            text, "cronstable_job_permanent_failures_total", job_name="flaky"
-        )
-        == 1
-    )
+    assert _permanent_failures(text, job_name="flaky") == 1
 
 
 @pytest.mark.asyncio
@@ -1176,27 +904,9 @@ async def test_metrics_count_start_failures():
     await cron.maybe_launch_job(cron.cron_jobs["ghost"])
     await _run_to_completion(cron, "ghost")
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text, "cronstable_job_start_failures_total", job_name="ghost"
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="ghost",
-            status="failure",
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_exit_code", job_name="ghost"
-        )
-        == 127
-    )
+    assert _start_failures(text, job_name="ghost") == 1
+    assert _job_runs(text, job_name="ghost", status="failure") == 1
+    assert _last_run_exit_code(text, job_name="ghost") == 127
 
 
 @pytest.mark.asyncio
@@ -1215,19 +925,8 @@ async def test_metrics_count_cancelled_runs():
     await running_job.wait()
     await cron._handle_finished_job(running_job)
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="slow",
-            status="cancelled",
-        )
-        == 1
-    )
-    assert (
-        sample_value(text, "cronstable_job_last_run_success", job_name="slow")
-        == 0
-    )
+    assert _job_runs(text, job_name="slow", status="cancelled") == 1
+    assert _last_run_success(text, job_name="slow") == 0
 
 
 @pytest.mark.asyncio
@@ -1254,10 +953,7 @@ async def test_retry_swallowed_by_forbid_is_not_counted():
     try:
         await cron.schedule_retry_job("busy", 0, 1)
         text = cron.metrics.render(cron)
-        assert (
-            sample_value(text, "cronstable_job_retries_total", job_name="busy")
-            == 0
-        )
+        assert _retries(text, job_name="busy") == 0
     finally:
         running_job.cancelled = True
         await running_job.cancel()
@@ -1326,39 +1022,24 @@ async def test_cluster_metrics_from_manager_view():
     cron = Cron(None, config_yaml=_TWO_JOBS)
     cron.cluster_manager = FakeManager()
     text = cron.metrics.render(cron)
-    assert sample_value(text, "cronstable_cluster_enabled") == 1
-    assert (
-        sample_value(
-            text,
-            "cronstable_cluster_info",
-            backend="gossip",
-            node_name="n1",
-            distribution="single-leader",
-        )
-        == 1
-    )
-    assert sample_value(text, "cronstable_cluster_size") == 3
-    assert sample_value(text, "cronstable_cluster_quorum") == 2
-    assert sample_value(text, "cronstable_cluster_quorate") == 1
-    assert sample_value(text, "cronstable_cluster_is_leader") == 1
-    assert (
-        sample_value(text, "cronstable_cluster_leader_info", leader="n1") == 1
-    )
-    assert (
-        sample_value(text, "cronstable_cluster_conflict", kind="nodename") == 0
-    )
-    assert (
-        sample_value(text, "cronstable_cluster_conflict", kind="policy") == 1
-    )
-    assert sample_value(text, "cronstable_cluster_peers", status="agreed") == 2
-    assert (
-        sample_value(text, "cronstable_cluster_peers", status="unreachable")
-        == 1
-    )
+    assert _cluster_enabled(text) == 1
+    assert _cluster_info(
+        text,
+        backend="gossip",
+        node_name="n1",
+        distribution="single-leader",
+    ) == 1
+    assert _cluster_size(text) == 3
+    assert _cluster_quorum(text) == 2
+    assert _cluster_quorate(text) == 1
+    assert _cluster_is_leader(text) == 1
+    assert _cluster_leader_info(text, leader="n1") == 1
+    assert _cluster_conflict(text, kind="nodename") == 0
+    assert _cluster_conflict(text, kind="policy") == 1
+    assert _cluster_peers(text, status="agreed") == 2
+    assert _cluster_peers(text, status="unreachable") == 1
     # zero-filled for statuses with no peer, so alert series never vanish
-    assert (
-        sample_value(text, "cronstable_cluster_peers", status="drifted") == 0
-    )
+    assert _cluster_peers(text, status="drifted") == 0
     # observe-only cluster (electLeader off): the transition counters are
     # omitted rather than exposed permanently frozen at zero while the
     # quorate gauge visibly changes
@@ -1377,7 +1058,7 @@ async def test_cluster_metrics_survive_backend_error():
     text = cron.metrics.render(cron)
     # job metrics still render; the cluster block degrades to the enabled
     # gauge instead of failing the whole scrape
-    assert sample_value(text, "cronstable_cluster_enabled") == 1
+    assert _cluster_enabled(text) == 1
     assert "cronstable_cluster_info" not in text
     assert 'cronstable_job_enabled{job_name="alpha"}' in text
 
@@ -1393,12 +1074,8 @@ async def test_cluster_transition_counters():
     cron.cluster_manager = FakeManager(is_leader=False, quorate=True)
     cron._log_cluster_role()  # leadership flips off, quorum unchanged
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(text, "cronstable_cluster_leader_transitions_total") == 2
-    )
-    assert (
-        sample_value(text, "cronstable_cluster_quorum_transitions_total") == 1
-    )
+    assert _leader_transitions(text) == 2
+    assert _quorum_transitions(text) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1406,161 +1083,139 @@ async def test_cluster_transition_counters():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_web_metrics_served_by_default():
-    import aiohttp
-
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base + "/metrics") as resp:
-                assert resp.status == 200
-                assert resp.headers["Content-Type"] == CONTENT_TYPE_TEXT
-                text = await resp.text()
-                assert "cronstable_info{version=" in text
+# The six near-identical single-scaffold tests, folded into one matrix
+# (finding B5).  A row stands the web app up with one config and walks its
+# checks in order; a check asserts only the keys it carries (status,
+# content_type, contains, excludes, endswith), so each row keeps exactly
+# the assertions its source test made.
+_REAL_HTTP_CASES = [
+    pytest.param(
+        {"listen": ["http://127.0.0.1:0"]},
+        (
+            {
+                "path": "/metrics",
+                "status": 200,
+                "content_type": CONTENT_TYPE_TEXT,
+                "contains": ("cronstable_info{version=",),
+            },
             # a Prometheus scraper advertising OpenMetrics gets it
-            async with session.get(
-                base + "/metrics",
-                headers={
+            {
+                "path": "/metrics",
+                "headers": {
                     "Accept": (
                         "application/openmetrics-text;"
                         "version=1.0.0,text/plain;q=0.5"
                     )
                 },
-            ) as resp:
-                assert resp.status == 200
-                assert resp.headers["Content-Type"] == CONTENT_TYPE_OPENMETRICS
-                assert (await resp.text()).endswith("# EOF\n")
-    finally:
-        await cron.start_stop_web_app(None)
-
-
-@pytest.mark.asyncio
-async def test_web_metrics_disabled():
-    import aiohttp
-
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    await cron.start_stop_web_app(
-        {"listen": ["http://127.0.0.1:0"], "metrics": False}
-    )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base + "/metrics") as resp:
-                assert resp.status == 404
-            async with session.get(base + "/jobs") as resp:
-                assert resp.status == 200  # the rest of the API is untouched
-    finally:
-        await cron.start_stop_web_app(None)
-
-
-@pytest.mark.asyncio
-async def test_web_metrics_requires_token_by_default():
-    import aiohttp
-
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    await cron.start_stop_web_app(
+                "status": 200,
+                "content_type": CONTENT_TYPE_OPENMETRICS,
+                "endswith": "# EOF\n",
+            },
+        ),
+        id="served-by-default",
+    ),
+    pytest.param(
+        {"listen": ["http://127.0.0.1:0"], "metrics": False},
+        (
+            {"path": "/metrics", "status": 404},
+            # the rest of the API is untouched
+            {"path": "/jobs", "status": 200},
+        ),
+        id="disabled",
+    ),
+    pytest.param(
         {
             "listen": ["http://127.0.0.1:0"],
             "authToken": {"value": "secret"},
             "ui": False,
-        }
-    )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base + "/metrics") as resp:
-                assert resp.status == 401
+        },
+        (
+            {"path": "/metrics", "status": 401},
             # scrape_configs `authorization: credentials: secret` works
-            async with session.get(
-                base + "/metrics",
-                headers={"Authorization": "Bearer secret"},
-            ) as resp:
-                assert resp.status == 200
-    finally:
-        await cron.start_stop_web_app(None)
-
-
-@pytest.mark.asyncio
-async def test_web_metrics_requires_token_with_ui_enabled():
-    import aiohttp
-
+            {
+                "path": "/metrics",
+                "headers": {"Authorization": "Bearer secret"},
+                "status": 200,
+            },
+        ),
+        id="requires-token-by-default",
+    ),
     # the production default is ui: true, where the auth-exempt set is
     # composed from WEB_PUBLIC_PATHS -- pin that /metrics is NOT part of
     # it (a widened WEB_PUBLIC_PATHS would otherwise silently serve
     # metrics unauthenticated).
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    await cron.start_stop_web_app(
-        {"listen": ["http://127.0.0.1:0"], "authToken": {"value": "secret"}}
-    )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base + "/") as resp:
-                assert resp.status == 200  # the UI page stays public
-            async with session.get(base + "/metrics") as resp:
-                assert resp.status == 401
-            async with session.get(
-                base + "/metrics",
-                headers={"Authorization": "Bearer secret"},
-            ) as resp:
-                assert resp.status == 200
-    finally:
-        await cron.start_stop_web_app(None)
-
-
-@pytest.mark.asyncio
-async def test_web_metrics_public_exemption():
-    import aiohttp
-
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    await cron.start_stop_web_app(
+    pytest.param(
+        {"listen": ["http://127.0.0.1:0"], "authToken": {"value": "secret"}},
+        (
+            {"path": "/", "status": 200},  # the UI page stays public
+            {"path": "/metrics", "status": 401},
+            {
+                "path": "/metrics",
+                "headers": {"Authorization": "Bearer secret"},
+                "status": 200,
+            },
+        ),
+        id="requires-token-with-ui-enabled",
+    ),
+    pytest.param(
         {
             "listen": ["http://127.0.0.1:0"],
             "authToken": {"value": "secret"},
             "ui": False,
             "metrics": {"public": True},
-        }
-    )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
+        },
+        (
             # /metrics was deliberately opened up...
-            async with session.get(base + "/metrics") as resp:
-                assert resp.status == 200
+            {"path": "/metrics", "status": 200},
             # ...but the data endpoints stay behind the token
-            async with session.get(base + "/jobs") as resp:
-                assert resp.status == 401
-    finally:
-        await cron.start_stop_web_app(None)
-
-
-@pytest.mark.asyncio
-async def test_web_metrics_custom_buckets_applied():
-    import aiohttp
-
-    cron = Cron(None, config_yaml=_TWO_JOBS)
-    await cron.start_stop_web_app(
+            {"path": "/jobs", "status": 401},
+        ),
+        id="public-exemption",
+    ),
+    pytest.param(
         {
             "listen": ["http://127.0.0.1:0"],
             "metrics": {"durationBuckets": [1.0, 30.0]},
-        }
-    )
+        },
+        (
+            {
+                "path": "/metrics",
+                "contains": ('le="30.0"',),
+                "excludes": ('le="300.0"',),
+            },
+        ),
+        id="custom-buckets-applied",
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("web_config", "checks"), _REAL_HTTP_CASES)
+async def test_web_metrics_real_http_matrix(web_config, checks):
+    import aiohttp
+
+    cron = Cron(None, config_yaml=_TWO_JOBS)
+    await cron.start_stop_web_app(web_config)
     try:
         port = cron.web_runner.addresses[0][1]
         base = "http://127.0.0.1:{}".format(port)
         async with aiohttp.ClientSession() as session:
-            async with session.get(base + "/metrics") as resp:
-                text = await resp.text()
-        assert 'le="30.0"' in text
-        assert 'le="300.0"' not in text
+            for check in checks:
+                async with session.get(
+                    base + check["path"], headers=check.get("headers")
+                ) as resp:
+                    if "status" in check:
+                        assert resp.status == check["status"]
+                    if "content_type" in check:
+                        content_type = resp.headers["Content-Type"]
+                        assert content_type == check["content_type"]
+                    text = await resp.text()
+                    for needle in check.get("contains", ()):
+                        assert needle in text
+                    for needle in check.get("excludes", ()):
+                        assert needle not in text
+                    if "endswith" in check:
+                        assert text.endswith(check["endswith"])
     finally:
         await cron.start_stop_web_app(None)
 
@@ -1589,21 +1244,8 @@ async def test_web_metrics_bucket_change_applies_on_web_restart():
                 text = await resp.text()
         assert 'le="30.0"' in text
         assert 'le="300.0"' not in text
-        assert (
-            sample_value(
-                text, "cronstable_job_duration_seconds_count", job_name="alpha"
-            )
-            == 0
-        )
-        assert (
-            sample_value(
-                text,
-                "cronstable_job_runs_total",
-                job_name="alpha",
-                status="success",
-            )
-            == 1
-        )
+        assert _duration_count(text, job_name="alpha") == 0
+        assert _job_runs(text, job_name="alpha", status="success") == 1
     finally:
         await cron.start_stop_web_app(None)
 
@@ -1625,13 +1267,13 @@ def test_update_config_records_reload_outcome(tmp_path):
     cfg.write_text(_GOOD_FILE, encoding="utf-8")
     cron = Cron(str(cfg))
     text = cron.metrics.render(cron)
-    assert sample_value(text, "cronstable_config_last_reload_successful") == 1
+    assert _reload_ok(text) == 1
     # break the file: the reload fails and the gauge flips to 0
     cfg.write_text("jobs: [", encoding="utf-8")
     with pytest.raises(cronstable.cron.ConfigError):
         cron.update_config()
     text = cron.metrics.render(cron)
-    assert sample_value(text, "cronstable_config_last_reload_successful") == 0
+    assert _reload_ok(text) == 0
 
 
 def test_update_config_prunes_removed_jobs(tmp_path):
@@ -1669,39 +1311,15 @@ async def test_prune_spares_still_running_removed_job(tmp_path):
     cfg.write_text(_GOOD_FILE, encoding="utf-8")
     cron.update_config()
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="doomed",
-            status="success",
-        )
-        == 1
-    )
+    assert _job_runs(text, job_name="doomed", status="success") == 1
     # the run finishes onto the surviving accumulator, not a fresh one
     running_job.cancelled = True
     await running_job.cancel()
     await running_job.wait()
     await cron._handle_finished_job(running_job)
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="doomed",
-            status="success",
-        )
-        == 1
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_runs_total",
-            job_name="doomed",
-            status="cancelled",
-        )
-        == 1
-    )
+    assert _job_runs(text, job_name="doomed", status="success") == 1
+    assert _job_runs(text, job_name="doomed", status="cancelled") == 1
     # the next reload -- nothing running any more -- prunes it for good
     cron.update_config()
     text = cron.metrics.render(cron)
@@ -1735,19 +1353,9 @@ def test_seed_counters_non_numeric_buckets_skip_histogram(bad_bucket):
     assert seeded == 1
     text = _registry_text(metrics)
     # outcome counter seeded despite the unusable buckets
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="j", status="success"
-        )
-        == 2
-    )
+    assert _job_runs(text, job_name="j", status="success") == 2
     # histogram left at zero: the corrupt buckets blocked _seed_histogram
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 0
-    )
+    assert _duration_count(text, job_name="j") == 0
 
 
 def test_seed_counters_matching_buckets_seeds_histogram_baseline():
@@ -1768,12 +1376,7 @@ def test_seed_counters_matching_buckets_seeds_histogram_baseline():
     metrics = PrometheusMetrics()
     metrics.seed_counters(snapshot, keep=["j"])
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 2
-    )
+    assert _duration_count(text, job_name="j") == 2
 
 
 def _custom_bucket_snapshot():
@@ -1801,18 +1404,8 @@ def test_seed_counters_parks_histogram_until_buckets_apply():
     metrics.seed_counters(_custom_bucket_snapshot(), keep=["j"])
     text = _registry_text(metrics)
     # outcome counters seed immediately; the histogram waits for its bounds
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="j", status="success"
-        )
-        == 3
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 0
-    )
+    assert _job_runs(text, job_name="j", status="success") == 3
+    assert _duration_count(text, job_name="j") == 0
     # a run recorded between seed and set is binned under the still-default
     # bounds, so the bucket change resets it (past observations cannot be
     # re-binned), exactly as any bucket change does today.
@@ -1820,51 +1413,17 @@ def test_seed_counters_parks_histogram_until_buckets_apply():
     # the web app applies the configured bounds: the parked baseline lands
     metrics.set_duration_buckets((1.0, 10.0, 60.0))
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 3
-    )
-    assert (
-        sample_value(text, "cronstable_job_duration_seconds_sum", job_name="j")
-        == 12.0
-    )
+    assert _duration_count(text, job_name="j") == 3
+    assert _duration_sum(text, job_name="j") == 12.0
     for le, expected in (("1.0", 1), ("10.0", 2), ("60.0", 3), ("+Inf", 3)):
-        assert (
-            sample_value(
-                text,
-                "cronstable_job_duration_seconds_bucket",
-                job_name="j",
-                le=le,
-            )
-            == expected
-        )
+        assert _duration_bucket(text, job_name="j", le=le) == expected
     # ...and the boot-window run still counted toward the outcome counter
-    assert (
-        sample_value(
-            text, "cronstable_job_runs_total", job_name="j", status="success"
-        )
-        == 4
-    )
+    assert _job_runs(text, job_name="j", status="success") == 4
     # runs observed after adoption pile on top of the restored baseline
     metrics.job_run_recorded("j", "success", 0.5)
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 4
-    )
-    assert (
-        sample_value(
-            text,
-            "cronstable_job_duration_seconds_bucket",
-            job_name="j",
-            le="1.0",
-        )
-        == 2
-    )
+    assert _duration_count(text, job_name="j") == 4
+    assert _duration_bucket(text, job_name="j", le="1.0") == 2
 
 
 def test_set_duration_buckets_drops_stale_parked_histogram():
@@ -1876,21 +1435,11 @@ def test_set_duration_buckets_drops_stale_parked_histogram():
     metrics.seed_counters(_custom_bucket_snapshot(), keep=["j"])
     metrics.set_duration_buckets((0.5, 5.0))
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 0
-    )
+    assert _duration_count(text, job_name="j") == 0
     # a later reload to the snapshot's old bounds finds the slot empty
     metrics.set_duration_buckets((1.0, 10.0, 60.0))
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 0
-    )
+    assert _duration_count(text, job_name="j") == 0
 
 
 def test_set_duration_buckets_noop_also_resolves_parked_histogram():
@@ -1903,12 +1452,7 @@ def test_set_duration_buckets_noop_also_resolves_parked_histogram():
     metrics.set_duration_buckets(DEFAULT_DURATION_BUCKETS)
     metrics.set_duration_buckets((1.0, 10.0, 60.0))
     text = _registry_text(metrics)
-    assert (
-        sample_value(
-            text, "cronstable_job_duration_seconds_count", job_name="j"
-        )
-        == 0
-    )
+    assert _duration_count(text, job_name="j") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1941,23 +1485,14 @@ async def test_state_families_emit_lock_and_throttle_counters():
     text = cron.metrics.render(cron)
 
     # lock family (acquisitions > 0 gate is open)
-    assert (
-        sample_value(text, "cronstable_state_lock_acquisitions_total") == 4
-    )
-    assert (
-        sample_value(text, "cronstable_state_lock_wait_seconds_total") == 1.5
-    )
+    assert _lock_acquisitions(text) == 4
+    assert _lock_wait(text) == 1.5
     # throttle family (count > 0 gate is open)
-    assert sample_value(text, "cronstable_state_throttled_ops_total") == 3
-    assert (
-        sample_value(text, "cronstable_state_throttle_wait_seconds_total")
-        == 0.75
-    )
+    assert _throttled_ops(text) == 3
+    assert _throttle_wait(text) == 0.75
     # the info + op families rendered too
     assert 'cronstable_state_info{backend="sqlite"' in text
-    assert (
-        sample_value(text, "cronstable_state_ops_total", op="put") == 5
-    )
+    assert _state_ops(text, op="put") == 5
 
 
 @pytest.mark.asyncio
@@ -2001,18 +1536,8 @@ async def test_job_families_emit_last_run_cpu_and_rss():
     )
     text = cron.metrics.render(cron)
     # cpu_total_seconds = user + system = 2.0
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_cpu_seconds", job_name="alpha"
-        )
-        == 2.0
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_max_rss_bytes", job_name="alpha"
-        )
-        == 9000
-    )
+    assert _last_run_cpu(text, job_name="alpha") == 2.0
+    assert _last_run_rss(text, job_name="alpha") == 9000
 
 
 @pytest.mark.asyncio
@@ -2033,18 +1558,8 @@ async def test_job_families_omit_last_run_cpu_when_unmonitored():
         ),
     )
     text = cron.metrics.render(cron)
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_cpu_seconds", job_name="alpha"
-        )
-        is None
-    )
-    assert (
-        sample_value(
-            text, "cronstable_job_last_run_max_rss_bytes", job_name="alpha"
-        )
-        is None
-    )
+    assert _last_run_cpu(text, job_name="alpha") is None
+    assert _last_run_rss(text, job_name="alpha") is None
 
 
 # ---- the two-phase render seam (families / render_prepared) ----------------
@@ -2251,17 +1766,6 @@ async def test_a_failed_build_lets_the_followers_build_their_own(monkeypatch):
     assert cron._metrics_response_memo[False].inflight is None
     assert cron._metrics_response_memo[False].cached is None
     assert calls == [1]
-
-
-async def _wait_until(pred, tries=300, interval=0.01):
-    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
-    # and do not flake under CI load. Bounded so a never-true predicate fails
-    # cleanly instead of hanging.
-    for _ in range(tries):
-        if pred():
-            return
-        await asyncio.sleep(interval)
-    raise AssertionError("condition not met within {} tries".format(tries))
 
 
 @pytest.mark.asyncio

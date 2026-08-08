@@ -7,6 +7,7 @@ import pytest
 
 import cronstable.cron
 from cronstable.job import JobOutputStream, JobRetryState
+from tests._configs import _ONE_JOB, job_yaml
 from tests._cron_helpers import (
     _EVERY_SECOND_AND_MINUTE,
     _PAUSABLE_JOB,
@@ -32,11 +33,11 @@ from tests._cron_helpers import (
     _wait_until,
     fixed_current_time,  # noqa: F401
 )
+from tests._helpers import _state_cfg
 from tests.test_state import (
     _NOW,
     _count_launcher,
     _cron_with_watermark,
-    _state_cfg,
 )
 
 LONDON = ZoneInfo("Europe/London")
@@ -470,6 +471,10 @@ async def test_reload_runs_off_event_loop(tmp_path, monkeypatch):
     assert all(t != main_thread for t in seen)  # ...always off the loop thread
 
 
+# stays local (finding B13): a near-miss of tests._configs._TLS_CLUSTER_YAML,
+# not one of its byte-identical copies. The job is a Leader @reboot one-shot
+# (the deferral under test) and the listen port differs (18444), so per the
+# _configs policy this variant keeps its own literal.
 _LEADER_REBOOT_BAD_CLUSTER = """
 jobs:
   - name: boot
@@ -526,19 +531,9 @@ async def test_startup_gates_reboot_before_servicing(tmp_path, monkeypatch):
 #  next-fire index + monotonic-sleep behaviour, and a perf demonstration
 # =====================================================================
 
-_ONE_MINUTE_JOB = """
-jobs:
-  - name: m
-    command: echo m
-    schedule: "* * * * *"
-"""
+_ONE_MINUTE_JOB = job_yaml("m")
 
-_NOON_DAILY = """
-jobs:
-  - name: noon
-    command: echo noon
-    schedule: "0 12 * * *"
-"""
+_NOON_DAILY = job_yaml("noon", schedule="0 12 * * *")
 
 _TZ_JOBS = """
 jobs:
@@ -654,12 +649,7 @@ async def test_backward_clock_step_does_not_refire(monkeypatch):
     assert [s for (n, s) in launched if n == "tick"] == [6]
 
 
-_EVERY_15MIN = """
-jobs:
-  - name: j15
-    command: echo j15
-    schedule: "*/15 * * * *"
-"""
+_EVERY_15MIN = job_yaml("j15", schedule="*/15 * * * *")
 
 
 @pytest.mark.asyncio
@@ -722,13 +712,7 @@ async def test_large_forward_jump_does_not_enumerate_window(monkeypatch):
     assert [s for (n, s) in launched if n == "tick"] == [0]
 
 
-_LOCAL_MINUTE_JOB = """
-jobs:
-  - name: loc
-    command: echo loc
-    schedule: "* * * * *"
-    utc: false
-"""
+_LOCAL_MINUTE_JOB = job_yaml("loc", extra="    utc: false\n")
 
 
 @pytest.mark.asyncio
@@ -1127,10 +1111,7 @@ async def test_catch_up_defers_a_paused_job_instead_of_latching_it(
     # pause began, and catch-up is one-shot per process.
     holder = {"now": DT(2020, 1, 1, 0, 10, 0)}
     _set_now(monkeypatch, holder)
-    yaml = (
-        "jobs:\n  - name: p\n    command: echo hi\n"
-        '    schedule: "* * * * *"\n    onMissed: run-all\n'
-    )
+    yaml = _PAUSABLE_JOB + "    onMissed: run-all\n"
     cron = cronstable.cron.Cron(None, config_yaml=yaml)
     await cron.pause_job_by_name("p")
     unresolved = await cron._evaluate_catch_up(
@@ -1157,6 +1138,9 @@ async def test_origin_middleware_covers_pause_and_resume_routes():
     async def handler(request):
         return web.Response(text="ok")
 
+    # stays local (finding B6): the origin middleware reads method, host,
+    # path and the Origin header; the shared tests.conftest.Req carries only
+    # query/match_info/headers, so its shape does not fit here.
     class FakeRequest:
         def __init__(self, path):
             self.method = "POST"
@@ -1175,14 +1159,9 @@ async def test_origin_middleware_covers_pause_and_resume_routes():
 # ---------------------------------------------------------------------------
 
 
-_SLA_LATE_JOB = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "* * * * *"
-    sla:
-      lateAfterSeconds: 120
-"""
+_SLA_LATE_JOB = job_yaml(
+    "s", "echo hi", extra="    sla:\n      lateAfterSeconds: 120\n"
+)
 
 
 _SLA_EXEMPT_JOBS = """
@@ -1596,26 +1575,25 @@ def test_reload_prunes_sla_trackers(tmp_path, monkeypatch):
 # SLA: exemption clears the latch, and false lateAfter pages
 # ---------------------------------------------------------------------------
 
-_SLA_CLUSTER_LATE_JOB = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "* * * * *"
-    concurrencyScope: cluster
-    concurrencyPolicy: Forbid
-    sla:
-      lateAfterSeconds: 120
-"""
+_SLA_CLUSTER_LATE_JOB = job_yaml(
+    "s",
+    "echo hi",
+    extra=(
+        "    concurrencyScope: cluster\n"
+        "    concurrencyPolicy: Forbid\n"
+        "    sla:\n      lateAfterSeconds: 120\n"
+    ),
+)
 
-_SLA_FORBID_LATE_JOB = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "*/10 * * * *"
-    concurrencyPolicy: Forbid
-    sla:
-      lateAfterSeconds: 300
-"""
+_SLA_FORBID_LATE_JOB = job_yaml(
+    "s",
+    "echo hi",
+    schedule="*/10 * * * *",
+    extra=(
+        "    concurrencyPolicy: Forbid\n"
+        "    sla:\n      lateAfterSeconds: 300\n"
+    ),
+)
 
 
 @pytest.mark.asyncio
@@ -1911,17 +1889,21 @@ def test_reload_prunes_sla_first_seen_and_pause_windows(tmp_path, monkeypatch):
     assert set(cron._sla_pause_windows) == {"keep"}
 
 
-_SLA_DISABLED_STALE_JOB = (
-    "jobs:\n  - name: db-vacuum\n    command: echo hi\n"
-    '    schedule: "0 3 * * *"\n'
-    "    enabled: false\n"
-    "    sla:\n      maxTimeSinceSuccessSeconds: 90000\n"
+_SLA_ENABLED_STALE_JOB = job_yaml(
+    "db-vacuum",
+    "echo hi",
+    schedule="0 3 * * *",
+    extra="    sla:\n      maxTimeSinceSuccessSeconds: 90000\n",
 )
 
-_SLA_ENABLED_STALE_JOB = (
-    "jobs:\n  - name: db-vacuum\n    command: echo hi\n"
-    '    schedule: "0 3 * * *"\n'
-    "    sla:\n      maxTimeSinceSuccessSeconds: 90000\n"
+_SLA_DISABLED_STALE_JOB = job_yaml(
+    "db-vacuum",
+    "echo hi",
+    schedule="0 3 * * *",
+    extra=(
+        "    enabled: false\n"
+        "    sla:\n      maxTimeSinceSuccessSeconds: 90000\n"
+    ),
 )
 
 
@@ -2473,13 +2455,9 @@ async def test_sla_warm_seeds_reference_when_a_run_lands_during_the_read(
     await cron._drain_completions()
 
 
-_ONLY_IF_LAST_JOB = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "* * * * *"
-    onlyIfLastSucceeded: true
-"""
+_ONLY_IF_LAST_JOB = job_yaml(
+    "s", "echo hi", extra="    onlyIfLastSucceeded: true\n"
+)
 
 
 @pytest.mark.asyncio
@@ -2630,12 +2608,7 @@ def test_catchup_smoke_sanity():
     assert cron is not None
 
 
-_CATCHUP_REBOOT_YAML = """
-jobs:
-  - name: boot
-    command: echo hi
-    schedule: "@reboot"
-"""
+_CATCHUP_REBOOT_YAML = job_yaml("boot", "echo hi", schedule="@reboot")
 
 
 def _catchup_pause(hours_from=1):
@@ -2796,8 +2769,7 @@ async def test_catchup_catch_up_defers_before_retry_interval(tmp_path):
 async def test_catchup_catch_up_no_state_warns_archive_and_gate(caplog):
     import logging
 
-    yaml = (
-        "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+    yaml = _ONE_JOB + (
         "    archiveOutput: true\n    onlyIfLastSucceeded: true\n"
     )
     cron = cronstable.cron.Cron(None, config_yaml=yaml)  # no state backend

@@ -26,8 +26,7 @@ from cronstable.config import (
     parse_config_string,
 )
 from cronstable.dag import DagSpec, ExpandSpec, TaskSpec
-
-_STATE = "state:\n  path: /tmp/x\n"
+from tests._configs import _STATE
 
 
 def _dagcfg(dags_yaml, state=_STATE):
@@ -133,6 +132,19 @@ def _state(body, key):
     return body["tasks"][key]["state"]
 
 
+# The canonical two-task fan-out spec (finding B14): `work` expands over the
+# "items" list its upstream `gen` publishes.  Specs are frozen dataclasses,
+# so sharing one instance across tests is safe; only run bodies mutate.
+_FANOUT_SPEC = _spec(
+    TaskSpec("gen"),
+    TaskSpec(
+        "work",
+        depends_on=("gen",),
+        expand=ExpandSpec(from_task="gen", key="items"),
+    ),
+)
+
+
 # --------------------------------------------------------------------------
 # Graph validation
 # --------------------------------------------------------------------------
@@ -147,69 +159,95 @@ def test_validate_ok_linear():
     dag.validate_graph(spec)  # no raise
 
 
-def test_validate_unknown_dep():
-    spec = _spec(TaskSpec("a", depends_on=("nope",)))
-    with pytest.raises(dag.DagValidationError, match="unknown task 'nope'"):
-        dag.validate_graph(spec)
-
-
-def test_validate_cycle():
-    spec = _spec(
-        TaskSpec("a", depends_on=("c",)),
-        TaskSpec("b", depends_on=("a",)),
-        TaskSpec("c", depends_on=("b",)),
-    )
-    with pytest.raises(dag.DagValidationError, match="cycle"):
-        dag.validate_graph(spec)
-
-
-def test_validate_duplicate_id():
-    spec = _spec(TaskSpec("a"), TaskSpec("a"))
-    with pytest.raises(dag.DagValidationError, match="duplicate"):
-        dag.validate_graph(spec)
-
-
-def test_validate_expand_needs_direct_dep():
-    spec = _spec(
-        TaskSpec("a"),
-        TaskSpec("b", depends_on=("a",)),
-        TaskSpec(
-            "c",
-            depends_on=("b",),
-            expand=ExpandSpec(from_task="a", key="items"),
+@pytest.mark.parametrize(
+    "tasks, match",
+    [
+        pytest.param(
+            (TaskSpec("a", depends_on=("nope",)),),
+            "unknown task 'nope'",
+            id="unknown-dep",
         ),
-    )
-    with pytest.raises(dag.DagValidationError, match="direct dependsOn"):
-        dag.validate_graph(spec)
-
-
-def test_validate_expand_of_sensor_rejected():
-    spec = _spec(
-        TaskSpec("a"),
-        TaskSpec(
-            "s",
-            type=dag.SENSOR,
-            depends_on=("a",),
-            expand=ExpandSpec(from_task="a", key="k"),
+        pytest.param(
+            (
+                TaskSpec("a", depends_on=("c",)),
+                TaskSpec("b", depends_on=("a",)),
+                TaskSpec("c", depends_on=("b",)),
+            ),
+            "cycle",
+            id="cycle",
         ),
-    )
-    with pytest.raises(dag.DagValidationError, match="only a plain task"):
-        dag.validate_graph(spec)
-
-
-def test_validate_chained_mapping_rejected():
-    spec = _spec(
-        TaskSpec("a"),
-        TaskSpec(
-            "b", depends_on=("a",),
-            expand=ExpandSpec(from_task="a", key="k"),
+        pytest.param(
+            (TaskSpec("a"), TaskSpec("a")),
+            "duplicate",
+            id="duplicate-id",
         ),
-        TaskSpec(
-            "c", depends_on=("b",),
-            expand=ExpandSpec(from_task="b", key="k"),
+        pytest.param(
+            (
+                TaskSpec("a"),
+                TaskSpec("b", depends_on=("a",)),
+                TaskSpec(
+                    "c",
+                    depends_on=("b",),
+                    expand=ExpandSpec(from_task="a", key="items"),
+                ),
+            ),
+            "direct dependsOn",
+            id="expand-needs-direct-dep",
         ),
-    )
-    with pytest.raises(dag.DagValidationError, match="itself mapped"):
+        pytest.param(
+            (
+                TaskSpec("a"),
+                TaskSpec(
+                    "s",
+                    type=dag.SENSOR,
+                    depends_on=("a",),
+                    expand=ExpandSpec(from_task="a", key="k"),
+                ),
+            ),
+            "only a plain task",
+            id="expand-of-sensor",
+        ),
+        pytest.param(
+            (
+                TaskSpec("a"),
+                TaskSpec(
+                    "b", depends_on=("a",),
+                    expand=ExpandSpec(from_task="a", key="k"),
+                ),
+                TaskSpec(
+                    "c", depends_on=("b",),
+                    expand=ExpandSpec(from_task="b", key="k"),
+                ),
+            ),
+            "itself mapped",
+            id="chained-mapping",
+        ),
+        pytest.param((TaskSpec(""),), "non-empty", id="empty-task-id"),
+        pytest.param(
+            (TaskSpec("a", depends_on=("a",)),),
+            "dependsOn itself",
+            id="depends-on-self",
+        ),
+        # from_task is neither in depends_on nor a known task: the
+        # expand-specific "is not a task" error fires (not the generic
+        # unknown-dependsOn one).
+        pytest.param(
+            (
+                TaskSpec("a"),
+                TaskSpec(
+                    "b",
+                    depends_on=("a",),
+                    expand=ExpandSpec(from_task="ghost", key="items"),
+                ),
+            ),
+            "is not a task",
+            id="expand-from-task-not-a-task",
+        ),
+    ],
+)
+def test_validate_graph_rejects(tasks, match):
+    spec = _spec(*tasks)
+    with pytest.raises(dag.DagValidationError, match=match):
         dag.validate_graph(spec)
 
 
@@ -568,13 +606,7 @@ def test_added_task_does_not_block_terminalise():
 def test_fan_out_deterministic_on_replan():
     # the mapped item set is recorded once and never recomputed, even if the
     # upstream xcom "changes" underneath a later pass.
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work", depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     body = _body(spec)
     body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
     body, _ = _apply(
@@ -1041,58 +1073,84 @@ def test_dag_manual_only_no_schedule():
     assert cfg.dags[0].schedule_job is None
 
 
-def test_dag_requires_state():
-    with pytest.raises(ConfigError, match="dags require a `state` section"):
-        _validate_cross_sections(
-            parse_config_string(
-                "dags:\n  - name: d\n    tasks:\n"
-                "      - id: t\n        command: 'echo'\n",
-                "",
-            )
-        )
-
-
-def test_dag_requires_jobapi_enabled():
-    with pytest.raises(ConfigError, match="loopback endpoint"):
-        _xsect(
+@pytest.mark.parametrize(
+    "dags_yaml, state, match",
+    [
+        pytest.param(
             "dags:\n  - name: d\n    tasks:\n"
             "      - id: t\n        command: 'echo'\n",
-            state="state:\n  path: /x\n  jobApi:\n    enabled: false\n",
-        )
-
-
-def test_dag_duplicate_name_rejected():
-    with pytest.raises(ConfigError, match="duplicate dag name"):
-        _xsect(
+            "",
+            "dags require a `state` section",
+            id="requires-state",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: t\n        command: 'echo'\n",
+            "state:\n  path: /x\n  jobApi:\n    enabled: false\n",
+            "loopback endpoint",
+            id="requires-jobapi-enabled",
+        ),
+        pytest.param(
             "dags:\n"
             "  - name: d\n    tasks:\n      - id: a\n        command: 'e'\n"
-            "  - name: d\n    tasks:\n      - id: b\n        command: 'e'\n"
-        )
+            "  - name: d\n    tasks:\n      - id: b\n        command: 'e'\n",
+            _STATE,
+            "duplicate dag name",
+            id="duplicate-name",
+        ),
+    ],
+)
+def test_dag_cross_section_rejected(dags_yaml, state, match):
+    with pytest.raises(ConfigError, match=match):
+        _xsect(dags_yaml, state=state)
 
 
-def test_dag_cycle_is_config_error():
-    with pytest.raises(ConfigError, match="cycle"):
-        _dagcfg(
+@pytest.mark.parametrize(
+    "dags_yaml, match",
+    [
+        pytest.param(
             "dags:\n  - name: d\n    tasks:\n"
             "      - id: a\n        command: 'e'\n        dependsOn:\n"
             "          - b\n"
             "      - id: b\n        command: 'e'\n        dependsOn:\n"
-            "          - a\n"
-        )
-
-
-def test_dag_unknown_dep_is_config_error():
-    with pytest.raises(ConfigError, match="unknown task"):
-        _dagcfg(
+            "          - a\n",
+            "cycle",
+            id="cycle",
+        ),
+        pytest.param(
             "dags:\n  - name: d\n    tasks:\n"
             "      - id: a\n        command: 'e'\n        dependsOn:\n"
-            "          - ghost\n"
-        )
-
-
-def test_dag_task_needs_command():
-    with pytest.raises(ConfigError, match="needs a command"):
-        _dagcfg("dags:\n  - name: d\n    tasks:\n      - id: a\n")
+            "          - ghost\n",
+            "unknown task",
+            id="unknown-dep",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n      - id: a\n",
+            "needs a command",
+            id="task-needs-command",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n"
+            "      - id: b\n        command: 'e'\n        dependsOn:\n"
+            "          - a\n"
+            "      - id: c\n        command: 'e'\n        dependsOn:\n"
+            "          - b\n        expand:\n"
+            "          fromTask: a\n          key: items\n",
+            "direct dependsOn",
+            id="expand-not-direct-dep",
+        ),
+        pytest.param(
+            "dags:\n  - name: d\n    retainRuns: 0\n    tasks:\n"
+            "      - id: a\n        command: 'e'\n",
+            "retainRuns must be >= 1",
+            id="retain-runs-floor",
+        ),
+    ],
+)
+def test_dag_config_rejected(dags_yaml, match):
+    with pytest.raises(ConfigError, match=match):
+        _dagcfg(dags_yaml)
 
 
 def test_dag_approval_needs_no_command():
@@ -1101,27 +1159,6 @@ def test_dag_approval_needs_no_command():
         "      - id: gate\n        type: approval\n"
     )
     assert cfg.dags[0].tasks[0].type == "approval"
-
-
-def test_dag_expand_must_be_direct_dep():
-    with pytest.raises(ConfigError, match="direct dependsOn"):
-        _dagcfg(
-            "dags:\n  - name: d\n    tasks:\n"
-            "      - id: a\n        command: 'e'\n"
-            "      - id: b\n        command: 'e'\n        dependsOn:\n"
-            "          - a\n"
-            "      - id: c\n        command: 'e'\n        dependsOn:\n"
-            "          - b\n        expand:\n"
-            "          fromTask: a\n          key: items\n"
-        )
-
-
-def test_dag_retain_runs_floor():
-    with pytest.raises(ConfigError, match="retainRuns must be >= 1"):
-        _dagcfg(
-            "dags:\n  - name: d\n    retainRuns: 0\n    tasks:\n"
-            "      - id: a\n        command: 'e'\n"
-        )
 
 
 def test_dag_task_id_charset_rejected():
@@ -1612,14 +1649,7 @@ def test_reconcile_and_plan_flags_pending_expansion():
 
 
 def test_reconcile_and_plan_expansion_pending_nothing_to_reconcile_keeps():
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     body = _body(spec)
     body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
     body, _ = _apply(
@@ -1753,14 +1783,7 @@ def test_quiescent_approval_gate_keeps_document():
 def test_quiescent_mapped_fanout_in_flight():
     # the large-document case the short-circuit exists for: a fan-out whose
     # instances are all claimed under our token idles as a plain read.
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     body = _body(spec)
     body, _ = _apply(dag.plan_and_claim(spec, 1.0, "p", "h", {}), body)
     body, _ = _apply(
@@ -1869,34 +1892,8 @@ def test_task_record_without_resources_field_still_parses():
 # --------------------------------------------------------------------------
 
 
-# validate_graph / _validate_expand edge cases
-
-
-def test_validate_empty_task_id():
-    spec = _spec(TaskSpec(""))
-    with pytest.raises(dag.DagValidationError, match="non-empty"):
-        dag.validate_graph(spec)
-
-
-def test_validate_depends_on_self():
-    spec = _spec(TaskSpec("a", depends_on=("a",)))
-    with pytest.raises(dag.DagValidationError, match="dependsOn itself"):
-        dag.validate_graph(spec)
-
-
-def test_validate_expand_from_task_not_a_task():
-    # from_task is neither in depends_on nor a known task: the expand-specific
-    # "is not a task" error fires (not the generic unknown-dependsOn one).
-    spec = _spec(
-        TaskSpec("a"),
-        TaskSpec(
-            "b",
-            depends_on=("a",),
-            expand=ExpandSpec(from_task="ghost", key="items"),
-        ),
-    )
-    with pytest.raises(dag.DagValidationError, match="is not a task"):
-        dag.validate_graph(spec)
+# validate_graph / _validate_expand edge cases (empty id, self-dep, phantom
+# expand source) live as rows of test_validate_graph_rejects above.
 
 
 # _mapped_group_state: the all-skipped reduction
@@ -1977,14 +1974,7 @@ def test_plan_and_claim_noop_on_none_and_terminal():
 
 
 def test_apply_expansions_skip_branches():
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     # (1) items is None -> unknown read, left for a later pass.
     body = _body(spec)
     body["tasks"]["gen"]["state"] = dag.SUCCESS
@@ -2016,14 +2006,7 @@ def test_apply_expansions_skip_branches():
 
 
 def test_instances_of_unexpanded_mapped_is_empty():
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     body = _body(spec)  # no mapped entry yet
     assert dag._instances_of(spec, body, spec.by_id["work"]) == []
     # a plain task is always exactly one instance keyed by its id.
@@ -2036,14 +2019,7 @@ def test_instances_of_unexpanded_mapped_is_empty():
 
 
 def test_propagate_placeholder_source_skipped():
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     body = _body(spec)
     body["tasks"]["gen"]["state"] = dag.SKIPPED
     result = dag.AdvanceResult()
@@ -2173,14 +2149,7 @@ def test_sensor_timed_out_without_first_poke():
 
 
 def test_maybe_terminalise_ignores_unmaterialised_mapped_task():
-    spec = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    spec = _FANOUT_SPEC
     body = _body(spec)
     body["tasks"]["gen"]["state"] = dag.SUCCESS
     # `work` was added by a reload after the run doc was created: it has no
@@ -2503,14 +2472,7 @@ def test_renamed_expand_source_does_not_wedge_an_inflight_run():
     # _deps_verdict and _maybe_terminalise both already implement the rule
     # ("no entry in the run document -> added after the run was created, so it
     # cannot gate anything"); only the mapped-expansion path was missing it.
-    old = _spec(
-        TaskSpec("gen"),
-        TaskSpec(
-            "work",
-            depends_on=("gen",),
-            expand=ExpandSpec(from_task="gen", key="items"),
-        ),
-    )
+    old = _FANOUT_SPEC
     body = _body(old)
     body["tasks"]["gen"]["state"] = dag.SUCCESS
     body["tasks"]["gen"]["finishedAt"] = 5.0

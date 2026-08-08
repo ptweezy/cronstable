@@ -5,6 +5,7 @@ import pytest
 
 import cronstable.cron
 from cronstable.job import JobRetryState
+from tests._configs import _PLAIN_JOB, job_yaml
 from tests._cron_helpers import (
     _SLA_RUNTIME_JOB,
     _SLA_STALE_JOB,
@@ -17,6 +18,8 @@ from tests._cron_helpers import (
     _sla_report_recorder,
     fixed_current_time,  # noqa: F401
 )
+from tests._helpers import _drain_state_writes
+from tests.conftest import _cron
 
 # ===================================================================
 # Job start/pause/resume, SLA, and the cross-node retry claim machinery
@@ -24,58 +27,27 @@ from tests._cron_helpers import (
 # observations/report, and the cross-node retry claim/consume machinery)
 # ===================================================================
 
-_RETRYCLAIM_RETRY_JOB = """
-jobs:
-  - name: j
-    command: ls
-    schedule: "0 0 * * *"
-    onFailure:
-      retry:
-        maximumRetries: 3
-        initialDelay: 1
-        maximumDelay: 60
-        backoffMultiplier: 2
-"""
+# maximumRetries: 3 differs from tests._configs._RETRY_JOB's 5, so the
+# ladder block stays local; the one-job base comes from the shared builder.
+_RETRYCLAIM_RETRY_BLOCK = (
+    "    onFailure:\n"
+    "      retry:\n"
+    "        maximumRetries: 3\n"
+    "        initialDelay: 1\n"
+    "        maximumDelay: 60\n"
+    "        backoffMultiplier: 2\n"
+)
 
-_RETRYCLAIM_RETRY_JOB_DEADLINE = """
-jobs:
-  - name: j
-    command: ls
-    schedule: "0 0 * * *"
-    startingDeadlineSeconds: 60
-    onFailure:
-      retry:
-        maximumRetries: 3
-        initialDelay: 1
-        maximumDelay: 60
-        backoffMultiplier: 2
-"""
+_RETRYCLAIM_RETRY_JOB = job_yaml(
+    "j", "ls", schedule="0 0 * * *", extra=_RETRYCLAIM_RETRY_BLOCK
+)
 
-_RETRYCLAIM_RETRY_JOB_NO_RETRY = """
-jobs:
-  - name: j
-    command: ls
-    schedule: "0 0 * * *"
-"""
-
-
-async def _retryclaim_stateful(tmp_path, yaml, extra=""):
-    from tests.test_state import _state_cfg
-
-    cron = cronstable.cron.Cron(None, config_yaml=yaml)
-    cfg = _state_cfg("state:\n  path: {}\n{}".format(tmp_path, extra))
-    await cron.start_stop_state(cfg)
-    assert cron.state_backend is not None
-    return cron
-
-
-async def _retryclaim_stop(cron):
-    from tests.test_state import _drain_state_writes
-
-    await _drain_state_writes(cron)
-    if cron.state_backend is not None:
-        await cron.state_backend.stop()
-        cron.state_backend = None
+_RETRYCLAIM_RETRY_JOB_DEADLINE = job_yaml(
+    "j",
+    "ls",
+    schedule="0 0 * * *",
+    extra="    startingDeadlineSeconds: 60\n" + _RETRYCLAIM_RETRY_BLOCK,
+)
 
 
 def _retryclaim_foreign(cron, job, host="node-a", secs_stale=120):
@@ -173,54 +145,51 @@ def test_retryclaim_pause_info_from_record_variants():
 
 @pytest.mark.asyncio
 async def test_retryclaim_refresh_pauses_from_store_skip_removed_and_replace(
-    tmp_path,
+    stateful_cron,
 ):
-    cron = await _retryclaim_stateful(tmp_path, TWO_JOBS)
-    try:
-        now = cronstable.cron.get_now(datetime.timezone.utc)
-        until1 = now + datetime.timedelta(hours=1)
-        until2 = now + datetime.timedelta(hours=2)
-        # a stream for a job not in the config: the sweep skips it entirely
-        await cron.state_backend.append_record(
-            "paused/ghost",
-            {
-                "kind": "paused",
-                "since": now.isoformat(),
-                "until": until1.isoformat(),
-                "note": "",
-                "by": "",
-                "channel": "",
-                "at": now.isoformat(),
-                "host": "h",
-            },
-        )
-        # alpha already paused in memory with a DIFFERENT window: the store's
-        # newer window replaces it and banks the one it superseded.
-        cron._paused["alpha"] = cronstable.cron.PauseInfo(
-            since=now - datetime.timedelta(minutes=30),
-            until=until1,
-            note="",
-            by="",
-            channel="",
-        )
-        await cron.state_backend.append_record(
-            "paused/alpha",
-            {
-                "kind": "paused",
-                "since": now.isoformat(),
-                "until": until2.isoformat(),
-                "note": "",
-                "by": "",
-                "channel": "",
-                "at": now.isoformat(),
-                "host": "h",
-            },
-        )
-        await cron._refresh_pauses_from_store()
-        assert "ghost" not in cron._paused  # removed-job stream skipped
-        assert cron._paused["alpha"].until == until2  # window replaced
-    finally:
-        await _retryclaim_stop(cron)
+    cron = await stateful_cron(TWO_JOBS)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    until1 = now + datetime.timedelta(hours=1)
+    until2 = now + datetime.timedelta(hours=2)
+    # a stream for a job not in the config: the sweep skips it entirely
+    await cron.state_backend.append_record(
+        "paused/ghost",
+        {
+            "kind": "paused",
+            "since": now.isoformat(),
+            "until": until1.isoformat(),
+            "note": "",
+            "by": "",
+            "channel": "",
+            "at": now.isoformat(),
+            "host": "h",
+        },
+    )
+    # alpha already paused in memory with a DIFFERENT window: the store's
+    # newer window replaces it and banks the one it superseded.
+    cron._paused["alpha"] = cronstable.cron.PauseInfo(
+        since=now - datetime.timedelta(minutes=30),
+        until=until1,
+        note="",
+        by="",
+        channel="",
+    )
+    await cron.state_backend.append_record(
+        "paused/alpha",
+        {
+            "kind": "paused",
+            "since": now.isoformat(),
+            "until": until2.isoformat(),
+            "note": "",
+            "by": "",
+            "channel": "",
+            "at": now.isoformat(),
+            "host": "h",
+        },
+    )
+    await cron._refresh_pauses_from_store()
+    assert "ghost" not in cron._paused  # removed-job stream skipped
+    assert cron._paused["alpha"].until == until2  # window replaced
 
 
 # --- SLA banking / observations / report ----------------------------------
@@ -300,9 +269,10 @@ async def test_retryclaim_queue_sla_report_reraises_cancelled(monkeypatch):
 async def test_retryclaim_web_resume_job_rejects_nonstring_by():
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
 
+    # stays local (finding B6): the shared tests.conftest.Req carries no
+    # request body, and this handler reads can_read_body + json().
     class Req:
         can_read_body = True
         match_info = {"name": "alpha"}
@@ -386,25 +356,22 @@ async def test_retryclaim_queue_retry_write_orders_behind_prev_no_backend():
 
 @pytest.mark.asyncio
 async def test_retryclaim_append_retry_record_survives_backend_error(
-    tmp_path, caplog
+    stateful_cron, caplog
 ):
     import logging
 
-    cron = await _retryclaim_stateful(tmp_path, TWO_JOBS)
-    try:
+    cron = await stateful_cron(TWO_JOBS)
 
-        async def _boom(*a, **k):
-            raise OSError("disk gone")
+    async def _boom(*a, **k):
+        raise OSError("disk gone")
 
-        cron.state_backend.append_record = _boom
-        with caplog.at_level(logging.WARNING, logger="cronstable"):
-            await cron._append_retry_record("alpha", {"kind": "settled"})
-        assert any(
-            "failed to persist retry state" in r.getMessage()
-            for r in caplog.records
-        )
-    finally:
-        await _retryclaim_stop(cron)
+    cron.state_backend.append_record = _boom
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron._append_retry_record("alpha", {"kind": "settled"})
+    assert any(
+        "failed to persist retry state" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio
@@ -752,7 +719,8 @@ async def test_retryclaim_maybe_claim_retry_guards(monkeypatch):
 async def test_retryclaim_maybe_claim_retry_disabled_or_no_retries(monkeypatch):
     import types
 
-    cron = cronstable.cron.Cron(None, config_yaml=_RETRYCLAIM_RETRY_JOB_NO_RETRY)
+    # _PLAIN_JOB: the same job with no onFailure.retry block at all
+    cron = cronstable.cron.Cron(None, config_yaml=_PLAIN_JOB)
     monkeypatch.setattr(cron, "_retry_cross_node_eligible", lambda job: True)
     cron.state_backend = types.SimpleNamespace()
     # maximumRetries defaults to 0 for a job with no onFailure.retry block
@@ -835,52 +803,49 @@ async def test_retryclaim_maybe_claim_retry_release_error_swallowed(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_retryclaim_maybe_claim_retry_claims_and_arms(tmp_path, monkeypatch):
+async def test_retryclaim_maybe_claim_retry_claims_and_arms(
+    stateful_cron, monkeypatch
+):
     import types
 
     from cronstable.fingerprint import job_digest
 
-    cron = await _retryclaim_stateful(
-        tmp_path, _RETRYCLAIM_RETRY_JOB, extra="  topology: shared\n"
+    cron = await stateful_cron(
+        _RETRYCLAIM_RETRY_JOB, extra_state="  topology: shared\n"
     )
-    try:
-        cron._elect_leader_configured = True
-        cron.cluster_manager = types.SimpleNamespace(
-            distribution="single-leader",
-            is_leader=lambda: True,
-            is_quorate=lambda: True,
-            has_conflict=lambda: False,
-            view_settled=lambda: True,
-            is_available_leader=lambda: True,
-        )
-        assert cron._retry_resume_active() is True
-        cron._state_host = "node-b"
-        job = cron.cron_jobs["j"]
-        foreign = _retryclaim_foreign(cron, job, host="node-a")
-        await cron.state_backend.append_record("retries/j", foreign)
-        armed = []
+    cron._elect_leader_configured = True
+    cron.cluster_manager = types.SimpleNamespace(
+        distribution="single-leader",
+        is_leader=lambda: True,
+        is_quorate=lambda: True,
+        has_conflict=lambda: False,
+        view_settled=lambda: True,
+        is_available_leader=lambda: True,
+    )
+    assert cron._retry_resume_active() is True
+    cron._state_host = "node-b"
+    job = cron.cron_jobs["j"]
+    foreign = _retryclaim_foreign(cron, job, host="node-a")
+    await cron.state_backend.append_record("retries/j", foreign)
+    armed = []
 
-        async def _fake_sched(name, delay, attempt):
-            armed.append((name, delay, attempt))
+    async def _fake_sched(name, delay, attempt):
+        armed.append((name, delay, attempt))
 
-        monkeypatch.setattr(cron, "schedule_retry_job", _fake_sched)
-        await cron._maybe_claim_retry("j", job)
-        assert "j" in cron.retry_state  # claimed and armed a local ladder
-        # the ladder arms via asyncio.create_task; let it run once so the
-        # scheduling call lands before we assert on it.
-        await cron.retry_state["j"].task
-        assert armed and armed[0][0] == "j" and armed[0][2] == 1
-        from tests.test_state import _drain_state_writes
-
-        await _drain_state_writes(cron)
-        recs = await cron.state_backend.list_records(
-            "retries/j", limit=1, newest_first=True
-        )
-        assert recs[0]["host"] == "node-b"
-        assert recs[0]["claimedFrom"] == "node-a"
-        assert recs[0]["jobDigest"] == job_digest(job)
-    finally:
-        await _retryclaim_stop(cron)
+    monkeypatch.setattr(cron, "schedule_retry_job", _fake_sched)
+    await cron._maybe_claim_retry("j", job)
+    assert "j" in cron.retry_state  # claimed and armed a local ladder
+    # the ladder arms via asyncio.create_task; let it run once so the
+    # scheduling call lands before we assert on it.
+    await cron.retry_state["j"].task
+    assert armed and armed[0][0] == "j" and armed[0][2] == 1
+    await _drain_state_writes(cron)
+    recs = await cron.state_backend.list_records(
+        "retries/j", limit=1, newest_first=True
+    )
+    assert recs[0]["host"] == "node-b"
+    assert recs[0]["claimedFrom"] == "node-a"
+    assert recs[0]["jobDigest"] == job_digest(job)
 
 
 # --- _claim_retry_under_lease ---------------------------------------------
@@ -897,93 +862,81 @@ async def test_retryclaim_claim_under_lease_no_backend_false():
 
 
 @pytest.mark.asyncio
-async def test_retryclaim_claim_under_lease_recheck_mismatch_false(tmp_path):
-    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
-    try:
-        cron._state_host = "node-b"
-        job = cron.cron_jobs["j"]
-        foreign = _retryclaim_foreign(cron, job, host="node-a")
-        await cron.state_backend.append_record("retries/j", foreign)
-        now = cronstable.cron.get_now(datetime.timezone.utc)
-        # the record we "saw" differs from what is now newest -> declined
-        stale_view = dict(foreign, attempt=2)
-        ok = await cron._claim_retry_under_lease(
-            "j", job, stale_view, 2, now
-        )
-        assert ok is False
-    finally:
-        await _retryclaim_stop(cron)
+async def test_retryclaim_claim_under_lease_recheck_mismatch_false(
+    stateful_cron,
+):
+    cron = await stateful_cron(_RETRYCLAIM_RETRY_JOB)
+    cron._state_host = "node-b"
+    job = cron.cron_jobs["j"]
+    foreign = _retryclaim_foreign(cron, job, host="node-a")
+    await cron.state_backend.append_record("retries/j", foreign)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    # the record we "saw" differs from what is now newest -> declined
+    stale_view = dict(foreign, attempt=2)
+    ok = await cron._claim_retry_under_lease("j", job, stale_view, 2, now)
+    assert ok is False
 
 
 @pytest.mark.asyncio
-async def test_retryclaim_claim_under_lease_list_error_false(tmp_path, monkeypatch):
-    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
-    try:
-        job = cron.cron_jobs["j"]
-        now = cronstable.cron.get_now(datetime.timezone.utc)
+async def test_retryclaim_claim_under_lease_list_error_false(stateful_cron):
+    cron = await stateful_cron(_RETRYCLAIM_RETRY_JOB)
+    job = cron.cron_jobs["j"]
+    now = cronstable.cron.get_now(datetime.timezone.utc)
 
-        async def _boom(*a, **k):
-            raise OSError("read fail")
+    async def _boom(*a, **k):
+        raise OSError("read fail")
 
-        cron.state_backend.list_records = _boom
-        ok = await cron._claim_retry_under_lease("j", job, {}, 1, now)
-        assert ok is False
-    finally:
-        await _retryclaim_stop(cron)
+    cron.state_backend.list_records = _boom
+    ok = await cron._claim_retry_under_lease("j", job, {}, 1, now)
+    assert ok is False
 
 
 @pytest.mark.asyncio
 async def test_retryclaim_claim_under_lease_durable_read_error_false(
-    tmp_path, monkeypatch
+    stateful_cron, monkeypatch
 ):
-    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
-    try:
-        cron._state_host = "node-b"
-        job = cron.cron_jobs["j"]
-        foreign = _retryclaim_foreign(cron, job, host="node-a")
-        await cron.state_backend.append_record("retries/j", foreign)
+    cron = await stateful_cron(_RETRYCLAIM_RETRY_JOB)
+    cron._state_host = "node-b"
+    job = cron.cron_jobs["j"]
+    foreign = _retryclaim_foreign(cron, job, host="node-a")
+    await cron.state_backend.append_record("retries/j", foreign)
 
-        async def _boom(name):
-            raise OSError("ledger read fail")
+    async def _boom(name):
+        raise OSError("ledger read fail")
 
-        monkeypatch.setattr(cron, "durable_last_completed_at", _boom)
-        ok = await cron._claim_retry_under_lease(
-            "j", job, foreign, 1, foreign_notbefore(foreign)
-        )
-        assert ok is False
-    finally:
-        await _retryclaim_stop(cron)
+    monkeypatch.setattr(cron, "durable_last_completed_at", _boom)
+    ok = await cron._claim_retry_under_lease(
+        "j", job, foreign, 1, foreign_notbefore(foreign)
+    )
+    assert ok is False
 
 
 @pytest.mark.asyncio
-async def test_retryclaim_claim_under_lease_superseded_by_run(tmp_path, monkeypatch):
-    cron = await _retryclaim_stateful(tmp_path, _RETRYCLAIM_RETRY_JOB)
-    try:
-        cron._state_host = "node-b"
-        job = cron.cron_jobs["j"]
-        foreign = _retryclaim_foreign(cron, job, host="node-a")
-        await cron.state_backend.append_record("retries/j", foreign)
-        now = cronstable.cron.get_now(datetime.timezone.utc)
-        later = (now + datetime.timedelta(minutes=1)).isoformat()
+async def test_retryclaim_claim_under_lease_superseded_by_run(
+    stateful_cron, monkeypatch
+):
+    cron = await stateful_cron(_RETRYCLAIM_RETRY_JOB)
+    cron._state_host = "node-b"
+    job = cron.cron_jobs["j"]
+    foreign = _retryclaim_foreign(cron, job, host="node-a")
+    await cron.state_backend.append_record("retries/j", foreign)
+    now = cronstable.cron.get_now(datetime.timezone.utc)
+    later = (now + datetime.timedelta(minutes=1)).isoformat()
 
-        async def _durable(name):
-            return later  # a run finished AFTER the ladder was armed
+    async def _durable(name):
+        return later  # a run finished AFTER the ladder was armed
 
-        monkeypatch.setattr(cron, "durable_last_completed_at", _durable)
-        ok = await cron._claim_retry_under_lease(
-            "j", job, foreign, 1, foreign_notbefore(foreign)
-        )
-        assert ok is False
-        from tests.test_state import _drain_state_writes
-
-        await _drain_state_writes(cron)
-        recs = await cron.state_backend.list_records(
-            "retries/j", limit=1, newest_first=True
-        )
-        assert recs[0]["kind"] == "settled"
-        assert recs[0]["reason"] == "superseded-by-run"
-    finally:
-        await _retryclaim_stop(cron)
+    monkeypatch.setattr(cron, "durable_last_completed_at", _durable)
+    ok = await cron._claim_retry_under_lease(
+        "j", job, foreign, 1, foreign_notbefore(foreign)
+    )
+    assert ok is False
+    await _drain_state_writes(cron)
+    recs = await cron.state_backend.list_records(
+        "retries/j", limit=1, newest_first=True
+    )
+    assert recs[0]["kind"] == "settled"
+    assert recs[0]["reason"] == "superseded-by-run"
 
 
 def foreign_notbefore(rec):

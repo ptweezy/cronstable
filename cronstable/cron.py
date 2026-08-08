@@ -21,7 +21,7 @@ import ssl
 import zlib
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
-from functools import lru_cache, partial
+from functools import lru_cache, partial, wraps
 from typing import (  # noqa
     TYPE_CHECKING,
     Any,
@@ -576,6 +576,28 @@ def _http_for_action_error(
     }
     factory = status_map.get(ex.status, web.HTTPBadRequest)
     return _api_error(factory, ex.message, headers)
+
+
+def _maps_action_errors(
+    handler: Callable[["Cron", web.Request], Awaitable[web.Response]],
+) -> Callable[["Cron", web.Request], Awaitable[web.Response]]:
+    """Translate an escaping :class:`ApiActionError` into its HTTP response.
+
+    The ONE spelling of the ``except ApiActionError`` tail the action and
+    state-inspection handlers used to each repeat.  The status mapping and
+    the headers-on-409 rule live in :meth:`Cron._action_http_error` (the
+    state-inspection payloads never raise 409, so that rule is inert for
+    them).
+    """
+
+    @wraps(handler)
+    async def wrapper(self: "Cron", request: web.Request) -> web.Response:
+        try:
+            return await handler(self, request)
+        except ApiActionError as ex:
+            raise self._action_http_error(ex) from ex
+
+    return wrapper
 
 
 @web.middleware
@@ -4461,6 +4483,7 @@ class Cron:
         *,
         spawn: Callable[[Coroutine[Any, Any, None]], asyncio.Task],
         after: Optional[Iterable[Optional[asyncio.Task]]] = None,
+        bug_log: str | None = None,
     ) -> asyncio.Task:
         """Spawn ``body()`` behind ``name``'s current tail and become the tail.
 
@@ -4479,6 +4502,10 @@ class Cron:
         closes when it sheds a write under overload, and a coroutine built
         eagerly by the caller would then never be awaited nor closed (a
         ``RuntimeWarning`` per shed write, an error under ``-W error``).
+
+        ``bug_log`` (a format string taking ``name``) logs-and-swallows
+        the body's unexpected exceptions instead of losing them to the
+        task object; cancellation always propagates.
         """
         earlier = list(after) if after is not None else [tail.get(name)]
 
@@ -4486,7 +4513,15 @@ class Cron:
             for prev in earlier:
                 if prev is not None and not prev.done():
                     await asyncio.wait({prev})
-            await body()
+            if bug_log is None:
+                await body()
+                return
+            try:
+                await body()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(bug_log, name)
 
         task = spawn(_ordered())
         tail[name] = task
@@ -4533,51 +4568,38 @@ class Cron:
         )
         report_config = job.onLate["report"]
 
-        async def _report() -> None:
-            try:
-                await report_sla_breach(ctx, report_config)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover - defensive
-                logger.exception(
-                    "Unexpected error reporting the SLA breach of job %s; "
-                    "please report this as a bug (7)",
-                    name,
-                )
-
         self._install_tail_task(
             self._sla_report_tail,
             name,
-            _report,
+            lambda: report_sla_breach(ctx, report_config),
             spawn=self._spawn_completion,
             after=[
                 self._completion_tail.get(name),
                 self._sla_report_tail.get(name),
             ],
+            bug_log="Unexpected error reporting the SLA breach of job %s; "
+            "please report this as a bug (7)",
         )
 
+    @_maps_action_errors
     async def _web_start_job(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        try:
-            await self.start_job_by_name(name)
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        await self.start_job_by_name(name)
         # a minimal JSON ack in the MCP cron_run_job shape; this route once
         # returned an empty 200 while every sibling action returned JSON.
         return _json_response({"started": name}, headers=self._web_headers())
 
+    @_maps_action_errors
     async def _web_cancel_job(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
-        try:
-            count = await self.cancel_job_by_name(name)
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        count = await self.cancel_job_by_name(name)
         # the MCP cron_cancel_job shape, instances included
         return _json_response(
             {"cancelled": name, "instances": count},
             headers=self._web_headers(),
         )
 
+    @_maps_action_errors
     async def _web_pause_job(self, request: web.Request) -> web.Response:
         body = await self._web_json_body(request)
         duration = body.get("durationSeconds")
@@ -4608,30 +4630,25 @@ class Cron:
         by = body.get("by")
         if by is not None and not isinstance(by, str):
             raise _api_error(web.HTTPBadRequest, "by must be a string")
-        try:
-            paused = await self.pause_job_by_name(
-                request.match_info["name"],
-                duration=duration,
-                until=until,
-                note=note or "",
-                by=by or "api",
-                channel="api",
-            )
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        paused = await self.pause_job_by_name(
+            request.match_info["name"],
+            duration=duration,
+            until=until,
+            note=note or "",
+            by=by or "api",
+            channel="api",
+        )
         return _json_response({"paused": paused}, headers=self._web_headers())
 
+    @_maps_action_errors
     async def _web_resume_job(self, request: web.Request) -> web.Response:
         body = await self._web_json_body(request)
         by = body.get("by")
         if by is not None and not isinstance(by, str):
             raise _api_error(web.HTTPBadRequest, "by must be a string")
-        try:
-            await self.resume_job_by_name(
-                request.match_info["name"], by=by or "api", channel="api"
-            )
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        await self.resume_job_by_name(
+            request.match_info["name"], by=by or "api", channel="api"
+        )
         return _json_response({"paused": None}, headers=self._web_headers())
 
     def _action_http_error(self, ex: "ApiActionError") -> web.HTTPException:
@@ -5238,13 +5255,11 @@ class Cron:
                 out.append(doc)
         return {"namespace": ns, "documents": out}
 
+    @_maps_action_errors
     async def _web_state_documents(self, request: web.Request) -> web.Response:
-        try:
-            payload = await self.state_documents_payload(
-                request.query.get("ns", "")
-            )
-        except ApiActionError as ex:
-            raise _http_for_action_error(ex) from ex
+        payload = await self.state_documents_payload(
+            request.query.get("ns", "")
+        )
         return _json_response(payload, headers=self._web_headers())
 
     async def state_records_payload(
@@ -5281,16 +5296,14 @@ class Cron:
             recs = []
         return {"stream": stream, "records": recs}
 
+    @_maps_action_errors
     async def _web_state_records(self, request: web.Request) -> web.Response:
         limit = self._web_int_query(
             request, "limit", default=100, lo=1, hi=500
         )
-        try:
-            payload = await self.state_records_payload(
-                request.query.get("stream", ""), limit=limit
-            )
-        except ApiActionError as ex:
-            raise _http_for_action_error(ex) from ex
+        payload = await self.state_records_payload(
+            request.query.get("stream", ""), limit=limit
+        )
         return _json_response(payload, headers=self._web_headers())
 
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
@@ -6319,6 +6332,29 @@ class Cron:
             if key not in ("shareNodeStats", "observabilityMesh")
         }
 
+    @staticmethod
+    def _backend_start_errors() -> tuple[type[Exception], ...]:
+        """The operational failures a gossip/lease backend start may raise.
+
+        The one swallow list for start_stop_cluster and
+        start_stop_observability, so the two cannot drift.
+        ``aiohttp.ClientError`` / ``asyncio.TimeoutError`` cover a lease
+        backend that cannot reach or authenticate to its store at start(),
+        an operational misconfiguration to log, not the generic "report a
+        bug" path (a ClientResponseError on a rejected token is not
+        OSError). Built per call, never a module constant: naming
+        ``aiohttp.ClientError`` at module scope would open the lazy
+        aiohttp door on import (see :class:`_AiohttpDoor`).
+        """
+        return (
+            OSError,
+            ssl.SSLError,
+            ValueError,
+            ConfigError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        )
+
     async def start_stop_cluster(
         self, cluster_config: Optional[ClusterConfig]
     ) -> None:
@@ -6473,22 +6509,11 @@ class Cron:
                     and cluster_config.get("observabilityMesh") is None,
                 )
                 await manager.start()
-            except (
-                OSError,
-                ssl.SSLError,
-                ValueError,
-                ConfigError,
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-            ) as ex:
+            except self._backend_start_errors() as ex:
                 # bad cert/credential files / bad listen address / port already
                 # in use / unreachable setup: log and keep running jobs rather
                 # than aborting the reload. (A backend cleans up its own
-                # half-started state on failure.) aiohttp.ClientError /
-                # asyncio.TimeoutError cover a lease backend that cannot reach
-                # or authenticate to its store at start(), an operational
-                # misconfiguration to log, not the generic "report a bug" path
-                # (a ClientResponseError on a rejected token is not OSError).
+                # half-started state on failure.)
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
@@ -6589,14 +6614,7 @@ class Cron:
                     ),
                 )
                 await mgr.start()
-            except (
-                OSError,
-                ssl.SSLError,
-                ValueError,
-                ConfigError,
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-            ) as ex:
+            except self._backend_start_errors() as ex:
                 # same swallow-and-keep-running contract as the election
                 # backend: a bad overlay cert/listen/peer must not stop jobs.
                 logger.error("cluster.observability: failed to start: %s", ex)
@@ -11219,25 +11237,18 @@ class Cron:
         name = job.config.name
 
         async def _handle() -> None:
-            try:
-                if failed:
-                    await self.handle_job_failure(job)
-                else:
-                    await self.handle_job_success(job)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover - defensive
-                logger.exception(
-                    "Unexpected error handling the completion of job %s; "
-                    "please report this as a bug (8)",
-                    name,
-                )
+            if failed:
+                await self.handle_job_failure(job)
+            else:
+                await self.handle_job_success(job)
 
         self._install_tail_task(
             self._completion_tail,
             name,
             _handle,
             spawn=self._spawn_completion,
+            bug_log="Unexpected error handling the completion of job %s; "
+            "please report this as a bug (8)",
         )
 
     async def _drain_completions(self) -> None:

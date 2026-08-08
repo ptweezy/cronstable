@@ -8,6 +8,7 @@ import pytest
 
 import cronstable.cron
 from cronstable.job import JobOutputStream
+from tests._configs import DISABLED_JOB
 from tests._cron_helpers import (
     _SUBMINUTE_NOFIRE,
     _WEB_ONE_JOB,
@@ -20,6 +21,54 @@ from tests._cron_helpers import (
     _wait_until,
     fixed_current_time,  # noqa: F401
 )
+from tests._helpers import _drain_state_writes, _state_cfg
+from tests.conftest import Req, _cron
+
+
+@pytest.fixture
+async def start_web_app():
+    """Start a cron's real web app with teardown guaranteed (finding B1:
+    the start_stop_web_app try/finally idiom).
+
+    ``await start_web_app(cron, config, *mcp)`` forwards to
+    cron.start_stop_web_app and registers the cron.  Teardown clears every
+    registered app (idempotent, so a test that already cleared its own is
+    unaffected), then lets the Proactor's connection transports finish
+    closing before the loop is torn down (the aiohttp-documented Windows
+    grace period); otherwise their GC-time repr can raise "I/O operation
+    on closed pipe" as a PytestUnraisableExceptionWarning.
+    """
+    crons = []
+
+    async def start(cron, config, *mcp):
+        crons.append(cron)
+        await cron.start_stop_web_app(config, *mcp)
+
+    yield start
+    for cron in reversed(crons):
+        await cron.start_stop_web_app(None)
+    await asyncio.sleep(0.25)
+
+
+@pytest.fixture
+async def run_cron():
+    """Drive cron.run() as a background task with a guaranteed graceful
+    stop (finding B1: the signal_shutdown try/finally idiom).  Teardown
+    signals shutdown and drains the task with the same 5s bound the
+    try/finally sites used; a test that already stopped its own cron is
+    unaffected (signal_shutdown is idempotent and the task already done).
+    """
+    running = []
+
+    def start(cron):
+        task = asyncio.create_task(cron.run())
+        running.append((cron, task))
+        return task
+
+    yield start
+    for cron, task in reversed(running):
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=5)
 
 
 def test_resolve_web_token_value():
@@ -217,7 +266,7 @@ async def test_origin_middleware_blocks_cross_site_mutations():
 
 
 @pytest.mark.asyncio
-async def test_web_app_origin_gate_end_to_end():
+async def test_web_app_origin_gate_end_to_end(start_web_app):
     # the gate is wired into the real app even with NO authToken configured
     # (the default posture the CSRF gate exists for): a cross-site POST is
     # refused before the handler, while same-origin and Origin-less requests
@@ -225,29 +274,21 @@ async def test_web_app_origin_gate_end_to_end():
     import aiohttp
 
     cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
-    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                base + "/jobs/test/start",
-                headers={"Origin": "https://evil.example"},
-            ) as resp:
-                assert resp.status == 403
-            async with session.post(
-                base + "/jobs/test/start", headers={"Origin": base}
-            ) as resp:
-                assert resp.status == 409
-            async with session.post(base + "/jobs/test/start") as resp:
-                assert resp.status == 409
-    finally:
-        await cron.start_stop_web_app(None)
-        # let the Proactor's connection transports finish closing before the
-        # loop is torn down (the aiohttp-documented Windows grace period);
-        # otherwise their GC-time repr can raise "I/O operation on closed
-        # pipe" as a PytestUnraisableExceptionWarning.
-        await asyncio.sleep(0.25)
+    await start_web_app(cron, {"listen": ["http://127.0.0.1:0"]})
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            base + "/jobs/test/start",
+            headers={"Origin": "https://evil.example"},
+        ) as resp:
+            assert resp.status == 403
+        async with session.post(
+            base + "/jobs/test/start", headers={"Origin": base}
+        ) as resp:
+            assert resp.status == 409
+        async with session.post(base + "/jobs/test/start") as resp:
+            assert resp.status == 409
 
 
 def test_web_site_from_url_bad_scheme():
@@ -263,38 +304,20 @@ def test_web_site_from_url_malformed_http():
 
 
 @pytest.mark.asyncio
-async def test_start_web_app_ignores_bad_listen_urls():
+async def test_start_web_app_ignores_bad_listen_urls(start_web_app):
     # an unusable listen url is skipped, not surfaced as an exception
     cron = cronstable.cron.Cron(None)
     bad_config = {"listen": ["ftp://localhost:1234", "http://"]}
-    try:
-        await cron.start_stop_web_app(bad_config)  # must not raise
-    finally:
-        await cron.start_stop_web_app(None)  # tear down the runner
-
-
-DISABLED_JOB = """
-jobs:
-  - name: test
-    command: echo hi
-    schedule: "* * * * *"
-    enabled: false
-"""
+    await start_web_app(cron, bad_config)  # must not raise
 
 
 @pytest.mark.asyncio
 async def test_web_start_disabled_job_refused():
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
-    cron.web_config = {}
-
-    class Req:
-        match_info = {"name": "test"}
-        headers: dict = {}
-
+    cron = _cron(DISABLED_JOB)
     with pytest.raises(web.HTTPConflict):
-        await cron._web_start_job(Req())
+        await cron._web_start_job(Req(match={"name": "test"}))
     # the disabled job must not have been launched
     assert not cron.running_jobs
 
@@ -303,13 +326,10 @@ async def test_web_start_disabled_job_refused():
 async def test_web_status_reports_disabled():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
-    cron.web_config = {}
-
-    class Req:
-        headers = {"Accept": "application/json"}
-
-    resp = await cron._web_get_status(Req())
+    cron = _cron(DISABLED_JOB)
+    resp = await cron._web_get_status(
+        Req(headers={"Accept": "application/json"})
+    )
     data = json.loads(resp.text)
     assert data[0]["status"] == "disabled"
 
@@ -322,12 +342,10 @@ async def test_web_status_and_job_set_id_accept_negotiation():
     # the classic text form every existing script parses.
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=DISABLED_JOB)
-    cron.web_config = {}
+    cron = _cron(DISABLED_JOB)
 
-    class Req:
-        def __init__(self, accept=None):
-            self.headers = {} if accept is None else {"Accept": accept}
+    def req(accept):
+        return Req(headers={} if accept is None else {"Accept": accept})
 
     for accept in (
         "application/json",
@@ -335,15 +353,15 @@ async def test_web_status_and_job_set_id_accept_negotiation():
         "text/html, application/json;q=0.9",
         "APPLICATION/JSON; charset=utf-8",
     ):
-        resp = await cron._web_get_status(Req(accept))
+        resp = await cron._web_get_status(req(accept))
         assert json.loads(resp.text)[0]["status"] == "disabled", accept
     for accept in (None, "*/*", "application/*", "text/plain"):
-        resp = await cron._web_get_status(Req(accept))
+        resp = await cron._web_get_status(req(accept))
         assert resp.content_type == "text/plain", accept
 
-    jresp = await cron._web_job_set_id(Req("application/json, */*"))
+    jresp = await cron._web_job_set_id(req("application/json, */*"))
     assert "job_set_id" in json.loads(jresp.text)
-    tresp = await cron._web_job_set_id(Req("*/*"))
+    tresp = await cron._web_job_set_id(req("*/*"))
     assert tresp.content_type == "text/plain"
 
 
@@ -351,12 +369,7 @@ async def test_web_status_and_job_set_id_accept_negotiation():
 async def test_web_list_jobs():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        headers: dict = {}
-
+    cron = _cron(TWO_JOBS)
     resp = await cron._web_list_jobs(Req())
     data = json.loads(resp.text)
     assert [j["name"] for j in data] == ["alpha", "beta"]
@@ -382,14 +395,10 @@ async def test_web_list_jobs_etag_304_and_invalidation():
     """GET /jobs serves a content ETag, 304s a matching conditional poll,
     keeps the tag stable while only the countdown moves, and moves it when
     job state changes."""
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
 
     def req(inm=None):
-        class Req:
-            headers = {} if inm is None else {"If-None-Match": inm}
-
-        return Req()
+        return Req(headers={} if inm is None else {"If-None-Match": inm})
 
     first = await cron._web_list_jobs(req())
     etag = first.headers["ETag"]
@@ -434,8 +443,7 @@ async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
     # by a stall between awaits (CPU steal on a loaded runner under
     # --cov inserts an extra build past the real 1.0s TTL).
     monkeypatch.setattr(cronstable.cron, "_JOBS_RESPONSE_TTL", 3600.0)
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     builds = []
     real_payload = cron.jobs_payload
 
@@ -445,15 +453,9 @@ async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
 
     monkeypatch.setattr(cron, "jobs_payload", counting_payload)
 
-    def req():
-        class Req:
-            headers: dict = {}
-
-        return Req()
-
-    first = await cron._web_list_jobs(req())
-    second = await cron._web_list_jobs(req())
-    third = await cron._web_list_jobs(req())
+    first = await cron._web_list_jobs(Req())
+    second = await cron._web_list_jobs(Req())
+    third = await cron._web_list_jobs(Req())
     assert len(builds) == 1  # one build served all three pollers
     assert second.headers["ETag"] == first.headers["ETag"]
     assert third.body == first.body
@@ -461,7 +463,7 @@ async def test_web_list_jobs_memo_shares_one_build(monkeypatch):
     # a recorded run changes the payload: the memo is busted and the next
     # poll rebuilds rather than serving the stale product out to the TTL.
     cron._record_run("alpha", _mk_run("failure"))
-    fresh = await cron._web_list_jobs(req())
+    fresh = await cron._web_list_jobs(Req())
     assert len(builds) == 2
     assert fresh.headers["ETag"] != first.headers["ETag"]
 
@@ -480,8 +482,7 @@ async def test_web_list_jobs_single_flight_shares_one_build(monkeypatch):
     # join exists.
     monkeypatch.setattr(cronstable.cron, "_JOBS_RESPONSE_TTL", 3600.0)
     monkeypatch.setattr(cronstable.cron, "_JOBS_SERIALIZE_OFFLOAD_MIN", 0)
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     builds = []
     release = threading.Event()
     real_product = cronstable.cron._jobs_response_product
@@ -496,17 +497,11 @@ async def test_web_list_jobs_single_flight_shares_one_build(monkeypatch):
         cronstable.cron, "_jobs_response_product", parked_product
     )
 
-    def req():
-        class Req:
-            headers: dict = {}
-
-        return Req()
-
-    tasks = [asyncio.create_task(cron._web_list_jobs(req()))]
+    tasks = [asyncio.create_task(cron._web_list_jobs(Req()))]
     try:
         await _wait_until(lambda: builds)
         tasks += [
-            asyncio.create_task(cron._web_list_jobs(req()))
+            asyncio.create_task(cron._web_list_jobs(Req()))
             for _ in range(7)
         ]
         # the state that proves the join: every task suspended (the
@@ -547,8 +542,7 @@ async def test_web_list_jobs_bust_mid_build_is_not_stored(monkeypatch):
     # rebuilds instead of inheriting the stale product.
     monkeypatch.setattr(cronstable.cron, "_JOBS_RESPONSE_TTL", 3600.0)
     monkeypatch.setattr(cronstable.cron, "_JOBS_SERIALIZE_OFFLOAD_MIN", 0)
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     calls = []
     release = threading.Event()
     real_product = cronstable.cron._jobs_response_product
@@ -562,13 +556,7 @@ async def test_web_list_jobs_bust_mid_build_is_not_stored(monkeypatch):
         cronstable.cron, "_jobs_response_product", gated_product
     )
 
-    def req():
-        class Req:
-            headers: dict = {}
-
-        return Req()
-
-    task = asyncio.create_task(cron._web_list_jobs(req()))
+    task = asyncio.create_task(cron._web_list_jobs(Req()))
     try:
         await _wait_until(lambda: calls)
         cron._bust_response_memos()
@@ -576,7 +564,7 @@ async def test_web_list_jobs_bust_mid_build_is_not_stored(monkeypatch):
         resp = await task
         assert resp.status == 200
         assert cron._jobs_response_memo.cached is None
-        follow_up = await cron._web_list_jobs(req())
+        follow_up = await cron._web_list_jobs(Req())
         assert follow_up.status == 200
         assert len(calls) == 2
     finally:
@@ -600,12 +588,7 @@ def _hdr_req(inm=None, ae=None):
         headers["If-None-Match"] = inm
     if ae is not None:
         headers["Accept-Encoding"] = ae
-
-    class Req:
-        pass
-
-    Req.headers = headers
-    return Req()
+    return Req(headers=headers)
 
 
 @pytest.mark.asyncio
@@ -617,9 +600,7 @@ async def test_web_list_dags_etag_304_and_gzip():
     import gzip as gzip_mod
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=_FAT_DAG)
-    cron.web_config = {}
-
+    cron = _cron(_FAT_DAG)
     first = await cron._web_list_dags(_hdr_req())
     etag = first.headers["ETag"]
     assert first.status == 200 and etag
@@ -656,9 +637,7 @@ async def test_web_get_cluster_negotiates_gzip_but_never_etags():
     Gzip stays negotiated (with the size floor) and Vary rides along."""
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
+    cron = _cron(TWO_JOBS)
     resp = await cron._web_get_cluster(_hdr_req(ae="gzip"))
     assert resp.status == 200
     assert resp.headers.get("ETag") is None
@@ -672,12 +651,7 @@ async def test_web_get_cluster_negotiates_gzip_but_never_etags():
 async def test_web_job_set_id():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        headers: dict = {}
-
+    cron = _cron(TWO_JOBS)
     resp = await cron._web_job_set_id(Req())
     assert resp.text == cron.job_set_id()
     # the id always carries the live scheme label (see cronstable.fingerprint;
@@ -686,10 +660,9 @@ async def test_web_job_set_id():
 
     assert resp.text.startswith(SCHEME_VERSION + ":")
 
-    class JsonReq:
-        headers = {"Accept": "application/json"}
-
-    resp = await cron._web_job_set_id(JsonReq())
+    resp = await cron._web_job_set_id(
+        Req(headers={"Accept": "application/json"})
+    )
     data = json.loads(resp.text)
     assert data["job_set_id"] == cron.job_set_id()
     assert data["jobs"] == 2
@@ -711,8 +684,7 @@ def test_job_set_id_logged_only_on_change(caplog):
 async def test_web_list_jobs_includes_last_run():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
         outcome="failure",
         exit_code=2,
@@ -721,10 +693,6 @@ async def test_web_list_jobs_includes_last_run():
         fail_reason="failsWhen=nonzeroReturn and retcode=2",
         output=JobOutputStream(),
     )
-
-    class Req:
-        headers: dict = {}
-
     resp = await cron._web_list_jobs(Req())
     data = json.loads(resp.text)
     last = data[0]["last_run"]
@@ -872,8 +840,6 @@ async def test_archive_snapshots_lines_at_record_time():
     # not whatever the ring holds when the persist task finally runs: a
     # back-to-back completion releases the superseded ring, and reading it
     # late would archive nothing.
-    from tests.test_state import _drain_state_writes
-
     cron = cronstable.cron.Cron(None, config_yaml=_ARCHIVE_JOB)
     backend = _GatedAppendBackend()
     cron.state_backend = backend
@@ -1018,18 +984,13 @@ async def test_start_stop_observability_none_is_noop():
 async def test_web_get_cluster_injects_local_node_stats():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
 
     class FakeMgr:
         def view_dict(self):
             return {"backend": "gossip", "peers": []}
 
     cron.cluster_manager = FakeMgr()
-
-    class Req:
-        headers: dict = {}
-
     resp = await cron._web_get_cluster(Req())
     data = json.loads(resp.text)
     # this node's own live load is always injected (local, free)
@@ -1041,12 +1002,7 @@ async def test_web_get_cluster_injects_local_node_stats():
 async def test_web_get_node_returns_resources():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        pass
-
+    cron = _cron(TWO_JOBS)
     resp = await cron._web_get_node(Req())
     data = json.loads(resp.text)
     assert data["node_name"]
@@ -1098,14 +1054,9 @@ async def test_job_to_dict_omits_running_resources_when_unmonitored():
 async def test_web_list_jobs_includes_history_and_timezone():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     for outcome in ("success", "failure", "success"):
         cron._record_run("alpha", _mk_run(outcome))
-
-    class Req:
-        headers: dict = {}
-
     resp = await cron._web_list_jobs(Req())
     data = json.loads(resp.text)
     alpha = data[0]
@@ -1127,18 +1078,14 @@ async def test_web_list_jobs_includes_history_and_timezone():
 async def test_web_job_runs_endpoint_returns_runs_and_stats():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     cron._record_run("alpha", _mk_run("success", dur=2.0))
     cron._record_run("alpha", _mk_run("failure", dur=4.0))
     cron._record_run("alpha", _mk_run("success", dur=6.0))
     cron._record_run("alpha", _mk_run("cancelled", dur=1.0))
 
-    class Req:
-        match_info = {"name": "alpha"}
-        query: dict = {}  # the runs listing reads its `limit` param
-
-    resp = await cron._web_job_runs(Req())
+    # the runs listing reads Req's (empty) query for its `limit` param
+    resp = await cron._web_job_runs(Req(match={"name": "alpha"}))
     body = json.loads(resp.text)
     assert body["name"] == "alpha"
     assert [r["outcome"] for r in body["runs"]] == [
@@ -1164,28 +1111,18 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
 async def test_web_job_runs_unknown_job_404():
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        match_info = {"name": "nope"}
-
+    cron = _cron(TWO_JOBS)
     with pytest.raises(web.HTTPNotFound):
-        await cron._web_job_runs(Req())
+        await cron._web_job_runs(Req(match={"name": "nope"}))
 
 
 @pytest.mark.asyncio
 async def test_web_job_runs_empty_history():
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        match_info = {"name": "alpha"}
-        query: dict = {}  # the runs listing reads its `limit` param
-
-    resp = await cron._web_job_runs(Req())
+    cron = _cron(TWO_JOBS)
+    # the runs listing reads Req's (empty) query for its `limit` param
+    resp = await cron._web_job_runs(Req(match={"name": "alpha"}))
     body = json.loads(resp.text)
     assert body["runs"] == []
     assert body["stats"]["total"] == 0
@@ -1200,16 +1137,12 @@ async def test_web_job_runs_honours_limit_param():
     # whole retained history, exactly the old behavior
     import json
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     for n in range(5):
         cron._record_run("alpha", _mk_run("success", dur=float(n + 1)))
-
-    class Req:
-        match_info = {"name": "alpha"}
-        query = {"limit": "2"}
-
-    resp = await cron._web_job_runs(Req())
+    resp = await cron._web_job_runs(
+        Req(match={"name": "alpha"}, query={"limit": "2"})
+    )
     body = json.loads(resp.text)
     assert [r["duration"] for r in body["runs"]] == [4.0, 5.0]  # newest kept
     assert body["stats"]["total"] == 5  # stats keep the whole window
@@ -1218,14 +1151,14 @@ async def test_web_job_runs_honours_limit_param():
 def test_web_int_query_reads_limit_before_its_legacy_alias():
     # count/per_job/runs had grown endpoint by endpoint; every capped
     # listing reads `limit` first and its original spelling still works
-    query_only_alias = type("Req", (), {"query": {"count": "7"}})()
+    query_only_alias = Req(query={"count": "7"})
     assert (
         cronstable.cron.Cron._web_int_query(
             query_only_alias, "limit", default=12, lo=1, hi=60, alias="count"
         )
         == 7
     )
-    both = type("Req", (), {"query": {"count": "7", "limit": "9"}})()
+    both = Req(query={"count": "7", "limit": "9"})
     assert (
         cronstable.cron.Cron._web_int_query(
             both, "limit", default=12, lo=1, hi=60, alias="count"
@@ -1259,16 +1192,9 @@ async def test_handler_errors_carry_the_json_envelope():
 
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class RunsReq:
-        match_info = {"name": "nope"}
-        headers: dict = {}
-        query: dict = {}
-
+    cron = _cron(TWO_JOBS)
     with pytest.raises(web.HTTPNotFound) as raised:
-        await cron._web_job_runs(RunsReq())
+        await cron._web_job_runs(Req(match={"name": "nope"}))
     assert raised.value.content_type == "application/json"
     assert json.loads(raised.value.text or "") == {
         "error": "job 'nope' not found"
@@ -1295,29 +1221,18 @@ async def test_handler_errors_carry_the_json_envelope():
 async def test_web_cancel_unknown_job_404():
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        match_info = {"name": "nope"}
-
+    cron = _cron(TWO_JOBS)
     with pytest.raises(web.HTTPNotFound):
-        await cron._web_cancel_job(Req())
+        await cron._web_cancel_job(Req(match={"name": "nope"}))
 
 
 @pytest.mark.asyncio
 async def test_web_cancel_not_running_409():
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        match_info = {"name": "alpha"}
-        headers: dict = {}
-
+    cron = _cron(TWO_JOBS)
     with pytest.raises(web.HTTPConflict):
-        await cron._web_cancel_job(Req())
+        await cron._web_cancel_job(Req(match={"name": "alpha"}))
 
 
 @pytest.mark.asyncio
@@ -1363,20 +1278,13 @@ async def test_handle_finished_job_records_cancelled(monkeypatch):
 async def test_web_cancel_running_job_terminates_and_records():
     # end-to-end: launch a real long-running job, cancel it via the endpoint,
     # and confirm it is actually terminated and recorded as "cancelled".
-    cron = cronstable.cron.Cron(
-        None, config_yaml=CONCURRENT_JOB.format(policy="Allow")
-    )
-    cron.web_config = {}
+    cron = _cron(CONCURRENT_JOB.format(policy="Allow"))
     job = cron.cron_jobs["test"]
     await cron.maybe_launch_job(job)
     rj = cron.running_jobs["test"][0]
     assert rj.proc.returncode is None
 
-    class Req:
-        match_info = {"name": "test"}
-        headers: dict = {}
-
-    resp = await cron._web_cancel_job(Req())
+    resp = await cron._web_cancel_job(Req(match={"name": "test"}))
     assert resp.status == 200
     # the MCP cron_cancel_job ack shape (this route once returned an
     # empty 200 while every sibling action returned JSON)
@@ -1398,14 +1306,9 @@ async def test_web_cancel_running_job_terminates_and_records():
 
 @pytest.mark.asyncio
 async def test_web_index_served():
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        # a real web.Request always carries headers; _web_index reads
-        # If-None-Match and Accept-Encoding off them.
-        headers: dict = {}
-
+    cron = _cron(TWO_JOBS)
+    # a real web.Request always carries headers; _web_index reads
+    # If-None-Match and Accept-Encoding off them (Req provides both).
     resp = await cron._web_index(Req())
     assert resp.content_type == "text/html"
     assert "cronstable" in resp.text
@@ -1414,14 +1317,7 @@ async def test_web_index_served():
 
 @pytest.mark.asyncio
 async def test_web_index_sets_security_headers():
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        # a real web.Request always carries headers; _web_index reads
-        # If-None-Match and Accept-Encoding off them.
-        headers: dict = {}
-
+    cron = _cron(TWO_JOBS)
     resp = await cron._web_index(Req())
     csp = resp.headers["Content-Security-Policy"]
     # self-contained app: no external connections, so the CSP confines any
@@ -1440,12 +1336,6 @@ async def test_web_index_security_headers_overridable():
     # while defaults the operator didn't set are still applied.
     cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
     cron.web_config = {"headers": {"X-Frame-Options": "SAMEORIGIN"}}
-
-    class Req:
-        # a real web.Request always carries headers; _web_index reads
-        # If-None-Match and Accept-Encoding off them.
-        headers: dict = {}
-
     resp = await cron._web_index(Req())
     assert resp.headers["X-Frame-Options"] == "SAMEORIGIN"  # operator override
     assert resp.headers["X-Content-Type-Options"] == "nosniff"  # default kept
@@ -1455,23 +1345,16 @@ async def test_web_index_security_headers_overridable():
 async def test_web_index_revalidates_with_304():
     # the dashboard is static package data, so a client that echoes the ETag
     # gets an empty 304 instead of another ~573 KB body.
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     _raw, etag = cronstable.cron._index_document()
 
-    class Req:
-        headers = {"If-None-Match": etag}
-
-    resp = await cron._web_index(Req())
+    resp = await cron._web_index(Req(headers={"If-None-Match": etag}))
     assert resp.status == 304
     assert resp.headers["ETag"] == etag
     assert not resp.body
 
     # a stale/absent validator still gets the full document
-    class ColdReq:
-        headers = {"If-None-Match": '"stale"'}
-
-    full = await cron._web_index(ColdReq())
+    full = await cron._web_index(Req(headers={"If-None-Match": '"stale"'}))
     assert full.status == 200
     assert full.body
 
@@ -1482,14 +1365,12 @@ async def test_web_index_serves_gzip_when_accepted():
     # decode back to exactly the identity body.
     import gzip as _gzip
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     raw, _etag = cronstable.cron._index_document()
 
-    class Req:
-        headers = {"Accept-Encoding": "gzip, deflate"}
-
-    resp = await cron._web_index(Req())
+    resp = await cron._web_index(
+        Req(headers={"Accept-Encoding": "gzip, deflate"})
+    )
     assert resp.status == 200
     assert resp.headers["Content-Encoding"] == "gzip"
     assert resp.headers["Vary"] == "Accept-Encoding"
@@ -1498,10 +1379,7 @@ async def test_web_index_serves_gzip_when_accepted():
 
     # a client that does not accept gzip still gets the identity body, and the
     # response still advertises that it varies on the header.
-    class PlainReq:
-        headers: dict = {}
-
-    plain = await cron._web_index(PlainReq())
+    plain = await cron._web_index(Req())
     assert "Content-Encoding" not in plain.headers
     assert plain.headers["Vary"] == "Accept-Encoding"
     assert plain.body == raw
@@ -1537,8 +1415,7 @@ async def test_web_job_logs_streams_last_run():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     out = JobOutputStream()
     out.publish("stdout", "hello world\n")
     out.publish("stderr", "uh oh\n")
@@ -1574,8 +1451,7 @@ async def test_web_job_logs_batches_live_bursts(monkeypatch):
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     out = JobOutputStream()
     out.publish("stdout", "replayed\n")
     cron.last_run["alpha"] = cronstable.cron.JobRunInfo(
@@ -1625,8 +1501,7 @@ async def test_web_job_logs_no_output():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     app = web.Application()
     app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
     async with TestClient(TestServer(app)) as client:
@@ -1641,8 +1516,7 @@ async def test_web_job_logs_unknown_job():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     app = web.Application()
     app.router.add_get("/jobs/{name}/logs", cron._web_job_logs)
     async with TestClient(TestServer(app)) as client:
@@ -1662,71 +1536,72 @@ async def test_web_job_logs_unknown_job():
 
 
 @pytest.mark.asyncio
-async def test_web_app_enforces_auth_when_token_configured():
+async def test_web_app_enforces_auth_when_token_configured(start_web_app):
     import aiohttp
 
     cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
-    await cron.start_stop_web_app(
+    await start_web_app(
+        cron,
         {
             "listen": ["http://127.0.0.1:0"],
             "authToken": {"value": "secret"},
             "ui": False,
-        }
+        },
     )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            # no credentials -> rejected
-            async with session.get(base + "/jobs") as resp:
-                assert resp.status == 401
-            # wrong token -> rejected
-            async with session.get(
-                base + "/jobs", headers={"Authorization": "Bearer nope"}
-            ) as resp:
-                assert resp.status == 401
-            # correct token -> the real jobs payload is served
-            async with session.get(
-                base + "/jobs", headers={"Authorization": "Bearer secret"}
-            ) as resp:
-                assert resp.status == 200
-                data = await resp.json()
-                assert [j["name"] for j in data] == ["alpha"]
-    finally:
-        await cron.start_stop_web_app(None)
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    async with aiohttp.ClientSession() as session:
+        # no credentials -> rejected
+        async with session.get(base + "/jobs") as resp:
+            assert resp.status == 401
+        # wrong token -> rejected
+        async with session.get(
+            base + "/jobs", headers={"Authorization": "Bearer nope"}
+        ) as resp:
+            assert resp.status == 401
+        # correct token -> the real jobs payload is served
+        async with session.get(
+            base + "/jobs", headers={"Authorization": "Bearer secret"}
+        ) as resp:
+            assert resp.status == 200
+            data = await resp.json()
+            assert [j["name"] for j in data] == ["alpha"]
     # clearing the config fully stops the server
+    await cron.start_stop_web_app(None)
     assert cron.web_runner is None
 
 
 @pytest.mark.asyncio
-async def test_web_app_ui_path_public_but_data_paths_require_auth():
+async def test_web_app_ui_path_public_but_data_paths_require_auth(
+    start_web_app,
+):
     import aiohttp
 
     cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
-    await cron.start_stop_web_app(
+    await start_web_app(
+        cron,
         {
             "listen": ["http://127.0.0.1:0"],
             "authToken": {"value": "secret"},
             "ui": True,
-        }
+        },
     )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        async with aiohttp.ClientSession() as session:
-            # the UI page holds no data, so it is reachable without a token
-            async with session.get(base + "/") as resp:
-                assert resp.status == 200
-                assert "text/html" in resp.headers["Content-Type"]
-            # a data endpoint still requires the token even with the UI enabled
-            async with session.get(base + "/jobs") as resp:
-                assert resp.status == 401
-    finally:
-        await cron.start_stop_web_app(None)
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    async with aiohttp.ClientSession() as session:
+        # the UI page holds no data, so it is reachable without a token
+        async with session.get(base + "/") as resp:
+            assert resp.status == 200
+            assert "text/html" in resp.headers["Content-Type"]
+        # a data endpoint still requires the token even with the UI enabled
+        async with session.get(base + "/jobs") as resp:
+            assert resp.status == 401
 
 
 @pytest.mark.asyncio
-async def test_web_json_endpoints_tolerate_operator_content_type():
+async def test_web_json_endpoints_tolerate_operator_content_type(
+    start_web_app,
+):
     # aiohttp refuses content_type= when the headers mapping already
     # carries a Content-Type, so an operator-configured web.headers
     # Content-Type used to 500 every route built by _json_response and
@@ -1736,35 +1611,33 @@ async def test_web_json_endpoints_tolerate_operator_content_type():
     import aiohttp
 
     cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
-    await cron.start_stop_web_app(
+    await start_web_app(
+        cron,
         {
             "listen": ["http://127.0.0.1:0"],
             "headers": {"content-type": "text/plain; charset=utf-8"},
             "ui": True,
-        }
+        },
     )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        expected = {
-            "/jobs": "application/json",
-            "/fleet": "application/json",
-            "/cluster": "application/json",
-            "/dags": "application/json",
-            "/": "text/html",
-            "/calendar.ics": "text/calendar",
-        }
-        async with aiohttp.ClientSession() as session:
-            for path, ctype in expected.items():
-                async with session.get(base + path) as resp:
-                    assert resp.status == 200, path
-                    assert resp.content_type == ctype, path
-    finally:
-        await cron.start_stop_web_app(None)
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    expected = {
+        "/jobs": "application/json",
+        "/fleet": "application/json",
+        "/cluster": "application/json",
+        "/dags": "application/json",
+        "/": "text/html",
+        "/calendar.ics": "text/calendar",
+    }
+    async with aiohttp.ClientSession() as session:
+        for path, ctype in expected.items():
+            async with session.get(base + path) as resp:
+                assert resp.status == 200, path
+                assert resp.content_type == ctype, path
 
 
 @pytest.mark.asyncio
-async def test_web_errors_carry_the_json_envelope():
+async def test_web_errors_carry_the_json_envelope(start_web_app):
     # every error body is one JSON envelope, including the three families
     # that used to escape as aiohttp's text/plain defaults: the auth
     # middleware's 401, the router's 404 on an unmatched path, and the
@@ -1773,33 +1646,33 @@ async def test_web_errors_carry_the_json_envelope():
     import aiohttp
 
     cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
-    await cron.start_stop_web_app(
+    await start_web_app(
+        cron,
         {
             "listen": ["http://127.0.0.1:0"],
             "authToken": {"value": "secret"},
             "ui": False,
-        }
+        },
     )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        auth = {"Authorization": "Bearer secret"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base + "/jobs") as resp:
-                assert resp.status == 401
-                assert resp.content_type == "application/json"
-                assert "error" in await resp.json()
-            async with session.get(base + "/no-such-route", headers=auth) as resp:
-                assert resp.status == 404
-                assert resp.content_type == "application/json"
-                assert "error" in await resp.json()
-            async with session.delete(base + "/jobs", headers=auth) as resp:
-                assert resp.status == 405
-                assert resp.content_type == "application/json"
-                assert "error" in await resp.json()
-                assert "GET" in resp.headers.get("Allow", "")
-    finally:
-        await cron.start_stop_web_app(None)
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    auth = {"Authorization": "Bearer secret"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(base + "/jobs") as resp:
+            assert resp.status == 401
+            assert resp.content_type == "application/json"
+            assert "error" in await resp.json()
+        async with session.get(
+            base + "/no-such-route", headers=auth
+        ) as resp:
+            assert resp.status == 404
+            assert resp.content_type == "application/json"
+            assert "error" in await resp.json()
+        async with session.delete(base + "/jobs", headers=auth) as resp:
+            assert resp.status == 405
+            assert resp.content_type == "application/json"
+            assert "error" in await resp.json()
+            assert "GET" in resp.headers.get("Allow", "")
 
 
 @pytest.mark.asyncio
@@ -1983,7 +1856,9 @@ def test_webloop_update_config_no_source_returns_empty():
 
 
 @pytest.mark.asyncio
-async def test_webloop_run_skips_subminute_housekeeping(monkeypatch):
+async def test_webloop_run_skips_subminute_housekeeping(
+    monkeypatch, run_cron
+):
     # a second-level job forces per-second ticking, so after the first pass the
     # once-a-minute housekeeping is SKIPPED on subsequent same-minute ticks (the
     # frozen clock keeps now_minute constant). The seconds (5/15) never include
@@ -1993,75 +1868,67 @@ async def test_webloop_run_skips_subminute_housekeeping(monkeypatch):
     )
     cron = cronstable.cron.Cron(None, config_yaml=_SUBMINUTE_NOFIRE)
     assert cron._needs_subminute() is True
-    task = asyncio.create_task(cron.run())
-    try:
-        await _wait_until(lambda: cron._last_housekeeping_minute is not None)
-        # let it iterate several more times within the same frozen minute
-        await asyncio.sleep(0.05)
-        assert not task.done()
-    finally:
-        cron.signal_shutdown()
-        await asyncio.wait_for(task, timeout=5)
+    task = run_cron(cron)
+    await _wait_until(lambda: cron._last_housekeeping_minute is not None)
+    # let it iterate several more times within the same frozen minute
+    await asyncio.sleep(0.05)
+    assert not task.done()
 
 
 @pytest.mark.asyncio
-async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch):
-    from tests.test_state import _state_cfg
-
+async def test_webloop_run_shutdown_teardown(tmp_path, monkeypatch, run_cron):
     # drive run()'s graceful-shutdown teardown across the observability overlay,
     # the slot renewers / catch-up / slot-pursuit task pools, the state-backend
     # block (with an empty pending-write set) and the web runner cleanup.
     monkeypatch.setattr("cronstable.cron.next_sleep_interval", lambda *a: 30)
     cron = cronstable.cron.Cron(None)
-    task = asyncio.create_task(cron.run())
+    task = run_cron(cron)
 
-    renewer = catchup = pursuit = None
     stopped = {"mesh": False}
 
-    try:
-        # let the loop finish its first housekeeping pass and park on the long
-        # sleep, then inject the teardown-path fixtures.
-        await asyncio.sleep(0.2)
+    # let the loop finish its first housekeeping pass and park on the long
+    # sleep, then inject the teardown-path fixtures.
+    await asyncio.sleep(0.2)
 
-        await cron.start_stop_state(
-            _state_cfg("state:\n  path: {}\n".format(tmp_path))
-        )
-        assert cron.state_backend is not None
+    await cron.start_stop_state(
+        _state_cfg("state:\n  path: {}\n".format(tmp_path))
+    )
+    assert cron.state_backend is not None
 
-        # drain any writes the backend startup queued, then neutralise
-        # _track_state_write so the final counter snapshot does not repopulate
-        # the pending set: the shutdown flush must see it EMPTY.
-        pend = list(cron._pending_state_writes)
-        if pend:
-            await asyncio.gather(*pend, return_exceptions=True)
-        monkeypatch.setattr(
-            cron, "_track_state_write", lambda coro: coro.close()
-        )
+    # drain any writes the backend startup queued, then neutralise
+    # _track_state_write so the final counter snapshot does not repopulate
+    # the pending set: the shutdown flush must see it EMPTY.
+    pend = list(cron._pending_state_writes)
+    if pend:
+        await asyncio.gather(*pend, return_exceptions=True)
+    monkeypatch.setattr(
+        cron, "_track_state_write", lambda coro: coro.close()
+    )
 
-        class Mesh:
-            async def stop(self):
-                stopped["mesh"] = True
+    class Mesh:
+        async def stop(self):
+            stopped["mesh"] = True
 
-        cron.observability_mesh = Mesh()
+    cron.observability_mesh = Mesh()
 
-        class Runner:
-            def __init__(self):
-                self.cleaned = False
+    class Runner:
+        def __init__(self):
+            self.cleaned = False
 
-            async def cleanup(self):
-                self.cleaned = True
+        async def cleanup(self):
+            self.cleaned = True
 
-        cron.web_runner = Runner()
+    cron.web_runner = Runner()
 
-        renewer = asyncio.create_task(asyncio.sleep(100))
-        cron._slot_renewers["s"] = renewer
-        catchup = asyncio.create_task(asyncio.sleep(100))
-        cron._catchup_tasks.add(catchup)
-        pursuit = asyncio.create_task(asyncio.sleep(100))
-        cron._slot_pursuits["p"] = pursuit
-    finally:
-        cron.signal_shutdown()
-        await asyncio.wait_for(task, timeout=5)
+    renewer = asyncio.create_task(asyncio.sleep(100))
+    cron._slot_renewers["s"] = renewer
+    catchup = asyncio.create_task(asyncio.sleep(100))
+    cron._catchup_tasks.add(catchup)
+    pursuit = asyncio.create_task(asyncio.sleep(100))
+    cron._slot_pursuits["p"] = pursuit
+
+    cron.signal_shutdown()
+    await asyncio.wait_for(task, timeout=5)
 
     await asyncio.gather(
         renewer, catchup, pursuit, return_exceptions=True
@@ -2086,7 +1953,9 @@ logging:
 
 
 @pytest.mark.asyncio
-async def test_webloop_run_applies_logging_config(tmp_path, monkeypatch):
+async def test_webloop_run_applies_logging_config(
+    tmp_path, monkeypatch, run_cron
+):
     monkeypatch.setattr(
         "cronstable.cron.next_sleep_interval", lambda *a: 0.01
     )
@@ -2098,17 +1967,15 @@ async def test_webloop_run_applies_logging_config(tmp_path, monkeypatch):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_LOGGING_CFG)
     cron = cronstable.cron.Cron(str(cfg))
-    task = asyncio.create_task(cron.run())
-    try:
-        await _wait_until(lambda: bool(applied))
-    finally:
-        cron.signal_shutdown()
-        await asyncio.wait_for(task, timeout=5)
+    run_cron(cron)
+    await _wait_until(lambda: bool(applied))
     assert applied[0] == {"version": 1}
 
 
 @pytest.mark.asyncio
-async def test_webloop_run_survives_logging_config_error(tmp_path, monkeypatch):
+async def test_webloop_run_survives_logging_config_error(
+    tmp_path, monkeypatch, run_cron
+):
     monkeypatch.setattr(
         "cronstable.cron.next_sleep_interval", lambda *a: 0.01
     )
@@ -2122,26 +1989,17 @@ async def test_webloop_run_survives_logging_config_error(tmp_path, monkeypatch):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(_LOGGING_CFG)
     cron = cronstable.cron.Cron(str(cfg))
-    task = asyncio.create_task(cron.run())
-    try:
-        await _wait_until(lambda: len(attempts) >= 1)
-        # a broken logging section is logged and the daemon keeps running.
-        assert not task.done()
-    finally:
-        cron.signal_shutdown()
-        await asyncio.wait_for(task, timeout=5)
+    task = run_cron(cron)
+    await _wait_until(lambda: len(attempts) >= 1)
+    # a broken logging section is logged and the daemon keeps running.
+    assert not task.done()
 
 
 @pytest.mark.asyncio
 async def test_webloop_web_get_version():
     import cronstable.version
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        headers: dict = {}
-
+    cron = _cron(TWO_JOBS)
     resp = await cron._web_get_version(Req())
     assert resp.text == cronstable.version.version
 
@@ -2150,15 +2008,12 @@ async def test_webloop_web_get_version():
 async def test_webloop_web_status_text_running_and_disabled():
     from types import SimpleNamespace
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     cron.running_jobs["alpha"] = [
         SimpleNamespace(proc=SimpleNamespace(pid=4321))
     ]
 
-    class Req:
-        headers: dict = {}  # no Accept header -> plain-text renderer
-
+    # no Accept header -> plain-text renderer
     resp = await cron._web_get_status(Req())
     assert "alpha: running (pid: 4321)" in resp.text
     assert "beta: disabled" in resp.text
@@ -2244,24 +2099,21 @@ async def test_webloop_web_dag_run_and_xcom(monkeypatch):
 
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
-
-    class Req:
-        match_info = {"name": "d", "run_key": "rk"}
+    cron = _cron(TWO_JOBS)
+    req = Req(match={"name": "d", "run_key": "rk"})
 
     async def none_run(name, run_key):
         return None
 
     monkeypatch.setattr(cron._dag, "get_run", none_run)
     with pytest.raises(web.HTTPNotFound):
-        await cron._web_dag_run(Req())
+        await cron._web_dag_run(req)
 
     async def some_run(name, run_key):
         return {"state": "ok"}
 
     monkeypatch.setattr(cron._dag, "get_run", some_run)
-    resp = await cron._web_dag_run(Req())
+    resp = await cron._web_dag_run(req)
     assert _json.loads(resp.text)["state"] == "ok"
 
     async def none_xcom(name, run_key):
@@ -2269,13 +2121,13 @@ async def test_webloop_web_dag_run_and_xcom(monkeypatch):
 
     monkeypatch.setattr(cron._dag, "xcom_for_run", none_xcom)
     with pytest.raises(web.HTTPNotFound):
-        await cron._web_dag_xcom(Req())
+        await cron._web_dag_xcom(req)
 
     async def some_xcom(name, run_key):
         return {"a": 1}
 
     monkeypatch.setattr(cron._dag, "xcom_for_run", some_xcom)
-    resp = await cron._web_dag_xcom(Req())
+    resp = await cron._web_dag_xcom(req)
     assert _json.loads(resp.text)["a"] == 1
 
 
@@ -2285,10 +2137,10 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
 
     from aiohttp import web
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
 
-    class Req:
+    # local fake request (not the shared Req): this handler reads a JSON body
+    class BackfillReq:
         can_read_body = True
 
         def __init__(self, body):
@@ -2300,7 +2152,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
 
     # non-string from/to -> 400
     with pytest.raises(web.HTTPBadRequest):
-        await cron._web_dag_backfill(Req({"from": 1, "to": 2}))
+        await cron._web_dag_backfill(BackfillReq({"from": 1, "to": 2}))
 
     async def bad_backfill(name, start, end):
         return {"ok": False, "reason": "nope"}
@@ -2308,7 +2160,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
     monkeypatch.setattr(cron._dag, "backfill", bad_backfill)
     with pytest.raises(web.HTTPBadRequest):
         await cron._web_dag_backfill(
-            Req({"from": "2020-01-01", "to": "2020-01-02"})
+            BackfillReq({"from": "2020-01-01", "to": "2020-01-02"})
         )
 
     async def ok_backfill(name, start, end):
@@ -2316,7 +2168,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
 
     monkeypatch.setattr(cron._dag, "backfill", ok_backfill)
     resp = await cron._web_dag_backfill(
-        Req({"from": "2020-01-01", "to": "2020-01-02"})
+        BackfillReq({"from": "2020-01-01", "to": "2020-01-02"})
     )
     assert _json.loads(resp.text)["runs"] == 2
 
@@ -2365,8 +2217,7 @@ def test_webloop_tail_payload_with_cursor():
 
 @pytest.mark.asyncio
 async def test_webloop_pump_output_handles_disconnect():
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     out = JobOutputStream()
     out.publish("stdout", "x\n")
     out.close()
@@ -2386,8 +2237,7 @@ async def test_webloop_web_job_logs_live_running():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
-    cron.web_config = {}
+    cron = _cron(TWO_JOBS)
     out = JobOutputStream()
     # a currently-running instance exposes its live output buffer.
     cron.running_jobs["alpha"] = [SimpleNamespace(output=out)]
@@ -2421,8 +2271,7 @@ async def test_webloop_web_dag_task_logs_unknown_dag():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=_DAG_LOGS_YAML)
-    cron.web_config = {}
+    cron = _cron(_DAG_LOGS_YAML)
     app = web.Application()
     app.router.add_get(
         "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
@@ -2438,8 +2287,7 @@ async def test_webloop_web_dag_task_logs_no_output():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=_DAG_LOGS_YAML)
-    cron.web_config = {}
+    cron = _cron(_DAG_LOGS_YAML)
     app = web.Application()
     app.router.add_get(
         "/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs",
@@ -2460,8 +2308,7 @@ async def test_webloop_web_dag_task_logs_live_running():
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
-    cron = cronstable.cron.Cron(None, config_yaml=_DAG_LOGS_YAML)
-    cron.web_config = {}
+    cron = _cron(_DAG_LOGS_YAML)
     out = JobOutputStream()
     dref = SimpleNamespace(run_key="rk", taskkey="a")
     # a running instance under the template name "<dag>.<task_id>" whose dag_ref
@@ -2500,7 +2347,7 @@ async def test_webloop_web_dag_task_logs_live_running():
 
 
 @pytest.mark.asyncio
-async def test_web_app_retries_bind_after_all_listens_fail():
+async def test_web_app_retries_bind_after_all_listens_fail(start_web_app):
     # A predecessor (here: a plain socket) still holds the only listen port,
     # so every bind fails. web_config must NOT latch: the unchanged latch is
     # what makes the next housekeeping pass retry, and latching it left the
@@ -2514,23 +2361,21 @@ async def test_web_app_retries_bind_after_all_listens_fail():
         port = blocker.getsockname()[1]
         listen = {"listen": ["http://127.0.0.1:{}".format(port)]}
         cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
-        try:
-            await cron.start_stop_web_app(listen)
-            assert cron.web_runner is None  # torn down, nothing half-bound
-            assert cron.web_config is None  # not latched: a retry will run
-            blocker.close()  # the old holder exits; the port frees
-            await cron.start_stop_web_app(listen)  # the next pass
-            assert cron.web_runner is not None
-            assert cron.web_runner.addresses
-        finally:
-            await cron.start_stop_web_app(None)
-            await asyncio.sleep(0.25)
+        await start_web_app(cron, listen)
+        assert cron.web_runner is None  # torn down, nothing half-bound
+        assert cron.web_config is None  # not latched: a retry will run
+        blocker.close()  # the old holder exits; the port frees
+        await cron.start_stop_web_app(listen)  # the next pass
+        assert cron.web_runner is not None
+        assert cron.web_runner.addresses
     finally:
         blocker.close()
 
 
 @pytest.mark.asyncio
-async def test_web_teardown_ends_open_sse_tails_promptly(monkeypatch):
+async def test_web_teardown_ends_open_sse_tails_promptly(
+    monkeypatch, start_web_app
+):
     # An SSE log tail never finishes on its own: site.stop() only closes the
     # listening socket and the 15s keep-alive pings keep succeeding on the
     # established connection. Without the on_shutdown drain, a teardown
@@ -2544,34 +2389,27 @@ async def test_web_teardown_ends_open_sse_tails_promptly(monkeypatch):
     live = JobOutputStream()
     live.publish("stdout", "hello")  # replay content the client can sync on
     monkeypatch.setattr(cron, "_job_output", lambda name: live)
-    await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        session = aiohttp.ClientSession()
-        try:
-            resp = await session.get(base + "/jobs/alpha/logs")
-            # the replayed frame proves the tail handler is up and
-            # subscribed (frame shape: "event: <name>" then "data: <line>")
-            event_line = await resp.content.readline()
-            data_line = await resp.content.readline()
-            assert event_line.startswith(b"event:")
-            assert b"hello" in data_line
-            # teardown with the tail still open must complete promptly, not
-            # after aiohttp's 60s shutdown timeout.
-            await asyncio.wait_for(cron.start_stop_web_app(None), timeout=5)
-            # the handler ended the stream via the end-of-output path
-            rest = await resp.content.read()
-            assert b"event: end" in rest
-        finally:
-            await session.close()
-    finally:
-        await cron.start_stop_web_app(None)
-        await asyncio.sleep(0.25)
+    await start_web_app(cron, {"listen": ["http://127.0.0.1:0"]})
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    async with aiohttp.ClientSession() as session:
+        resp = await session.get(base + "/jobs/alpha/logs")
+        # the replayed frame proves the tail handler is up and
+        # subscribed (frame shape: "event: <name>" then "data: <line>")
+        event_line = await resp.content.readline()
+        data_line = await resp.content.readline()
+        assert event_line.startswith(b"event:")
+        assert b"hello" in data_line
+        # teardown with the tail still open must complete promptly, not
+        # after aiohttp's 60s shutdown timeout.
+        await asyncio.wait_for(cron.start_stop_web_app(None), timeout=5)
+        # the handler ended the stream via the end-of-output path
+        rest = await resp.content.read()
+        assert b"event: end" in rest
 
 
 @pytest.mark.asyncio
-async def test_cors_preflight_reaches_mcp_options_through_auth():
+async def test_cors_preflight_reaches_mcp_options_through_auth(start_web_app):
     # A browser preflight carries no Authorization by the Fetch standard, so
     # the bearer gate must pass it through to the /mcp OPTIONS route, which
     # enforces mcp.allowedOrigins itself; the POST that follows still
@@ -2581,7 +2419,8 @@ async def test_cors_preflight_reaches_mcp_options_through_auth():
     from cronstable.config import _build_mcp_config
 
     cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
-    await cron.start_stop_web_app(
+    await start_web_app(
+        cron,
         {
             "listen": ["http://127.0.0.1:0"],
             "authToken": {"value": "secret"},
@@ -2593,41 +2432,37 @@ async def test_cors_preflight_reaches_mcp_options_through_auth():
             }
         ),
     )
-    try:
-        port = cron.web_runner.addresses[0][1]
-        base = "http://127.0.0.1:{}".format(port)
-        preflight = {
-            "Origin": "https://inspector.example",
-            "Access-Control-Request-Method": "POST",
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.options(base + "/mcp", headers=preflight) as r:
-                assert r.status == 204
-                assert (
-                    r.headers["Access-Control-Allow-Origin"]
-                    == "https://inspector.example"
-                )
-                assert "Authorization" in (
-                    r.headers["Access-Control-Allow-Headers"]
-                )
-            # a foreign origin's preflight is refused by the route itself
-            async with session.options(
-                base + "/mcp",
-                headers={
-                    "Origin": "https://evil.example",
-                    "Access-Control-Request-Method": "POST",
-                },
-            ) as r:
-                assert r.status == 403
-            # the carve-out is preflights only: a bare OPTIONS keeps the 401
-            async with session.options(base + "/mcp") as r:
-                assert r.status == 401
-            # and the actual POST still requires the bearer
-            async with session.post(base + "/mcp", json={}) as r:
-                assert r.status == 401
-    finally:
-        await cron.start_stop_web_app(None)
-        await asyncio.sleep(0.25)
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    preflight = {
+        "Origin": "https://inspector.example",
+        "Access-Control-Request-Method": "POST",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.options(base + "/mcp", headers=preflight) as r:
+            assert r.status == 204
+            assert (
+                r.headers["Access-Control-Allow-Origin"]
+                == "https://inspector.example"
+            )
+            assert "Authorization" in (
+                r.headers["Access-Control-Allow-Headers"]
+            )
+        # a foreign origin's preflight is refused by the route itself
+        async with session.options(
+            base + "/mcp",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "POST",
+            },
+        ) as r:
+            assert r.status == 403
+        # the carve-out is preflights only: a bare OPTIONS keeps the 401
+        async with session.options(base + "/mcp") as r:
+            assert r.status == 401
+        # and the actual POST still requires the bearer
+        async with session.post(base + "/mcp", json={}) as r:
+            assert r.status == 401
 
 
 # --- the memo-busting mutator funnels and the bounded boot scan -------------
