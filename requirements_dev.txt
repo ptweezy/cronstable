@@ -29,6 +29,26 @@ pynacl>=1.5
 # pure Python with optional prebuilt speedups, so no platform marker is
 # needed; the tests still importorskip so a bare checkout runs the rest.
 zeroconf>=0.132
+# playwright drives a real Chromium for the client/daemon cron-engine
+# differential (tests/test_web_engine_parity.py), which replays the whole
+# golden corpus through both the dashboard's own JavaScript schedule engine
+# and the daemon's, and requires byte-identical fire instants and
+# descriptions. It was in NEITHER dependency list, so that test
+# importorskipped itself in every environment including all 12 CI cells, and
+# the page's second engine shipped with nothing comparing it to the first:
+# the same optional-dep blind spot the orjson note above describes. Excluded
+# on win-arm64, the one runner with no playwright wheel; there is no sdist to
+# fall back to, so an unmarked line would fail to resolve there rather than
+# skip.
+#
+# pip installs the LIBRARY, not the browser. Chromium arrives only from a
+# separate `playwright install chromium` step, so an environment that has this
+# line but never ran that step still skips the differential (the test catches
+# the launch failure and skips rather than erroring). This line covers only
+# what pip can do; test_playwright_is_installed_where_a_wheel_exists in
+# tests/test_dev_deps_parity.py fails if it is dropped or its marker stops
+# covering the cells that DO have wheels.
+playwright; platform_machine != "ARM64" or sys_platform != "win32"
 # security linter; bandit[toml] reads its config from pyproject.toml.
 bandit[toml]
 mypy

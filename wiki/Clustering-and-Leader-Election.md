@@ -760,6 +760,7 @@ JSON. When no `cluster` section is configured it returns
   "conflicting_sizes": [],         // those divergent cluster sizes, if any
   "policy_conflict": false,        // true if an agreeing peer declares a different distribution/elect_leader
   "conflicting_policies": [],      // those differing coordination-policy descriptors, if any
+  "candidates_truncated": 0,       // nonzero: the fleet outgrew the candidate advertisement cap (see below)
   "quorate": true,                 // whether this node sees a quorum
   "leader": "cronstable-a",            // null when not quorate, or always in spread mode
   "is_leader": true,               // always false in spread mode (no single leader)
@@ -854,6 +855,21 @@ pre-derived field on `GET /cluster` (the
 | `conflict` is `true` | `conflict`, `conflict_names`, `size_conflict`, `conflicting_sizes`, `policy_conflict`, `conflicting_policies` | `cronstable_cluster_conflict{kind}` (`kind="nodename"` / `"size"` / `"policy"`) | a duplicate `nodeName`, a cluster-size disagreement, or a coordination-policy (`distribution`/`elect_leader`) mismatch is pausing `Leader` jobs (page on this) |
 | `agreed` peers fall below `quorum` | count of `peers[].status == "agreed"` vs `quorum` | `cronstable_cluster_peers{status="agreed"}` vs `cronstable_cluster_quorum` | the cluster is one failure from losing quorum (this node counts itself toward quorum, so `quorum − 1` agreed peers is the last quorate state; any fewer duplicates the `quorate` alert) |
 | any `peers[].status` is `untrusted` | `peers[].status`, `peers[].last_error` | `cronstable_cluster_peers{status="untrusted"}` | a peer's certificate failed verification (often a botched cert rotation; see [Certificate rotation](#certificate-rotation)) |
+| `candidates_truncated` is nonzero | `candidates_truncated` | none (read `/cluster`, or watch the log) | the fleet has grown past the number of candidate names a node may advertise, so a `spread` job whose owner falls in the dropped tail can run on more than one node |
+
+A node gossips the set of peers it can confirm are themselves quorate, and
+`spread` ownership is computed over that set. The set is capped so one peer
+feeding a node inflated gossip cannot push that node's own `/peer` body past
+the size every peer enforces, which would cost it its place in the quorum. The
+cap is 512 names, sized so a worst-case set (every name at the 256-byte field
+limit) still leaves half the response budget for the election fields.
+
+Reaching it takes a fleet of several hundred bridge-discovered nodes. If you
+do, `candidates_truncated` carries the full count the node derived and the
+daemon logs a warning naming it. The dropped names are the highest-sorting
+ones, and every node drops the same ones, so single-leader election is
+unaffected: it reads the lowest name, which always survives. Only `spread`
+ownership degrades, and only for jobs whose owner sits in the tail.
 
 The [example alerts](Metrics-with-Prometheus#example-alerts) on the Prometheus
 page include the quorum rule and the split-brain check

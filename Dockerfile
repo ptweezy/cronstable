@@ -10,44 +10,70 @@
 # ---- build stage --------------------------------------------------------
 FROM python:3.14-slim AS builder
 
-# In CI we pass the already-computed release version so the build is
-# deterministic and needs no git history. A plain `docker build .` leaves it
-# empty and setuptools_scm reads the version from .git (which .dockerignore
-# deliberately keeps in the build context).
-ARG VERSION=""
-
 WORKDIR /src
-COPY . .
 
-# Install into a self-contained venv so the runtime stage can copy just that,
-# leaving the build toolchain behind. The venv lives at the same path in both
-# stages (both are python:3.14-slim), so its interpreter symlinks stay valid.
+# Layer contract, load-bearing for CI speed: everything from here through the
+# orjson step reads nothing from the source tree except pyproject.toml and
+# docker/extract_deps.py and never references the per-commit VERSION arg.
+# These are the expensive layers (toolchain plus every third-party
+# dependency, source-compiled under QEMU on the wheel-less arches), and
+# keeping per-commit inputs out of them lets buildx's GHA cache reuse them
+# across source-only commits; a typical push rebuilds only the cheap project
+# install at the bottom of this stage.
 #
+# CI sets DEPS_REFRESH to the workflow run id on a RELEASE, deliberately
+# missing the cache so a release re-resolves every dependency fresh from the
+# index (the freshness every release had when each push rebuilt these layers).
+# Ordinary pushes leave it "" and ride the cache, which also refreshes
+# whenever pyproject.toml, this file, or the base image digest changes.
+ARG DEPS_REFRESH=""
+
 # build-essential + libffi/zlib headers let pip source-compile the C-extension
 # deps that ship no wheel on some targets — notably the aiohttp stack on 32-bit
 # x86 (linux/386), propcache on 32-bit ARM (linux/arm/v7), and
 # multidict/frozenlist/ruamel.yaml.clib on linux/riscv64 (no riscv64 wheels yet).
 # On amd64/arm64 the whole stack is prebuilt wheels, so the toolchain goes
 # unused; either way it stays in this builder stage and never reaches the slim
-# runtime image.
-#
-# When VERSION is given we hand it to setuptools_scm directly — no git needed.
-# Otherwise (a plain `docker build .`) setuptools_scm reads the version from
-# .git, which requires the git binary the slim image does not ship; git is
-# installed only in that case.
+# runtime image. git is now installed unconditionally: a plain `docker build .`
+# needs it for setuptools_scm to read .git, and gating it on VERSION (as this
+# layer once did) would put the per-commit version into the cache key and
+# rebuild the toolchain on every push.
 # retry() re-runs a network step (package install, pip download) a few times
 # with backoff, so a transient mirror/index hiccup does not fail the build.
 RUN set -eux; \
+    : "deps-refresh=${DEPS_REFRESH}"; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    pkgs="build-essential libffi-dev zlib1g-dev"; \
-    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
     retry apt-get -o Acquire::Retries=5 update; \
-    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends $pkgs; \
-    rm -rf /var/lib/apt/lists/*; \
-    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    retry apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev git; \
+    rm -rf /var/lib/apt/lists/*
+
+# Only pyproject.toml and the shared extraction helper reach the dependency
+# layer: its cache key is the dependency metadata plus the small script that
+# reads it, never the rest of the tree.
+COPY pyproject.toml /tmp/deps/pyproject.toml
+COPY docker/extract_deps.py /tmp/deps/extract_deps.py
+
+# Install the third-party dependencies into a self-contained venv so the
+# runtime stage can copy just that, leaving the build toolchain behind. The
+# venv lives at the same path in both stages (both are python:3.14-slim), so
+# its interpreter symlinks stay valid.
+#
+# The requirement strings are read out of pyproject.toml by the COPYd
+# extract_deps.py helper (the core dependencies plus the push and discovery
+# extras), the exact strings `pip install ".[push,discovery]"` would
+# resolve, so the two can never drift, and a renamed extra fails the build
+# loudly (KeyError) instead of silently shipping without it. The build
+# backend (build-system.requires) goes into a separate throwaway venv,
+# /tmp/deps/buildenv: the project install below uses it to build the wheel
+# without network access, and it never pollutes the shipped /opt/venv.
+RUN set -eux; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
     python -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 ".[push,discovery]"
+    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/requirements.txt; \
+    python -m venv /tmp/deps/buildenv; \
+    retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
 # The push (PyNaCl) and discovery (zeroconf) extras above are part of the
 # image contract: a `push:` or `web.bonjour` section fails closed at config
@@ -84,6 +110,28 @@ RUN set -eux; \
         /opt/venv/bin/pip uninstall -y orjson || true; \
     fi; \
     rm -rf /var/lib/apt/lists/*
+
+# ---- project install: the only per-commit layers ------------------------
+
+# In CI we pass the already-computed release version so the build is
+# deterministic and needs no git history. A plain `docker build .` leaves it
+# empty and setuptools_scm reads the version from .git (which .dockerignore
+# deliberately keeps in the build context, and the toolchain layer's git
+# binary serves).
+ARG VERSION=""
+
+COPY . .
+
+# Build the wheel with the cached buildenv's backend (--no-build-isolation:
+# no per-commit network fetch of setuptools/setuptools_scm) and install it
+# with --no-deps: every dependency is already in /opt/venv from the cached
+# layer above, and adding one edits pyproject.toml, which rebuilds that
+# layer. `pip check` then proves the split left nothing unsatisfied.
+RUN set -eux; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    /tmp/deps/buildenv/bin/pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/deps/wheelhouse .; \
+    /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/deps/wheelhouse/cronstable-*.whl; \
+    /opt/venv/bin/pip check
 
 # Drop pip from the venv before it ships. The runtime image installs nothing
 # (no package manager, read-only root filesystem), so pip and its vendored

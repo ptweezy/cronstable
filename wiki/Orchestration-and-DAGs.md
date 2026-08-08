@@ -243,8 +243,12 @@ expressions; @reboot is not supported for dags`), while `@daily` /
 `@hourly`-style aliases still work. It follows the
 [catch-up discipline](Durable-State#missed-run-catch-up): `onMissed`
 (`skip` / `run-once` / `run-all`) and `startingDeadlineSeconds` bound how many
-missed logical dates a restart replays, capped like a job's catch-up. A DAG
-with no `schedule` is manual-only.
+missed logical dates a restart replays, capped like a job's catch-up.
+`catchupJitterSeconds` spreads the replays, with the same checkpointed
+at-least-once resume the job engine has: the owed watermark goes into a
+`catchup-dag/<dag>` stream (the twin of the job's `catchup/<job>`) before the
+jitter offset starts, so a restart during the offset resumes the backfill
+rather than losing it. A DAG with no `schedule` is manual-only.
 
 **Backfill** replays a DAG across a historical range on demand -- a deliberate
 operation that ignores the automatic deadline but is still bounded and

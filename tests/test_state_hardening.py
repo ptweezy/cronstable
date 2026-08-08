@@ -398,7 +398,7 @@ async def test_lease_write_failure_denies_instead_of_raising(
     lease = await backend.acquire_lease("leader", "node-a", 30.0)
     assert lease is not None
 
-    def boom(path, obj):
+    def boom(path, obj, *, durable=True):
         raise PermissionError(5, "sharing violation", path)
 
     monkeypatch.setattr(backend, "_write_lease_file", boom)

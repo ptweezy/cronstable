@@ -23,9 +23,30 @@ __pycache__
 .claude
 .github
 docker
+# except the shared requirement-extraction helper, which every Dockerfile
+# COPYs into its dependency layer beside pyproject.toml (the negation must
+# follow the exclusion it carves out)
+!docker/extract_deps.py
 example
 scripts
 target
 tests
 .editorconfig
 .gitignore
+
+# Documentation, website assets and side trees. None of these reach the wheel
+# (`packages` in pyproject.toml lists three package directories, all under
+# cronstable/), and none of the eight Dockerfiles or the pyinstaller build
+# reads them. docs/ alone is ~45 MB of screenshots and diagrams, which every
+# `docker build` uploaded to the daemon and every layer-cache key hashed:
+# a screenshot edit invalidated the COPY layer and everything under it in all
+# 36 emulated platform builds. The two files the SHIPPED test suite reads from
+# docs/ (openapi.yaml, demo/index.html) matter to the sdist, not to any image:
+# tests/ is excluded here already, so nothing in an image build wants them.
+docs
+wiki
+benchmarks
+packaging
+pro
+HISTORY.md
+coverage.xml

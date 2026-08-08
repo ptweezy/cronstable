@@ -55,6 +55,8 @@ mcp: { ... }        # optional: Model Context Protocol server for AI agents
 cluster: { ... }    # optional: mTLS peer attestation / leader election
 state: { ... }      # optional: durable state store (history, catch-up, retries)
 logging: { ... }    # optional: Python logging dictConfig
+notify: { ... }     # optional: daemon/orchestration event notifications
+push: { ... }       # optional: E2E-encrypted push alerts (relay + device registry)
 ```
 
 | Key | Type | Required | Description |
@@ -68,6 +70,8 @@ logging: { ... }    # optional: Python logging dictConfig
 | `cluster` | `Map` | No | Enables mutual-TLS peer attestation and optional leader election across replicas. See [Clustering and Leader Election](Clustering-and-Leader-Election). |
 | `state` | `Map` | No | Enables the opt-in durable state store: restart-durable run history, missed-run catch-up, restart-surviving retries, and once-per-boot `@reboot` runs. Without it cronstable is stateless (everything in memory, exactly as before). See [Durable State](Durable-State). |
 | `logging` | `Map` (Python `logging.config` dictConfig) | No | Custom logging configuration. See [Logging Configuration](Logging-Configuration). |
+| `notify` | `Map` | No | Daemon and orchestration event notifications (DAG failures, approval gates, leadership changes) through the standard reporter block. See [`notify`](#notify) below and [Reporting](Reporting). |
+| `push` | `Map` | No | The daemon-global relay endpoint and paired-device registry behind the end-to-end encrypted `push` reporter. See [`push`](#push) below and [Push Notifications](Push-Notifications). |
 
 ### `web`
 
@@ -77,6 +81,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `headers` | `MapPattern(Str, Str)` | none | Extra HTTP response headers applied to all endpoints. |
 | `allowedOrigins` | `Seq(Str)` | `[]` | Extra exact-match browser `Origin`s allowed to call the **mutating** endpoints (`POST /jobs/{name}/start`, `/jobs/{name}/cancel`, `/dags/{name}/trigger`, `/dags/{name}/backfill`, task decisions). Cross-site browser requests to those endpoints are refused `403` as a CSRF/DNS-rebinding defense; same-origin requests (the served dashboard) and clients that send no `Origin` (curl, monitoring) always pass, and `/mcp` keeps enforcing its own `mcp.allowedOrigins`. Setting `headers` with `Access-Control-Allow-Origin: <origin>` implicitly allow-lists that origin; `Access-Control-Allow-Origin: "*"` disables the check (logged loudly). |
 | `authToken` | `Map` with `value` / `fromFile` / `fromEnvVar` (each `EmptyNone() \| Str`) | none | Opt-in bearer-token auth. When set but resolving empty, cronstable refuses to start. |
+| `authTokens` | `Seq(Map)`, each with the `authToken` source triple plus `scopes` (`Seq` of `view`/`control`/`approve`) and an optional `label` | none | Multiple named bearer tokens with per-token scopes (`control` and `approve` imply `view`). `label` identifies a token in logs and lets it be revoked by dropping the entry and reloading. Tokens must resolve non-empty and be distinct from each other and from `authToken`. See [HTTP Control API](HTTP-API#authentication). |
 | `socketMode` | `Str` | none | Octal permissions applied to a `unix://` listen socket. Only ever applies to unix sockets, so it is irrelevant on Windows (where `unix://` listeners are unsupported). |
 | `tls.cert` | `EmptyNone() \| Str` | none | Path to the certificate (chain) every `https://` listener serves. Required together with `tls.key`: one without the other is a `ConfigError` at load, as is TLS material with no `https://` address in `listen`, or an `https://` address with no certificate. Whether the files exist is not checked at load (a mounted secret may not exist at first boot); an unloadable certificate keeps the web API down with a logged error and is retried on the next reload. Rotating these files in place restarts the listeners. See [Listener TLS](Listener-TLS). |
 | `tls.key` | `EmptyNone() \| Str` | none | Path to the private key for `tls.cert`. |
@@ -84,6 +89,7 @@ logging: { ... }    # optional: Python logging dictConfig
 | `ui` | `Bool` | `true` | Serve the browser dashboard at `/`. `ui: false` omits the dashboard page while every JSON endpoint keeps working, for an API-only deployment. See [Web Dashboard](Web-Dashboard). |
 | `metrics` | `Bool \| Map` with `enabled` / `public` (each `Bool`) and `durationBuckets` (`Seq(Float)`) | enabled | The Prometheus `GET /metrics` endpoint, served by default whenever the web API is on. `metrics: false` (bool shorthand) disables it; the map form sets `enabled` (default `true`), `public` (default `false`; exempts only `/metrics` from `authToken`), and `durationBuckets` (histogram bounds in seconds; must be finite, positive, and strictly increasing, else a `ConfigError`). See [Metrics with Prometheus](Metrics-with-Prometheus). |
 | `nodeHistory` | `Bool \| Map` with `enabled` (`Bool`), `interval` (`Float`) and `points` (`Int`) | enabled | Background node CPU/memory sampling for the dashboard's node history chart, served by `GET /node/history`. On by default whenever the web API is on; `nodeHistory: false` disables the sampling task. The map form sets `interval` (seconds between samples, default `5.0`, minimum `1.0`) and `points` (ring size, default `720` — the last hour at the default cadence; 10–50000). The ring is in-memory only and follows the web app's lifecycle. |
+| `bonjour` | `Bool \| Map` with `enabled` (`Bool`) and `name` (`Str`) | off | Opt-in zero-config LAN discovery: advertises the web API as a `_cronstable._tcp` mDNS/Bonjour service so a companion app on the same network finds the daemon without a typed URL. Requires the `discovery` extra (python-zeroconf; enabling it without the library installed is a `ConfigError`, never a silent no-advert) and at least one TCP listen address. The map form overrides the advertised instance name. See [LAN Discovery](LAN-Discovery). |
 
 `listen` is the only required key. Full behavior, authentication, and endpoint
 semantics are documented in [HTTP Control API](HTTP-API); the `tls` block,
@@ -444,6 +450,34 @@ required; `incremental`, `disable_existing_loggers`, `formatters`, `filters`,
 `handlers`, `loggers`, and `root` are optional. See
 [Logging Configuration](Logging-Configuration).
 
+### `notify`
+
+Daemon and orchestration event notifications: events that belong to no single
+job run (so no per-job hook would fire) delivered through the same reporter
+machinery as the per-job hooks. See [Reporting](Reporting) for the delivery
+semantics and templates.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `events` | `Seq(Enum)` | all four | Which events to deliver: `dag_failure` (a DAG run reached a terminal failed state), `approval_waiting` (an approval gate began awaiting a decision), `leader_change` (this node acquired or lost scheduled-job leadership), `quorum_loss` (this node left quorum, so `Leader` jobs stand down). |
+| `report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`/`push`) | event-worded defaults | The reporter block fired per event, sharing the per-job `report` schema; its default subject/body templates are worded for daemon events rather than run completions. |
+
+### `push`
+
+The daemon-global half of the end-to-end encrypted `push` reporter: where
+sealed alerts are relayed and where device pairings are stored. Turning the
+reporter on stays per-job/per-event (`report.push.enabled` /
+`notify.report.push`); this section only says where alerts go. Requires the
+`push` extra (PyNaCl); a config with a `push:` section refuses to start
+without it. See [Push Notifications](Push-Notifications).
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `relay.url` | `Str` | required | The relay endpoint alert ciphertext is POSTed to. Explicit and required: the daemon never posts anywhere the operator did not spell out. Treated as a secret in logs. |
+| `relay.timeout` | `Float` | `10` | Total relay request timeout, seconds. |
+| `devicesFile` | `EmptyNone() \| Str` | none | Path of the paired-device registry for stateless installs. With a `state:` section the registry rides the durable store instead (cluster-visible); one of the two must exist. |
+| `allowUnauthenticated` | `Bool` | `false` | Escape hatch for the fail-closed web-auth gate (the twin of `mcp.allowUnauthenticated`): serve the `/push/devices` pairing endpoints on a routable listener that has no `web.authToken`. |
+
 ## Per-job options
 
 Every key below comes from `_job_schema_dict` (jobs) / `_job_defaults_common`
@@ -526,9 +560,9 @@ See [Failure Detection and Retries](Failure-Detection-and-Retries).
 ### Retries and reporting hooks
 
 Three lifecycle hooks each carry a `report` block (mail, sentry, shell,
-webhook); `onFailure` additionally carries a `retry` block. The `report` blocks
-all share the same `_report_schema` and the same `_REPORT_DEFAULTS` (deep-copied
-so the three blocks do not alias one another).
+webhook, push); `onFailure` also carries a `retry` block. The `report`
+blocks all share the same `_report_schema` and the same `_REPORT_DEFAULTS`
+(deep-copied so the three blocks do not alias one another).
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -536,7 +570,7 @@ so the three blocks do not alias one another).
 | `onFailure.retry.initialDelay` | `Float` | `1` | Seconds before the first retry. Must be `>= 0`. |
 | `onFailure.retry.maximumDelay` | `Float` | `300` | Upper bound on the backoff delay. Must be `> 0`. |
 | `onFailure.retry.backoffMultiplier` | `Float` | `2` | Multiplier applied to the delay between retries (exponential backoff). Must be `> 0`. |
-| `onFailure.report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`) | defaults below | Reporters fired on every detected failure (including each failed attempt). |
+| `onFailure.report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`/`push`) | defaults below | Reporters fired on every detected failure (including each failed attempt). |
 | `onPermanentFailure.report` | `_report_schema` | defaults below | Reporters fired only after all retries are exhausted. |
 | `onSuccess.report` | `_report_schema` | defaults below | Reporters fired on a successful run. |
 
@@ -602,6 +636,19 @@ Defaults from `_REPORT_DEFAULTS["webhook"]`:
 | `headers` | `MapPattern(Str, Str)` | `{}` | Extra request headers, sent verbatim (not templated). |
 | `body` | `Str` | default webhook body template | Request body (jinja2). The default is a Slack-compatible `{"text": ...}` JSON payload of the default subject + body text. |
 | `timeout` | `Float` | `10` | Total request timeout, seconds. |
+
+#### `report.push`
+
+The end-to-end encrypted push channel. Enabling it anywhere requires the
+daemon-global [`push:` section](#push) (relay + device registry) and the
+`push` extra (PyNaCl); both requirements fail closed at config load. See
+[Push Notifications](Push-Notifications).
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | `Bool` | `false` | Opt this job/event into the push channel. |
+| `priority` | `Enum` of `time-sensitive` / `passive` | `time-sensitive` | Relayed to APNs as the interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
+| `includeLogTail` | `Bool` | `true` | Carry the last captured output lines inside the sealed payload (trimmed oldest-first to fit the APNs size cap). |
 
 ### SLA monitoring and the `onLate` hook
 

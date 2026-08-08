@@ -16,7 +16,9 @@ fixes regresses, the matching test here must fail.  Covered:
 
 import asyncio
 import datetime
+import gc
 import os
+import warnings
 
 from cronstable import cron as cron_mod
 from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
@@ -525,7 +527,9 @@ async def test_archive_save_limit_zero_writes_nothing(tmp_path):
     # web UI keeps anyway.
     cron = await _archive_cron(tmp_path, save_limit=0)
     info = _output_run([("stdout", "must never be stored")])
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     logs = await cron.state_backend.list_records(cron._log_stream("j"))
     assert logs == []
 
@@ -537,7 +541,9 @@ async def test_archive_accounts_dropped_lines(tmp_path):
     cron = await _archive_cron(tmp_path)
     pairs = [("stdout", "line-%d" % i) for i in range(1, 9)]
     info = _output_run(pairs, limit=5)
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     (rec,) = await cron.state_backend.list_records(cron._log_stream("j"))
     assert rec["dropped_lines"] == 3
     stored = [ln["line"] for ln in rec["lines"]]
@@ -557,7 +563,9 @@ async def test_archive_redacts_multiline_pem_body(tmp_path):
             ("stdout", "-----END RSA PRIVATE KEY-----"),
         ]
     )
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     (rec,) = await cron.state_backend.list_records(cron._log_stream("j"))
     assert [ln["line"] for ln in rec["lines"]] == [REDACTED] * 4
 
@@ -567,7 +575,9 @@ async def test_archive_verbatim_when_redaction_off(tmp_path):
     # must be exactly what the job printed.
     cron = await _archive_cron(tmp_path, redact=False)
     info = _output_run([("stdout", "password=hunter2")])
-    await cron._archive_output(cron.cron_jobs["j"], info)
+    await cron._archive_output(
+        cron.cron_jobs["j"], info, list(info.output.lines)
+    )
     (rec,) = await cron.state_backend.list_records(cron._log_stream("j"))
     assert rec["redacted"] is False
     assert rec["lines"][0]["line"] == "password=hunter2"
@@ -663,6 +673,19 @@ async def test_state_path_change_rewarms_from_new_store(tmp_path):
         cron.last_run["j"].finished_at.isoformat()
         == "2026-06-30T00:00:00+00:00"
     )
+
+
+async def test_state_swap_resets_the_reboot_gate_health_latch(tmp_path):
+    # a store-op timeout latches _reboot_gate_sick so the rest of that boot
+    # pass stops probing the hung store; the latch is a per-store health
+    # verdict (like _slot_fidelity, reset in the same teardown) and must not
+    # survive into a replacement store brought up by a state-section reload,
+    # or @reboot dedupe stays degraded for the life of the process.
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path / "a")))
+    cron._reboot_gate_sick = True  # as a hung store's timeout would latch
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path / "b")))
+    assert cron._reboot_gate_sick is False
 
 
 _REPLACE_DEP_JOB = (
@@ -945,6 +968,71 @@ async def test_gc_leaves_artifacts_unmanaged_without_scope_manifests(
         cron.state_backend = None
 
 
+async def test_gc_keeps_catchup_dag_streams_without_dag_manifests(
+    tmp_path, monkeypatch
+):
+    # rolling-upgrade safety, the dag catch-up twin of the artifact test
+    # above: while any recent manifest predates dag advertising, live_dags
+    # is a partial view, so a peer's rarely-written catchup-dag/ checkpoint
+    # stream must stay unmanaged (kept) while ordinary job streams still
+    # collect; deleting it live would re-run the work it exists to fence.
+    import cronstable.state as state_mod
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            await backend.append_record(
+                "catchup-dag/peerdag", {"watermark": "x"}
+            )
+            await backend.append_record("runs/orphan", {"finished_at": "x"})
+        finally:
+            monkeypatch.undo()
+        await _seed_gc_anchor(cron, covered=False)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        # the orphan run stream collected, proving the pass really ran...
+        assert await backend.list_records("runs/orphan") == []
+        # ...while the aged peer checkpoint survived the partial view.
+        assert len(await backend.list_records("catchup-dag/peerdag")) == 1
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
+async def test_gc_collects_removed_dag_catchup_streams_when_covered(
+    tmp_path, monkeypatch
+):
+    # the guard must not overcorrect into never managing the prefix: once
+    # every recent manifest advertises its dags, an aged checkpoint stream
+    # for a dag no config or manifest knows ages out exactly as a removed
+    # job's catchup/<job> stream does.
+    import cronstable.state as state_mod
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        old_epoch = state_mod._now() - 7200.0
+        monkeypatch.setattr(state_mod, "_now", lambda: old_epoch)
+        try:
+            await backend.append_record(
+                "catchup-dag/peerdag", {"watermark": "x"}
+            )
+        finally:
+            monkeypatch.undo()
+        await _seed_gc_anchor(cron, covered=True)
+        cron._state_gc_grace = 3600.0
+        await cron._collect_state_garbage()
+        assert await backend.list_records("catchup-dag/peerdag") == []
+    finally:
+        await cron.state_backend.stop()
+        cron.state_backend = None
+
+
 async def test_gc_pass_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
     # the daemon pass wires the ephemeral-lease prefix through to the
     # backend: a dead-past-grace dagadvance/ per-run lease is reclaimed
@@ -1040,3 +1128,28 @@ async def test_track_state_write_sheds_when_pending_set_full(monkeypatch):
     real_task = cron._track_state_write(_would_write())
     await real_task
     assert ran is True
+
+
+async def test_a_shed_chained_write_leaves_no_unawaited_coroutine(monkeypatch):
+    # The chained-tail helper builds its body INSIDE the ordered wrapper, so
+    # that shedding closes the only coroutine that was ever created. Built at
+    # the call site instead, the shed closes the wrapper and the inner
+    # coroutine is left neither awaited nor closed: a RuntimeWarning per shed
+    # write, and an outright error under -W error, at exactly the moment the
+    # store is already in trouble.
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    monkeypatch.setattr(cron_mod, "MAX_PENDING_STATE_WRITES", 0)
+    appended = []
+    monkeypatch.setattr(
+        Cron,
+        "_append_retry_record",
+        lambda self, name, record: appended.append(name),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # every chained-write entry point, through its real caller
+        await cron._queue_retry_write("alpha", {"kind": "armed"})
+        await cron._queue_pause_write("alpha", {"kind": "paused"})
+        gc.collect()
+    assert appended == []  # shed, as the cap demands
+    assert [w for w in caught if "never awaited" in str(w.message)] == []

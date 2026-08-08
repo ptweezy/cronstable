@@ -1787,8 +1787,11 @@ async def test_pairing_400_keeps_the_pynacl_import_detail_in_the_log(
     text = raised.value.text or ""
     assert "nacl.public" not in text
     assert "sys.modules" not in text
-    assert "the reason is in the cronstable log" in text
-    assert 'pip install "cronstable[push]"' in text
+    # the body is the uniform JSON error envelope now; assert on the
+    # decoded message so the inner quotes are not escape-mangled
+    message = json.loads(text)["error"]
+    assert "the reason is in the cronstable log" in message
+    assert 'pip install "cronstable[push]"' in message
     leaked = [r for r in caplog.records if "nacl.public" in r.getMessage()]
     assert len(leaked) == 1
     assert leaked[0].levelno == logging.WARNING

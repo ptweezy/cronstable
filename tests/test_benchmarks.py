@@ -7,6 +7,7 @@ gate down with it.  These tests run the suite in its minimal --smoke mode and
 exercise compare.py's merge, chart, and gate logic on synthetic inputs.
 """
 
+import datetime
 import json
 import os
 import statistics
@@ -27,6 +28,130 @@ def _run(args, **kwargs):
         stderr=subprocess.STDOUT,
         text=True,
         **kwargs,
+    )
+
+
+def _expected_gated_names():
+    """The metric ids the release comparison requires, from the one source.
+
+    Same comment-stripping parse as compare.py's _load_expected_gated, so
+    the smoke net and the release integrity check read identical lists.
+    """
+    path = os.path.join(REPO_ROOT, "benchmarks", "expected_gated.txt")
+    names = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                names.append(line)
+    return names
+
+
+def _importable(module):
+    import importlib.util
+
+    return importlib.util.find_spec(module) is not None
+
+
+# --- the checked-in budgets.json ------------------------------------------
+#
+# Every other budget test in this file builds a synthetic document in
+# tmp_path, so these two are the only ones that read the shipped file.  It
+# needs reading: compare.py takes it with a bare doc.get("budgets", {}), so a
+# renamed section, or an entry left behind under "proposed", disarms ceilings
+# with the perf job exiting 0 and printing nothing.  A disarmed file is
+# indistinguishable from an intended one by inspection.
+#
+# The limit of these checks, so they are not mistaken for cover: they cannot
+# detect a stale stamp.  max/observed is scale-invariant and a maintainer
+# writes both numbers in one edit, so a ceiling and an observation that are
+# equally out of date score the same ~1.6x forever.  The nine entries as they
+# stood before the 2026-08-07 re-stamp all pass, including the one then
+# sitting at 8.3x the value CI measured.  'set' is where staleness shows, and
+# reading it means comparing against a fresh CI number, which no offline test
+# has.  What is covered below is shape and arming.
+
+
+def _real_budgets_doc():
+    path = os.path.join(REPO_ROOT, "benchmarks", "budgets.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_checked_in_budgets_are_armed_and_sized_against_observed_values():
+    doc = _real_budgets_doc()
+    # compare.py reads exactly this key. A typo here is silent.
+    assert "budgets" in doc, (
+        "benchmarks/budgets.json has no 'budgets' section, so compare.py "
+        "arms NOTHING and the perf job still exits 0"
+    )
+    armed = doc["budgets"]
+    assert armed, "the 'budgets' section is empty: every ceiling is disarmed"
+
+    gated = set(_expected_gated_names())
+    for name, spec in sorted(armed.items()):
+        # a budget on a metric the comparison does not measure every run is
+        # a ceiling that only ever reports "was not measured this run".
+        assert name in gated, (
+            "%s carries an absolute budget but is not in expected_gated.txt, "
+            "so no run is required to measure it" % name
+        )
+        # 'observed' specifically, never 'local': an armed ceiling sized off a
+        # developer machine is what produced the config.parse_yaml_3k false
+        # red (max 2.0 from a 1.176 local figure, 2.164 on the runner). This
+        # required-field loop is the check that would have caught it.
+        for field in ("max", "unit", "observed", "set"):
+            assert field in spec, "%s is missing %r" % (name, field)
+        # 'set' is the only staleness evidence in the entry, so it has to be
+        # a date rather than any truthy string.
+        try:
+            datetime.date.fromisoformat(str(spec["set"]))
+        except (TypeError, ValueError):
+            raise AssertionError(
+                "%s has set=%r, which is not an ISO date; 'set' is the only "
+                "record of how old the observation is" % (name, spec["set"])
+            ) from None
+        # compare.py prints the unit straight into the breach message, so a
+        # wrong one misreports an MB ceiling as seconds to whoever triages it.
+        want_unit = "MB" if name.startswith("mem.") else "s"
+        assert spec["unit"] == want_unit, (
+            "%s has unit=%r, expected %r" % (name, spec["unit"], want_unit)
+        )
+        headroom = spec["max"] / spec["observed"]
+        assert 1.2 <= headroom <= 2.5, (
+            "%s sits at %.2fx its observed value (%s vs %s); the file sizes "
+            "ceilings at roughly +60%%. Under 1.2x false-reds on runner "
+            "variance, and a ceiling at or below its own observation reds "
+            "immediately. Over 2.5x the drift it permits is larger than any "
+            "regression worth catching. Re-measure, update 'observed' and "
+            "'set', and re-size 'max'."
+            % (name, headroom, spec["max"], spec["observed"])
+        )
+
+    # an entry parked in 'proposed' is NOT read by compare.py, so a promotion
+    # that forgets to move it leaves the ceiling inert while reading as live.
+    overlap = set(doc.get("proposed", {})) & set(armed)
+    assert not overlap, (
+        "%s appear in both 'proposed' and 'budgets'; only 'budgets' is read"
+        % sorted(overlap)
+    )
+
+
+def test_compare_actually_loads_every_checked_in_budget():
+    # the assertions above read the file directly; this one reads it THROUGH
+    # compare.py, so a change to how the document is shaped or loaded cannot
+    # pass the structural check above and still leave the ceilings inert.
+    # _load_compare() is this file's one loader: importing
+    # benchmarks/compare.py a second time under the bare name `compare` would
+    # squat that name for the session and hand the other tests a different
+    # module object with its own state.
+    compare_mod = _load_compare()
+    loaded = compare_mod._load_budgets(
+        os.path.join(REPO_ROOT, "benchmarks", "budgets.json")
+    )
+    assert set(loaded) == set(_real_budgets_doc()["budgets"]), (
+        "compare.py loaded %d of %d checked-in ceilings"
+        % (len(loaded), len(_real_budgets_doc()["budgets"]))
     )
 
 
@@ -55,54 +180,30 @@ def test_bench_smoke_produces_results(tmp_path):
     for r in ran:
         assert r["value"] >= 0.0
         assert r["unit"] in ("s", "MB", "KB")
-    # The headline metrics must never silently skip -- including the terminal
-    # UI and the branch-win backend metrics (the web UI ones legitimately skip
-    # in smoke, since they would launch a browser).  Every 2026-07 addition
-    # that leans on a private seam is in this net BY REQUIREMENT (see
-    # benchmarks/expected_gated.txt): this test is what catches a drifted
-    # seam in the ordinary test run instead of at release time.  Not listed:
-    # json.roundtrip_orjson_3k (skips wherever the optional orjson is not
-    # installed, e.g. the tox envs) and the webui.* browser metrics.
-    for name in (
-        "startup.version",
-        "schedule.cold_build_100k",
-        "config.parse_yaml_300",
-        "state.append_1k",
-        "state.artifact_list_churn",
-        "state.depends_on_past_gate",
-        "dag.finish_fanin_1k",
-        "dag.list_dags_warm",
-        "tui.log_restyle_5k",
-        # 2026-07 additions, round 1 (bench-additions.md)
-        "loop.stall_jobs_500",
-        "cronexpr.next_dst_2k",
-        "redact.adversarial_10k",
-        "schedule.due_pass_100k",
-        "schedule.lint_250_zoned",
-        "state.lease_renew_200",
-        "state.gc_sweep_2k_streams",
-        "dag.mapped_drain_256",
-        "dag.adopt_scan_500",
-        "dag.advance_quiescent_1k",
-        "cluster.job_owner_2k",
-        "cluster.parse_summaries_6k",
-        "config.reload_warm_50",
-        "config.interp_2k",
-        "prometheus.render_500",
-        "statsd.emit_2k",
-        "webapi.jobs_payload_500",
-        "webapi.auth_scope_20k",
-        "mcp.handle_200",
-        "job.stream_capture_120k",
-        "json.roundtrip_3k",
-        # 2026-07 additions, round 2 (bench-additions-2.md)
-        "state.fanout_gather_100",
-        "state.boot_rehydrate_populated",
-        "state.list_documents_600",
-        "tui.drawer_paint_5k",
-        "webapi.jobs_bytes_500",
-        "schedule.pressure_20k_48h",
-    ):
+    # The gated metrics must never silently skip.  The set is DERIVED from
+    # benchmarks/expected_gated.txt rather than hand-curated: the previous
+    # hand list was missing webapi.sse_frame_20k, so when the branch that
+    # batched SSE delivery deleted the seam it drove, every test stayed
+    # green and the dead gate would first have surfaced as a release-time
+    # integrity failure.  Deriving makes the two nets one list: a metric
+    # the release comparison requires is a metric --smoke must run.
+    # Excused, each for an environment reason the release runner does not
+    # share: the webui.* browser metrics (smoke must not launch Chromium),
+    # the POSIX-only RSS metrics on Windows, push.seal_500 where PyNaCl is
+    # absent (the tox and WSL envs), and json.roundtrip_orjson_3k where
+    # orjson is absent (the tox envs).
+    for name in _expected_gated_names():
+        if name.startswith("webui."):
+            continue
+        if name.startswith("mem.rss_") and os.name == "nt":
+            continue
+        if name == "push.seal_500" and not _importable("nacl"):
+            continue
+        if name == "json.roundtrip_orjson_3k" and not _importable("orjson"):
+            continue
+        assert name in results, (
+            "expected-gated metric %s is not registered" % name
+        )
         assert not results[name]["skipped"], results[name]
 
 
@@ -122,6 +223,65 @@ def _load_bench():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def test_yaml_parse_is_gated_above_the_quadratic_threshold(monkeypatch):
+    # Config parsing was quadratic in the job count for the whole life of the
+    # project: strictyaml's vendored CommentedSeq.__deepcopy__ calls
+    # copy_attributes INSIDE its element loop, and jobs: is the one big
+    # sequence a config has, so it paid the entire bill (8k jobs took 49.6s;
+    # the hoisted call takes 3.7s). The suite never saw it, because the only
+    # YAML parse metric measured 300 jobs, where the linear term still
+    # dominates: the same slip showed there as 0.161s against 0.117s, next to
+    # 6.27s against 1.18s at 3k on the same machine.
+    #
+    # What has to survive is the SIZE, not a benchmark id. Some gated parse
+    # benchmark must hand the parser a config large enough that a quadratic
+    # term stands out from a runner's own jitter. Shrinking the big one to
+    # save CI minutes, or dropping it from expected_gated.txt so its baseline
+    # side may skip, retires the tripwire without failing anything else, so
+    # this test fails instead.
+    #
+    # The parse itself is stubbed out: this is a shape check on the workload
+    # the harness builds, not a timing test (see tests/test_perf_invariants.py
+    # for the same split), and running the real 3k-job parse here would cost
+    # the suite seconds for no added signal.
+    bench = _load_bench()
+    import cronstable.config as config
+
+    seen = []
+
+    def _record(text, path, *args, **kwargs):
+        seen.append(text)
+        return None
+
+    monkeypatch.setattr(config, "parse_config_string", _record)
+    # The sizes asserted below are the ones CI measures, and _n() scales the
+    # workload per mode, so a bench module left in quick/smoke mode would
+    # check the wrong numbers.
+    assert bench._MODE == "full"
+
+    sizes = {}
+    for spec in bench._BENCHMARKS:
+        if not spec["name"].startswith("config.parse_yaml"):
+            continue
+        seen.clear()
+        spec["fn"]()
+        assert seen, "%s never called parse_config_string" % spec["name"]
+        sizes[spec["name"]] = seen[-1].count("\n  - name:")
+    assert sizes, "no config.parse_yaml* benchmark is registered"
+
+    gated = set(_expected_gated_names())
+    big = {
+        name: jobs
+        for name, jobs in sizes.items()
+        if jobs >= 3000 and name in gated
+    }
+    assert big, (
+        "no gated config.parse_yaml* benchmark parses 3000+ jobs, so a "
+        "return of the quadratic Seq validation would not be caught: %r"
+        % (sizes,)
+    )
 
 
 def test_evict_fixtures_runs_finalizers_and_audits_loop_hygiene():

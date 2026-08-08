@@ -1,8 +1,10 @@
 import asyncio
+import dataclasses
 import datetime
 import json
 import logging
 import socket
+import threading
 
 import aiohttp
 import pytest
@@ -20,6 +22,7 @@ from cronstable.cluster import (
     STATUS_UNTRUSTED,
     ClusterManager,
     ClusterView,
+    PeerState,
     _aged_job_summaries,
     _hrw_owner,
     _hrw_owner_bytes,
@@ -965,6 +968,243 @@ async def test_web_fleet_endpoint_passes_through_gossip_view():
     data = json.loads(resp.text)
     assert data["enabled"] is True
     assert data["nodes"][0]["self"] is True
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized(
+    monkeypatch,
+):
+    # /fleet rides the same dashboard poll cadence as /jobs while its build is
+    # O(nodes x jobs) with a dict copy per summary entry, so it was the one
+    # fan-out leg with no ETag, no gzip and no shared product: every open tab
+    # paid a full merge and a full uncompressed body on the scheduler's loop.
+    import gzip
+    import json
+
+    import cronstable.cron
+
+    # widened so the exact build counts below cannot be broken by a stall
+    # between awaits (CPU steal on a loaded runner under --cov inserts an
+    # extra build past the real 1.0s TTL).
+    monkeypatch.setattr(cronstable.cron, "_FLEET_RESPONSE_TTL", 3600.0)
+    builds = []
+
+    class StubManager:
+        def fleet_view(self):
+            builds.append(1)
+            return {
+                "enabled": True,
+                "backend": "gossip",
+                "node_name": "n",
+                "nodes": [
+                    {
+                        "node_name": "n{}".format(i),
+                        "self": i == 0,
+                        "status": "agreed",
+                        "as_of": "2026-01-01T00:00:00+00:00",
+                        "jobs": {
+                            "job-{}".format(j): {
+                                "running": False,
+                                "enabled": True,
+                                "scheduled_in": 30.0,
+                                "last": None,
+                            }
+                            for j in range(20)
+                        },
+                    }
+                    for i in range(4)
+                ],
+            }
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    first = await cron._web_get_fleet(_Req())
+    assert first.headers["Vary"] == "Accept-Encoding"
+    etag = first.headers["ETag"]
+    # one product shared across the pollers in the window
+    second = await cron._web_get_fleet(_Req())
+    assert len(builds) == 1
+    assert second.body == first.body
+    # a matching validator -> bodyless 304, so a poll of an unchanged fleet
+    # costs headers only
+    req = _Req()
+    req.headers = {"If-None-Match": etag}
+    not_modified = await cron._web_get_fleet(req)
+    assert not_modified.status == 304
+    assert not_modified.headers["ETag"] == etag
+    # ... and a weak validator or a list still matches (_etag_matches)
+    req.headers = {"If-None-Match": 'W/{}, "other"'.format(etag)}
+    assert (await cron._web_get_fleet(req)).status == 304
+    # gzip for a capable client, same bytes underneath
+    req.headers = {"Accept-Encoding": "gzip"}
+    zipped = await cron._web_get_fleet(req)
+    assert zipped.headers["Content-Encoding"] == "gzip"
+    assert len(zipped.body) < len(first.body)
+    assert json.loads(gzip.decompress(zipped.body))["enabled"] is True
+    # a local change renders on the next poll rather than waiting out the TTL
+    cron._bust_response_memos()
+    await cron._web_get_fleet(_Req())
+    assert len(builds) == 2
+
+
+async def _wait_until(pred, tries=300, interval=0.01):
+    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
+    # and do not flake under CI load. Bounded so a never-true predicate fails
+    # cleanly instead of hanging.
+    for _ in range(tries):
+        if pred():
+            return
+        await asyncio.sleep(interval)
+    raise AssertionError("condition not met within {} tries".format(tries))
+
+
+def _fat_fleet_view(builds=None):
+    # the 4x20 (80 summary entries) shape the memoized-endpoint test uses
+    if builds is not None:
+        builds.append(1)
+    return {
+        "enabled": True,
+        "backend": "gossip",
+        "node_name": "n",
+        "nodes": [
+            {
+                "node_name": "n{}".format(i),
+                "self": i == 0,
+                "status": "agreed",
+                "as_of": "2026-01-01T00:00:00+00:00",
+                "jobs": {
+                    "job-{}".format(j): {
+                        "running": False,
+                        "enabled": True,
+                        "scheduled_in": 30.0,
+                        "last": None,
+                    }
+                    for j in range(20)
+                },
+            }
+            for i in range(4)
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_single_flight_shares_one_build(monkeypatch):
+    # Concurrent pollers must JOIN one merge+serialize while it is in
+    # flight; sharing a product that already landed in the memo proves
+    # nothing. Above the offload gate the build spans an executor hop,
+    # and a plain check-then-store memo let every poller landing inside
+    # that await miss too and run its own full build.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_FLEET_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 0)
+    builds = []
+
+    class StubManager:
+        def fleet_view(self):
+            return _fat_fleet_view(builds)
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    responses = await asyncio.gather(
+        *(cron._web_get_fleet(_Req()) for _ in range(6))
+    )
+    assert len(builds) == 1
+    first = responses[0]
+    assert all(r.status == 200 for r in responses)
+    assert all(r.headers["ETag"] == first.headers["ETag"] for r in responses)
+    assert cron._fleet_response_memo.inflight is None
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_offloads_only_a_large_serialize(monkeypatch):
+    # the merge reads live gossip state so it stays on the loop; the
+    # serialize/hash/gzip over the merged dict offloads only at
+    # _FLEET_SERIALIZE_OFFLOAD_MIN summary entries, below which the
+    # thread hop costs more than the encode.
+    import cronstable.cron
+
+    idents = []
+    real_product = cronstable.cron._cachable_json_product
+
+    def recording_product(payload):
+        idents.append(threading.get_ident())
+        return real_product(payload)
+
+    monkeypatch.setattr(
+        cronstable.cron, "_cachable_json_product", recording_product
+    )
+
+    class StubManager:
+        def fleet_view(self):
+            return _fat_fleet_view()
+
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 1)
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    resp = await cron._web_get_fleet(_Req())
+    assert resp.status == 200 and resp.headers["ETag"]
+    assert idents[-1] != threading.get_ident()  # built on an executor thread
+
+    # a fresh cron at the default threshold: the 4x20 stub is 80 entries,
+    # under the gate, so the product is built inline on the loop thread
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 200)
+    small = cronstable.cron.Cron(None)
+    small.web_config = {}
+    small.cluster_manager = StubManager()
+    resp = await small._web_get_fleet(_Req())
+    assert resp.status == 200 and resp.headers["ETag"]
+    assert idents[-1] == threading.get_ident()
+
+
+@pytest.mark.asyncio
+async def test_web_fleet_bust_mid_build_is_not_stored(monkeypatch):
+    # A bust landing while the build is on the executor must not be undone
+    # by that pre-bust product being stored on the way out: the leader
+    # still serves its own product to its own caller, but the next poll
+    # rebuilds instead of inheriting the stale product.
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_FLEET_RESPONSE_TTL", 3600.0)
+    monkeypatch.setattr(cronstable.cron, "_FLEET_SERIALIZE_OFFLOAD_MIN", 0)
+    calls = []
+    release = threading.Event()
+    real_product = cronstable.cron._cachable_json_product
+
+    def gated_product(payload):
+        calls.append(1)
+        release.wait(5)
+        return real_product(payload)
+
+    monkeypatch.setattr(
+        cronstable.cron, "_cachable_json_product", gated_product
+    )
+
+    class StubManager:
+        def fleet_view(self):
+            return _fat_fleet_view()
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    cron.cluster_manager = StubManager()
+    task = asyncio.create_task(cron._web_get_fleet(_Req()))
+    try:
+        await _wait_until(lambda: calls)
+        cron._bust_response_memos()
+        release.set()
+        resp = await task
+        assert resp.status == 200
+        assert cron._fleet_response_memo.cached is None
+        follow_up = await cron._web_get_fleet(_Req())
+        assert follow_up.status == 200
+        assert len(calls) == 2
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
 
 
 def test_lease_backend_seam_defaults_for_fleet():
@@ -2618,6 +2858,86 @@ def test_policy_divergent_node_not_bridge_confirmed(no_tls):
     assert mgr.leader_name() == "node-a"
 
 
+# One row per peer-declared coordination field, as
+# {PeerState attribute: (aligned-value, diverging-value, detector)}.
+# The two callables take the manager because "aligned" means "whatever this
+# node declares" and every field derives that differently. `detector` is the
+# operator-facing method that must NAME the divergence.
+#
+# Adding a `declared_*` field to PeerState without adding a row here fails
+# test_declared_fields_gate_both_agreement_and_conflict on purpose: a field
+# missing from this table could be wired into one half of the divergence gate
+# only, with nothing to catch it (see cluster._declares_divergent).
+_DIVERGENCE_FIELD_CASES = {
+    "declared_size": (
+        lambda mgr: mgr.cluster_size(),
+        lambda mgr: mgr.cluster_size() + 1,
+        "conflicting_sizes",
+    ),
+    "declared_distribution": (
+        lambda mgr: mgr.distribution,
+        lambda mgr: "spread" if mgr.distribution != "spread" else "hrw",
+        "conflicting_policies",
+    ),
+    "declared_elect_leader": (
+        lambda mgr: bool(mgr.config.get("electLeader")),
+        lambda mgr: not bool(mgr.config.get("electLeader")),
+        "conflicting_policies",
+    ),
+}
+
+
+def test_declared_fields_gate_both_agreement_and_conflict(no_tls):
+    # Drift guard over the divergence gate's two halves, which are ONE safety
+    # invariant spelled in three methods. For every coordination field a peer
+    # declares, a divergent declaration must BOTH
+    #   * drop the peer from _agreeing_peers (so we neither count it toward
+    #     quorum nor gossip it as a node we vouch for, which is what stops a
+    #     third node that reaches it only across a bridge from confirming it
+    #     quorate and coordinating across a node running by other rules), and
+    #   * be named by conflicting_sizes / conflicting_policies (so the Leader
+    #     gate fails closed here and the operator sees why).
+    # Wiring a field into one half only reintroduces a split-brain: detected
+    # but still vouched for is the bridge-confirm hole; excluded but not
+    # detected is a silent stand-down with nothing on the dashboard. The
+    # per-field behaviour is covered by the two tests above; this one fences
+    # the SETS, so a fourth declared field cannot land on one side alone.
+    gated = {
+        f.name
+        for f in dataclasses.fields(PeerState)
+        if f.name.startswith("declared_")
+    }
+    cases = _DIVERGENCE_FIELD_CASES
+    assert gated == set(cases)
+    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
+    # the exclude set _agreeing_peers iterates must be exactly those fields
+    probe = ClusterManager(cfg, lambda: "v1:mine")
+    assert set(probe._our_declarations()) == gated
+    hosts = {"b:1": "node-b", "c:1": "node-c", "d:1": "node-d"}
+    for field, (_aligned, diverging, detector) in cases.items():
+        # a fresh manager per field: N=4, quorum 3, every peer agreed and
+        # declaring exactly what we declare.
+        mgr = ClusterManager(cfg, lambda: "v1:mine")
+        for host, name in hosts.items():
+            _seed_agree(mgr, host, name)
+            for other, (aligned, _d, _det) in cases.items():
+                setattr(mgr.view.peers[host], other, aligned(mgr))
+        assert mgr._agreeing_peer_names() == ["node-b", "node-c", "node-d"]
+        assert mgr.has_conflict() is False
+        # now diverge node-b on this one field
+        setattr(mgr.view.peers["b:1"], field, diverging(mgr))
+        assert mgr._agreeing_peer_names() == ["node-c", "node-d"], field
+        assert mgr.has_conflict() is True, field
+        named = {
+            "conflicting_sizes": mgr.conflicting_sizes(),
+            "conflicting_policies": mgr.conflicting_policies(),
+        }
+        assert named.pop(detector), field
+        # and only that detector fires, so a field cannot be reported twice
+        # under two different names in the view.
+        assert not any(named.values()), field
+
+
 @pytest.mark.asyncio
 async def test_mtls_cluster_size_divergence_detected(tmp_path):
     # end-to-end repro of the headline trace over real mTLS: mid 3->5 resize,
@@ -3508,6 +3828,229 @@ async def test_handle_peer_includes_quorate_vouched(no_tls):
 
 
 @pytest.mark.asyncio
+async def test_handle_peer_caps_quorate_vouched(no_tls):
+    # quorate_vouched is the one re-advertised set built entirely from ABSORBED
+    # peer data (_bridge_candidates folds a peer's mutual_agreeing), so without
+    # a cap one inflated upstream peer walks OUR /peer body past
+    # MAX_PEER_RESPONSE_BYTES, and honest peers reject an oversized response,
+    # record_failure us and drop us from their agreeing sets. Cluster-wide
+    # availability loss from one peer's gossip.
+    from cronstable.cluster import (
+        MAX_ADVERTISED_CANDIDATE_NAMES,
+        MAX_PEER_RESPONSE_BYTES,
+    )
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # what a peer parsed at MAX_MEMBER_ENTRIES x MAX_PEER_FIELD_LEN can hand
+    # us: far more names, each far longer, than any real fleet has.
+    flood = {"n{:04d}".format(i) + "x" * 200 for i in range(4096)}
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    bridged = mgr._bridge_candidates()
+    assert len(bridged) == MAX_ADVERTISED_CANDIDATE_NAMES
+    # sorted before slicing: the surviving prefix is the same on every node
+    # (the election needs one shared view) and holds the LOWEST names, which
+    # is what elect_leader's min() reads, so the cap cannot change it.
+    assert bridged == sorted(flood)[:MAX_ADVERTISED_CANDIDATE_NAMES]
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(payload["quorate_vouched"]) <= MAX_ADVERTISED_CANDIDATE_NAMES
+    assert len(resp.body) <= MAX_PEER_RESPONSE_BYTES
+    # the worst case the cap is sized against still leaves room for the rest
+    # of the body (see MAX_ADVERTISED_CANDIDATE_NAMES): every surviving name
+    # is at the field-length cap here.
+    assert len(resp.body) <= MAX_PEER_RESPONSE_BYTES // 2 + 8192
+
+
+@pytest.mark.asyncio
+async def test_candidate_truncation_is_reported_not_silent(no_tls, caplog):
+    # Unlike the summaries cap, whose residual is a degraded VIEW, dropping a
+    # candidate from the tail costs a `spread` co-owner and double-runs its
+    # jobs. An operator must not have to infer that from run history, so the
+    # truncation logs and rides /cluster as `candidates_truncated`.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
+    }
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        assert len(mgr._bridge_candidates()) == MAX_ADVERTISED_CANDIDATE_NAMES
+    warned = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    assert len(warned) == 1
+    assert str(len(flood)) in warned[0].getMessage()
+    assert mgr._candidates_truncated == len(flood)
+    view = mgr.view_dict()
+    assert view["candidates_truncated"] == len(flood)
+    # NOT a conflict: that flag fails Leader jobs closed, and standing a
+    # whole fleet down for outgrowing a gossip budget is worse than the
+    # residual it would be protecting against.
+    assert view["conflict"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
+    # The bridge derive and the advert build report DIFFERENT counts (the
+    # advert is the direct + bridge union, strictly larger whenever any
+    # direct-eligible peer exists). One shared last-logged scalar saw an
+    # alternating value and fired on every derive and every advert build,
+    # roughly twice per poll round for as long as the fleet stayed
+    # oversized: the exact flood the limiter's docstring says it prevents.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
+    }
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        for _ in range(5):
+            # each round re-seeds (a gossip poll landing: the peer-table
+            # generation bumps, the derive memo rolls) then rebuilds both
+            # halves, as a live poll round does
+            _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+            mgr._bridge_candidates()
+            mgr._capped_vouched()
+    warned = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    # once per source (the counts differ, so each deserves its line), NOT
+    # once per build
+    assert len(warned) == 2
+
+
+@pytest.mark.asyncio
+async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
+    # The /cluster view flag rode the same scalar the bridge derive zeroes
+    # when ITS half fits, and view_dict cascades into that derive, so the
+    # operator's own /cluster read blanked the truncation the advert build
+    # had just observed on the strictly larger union.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
+    }
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    # the bridge half fits the cap exactly; the union (node-b plus the
+    # bridge set) does not
+    assert len(mgr._bridge_candidates()) == MAX_ADVERTISED_CANDIDATE_NAMES
+    assert len(mgr._capped_vouched()) == MAX_ADVERTISED_CANDIDATE_NAMES
+    over = MAX_ADVERTISED_CANDIDATE_NAMES + 1
+    assert mgr._candidates_truncated == over
+    # a fresh peer write rolls the derive memo, and the derive re-runs on
+    # the next read (what any /cluster view build cascades into); its
+    # fits-branch must not blank the advert's observation
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    mgr._bridge_candidates()
+    assert mgr._candidates_truncated == over
+    assert mgr.view_dict()["candidates_truncated"] == over
+
+
+@pytest.mark.asyncio
+async def test_candidates_truncated_is_zero_for_an_ordinary_fleet(no_tls):
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
+    mgr._bridge_candidates()
+    assert mgr._candidates_truncated == 0
+    assert mgr.view_dict()["candidates_truncated"] == 0
+
+
+@pytest.mark.asyncio
+async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
+    # The advert cell is rewritten only when a /peer poll rebuilds the
+    # response body, so a node whose pollers were all decommissioned kept
+    # a latched overflow and warned about a truncation no longer
+    # happening. The /cluster read must re-check the current union
+    # against the cap instead of trusting the last advert build.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
+    }
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    # a peer poll rebuilds the body: the bridge half fits the cap exactly,
+    # the union (node-b plus the bridge set) does not, so only the advert
+    # cell latches
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(payload["quorate_vouched"]) == MAX_ADVERTISED_CANDIDATE_NAMES
+    over = MAX_ADVERTISED_CANDIDATE_NAMES + 1
+    assert mgr._candidates_truncated == over
+    # still oversized: a peer-table write rolls the derive memo, and with
+    # no /peer rebuild since, the read must keep reporting the latched
+    # count
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    assert mgr.view_dict()["candidates_truncated"] == over
+    # the fleet shrinks under the cap with NO further /peer rebuild
+    # (nobody polls this node any more): the read re-checks and reports 0
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
+    assert mgr.view_dict()["candidates_truncated"] == 0
+    assert mgr._candidates_truncated == 0
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
+    no_tls, monkeypatch
+):
+    # Last-resort degradation: every re-advertised set is capped individually,
+    # so this should be unreachable (the byte cap is patched down here to reach
+    # it at all). If a body ever DOES exceed the cap, shipping it is the worst
+    # outcome: pollers cap the read, record us oversized and drop us from
+    # their quorum, so one over-budget field costs this node its place in the
+    # cluster. Drop the observability-only job_summaries block instead, so
+    # every election-relevant field still travels.
+    import cronstable.cluster as cluster_mod
+
+    monkeypatch.setattr(cluster_mod, "MAX_PEER_RESPONSE_BYTES", 4096)
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
+    )
+    mgr.set_job_summaries_provider(
+        lambda: {
+            "job-{:03d}".format(i): {
+                "running": False,
+                "enabled": True,
+                "scheduled_in": 5.0,
+                "last": {
+                    "outcome": "success",
+                    "finished_at": "2026-01-01T00:00:00+00:00",
+                    "exit_code": 0,
+                },
+            }
+            for i in range(64)
+        }
+    )
+    resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(resp.body) <= 4096
+    assert payload["job_summaries"] == {}
+    assert payload["job_summaries_truncated"] is True
+    # the election-relevant fields still travel
+    assert payload["node_name"] == "node-a"
+    assert payload["cluster_size"] == 1
+    # and the ETag is of the body we actually sent, so a poller echoing it
+    # gets a 304 for the degraded body it really holds, not the full one.
+    req = _Req()
+    req.headers = {"If-None-Match": resp.headers["ETag"]}
+    assert (await mgr._handle_peer(req)).status == 304
+
+
+@pytest.mark.asyncio
 async def test_poll_peer_round_trips_quorate_vouched(no_tls):
     # end to end: a polled quorate_vouched is parsed, stored, and drives the
     # spread Leader owner fold. node-a (spread) polls node-c, which vouches a
@@ -4250,6 +4793,89 @@ def test_parse_str_list_drops_control_char_entries():
         ["ok-job", "bad\njob", "null\x00job"], max_len=128, max_items=64
     )
     assert out == {"ok-job"}
+
+
+def test_parse_str_list_drops_the_empty_string():
+    # The empty string clears every other guard here ("".isprintable() is True
+    # and len("") is under any cap) but sorts BELOW every real node name, so
+    # one folded into mutual_agreeing makes elect_leader's min() return '' on
+    # every node that witnesses it: nobody is leader and every Leader job
+    # stops firing cluster-wide, with the view still reporting quorate.
+    out = _parse_str_list(["", "ok-job"], max_len=128, max_items=64)
+    assert out == {"ok-job"}
+
+
+def test_parse_members_drops_empty_name_or_instance():
+    # same input class as above, on the members list.
+    out = _parse_members(
+        [
+            {"node_name": "", "instance_id": "abc", "agreed": True},
+            {"node_name": "node-b", "instance_id": "", "agreed": True},
+            {"node_name": "node-c", "instance_id": "ic", "agreed": True},
+        ],
+        max_len=256,
+        max_items=64,
+    )
+    assert out == [("node-c", "ic", True)]
+
+
+def test_bridge_candidates_reject_an_empty_name(no_tls):
+    # the same guard at the fold, so the three peer folds (_bridge_candidates,
+    # _unconfirmed_contenders, _available_contenders) read identically and a
+    # future parser change cannot single this one out. Seeded directly, i.e.
+    # past the parse boundary.
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    # N=2, quorum 2: one witness plus the node itself is enough to confirm a
+    # bridge candidate, so an unguarded '' would be elected here.
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", ""})
+    assert mgr._bridge_candidates() == []
+    assert "" not in mgr._eligible_candidates()
+    assert mgr.leader_name() == "node-a"
+    assert mgr.is_leader()
+
+
+@pytest.mark.asyncio
+async def test_poll_peer_empty_name_never_stands_the_cluster_down(no_tls):
+    # end to end: a peer gossiping "" in mutual_agreeing must not elect '' as
+    # leader (no node matches it, so every Leader job stops firing while
+    # /cluster still reports quorate and conflict-free).
+    mgr = ClusterManager(
+        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
+    )
+    me = {
+        "node_name": "node-a",
+        "instance_id": mgr.instance_id,
+        "agreed": True,
+    }
+    session = _FakeSession(
+        _FakeGet(
+            resp=_FakeResp(
+                {
+                    "node_name": "node-b",
+                    "job_set_id": "v1:mine",
+                    "scheme_version": SCHEME_VERSION,
+                    "instance_id": "ib",
+                    "members": [
+                        me,
+                        {
+                            "node_name": "node-b",
+                            "instance_id": "ib",
+                            "agreed": True,
+                        },
+                    ],
+                    "mutual_agreeing": ["node-a", ""],
+                    "quorate_vouched": ["node-a", ""],
+                }
+            )
+        )
+    )
+    await mgr._poll_peer(session, "b:1", "v1:mine")
+    assert mgr.view.peers["b:1"].mutual_agreeing == {"node-a"}
+    assert mgr.view.peers["b:1"].quorate_vouched == {"node-a"}
+    assert mgr.leader_name() == "node-a"
+    assert mgr.is_leader()
 
 
 # --------------------------------------------------------------------------

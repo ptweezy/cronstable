@@ -1830,6 +1830,102 @@ def test_tui_outcome_mapping_has_exactly_one_home():
         assert hits < 2, "%s outcome ladder outside outcome_key" % where
 
 
+def test_health_colors_cover_the_health_vocabulary():
+    """HEALTH_COLOR replaced three identical inline dicts (jobs table,
+    wallboard tiles, drawer header), the OUTCOME_KEY history repeating
+    itself. Pin the shared map to health()'s real return vocabulary and
+    to inks every palette carries, and fence the inline copies out."""
+    import inspect
+    import re
+
+    # every ("key", "Label") return in health() has a colour, and nothing
+    # in the map is dead vocabulary health() can never produce
+    returns = set(
+        re.findall(r'return \("(\w+)",', inspect.getsource(tui.health))
+    )
+    assert returns == set(tui.HEALTH_COLOR)
+    for ink in set(tui.HEALTH_COLOR.values()):
+        for hue, palette in tui._P.items():
+            assert ink in palette, (hue, ink)
+    # no panel regrows its own copy of the map
+    source = open(tui.__file__, encoding="utf-8").read()
+    assert source.count('"disabled": "off"') == 1
+
+
+def test_heat_rank_covers_the_outcome_key_vocabulary():
+    """HEAT_RANK was the one outcome map with no parity guard, and the
+    heatmap reads it with a bare subscript once per run per row per frame.
+    Grow ``outcome_key`` an arm, miss this map, and only the clamp in
+    ``_heat_runs`` stands between that and a ``KeyError`` every repaint,
+    which is the whole dashboard gone rather than one cell in the wrong
+    shade. Pin the ladder to the vocabulary its producer can emit, so the
+    drift lands on this test instead."""
+    vocabulary = set(tui.OUTCOME_KEY.values()) | {"ok"}
+    assert set(tui.HEAT_RANK) == vocabulary
+    # the two orderings the ladder exists for: an hour that only ever held
+    # slots back for a pause must not shade like a success, and a failure
+    # outranks everything else in its bucket
+    assert tui.HEAT_RANK["skipped"] < tui.HEAT_RANK["ok"]
+    assert tui.HEAT_RANK["fail"] == max(tui.HEAT_RANK.values())
+    # ties would make the worst outcome in a bucket depend on run order
+    assert len(set(tui.HEAT_RANK.values())) == len(tui.HEAT_RANK)
+    # the winning key goes straight into OUTCOME_COLOR, so the two maps
+    # have to speak the same vocabulary or the crash just moves one line
+    assert set(tui.HEAT_RANK) == set(tui.OUTCOME_COLOR)
+
+
+def test_dag_state_colors_cover_dag_vocabulary_and_match_web():
+    """DAG_STATE_COLOR is the explicit port of the web's ``dstVar``. The
+    old spelling-guess ladder handled six strings the engine never emits
+    while ``upstream_failed`` (a failure state, fail-red on the web)
+    painted neutral "dim"; this pins the map to dag.py's real vocabulary
+    and to the web's own map, so neither side can drift alone again."""
+    import re
+
+    from cronstable import dag
+
+    states = set(dag.TERMINAL_STATES) | {
+        dag.PENDING,
+        dag.RUNNING,
+        dag.UP_FOR_RETRY,
+        dag.EXPANDED,
+    }
+    for state in states:
+        assert state in tui.DAG_STATE_COLOR, state
+    # the drifted trio that motivated the map
+    assert tui.DAG_STATE_COLOR[dag.UPSTREAM_FAILED] == "fail"
+    assert tui.DAG_STATE_COLOR[dag.UP_FOR_RETRY] == "pending"
+    assert tui.DAG_STATE_COLOR[dag.SKIPPED] == "off"
+    # the run-level extra the TUI paints as queued work
+    assert tui.DAG_STATE_COLOR["scheduled"] == "pending"
+    # every ink the map can return exists in every palette, or a state
+    # renders in the default ink and reads as an ordinary one
+    for hue, palette in tui._P.items():
+        for ink in set(tui.DAG_STATE_COLOR.values()):
+            assert ink in palette, (hue, ink)
+    # web parity: read dstVar's own map and translate its CSS var names to
+    # the TUI's ink names (the web's --unknown and fg-faint have no TUI
+    # palette twin; "dim" stands in for both)
+    path, html = _web_page()
+    mapper = re.search(
+        r"function dstVar\(s\) \{\s*return \(\{(.*?)\}\)", html, re.S
+    )
+    assert mapper, path
+    web_map = dict(re.findall(r'(\w+): "([\w-]+)"', mapper.group(1)))
+    assert set(web_map) >= states, path
+    web2tui = {
+        "ok": "ok",
+        "fail": "fail",
+        "run": "run",
+        "pending": "pending",
+        "disabled": "off",
+        "fg-faint": "dim",
+        "unknown": "dim",
+    }
+    for state, web_var in web_map.items():
+        assert tui.DAG_STATE_COLOR[state] == web2tui[web_var], state
+
+
 def test_tui_paints_a_pause_held_slot_as_skipped_not_ok():
     """#28 residual: the web fix routed both of its outcome ladders
     through ``outcomeCls``, but the TUI's five copies were untouched, so
@@ -2786,6 +2882,181 @@ def test_render_heat_bucket_edges(tmp_path):
     assert "activity heatmap" in _txt(app.render_heat(paint, 110, 30))
 
 
+async def test_load_heat_overlaps_bounded_and_prunes_dead_names(tmp_path):
+    # The heat load used to await its per-job /runs fetches strictly one at
+    # a time INSIDE the poll loop, freezing every poll surface for the sum
+    # of the round trips. It now runs spawned with a few requests in
+    # flight, and prunes entries for jobs a reload removed.
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j%02d" % i} for i in range(12)]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.heat_data["gone"] = [{"outcome": "success"}]  # a removed job's relic
+    state = {"in_flight": 0, "high": 0, "calls": 0}
+
+    class FakeApi:
+        async def get_json(self, path):
+            if path == "/activity":
+                # an old daemon: the batch probe 404s (uncounted), and
+                # the per-job fan-out below is the path under test
+                raise tui.ApiError(404)
+            state["calls"] += 1
+            state["in_flight"] += 1
+            state["high"] = max(state["high"], state["in_flight"])
+            await asyncio.sleep(0.01)
+            state["in_flight"] -= 1
+            return {"runs": [{"outcome": "success"}]}
+
+    app.api = FakeApi()
+    app._heat_busy = True  # exactly as _fanout sets it before spawning
+    await app._load_heat()
+    assert state["calls"] == 12
+    assert 1 < state["high"] <= 5  # overlapped, but politely bounded
+    assert "gone" not in app.heat_data
+    assert app.heat_data["j00"] == [{"outcome": "success"}]
+    assert app._heat_busy is False  # the 60s gate can spawn again
+
+
+async def test_load_heat_prefers_the_batched_endpoint(tmp_path):
+    # One /activity fetch replaces the per-job storm. The payload lands
+    # wholesale, so a removed job's relic entry disappears without an
+    # explicit prune and an empty history renders as an empty row.
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j00"}, {"name": "j01"}]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    app.heat_data["gone"] = [{"outcome": "success"}]  # a removed job's relic
+    row = {"outcome": "success", "finished_at": _iso_ago(60)}
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            assert path == "/activity", "unexpected fan-out to %s" % path
+            return {"jobs": {"j00": [row], "j01": []}}
+
+    app.api = FakeApi()
+    app._heat_busy = True  # exactly as _fanout sets it before spawning
+    await app._load_heat()
+    assert calls == ["/activity"]
+    assert "gone" not in app.heat_data
+    assert app.heat_data["j00"] == [row]
+    assert app.heat_data["j01"] == []
+    assert app._heat_busy is False
+
+
+async def test_load_heat_falls_back_per_job_on_404(tmp_path):
+    # only the old-daemon signature (a 404: aiohttp answers unmatched
+    # paths with one) may launch the per-job fan-out
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j%02d" % i} for i in range(12)]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            if path == "/activity":
+                raise tui.ApiError(404)
+            return {"runs": [{"outcome": "success"}]}
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert calls[0] == "/activity"
+    assert len(calls) == 13  # the probe plus one /runs per job
+    assert app.heat_data["j00"] == [{"outcome": "success"}]
+    assert app._heat_busy is False
+
+
+async def test_load_heat_transient_batch_failure_keeps_stale_data(tmp_path):
+    # a flaky NEW daemon (a 500, a timeout) must not trigger the fan-out
+    # storm; the stale card simply survives until the next window
+    app = _bare_app(tmp_path)
+    app.jobs = [{"name": "j00"}]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    stale = [{"outcome": "failure", "finished_at": _iso_ago(120)}]
+    app.heat_data["j00"] = list(stale)
+    calls = []
+
+    class FakeApi:
+        async def get_json(self, path):
+            calls.append(path)
+            raise tui.ApiError(500)
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert calls == ["/activity"]  # no per-job fan-out
+    assert app.heat_data["j00"] == stale
+    assert app._heat_busy is False
+
+
+async def test_fanout_secondary_legs_overlap(tmp_path):
+    # The fan-out used to await /cluster, /node, /fleet and /state one
+    # after another, paying the sum of the round trips every poll cycle
+    # (up to four serial timeouts against a stalled daemon). The legs are
+    # independent, so they must be in flight together.
+    app = _bare_app(tmp_path)
+    app.open("fleet")
+    app.open("state")
+    app.state_tab = "view"
+    state = {"in_flight": 0, "high": 0, "paths": []}
+
+    class FakeApi:
+        async def get_json(self, path):
+            state["paths"].append(path)
+            state["in_flight"] += 1
+            state["high"] = max(state["high"], state["in_flight"])
+            await asyncio.sleep(0.01)
+            state["in_flight"] -= 1
+            return {"from": path}
+
+    app.api = FakeApi()
+    await app._fanout()
+    assert sorted(state["paths"]) == ["/cluster", "/fleet", "/node", "/state"]
+    assert state["high"] > 1  # concurrent, not serial
+    # every leg still lands on its own attribute
+    assert app.cluster == {"from": "/cluster"}
+    assert app.node == {"from": "/node"}
+    assert app.fleet == {"from": "/fleet"}
+    assert app.state_data == {"from": "/state"}
+
+
+async def test_spawn_swallows_cancellation_in_its_done_callback(tmp_path):
+    # A spawned task still pending at quit is cancelled by asyncio.run's
+    # teardown, and Task.exception() raises CancelledError on a cancelled
+    # task; the old retrieve-always callback therefore blew up itself and
+    # printed an "Exception in callback" traceback over the restored
+    # terminal. The loop's exception handler sees such a callback crash,
+    # so capture through it and assert silence.
+    app = _bare_app(tmp_path)
+    loop = asyncio.get_running_loop()
+    captured: List[Dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda lp, ctx: captured.append(ctx))
+    try:
+        holder: Dict[str, Any] = {}
+
+        async def park() -> None:
+            holder["task"] = asyncio.current_task()
+            await asyncio.Event().wait()  # parked until cancelled
+
+        app._spawn(park())
+        deadline = time.monotonic() + 5.0
+        while "task" not in holder and time.monotonic() < deadline:
+            await asyncio.sleep(0.001)
+        task = holder["task"]
+        # fires strictly after _spawn's own callback, so once this lands
+        # any crash in that callback has already reached the handler
+        settled = asyncio.Event()
+        task.add_done_callback(lambda t: settled.set())
+        task.cancel()
+        await asyncio.wait_for(settled.wait(), 5.0)
+        assert task.cancelled()
+        assert not captured, captured
+    finally:
+        loop.set_exception_handler(previous)
+
+
 def test_render_heat_future_run_lands_in_newest_bucket(tmp_path):
     # remote daemon clock skew can date a finish more than an hour into
     # this host's future; that must shade the newest cell, not crash
@@ -2801,6 +3072,23 @@ def test_render_heat_future_run_lands_in_newest_bucket(tmp_path):
     assert "activity heatmap" in body
     # both runs share the newest bucket: one cell at volume 2
     assert "▒" in body and "░" not in body
+
+
+def test_render_heat_survives_an_outcome_key_the_ladder_lacks(
+    tmp_path, monkeypatch
+):
+    # if an outcome key HEAT_RANK never learned does ship, the heatmap
+    # paints it in the "unknown" ink rather than raising KeyError once a
+    # frame and taking the dashboard down with it; the parity test above
+    # fails the build on that drift, this covers the drift escaping anyway
+    monkeypatch.setitem(tui.OUTCOME_KEY, "smote", "smote")
+    app = _bare_app(tmp_path)
+    paint = _paint(app)
+    app.heat_data = {"j": [{"outcome": "smote", "finished_at": _iso_ago(60)}]}
+    body = _txt(app.render_heat(paint, 110, 30))
+    assert "activity heatmap" in body
+    assert "░" in body  # the cell rendered, at volume 1
+    assert [key for _, key in app._heat_runs("j")] == ["unknown"]
 
 
 def test_render_press_full_grid(tmp_path):
