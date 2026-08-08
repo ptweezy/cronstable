@@ -33,11 +33,16 @@ from cronstable.backends._common import (
     _SKEW_SECONDS,
     _UNKNOWN_HOLDER,
     StoreLeaseBackend,
-    _file_signature,  # noqa: F401  (re-exported; backend tests import it)
+    # Re-exported; backend tests import it. Rotation detection
+    # (tls_files_changed) resolves the name in cronstable.backends._common,
+    # so a patch must target _common, not this module (unlike _monotonic,
+    # whose call sites stay here and patch per-module).
+    _file_signature,  # noqa: F401
     _format_microtime,
     _monotonic,
     _utcnow,
     display_deadline,
+    fence_deadline,
 )
 from cronstable.config import ClusterConfig, _redact_userinfo
 from cronstable.leadership import (
@@ -266,7 +271,6 @@ class EtcdBackend(StoreLeaseBackend):
         # backend: the context is never reloaded, so a rotated cert would
         # otherwise silently lose leadership fleet-wide once the old one
         # expires. Empty (-> tls_files_changed False) for plain-http.
-        self._tls_files: list[str] = []
         self._tls_signature: dict[str, Optional[tuple[int, int]]] = {}
         self.connect_timeout: int = config["connectTimeout"]
         # renew_period / round_deadline / request_timeout are derived from the
@@ -506,15 +510,15 @@ class EtcdBackend(StoreLeaseBackend):
             # conservative regardless of keepalive/grant or campaign latency.
             fence_anchor = lease_mono if lease_mono is not None else mono
             self._lease_deadline = self._leader_deadline(now)
-            self._lease_deadline_mono = (
-                fence_anchor + self._effective_ttl - _SKEW_SECONDS
+            self._lease_deadline_mono = fence_deadline(
+                fence_anchor, self._effective_ttl
             )
 
     # --- network glue (integration-only) ---------------------------------
 
     async def start(self) -> None:  # pragma: no cover - network/credential I/O
         self._ssl = self._build_ssl()
-        self._record_tls_files()
+        self._record_tls_files(self._tls_file_paths())
         timeout = aiohttp.ClientTimeout(total=self.connect_timeout)
         self._session = aiohttp.ClientSession(timeout=timeout)
         try:
@@ -593,14 +597,6 @@ class EtcdBackend(StoreLeaseBackend):
             if value:
                 paths.append(value)
         return paths
-
-    def _record_tls_files(self) -> None:  # pragma: no cover - file stat
-        """Snapshot the on-disk client-TLS files the SSLContext was built from.
-
-        Called from :meth:`start`; see ``StoreLeaseBackend.tls_files_changed``
-        for what the snapshot buys (empty for plain-http: nothing to rotate).
-        """
-        self._record_tls_signature(self._tls_file_paths())
 
     def tls_files_loadable(self) -> bool:  # pragma: no cover - ssl file I/O
         """Dry-run-load the current on-disk client-TLS material.

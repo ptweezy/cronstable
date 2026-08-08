@@ -516,12 +516,12 @@ jobs:
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
           # sdist (ship uvloop as broadly as it compiles); a failed install
-          # falls back to asyncio. verify_extra.py then proves the result
-          # actually runs a loop (a source build can miscompile under emulation)
-          # and uninstalls it if not, so a broken uvloop is never frozen in and
-          # the binary cleanly uses asyncio.
-          uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-          uv run python pyinstaller/verify_extra.py uvloop || uv pip uninstall uvloop || true
+          # falls back to asyncio. The shared script then has verify_extra.py
+          # prove the result actually runs a loop (a source build can
+          # miscompile under emulation) and uninstalls it if not, so a broken
+          # uvloop is never frozen in and the binary cleanly uses asyncio.
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
           # Bundle orjson (the `speedups` extra) to accelerate the durable-state
           # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
           # needed). The shared script round-trip-verifies it and drops a broken
@@ -534,16 +534,16 @@ jobs:
           # would let a transient index blip silently ship the advertised
           # push channel disabled. verify_extra.py round-trips a real
           # sealed box so a miscompiled libsodium also fails the job.
-          uv pip install "pynacl>=1.5"
-          uv run python pyinstaller/verify_extra.py pynacl
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
           # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
           # Python with optional speedups, so the install works on every
           # arch and is a HARD failure too. It is LGPL-2.1: the notice
           # ships inside the binary (--third-party-licenses), the source
           # archive is attached to the Release, and the public build
           # recipe is the relink path. See LICENSING.md.
-          uv pip install "zeroconf>=0.132"
-          uv run python pyinstaller/verify_extra.py zeroconf
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
@@ -683,12 +683,12 @@ jobs:
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a wheel where one exists
-              # (amd64/arm64), else a source build. verify_extra.py proves the
-              # result runs a loop (a source build can miscompile under QEMU)
-              # and uninstalls it otherwise, so a broken uvloop is never frozen
-              # in; the binary then cleanly falls back to asyncio.
-              pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-              python pyinstaller/verify_extra.py uvloop || pip uninstall -y uvloop || true
+              # (amd64/arm64), else a source build. The shared script has
+              # verify_extra.py prove the result runs a loop (a source build
+              # can miscompile under QEMU) and uninstalls it otherwise, so a
+              # broken uvloop is never frozen in; the binary then cleanly
+              # falls back to asyncio.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
               # Bundle orjson (the `speedups` extra): a wheel on amd64/arm64,
               # else a Rust source build. RUST_SETUP (per-libc, from the
               # matrix) installs a CURRENT Rust via rustup (distro rustc is
@@ -703,19 +703,18 @@ jobs:
               RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
               # Bundle pynacl (the `push` extra): wheels on amd64/arm64, else
               # a plain-C source build (bundled libsodium, no Rust; the
-              # libffi/make toolchain is best-effort). A build that fails the
-              # sealed-box round-trip is uninstalled, so the binary never
-              # ships a miscompiled libsodium (push fails closed).
+              # libffi/make toolchain is best-effort). Soft on this lane
+              # only: a build that fails the sealed-box round-trip is
+              # uninstalled, so the binary never ships a miscompiled
+              # libsodium (push fails closed).
               ${{ matrix.nacl_tools }}
-              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
-              python pyinstaller/verify_extra.py pynacl || pip uninstall -y pynacl || true
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" soft "push extra not bundled"
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install even under QEMU. It
               # is LGPL-2.1; the in-binary notice, Release source
               # archive, and public build recipe are the compliance kit
               # (see LICENSING.md).
-              pip install "zeroconf>=0.132"
-              python pyinstaller/verify_extra.py zeroconf
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
               pyinstaller pyinstaller/cronstable.spec
               dist/cronstable --version            # smoke test, native or emulated on its own libc
               # Whenever the build env kept pynacl, the frozen binary
@@ -786,10 +785,11 @@ jobs:
           uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
-          # ships wheels for both arches. verify_extra.py confirms it imports and
-          # runs a loop, else uninstalls it so the binary falls back to asyncio.
-          uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-          uv run python pyinstaller/verify_extra.py uvloop || uv pip uninstall uvloop || true
+          # ships wheels for both arches. The shared script has verify_extra.py
+          # confirm it imports and runs a loop, else uninstalls it so the binary
+          # falls back to asyncio.
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
           # Bundle orjson (the `speedups` extra); macOS ships wheels (no Rust).
           # The shared script round-trip-verifies it and drops a broken build, so
           # the binary falls back to stdlib json (cronstable/_json).
@@ -799,13 +799,13 @@ jobs:
           # wheels, so absence means a broken build. Install and verify
           # are HARD failures on this lane (a soft-fail would silently
           # ship the advertised push channel disabled).
-          uv pip install "pynacl>=1.5"
-          uv run python pyinstaller/verify_extra.py pynacl
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
           # Release source archive + public build recipe (LICENSING.md).
-          uv pip install "zeroconf>=0.132"
-          uv run python pyinstaller/verify_extra.py zeroconf
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -932,14 +932,14 @@ jobs:
           # win32/amd64/arm64, so absence means a broken build. Install
           # and verify are HARD failures on this lane (a soft-fail would
           # silently ship the advertised push channel disabled).
-          uv pip install "pynacl>=1.5"
-          uv run python pyinstaller/verify_extra.py pynacl
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
           # notice + Release source archive + public build recipe
           # (LICENSING.md).
-          uv pip install "zeroconf>=0.132"
-          uv run python pyinstaller/verify_extra.py zeroconf
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both

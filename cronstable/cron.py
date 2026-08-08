@@ -2956,14 +2956,8 @@ class Cron:
             ):
                 soonest_in = scheduled_in
                 soonest_name = name
-        # the cluster node name when clustered, else the plain hostname (the
-        # same identity node_payload reports).
         mgr = self.cluster_manager
-        node_name = (
-            mgr.node_name
-            if mgr is not None and getattr(mgr, "node_name", None)
-            else self._state_host
-        )
+        node_name = self._node_name()
         next_fire: Optional[dict[str, Any]] = None
         if soonest_name is not None and soonest_in is not None:
             when = self._next_fire.get(soonest_name)
@@ -6470,7 +6464,7 @@ class Cron:
                 # flag resets below would otherwise suppress the transition
                 # log, leaving the ex-leader silent about why it stopped
                 # Leader jobs.
-                node = getattr(mgr, "node_name", None) or self._state_host
+                node = self._node_name()
                 if self._was_leader:
                     # a real leadership loss (the rebuilt manager re-elects
                     # from scratch), so it counts as a transition too
@@ -9083,7 +9077,7 @@ class Cron:
                 # quorum loss is alert-worthy (regain is logged, not
                 # paged). Guarded so an unconfigured daemon builds no
                 # payload.
-                node = getattr(mgr, "node_name", None) or self._state_host
+                node = self._node_name()
                 self._dispatch_notify(
                     "quorum_loss",
                     success=False,
@@ -9107,7 +9101,7 @@ class Cron:
             )
             # Guarded so an unconfigured daemon builds no payload.
             if self._notify_config is not None:
-                node = getattr(mgr, "node_name", None) or self._state_host
+                node = self._node_name()
                 self._dispatch_notify(
                     "leader_change",
                     success=False,

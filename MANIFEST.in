@@ -31,7 +31,8 @@ include docs/palette.css
 # wiki/Web-Dashboard.md, and tests/test_benchmarks.py runs benchmarks/bench.py
 # and benchmarks/compare.py.
 
-# The shipped suite also reads Dockerfile, docker/, .dockerignore and
-# .github/workflows/release.yml (tests/test_dockerfile_layering.py and
-# tests/test_ci_fences.py); none of those are pruned, so they ship, and any
-# future prune must keep them reachable.
+# The shipped suite also reads Dockerfile, docker/, .dockerignore,
+# .github/docker-matrix.json and .github/workflows/release.yml
+# (tests/test_dockerfile_layering.py and tests/test_ci_fences.py); none of
+# those are pruned, so they ship, and any future prune must keep them
+# reachable.

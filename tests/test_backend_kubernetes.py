@@ -1180,7 +1180,7 @@ def test_tls_files_changed_false_when_nothing_tracked():
     b = _backend()
     assert b.tls_files_changed() is False  # nothing recorded yet
     b._record_tls_files([None, ""])  # None/empty entries dropped
-    assert b._tls_files == []
+    assert b._tls_signature == {}
     assert b.tls_files_changed() is False
 
 

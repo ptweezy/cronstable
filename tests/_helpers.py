@@ -39,9 +39,9 @@ def _state_cfg(yaml):
 
 
 # --- the filesystem state-backend factory -----------------------------------
-# canonical: tests/test_state.py (test_perf_invariants.py keeps the same
-# construction; test_backend_filesystem.py's variant with node/jsid
-# parameters stays local).
+# the one home: test_state.py and test_perf_invariants.py import it from
+# here (test_backend_filesystem.py's variant with node/jsid parameters
+# stays local).
 
 
 def _backend(tmp_path, **over):

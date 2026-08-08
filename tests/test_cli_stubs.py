@@ -91,7 +91,7 @@ def test_entry_point_module_does_not_import_heavy_surfaces():
 
 
 def test_cliargs_is_a_leaf():
-    """cronstable._cliargs is imported at module scope by __main__, jobcli,
+    """cronstable._cliargs is imported at module scope by __main__,
     mcpcli AND tui, so any import it grows beyond the stdlib is paid by all
     of them at once; asyncio is checked by name as the costliest stdlib
     module it could sprout.
