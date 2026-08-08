@@ -520,7 +520,8 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
-          python-version: '3.14'
+          python-version: '3.15'
+          allow-prereleases: true  # 3.15 is an rc until 2026-10-01
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.12.1"
@@ -529,10 +530,12 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          # Runner-native, all-wheels arch: install into a throwaway uv venv and
-          # freeze from it with `uv run` (uv discovers the setup-python 3.14).
-          uv venv --python 3.14
-          uv pip install pyinstaller==6.21.0  # pin matches pyinstaller/Dockerfile
+          # Runner-native arch: install into a throwaway uv venv and freeze from
+          # it with `uv run` (uv discovers the setup-python 3.15). aiohttp has no
+          # cp315 wheel yet, so it compiles from sdist here. These runners have a
+          # toolchain, so the cost is build time.
+          uv venv --python 3.15
+          uv pip install pyinstaller==6.21.0  # supports 3.15 (requires_python <3.16)
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
@@ -587,6 +590,10 @@ jobs:
   # the amd64 runner; armv7, armv6, ppc64le, s390x and riscv64 run under QEMU.
   # armv6 is musl-only (Debian/glibc ships no arm32v6). Same pyinstaller pin and
   # `--version` smoke test as the glibc job; the asset carries a `-musl` suffix.
+  #
+  # The base is python:3.15-rc-alpine. That tag stops being updated when 3.15.0
+  # ships on 2026-10-01, so swap it (and the glibc job's -rc-slim) to the plain
+  # python:3.15-alpine / -slim tags then.
   binaries-musl:
     needs: version
     strategy:
@@ -669,7 +676,7 @@ jobs:
         run: |
           set -euo pipefail
           . .github/scripts/retry.sh
-          pull_base python:3.14-alpine ${{ matrix.platform }}
+          pull_base python:3.15-rc-alpine ${{ matrix.platform }}
       - name: Build binary (Alpine/musl)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -680,18 +687,19 @@ jobs:
             -e PIP_RETRIES -e PIP_TIMEOUT \
             -e PIP_CACHE_DIR=/src/.pip-cache \
             -v "$PWD:/src" -w /src \
-            python:3.14-alpine sh -euc '
+            python:3.15-rc-alpine sh -euc '
               # The checkout is mounted at /src, so the runner-side retry helper
               # is reachable in here too. apk has no retry flag of its own and a
               # failed index fetch is a hard job failure, so it gets wrapped.
               . /src/.github/scripts/retry.sh
               # build-base brings the C toolchain + strip (the spec sets
               # strip=True); libffi/zlib headers cover any dep that lacks a
-              # musllinux wheel and falls back to compiling from sdist (notably
-              # the i686 aiohttp stack, which ships no musllinux_i686 wheels).
+              # musllinux wheel and falls back to compiling from sdist. On 3.15
+              # every row needs that toolchain, not just i686: aiohttp publishes
+              # no cp315 wheel at all, so every arch compiles it.
               retry 5 apk add --no-cache build-base libffi-dev zlib-dev
               pip install --upgrade pip
-              pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
+              pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.15)
               pip install .                     # bakes the pinned version into cronstable/version.py
               # Bundle uvloop (the `speedups` extra): a musllinux wheel where one
               # exists (amd64/arm64), else a source build. verify_uvloop.py proves
@@ -746,8 +754,10 @@ jobs:
   # Self-contained glibc binaries for the arches with no native GitHub runner
   # (i686, armv7, ppc64le, s390x, riscv64). PyInstaller is not a cross-compiler,
   # so -- like binaries-musl -- these build inside a container via
-  # `docker run --platform`, here on python:3.14-slim (Debian glibc). i686 runs
+  # `docker run --platform`, here on python:3.15-rc-slim (Debian glibc). i686 runs
   # natively on the amd64 runner; armv7, ppc64le, s390x and riscv64 under QEMU.
+  # The -rc- tag stops being updated at 3.15.0 final; see the note on
+  # binaries-musl for the swap.
   binaries-glibc-extra:
     needs: version
     strategy:
@@ -798,7 +808,7 @@ jobs:
         run: |
           set -euo pipefail
           . .github/scripts/retry.sh
-          pull_base python:3.14-slim ${{ matrix.platform }}
+          pull_base python:3.15-rc-slim ${{ matrix.platform }}
       - name: Build binary (Debian/glibc container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
@@ -809,15 +819,16 @@ jobs:
             -e PIP_RETRIES -e PIP_TIMEOUT \
             -e PIP_CACHE_DIR=/src/.pip-cache \
             -v "$PWD:/src" -w /src \
-            python:3.14-slim sh -euc '
+            python:3.15-rc-slim sh -euc '
               # The checkout is mounted at /src, so the runner-side retry helper
               # is reachable in here too.
               . /src/.github/scripts/retry.sh
               # build-essential brings gcc + strip (the spec sets strip=True);
               # libffi/zlib headers cover the C-extension deps that ship no glibc
-              # wheel and compile from sdist (the i686 aiohttp stack; propcache on
-              # armv7). ppc64le/s390x have full manylinux wheels, so the toolchain
-              # goes unused there.
+              # wheel and compile from sdist. On 3.15 that is every row: aiohttp
+              # publishes no cp315 wheel for any arch, so even ppc64le/s390x,
+              # which have full manylinux wheels on older interpreters, compile
+              # it under QEMU and run long.
               # Acquire::Retries matches the apt calls further down, which had it
               # from the start while these two (the ones that always run) did not.
               retry 5 apt-get -o Acquire::Retries=5 update
@@ -909,7 +920,8 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
-          python-version: '3.14'  # set explicitly; don't rely on the runner's preinstalled patch level
+          python-version: '3.15'  # set explicitly; don't rely on the runner's preinstalled patch level
+          allow-prereleases: true  # 3.15 is an rc until 2026-10-01
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.12.1"
@@ -918,9 +930,10 @@ jobs:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
           set -euo pipefail
-          # Runner-native, all-wheels arch: install into a throwaway uv venv and
-          # freeze from it with `uv run` (uv discovers the setup-python 3.14).
-          uv venv --python 3.14
+          # Runner-native arch: install into a throwaway uv venv and freeze from
+          # it with `uv run` (uv discovers the setup-python 3.15). aiohttp has no
+          # cp315 wheel yet and compiles from sdist here.
+          uv venv --python 3.15
           uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
@@ -1020,9 +1033,10 @@ jobs:
           retention-days: 7
 
   # Self-contained Windows binaries: amd64 on the hosted runner, arm64 on the
-  # windows-11-arm runner. Any C-extension dep lacking a win_arm64 wheel (parts
-  # of the aiohttp stack, ruamel.yaml.clib) compiles from sdist via the runner's
-  # Visual Studio ARM64 toolchain. Same pyinstaller pin + `--version` smoke test;
+  # windows-11-arm runner. Any C-extension dep lacking a wheel (on 3.15 that is
+  # aiohttp and zeroconf on BOTH arches, plus ruamel.yaml.clib and the rest of
+  # the aiohttp stack on arm64) compiles from sdist via the runner's Visual
+  # Studio toolchain. Same pyinstaller pin + `--version` smoke test;
   # the assets are cronstable-windows-<arch>.exe. Steps use bash (git bash ships
   # on the Windows runners).
   binaries-windows:
@@ -1046,7 +1060,8 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v7.0.0
         with:
-          python-version: '3.14'
+          python-version: '3.15'
+          allow-prereleases: true  # 3.15 is an rc until 2026-10-01
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           version: "0.12.1"
@@ -1057,8 +1072,16 @@ jobs:
           set -euo pipefail
           # Runner-native (uv ships a win_arm64 build too); install into a
           # throwaway uv venv and freeze from it with `uv run`.
-          uv venv --python 3.14
-          uv pip install pyinstaller==6.21.0  # pin matches the Linux/macOS jobs
+          #
+          # Neither aiohttp nor zeroconf publishes a cp315 wheel for any Windows
+          # arch, so both compile from sdist against the runner's MSVC
+          # toolchain, and the zeroconf install and import below are HARD
+          # failures by design. That makes this the most fragile binary lane on
+          # 3.15, and arm64 the most fragile row in it, since nothing in the
+          # aiohttp stack has a win_arm64 wheel to fall back on. Read a red here
+          # as upstream wheel lag before suspecting a cronstable defect.
+          uv venv --python 3.15
+          uv pip install pyinstaller==6.21.0  # supports 3.15 (requires_python <3.16)
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle orjson (the `speedups` extra) for the durable-state / cluster
           # JSON paths; Windows amd64 ships a wheel (arm64 falls back if none).
