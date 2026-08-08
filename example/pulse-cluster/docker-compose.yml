@@ -7,8 +7,12 @@
 #   docker compose -f example/pulse-cluster/docker-compose.yml down -v        # stop + wipe certs
 #
 # Three nodes (cronstable-a, -b, -c) run one identical pulse job set
-# (example/pulse-cluster/jobs.yaml) plus a per-node cluster section. A one-shot
-# `certgen` mints a throwaway CA + one cert per node into a shared volume first.
+# (example/pulse-cluster/jobs.yaml); each node's `cluster:` section is
+# generated at start from environment variables by the shared
+# example/_shared/node-entrypoint.sh, so there are no hand-written per-node
+# files here (example/cluster keeps annotated node-*.yaml files if you want to
+# read the section itself). A one-shot `certgen` mints a throwaway CA + one
+# cert per node into a shared volume first.
 #
 # Each node serves its own dashboard:
 #   - cronstable-a -> http://localhost:8080/   (the leader while all three are up)
@@ -34,32 +38,53 @@
 #    unaffected (a+b = 2 of 3), so this is a pure OUTAGE-DETECTION demo, cleanly
 #    separate from #2. Bring it back: `... start cronstable-c`.
 #
-# 4. Spread the Leader work. Uncomment `distribution: spread` in ALL THREE
-#    example/pulse-cluster/node-*.yaml and recreate. Now `latency-slo` and
-#    `sla-rollup` get per-job owners (rendezvous-hashed), so they can land on
-#    different nodes instead of both on the leader.
+# 4. Spread the Leader work. Recreate with per-job owners (rendezvous-hashed):
+#        DISTRIBUTION=spread docker compose -f example/pulse-cluster/docker-compose.yml up -d
+#    Now `latency-slo` and `sla-rollup` can land on different nodes instead of
+#    both on the leader.
 #
 # For the single-node version, see example/pulse-monitor/docker-compose.yml.
 # For the clustering feature tour without the monitoring theme, see
 # example/cluster/docker-compose.yml.
 
+x-cluster-hosts: &cluster_hosts "cronstable-a:8443,cronstable-b:8443,cronstable-c:8443"
+
+x-node-env: &node-env
+  CLUSTER_HOSTS: *cluster_hosts
+  DISTRIBUTION: ${DISTRIBUTION:-single-leader}  # spread = per-job owners (WHAT TO WATCH #4)
+  ELECT_LEADER: "true"
+  INTERVAL: "10"
+  DRIFT_AFTER: "2"
+  SHARE_NODE_STATS: "false"       # keep the demo about the probes, not load meters
+
 x-cronstable-node: &cronstable-node
   build:
     context: ../..
   image: cronstable-pulse-cluster:local   # built once, reused by all three nodes
+  entrypoint: ["sh", "/node-entrypoint.sh"]
   restart: unless-stopped
   depends_on:
     certgen:
       condition: service_completed_successfully
+  volumes:
+    - ./jobs.yaml:/config/jobs.yaml:ro
+    - ../_shared/node-entrypoint.sh:/node-entrypoint.sh:ro
+    - pulse-certs:/certs:ro
 
 services:
-  # One-shot: generate the cluster CA + per-node certs, then exit.
+  # One-shot: generate the cluster CA + per-node certs, then exit. The script
+  # is shared by all the cluster demos (example/_shared/gen-certs.sh, see its
+  # header for the demo-only caveats); the env below names this demo's nodes.
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]
+    environment:
+      NODES: "cronstable-a cronstable-b cronstable-c"
+      CA_CN: cronstable-pulse-cluster-ca
+      PROJECT: example/pulse-cluster
     volumes:
       - pulse-certs:/certs
-      - ./gen-certs.sh:/gen-certs.sh:ro
+      - ../_shared/gen-certs.sh:/gen-certs.sh:ro
 
   cronstable-a:
     <<: *cronstable-node
@@ -67,10 +92,9 @@ services:
     hostname: cronstable-a                 # sets $HOSTNAME, used in the job output
     ports:
       - "8080:8080"                    # dashboard; 8443 (cluster mTLS) stays internal
-    volumes:
-      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./node-a.yaml:/etc/cronstable.d/cluster.yaml:ro
-      - pulse-certs:/certs:ro
+    environment:
+      <<: *node-env
+      NODE_NAME: cronstable-a
 
   cronstable-b:
     <<: *cronstable-node
@@ -78,21 +102,22 @@ services:
     hostname: cronstable-b
     ports:
       - "8081:8080"
-    volumes:
-      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./node-b.yaml:/etc/cronstable.d/cluster.yaml:ro
-      - pulse-certs:/certs:ro
+    environment:
+      <<: *node-env
+      NODE_NAME: cronstable-b
 
+  # cronstable-c is also the default PULSE_TARGET (a follower, never the leader):
+  # "stop cronstable-c" simulates an UPSTREAM OUTAGE while "stop cronstable-a"
+  # simulates a LEADER failover, two independent experiments (see the README).
   cronstable-c:
     <<: *cronstable-node
     container_name: cronstable-c
     hostname: cronstable-c
     ports:
       - "8082:8080"
-    volumes:
-      - ./jobs.yaml:/etc/cronstable.d/jobs.yaml:ro
-      - ./node-c.yaml:/etc/cronstable.d/cluster.yaml:ro
-      - pulse-certs:/certs:ro
+    environment:
+      <<: *node-env
+      NODE_NAME: cronstable-c
 
 volumes:
   pulse-certs:

@@ -1,17 +1,24 @@
 #!/bin/sh
-# Entry point for the 10-node demo: build this node's cluster config from
-# environment variables, then exec cronstable. This keeps the compose file small
-# (no ten hand-written peer lists): every node shares one CLUSTER_HOSTS list and
-# excludes itself by NODE_NAME.
+# Shared entry point for the cluster demos that generate their node config from
+# environment variables (example/cluster-large, example/pulse-cluster): build
+# this node's `cluster:` section, then exec cronstable. This keeps each compose
+# file small (no hand-written per-node peer lists): every node shares one
+# CLUSTER_HOSTS list and excludes itself by NODE_NAME.
+#
+# (example/grand-tour carries its own entrypoint: it also switches election
+# backends and assembles a multi-file config directory. example/cluster keeps
+# hand-written node-*.yaml files on purpose; they are the annotated reference
+# for the `cluster:` section.)
 #
 # Env in:
-#   NODE_NAME      this node's name (also its cert name and TLS SAN)
-#   CLUSTER_HOSTS  comma/space list of ALL members as host:port (self included;
-#                  it is filtered out below)
-#   DISTRIBUTION   single-leader | spread   (default spread)
-#   ELECT_LEADER   true | false             (default true)
-#   INTERVAL       poll seconds             (default 10)
-#   DRIFT_AFTER    rounds before "drifted"  (default 2)
+#   NODE_NAME         this node's name (also its cert name and TLS SAN)
+#   CLUSTER_HOSTS     comma/space list of ALL members as host:port (self
+#                     included; it is filtered out below)
+#   DISTRIBUTION      single-leader | spread   (default spread)
+#   ELECT_LEADER      true | false             (default true)
+#   INTERVAL          poll seconds             (default 10)
+#   DRIFT_AFTER       rounds before "drifted"  (default 2)
+#   SHARE_NODE_STATS  true | false             (default true)
 set -eu
 
 # Validate every value that is spliced into a file path or the generated YAML,
@@ -49,10 +56,10 @@ cp /config/jobs.yaml "$DIR/jobs.yaml"
   echo "  interval: ${INTERVAL:-10}"
   echo "  driftAfter: ${DRIFT_AFTER:-2}"
   # Share each node's live CPU/memory across the cluster (backend is gossip, so
-  # this is just an opt-in marker -- the election mesh carries the data). The
-  # dashboard's fleet view and cluster panel then show per-node load, the
-  # natural companion to this CPU-heavy demo. Set SHARE_NODE_STATS=false to
-  # keep the fleet job summaries but not the load numbers.
+  # this is just an opt-in marker; the election mesh carries the data). The
+  # dashboard's fleet view and cluster panel then show per-node load. Set
+  # SHARE_NODE_STATS=false to keep the fleet job summaries but not the load
+  # numbers.
   echo "  observability:"
   echo "    shareNodeStats: ${SHARE_NODE_STATS:-true}"
   echo "  peers:"

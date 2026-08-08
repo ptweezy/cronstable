@@ -5,7 +5,7 @@ Two layers are exercised here:
 * the backend primitives it all rests on -- the mutable *document*
   store (one file per key, atomic-rename rewrite under an advisory flock) and
   the content-addressed *blob* store -- driven straight against a real temp
-  directory through :func:`tests.test_state._backend`;
+  directory through the shared ``fs_backend`` fixture (tests/conftest.py);
 * the pure logic layer in :mod:`cronstable.jobstate` (KV, monotonic cursor,
   create-if-absent idempotency, named artifacts) over that backend.
 
@@ -22,7 +22,6 @@ from cronstable import jobstate, state
 from cronstable.config import ConfigError, parse_config, parse_config_string
 from cronstable.jobstate import JobStateError
 from cronstable.state import DOC_DELETE, DOC_KEEP
-from tests.test_state import _backend
 
 
 def _cfg(yaml):
@@ -210,21 +209,20 @@ def test_secrets_merge_from_defaults():
 # --------------------------------------------------------------------------
 
 
-async def test_document_absent_reads_none(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_absent_reads_none(fs_backend):
+    backend = fs_backend
     assert await backend.read_document("ns", "missing") is None
     assert await backend.list_documents("ns") == []
-    await backend.stop()
 
 
-async def test_artifact_get_max_bytes_refuses_oversized_before_fetch(tmp_path):
+async def test_artifact_get_max_bytes_refuses_oversized_before_fetch(
+    fs_backend,
+):
     # The mapped-XCom fan-out OOM guard: artifact_get(max_bytes=...) must refuse
     # a payload whose recorded size exceeds the budget WITHOUT fetching the
     # blob, so an upstream that opted out of the publish-time size limit cannot
     # OOM the daemon during a fan-out read.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await jobstate.artifact_put(backend, "scope", "big", b"x" * 5000)
     # under budget: the payload comes back as normal.
     got = await jobstate.artifact_get(backend, "scope", "big", max_bytes=10000)
@@ -236,12 +234,10 @@ async def test_artifact_get_max_bytes_refuses_oversized_before_fetch(tmp_path):
     # no max_bytes => unchanged behaviour (returns the payload).
     unbounded = await jobstate.artifact_get(backend, "scope", "big")
     assert unbounded is not None and unbounded[1] == b"x" * 5000
-    await backend.stop()
 
 
-async def test_document_write_read_roundtrip(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_write_read_roundtrip(fs_backend):
+    backend = fs_backend
 
     def _put(current):
         return {"key": "k", "value": {"a": 1}}, "created"
@@ -253,12 +249,10 @@ async def test_document_write_read_roundtrip(tmp_path):
         "key": "k",
         "value": {"a": 1},
     }
-    await backend.stop()
 
 
-async def test_document_keep_leaves_value(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_keep_leaves_value(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
     stored, res = await backend.mutate_document(
         "ns", "k", lambda c: (DOC_KEEP, "unchanged")
@@ -266,23 +260,19 @@ async def test_document_keep_leaves_value(tmp_path):
     assert res == "unchanged"
     assert stored == {"value": 1}
     assert await backend.read_document("ns", "k") == {"value": 1}
-    await backend.stop()
 
 
-async def test_document_delete(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_delete(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
     assert await backend.delete_document("ns", "k") is True
     assert await backend.read_document("ns", "k") is None
     # deleting an absent document reports it did not exist.
     assert await backend.delete_document("ns", "k") is False
-    await backend.stop()
 
 
-async def test_document_delete_via_sentinel(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_delete_via_sentinel(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
     stored, res = await backend.mutate_document(
         "ns", "k", lambda c: (DOC_DELETE, "gone")
@@ -290,12 +280,10 @@ async def test_document_delete_via_sentinel(tmp_path):
     assert stored is None
     assert res == "gone"
     assert await backend.read_document("ns", "k") is None
-    await backend.stop()
 
 
-async def test_document_transform_sees_current(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_transform_sees_current(fs_backend):
+    backend = fs_backend
     await backend.mutate_document(
         "ns", "counter", lambda c: ({"value": 0}, None)
     )
@@ -308,49 +296,40 @@ async def test_document_transform_sees_current(tmp_path):
         _stored, res = await backend.mutate_document("ns", "counter", _incr)
         assert res == expected
     assert (await backend.read_document("ns", "counter"))["value"] == 3
-    await backend.stop()
 
 
-async def test_document_list_returns_bodies(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_list_returns_bodies(fs_backend):
+    backend = fs_backend
     for key in ("a", "b", "c"):
         await backend.mutate_document(
             "ns", key, lambda c, k=key: ({"key": k, "value": k}, None)
         )
     bodies = await backend.list_documents("ns")
     assert sorted(b["key"] for b in bodies) == ["a", "b", "c"]
-    await backend.stop()
 
 
-async def test_document_namespaces_isolated(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_namespaces_isolated(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("ns1", "k", lambda c: ({"value": 1}, None))
     await backend.mutate_document("ns2", "k", lambda c: ({"value": 2}, None))
     assert (await backend.read_document("ns1", "k"))["value"] == 1
     assert (await backend.read_document("ns2", "k"))["value"] == 2
     assert len(await backend.list_documents("ns1")) == 1
-    await backend.stop()
 
 
-async def test_document_survives_restart(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_survives_restart(fs_backend, fs_backend_factory):
+    backend = fs_backend
     await backend.mutate_document(
         "ns", "k", lambda c: ({"value": "durable"}, None)
     )
     await backend.stop()
 
-    backend2 = _backend(tmp_path)
-    await backend2.start()
+    backend2 = await fs_backend_factory()
     assert (await backend2.read_document("ns", "k"))["value"] == "durable"
-    await backend2.stop()
 
 
-async def test_document_weird_key_is_filename_safe(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_weird_key_is_filename_safe(fs_backend):
+    backend = fs_backend
     # slashes, spaces, unicode, path traversal attempts: all injective-safe.
     for key in ("a/b/c", "../escape", "with space", "uniçode", "CON"):
         await backend.mutate_document(
@@ -360,12 +339,10 @@ async def test_document_weird_key_is_filename_safe(tmp_path):
     # nothing escaped the docs namespace directory.
     ns_dir = os.path.join(backend.base, "docs")
     assert os.path.isdir(ns_dir)
-    await backend.stop()
 
 
-async def test_document_corrupt_reads_none_but_mutate_fails(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_document_corrupt_reads_none_but_mutate_fails(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("ns", "k", lambda c: ({"value": 1}, None))
     _lock, doc_path = backend._doc_paths("ns", "k")
     with open(doc_path, "wb") as fobj:
@@ -377,7 +354,6 @@ async def test_document_corrupt_reads_none_but_mutate_fails(tmp_path):
         await backend.mutate_document(
             "ns", "k", lambda c: ({"value": 2}, None)
         )
-    await backend.stop()
 
 
 # --------------------------------------------------------------------------
@@ -385,44 +361,35 @@ async def test_document_corrupt_reads_none_but_mutate_fails(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_blob_put_get_roundtrip(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_blob_put_get_roundtrip(fs_backend):
+    backend = fs_backend
     digest = await backend.put_blob(b"hello world")
     assert len(digest) == 64  # sha-256 hex
     assert await backend.get_blob(digest) == b"hello world"
-    await backend.stop()
 
 
-async def test_blob_is_content_addressed_and_deduped(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_blob_is_content_addressed_and_deduped(fs_backend):
+    backend = fs_backend
     d1 = await backend.put_blob(b"same")
     d2 = await backend.put_blob(b"same")
     assert d1 == d2
     # only one file on disk for identical content.
     shard = os.path.join(backend.base, "blobs", d1[:2])
     assert os.listdir(shard) == [d1 + ".blob"]
-    await backend.stop()
 
 
-async def test_blob_missing_returns_none(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_blob_missing_returns_none(fs_backend):
+    backend = fs_backend
     assert await backend.get_blob("0" * 64) is None
-    await backend.stop()
 
 
-async def test_blob_survives_restart(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_blob_survives_restart(fs_backend, fs_backend_factory):
+    backend = fs_backend
     digest = await backend.put_blob(b"persisted bytes")
     await backend.stop()
 
-    backend2 = _backend(tmp_path)
-    await backend2.start()
+    backend2 = await fs_backend_factory()
     assert await backend2.get_blob(digest) == b"persisted bytes"
-    await backend2.stop()
 
 
 # --------------------------------------------------------------------------
@@ -430,55 +397,46 @@ async def test_blob_survives_restart(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_kv_set_get_delete(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_kv_set_get_delete(fs_backend):
+    backend = fs_backend
     assert await jobstate.kv_get(backend, "job-a", "greeting") is None
     await jobstate.kv_set(backend, "job-a", "greeting", "hello")
     body = await jobstate.kv_get(backend, "job-a", "greeting")
     assert body["value"] == "hello"
     assert await jobstate.kv_delete(backend, "job-a", "greeting") is True
     assert await jobstate.kv_get(backend, "job-a", "greeting") is None
-    await backend.stop()
 
 
-async def test_kv_null_value_distinct_from_absent(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_kv_null_value_distinct_from_absent(fs_backend):
+    backend = fs_backend
     await jobstate.kv_set(backend, "job-a", "k", None)
     body = await jobstate.kv_get(backend, "job-a", "k")
     assert body is not None and body["value"] is None
-    await backend.stop()
 
 
-async def test_kv_scopes_isolated(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_kv_scopes_isolated(fs_backend):
+    backend = fs_backend
     await jobstate.kv_set(backend, "job-a", "k", "a")
     await jobstate.kv_set(backend, "job-b", "k", "b")
     assert (await jobstate.kv_get(backend, "job-a", "k"))["value"] == "a"
     assert (await jobstate.kv_get(backend, "job-b", "k"))["value"] == "b"
     keys_a = [b["key"] for b in await jobstate.kv_list(backend, "job-a")]
     assert keys_a == ["k"]
-    await backend.stop()
 
 
-async def test_kv_size_limit(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_kv_size_limit(fs_backend):
+    backend = fs_backend
     with pytest.raises(JobStateError) as ei:
         await jobstate.kv_set(backend, "job-a", "k", "x" * 100, max_bytes=10)
     assert ei.value.status == 413
-    await backend.stop()
 
 
-async def test_kv_rejects_non_portable_values(tmp_path):
+async def test_kv_rejects_non_portable_values(fs_backend):
     # H9/M26: a NaN/Infinity float or a >64-bit int is written differently (or
     # unreadably) with vs. without orjson, so on a mixed fleet it corrupts the
     # store.  It must be refused at the boundary with a clean 400, on every
     # node, BEFORE any write -- not accepted here and unreadable elsewhere.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for bad in (float("inf"), float("nan"), 2**64, {"x": float("-inf")}):
         with pytest.raises(JobStateError) as ei:
             await jobstate.kv_set(backend, "job-a", "k", bad)
@@ -489,31 +447,26 @@ async def test_kv_rejects_non_portable_values(tmp_path):
     await jobstate.kv_set(backend, "job-a", "k", {"n": 2**63 - 1})
     got = await jobstate.kv_get(backend, "job-a", "k")
     assert got["value"] == {"n": 2**63 - 1}
-    await backend.stop()
 
 
-async def test_cursor_rejects_non_portable_value(tmp_path):
+async def test_cursor_rejects_non_portable_value(fs_backend):
     # the exact reported vector: `cursor advance wm 1e400` (-> inf) on a
     # non-orjson node would persist `{"value":Infinity}` that orjson nodes
     # cannot read, wedging the cursor.  Refuse it up front.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     with pytest.raises(JobStateError) as ei:
         await jobstate.cursor_advance(backend, "etl", "wm", float("1e400"))
     assert ei.value.status == 400
     # the cursor was never created, so it still reads as unset (not wedged).
     assert await jobstate.cursor_get(backend, "etl", "wm") is None
-    await backend.stop()
 
 
-async def test_kv_list_sorted(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_kv_list_sorted(fs_backend):
+    backend = fs_backend
     for key in ("charlie", "alpha", "bravo"):
         await jobstate.kv_set(backend, "s", key, key)
     keys = [b["key"] for b in await jobstate.kv_list(backend, "s")]
     assert keys == ["alpha", "bravo", "charlie"]
-    await backend.stop()
 
 
 # --------------------------------------------------------------------------
@@ -521,9 +474,8 @@ async def test_kv_list_sorted(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_cursor_monotonic_advance(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_cursor_monotonic_advance(fs_backend):
+    backend = fs_backend
     r1 = await jobstate.cursor_advance(backend, "etl", "wm", 100)
     assert r1 == {"value": 100, "advanced": True}
     r2 = await jobstate.cursor_advance(backend, "etl", "wm", 200)
@@ -532,12 +484,10 @@ async def test_cursor_monotonic_advance(tmp_path):
     r3 = await jobstate.cursor_advance(backend, "etl", "wm", 150)
     assert r3 == {"value": 200, "advanced": False}
     assert (await jobstate.cursor_get(backend, "etl", "wm"))["value"] == 200
-    await backend.stop()
 
 
-async def test_cursor_iso_string_watermark(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_cursor_iso_string_watermark(fs_backend):
+    backend = fs_backend
     await jobstate.cursor_advance(backend, "etl", "ts", "2026-07-01T00:00:00")
     r = await jobstate.cursor_advance(
         backend, "etl", "ts", "2026-06-01T00:00:00"
@@ -548,26 +498,21 @@ async def test_cursor_iso_string_watermark(tmp_path):
     assert (
         await jobstate.cursor_get(backend, "etl", "ts")
     )["value"] == "2026-07-01T00:00:00"
-    await backend.stop()
 
 
-async def test_cursor_force_rewind(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_cursor_force_rewind(fs_backend):
+    backend = fs_backend
     await jobstate.cursor_advance(backend, "etl", "wm", 500)
     r = await jobstate.cursor_advance(backend, "etl", "wm", 10, force=True)
     assert r == {"value": 10, "advanced": True}
-    await backend.stop()
 
 
-async def test_cursor_type_clash_rejected(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_cursor_type_clash_rejected(fs_backend):
+    backend = fs_backend
     await jobstate.cursor_advance(backend, "etl", "wm", 100)
     with pytest.raises(JobStateError) as ei:
         await jobstate.cursor_advance(backend, "etl", "wm", "not-a-number")
     assert ei.value.status == 409
-    await backend.stop()
 
 
 # --------------------------------------------------------------------------
@@ -575,20 +520,17 @@ async def test_cursor_type_clash_rejected(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_idempotency_first_claim_fresh(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_idempotency_first_claim_fresh(fs_backend):
+    backend = fs_backend
     assert (await jobstate.idempotency_claim(backend, "s", "order-1"))["fresh"]
     # a second claim of the same key is not fresh.
     assert not (
         await jobstate.idempotency_claim(backend, "s", "order-1")
     )["fresh"]
-    await backend.stop()
 
 
-async def test_idempotency_ttl_reclaim(tmp_path, monkeypatch):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_idempotency_ttl_reclaim(fs_backend, monkeypatch):
+    backend = fs_backend
     clock = {"t": 1000.0}
     monkeypatch.setattr(jobstate, "_now", lambda: clock["t"])
     assert (
@@ -604,16 +546,13 @@ async def test_idempotency_ttl_reclaim(tmp_path, monkeypatch):
     assert (
         await jobstate.idempotency_claim(backend, "s", "k", ttl=30)
     )["fresh"]
-    await backend.stop()
 
 
-async def test_idempotency_release(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_idempotency_release(fs_backend):
+    backend = fs_backend
     await jobstate.idempotency_claim(backend, "s", "k")
     assert await jobstate.idempotency_release(backend, "s", "k") is True
     assert (await jobstate.idempotency_claim(backend, "s", "k"))["fresh"]
-    await backend.stop()
 
 
 # --------------------------------------------------------------------------
@@ -621,9 +560,8 @@ async def test_idempotency_release(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_artifact_put_get(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_artifact_put_get(fs_backend):
+    backend = fs_backend
     rec = await jobstate.artifact_put(backend, "s", "report.csv", b"a,b,c\n")
     assert rec["size"] == 6
     got = await jobstate.artifact_get(backend, "s", "report.csv")
@@ -631,36 +569,30 @@ async def test_artifact_put_get(tmp_path):
     record, data = got
     assert data == b"a,b,c\n"
     assert record["sha256"] == rec["sha256"]
-    await backend.stop()
 
 
-async def test_artifact_newest_version_wins(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_artifact_newest_version_wins(fs_backend):
+    backend = fs_backend
     await jobstate.artifact_put(backend, "s", "x", b"v1")
     await jobstate.artifact_put(backend, "s", "x", b"v2")
     _rec, data = await jobstate.artifact_get(backend, "s", "x")
     assert data == b"v2"
-    await backend.stop()
 
 
-async def test_artifact_list_newest_per_name(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_artifact_list_newest_per_name(fs_backend):
+    backend = fs_backend
     await jobstate.artifact_put(backend, "s", "a", b"1")
     await jobstate.artifact_put(backend, "s", "b", b"2")
     await jobstate.artifact_put(backend, "s", "a", b"3")
     listing = await jobstate.artifact_list(backend, "s")
     assert [r["name"] for r in listing] == ["a", "b"]
-    await backend.stop()
 
 
-async def test_artifact_put_prunes_superseded_same_name_records(tmp_path):
+async def test_artifact_put_prunes_superseded_same_name_records(fs_backend):
     # Republishing one name must not grow the stream without bound: the name-
     # keyed prune drops superseded records, keeping only the newest per name,
     # while reads still return the latest value.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         for i in range(30):
             await jobstate.artifact_put(
@@ -680,13 +612,12 @@ async def test_artifact_put_prunes_superseded_same_name_records(tmp_path):
         await backend.stop()
 
 
-async def test_artifact_prune_keeps_every_live_name(tmp_path):
+async def test_artifact_prune_keeps_every_live_name(fs_backend):
     # The safety property a blind newest-N prune would violate: with more
     # distinct names than the prune cadence, every name's latest must survive.
     # (A newest-N record prune would evict live names once their count exceeds
     # N, then the orphan-blob sweep would delete still-referenced blobs.)
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         names = ["n{}".format(i) for i in range(20)]  # > _PRUNE_EVERY_APPENDS
         for nm in names:
@@ -704,15 +635,13 @@ async def test_artifact_prune_keeps_every_live_name(tmp_path):
         await backend.stop()
 
 
-async def test_artifact_missing_returns_none(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_artifact_missing_returns_none(fs_backend):
+    backend = fs_backend
     assert await jobstate.artifact_get(backend, "s", "nope") is None
-    await backend.stop()
 
 
 async def test_artifact_get_strict_propagates_a_transient_read_error(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # Non-strict, an unreadable record is SKIPPED -- so a published artifact
     # reads back as never published. That silent lie is fatal wherever absence
@@ -720,8 +649,7 @@ async def test_artifact_get_strict_propagates_a_transient_read_error(
     # fan-out once and never recomputes it, so one NFS blip silently skips the
     # whole task's work. strict=True must surface the error instead, exactly
     # as referenced_blob_digests(strict=True) already does for the blob sweep.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await jobstate.artifact_put(backend, "s", "items", b'["a"]')
     # Drop the best-effort read cache first: the put's own prune pass already
     # read this record, and a cached body would satisfy the non-strict read
@@ -749,22 +677,18 @@ async def test_artifact_get_strict_propagates_a_transient_read_error(
     assert rec["name"] == "items"
     got = await jobstate.artifact_get(backend, "s", "items", strict=True)
     assert got is not None and got[1] == b'["a"]'
-    await backend.stop()
 
 
-async def test_artifact_size_limit(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_artifact_size_limit(fs_backend):
+    backend = fs_backend
     with pytest.raises(JobStateError) as ei:
         await jobstate.artifact_put(backend, "s", "big", b"x" * 100,
                                     max_bytes=10)
     assert ei.value.status == 413
-    await backend.stop()
 
 
-async def test_artifact_orphan_blob_swept_after_reference_gone(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_artifact_orphan_blob_swept_after_reference_gone(fs_backend):
+    backend = fs_backend
     digest = (await jobstate.artifact_put(backend, "s", "x", b"payload"))[
         "sha256"
     ]
@@ -774,17 +698,14 @@ async def test_artifact_orphan_blob_swept_after_reference_gone(tmp_path):
     # unreferenced (its scope was collected) and old enough: swept.
     assert await backend.sweep_orphan_blobs(set(), 0.0) == 1
     assert await backend.get_blob(digest) is None
-    await backend.stop()
 
 
-async def test_referenced_blob_digests(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_referenced_blob_digests(fs_backend):
+    backend = fs_backend
     d1 = (await jobstate.artifact_put(backend, "s1", "a", b"one"))["sha256"]
     d2 = (await jobstate.artifact_put(backend, "s2", "b", b"two"))["sha256"]
     refs = await jobstate.referenced_blob_digests(backend, ["s1", "s2"])
     assert refs == {d1, d2}
-    await backend.stop()
 
 
 # --------------------------------------------------------------------------
@@ -792,11 +713,10 @@ async def test_referenced_blob_digests(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_require_scope_rejects_blank(tmp_path):
+async def test_require_scope_rejects_blank(fs_backend):
     # a blank (or whitespace-only) scope strips to empty and is refused before
     # any store work -- _require_scope's guard branch.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         with pytest.raises(JobStateError, match="non-empty scope"):
             await jobstate.kv_get(backend, "   ", "k")
@@ -805,7 +725,7 @@ async def test_require_scope_rejects_blank(tmp_path):
 
 
 async def test_require_scope_rejects_unstripped_instead_of_collapsing(
-    tmp_path,
+    fs_backend,
 ):
     # A scope is the isolation boundary; _require_scope used to strip() it
     # AFTER jobapi authorized the raw string and BEFORE the store's injective
@@ -815,8 +735,7 @@ async def test_require_scope_rejects_unstripped_instead_of_collapsing(
     # GC keep-set built from the un-stripped config name (live artifacts
     # deleted).  A non-normalized scope is now rejected outright: distinct
     # scope strings can never collapse.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         await jobstate.kv_set(backend, "report", "secret", "PRIVATE")
         for padded in ("report ", " report", "report\n", "report\xa0"):
@@ -845,10 +764,9 @@ async def test_require_scope_rejects_unstripped_instead_of_collapsing(
         await backend.stop()
 
 
-async def test_artifact_put_stores_optional_meta(tmp_path):
+async def test_artifact_put_stores_optional_meta(fs_backend):
     # the optional meta mapping rides along on the record and reads back.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         rec = await jobstate.artifact_put(
             backend, "s", "r.csv", b"a,b\n", meta={"kind": "csv"}
@@ -863,11 +781,10 @@ async def test_artifact_put_stores_optional_meta(tmp_path):
         await backend.stop()
 
 
-async def test_artifact_get_record_absent_returns_none(tmp_path):
+async def test_artifact_get_record_absent_returns_none(fs_backend):
     # a name never published reads back as None on both the record and the
     # (record, payload) accessor -- the exhausted-stream branch.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         assert await jobstate.artifact_get_record(backend, "s", "nope") is None
         assert await jobstate.artifact_get(backend, "s", "nope") is None
@@ -875,11 +792,10 @@ async def test_artifact_get_record_absent_returns_none(tmp_path):
         await backend.stop()
 
 
-async def test_artifact_get_raises_410_when_blob_swept(tmp_path):
+async def test_artifact_get_raises_410_when_blob_swept(fs_backend):
     # the record survives but its content-addressed blob was garbage-collected:
     # artifact_get must fail closed with a 410, not return empty bytes.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         await jobstate.artifact_put(backend, "s", "x", b"payload")
         # sweep with an empty referenced set: nothing is referenced, so the

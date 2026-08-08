@@ -4,6 +4,7 @@ import pytest
 
 import cronstable.cron
 from cronstable.state import Lease
+from tests._configs import job_yaml
 from tests._cron_helpers import (
     fixed_current_time,  # noqa: F401
 )
@@ -37,29 +38,40 @@ async def _slotlease_cancel(*tasks):
             pass
 
 
+@pytest.fixture
+async def slotlease_reaper():
+    """Teardown for the tasks a test leaves running (finding B1): the
+    replacement for the four try/finally _slotlease_cancel sites.
+
+    Register an asyncio task directly, or a zero-arg callable resolved at
+    teardown for a task the claim under test creates later (for example
+    ``lambda: cron._slot_renewers.get("s")``).  Everything registered is
+    cancelled and awaited after the test body, pass or fail.
+    """
+    deferred = []
+    yield deferred.append
+    await _slotlease_cancel(
+        *(item() if callable(item) else item for item in deferred)
+    )
+
+
 def _slotlease_lease(name="slots/s", holder="peer#1", fence=1, expires_at=1e12):
     return Lease(
         name=name, holder=holder, fence=fence, expires_at=expires_at
     )
 
 
-_SLOTLEASE_CLUSTER_FORBID = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "* * * * *"
-    concurrencyScope: cluster
-    concurrencyPolicy: Forbid
-"""
+_SLOTLEASE_CLUSTER_FORBID = job_yaml(
+    "s",
+    "echo hi",
+    extra="    concurrencyScope: cluster\n    concurrencyPolicy: Forbid\n",
+)
 
-_SLOTLEASE_CLUSTER_REPLACE = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "* * * * *"
-    concurrencyScope: cluster
-    concurrencyPolicy: Replace
-"""
+_SLOTLEASE_CLUSTER_REPLACE = job_yaml(
+    "s",
+    "echo hi",
+    extra="    concurrencyScope: cluster\n    concurrencyPolicy: Replace\n",
+)
 
 
 class _SlotleaseBackend:
@@ -408,18 +420,18 @@ async def test_slotlease_claim_degrades_when_locks_cannot_fence(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_slotlease_claim_adopts_live_local_lease(monkeypatch):
+async def test_slotlease_claim_adopts_live_local_lease(
+    monkeypatch, slotlease_reaper
+):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend()
     live = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
+    slotlease_reaper(live)
     cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder())
     cron._slot_renewers["s"] = live
     cron._slot_refs["s"] = 1
-    try:
-        assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
-        assert cron._slot_refs["s"] == 2  # adopted the live lease
-    finally:
-        await _slotlease_cancel(live)
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+    assert cron._slot_refs["s"] == 2  # adopted the live lease
 
 
 @pytest.mark.asyncio
@@ -451,18 +463,19 @@ async def test_slotlease_claim_replace_spawns_pursuit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_slotlease_claim_adopts_own_late_acquire(monkeypatch):
+async def test_slotlease_claim_adopts_own_late_acquire(
+    monkeypatch, slotlease_reaper
+):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     # acquire timed out (None) but the read shows OUR holder landed the write.
     cron.state_backend = _SlotleaseBackend(
         acquire=None, read=_slotlease_lease(holder=cron._slot_holder())
     )
-    try:
-        assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
-        assert cron._slot_leases["s"].holder == cron._slot_holder()
-        assert cron._slot_refs["s"] == 1
-    finally:
-        await _slotlease_cancel(cron._slot_renewers.get("s"))
+    # the adopting claim installs a renewer; reap whatever is there at exit
+    slotlease_reaper(lambda: cron._slot_renewers.get("s"))
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+    assert cron._slot_leases["s"].holder == cron._slot_holder()
+    assert cron._slot_refs["s"] == 1
 
 
 @pytest.mark.asyncio
@@ -499,37 +512,38 @@ async def test_slotlease_claim_read_error_is_unanswered(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_slotlease_claim_success_cancels_stale_renewer(monkeypatch):
+async def test_slotlease_claim_success_cancels_stale_renewer(
+    monkeypatch, slotlease_reaper
+):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     cron.state_backend = _SlotleaseBackend(acquire=_slotlease_lease(holder=cron._slot_holder()))
     # a live renewer with no recorded lease (the adoption branch is skipped):
     # the fresh acquire must cancel it and install a replacement.
     stale = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
     cron._slot_renewers["s"] = stale
-    try:
-        assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
-        new = cron._slot_renewers["s"]
-        assert new is not stale  # replaced by a fresh renewer
-        await _slotlease_cancel(stale, new)
-        assert stale.cancelled()
-    finally:
-        await _slotlease_cancel(stale, cron._slot_renewers.get("s"))
+    slotlease_reaper(stale)
+    slotlease_reaper(lambda: cron._slot_renewers.get("s"))
+    assert await cron._claim_cluster_slot(cron.cron_jobs["s"]) is True
+    new = cron._slot_renewers["s"]
+    assert new is not stale  # replaced by a fresh renewer
+    await _slotlease_cancel(stale, new)
+    assert stale.cancelled()
 
 
 # --- _spawn_slot_pursuit: single-flight ------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_slotlease_spawn_slot_pursuit_is_single_flight():
+async def test_slotlease_spawn_slot_pursuit_is_single_flight(
+    slotlease_reaper,
+):
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
     job = cron.cron_jobs["s"]
     existing = asyncio.create_task(_SLOTLEASE_REAL_SLEEP(30))
     cron._slot_pursuits["s"] = existing
-    try:
-        cron._spawn_slot_pursuit(job, _slotlease_lease())
-        assert cron._slot_pursuits["s"] is existing  # not replaced
-    finally:
-        await _slotlease_cancel(existing)
+    slotlease_reaper(existing)
+    cron._spawn_slot_pursuit(job, _slotlease_lease())
+    assert cron._slot_pursuits["s"] is existing  # not replaced
 
 
 # --- _pursue_replace_slot --------------------------------------------------
@@ -1022,12 +1036,7 @@ async def test_slotlease_release_phantom_slot_cancel_propagates():
 
 # Non-cluster start-failure cleanup and the slot pursuit poll loop.
 
-_SLOTLEASE_NODE_JOB = """
-jobs:
-  - name: s
-    command: echo hi
-    schedule: "* * * * *"
-"""
+_SLOTLEASE_NODE_JOB = job_yaml("s", "echo hi")
 
 
 @pytest.mark.asyncio

@@ -687,33 +687,34 @@ from cronstable.croninfo import (  # noqa: E402
 # --- _field_values: the tolerant parser's rejection and wrap-around branches
 
 
-def test_field_values_rejects_bad_step():
-    # a non-dividing '/' step whose text is not a positive integer
-    with pytest.raises(ValueError, match="bad step"):
-        _field_values("*/0", 0, 59)
-    with pytest.raises(ValueError, match="bad step"):
-        _field_values("*/x", 0, 59)
-
-
-def test_field_values_rejects_unresolvable_range():
-    # a range whose endpoints are neither digits nor known names
-    with pytest.raises(ValueError, match="bad field"):
-        _field_values("x-y", 0, 59)
+@pytest.mark.parametrize(
+    ("field", "match"),
+    [
+        # a non-dividing '/' step whose text is not a positive integer
+        pytest.param("*/0", "bad step", id="bad-step-zero"),
+        pytest.param("*/x", "bad step", id="bad-step-non-integer"),
+        # a range whose endpoints are neither digits nor known names
+        pytest.param("x-y", "bad field", id="unresolvable-range"),
+        # "1-2000000000" must degrade (raise, caught upstream as Custom
+        # prose) rather than build list(range(...)) of billions of ints.
+        # The lazy iteration raises on the first out-of-range value, so this
+        # returns at once instead of exhausting memory -- if it ever
+        # materialized the list the test would hang/OOM rather than fail.
+        pytest.param(
+            "1-2000000000",
+            "out of range",
+            id="huge-range-not-materialized",
+        ),
+    ],
+)
+def test_field_values_rejections(field, match):
+    with pytest.raises(ValueError, match=match):
+        _field_values(field, 0, 59)
 
 
 def test_field_values_wraps_a_descending_range():
     # fri-mon crosses the week boundary: Fri, Sat, Sun, Mon
     assert _field_values("fri-mon", 0, 6, _DOW_NAMES) == [0, 1, 5, 6]
-
-
-def test_field_values_rejects_a_huge_range_without_materializing():
-    # "1-2000000000" must degrade (raise, caught upstream as Custom prose)
-    # rather than build list(range(...)) of billions of ints.  The lazy
-    # iteration raises on the first out-of-range value, so this returns at
-    # once instead of exhausting memory -- if it ever materialized the list
-    # the test would hang/OOM rather than fail.
-    with pytest.raises(ValueError, match="out of range"):
-        _field_values("1-2000000000", 0, 59)
 
 
 def test_field_values_stepped_range_over_ceiling_stays_accepted():
@@ -735,22 +736,25 @@ def test_finish_split_rejects_special_forms_beside_a_star():
     assert describe_cron("0 0 *,l * *").startswith("Custom schedule")
 
 
-def test_split_special_dow_rejects_bad_last_weekday():
-    with pytest.raises(ValueError, match="bad L day-of-week"):
-        _split_special_dow("lx")
-    assert describe_cron("0 0 * * lx").startswith("Custom schedule")
-
-
-def test_split_special_dow_rejects_out_of_range_last_weekday():
-    with pytest.raises(ValueError, match="out of range"):
-        _split_special_dow("l8")
-    assert describe_cron("0 0 * * l8").startswith("Custom schedule")
-
-
-def test_split_special_dow_rejects_bad_hash_weekday():
-    with pytest.raises(ValueError, match="bad '#' weekday"):
-        _split_special_dow("9#2")
-    assert describe_cron("0 0 * * 9#2").startswith("Custom schedule")
+@pytest.mark.parametrize(
+    ("token", "match", "expr"),
+    [
+        pytest.param(
+            "lx", "bad L day-of-week", "0 0 * * lx", id="bad-last-weekday"
+        ),
+        pytest.param(
+            "l8", "out of range", "0 0 * * l8", id="out-of-range-last-weekday"
+        ),
+        pytest.param(
+            "9#2", "bad '#' weekday", "0 0 * * 9#2", id="bad-hash-weekday"
+        ),
+    ],
+)
+def test_split_special_dow_rejections_degrade_to_custom(token, match, expr):
+    with pytest.raises(ValueError, match=match):
+        _split_special_dow(token)
+    # and end to end through describe_cron
+    assert describe_cron(expr).startswith("Custom schedule")
 
 
 # --- describe_cron prose branches

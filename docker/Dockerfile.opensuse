@@ -18,7 +18,8 @@ WORKDIR /src
 
 # Layer contract, load-bearing for CI speed: everything from here through the
 # orjson step reads nothing from the source tree except pyproject.toml and
-# docker/extract_deps.py and never references the per-commit VERSION arg, so
+# the docker/ helper scripts (extract_deps.py, install_orjson.sh) and never
+# references the per-commit VERSION arg, so
 # buildx's GHA cache reuses these expensive layers (toolchain plus every
 # dependency, source-compiled under QEMU on the wheel-less arches) across
 # source-only commits; a typical push rebuilds only the cheap project
@@ -93,27 +94,19 @@ RUN set -eux; \
 # round-trip plus a zeroconf import; a failure fails the build.
 RUN /opt/venv/bin/python -c 'from nacl.public import PrivateKey, SealedBox; k = PrivateKey.generate(); m = b"cronstable push self-test"; assert SealedBox(k).decrypt(SealedBox(k.public_key).encrypt(m)) == m; import zeroconf, zeroconf.asyncio; print("push and discovery extras verified")'
 
-# Best-effort orjson (the `speedups` extra) for the durable-state / cluster JSON
-# paths; cronstable/_json falls back to stdlib json when it is absent, so this never
-# fails the build. amd64/arm64 install a wheel; the other published arches
-# (ppc64le/s390x) have none, so a Rust toolchain is installed and orjson is
-# source-built. A miscompiled build is dropped by orjson_ok so it is never
-# shipped; the toolchain/cache stays in this builder stage, only the small
-# orjson .so rides along in /opt/venv.
+# Best-effort orjson (the `speedups` extra) for the durable-state / cluster
+# JSON paths; docker/install_orjson.sh never fails the build and never ships
+# a broken orjson (cronstable/_json falls back to stdlib json when it is
+# absent). amd64/arm64 install a wheel; the other published arches
+# (ppc64le/s390x) have none, so RUST_SETUP installs Leap's own rust + cargo
+# (new enough here, no rustup needed) for the source build. The script is
+# COPYd here, below the dependency layers, so editing it never invalidates
+# their cache.
+COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh
 RUN set -eux; \
-    orjson_ok() { \
-        /opt/venv/bin/python -c 'import orjson,sys; s={"v":1,"a":[1,2.5,True,None],"z":"x"}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'; \
-    }; \
-    if /opt/venv/bin/pip install --no-cache-dir --timeout 120 "orjson>=3.9" && orjson_ok; then \
-        echo "orjson: bundled (wheel)"; \
-    elif zypper --non-interactive refresh \
-        && zypper --non-interactive install rust cargo \
-        && /opt/venv/bin/pip install --no-cache-dir --timeout 300 "orjson>=3.9" && orjson_ok; then \
-        echo "orjson: bundled (source build)"; \
-    else \
-        echo "orjson: unavailable on this arch; using stdlib json"; \
-        /opt/venv/bin/pip uninstall -y orjson || true; \
-    fi; \
+    RUST_SETUP="zypper --non-interactive refresh \
+        && zypper --non-interactive install rust cargo" \
+    sh /tmp/deps/install_orjson.sh "orjson>=3.9"; \
     zypper clean --all
 
 # ---- project install: the only per-commit layers ------------------------

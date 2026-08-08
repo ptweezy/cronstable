@@ -14,10 +14,13 @@ eight parallel files is exactly the shape this repo has been bitten by before.
 So this pins the order rather than the wording: the dependency layers may only
 read ``pyproject.toml`` and the shared ``docker/extract_deps.py`` helper, and
 the per-commit inputs (the source tree and the ``VERSION`` arg) may only
-appear below them.
+appear below them.  The shared ``docker/install_orjson.sh`` sits between the
+two: COPYd below the dependency layers (so editing it cannot invalidate their
+cache) and invoked above the per-commit section.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,6 +42,8 @@ SCRIPT_COPY = "COPY docker/extract_deps.py /tmp/deps/extract_deps.py"
 SCRIPT_INVOKE = (
     "/opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml"
 )
+ORJSON_COPY = "COPY docker/install_orjson.sh /tmp/deps/install_orjson.sh"
+ORJSON_INVOKE = "sh /tmp/deps/install_orjson.sh"
 
 
 def _lines(relpath):
@@ -130,6 +135,56 @@ def test_dependency_extraction_goes_through_the_shared_script(relpath):
     )
 
 
+@pytest.mark.parametrize("relpath", DOCKERFILES)
+def test_orjson_install_goes_through_the_shared_script(relpath):
+    # Eight pasted ~25-line orjson blocks were the same drift class the
+    # extraction script killed, so the block lives once in
+    # docker/install_orjson.sh; per-distro variance stays in each file as the
+    # RUST_SETUP env string and any trailing package-manager cleanup. Two
+    # placement rules matter: the script COPY sits BELOW the dependency
+    # install (editing the script must never invalidate the expensive cached
+    # dependency layers) and the invocation sits ABOVE the source COPY
+    # (per-commit inputs stay at the bottom). The invocation must also spell
+    # the "orjson>=X.Y" floor itself, because test_extra_pins_parity.py scans
+    # the Dockerfiles, not the script, for hand-spelled pins to check against
+    # pyproject.
+    lines = _lines(relpath)
+    deps_invoke = _index(
+        lines,
+        lambda ln: SCRIPT_INVOKE in ln,
+        "invocation of the shared extraction script",
+        relpath,
+    )
+    orjson_copy = _index(
+        lines,
+        lambda ln: ln == ORJSON_COPY,
+        "COPY of the shared orjson install script",
+        relpath,
+    )
+    orjson_invoke = _index(
+        lines,
+        lambda ln: (
+            ORJSON_INVOKE in ln and re.search(r'"orjson>=[0-9][^"]*"', ln)
+        ),
+        "pin-carrying invocation of the shared orjson install script",
+        relpath,
+    )
+    source_copy = _index(
+        lines,
+        lambda ln: ln.startswith("COPY . ."),
+        "source COPY",
+        relpath,
+    )
+    assert deps_invoke < orjson_copy < orjson_invoke < source_copy, (
+        "{}: expected the dependency install, then the orjson script COPY, "
+        "then its invocation, all above the source COPY".format(relpath)
+    )
+    assert not any("orjson_ok()" in ln for ln in lines), (
+        "{}: the inline orjson block is back; edit docker/install_orjson.sh "
+        "instead".format(relpath)
+    )
+
+
 def test_retry_helper_is_identical_in_every_dockerfile():
     # retry() stays inline: its first use runs before any COPYd file's
     # interpreter exists, five runtime stages use it too (where a COPY would
@@ -188,9 +243,9 @@ def test_release_cache_bust_arg_is_present(relpath):
         relpath,
     )
     # referenced above the dependency install, or declaring it does nothing
-    assert any(
-        "DEPS_REFRESH" in ln for ln in lines[deps_arg + 1 :]
-    ), "{}: ARG DEPS_REFRESH is declared but never referenced".format(relpath)
+    assert any("DEPS_REFRESH" in ln for ln in lines[deps_arg + 1 :]), (
+        "{}: ARG DEPS_REFRESH is declared but never referenced".format(relpath)
+    )
 
 
 def test_dockerignore_excludes_the_heavy_untouched_trees():
@@ -209,12 +264,13 @@ def test_dockerignore_excludes_the_heavy_untouched_trees():
     # build time and setuptools_scm reads .git.
     for name in ("README.md", "LICENSE", ".git"):
         assert name not in entries, ".dockerignore must not exclude " + name
-    # the docker/ exclusion carves out exactly one file: the extraction
-    # helper every dependency layer COPYs.
-    assert "!docker/extract_deps.py" in entries, (
-        ".dockerignore no longer re-includes docker/extract_deps.py; "
-        "every deps layer COPY would fail"
-    )
+    # the docker/ exclusion carves out exactly two files: the extraction
+    # helper every dependency layer COPYs and the shared orjson installer.
+    for carved in ("!docker/extract_deps.py", "!docker/install_orjson.sh"):
+        assert carved in entries, (
+            ".dockerignore no longer re-includes {}; every Dockerfile's "
+            "COPY of it would fail".format(carved.lstrip("!"))
+        )
 
 
 def test_extract_deps_emits_what_the_extras_pair_resolves(tmp_path):

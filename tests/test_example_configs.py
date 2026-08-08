@@ -1,6 +1,6 @@
 """Every example config in example/ still parses with the real parser.
 
-The 41 YAML files under ``example/`` are the documentation people copy from,
+The YAML files under ``example/`` are the documentation people copy from,
 and they ride along in the sdist (MANIFEST.in keeps ``recursive-include
 example *``), yet nothing validated them: a schema key renamed in
 cronstable/config.py left the examples teaching the old spelling, and the
@@ -53,8 +53,11 @@ CONTAINER_CONFIG_DIR = "/config/"
 #: stops finding files (a renamed directory, a glob that no longer matches)
 #: would otherwise turn this whole module into zero tests that all pass.
 #: (lowered when example/acme-platform and example/adhoc.cronstable.d were
-#: retired; acme's unique jobs live on in grand-tour)
-_MIN_CONFIGS = 20
+#: retired, and again when example/pulse-cluster's hand-written node-*.yaml
+#: trio became env-generated at container start by the shared
+#: example/_shared/node-entrypoint.sh; acme's unique jobs live on in
+#: grand-tour)
+_MIN_CONFIGS = 18
 _MIN_COMPOSE = 7
 _MIN_JOBS = 80
 

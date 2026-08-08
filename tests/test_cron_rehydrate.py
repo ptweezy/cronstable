@@ -7,11 +7,12 @@ import cronstable.cron
 from cronstable.cron import JobRunInfo
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobOutputStream, JobRetryState
+from tests._configs import _DEP_JOB, _ONE_JOB, job_yaml
 from tests._cron_helpers import (
     UTC,
     fixed_current_time,  # noqa: F401
 )
-from tests.test_state import _state_cfg
+from tests._helpers import _state_cfg
 
 # ===================== rehydrate additions =====================
 #
@@ -23,22 +24,11 @@ from tests.test_state import _state_cfg
 # alongside the real happy-path behaviour so the in-memory maps are asserted.
 
 
-_ONE_JOB_REHYDRATE = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
-)
+# the one-job and onlyIfLastSucceeded bases are the shared _ONE_JOB and
+# _DEP_JOB from tests._configs; only the variants below stay local.
 
-_RUNALL_REHYDRATE = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
-    "    onMissed: run-all\n"
-)
-
-_DEP_REHYDRATE = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
-    "    onlyIfLastSucceeded: true\n"
-)
-
-_RETRY_REHYDRATE = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+# the retry ladder shared by the minute-schedule and @reboot variants
+_REHYDRATE_RETRY_BLOCK = (
     "    onFailure:\n"
     "      retry:\n"
     "        maximumRetries: 2\n"
@@ -47,14 +37,12 @@ _RETRY_REHYDRATE = (
     "        backoffMultiplier: 2\n"
 )
 
-_REBOOT_RETRY_REHYDRATE = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '@reboot'\n"
-    "    onFailure:\n"
-    "      retry:\n"
-    "        maximumRetries: 2\n"
-    "        initialDelay: 0.1\n"
-    "        maximumDelay: 1\n"
-    "        backoffMultiplier: 2\n"
+_RUNALL_REHYDRATE = _ONE_JOB + "    onMissed: run-all\n"
+
+_RETRY_REHYDRATE = _ONE_JOB + _REHYDRATE_RETRY_BLOCK
+
+_REBOOT_RETRY_REHYDRATE = job_yaml(
+    "j", "'true'", schedule="@reboot", extra=_REHYDRATE_RETRY_BLOCK
 )
 
 
@@ -62,7 +50,7 @@ def _rehydrate_cfg(tmp_path):
     return _state_cfg("state:\n  path: " + str(tmp_path))
 
 
-async def _rehydrate_state_cron(tmp_path, yaml=_ONE_JOB_REHYDRATE):
+async def _rehydrate_state_cron(tmp_path, yaml=_ONE_JOB):
     cron = cronstable.cron.Cron(None, config_yaml=yaml)
     await cron.start_stop_state(_rehydrate_cfg(tmp_path))
     return cron
@@ -129,7 +117,7 @@ class _FakeRun5:
 
 
 async def test_rehydrate_persist_inflight_open_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     assert cron.state_backend is None
     await cron._persist_inflight_open(cron.cron_jobs["j"], object())
 
@@ -145,7 +133,7 @@ async def test_rehydrate_persist_inflight_open_degrades_on_error(tmp_path):
 
 
 async def test_rehydrate_persist_inflight_closed_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._persist_inflight_closed("j")
 
 
@@ -159,7 +147,7 @@ async def test_rehydrate_persist_inflight_closed_degrades_on_error(tmp_path):
 
 
 async def test_rehydrate_reconcile_inflight_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._reconcile_inflight()
 
 
@@ -303,7 +291,7 @@ async def test_rehydrate_reconcile_inflight_reconciles_every_job(tmp_path):
 
 
 async def test_rehydrate_reconcile_takeover_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._reconcile_takeover_inflight(cron.cron_jobs["j"])
 
 
@@ -397,7 +385,7 @@ async def test_rehydrate_reconcile_open_record_runall_leaves_watermark(tmp_path)
 
 
 async def test_rehydrate_persist_reconciled_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._persist_reconciled_record("j", {"outcome": "unknown"})
 
 
@@ -411,12 +399,12 @@ async def test_rehydrate_persist_reconciled_degrades_on_error(tmp_path):
 
 
 async def test_rehydrate_persist_run_record_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._persist_run_record("j", _mem_run5("success", 0))
 
 
 async def test_rehydrate_persist_counter_snapshot_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._persist_counter_snapshot()
 
 
@@ -430,7 +418,7 @@ async def test_rehydrate_persist_counter_snapshot_unseeded(tmp_path):
 
 
 async def test_rehydrate_archive_output_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     info = _mem_run5("success", 0)
     await cron._archive_output(
         cron.cron_jobs["j"], info, list(info.output.lines)
@@ -591,7 +579,7 @@ async def test_rehydrate_rehydrate_from_state_warms_history(tmp_path):
 
 
 async def test_rehydrate_rehydrate_counters_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._rehydrate_counters()
 
 
@@ -615,7 +603,7 @@ async def test_rehydrate_rehydrate_counters_error_forfeits_seed(tmp_path):
 
 
 async def test_rehydrate_rehydrate_retries_no_backend():
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     await cron._rehydrate_retries()
 
 
@@ -740,7 +728,7 @@ def test_rehydrate_validate_pending_retry_ok(tmp_path):
 
 
 async def test_rehydrate_depends_on_past_cancelled_propagates(tmp_path):
-    cron = await _rehydrate_state_cron(tmp_path, _DEP_REHYDRATE)
+    cron = await _rehydrate_state_cron(tmp_path, _DEP_JOB)
     cron.state_backend.list_records = _raise_cancelled5
     with pytest.raises(asyncio.CancelledError):
         await cron._depends_on_past_ok(cron.cron_jobs["j"])
@@ -752,7 +740,7 @@ async def test_rehydrate_depends_on_past_cancelled_propagates(tmp_path):
 async def test_rehydrate_queue_completion_chains_behind_prev():
     # the second completion for one job waits on the first: the serial
     # per-job retry-arm ordering the reaper used to give inline.
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     job = _FakeRun5(cron.cron_jobs["j"])
     gate = asyncio.Event()
     calls = []
@@ -782,7 +770,7 @@ async def test_rehydrate_queue_completion_chains_behind_prev():
 async def test_rehydrate_queue_completion_reraises_cancelled():
     # a cancellation inside the sequenced handler propagates (it is not
     # swallowed by the defensive except), ending the task cancelled.
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     job = _FakeRun5(cron.cron_jobs["j"])
     cron.handle_job_failure = _raise_cancelled5
     cron._queue_job_completion(job, failed=True)
@@ -796,7 +784,7 @@ async def test_rehydrate_queue_completion_reraises_cancelled():
 async def test_rehydrate_handle_finished_dag_task_survives_dag_error():
     # a DAG scheduler error while recording a task completion is logged, never
     # allowed to kill the reaper; the task is still removed from running_jobs.
-    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB_REHYDRATE)
+    cron = cronstable.cron.Cron(None, config_yaml=_ONE_JOB)
     rj = _FakeRun5(cron.cron_jobs["j"], state_token=None)
     cron.running_jobs["j"].append(rj)
 

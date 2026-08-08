@@ -18,9 +18,11 @@ Files
   node-a.yaml          Per-node `cluster` section (mounted as cluster.yaml on
   node-b.yaml            the node) — TLS identity, peer list, and node name.
   node-c.yaml            These differ per node but do NOT change the job-set id.
-  gen-certs.sh         Generates a throwaway cluster CA + per-node certs (SAN =
+  ../_shared/gen-certs.sh
+                       Generates a throwaway cluster CA + per-node certs (SAN =
                        service name) into the shared `cluster-certs` volume on
-                       first start.
+                       first start. Shared by all the cluster demos; this demo's
+                       compose file names its nodes via the NODES env var.
 
 Dashboards: cronstable-a http://localhost:8080/ , cronstable-b :8081 , cronstable-c :8082 .
 Scroll to the "cluster" panel on any dashboard to watch attestation and

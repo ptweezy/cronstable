@@ -26,11 +26,15 @@ from cronstable.backends.etcd import (
     lease_ttl_from_keepalive,
 )
 from cronstable.config import parse_config_string
+from tests._helpers import _utc_now_plus
 
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 
 def _backend(extra="", endpoint="http://127.0.0.1:2379"):
+    # Deliberately NOT tests/_helpers._backend (finding B2): that one builds
+    # the FilesystemStateBackend state store, while this builds the EtcdBackend
+    # leadership backend from cluster YAML with endpoint/extra knobs.
     yaml = (
         "cluster:\n"
         "  backend: etcd\n"
@@ -44,12 +48,6 @@ def _backend(extra="", endpoint="http://127.0.0.1:2379"):
     )
     cfg = parse_config_string(yaml, "").cluster_config
     return EtcdBackend(cfg, lambda: "v1:job")
-
-
-def _utc_now_plus(seconds):
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        seconds=seconds
-    )
 
 
 # --- base64 helpers -------------------------------------------------------
