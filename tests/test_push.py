@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import pytest
 from aiohttp import web
@@ -64,7 +64,7 @@ def _device_keypair():
     return private, public_b64
 
 
-def _open_sealed(private, ciphertext_b64: str) -> Dict[str, Any]:
+def _open_sealed(private, ciphertext_b64: str) -> dict[str, Any]:
     sealed = base64.b64decode(ciphertext_b64)
     plaintext = nacl_public.SealedBox(private).decrypt(sealed)
     return json.loads(plaintext.decode("utf-8"))
@@ -95,7 +95,7 @@ class _RelayServer:
 
     def __init__(self, status: int = 200) -> None:
         self.status = status
-        self.requests: List[Dict[str, Any]] = []
+        self.requests: list[dict[str, Any]] = []
         self.url = ""
         self._runner: Optional[web.AppRunner] = None
 
@@ -615,7 +615,7 @@ class _FakeStateBackend:
     """
 
     def __init__(self) -> None:
-        self.docs: Dict[Any, Dict[str, Any]] = {}
+        self.docs: dict[Any, dict[str, Any]] = {}
 
     async def list_documents(self, namespace):
         assert namespace == push.PUSH_DOC_NAMESPACE
@@ -654,7 +654,7 @@ class _BrokenStateBackend:
 
 
 async def test_state_store_round_trip_and_backend_loss():
-    backend: List[Any] = [_FakeStateBackend()]
+    backend: list[Any] = [_FakeStateBackend()]
     store = push.StateDeviceStore(lambda: backend[0])
     await store.upsert({"id": "d1", "name": "phone"})
     assert [d["id"] for d in await store.load()] == ["d1"]
@@ -1132,7 +1132,7 @@ async def test_send_test_collapse_ids_are_unique(tmp_path):
 
 class _StubService:
     def __init__(self) -> None:
-        self.calls: List[Any] = []
+        self.calls: list[Any] = []
 
     async def send_report(self, ctx, success, push_config):
         self.calls.append((ctx, success, push_config))
@@ -1625,7 +1625,7 @@ class _Req:
     def __init__(self, match=None, body=None, token=None):
         self.match_info = match or {}
         self._body = body
-        self._store: Dict[str, Any] = {}
+        self._store: dict[str, Any] = {}
         if token is not None:
             self._store[WEB_TOKEN_REQUEST_KEY] = token
 
@@ -1653,7 +1653,7 @@ def _cron() -> Cron:
     return cron
 
 
-def _pair_body(public_b64: str) -> Dict[str, str]:
+def _pair_body(public_b64: str) -> dict[str, str]:
     return {
         "name": "phone",
         "platform": "ios",
@@ -1950,11 +1950,11 @@ class _ScopeReq:
         self.path = path
         self.method = method
         self.headers = headers
-        self.query: Dict[str, str] = {}
+        self.query: dict[str, str] = {}
         resource = SimpleNamespace(canonical=canonical)
         route = SimpleNamespace(resource=resource)
         self.match_info = SimpleNamespace(route=route)
-        self._store: Dict[str, Any] = {}
+        self._store: dict[str, Any] = {}
 
     def __setitem__(self, key, value):
         self._store[key] = value
@@ -2124,11 +2124,11 @@ async def test_start_stop_push_state_store_tracks_backend(tmp_path):
 
 
 class _FakeAsyncZeroconf:
-    instances: List["_FakeAsyncZeroconf"] = []
+    instances: list["_FakeAsyncZeroconf"] = []
 
     def __init__(self) -> None:
-        self.registered: List[Any] = []
-        self.unregistered: List[Any] = []
+        self.registered: list[Any] = []
+        self.unregistered: list[Any] = []
         self.closed = False
         _FakeAsyncZeroconf.instances.append(self)
 

@@ -35,8 +35,9 @@ import threading
 import time
 import weakref
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Optional
 
 try:
     import psutil
@@ -126,7 +127,7 @@ class _SeriesRecorder:
 
     def __init__(self, maxpoints: int) -> None:
         self._max = max(2, maxpoints)
-        self._points: List[List[float]] = []
+        self._points: list[list[float]] = []
         self._stride = 1  # samples per emitted point
         # the accumulating (not yet emitted) bucket
         self._count = 0
@@ -156,7 +157,7 @@ class _SeriesRecorder:
 
     def _compact(self) -> None:
         """Merge adjacent point pairs and double the stride."""
-        merged: List[List[float]] = []
+        merged: list[list[float]] = []
         pts = self._points
         for i in range(0, len(pts) - 1, 2):
             a, b = pts[i], pts[i + 1]
@@ -170,7 +171,7 @@ class _SeriesRecorder:
         self._points = merged
         self._stride *= 2
 
-    def points(self) -> List[List[float]]:
+    def points(self) -> list[list[float]]:
         """A copy of the emitted points, oldest first.
 
         The accumulating partial bucket is included as a provisional final
@@ -189,7 +190,7 @@ class _SeriesRecorder:
         return out
 
 
-def _parse_series(raw: Any) -> Optional[List[List[float]]]:
+def _parse_series(raw: Any) -> Optional[list[list[float]]]:
     """Sanitise a ``series`` field from a ledger record, or ``None``.
 
     Applies the same distrust as :meth:`ResourceUsage.from_dict`: entries
@@ -200,7 +201,7 @@ def _parse_series(raw: Any) -> Optional[List[List[float]]]:
     """
     if not isinstance(raw, list):
         return None
-    out: List[List[float]] = []
+    out: list[list[float]] = []
     for entry in raw[:MAX_SERIES_POINTS]:
         if not isinstance(entry, list) or len(entry) != 3:
             continue
@@ -238,13 +239,13 @@ class ResourceUsage:
     # job's monitorResources.history); None when series capture is off or
     # nothing was recorded.  Defaulted so pre-existing construction sites
     # (and summary-only ledger records) stay valid.
-    series: Optional[List[List[float]]] = None
+    series: Optional[list[list[float]]] = None
 
     @property
     def cpu_total_seconds(self) -> float:
         return self.cpu_user_seconds + self.cpu_system_seconds
 
-    def to_dict(self, *, include_series: bool = False) -> Dict[str, Any]:
+    def to_dict(self, *, include_series: bool = False) -> dict[str, Any]:
         """JSON-serialisable summary for the API / durable ledger.
 
         The chart series is opt-in (``include_series``): the durable ledger
@@ -252,7 +253,7 @@ class ResourceUsage:
         polled dashboard payloads keep the summary-only shape so a monitored
         job does not multiply the size of every /jobs tick.
         """
-        data: Dict[str, Any] = {
+        data: dict[str, Any] = {
             "cpu_user_seconds": self.cpu_user_seconds,
             "cpu_system_seconds": self.cpu_system_seconds,
             # denormalised for convenience -- every consumer wants the total,
@@ -305,7 +306,7 @@ class ResourceUsage:
         )
 
 
-def _ppid_index() -> Optional[Dict[int, List[int]]]:
+def _ppid_index() -> Optional[dict[int, list[int]]]:
     """``ppid -> child pids`` for the whole table, from ONE snapshot.
 
     ``psutil``'s ``children(recursive=True)`` scans the ENTIRE process table
@@ -327,7 +328,7 @@ def _ppid_index() -> Optional[Dict[int, List[int]]]:
     ppid_map = getattr(psutil, "_ppid_map", None)
     if ppid_map is None:  # pragma: no cover - shipped by every psutil 3.x+
         return None
-    index: Dict[int, List[int]] = {}
+    index: dict[int, list[int]] = {}
     try:
         for pid, ppid in ppid_map().items():
             index.setdefault(ppid, []).append(pid)
@@ -353,17 +354,17 @@ class _SharedSampleTicker:
         # monitor -> loop-clock instant its next sample is due (0.0 = now:
         # a fresh registration is sampled immediately, so even a very short
         # run has a chance of one reading).
-        self._due: Dict["ResourceMonitor", float] = {}
+        self._due: dict["ResourceMonitor", float] = {}
         self._task: Optional[asyncio.Task] = None
         self._wake = asyncio.Event()
         # The latest table snapshot and the loop-clock instant it was
         # taken, so a monitor stopping between ticks can fold its final
         # reading against it rather than walking the table again (see
         # ResourceMonitor.stop).
-        self._index: Optional[Dict[int, List[int]]] = None
+        self._index: Optional[dict[int, list[int]]] = None
         self._index_at = 0.0
 
-    def recent_index(self, max_age: float) -> Optional[Dict[int, List[int]]]:
+    def recent_index(self, max_age: float) -> Optional[dict[int, list[int]]]:
         """The last table snapshot, if it is younger than ``max_age``.
 
         ``None`` when there is none yet, when the walk failed, or when it
@@ -433,8 +434,8 @@ class _SharedSampleTicker:
 
     @staticmethod
     def _sample_batch(
-        monitors: List["ResourceMonitor"],
-    ) -> Optional[Dict[int, List[int]]]:
+        monitors: list["ResourceMonitor"],
+    ) -> Optional[dict[int, list[int]]]:
         # Worker thread. One table snapshot; each monitor folds its own
         # tree. The snapshot is returned so the caller can retain it for
         # monitors that stop before the next tick.
@@ -500,7 +501,7 @@ class ResourceMonitor:
         self._cpu_system = 0.0
         self._max_rss = 0
         self._samples = 0
-        self._members: Dict[tuple, tuple] = {}
+        self._members: dict[tuple, tuple] = {}
         self._departed_user = 0.0
         self._departed_system = 0.0
         # Serialises _sample.  Normally only the single sampling task runs
@@ -520,7 +521,7 @@ class ResourceMonitor:
         """Whether monitoring could actually attach to the process."""
         return self._proc is not None
 
-    def snapshot(self) -> Optional[Dict[str, Any]]:
+    def snapshot(self) -> Optional[dict[str, Any]]:
         """Current live usage of the running tree, or ``None`` if unsampled.
 
         Read by the scheduler while the job is still running (see
@@ -539,7 +540,7 @@ class ResourceMonitor:
             "rss_bytes": self._live_rss,
         }
 
-    def series(self) -> Optional[List[List[float]]]:
+    def series(self) -> Optional[list[list[float]]]:
         """The run-so-far ``[t, cpu%, rss]`` chart series, oldest first.
 
         ``None`` when series capture is off (history 0) or nothing has been
@@ -577,7 +578,7 @@ class ResourceMonitor:
         self._ticker = _loop_ticker()
         self._ticker.register(self)
 
-    def _sample(self, index: Optional[Dict[int, List[int]]] = None) -> None:
+    def _sample(self, index: Optional[dict[int, list[int]]] = None) -> None:
         """Read the process tree once, folding it into the running totals.
 
         Runs in a worker thread (the shared ticker's batch, or stop()'s
@@ -593,8 +594,8 @@ class ResourceMonitor:
             self._sample_locked(index)
 
     def _tree_from_index(
-        self, proc: Any, index: Dict[int, List[int]]
-    ) -> List[Any]:
+        self, proc: Any, index: dict[int, list[int]]
+    ) -> list[Any]:
         """This run's process tree, derived from the shared table snapshot.
 
         Mirrors ``psutil.Process.children(recursive=True)``: Process
@@ -626,7 +627,7 @@ class ResourceMonitor:
         return tree
 
     def _sample_locked(
-        self, index: Optional[Dict[int, List[int]]] = None
+        self, index: Optional[dict[int, list[int]]] = None
     ) -> None:
         proc = self._proc
         if proc is None:
@@ -642,7 +643,7 @@ class ResourceMonitor:
                 tree = [proc]
             except Exception:  # noqa: BLE001 - never let sampling raise
                 return
-        live: Dict[tuple, tuple] = {}
+        live: dict[tuple, tuple] = {}
         tree_pids = set()
         rss = 0
         for member in tree:
@@ -972,7 +973,7 @@ class NodeResourceSampler:
     def __init__(self) -> None:
         self._proc: Any = None
         # snapshot() memoisation (see NODE_SNAPSHOT_TTL).
-        self._cache: Optional[Dict[str, Any]] = None
+        self._cache: Optional[dict[str, Any]] = None
         self._cache_time = 0.0
         if psutil is not None:
             try:
@@ -987,18 +988,18 @@ class NodeResourceSampler:
         # The CPU reading is a delta between snapshots, so prime it here the
         # same way the psutil counters are primed above.
         self._cgroup = _CgroupV2Reader()
-        self._cgroup_prev_cpu: Optional[Tuple[float, float]] = None
+        self._cgroup_prev_cpu: Optional[tuple[float, float]] = None
         if self._cgroup.available:
             usage = self._cgroup.cpu_usage_seconds()
             if usage is not None:
                 self._cgroup_prev_cpu = (usage, time.monotonic())
         # background node history (see start_history): a bounded ring of
         # [t, cpu%, mem%] points feeding the dashboard's node chart.
-        self._history: Optional[Deque[List[float]]] = None
+        self._history: Optional[deque[list[float]]] = None
         self._history_interval = NODE_HISTORY_INTERVAL
         self._history_task: Optional[asyncio.Task] = None
 
-    def snapshot(self) -> Optional[Dict[str, Any]]:
+    def snapshot(self) -> Optional[dict[str, Any]]:
         """Current node CPU%/memory (+ this daemon's own), or ``None``."""
         if psutil is None:
             return None
@@ -1014,7 +1015,7 @@ class NodeResourceSampler:
             return dict(self._cache)
         try:
             vm = psutil.virtual_memory()
-            data: Dict[str, Any] = {
+            data: dict[str, Any] = {
                 # system-wide CPU utilisation since the previous snapshot,
                 # 0..100 (already averaged across cores by psutil).
                 "cpu_percent": psutil.cpu_percent(interval=None),
@@ -1045,7 +1046,7 @@ class NodeResourceSampler:
         self._cache_time = now
         return dict(data)
 
-    def _overlay_cgroup(self, data: Dict[str, Any]) -> None:
+    def _overlay_cgroup(self, data: dict[str, Any]) -> None:
         """Swap host-wide fields for our cgroup slice's, where limited.
 
         Memory and CPU are overlaid independently -- a container run with
@@ -1143,7 +1144,7 @@ class NodeResourceSampler:
                 exc_info=True,
             )
 
-    def history(self) -> Optional[Dict[str, Any]]:
+    def history(self) -> Optional[dict[str, Any]]:
         """The retained node history, or ``None`` when never started.
 
         ``points`` is oldest-first ``[t, cpu%, mem%]``; ``interval`` is the
@@ -1159,8 +1160,8 @@ class NodeResourceSampler:
 
 
 def resolve_node_history_config(
-    web_config: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+    web_config: dict[str, Any],
+) -> Optional[dict[str, Any]]:
     """Resolve the raw ``web.nodeHistory`` option into effective settings.
 
     Returns ``None`` when disabled, else ``{"interval", "points"}``.  Enabled

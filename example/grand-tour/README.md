@@ -25,7 +25,7 @@ you can read it top to bottom and know what it proves.
 If you only run one example, run this one. For a gentler start see
 [`example/demo`](../demo) (single node), [`example/dag`](../dag) (DAGs alone),
 [`example/job-state`](../job-state) (state primitives alone), or the
-[`acme-platform`](../acme-platform) cluster showcase this one extends.
+[`example/cluster`](../cluster) three-node cluster.
 
 ## Run it
 

@@ -75,7 +75,8 @@ import datetime
 import logging
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional, Set
+from collections.abc import Callable
+from typing import Any, Optional
 
 from cronstable.config import ClusterConfig, ConfigError, StateConfig
 
@@ -251,7 +252,7 @@ class FilesystemBackend(LeaseBackend):
         # completed _refresh_reboot_ran; cleared synchronously (no await
         # in between) where leadership is gained in _renew_once.
         self._reboot_ran_synced = False
-        self._reboot_persisted: Set[str] = set()
+        self._reboot_persisted: set[str] = set()
         self._reboot_persisted_job_set_id: Optional[str] = None
 
         self._task: Optional[asyncio.Task] = None
@@ -324,7 +325,7 @@ class FilesystemBackend(LeaseBackend):
         # only a successful round may extend it.
         return _monotonic() < self._quorum_deadline_mono
 
-    def lease_detail(self) -> Dict[str, Any]:
+    def lease_detail(self) -> dict[str, Any]:
         return {
             "path": self._store.root,
             "electionName": self.election_name,
@@ -796,7 +797,7 @@ class FilesystemBackend(LeaseBackend):
         self._reboot_refresh_next = _monotonic() + _REBOOT_RAN_REFRESH
         self._reboot_warn_next = 0.0
 
-    def _note_persisted(self, job_set_id: str, jobs: Set[str]) -> None:
+    def _note_persisted(self, job_set_id: str, jobs: set[str]) -> None:
         if self._reboot_persisted_job_set_id != job_set_id:
             self._reboot_persisted = set()
             self._reboot_persisted_job_set_id = job_set_id

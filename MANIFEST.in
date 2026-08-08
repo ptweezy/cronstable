@@ -13,14 +13,18 @@ prune pro
 # docs/ is the website tree. setuptools_scm's git file finder seeds the sdist
 # with every tracked file before this file is even read, so the ~116 MB of
 # screenshots and diagrams under docs/ rode along and pushed the 1.2.31 sdist
-# past PyPI's 100 MiB per-file limit. Deny the tree and add back only the two
-# files the shipped tests/ tree reads, so future website assets cannot leak in
-# again: docs/openapi.yaml is the API contract tests/test_openapi.py diffs
-# against cronstable.cron.WEB_ROUTES, and docs/demo/index.html is the mirror
-# fixture tests/test_web_demo_mirror.py compares to cronstable/web/index.html.
+# past PyPI's 100 MiB per-file limit. Deny the tree and add back only the
+# files the shipped tests/ tree reads, so future website assets cannot leak
+# in again. tests/test_packaging.py fences this list: it scans tests/ for
+# repo-relative docs/ reads and fails if one is missing here.
 prune docs
 include docs/openapi.yaml
 include docs/demo/index.html
+include docs/demo/_backend.html
+include docs/logo-engine.js
+include docs/logo-lab.html
+include docs/comparison.html
+include docs/palette.css
 
 # wiki/ and benchmarks/ deliberately stay. Together they are ~1.2 MB, and the
 # shipped test suite reads both: tests/test_tui.py asserts against

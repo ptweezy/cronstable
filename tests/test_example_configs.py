@@ -52,8 +52,10 @@ CONTAINER_CONFIG_DIR = "/config/"
 #: floors, not exact counts: the corpus grows, but a walk that silently
 #: stops finding files (a renamed directory, a glob that no longer matches)
 #: would otherwise turn this whole module into zero tests that all pass.
-_MIN_CONFIGS = 25
-_MIN_COMPOSE = 8
+#: (lowered when example/acme-platform and example/adhoc.cronstable.d were
+#: retired; acme's unique jobs live on in grand-tour)
+_MIN_CONFIGS = 20
+_MIN_COMPOSE = 7
 _MIN_JOBS = 80
 
 

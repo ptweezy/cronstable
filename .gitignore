@@ -66,8 +66,10 @@ target/
 /pyoxidizer/venv/
 /cronstable/version.py
 
-# Local-only changelog tooling
+# Local-only changelog tooling (build_demo.py is tracked: the demo mirror
+# test regenerates docs/demo/index.html through it)
 /scripts/*
+!/scripts/build_demo.py
 
 # Screenshot-pipeline scratch output: raw captures land here for review before
 # the keepers are copied over docs/img/ (the tracked, published set)

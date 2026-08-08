@@ -19,7 +19,7 @@ import asyncio
 import datetime
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from aiohttp import web
 
@@ -76,10 +76,10 @@ def _job(
     schedule: str = "* * * * *",
     command: str = "echo hi",
     scheduled_in: Optional[float] = 30.0,
-    history: Optional[List[Dict[str, Any]]] = None,
+    history: Optional[list[dict[str, Any]]] = None,
     paused: Any = None,
     late: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     last_run = None
     if outcome is not None:
         finished = datetime.datetime.now(
@@ -648,32 +648,32 @@ class FakeDaemon:
     """
 
     def __init__(self) -> None:
-        self.jobs: List[Dict[str, Any]] = []
+        self.jobs: list[dict[str, Any]] = []
         self.token: Optional[str] = None
-        self.posts: List[str] = []
-        self.post_bodies: List[Any] = []
-        self.log_lines: Dict[str, List[Dict[str, str]]] = {}
+        self.posts: list[str] = []
+        self.post_bodies: list[Any] = []
+        self.log_lines: dict[str, list[dict[str, str]]] = {}
         self.fail_logs_for: set = set()  # names whose SSE 500s
-        self.cluster: Dict[str, Any] = {"enabled": False, "peers": []}
-        self.fleet: Dict[str, Any] = {"enabled": False, "nodes": []}
-        self.dags_list: List[Dict[str, Any]] = []
-        self.dag_runs: Dict[str, List[Dict[str, Any]]] = {}
-        self.dag_docs: Dict[str, Dict[str, Any]] = {}  # runKey -> doc
-        self.dag_xcom: Dict[str, Dict[str, Any]] = {}  # runKey -> body
-        self.state: Dict[str, Any] = {"enabled": False}
-        self.state_documents: Dict[str, List[Any]] = {}
-        self.state_records: Dict[str, List[Any]] = {}
-        self.node: Dict[str, Any] = {
+        self.cluster: dict[str, Any] = {"enabled": False, "peers": []}
+        self.fleet: dict[str, Any] = {"enabled": False, "nodes": []}
+        self.dags_list: list[dict[str, Any]] = []
+        self.dag_runs: dict[str, list[dict[str, Any]]] = {}
+        self.dag_docs: dict[str, dict[str, Any]] = {}  # runKey -> doc
+        self.dag_xcom: dict[str, dict[str, Any]] = {}  # runKey -> body
+        self.state: dict[str, Any] = {"enabled": False}
+        self.state_documents: dict[str, list[Any]] = {}
+        self.state_records: dict[str, list[Any]] = {}
+        self.node: dict[str, Any] = {
             "node_name": "test-node",
             "resources": None,
         }
-        self.node_history: Dict[str, Any] = {
+        self.node_history: dict[str, Any] = {
             "node_name": "test-node",
             "enabled": False,
             "interval": None,
             "points": [],
         }
-        self.job_resources: Dict[str, Dict[str, Any]] = {}
+        self.job_resources: dict[str, dict[str, Any]] = {}
         self.runner: Optional[web.AppRunner] = None
         self.url = ""
 
@@ -1528,7 +1528,7 @@ async def test_ansi_memo_repaint_is_identical_and_regex_free(
     lines = [("stdout", "plain %03d" % i, 100.0 + i) for i in range(30)]
     lines.append(("stderr", "\x1b[31mred alert\x1b[0m", 200.0))
     app.log_tail = _stub_tail(app, lines)
-    calls: List[str] = []
+    calls: list[str] = []
     real = tui.rewrite_sgr
     monkeypatch.setattr(
         tui,
@@ -1644,7 +1644,7 @@ async def test_render_tail_window_matches_the_full_merge(tmp_path):
         app.tails.append(tail)
     paint = tui.Painter(app.theme)
 
-    def naive(scroll: int, lines: int) -> List[str]:
+    def naive(scroll: int, lines: int) -> list[str]:
         merged = []
         for idx, tail in enumerate(app.tails):
             for _stream, line, when in tail.lines:
@@ -1954,7 +1954,7 @@ async def test_tui_panels_paint_a_pause_held_slot_as_skipped(tmp_path):
     ok_ink = app.theme.fg("ok")
     when = "2020-01-01T10:00:00+00:00"
 
-    def ok_spans(rows: List[str], needle: str) -> List[str]:
+    def ok_spans(rows: list[str], needle: str) -> list[str]:
         return [r for r in rows if needle in strip_ansi(r) and ok_ink in r]
 
     # 2. incident timeline
@@ -2075,7 +2075,7 @@ async def test_api_builds_a_connector_only_for_a_tls_context(monkeypatch):
     stream() (SSE, the longest-lived connection) cannot be forgotten."""
     import aiohttp
 
-    seen: List[Dict[str, Any]] = []
+    seen: list[dict[str, Any]] = []
 
     class FakeSession:
         def __init__(self, **kwargs):
@@ -2107,7 +2107,7 @@ def test_resolve_tls_prefers_the_flag_over_the_env(monkeypatch):
     """Flag-then-env, per field, exactly like _resolve_token."""
     from cronstable import tlsutil
 
-    seen: Dict[str, Any] = {}
+    seen: dict[str, Any] = {}
 
     def _record(**kwargs):
         seen.update(kwargs)
@@ -3030,11 +3030,11 @@ async def test_spawn_swallows_cancellation_in_its_done_callback(tmp_path):
     # so capture through it and assert silence.
     app = _bare_app(tmp_path)
     loop = asyncio.get_running_loop()
-    captured: List[Dict[str, Any]] = []
+    captured: list[dict[str, Any]] = []
     previous = loop.get_exception_handler()
     loop.set_exception_handler(lambda lp, ctx: captured.append(ctx))
     try:
-        holder: Dict[str, Any] = {}
+        holder: dict[str, Any] = {}
 
         async def park() -> None:
             holder["task"] = asyncio.current_task()

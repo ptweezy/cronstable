@@ -6054,18 +6054,25 @@ var qrcode = function() {
       (paused ? '<span class="pill opt"><span class="dot paused"></span><b>' + paused + "</b>&nbsp;paused</span>" : "");
   }
 
+  // Duration-scaled outcome bars: one <i> per run, height proportional to
+  // duration against the window's max. Serves the jobs table sparkline and
+  // the history pane's bar chart, which differ only in scale and in the
+  // height of a run with no recorded duration.
+  function durationBars(runs, scale, fallback) {
+    const durs = runs.map((r) => r.duration).filter((d) => d != null);
+    const max = durs.length ? Math.max.apply(null, durs) : 0;
+    let html = "";
+    for (const r of runs) {
+      const h = (r.duration != null && max > 0) ? Math.max(2, Math.round((r.duration / max) * scale)) : fallback;
+      html += '<i class="' + outcomeCls(r.outcome) + '" title="' + escAttr(r.outcome + " · " + fmtDuration(r.duration)) + '" style="height:' + h + 'px"></i>';
+    }
+    return html;
+  }
+
   function sparkline(job) {
     const hist = job.history || [];
     if (!hist.length) return '<span class="spark empty">—</span>';
-    const durs = hist.map((r) => r.duration).filter((d) => d != null);
-    const max = durs.length ? Math.max.apply(null, durs) : 0;
-    let html = '<span class="spark" title="last ' + hist.length + ' runs">';
-    for (const r of hist) {
-      const cls = outcomeCls(r.outcome);
-      const h = (r.duration != null && max > 0) ? Math.max(2, Math.round((r.duration / max) * 16)) : 5;
-      html += '<i class="' + cls + '" title="' + escAttr(r.outcome + " · " + fmtDuration(r.duration)) + '" style="height:' + h + 'px"></i>';
-    }
-    return html + "</span>";
+    return '<span class="spark" title="last ' + hist.length + ' runs">' + durationBars(hist, 16, 5) + "</span>";
   }
 
   // The per-job owning node under distribution: spread. `clusterOwner` is only
@@ -6588,19 +6595,26 @@ var qrcode = function() {
     return pad2(Math.floor(sec / 60)) + ":" + pad2(sec % 60);
   }
   function fmtWall(c, withSeconds) { return c.Y + "-" + pad2(c.Mo) + "-" + pad2(c.D) + " " + pad2(c.h) + ":" + pad2(c.mi) + (withSeconds ? ":" + pad2(c.se || 0) : ""); }
+  // Every enabled job whose schedule the client cron engine can preview
+  // (interval-only jobs have no cron fields to walk): cb(job, parsed).
+  function forEachSchedulableJob(cb) {
+    for (const j of state.jobs) {
+      if (!j.enabled) continue;
+      const parsed = parseCron(schedOf(j));
+      if (parsed.type === "fields") cb(j, parsed);
+    }
+  }
+
   // Recompute each enabled job's next fire instant. Cheap (parseCron is cached,
   // nextRuns(n=1) is bounded), but only called when the panel is open or the
   // soonest fire has already elapsed.
   function computeRadar() {
     const now = Date.now();
     const items = [];
-    for (const j of state.jobs) {
-      if (!j.enabled) continue;
-      const parsed = parseCron(schedOf(j));
-      if (parsed.type !== "fields") continue;
+    forEachSchedulableJob((j, parsed) => {
       const runs = nextRuns(parsed, 1, frameOf(j), now);
       if (runs.length) items.push({ name: j.name, t: runs[0].t, c: runs[0].c });
-    }
+    });
     items.sort((a, b) => a.t - b.t);
     state.radar.items = items;
   }
@@ -6701,10 +6715,7 @@ var qrcode = function() {
     state.week.inputSig = inputSig;
     const items = [];
     const frequent = [];
-    for (const j of state.jobs) {
-      if (!j.enabled) continue;
-      const parsed = parseCron(schedOf(j));
-      if (parsed.type !== "fields") continue;
+    forEachSchedulableJob((j, parsed) => {
       // from one second before today's local midnight, so a fire exactly at
       // 00:00 lands in the grid; past fires today render dimmed. The walk
       // is bounded by the window's end and needs at most one fire past the
@@ -6717,7 +6728,7 @@ var qrcode = function() {
       } else {
         for (const t of fires) items.push({ name: j.name, t });
       }
-    }
+    });
     items.sort((a, b) => a.t - b.t || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     frequent.sort((a, b) => (a.name < b.name ? -1 : 1));
     const sig = bounds[0] + "#" + items.map((x) => x.name + "@" + x.t).join("|") +
@@ -7891,11 +7902,9 @@ var qrcode = function() {
     // the two right-side drawers are mutually exclusive (openDagDrawer closes
     // this one; mirror it here so they never overlap or fight over the hash).
     if (state.dagDrawer && state.dagDrawer.dag) closeDagDrawer();
-    const wasOpen = !!state.drawerJob;
-    if (!wasOpen) pushFocus();
+    const fresh = openOverlay("drawer");
     state.drawerJob = name;
     state.selected = name;
-    $("drawer").classList.add("open");
     $("drawer").setAttribute("aria-hidden", "false");
     $("scrim").classList.add("open");
     $("dName").textContent = name;
@@ -7903,19 +7912,18 @@ var qrcode = function() {
     renderDrawerMeta();
     renderRows();
     switchTab(tab || "logs", true);
-    if (!wasOpen) focusFirst($("drawer"));
+    if (fresh) focusFirst($("drawer"));
   }
   function closeDrawer() {
     stopStream();
     resStop();
     resPane.sel = null; resPane.data = null;
     state.drawerJob = null;
-    $("drawer").classList.remove("open");
     $("drawer").setAttribute("aria-hidden", "true");
     $("scrim").classList.remove("open");
     setHash(null);
     renderRows();
-    popFocus();
+    closeOverlay("drawer");
   }
   function switchTab(tab, force) {
     if (!force && state.tab === tab) return;
@@ -7994,19 +8002,25 @@ var qrcode = function() {
       : '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg> Pause';
   }
 
+  // GET path -> parsed JSON, or null after painting "could not load <what>"
+  // into the pane (a 401 stays silent: apiFetch's modal drives re-auth)
+  async function fetchJsonInto(path, pane, what) {
+    try {
+      const res = await apiFetch(path);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    } catch (e) {
+      if (e.message !== "unauthorized") pane.innerHTML = '<div class="term-empty">could not load ' + what + "</div>";
+      return null;
+    }
+  }
+
   // ---- history pane ----
   async function renderHistory(name) {
     const box = $("historyPane");
     box.innerHTML = '<div class="term-empty">loading run history…</div>';
-    let data;
-    try {
-      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/runs");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      data = await res.json();
-    } catch (e) {
-      if (e.message !== "unauthorized") box.innerHTML = '<div class="term-empty">could not load history</div>';
-      return;
-    }
+    const data = await fetchJsonInto("/jobs/" + encodeURIComponent(name) + "/runs", box, "history");
+    if (data == null) return;
     if (state.drawerJob !== name) return; // drawer changed while loading
     const runs = data.runs || [], s = data.stats || {};
     if (!runs.length) { box.innerHTML = '<div class="term-empty">No runs recorded yet. History is kept in memory and resets when cronstable restarts.</div>'; return; }
@@ -8029,15 +8043,7 @@ var qrcode = function() {
       (s.max_cpu_seconds != null ? stat("max cpu", fmtDuration(s.max_cpu_seconds)) : "") +
       (s.max_rss_bytes != null ? stat("peak mem", fmtBytes(s.max_rss_bytes)) : "") +
       "</div>";
-    const durs = runs.map((r) => r.duration).filter((d) => d != null);
-    const max = durs.length ? Math.max.apply(null, durs) : 0;
-    let bars = '<div class="barchart" title="duration per run (newest right)">';
-    for (const r of runs) {
-      const cls = outcomeCls(r.outcome);
-      const ht = (r.duration != null && max > 0) ? Math.max(2, Math.round((r.duration / max) * 54)) : 3;
-      bars += '<i class="' + cls + '" style="height:' + ht + 'px" title="' + escAttr((r.outcome) + " · " + fmtDuration(r.duration)) + '"></i>';
-    }
-    bars += "</div>";
+    const bars = '<div class="barchart" title="duration per run (newest right)">' + durationBars(runs, 54, 3) + "</div>";
     // show the CPU/mem columns only when the window has monitored runs, so an
     // unmonitored job's run table keeps its original five columns.
     const hasRes = runs.some((r) => r.resources);
@@ -8217,15 +8223,8 @@ var qrcode = function() {
     const box = $("resourcesPane");
     if (!resPane.data || resPane.data.name !== name) box.innerHTML = '<div class="term-empty">loading resource data…</div>';
     const seq = ++resPane.seq;
-    let data;
-    try {
-      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/resources");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      data = await res.json();
-    } catch (e) {
-      if (e.message !== "unauthorized") box.innerHTML = '<div class="term-empty">could not load resource data</div>';
-      return;
-    }
+    const data = await fetchJsonInto("/jobs/" + encodeURIComponent(name) + "/resources", box, "resource data");
+    if (data == null) return;
     // stale guard: the drawer moved on (or the tab changed) while loading
     if (seq !== resPane.seq || state.drawerJob !== name || state.tab !== "resources") return;
     resPane.data = data;
@@ -8329,15 +8328,8 @@ var qrcode = function() {
   async function loadNodeHistory() {
     nodeHistStop();
     if (!prefs.nodeCard) return;
-    let data;
-    try {
-      const res = await apiFetch("/node/history");
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      data = await res.json();
-    } catch (e) {
-      if (e.message !== "unauthorized") $("nodeCardBody").innerHTML = '<div class="term-empty">could not load node history</div>';
-      return;
-    }
+    const data = await fetchJsonInto("/node/history", $("nodeCardBody"), "node history");
+    if (data == null) return;
     if (!prefs.nodeCard) return; // toggled off while loading
     const pts = data.points || [];
     if (!data.enabled) {
@@ -8658,16 +8650,17 @@ var qrcode = function() {
     cur.scrollIntoView({ block: "center" });
   }
 
-  // Read one job's /logs SSE stream until the server closes it or the
+  // Read a line-per-event SSE stream until the server closes it or the
   // controller aborts (fetch + manual parse: EventSource cannot attach the
-  // Authorization header). hooks: line(stream, text) per output line;
+  // Authorization header). Serves the job log pane, the multi-tail and the
+  // DAG task-log pane. hooks: line(stream, text) per output line;
   // end(sawAnyLine, reason) per server end event (reason "no-output" = the
   // job has no output buffer at all); err(msg) on failure, with msg null for
   // a 401 (the re-auth flow is already driven by apiFetch's modal).
-  async function readLogStream(name, ctrl, hooks) {
+  async function readSSE(path, ctrl, hooks) {
     let gotLine = false;
     try {
-      const res = await apiFetch("/jobs/" + encodeURIComponent(name) + "/logs", { signal: ctrl.signal });
+      const res = await apiFetch(path, { signal: ctrl.signal });
       if (!res.ok || !res.body) { hooks.err("Could not open log stream (HTTP " + res.status + ")."); return; }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
@@ -8711,7 +8704,7 @@ var qrcode = function() {
     const ctrl = new AbortController();
     state.stream = ctrl;
     try {
-      await readLogStream(name, ctrl, {
+      await readSSE("/jobs/" + encodeURIComponent(name) + "/logs", ctrl, {
         line: (stream, text) => appendLine(stream, text, null),
         end: (sawLine) => { if (!sawLine) appendLine("", "(no output captured for the latest run)", "sys"); },
         err: (msg) => { if (msg) appendLine("", msg, "sys"); },
@@ -8869,7 +8862,7 @@ var qrcode = function() {
     const ctrl = new AbortController();
     st.ctrl = ctrl; st.err = false; st.retryAt = 0;
     st.sawRunning = !!job.running;   // were we ever attached to a LIVE run?
-    readLogStream(name, ctrl, {
+    readSSE("/jobs/" + encodeURIComponent(name) + "/logs", ctrl, {
       line: (stream, text) => appendTailLine(name, stream, text, null),
       end: (sawLine, reason) => {
         const s = state.tail.streams[name];
@@ -8968,11 +8961,9 @@ var qrcode = function() {
     if (!state.tail.lines.length) renderTailTerm();
   }
   function openTail(names) {
-    const fresh = !state.tail.open;
+    const fresh = openOverlay("tailWrap");
     if (fresh) {
-      pushFocus();
       state.tail.open = true;
-      $("tailWrap").classList.add("open");
       // a fresh console starts empty: reconnecting replays each job's
       // current buffer, so keeping the old lines would duplicate them
       state.tail.lines = []; state.tail.total = 0;
@@ -8992,14 +8983,12 @@ var qrcode = function() {
     if (fresh) setTimeout(() => $("tailAddInput").focus(), 30);
   }
   function closeTail() {
-    if (!state.tail.open) return;
+    if (!closeOverlay("tailWrap")) return;
     for (const name of state.tail.jobs) {
       const st = state.tail.streams[name];
       if (st && st.ctrl) { st.ctrl.abort(); st.ctrl = null; }
     }
     state.tail.open = false;
-    $("tailWrap").classList.remove("open");
-    popFocus();
   }
   function tailPreset(kind) {
     const names = state.jobs
@@ -9120,18 +9109,15 @@ var qrcode = function() {
     if (cur) cur.scrollIntoView({ block: "nearest" });
   }
   function openPalette() {
-    if (state.palette.open) return;
-    pushFocus();
+    if (!openOverlay("paletteWrap")) return;
     state.palette.open = true; state.palette.cur = 0;
-    $("paletteWrap").classList.add("open");
     $("paletteInput").value = "";
     renderPalette();
     setTimeout(() => $("paletteInput").focus(), 30);
   }
   function closePalette() {
-    if (!state.palette.open) return;
-    state.palette.open = false; $("paletteWrap").classList.remove("open");
-    popFocus();
+    if (!closeOverlay("paletteWrap")) return;
+    state.palette.open = false;
   }
   function runPaletteItem(i) {
     const item = state.palette.items[i];
@@ -9231,24 +9217,35 @@ var qrcode = function() {
     }
     prefs.notify = v && ("Notification" in window); savePref("notify"); syncSettings(); restartPolling();
   }
+  // One row per settings-sheet control: element id, how the current pref
+  // reads for display, and what a change event applies. syncSettings and
+  // the change listeners are loops over this table; the named setters stay
+  // standalone because the command palette and hotkeys call them directly.
+  const PREFS = [
+    ["setTheme", () => prefs.theme, (e) => setTheme(e.target.value)],
+    ["setFx", () => prefs.fx, (e) => setFx(e.target.checked)],
+    ["setScan", () => prefs.scan, (e) => setScan(e.target.checked)],
+    ["setDensity", () => prefs.density, (e) => setDensity(e.target.checked)],
+    ["setFont", fontPref, (e) => setFont(e.target.value)],
+    ["setScale", () => String(scalePref()), (e) => setScale(parseInt(e.target.value, 10))],
+    ["setMotion", () => prefs.motion, (e) => setMotion(e.target.checked)],
+    ["setCvd", cvdPref, (e) => setCvd(e.target.value)],
+    ["setNotify", () => prefs.notify, (e) => setNotify(e.target.checked)],
+    ["setSound", () => prefs.sound, (e) => setSound(e.target.checked)],
+    ["setVol", () => String(prefs.volume), (e) => setVolume(parseInt(e.target.value, 10))],
+    ["setBoot", () => prefs.boot, (e) => setBoot(e.target.checked)],
+    ["setPoll", () => String(prefs.pollMs), (e) => setPoll(parseInt(e.target.value, 10))],
+    ["setLedger", () => prefs.ledger, (e) => setLedger(e.target.checked)],
+    ["setZen", () => prefs.zen, (e) => { prefs.zen = e.target.checked; savePref("zen"); if (!prefs.zen) zenOff(); }],
+    ["setZenIdle", () => String(prefs.zenIdle), (e) => { prefs.zenIdle = parseInt(e.target.value, 10); savePref("zenIdle"); state.zen.idleSince = 0; }],
+    ["setEscalate", () => prefs.escalate, (e) => { prefs.escalate = e.target.checked; savePref("escalate"); }],
+  ];
   function syncSettings() {
-    $("setTheme").value = prefs.theme;
-    $("setFx").checked = prefs.fx;
-    $("setScan").checked = prefs.scan;
-    $("setDensity").checked = prefs.density;
-    $("setFont").value = fontPref();
-    $("setScale").value = String(scalePref());
-    $("setMotion").checked = prefs.motion;
-    $("setCvd").value = cvdPref();
-    $("setNotify").checked = prefs.notify;
-    $("setSound").checked = prefs.sound;
-    $("setVol").value = String(prefs.volume);
-    $("setBoot").checked = prefs.boot;
-    $("setPoll").value = String(prefs.pollMs);
-    $("setLedger").checked = prefs.ledger;
-    $("setZen").checked = prefs.zen;
-    $("setZenIdle").value = String(prefs.zenIdle);
-    $("setEscalate").checked = prefs.escalate;
+    for (const [id, read] of PREFS) {
+      const control = $(id);
+      if (control.type === "checkbox") control.checked = !!read();
+      else control.value = read();
+    }
     refreshLedgerStat();
     // CRT effects / scanlines do nothing on the flat themes (modern, standard)
     // — disable those toggles there so they aren't inoperative-yet-interactive.
@@ -9256,10 +9253,10 @@ var qrcode = function() {
     $("setFx").disabled = !crt;
     $("setScan").disabled = !crt;
   }
-  function openSettings() { if ($("settingsWrap").classList.contains("open")) return; pushFocus(); syncSettings(); $("settingsWrap").classList.add("open"); focusFirst($("settingsWrap")); }
-  function closeSettings() { if (!$("settingsWrap").classList.contains("open")) return; $("settingsWrap").classList.remove("open"); popFocus(); }
-  function openHelp() { if ($("helpWrap").classList.contains("open")) return; pushFocus(); $("helpWrap").classList.add("open"); focusFirst($("helpWrap")); }
-  function closeHelp() { if (!$("helpWrap").classList.contains("open")) return; $("helpWrap").classList.remove("open"); popFocus(); }
+  function openSettings() { if (!openOverlay("settingsWrap")) return; syncSettings(); focusFirst($("settingsWrap")); }
+  function closeSettings() { closeOverlay("settingsWrap"); }
+  function openHelp() { if (!openOverlay("helpWrap")) return; focusFirst($("helpWrap")); }
+  function closeHelp() { closeOverlay("helpWrap"); }
 
   // ===================================================================
   //  pair a device (QR)
@@ -9288,14 +9285,12 @@ var qrcode = function() {
     }
   }
   function openPair() {
-    if ($("pairWrap").classList.contains("open")) return;
-    pushFocus();
+    if (!openOverlay("pairWrap")) return;
     const payload = JSON.stringify({ v: 1, name: state.clusterNode || location.host, url: location.origin, token: token() });
     renderPairQr(payload);
     $("pairPayload").textContent = payload;
     $("pairHint").style.display = token() ? "none" : "";
     $("pairWarn").style.display = "none";
-    $("pairWrap").classList.add("open");
     focusFirst($("pairWrap"));
     const seq = ++pairSeq;
     apiFetch("/whoami").then((r) => (r.ok ? r.json() : null)).then((w) => {
@@ -9303,16 +9298,14 @@ var qrcode = function() {
       if (w.authenticated === true && w.allScopes === true) $("pairWarn").style.display = "";
     }).catch(() => {});
   }
-  function closePair() { if (!$("pairWrap").classList.contains("open")) return; pairSeq++; $("pairWrap").classList.remove("open"); popFocus(); }
+  function closePair() { if (closeOverlay("pairWrap")) pairSeq++; }
 
   // ===================================================================
   //  modal (token) + toasts + clipboard
   // ===================================================================
   function openModal(opts) {
     opts = opts || {};
-    const wrap = $("modalWrap");
-    if (wrap.classList.contains("open")) return;
-    pushFocus();
+    if (!openOverlay("modalWrap")) return;
     const has = !!token();
     if (opts.required) {
       $("modalTitle").textContent = "Access token required";
@@ -9322,11 +9315,10 @@ var qrcode = function() {
       $("modalMsg").textContent = "Stored only in this browser tab and sent as a bearer token with each request.";
     }
     $("tokenClear").style.display = has ? "" : "none";
-    wrap.classList.add("open");
     $("tokenInput").value = token();
     setTimeout(() => $("tokenInput").focus(), 40);
   }
-  function closeModal() { if (!$("modalWrap").classList.contains("open")) return; $("modalWrap").classList.remove("open"); popFocus(); }
+  function closeModal() { closeOverlay("modalWrap"); }
 
   function toast(kind, msg) {
     const e = el("div", "toast " + kind);
@@ -9418,6 +9410,24 @@ var qrcode = function() {
     if (state.dagDrawer && state.dagDrawer.dag) return $("dagDrawer");
     if (state.drawerJob) return $("drawer");
     return null;
+  }
+  // The overlay discipline in one place: the focus-stack push/pop pairs with
+  // an is-open guard, so stacked surfaces restore focus in LIFO order and a
+  // double open/close can never push twice or pop someone else's entry.
+  // Both return false when the surface is already in the requested state.
+  function openOverlay(id) {
+    const surf = $(id);
+    if (surf.classList.contains("open")) return false;
+    pushFocus();
+    surf.classList.add("open");
+    return true;
+  }
+  function closeOverlay(id) {
+    const surf = $(id);
+    if (!surf.classList.contains("open")) return false;
+    surf.classList.remove("open");
+    popFocus();
+    return true;
   }
   function pushFocus() { state.focusStack.push(document.activeElement); }
   function popFocus() {
@@ -9697,14 +9707,12 @@ var qrcode = function() {
   function openDagDrawer(dag, runKey, tab) {
     if (!state.dags.byName[dag]) return;
     if (state.drawerJob) closeDrawer();
-    const wasOpen = !!state.dagDrawer.dag;
-    if (!wasOpen) pushFocus();
+    const fresh = openOverlay("dagDrawer");
     state.dagDrawer.dag = dag;
     state.dagDrawer.runKey = runKey || null;
     state.dagDrawer.run = null; state.dagDrawer.xcom = null; state.dagDrawer.logTask = null;
     state.dagDrawer.runs = [];   // clear the prior dag's runs until fresh ones load
     state.dagDrawer.collapsed = {};
-    $("dagDrawer").classList.add("open");
     $("dagDrawer").setAttribute("aria-hidden", "false");
     $("dagScrim").classList.add("open");
     $("dgName").textContent = dag;
@@ -9714,18 +9722,17 @@ var qrcode = function() {
     switchDagTab(tab || (runKey ? "tasks" : "runs"));
     loadDagRuns();
     setDagHash();
-    if (!wasOpen) focusFirst($("dagDrawer"));
+    if (fresh) focusFirst($("dagDrawer"));
   }
   function closeDagDrawer() {
     stopDagTaskLog();
     if (state.dagRunPoll) { clearTimeout(state.dagRunPoll); state.dagRunPoll = null; }
     state.dagDrawer.dag = null; state.dagDrawer.runKey = null; state.dagDrawer.run = null;
-    $("dagDrawer").classList.remove("open");
     $("dagDrawer").setAttribute("aria-hidden", "true");
     $("dagScrim").classList.remove("open");
     setDagHash();
     renderDagCard();
-    popFocus();
+    closeOverlay("dagDrawer");
   }
   function renderDagDrawerHead() {
     const d = state.dags.byName[state.dagDrawer.dag];
@@ -10094,31 +10101,7 @@ var qrcode = function() {
   }
 
   // ---- Logs tab (live-tail a task instance's stdout/stderr) ----
-  async function readSSE(path, ctrl, hooks) {
-    let gotLine = false;
-    try {
-      const res = await apiFetch(path, { signal: ctrl.signal });
-      if (!res.ok || !res.body) { hooks.err("Could not open stream (HTTP " + res.status + ")."); return; }
-      const reader = res.body.getReader(); const dec = new TextDecoder(); let buf = "";
-      while (true) {
-        const rd = await reader.read();
-        if (rd.done) break;
-        buf += dec.decode(rd.value, { stream: true });
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-          let ev = "message", data = "";
-          block.split("\n").forEach((ln) => {
-            if (ln.startsWith(":")) return;
-            if (ln.startsWith("event:")) ev = ln.slice(6).trim();
-            else if (ln.startsWith("data:")) data += ln.slice(5).trim();
-          });
-          if (ev === "line" && data) { try { const o = JSON.parse(data); gotLine = true; hooks.line(o.stream, o.line); } catch (_) {} }
-          else if (ev === "end") { let reason = null; try { reason = (JSON.parse(data || "{}") || {}).reason || null; } catch (_) {} hooks.end(gotLine, reason); }
-        }
-      }
-    } catch (e) { if (e.name !== "AbortError") hooks.err(e.message === "unauthorized" ? null : "Stream ended: " + e.message); }
-  }
+  // streamed over the same readSSE reader the job log panes use
   function stopDagTaskLog() { if (state.dagStream) { state.dagStream.abort(); state.dagStream = null; } }
   // One line into the DAG task-log pane, on the same infrastructure the job
   // log pane uses. This path used to read scrollHeight (a forced synchronous
@@ -10433,17 +10416,20 @@ var qrcode = function() {
   // run)
   let kickMark = () => {};
   function wire() {
+    // one delegated dispatch for the per-row action buttons; `run` keeps its
+    // disabled guard (a Forbid job's run button renders disabled while it runs)
+    const rowActions = [
+      ["data-run", (name, btn) => { if (!btn.disabled) runJob(name); }],
+      ["data-cancel", cancelJob],
+      ["data-pause", pauseJob],
+      ["data-resume", resumeJob],
+      ["data-logs", openDrawer],
+    ];
     $("rows").addEventListener("click", (e) => {
-      const runBtn = e.target.closest("[data-run]");
-      if (runBtn) { e.stopPropagation(); if (!runBtn.disabled) runJob(runBtn.getAttribute("data-run")); return; }
-      const cancelBtn = e.target.closest("[data-cancel]");
-      if (cancelBtn) { e.stopPropagation(); cancelJob(cancelBtn.getAttribute("data-cancel")); return; }
-      const pauseBtn = e.target.closest("[data-pause]");
-      if (pauseBtn) { e.stopPropagation(); pauseJob(pauseBtn.getAttribute("data-pause")); return; }
-      const resumeBtn = e.target.closest("[data-resume]");
-      if (resumeBtn) { e.stopPropagation(); resumeJob(resumeBtn.getAttribute("data-resume")); return; }
-      const logsBtn = e.target.closest("[data-logs]");
-      if (logsBtn) { e.stopPropagation(); openDrawer(logsBtn.getAttribute("data-logs")); return; }
+      for (const [attr, fn] of rowActions) {
+        const btn = e.target.closest("[" + attr + "]");
+        if (btn) { e.stopPropagation(); fn(btn.getAttribute(attr), btn); return; }
+      }
       const tr = e.target.closest("tr[data-job]");
       if (tr) { state.selected = tr.getAttribute("data-job"); openDrawer(state.selected); }
     });
@@ -10700,24 +10686,8 @@ var qrcode = function() {
     $("paletteList").addEventListener("click", (e) => { const it = e.target.closest(".item"); if (it) runPaletteItem(+it.getAttribute("data-i")); });
     $("paletteWrap").addEventListener("click", (e) => { if (e.target === $("paletteWrap")) closePalette(); });
 
-    // settings
-    $("setTheme").addEventListener("change", (e) => setTheme(e.target.value));
-    $("setFx").addEventListener("change", (e) => setFx(e.target.checked));
-    $("setScan").addEventListener("change", (e) => setScan(e.target.checked));
-    $("setDensity").addEventListener("change", (e) => setDensity(e.target.checked));
-    $("setFont").addEventListener("change", (e) => setFont(e.target.value));
-    $("setScale").addEventListener("change", (e) => setScale(parseInt(e.target.value, 10)));
-    $("setMotion").addEventListener("change", (e) => setMotion(e.target.checked));
-    $("setCvd").addEventListener("change", (e) => setCvd(e.target.value));
-    $("setNotify").addEventListener("change", (e) => setNotify(e.target.checked));
-    $("setSound").addEventListener("change", (e) => setSound(e.target.checked));
-    $("setVol").addEventListener("change", (e) => setVolume(parseInt(e.target.value, 10)));
-    $("setBoot").addEventListener("change", (e) => setBoot(e.target.checked));
-    $("setPoll").addEventListener("change", (e) => setPoll(parseInt(e.target.value, 10)));
-    $("setLedger").addEventListener("change", (e) => setLedger(e.target.checked));
-    $("setZen").addEventListener("change", (e) => { prefs.zen = e.target.checked; savePref("zen"); if (!prefs.zen) zenOff(); });
-    $("setZenIdle").addEventListener("change", (e) => { prefs.zenIdle = parseInt(e.target.value, 10); savePref("zenIdle"); state.zen.idleSince = 0; });
-    $("setEscalate").addEventListener("change", (e) => { prefs.escalate = e.target.checked; savePref("escalate"); });
+    // settings: every sheet control wires through the PREFS table
+    for (const [id, , onChange] of PREFS) $(id).addEventListener("change", onChange);
     $("ledgerExport").addEventListener("click", ledgerExport);
     $("ledgerPurge").addEventListener("click", ledgerPurge);
     $("openHelp").addEventListener("click", () => { closeSettings(); openHelp(); });
@@ -11346,19 +11316,15 @@ var qrcode = function() {
 
   // ---- incident timeline overlay (hotkey i) ----
   function openTimeline() {
-    if (state.timeline.open) { closeTimeline(); return; }
-    pushFocus();
+    if (!openOverlay("timelineWrap")) { closeTimeline(); return; }
     state.timeline.open = true;
-    $("timelineWrap").classList.add("open");
     $("tlFailOnly").checked = state.timeline.failOnly;
     renderTimeline();
     focusFirst($("timelineWrap"));
   }
   function closeTimeline() {
-    if (!state.timeline.open) return;
+    if (!closeOverlay("timelineWrap")) return;
     state.timeline.open = false;
-    $("timelineWrap").classList.remove("open");
-    popFocus();
   }
   function renderTimeline() {
     if (!state.timeline.open) return;
@@ -11394,7 +11360,7 @@ var qrcode = function() {
   function openMitigate(names, label) {
     names = (names || []).filter((n) => state.byName[n]);
     if (!names.length) { toast("info", "nothing to mitigate — no target jobs"); return; }
-    if (!state.mitigate.open) pushFocus();
+    openOverlay("mitigateWrap");
     state.mitigate.open = true; state.mitigate.set = names; state.mitigate.abort = false;
     $("mitTitle").textContent = "Mitigate — " + (label || (names.length + " jobs"));
     $("mitDesc").textContent = "Acts on these " + names.length + " job" + (names.length > 1 ? "s" : "") +
@@ -11402,7 +11368,6 @@ var qrcode = function() {
     $("mitLog").style.display = "none"; $("mitLog").textContent = "";
     $("mitAbort").style.display = "none";
     renderMitList();
-    $("mitigateWrap").classList.add("open");
     focusFirst($("mitigateWrap"));
   }
   function renderMitList() {
@@ -11415,10 +11380,8 @@ var qrcode = function() {
     }).join("");
   }
   function closeMitigate() {
-    if (!state.mitigate.open) return;
+    if (!closeOverlay("mitigateWrap")) return;
     state.mitigate.abort = true; state.mitigate.open = false;
-    $("mitigateWrap").classList.remove("open");
-    popFocus();
   }
   function mitLog(line) {
     const box = $("mitLog"); box.style.display = "";
@@ -11494,20 +11457,19 @@ var qrcode = function() {
     return a === b || (MACROS[a] || a) === (MACROS[b] || b);
   }
   function openSandbox(prefillExpr, prefillFrame) {
-    if (!state.sandbox.open) pushFocus();
+    openOverlay("sandboxWrap");
     state.sandbox.open = true;
     const sel = $("sbxFrame");
     sel.innerHTML = sbxFrames().map((f) => '<option value="' + escAttr(f) + '">' + esc(f === "LOCAL" ? "local" : f) + "</option>").join("");
     const sj = selectedJob();
     if (prefillFrame) sel.value = prefillFrame; else if (sj) sel.value = frameOf(sj);
     $("sbxInput").value = prefillExpr != null ? prefillExpr : (sj ? sj.schedule : "");
-    $("sandboxWrap").classList.add("open");
     renderSandbox();
     setTimeout(() => $("sbxInput").focus(), 30);
   }
   function closeSandbox() {
-    if (!state.sandbox.open) return;
-    state.sandbox.open = false; $("sandboxWrap").classList.remove("open"); popFocus();
+    if (!closeOverlay("sandboxWrap")) return;
+    state.sandbox.open = false;
   }
   function sbxRecentHtml() {
     const list = sbxRecent();

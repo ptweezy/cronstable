@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 import weakref
-from typing import Any, Dict, Tuple
+from typing import Any
 
 logger = logging.getLogger("statsd")
 
@@ -72,7 +72,7 @@ class StatsdClientProtocol(asyncio.DatagramProtocol):
 #: so concurrent emits to a cold target share a single
 #: create_datagram_endpoint instead of racing to open several sockets and
 #: leaking all but the last.
-_ENDPOINTS: "weakref.WeakKeyDictionary[Any, Dict[Tuple[str, int], Any]]" = (
+_ENDPOINTS: "weakref.WeakKeyDictionary[Any, dict[tuple[str, int], Any]]" = (
     weakref.WeakKeyDictionary()
 )
 

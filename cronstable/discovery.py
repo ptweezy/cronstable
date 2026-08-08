@@ -18,7 +18,7 @@ import asyncio
 import logging
 import re
 import socket
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("cronstable")
 
@@ -188,13 +188,13 @@ class BonjourAdvertiser:
     def __init__(self) -> None:
         self._zeroconf: Optional[Any] = None
         self._info: Optional[Any] = None
-        self._signature: Optional[Dict[str, Any]] = None
+        self._signature: Optional[dict[str, Any]] = None
 
     @property
     def active(self) -> bool:
         return self._info is not None
 
-    async def start_stop(self, advert: Optional[Dict[str, Any]]) -> None:
+    async def start_stop(self, advert: Optional[dict[str, Any]]) -> None:
         """Converge the running advert onto ``advert``.
 
         ``advert`` is ``{"name", "port", "properties"}`` plus an

@@ -25,7 +25,8 @@ stays stable and backend-independent whether or not a given host has orjson.
 import json as _stdlib
 import math
 import re
-from typing import Any, Iterable, Union, cast
+from collections.abc import Iterable
+from typing import Any, cast
 
 try:
     import orjson
@@ -130,7 +131,7 @@ def _checked_parse_int(text: str) -> int:
 
 
 def _has_wide_int_run(
-    data: Union[bytes, bytearray, memoryview, str],
+    data: bytes | bytearray | memoryview | str,
 ) -> bool:
     # Wider than :func:`loads`' own ``Union[bytes, str]`` on purpose: the
     # translate path below needs a real ``bytes``/``bytearray``, so the
@@ -351,7 +352,7 @@ if orjson is not None:
             ensure_portable(obj)
             raise
 
-    def loads(data: Union[bytes, str]) -> Any:
+    def loads(data: bytes | str) -> Any:
         """Parse JSON from ``bytes`` or ``str``.
 
         Raises :class:`UnsupportedValue` for an integer literal outside the
@@ -408,7 +409,7 @@ else:
         )
         return text.encode("utf-8")
 
-    def loads(data: Union[bytes, str]) -> Any:
+    def loads(data: bytes | str) -> Any:
         """Parse JSON from ``bytes`` or ``str``.
 
         Raises :class:`UnsupportedValue` for an integer literal outside the
