@@ -13,11 +13,6 @@ import pytest
 import cronstable.cron
 from tests._commands import cmd_print, cmd_sleep, yaml_command
 
-# Re-exported so the split files keep one import site for their shared
-# helpers; the definitions live in the canonical shared modules.
-from tests._configs import _PAUSABLE_JOB  # noqa: F401
-from tests._helpers import _wait_until  # noqa: F401
-
 
 async def _noop():
     # awaitable stand-in for a monkeypatched async launch_scheduled_job

@@ -191,8 +191,6 @@ dags:
 """
 
 
-
-
 async def _make_cron(tmp_path, dags_yaml):
     cfg = (
         "state:\n  path: {}\n  jobApi:\n    enabled: true\n".format(tmp_path)
@@ -1717,21 +1715,14 @@ jobs:
 """
 
 
-class _PauseReq:
-    """A minimal aiohttp request stand-in with a match slot and JSON body."""
-
-    def __init__(self, name, body=None):
-        self.match_info = {"name": name}
-        self._body = body
-        self.can_read_body = body is not None
-
-    async def json(self):
-        return self._body
+def _pause_req(name, body=None):
+    # the shared Req with the pause handlers' match slot pre-filled
+    return Req(match={"name": name}, body=body)
 
 
 async def test_web_pause_defaults_to_default_duration():
     cron = _cron(_PAUSE_YAML)
-    resp = await cron._web_pause_job(_PauseReq("p"))
+    resp = await cron._web_pause_job(_pause_req("p"))
     assert resp.status == 200
     paused = json.loads(resp.body)["paused"]
     since = datetime.datetime.fromisoformat(paused["since"])
@@ -1746,7 +1737,7 @@ async def test_web_pause_defaults_to_default_duration():
 async def test_web_pause_with_duration_note_and_by():
     cron = _cron(_PAUSE_YAML)
     resp = await cron._web_pause_job(
-        _PauseReq(
+        _pause_req(
             "p", {"durationSeconds": 120, "note": "maint", "by": "parker"}
         )
     )
@@ -1762,7 +1753,7 @@ async def test_web_pause_with_until():
     cron = _cron(_PAUSE_YAML)
     until = datetime.datetime.now(_UTC) + datetime.timedelta(seconds=600)
     resp = await cron._web_pause_job(
-        _PauseReq("p", {"until": until.isoformat()})
+        _pause_req("p", {"until": until.isoformat()})
     )
     paused = json.loads(resp.body)["paused"]
     assert paused["until"] == until.isoformat()
@@ -1798,23 +1789,23 @@ async def test_web_pause_400_shapes():
     ]
     for body in bad_bodies:
         with pytest.raises(web.HTTPBadRequest):
-            await cron._web_pause_job(_PauseReq("p", body))
+            await cron._web_pause_job(_pause_req("p", body))
     assert cron._pause_active("p") is None  # nothing invalid stuck
 
 
 async def test_web_pause_and_resume_unknown_job_404():
     cron = _cron(_PAUSE_YAML)
     with pytest.raises(web.HTTPNotFound):
-        await cron._web_pause_job(_PauseReq("ghost"))
+        await cron._web_pause_job(_pause_req("ghost"))
     with pytest.raises(web.HTTPNotFound):
-        await cron._web_resume_job(_PauseReq("ghost"))
+        await cron._web_resume_job(_pause_req("ghost"))
 
 
 async def test_web_pause_is_idempotent_overwrite():
     cron = _cron(_PAUSE_YAML)
-    resp = await cron._web_pause_job(_PauseReq("p", {"durationSeconds": 60}))
+    resp = await cron._web_pause_job(_pause_req("p", {"durationSeconds": 60}))
     first = json.loads(resp.body)["paused"]
-    resp = await cron._web_pause_job(_PauseReq("p", {"durationSeconds": 7200}))
+    resp = await cron._web_pause_job(_pause_req("p", {"durationSeconds": 7200}))
     second = json.loads(resp.body)["paused"]
     # a re-pause overwrites the window (no 409): the live record is the new one
     assert second["until"] > first["until"]
@@ -1825,13 +1816,13 @@ async def test_web_pause_is_idempotent_overwrite():
 
 async def test_web_resume_clears_and_is_noop_when_not_paused():
     cron = _cron(_PAUSE_YAML)
-    await cron._web_pause_job(_PauseReq("p"))
-    resp = await cron._web_resume_job(_PauseReq("p", {"by": "parker"}))
+    await cron._web_pause_job(_pause_req("p"))
+    resp = await cron._web_resume_job(_pause_req("p", {"by": "parker"}))
     assert resp.status == 200
     assert json.loads(resp.body) == {"paused": None}
     assert cron._pause_active("p") is None
     # resuming a job that is not paused is a 200 no-op, not a conflict
-    resp = await cron._web_resume_job(_PauseReq("p"))
+    resp = await cron._web_resume_job(_pause_req("p"))
     assert json.loads(resp.body) == {"paused": None}
 
 

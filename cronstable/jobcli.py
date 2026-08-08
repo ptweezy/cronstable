@@ -31,7 +31,6 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-
 # The env vars the daemon injects (see cronstable.jobapi); the job CLI is the
 # consumer.  Hardcoded here rather than imported so the CLI never pulls aiohttp
 # into its import graph -- these three names are a stable wire contract.
@@ -64,6 +63,7 @@ EXIT_ERROR = 1
 EXIT_NOT_ACQUIRED = 3
 EXIT_NOT_FOUND = 4
 EXIT_DUPLICATE = 5
+
 
 class _CliError(Exception):
     """A user-facing failure: printed to stderr, exits non-zero."""

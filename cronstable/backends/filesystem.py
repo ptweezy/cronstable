@@ -82,13 +82,12 @@ from typing import Any, Optional
 # shared via _common.  Here the margin is applied TWICE (the module
 # docstring's holder and challenger halves) and must stay under the
 # config-floored ttl (>= 3) so the leader window never collapses at the
-# minimum ttl.  The time helpers bind under this module's name, so the
+# minimum ttl.  The monotonic helper binds under this module's name, so the
 # tests' per-module monkeypatching keeps working.
 from cronstable.backends._common import (
     _SKEW_SECONDS,
     _UNKNOWN_HOLDER,
     _monotonic,
-    _utcnow,
 )
 from cronstable.config import ClusterConfig, ConfigError, StateConfig
 

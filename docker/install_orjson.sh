@@ -42,8 +42,8 @@
 #     layers above the source COPY read only pyproject.toml and the docker/
 #     helper scripts). The inline probe round-trips the same sample as
 #     verify_extra.py's _verify_orjson (compact bytes, OPT_SORT_KEYS,
-#     non-ASCII: the case a QEMU-miscompiled build typically fails); keep
-#     the two probes in step.
+#     non-ASCII: the case a QEMU-miscompiled build typically fails);
+#     tests/test_extra_pins_parity.py holds the two samples equal.
 #   - paths are fixed: all eight builder stages install into /opt/venv, so the
 #     PIP/PY indirection the binary lanes need (uv vs pip) has no use here,
 #     and the image pip flags (--no-cache-dir, the 120s wheel / 300s
