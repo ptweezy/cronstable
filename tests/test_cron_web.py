@@ -18,10 +18,9 @@ from tests._cron_helpers import (
     TWO_JOBS,
     UTC,
     _FakeMesh,
-    _wait_until,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _drain_state_writes, _state_cfg
+from tests._helpers import _drain_state_writes, _state_cfg, _wait_until
 from tests.conftest import Req, _cron
 
 
@@ -1200,17 +1199,10 @@ async def test_handler_errors_carry_the_json_envelope():
         "error": "job 'nope' not found"
     }
 
-    class PauseReq:
-        match_info = {"name": "alpha"}
-        headers: dict = {}
-        can_read_body = True
-
-        @staticmethod
-        async def json():
-            return {"durationSeconds": "soon"}
-
     with pytest.raises(web.HTTPBadRequest) as raised:
-        await cron._web_pause_job(PauseReq())
+        await cron._web_pause_job(
+            Req(match={"name": "alpha"}, body={"durationSeconds": "soon"})
+        )
     assert raised.value.content_type == "application/json"
     assert json.loads(raised.value.text or "") == {
         "error": "durationSeconds must be an integer"
@@ -2160,20 +2152,11 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
 
     cron = _cron(TWO_JOBS)
 
-    # local fake request (not the shared Req): this handler reads a JSON body
-    class BackfillReq:
-        can_read_body = True
-
-        def __init__(self, body):
-            self.match_info = {"name": "d"}
-            self._body = body
-
-        async def json(self):
-            return self._body
-
     # non-string from/to -> 400
     with pytest.raises(web.HTTPBadRequest):
-        await cron._web_dag_backfill(BackfillReq({"from": 1, "to": 2}))
+        await cron._web_dag_backfill(
+            Req(match={"name": "d"}, body={"from": 1, "to": 2})
+        )
 
     async def bad_backfill(name, start, end):
         return {"ok": False, "reason": "nope"}
@@ -2181,7 +2164,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
     monkeypatch.setattr(cron._dag, "backfill", bad_backfill)
     with pytest.raises(web.HTTPBadRequest):
         await cron._web_dag_backfill(
-            BackfillReq({"from": "2020-01-01", "to": "2020-01-02"})
+            Req(match={"name": "d"}, body={"from": "2020-01-01", "to": "2020-01-02"})
         )
 
     async def ok_backfill(name, start, end):
@@ -2189,7 +2172,7 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
 
     monkeypatch.setattr(cron._dag, "backfill", ok_backfill)
     resp = await cron._web_dag_backfill(
-        BackfillReq({"from": "2020-01-01", "to": "2020-01-02"})
+        Req(match={"name": "d"}, body={"from": "2020-01-01", "to": "2020-01-02"})
     )
     assert _json.loads(resp.text)["runs"] == 2
 

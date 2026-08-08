@@ -43,6 +43,7 @@ from cronstable.job import (
     RunningJob,
     report_config_enabled,
 )
+from tests.conftest import _cron as _shared_cron
 
 try:
     from nacl import public as nacl_public
@@ -1648,9 +1649,7 @@ jobs:
 
 
 def _cron() -> Cron:
-    cron = Cron(None, config_yaml=_SEED_JOB)
-    cron.web_config = {}
-    return cron
+    return _shared_cron(_SEED_JOB)
 
 
 def _pair_body(public_b64: str) -> dict[str, str]:

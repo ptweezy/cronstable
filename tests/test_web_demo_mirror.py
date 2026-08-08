@@ -19,6 +19,8 @@ import importlib.util
 import os
 import re
 
+from cronstable._cliargs import THEME_HUES
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(ROOT, "cronstable", "web", "index.html")
 DEMO = os.path.join(ROOT, "docs", "demo", "index.html")
@@ -335,7 +337,7 @@ def test_docs_palette_matches_the_dashboards_theme_tokens():
     }
     expected = {":root", 'html[data-theme$="-light"]'} | {
         'html[data-theme="%s"]' % name
-        for hue in ("carolina", "green", "amber", "modern", "standard")
+        for hue in THEME_HUES
         for name in (hue, hue + "-light")
     }
     assert set(themed) == expected, (
@@ -357,6 +359,27 @@ def test_docs_palette_matches_the_dashboards_theme_tokens():
         "docs/palette.css has drifted from the dashboard's theme tokens "
         "(the dashboard's inline copy is canonical):\n"
         + "\n".join(mismatches)
+    )
+
+
+def test_dashboard_theme_hues_match_the_cli_list():
+    """The dashboard's JS THEME_HUES literal equals _cliargs.THEME_HUES.
+
+    The hue list lives in two places by construction: the CLI's stdlib-only
+    leaf (which drives --theme choices, the TUI cycler, and the screenshot
+    matrix in docs/screenshots) and the dashboard's inline script (which
+    drives its theme cycler and pref self-healing; the demo inherits it via
+    the mirror). A hue added to only one side ships half-wired: either the
+    dashboard can cycle to a theme the CLI and screenshots never heard of,
+    or the reverse. Order is asserted too, so every cycler walks the hues
+    the same way.
+    """
+    m = re.search(r"const THEME_HUES = \[(.*?)\];", _read(WEB))
+    assert m, "const THEME_HUES literal not found in %s" % WEB
+    web_hues = re.findall(r'"([^"]*)"', m.group(1))
+    assert web_hues == list(THEME_HUES), (
+        "the dashboard's THEME_HUES %r has drifted from "
+        "cronstable._cliargs.THEME_HUES %r" % (web_hues, list(THEME_HUES))
     )
 
 

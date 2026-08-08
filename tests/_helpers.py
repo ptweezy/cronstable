@@ -30,8 +30,8 @@ TLS_NOW = datetime.datetime(2026, 1, 1, tzinfo=_UTC)
 
 
 # --- config parsing shims ---------------------------------------------------
-# canonical: tests/test_state.py (same 2-line body in test_state_dag_run.py
-# and others; test_ui_endpoints.py imports this one)
+# the one home: every consumer (test_state.py, test_state_dag_run.py,
+# test_ui_endpoints.py, ...) imports it from here.
 
 
 def _state_cfg(yaml):
@@ -74,9 +74,8 @@ async def _wait_until(
     one final ``pred()`` so a boundary-true predicate still reads True.
 
     Source variants and how to reproduce them:
-    - test_cluster.py / test_prometheus.py: the defaults (tries=300,
-      interval=0.01, raising).  tests/_cron_helpers.py re-exports this
-      helper for the test_cron_* split files.
+    - test_cluster.py / test_prometheus.py and the test_cron_* split
+      files: the defaults (tries=300, interval=0.01, raising).
     - test_state.py's merged lifecycle-hardening tests: tries=1000
       (raising).
     - test_state.py (``timeout=3.0`` = 300 x 0.01): defaults with

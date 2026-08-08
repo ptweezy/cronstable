@@ -61,7 +61,7 @@ jobs:
     enabled: false
 """
 
-# the one home (tests/_cron_helpers.py re-exports it for the split files)
+# the one home; every consumer imports it from here
 _PAUSABLE_JOB = """
 jobs:
   - name: p

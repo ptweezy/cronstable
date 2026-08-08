@@ -12289,6 +12289,13 @@ class Cron:
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
             return None
+        if kind == "pending":
+            host = rec.get("host")
+            if not isinstance(host, str) or host == self._state_host:
+                # our own pending is rehydration's business, never the
+                # scan's; declined before the armed_at parse, which an
+                # own-host record never needs.
+                return None
         armed_at = _retry_armed_at(rec, not_before)
         # the newest ACTUAL run (see _validate_pending_retry): a pause-held
         # slot's "skipped" row is not evidence anything ran.
@@ -12297,10 +12304,6 @@ class Cron:
             return None  # locally-known newer run; the ladder resolved
         if kind == "handoff":
             return attempt, max(not_before, now)
-        host = rec.get("host")
-        if not isinstance(host, str) or host == self._state_host:
-            # our own pending is rehydration's business, never the scan's
-            return None
         due_anchor = max(not_before, armed_at)
         if (now - due_anchor).total_seconds() <= RETRY_CLAIM_GRACE:
             return None

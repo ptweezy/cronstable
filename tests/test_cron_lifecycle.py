@@ -31,10 +31,9 @@ from tests._cron_helpers import (
     _noop,
     _reboot_job,
     _reboot_mgr,
-    _wait_until,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _UTC, _state_cfg
+from tests._helpers import _UTC, _state_cfg, _wait_until
 from tests.conftest import Req
 from tests.test_state import (
     _NOW,

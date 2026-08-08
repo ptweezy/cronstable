@@ -22,6 +22,7 @@ import pytest
 
 import cronstable.backends.filesystem as fsb_mod
 import cronstable.state as state_mod
+from cronstable.backends._common import _utcnow
 from cronstable.backends.filesystem import FilesystemBackend, display_name
 from cronstable.config import ConfigError, parse_config_string
 from cronstable.leadership import make_backend
@@ -717,7 +718,7 @@ async def test_confirm_after_denied_acquire_does_not_assert_leadership(
 
 
 def test_utcnow_is_tz_aware_utc():
-    now = fsb_mod._utcnow()
+    now = _utcnow()
     assert isinstance(now, datetime.datetime)
     # deadlines/display must be an aware UTC stamp, never naive local time.
     assert now.tzinfo is datetime.timezone.utc

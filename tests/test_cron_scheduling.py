@@ -7,10 +7,9 @@ import pytest
 
 import cronstable.cron
 from cronstable.job import JobOutputStream, JobRetryState
-from tests._configs import _ONE_JOB, job_yaml
+from tests._configs import _ONE_JOB, _PAUSABLE_JOB, job_yaml
 from tests._cron_helpers import (
     _EVERY_SECOND_AND_MINUTE,
-    _PAUSABLE_JOB,
     _RELOAD_AFTER,
     _RELOAD_BEFORE,
     _SECONDS_JOB,
@@ -30,10 +29,9 @@ from tests._cron_helpers import (
     _seed_due,
     _set_now,
     _sla_report_recorder,
-    _wait_until,
     fixed_current_time,  # noqa: F401
 )
-from tests._helpers import _state_cfg
+from tests._helpers import _state_cfg, _wait_until
 from tests.test_state import (
     _NOW,
     _count_launcher,
