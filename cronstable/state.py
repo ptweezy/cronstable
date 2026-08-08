@@ -71,6 +71,16 @@ from typing import (
     cast,
 )
 
+# Module scope on purpose, though only _decode_fs_token uses it: that runs
+# once per FILENAME per directory listing, and at that rate the
+# IMPORT_NAME/IMPORT_FROM pair a function-local import compiles to is
+# measurable.  It costs nothing at import time either way, since importing
+# this module already pulls urllib.parse in through cronstable.config (whose
+# own `from urllib.parse import ParseResult, urlparse` is the real provider;
+# check before deferring THAT one, because this line sits above the config
+# import and would then become the thing putting urllib.parse on the graph).
+from urllib.parse import unquote_to_bytes
+
 from cronstable import _json
 from cronstable.config import ConfigError, StateConfig
 from cronstable.platform import (
@@ -228,6 +238,25 @@ _SHARED_FSTYPES = frozenset(
 # aliases Windows strips.
 _FS_SAFE = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
 
+# Per-byte escape table for _fs_safe_fragment, and the deletion table its
+# inverse uses to recognise an already-canonical token.  Both are derived from
+# _FS_SAFE so neither can drift from it.
+#
+# The escape table carries the weight, because encoding sits inside DECODING:
+# _decode_fs_token re-encodes each candidate name to prove it round-trips, and
+# _list_document_keys_sync decodes every filename on every keys-only listing,
+# one of which the DAG run-summary cache takes per dag per /dags poll.  At that
+# rate a table lookup per byte beats a Python conditional per byte by 43% of
+# the decode cost of a 50-entry listing of escaped names, measured.
+#
+# _FS_SAFE_DELETE serves only _decode_fs_token's fast path, a much narrower
+# win: see the note there on which token shapes reach it.
+_FS_BYTE_ESCAPE = [
+    chr(byte) if chr(byte) in _FS_SAFE else "%{:02X}".format(byte)
+    for byte in range(256)
+]
+_FS_SAFE_DELETE = str.maketrans("", "", "".join(sorted(_FS_SAFE)))
+
 # Windows device names, reserved in every directory (case-insensitively).  A
 # lowercase job name could otherwise pass through _fs_safe verbatim and make
 # every open/mkdir under it fail (or hit the console device) on Windows.
@@ -323,14 +352,12 @@ def _fs_safe_fragment(fragment: str) -> str:
     like ``runs/`` always survives verbatim at the front of the
     stream's encoded directory name.
     """
-    out: List[str] = []
-    for byte in fragment.encode("utf-8", "surrogatepass"):
-        char = chr(byte)
-        if char in _FS_SAFE:
-            out.append(char)
-        else:
-            out.append("%{:02X}".format(byte))
-    return "".join(out)
+    return "".join(
+        map(
+            _FS_BYTE_ESCAPE.__getitem__,
+            fragment.encode("utf-8", "surrogatepass"),
+        )
+    )
 
 
 def _decode_fs_token(token: str) -> Optional[str]:
@@ -348,9 +375,43 @@ def _decode_fs_token(token: str) -> Optional[str]:
     that does not re-encode to this exact token, e.g. a lowercase-hex
     alias): the caller must report the entry unnameable, never act on a
     mangled name.
-    """
-    from urllib.parse import unquote_to_bytes
 
+    A token already made entirely of :data:`_FS_SAFE` characters answers
+    itself, with neither half of the round trip run: there is no ``%`` for the
+    unquote to undo, and :func:`_fs_safe` would re-emit such a name verbatim,
+    because each of its three escape hatches is ruled out by one of the guards
+    standing beside the character test.  Each guard earns its place:
+    ``_fs_safe("")`` is ``"_"``, ``_fs_safe("con")`` is ``"%63on"``, and an
+    over-long name comes back as head + digest, so dropping any one of them
+    hands back a name the encoder cannot have produced.
+    ``tests/test_state.py`` carries one token per hatch.
+
+    Fewer tokens reach the fast path than it looks.  Every managed stream
+    prefix ends in ``/`` (``runs/``, ``manifests/``, ``dagrun/``), and a
+    scheduled DAG run key is an ISO instant, so the ordinary on-disk token is
+    heavily escaped (``2026-08-07%5412%3A00%3A00_00%3A00``) and goes the slow
+    way; manual run keys and plain document keys are what hit.  So the branch
+    is a trade.  Against carrying no fast path at all, a 50-entry listing of
+    escaped names costs 2% to 9% more, and one of unescaped names costs ~75%
+    less, which is the figure it is kept for.
+
+    The ``"%"`` test comes first to hold that first cost down: it scans
+    without allocating, where the character test allocates, so leading with
+    the character test instead costs 13% to 20% on those same escaped
+    listings.  Ordering it this way is worth 3% to 16% of an escaped listing.
+
+    Escaped names got faster elsewhere, in :data:`_FS_BYTE_ESCAPE` in the
+    re-encode above and in the module-scope ``unquote_to_bytes``.  Both apply
+    whether or not this branch exists.
+    """
+    if (
+        "%" not in token
+        and token
+        and not token.translate(_FS_SAFE_DELETE)
+        and len(token) <= _FS_SAFE_MAX
+        and token not in _WINDOWS_RESERVED
+    ):
+        return token
     try:
         name = unquote_to_bytes(token).decode("utf-8", "surrogatepass")
     except UnicodeError:
