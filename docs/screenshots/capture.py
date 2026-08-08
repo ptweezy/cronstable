@@ -41,6 +41,13 @@ BASE = "http://localhost:8080"       # the grand-tour fleet
 HERE = Path(__file__).parent
 ROOT = Path(__file__).resolve().parents[2]
 WEB = ROOT / "cronstable" / "web"
+
+# The one module-scope cronstable import: a stdlib-only leaf resolved from
+# the checkout itself, so --help keeps working with nothing installed and
+# the theme matrix follows the CLI's canonical hue list (a new hue cannot
+# ship without screenshots).
+sys.path.insert(0, str(ROOT))
+from cronstable._cliargs import THEME_HUES  # noqa: E402
 SHOTS = HERE / "shots"               # every target's output dir but showcase's
 REEL = HERE / "reel"                 # showcase frames for build_reel.py
 
@@ -1195,13 +1202,9 @@ def run_tui(shots_only):
 # ===================================================================
 #  target: showcase (still frames for the reel + theme row)
 # ===================================================================
-# the full theme matrix (5 hues x dark/paper); the overview is shot under all
-# ten to drive the theme-row loop, other scenes take a tasteful subset
-ALL_THEMES = [
-    "carolina", "amber", "green", "modern", "standard",
-    "carolina-light", "amber-light", "green-light",
-    "modern-light", "standard-light",
-]
+# the full theme matrix (every hue x dark/paper); the overview is shot under
+# all of them to drive the theme-row loop, other scenes take a tasteful subset
+ALL_THEMES = list(THEME_HUES) + [h + "-light" for h in THEME_HUES]
 
 # the hero reel stays in one theme throughout: the light carolina (paper)
 # look. Marquee scenes and the a11y beat are shot here in both fonts so the

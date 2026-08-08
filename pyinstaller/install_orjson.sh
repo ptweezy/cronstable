@@ -33,6 +33,8 @@ PIPUNINST="${PIPUNINST:-$PIP uninstall -y}"
 RUST_SETUP="${RUST_SETUP:-}"
 here=$(dirname "$0")
 
+# tests/test_extra_pins_parity.py checks the floor spelled below against
+# pyproject's speedups floor: bump them together.
 if $PIP install "orjson>=3.9"; then
     :  # a prebuilt wheel (or a toolchain already present) installed it
 elif [ -n "$RUST_SETUP" ] && sh -c "$RUST_SETUP" \

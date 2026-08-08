@@ -78,6 +78,18 @@ import uuid
 from collections.abc import Callable
 from typing import Any, Optional
 
+# The skew margin and unknown-holder sentinel are cross-backend contracts
+# shared via _common.  Here the margin is applied TWICE (the module
+# docstring's holder and challenger halves) and must stay under the
+# config-floored ttl (>= 3) so the leader window never collapses at the
+# minimum ttl.  The time helpers bind under this module's name, so the
+# tests' per-module monkeypatching keeps working.
+from cronstable.backends._common import (
+    _SKEW_SECONDS,
+    _UNKNOWN_HOLDER,
+    _monotonic,
+    _utcnow,
+)
 from cronstable.config import ClusterConfig, ConfigError, StateConfig
 
 # RebootRanUnknownError is re-exported here for compatibility: it was born in
@@ -89,14 +101,6 @@ from cronstable.state import FilesystemStateBackend, Lease
 
 logger = logging.getLogger("cronstable.backends.filesystem")
 
-# The clock budget applied TWICE (see the module docstring): the holder
-# self-demotes this early, and a challenger waits this long past the
-# observed expiry, so leadership only overlaps when inter-host skew
-# exceeds their sum.  Matches etcd's margin, and stays under the
-# config-floored ttl (3s) so the leader window never collapses at the
-# minimum ttl.
-_SKEW_SECONDS = 1.0
-
 # Kept in sync with config.py's cluster.filesystem.ttl floor (>= 3).
 _MIN_USABLE_TTL = 3
 
@@ -105,13 +109,6 @@ _MIN_USABLE_TTL = 3
 # refresh/append); the per-op timeout is sized off this so a whole round
 # fits its deadline even when every op is slow.
 _OPS_PER_CYCLE = 4
-
-# Reported as the holder's display name when a lease exists but its holder
-# string is empty/unparseable.  Reporting a non-None holder keeps
-# leader_name() non-None so a quorate follower defers its PreferLeader
-# jobs instead of reading "holder unknown" as "run anyway" (see
-# LeadershipBackend.is_available_leader).
-_UNKNOWN_HOLDER = "<unknown holder>"
 
 # Stream (inside the embedded store) holding the @reboot-ran records, and
 # the newest-N bound both the reader and the pruner use.
@@ -133,25 +130,6 @@ _REBOOT_RAN_KEEP = 512
 # store (see _maintain_reboot_ran).  The same period also rate-limits
 # the leader's "deferring one-shots" WARNING.
 _REBOOT_RAN_REFRESH = 60.0
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def _monotonic() -> float:
-    """A monotonic clock for lease/quorum *deadlines*.
-
-    Lease fences must never be judged on the wall clock: a backward NTP/VM
-    step would keep ``is_leader`` true past the lease's real expiry (a
-    second node has by then taken it over); a forward step would expire
-    quorum early.  ``time.monotonic`` cannot jump, so deadlines anchored
-    to it stay correct across any wall-clock correction.  The wall clock
-    is used only for the human-readable expiry in the dashboard and for
-    the challenger-side takeover margin (which is exactly the cross-host
-    comparison the margins exist to bound).
-    """
-    return time.monotonic()
 
 
 def _wallclock() -> float:

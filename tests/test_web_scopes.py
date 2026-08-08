@@ -30,6 +30,7 @@ from cronstable.cron import (
     _required_web_scope,
     _WebToken,
 )
+from tests._configs import DISABLED_JOB as _DISABLED_JOB
 
 # --------------------------------------------------------------------------
 # fake request plumbing for the middleware unit tests
@@ -423,14 +424,6 @@ def test_resolve_tokens_two_scoped_duplicates_refused():
 # --------------------------------------------------------------------------
 # end-to-end over a real aiohttp app
 # --------------------------------------------------------------------------
-
-_DISABLED_JOB = """
-jobs:
-  - name: test
-    command: echo hi
-    schedule: "* * * * *"
-    enabled: false
-"""
 
 
 @pytest.mark.asyncio

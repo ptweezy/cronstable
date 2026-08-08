@@ -26,7 +26,7 @@ _DEP_JOB = (
     "    onlyIfLastSucceeded: true\n"
 )
 
-# canonical: tests/test_state_fleet_ha.py
+# the one home (test_state_fleet_ha.py imports it)
 _PLAIN_JOB = """
 jobs:
   - name: j
@@ -34,8 +34,8 @@ jobs:
     schedule: "0 0 * * *"
 """
 
-# canonical: tests/test_state_fleet_ha.py.  Near-miss variants stay local:
-# test_state_scheduler_durability.py's uses maximumRetries: 3, and
+# the one home (test_state_fleet_ha.py imports it).  Near-miss variants stay
+# local: test_state_scheduler_durability.py's uses maximumRetries: 3, and
 # test_ui_endpoints.py's is a different job (flaky / 'false' / "@reboot"
 # with initialDelay: 8).
 _RETRY_JOB = """
@@ -51,8 +51,8 @@ jobs:
         backoffMultiplier: 2
 """
 
-# canonical: tests/test_cron_web.py (byte-identical as _DISABLED_JOB in
-# test_web_scopes.py)
+# the one home (test_cron_web.py imports it; test_web_scopes.py imports it
+# as _DISABLED_JOB)
 DISABLED_JOB = """
 jobs:
   - name: test
@@ -61,7 +61,7 @@ jobs:
     enabled: false
 """
 
-# canonical: tests/_cron_helpers.py
+# the one home (tests/_cron_helpers.py re-exports it for the split files)
 _PAUSABLE_JOB = """
 jobs:
   - name: p

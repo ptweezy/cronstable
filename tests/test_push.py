@@ -428,8 +428,8 @@ async def test_file_store_write_failure_is_push_error(tmp_path):
 
 async def test_file_store_runs_on_a_private_daemon_thread(tmp_path):
     # Registry I/O used to ride loop.run_in_executor(None, ...): the same
-    # regression tests/test_state_lifecycle_hardening.py guards state
-    # against. The default pool is shared with the once-a-minute config
+    # regression the lifecycle-hardening tests in tests/test_state.py guard
+    # state against. The default pool is shared with the once-a-minute config
     # reload and its workers are non-daemonic, so an op abandoned on a
     # wedged mount retired one worker per attempt until the reload had no
     # thread to run on, and interpreter exit hung joining them.

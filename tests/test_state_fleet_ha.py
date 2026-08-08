@@ -29,6 +29,7 @@ from cronstable.cron import Cron
 from cronstable.fingerprint import job_digest
 from cronstable.job import JobRetryState
 from tests._commands import cmd_print, cmd_sleep, yaml_command
+from tests._configs import _PLAIN_JOB, _RETRY_JOB
 from tests._helpers import _newest, _wait_until
 from tests.test_state import (
     _count_launcher,
@@ -86,19 +87,6 @@ jobs:
 """
 )
 
-_RETRY_JOB = """
-jobs:
-  - name: j
-    command: ls
-    schedule: "0 0 * * *"
-    onFailure:
-      retry:
-        maximumRetries: 5
-        initialDelay: 1
-        maximumDelay: 60
-        backoffMultiplier: 2
-"""
-
 _RETRY_EVERYNODE = """
 jobs:
   - name: j
@@ -124,13 +112,6 @@ jobs:
         initialDelay: 1
         maximumDelay: 60
         backoffMultiplier: 2
-"""
-
-_PLAIN_JOB = """
-jobs:
-  - name: j
-    command: ls
-    schedule: "0 0 * * *"
 """
 
 _CATCHUP_JOB = """

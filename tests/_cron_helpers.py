@@ -6,13 +6,17 @@ freezes cronstable.cron.get_now at 1999-12-31 12:00:00 in every module
 that imports it.
 """
 
-import asyncio
 import datetime
 
 import pytest
 
 import cronstable.cron
 from tests._commands import cmd_print, cmd_sleep, yaml_command
+
+# Re-exported so the split files keep one import site for their shared
+# helpers; the definitions live in the canonical shared modules.
+from tests._configs import _PAUSABLE_JOB  # noqa: F401
+from tests._helpers import _wait_until  # noqa: F401
 
 
 async def _noop():
@@ -154,17 +158,6 @@ jobs:
 """
 
 
-async def _wait_until(pred, tries=300, interval=0.01):
-    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
-    # and do not flake under CI load. Bounded so a never-true predicate fails
-    # cleanly instead of hanging.
-    for _ in range(tries):
-        if pred():
-            return
-        await asyncio.sleep(interval)
-    raise AssertionError("condition not met within {} tries".format(tries))
-
-
 _SECONDS_JOB = """
 jobs:
   - name: sec
@@ -261,14 +254,6 @@ jobs:
   - name: added
     command: echo added
     schedule: "*/5 * * * *"
-"""
-
-
-_PAUSABLE_JOB = """
-jobs:
-  - name: p
-    command: echo hi
-    schedule: "* * * * *"
 """
 
 

@@ -5,7 +5,7 @@ on ``/jobs``, the ``unknown`` bucket in run stats, the enriched ``/dags``
 summary, the DAG XCom read, and the metadata-only state inspector
 (``/state``, ``/state/documents``, ``/state/records``) with its redaction and
 guards.  Handlers are called directly with a small mock request, the same
-style as the existing ``test_cron.py`` web tests; the state/dag cases spin a
+style as the ``test_cron_web.py`` web tests; the state/dag cases spin a
 real :class:`~cronstable.state.FilesystemStateBackend` in a temp dir like
 ``test_state_dag_run.py``.
 """
@@ -30,17 +30,10 @@ from cronstable.cron import (
 from cronstable.job import JobOutputStream, JobRetryState
 from cronstable.resources import ResourceUsage
 from cronstable.state import Lease
+from tests._helpers import _state_cfg
+from tests.conftest import Req, _cron
 
 _UTC = datetime.timezone.utc
-
-
-class Req:
-    """A minimal stand-in for an aiohttp request."""
-
-    def __init__(self, query=None, match=None, headers=None):
-        self.query = query or {}
-        self.match_info = match or {}
-        self.headers = headers or {}
 
 
 def _run(outcome, *, dur=1.0, exit_code=0):
@@ -99,12 +92,6 @@ jobs:
         maximumDelay: 60
         backoffMultiplier: 2
 """
-
-
-def _cron(yaml):
-    cron = Cron(None, config_yaml=yaml)
-    cron.web_config = {}
-    return cron
 
 
 def test_job_to_dict_no_phantom_retry_when_unarmed():
@@ -204,10 +191,6 @@ dags:
 """
 
 
-def _state_cfg(yaml):
-    from cronstable.config import parse_config_string
-
-    return parse_config_string(yaml, "").state_config
 
 
 async def _make_cron(tmp_path, dags_yaml):

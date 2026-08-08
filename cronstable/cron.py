@@ -972,14 +972,15 @@ def build_gc_keep_set(
 
 def _parse_retry_record(
     rec: dict[str, Any],
-) -> tuple[int, datetime.datetime, datetime.datetime] | None:
-    """Parse ``(attempt, notBefore, armed_at)`` out of a ladder record.
+) -> tuple[int, datetime.datetime] | None:
+    """Parse ``(attempt, notBefore)`` out of a ladder record.
 
     ``None`` for unparseable content; the caller decides whether that
     settles the ladder (rehydration) or merely declines it (the
-    cross-node claim scan). A handoff carries the original arm time in
-    ``armedAt``; a pending's own ``at`` IS its arm time (a handoff's
-    ``at`` is the hand-off instant, which would hide a completed run).
+    cross-node claim scan). The arm time stays out of the tuple:
+    :func:`_retry_armed_at` parses it on first use, after the caller's
+    cheap decline gates, because the once-a-minute claim scan declines
+    most records (foreign or stale ladders) before ever needing it.
     """
     attempt = rec.get("attempt")
     not_before = _parse_iso_utc(rec.get("notBefore"))
@@ -990,12 +991,24 @@ def _parse_retry_record(
         or not_before is None
     ):
         return None
-    armed_at = (
+    return attempt, not_before
+
+
+def _retry_armed_at(
+    rec: dict[str, Any], not_before: datetime.datetime
+) -> datetime.datetime:
+    """The arm time of a ladder record ``_parse_retry_record`` accepted.
+
+    A handoff carries the original arm time in ``armedAt``; a pending's
+    own ``at`` IS its arm time (a handoff's ``at`` is the hand-off
+    instant, which would hide a completed run). Falls back to
+    ``notBefore`` when the record spells neither.
+    """
+    return (
         _parse_iso_utc(rec.get("armedAt"))
         or _parse_iso_utc(rec.get("at"))
         or not_before
     )
-    return attempt, not_before, armed_at
 
 
 def _job_run_info_from_dict(
@@ -10944,7 +10957,7 @@ class Cron:
         if parsed is None:
             self._persist_retry_settled(name, "invalid-record")
             return None
-        attempt, not_before, armed_at = parsed
+        attempt, not_before = parsed
         rec_digest = rec.get("jobDigest")
         if not retry["maximumRetries"] or rec_digest != job_digest_cached(job):
             # retries disabled since arming, or any behaviour-affecting
@@ -10952,6 +10965,7 @@ class Cron:
             # (nor lurk until a later config revert).
             self._persist_retry_settled(name, "config-changed", attempt)
             return None
+        armed_at = _retry_armed_at(rec, not_before)
         # the newest ACTUAL run, not last_run: a pause-held slot's
         # "skipped" row would settle every ladder the pause is only
         # holding, while a real run buried under a later pause must
@@ -12264,7 +12278,7 @@ class Cron:
         parsed = _parse_retry_record(rec)
         if parsed is None:
             return None
-        attempt, not_before, armed_at = parsed
+        attempt, not_before = parsed
         if rec.get("jobDigest") != job_digest_cached(job):
             return None
         retry = job.onFailure["retry"]
@@ -12275,6 +12289,7 @@ class Cron:
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
             return None
+        armed_at = _retry_armed_at(rec, not_before)
         # the newest ACTUAL run (see _validate_pending_retry): a pause-held
         # slot's "skipped" row is not evidence anything ran.
         last_at = self._last_completed_at.get(name)
