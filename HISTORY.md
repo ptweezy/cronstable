@@ -375,8 +375,11 @@ project, on which cronstable is based.
   things still wait on upstream wheels: orjson publishes none for 3.15, so
   the optional `speedups` extra leaves it out there and JSON falls back to
   the standard library, and aiohttp publishes none for `win_arm64`, so
-  Windows on ARM64 stays on 3.14. Nothing changes for 3.10 through 3.14,
-  and the released binaries and Docker images are still built on 3.14.
+  Windows on ARM64 stays on 3.14. Nothing changes for 3.10 through 3.14.
+  The standalone binaries are built on 3.15 across all five lanes (Linux
+  glibc and musl, macOS, Windows). Those lanes exercise 3.15 without any
+  wheels available, since aiohttp, zeroconf and uvloop all compile from
+  source there. The Docker images are still built on 3.14.
 
 ## 1.2.36 (2026-08-03)
 
