@@ -548,11 +548,20 @@ async def _seed_pending_armed_at(cron, name, attempt, not_before, at):
 
 
 async def _hold_slots(cron, name, count):
-    """Pause the job and drive `count` scheduled fires into the pause gate."""
+    """Pause the job and drive `count` scheduled fires into the pause gate.
+
+    Drains after every fire, not once at the end: a 50-slot burst leaves
+    the tail append queued behind the whole batch, and on a slow CI disk
+    its STATE_OP_TIMEOUT budget (which covers queue wait) can expire.
+    That shed is counted, legitimate product behavior, but it breaks the
+    exact-count preconditions the ladder tests assert (54 == 55 on the
+    windows-3.11 row). Per-fire draining keeps each append's budget
+    covering only its own IO.
+    """
     await cron.pause_job_by_name(name, duration=7200)
     for _ in range(count):
         await cron.launch_scheduled_job(cron.cron_jobs[name])
-    await _drain_state_writes(cron)
+        await _drain_state_writes(cron)
 
 
 async def test_pause_skip_row_is_absent_from_the_run_watermark(stateful_cron):
