@@ -31,7 +31,6 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from cronstable import _cliargs
 
 # The env vars the daemon injects (see cronstable.jobapi); the job CLI is the
 # consumer.  Hardcoded here rather than imported so the CLI never pulls aiohttp
@@ -65,14 +64,6 @@ EXIT_ERROR = 1
 EXIT_NOT_ACQUIRED = 3
 EXIT_NOT_FOUND = 4
 EXIT_DUPLICATE = 5
-
-# Every job-facing action name, so __main__ can tell a `state get` (this
-# module) from a `state backup` (cronstable.state_admin) without guessing.
-# Owned by cronstable._cliargs (the stdlib-only argparse leaf, so __main__
-# reads it without importing this module's urllib/ssl graph); re-exported
-# here under its original name.
-STATE_JOB_ACTIONS = _cliargs.STATE_JOB_ACTIONS
-
 
 class _CliError(Exception):
     """A user-facing failure: printed to stderr, exits non-zero."""
@@ -655,18 +646,6 @@ def _cmd_lock(args: argparse.Namespace) -> int:
                 except _CliError:
                     pass
     raise _CliError("unknown lock action {!r}".format(args.lock_command))
-
-
-# --------------------------------------------------------------------------
-# argparse wiring (called by cronstable.__main__)
-# --------------------------------------------------------------------------
-
-# The parser definitions live in cronstable._cliargs, a stdlib-only leaf, so
-# __main__ registers these verbs on every invocation without importing this
-# module (and its urllib.request/ssl/email graph, ~27ms) until one of them is
-# actually dispatched.  Re-exported here under their original public names.
-add_state_job_actions = _cliargs.add_state_job_actions
-add_job_commands = _cliargs.add_job_commands
 
 
 _DISPATCH = {

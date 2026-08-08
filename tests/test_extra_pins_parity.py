@@ -2,12 +2,12 @@
 
 The runtime extras (speedups, push, discovery, kubernetes) have one
 canonical floor each, declared in ``[project.optional-dependencies]``.  The
-release workflow's binary lanes and the Dockerfiles install those packages
-by hand, spelling the floor out again at every site.  Nothing tied the
-copies together: bump the floor in pyproject and every lane keeps building
-against the old one, silently, until an API mismatch surfaces in a shipped
-artifact.  This walks every hand-spelled ``pkg>=floor`` pin in the workflow
-and the Dockerfiles and demands it equal pyproject's.
+release workflow's binary lanes, the Dockerfiles and the pyinstaller helper
+scripts install those packages by hand, spelling the floor out again at
+every site.  Nothing tied the copies together: bump the floor in pyproject
+and every lane keeps building against the old one, silently, until an API
+mismatch surfaces in a shipped artifact.  This walks every hand-spelled
+``pkg>=floor`` pin in those files and demands it equal pyproject's.
 """
 
 import glob
@@ -22,7 +22,11 @@ requirements = pytest.importorskip("packaging.requirements")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: the files that hand-install optional extras outside pip's resolver
-_SCANNED = [".github/workflows/release.yml", "Dockerfile"] + sorted(
+_SCANNED = [
+    ".github/workflows/release.yml",
+    "Dockerfile",
+    "pyinstaller/install_orjson.sh",
+] + sorted(
     os.path.relpath(p, ROOT).replace(os.sep, "/")
     for p in glob.glob(os.path.join(ROOT, "docker", "Dockerfile.*"))
 )

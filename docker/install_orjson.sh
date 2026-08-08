@@ -35,11 +35,15 @@
 # This is the container sibling of pyinstaller/install_orjson.sh, which does
 # the same job for the binary lanes. The two stay separate scripts on purpose:
 #   - the requirement is an argument here (see above); the pyinstaller script
-#     hardcodes it because the binary lanes carry no per-file pin to protect.
+#     hardcodes it, and tests/test_extra_pins_parity.py checks both spellings
+#     against pyproject's canonical speedups floor.
 #   - verification is inline here; the pyinstaller script delegates to its
 #     sibling verify_extra.py, which the image builds do not COPY (the builder
 #     layers above the source COPY read only pyproject.toml and the docker/
-#     helper scripts).
+#     helper scripts). The inline probe round-trips the same sample as
+#     verify_extra.py's _verify_orjson (compact bytes, OPT_SORT_KEYS,
+#     non-ASCII: the case a QEMU-miscompiled build typically fails); keep
+#     the two probes in step.
 #   - paths are fixed: all eight builder stages install into /opt/venv, so the
 #     PIP/PY indirection the binary lanes need (uv vs pip) has no use here,
 #     and the image pip flags (--no-cache-dir, the 120s wheel / 300s
@@ -51,8 +55,10 @@ set -u
 spec="${1:?usage: install_orjson.sh \"orjson>=X.Y\"}"
 pip=/opt/venv/bin/pip
 
+# The \u escapes spell verify_extra.py's non-ASCII sample while keeping this
+# file ASCII, so no build-stage locale can mangle the argv bytes.
 orjson_ok() {
-    /opt/venv/bin/python -c 'import orjson,sys; s={"v":1,"a":[1,2.5,True,None],"z":"x"}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'
+    /opt/venv/bin/python -c 'import orjson,sys; s={"schemaVersion":"v1","z":1,"a":"caf\u00e9 \u2603 \u65e5\u672c","n":[1,2.5,True,None]}; b=orjson.dumps(s,option=orjson.OPT_SORT_KEYS); sys.exit(0 if isinstance(b,bytes) and orjson.loads(b)==s else 1)'
 }
 
 # The /opt/cargo PATH entry and the two HOME vars serve the rustup callers;

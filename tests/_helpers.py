@@ -30,8 +30,8 @@ TLS_NOW = datetime.datetime(2026, 1, 1, tzinfo=_UTC)
 
 
 # --- config parsing shims ---------------------------------------------------
-# canonical: tests/test_state.py (same 2-line body in test_state_dag_run.py,
-# test_state_lifecycle_hardening.py, test_ui_endpoints.py and others)
+# canonical: tests/test_state.py (same 2-line body in test_state_dag_run.py
+# and others; test_ui_endpoints.py imports this one)
 
 
 def _state_cfg(yaml):
@@ -39,10 +39,9 @@ def _state_cfg(yaml):
 
 
 # --- the filesystem state-backend factory -----------------------------------
-# canonical: tests/test_state.py (the copies in test_state_hardening.py,
-# test_state_lifecycle_hardening.py and test_perf_invariants.py are the same
-# construction, one of them literally commented "mirrors tests/test_state.py";
-# test_backend_filesystem.py's variant with node/jsid parameters stays local).
+# canonical: tests/test_state.py (test_perf_invariants.py keeps the same
+# construction; test_backend_filesystem.py's variant with node/jsid
+# parameters stays local).
 
 
 def _backend(tmp_path, **over):
@@ -75,9 +74,11 @@ async def _wait_until(
     one final ``pred()`` so a boundary-true predicate still reads True.
 
     Source variants and how to reproduce them:
-    - test_cluster.py / test_prometheus.py / tests/_cron_helpers.py:
-      the defaults (tries=300, interval=0.01, raising).
-    - test_state_lifecycle_hardening.py: tries=1000 (raising).
+    - test_cluster.py / test_prometheus.py: the defaults (tries=300,
+      interval=0.01, raising).  tests/_cron_helpers.py re-exports this
+      helper for the test_cron_* split files.
+    - test_state.py's merged lifecycle-hardening tests: tries=1000
+      (raising).
     - test_state.py (``timeout=3.0`` = 300 x 0.01): defaults with
       raise_on_timeout=False (it returned a final predicate() check).
     - test_state_fleet_ha.py: interval=0.05, raise_on_timeout=False (it

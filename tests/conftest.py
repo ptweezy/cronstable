@@ -35,21 +35,27 @@ from tests._helpers import (
 class Req:
     """A minimal stand-in for an aiohttp request.
 
-    Canonical copy of tests/test_ui_endpoints.py's ``Req`` (the shape the
-    former test_cron.py re-declared 42x, finding B6).
+    The shape the former test_cron.py re-declared 42x (finding B6); the
+    handler tests build one per direct handler call.  ``body`` (a
+    JSON-ready object) arms ``can_read_body`` and ``json()`` for the
+    POST-handler tests; without it the request carries no body.
     """
 
-    def __init__(self, query=None, match=None, headers=None):
+    def __init__(self, query=None, match=None, headers=None, body=None):
         self.query = query or {}
         self.match_info = match or {}
         self.headers = headers or {}
+        self.can_read_body = body is not None
+        self._body = body
+
+    async def json(self):
+        return self._body
 
 
 def _cron(yaml):
-    # canonical copy of tests/test_ui_endpoints.py's _cron: a Cron parsed
-    # from YAML with the web surface enabled (cron.web_config = {} is what
-    # the direct-handler-call tests need, declared 44x in the former
-    # test_cron.py, finding B6).
+    # a Cron parsed from YAML with the web surface enabled
+    # (cron.web_config = {} is what the direct-handler-call tests need,
+    # declared 44x in the former test_cron.py, finding B6).
     from cronstable.cron import Cron
 
     cron = Cron(None, config_yaml=yaml)
@@ -188,15 +194,13 @@ class JobApiHarness:
 
 
 @pytest.fixture
-async def job_api(tmp_path):
+async def job_api(fs_backend):
     import aiohttp
 
     from cronstable.jobapi import JobStateAPI, RunContext
 
-    backend = _backend(tmp_path)
-    await backend.start()
     api = JobStateAPI(
-        lambda: backend,
+        lambda: fs_backend,
         base_holder="h#proc",
         config={
             "maxValueBytes": 0,
@@ -222,11 +226,10 @@ async def job_api(tmp_path):
         headers={"Authorization": "Bearer tok"}
     )
     try:
-        yield JobApiHarness(api, backend, session, ctx)
+        yield JobApiHarness(api, fs_backend, session, ctx)
     finally:
         await session.close()
         await api.stop()
-        await backend.stop()
 
 
 # --- CLI runner (finding B12) ------------------------------------------------

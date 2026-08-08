@@ -1,6 +1,6 @@
 """Stitch the showcase stills into the README's animated loops.
 
-Reads the frames `capture_showcase.py` dropped in ./reel/ and assembles two
+Reads the frames `capture.py showcase` dropped in ./reel/ and assembles two
 seamless loops:
 
 * `dashboard-reel.webp`  -- the hero tour, in ONE consistent style throughout

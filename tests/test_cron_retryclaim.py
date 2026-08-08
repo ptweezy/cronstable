@@ -19,7 +19,7 @@ from tests._cron_helpers import (
     fixed_current_time,  # noqa: F401
 )
 from tests._helpers import _drain_state_writes
-from tests.conftest import _cron
+from tests.conftest import Req, _cron
 
 # ===================================================================
 # Job start/pause/resume, SLA, and the cross-node retry claim machinery
@@ -271,17 +271,10 @@ async def test_retryclaim_web_resume_job_rejects_nonstring_by():
 
     cron = _cron(TWO_JOBS)
 
-    # stays local (finding B6): the shared tests.conftest.Req carries no
-    # request body, and this handler reads can_read_body + json().
-    class Req:
-        can_read_body = True
-        match_info = {"name": "alpha"}
-
-        async def json(self):
-            return {"by": 123}
-
     with pytest.raises(web.HTTPBadRequest):
-        await cron._web_resume_job(Req())
+        await cron._web_resume_job(
+            Req(match={"name": "alpha"}, body={"by": 123})
+        )
 
 
 # --- schedule_retry_job gate/pause returns --------------------------------
