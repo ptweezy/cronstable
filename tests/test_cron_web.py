@@ -1636,6 +1636,27 @@ async def test_web_json_endpoints_tolerate_operator_content_type(
                 assert resp.content_type == ctype, path
 
 
+def test_error_envelope_middleware_carries_the_new_style_marker():
+    # An UNMARKED middleware is not refused: aiohttp reads it as a pre-3.0
+    # middleware FACTORY, calls it as m(app, handler), and every request 500s
+    # behind nothing louder than a DeprecationWarning. cron.py sets the marker
+    # by assignment at module scope rather than with @web.middleware, because
+    # the decorator would read an attribute off the lazy aiohttp door and
+    # import the whole web stack at import time. This pins the assignment to
+    # whatever aiohttp's own decorator does, so an aiohttp release that moves
+    # the marker cannot silently demote the envelope to a factory.
+    from aiohttp import web
+
+    async def probe(request, handler):  # pragma: no cover - never called
+        raise AssertionError("probe middleware must not run")
+
+    marked = web.middleware(probe)
+    assert (
+        cronstable.cron._error_envelope_middleware.__middleware_version__
+        == marked.__middleware_version__
+    )
+
+
 @pytest.mark.asyncio
 async def test_web_errors_carry_the_json_envelope(start_web_app):
     # every error body is one JSON envelope, including the three families

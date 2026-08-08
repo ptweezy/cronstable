@@ -996,6 +996,56 @@ def test_fs_safe_is_injective_and_portable():
     assert _fs_safe("") == "_"
 
 
+def test_decode_fs_token_inverts_fs_safe_including_every_escape_hatch():
+    # _decode_fs_token has a fast path that hands an all-_FS_SAFE token back
+    # unchanged, which is only sound because _fs_safe would re-emit such a
+    # name verbatim. _fs_safe has three escape hatches that break that, and
+    # the fast path spends one guard on each; with no coverage a guard can be
+    # deleted with the whole suite green, and the function then returns names
+    # the encoder cannot have produced. state_admin's GC keep-set re-encodes
+    # every decoded name, so such a name reads an absent directory and the
+    # live state behind it is collected as garbage.
+    #
+    # One case per hatch, asserted against _fs_safe rather than a literal, so
+    # the test follows the encoder if its spelling ever changes.
+    for hatch, name in [
+        ("empty name", ""),
+        ("reserved device", "con"),
+        ("over length", "a" * (state._FS_SAFE_MAX + 1)),
+    ]:
+        assert _fs_safe(name) != name, hatch  # the hatch really did rewrite it
+        # the RAW name is not a token the encoder can emit, so decoding it
+        # must refuse rather than hand it straight back.
+        assert state._decode_fs_token(name) is None, hatch
+
+    # a truncated token is unrecoverable by design (its tail became a digest),
+    # so even the encoder's own output is refused for the over-length case.
+    assert (
+        state._decode_fs_token(_fs_safe("a" * (state._FS_SAFE_MAX + 1)))
+        is None
+    )
+
+    # everything else round-trips exactly, escaped or not.
+    for name in [
+        "plain-name_1",
+        "manual-9f2c1ab4",
+        "runs/nightly-backup",
+        "2026-08-07T12:00:00+00:00",
+        "Backup",
+        "a/b c",
+        chr(0xDCFF),  # lone surrogate, as os.fsdecode can produce
+        "n" + chr(0x00EF) + "code",
+        "con-x",
+        "a" * state._FS_SAFE_MAX,
+    ]:
+        assert state._decode_fs_token(_fs_safe(name)) == name, name
+
+    # a token the encoder cannot have produced is refused, never mangled:
+    # lowercase-hex aliases and foreign filenames re-encode differently.
+    assert state._decode_fs_token("%2f") is None  # the encoder emits %2F
+    assert state._decode_fs_token("Backup") is None  # uppercase is escaped
+
+
 def test_fs_safe_case_insensitive_injectivity():
     # NTFS/APFS resolve names case-insensitively: two jobs differing only by
     # case must not share one on-disk stream (merged ledgers -> wrong
