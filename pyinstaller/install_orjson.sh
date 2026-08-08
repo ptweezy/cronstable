@@ -11,7 +11,7 @@
 # RUST_SETUP installs a CURRENT stable Rust via rustup into /opt/cargo +
 # /opt/rustup -- the distro rustc packages are often older than orjson's MSRV
 # (Debian's riscv64 rustc is 1.85; orjson 3.11 needs 1.95). A source build
-# (especially under QEMU) can import yet be miscompiled, so verify_orjson.py
+# (especially under QEMU) can import yet be miscompiled, so verify_extra.py
 # round-trips the result and this script uninstalls it on failure: a broken
 # orjson is never shipped, and the fallback is byte-compatible anyway.
 #
@@ -45,7 +45,7 @@ fi
 
 # Prove it actually round-trips -- a miscompiled source build can import yet be
 # broken -- and drop it if not, so only a known-good orjson is ever shipped.
-if $PY "$here/verify_orjson.py"; then
+if $PY "$here/verify_extra.py" orjson; then
     :
 else
     echo "orjson: verification failed; uninstalling, using stdlib json"

@@ -11,7 +11,8 @@ stdout.  Tool logic lives in exactly one place (the daemon, :mod:`cronstable.\
 mcp`).
 
 Like the other job-facing subcommands (:mod:`cronstable.jobcli`) it imports
-**only the standard library** -- never aiohttp, strictyaml, or the ``Cron``
+**only the standard library** plus :mod:`cronstable._cliargs` (the
+stdlib-only argparse leaf) -- never aiohttp, strictyaml, or the ``Cron``
 graph -- so it starts instantly and stays out of the daemon's import cost.  It
 therefore requires a REACHABLE running daemon; that is the right model for an
 ops tool (there is nothing to serve without one).
@@ -39,31 +40,31 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
+
+from cronstable import _cliargs
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     # ssl is imported inside the two functions that name it at runtime, so the
     # module-level import block stays exactly what the header promises.
     import ssl
 
-# Hardcoded, NOT imported from cronstable.mcp: importing that module would pull
-# aiohttp and the daemon graph into this featherweight CLI. This is only the
-# wire default sent before initialize completes; the real negotiated version is
-# learned from the initialize reply and used thereafter.
-DEFAULT_PROTOCOL_VERSION = "2025-11-25"
-DEFAULT_URL = "http://127.0.0.1:8080"
-DEFAULT_TIMEOUT = 30.0
-# The env var cronstable's own docs use for the web bearer token; consulted as
-# a convenience when neither --token nor --token-env is given.
-ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
-# The env fallbacks for the client TLS flags. Every cronstable client that
-# speaks to a web listener uses these same four names, so one exported set
-# covers them all; they are the web-listener counterparts of the
-# CRONSTABLE_STATE_* variables the daemon injects into a job.
-ENV_CACERT = "CRONSTABLE_WEB_CACERT"
-ENV_CLIENT_CERT = "CRONSTABLE_WEB_CLIENT_CERT"
-ENV_CLIENT_KEY = "CRONSTABLE_WEB_CLIENT_KEY"
-ENV_INSECURE = "CRONSTABLE_WEB_INSECURE"
+# Owned by cronstable._cliargs (which registers the `mcp` subcommand for
+# __main__ without importing this module); re-exported here under their
+# original names.  DEFAULT_PROTOCOL_VERSION is only the wire default sent
+# before initialize completes; the real negotiated version is learned from
+# the initialize reply and used thereafter.  ENV_TOKEN is the env var
+# cronstable's own docs use for the web bearer token, consulted as a
+# convenience when neither --token nor --token-env is given, and the other
+# ENV_* names are the env fallbacks for the client TLS flags.
+DEFAULT_PROTOCOL_VERSION = _cliargs.MCP_DEFAULT_PROTOCOL_VERSION
+DEFAULT_URL = _cliargs.WEB_DEFAULT_URL
+DEFAULT_TIMEOUT = _cliargs.MCP_DEFAULT_TIMEOUT
+ENV_TOKEN = _cliargs.WEB_ENV_TOKEN
+ENV_CACERT = _cliargs.WEB_ENV_CACERT
+ENV_CLIENT_CERT = _cliargs.WEB_ENV_CLIENT_CERT
+ENV_CLIENT_KEY = _cliargs.WEB_ENV_CLIENT_KEY
+ENV_INSECURE = _cliargs.WEB_ENV_INSECURE
 
 # JSON-RPC codes used when the bridge itself must synthesize an error reply.
 _PARSE_ERROR = -32700
@@ -176,7 +177,7 @@ def _post(
     protocol_version: str,
     timeout: float,
     opener: Any = None,
-) -> Tuple[int, bytes]:
+) -> tuple[int, bytes]:
     """POST one JSON-RPC frame to ``<url>/mcp``; return ``(status, body)``.
 
     ``opener`` trails the original signature and defaults to ``None`` so a
@@ -262,7 +263,7 @@ def _utf8_stream(stream: Any) -> Any:
     return stream
 
 
-def _bridge_stdio() -> Tuple[Any, Any]:
+def _bridge_stdio() -> tuple[Any, Any]:
     """The bridge's (stdin, stdout) as UTF-8 text streams.
 
     Resolved once at bridge start and used only by the frame loop, so help
@@ -478,90 +479,10 @@ def _check(args: argparse.Namespace) -> int:
     return 0
 
 
-def add_mcp_command(sub: Any) -> None:
-    """Register the ``cronstable mcp`` subcommand on the subparsers."""
-    parser = sub.add_parser(
-        "mcp",
-        help="run the MCP stdio bridge to a running daemon's /mcp endpoint "
-        "(for desktop MCP clients)",
-    )
-    parser.add_argument(
-        "--url",
-        default=DEFAULT_URL,
-        metavar="URL",
-        help="daemon web base URL serving /mcp (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        metavar="TOKEN",
-        help="web.authToken bearer value (prefer --token-env to keep it out "
-        "of the process table)",
-    )
-    parser.add_argument(
-        "--token-env",
-        default=None,
-        metavar="VAR",
-        help="env var holding the bearer token (default: {} if set)".format(
-            ENV_TOKEN
-        ),
-    )
-    parser.add_argument(
-        "--cacert",
-        default=None,
-        metavar="PATH",
-        help="verify the listener against this CA file instead of the system "
-        "trust store, for an internally-issued or self-signed certificate "
-        "(default: {} if set)".format(ENV_CACERT),
-    )
-    parser.add_argument(
-        "--client-cert",
-        default=None,
-        metavar="PATH",
-        help="client certificate to present to a listener configured with "
-        "web.tls.clientCa, which requires one (default: {} if set)".format(
-            ENV_CLIENT_CERT
-        ),
-    )
-    parser.add_argument(
-        "--client-key",
-        default=None,
-        metavar="PATH",
-        help="private key for --client-cert (default: {} if set)".format(
-            ENV_CLIENT_KEY
-        ),
-    )
-    parser.add_argument(
-        "--insecure",
-        default=False,
-        action="store_true",
-        help="skip TLS verification entirely; the bearer token is still sent, "
-        "so it goes to whoever answers (set {}=1 for the same)".format(
-            ENV_INSECURE
-        ),
-    )
-    parser.add_argument(
-        "--protocol-version",
-        default=None,
-        metavar="REV",
-        help="pin the MCP-Protocol-Version sent before initialize "
-        "(default: {})".format(DEFAULT_PROTOCOL_VERSION),
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=DEFAULT_TIMEOUT,
-        metavar="SECONDS",
-        help="per-request deadline (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--check",
-        dest="mcp_check",
-        default=False,
-        action="store_true",
-        help="handshake the endpoint (initialize + tools/list) and exit, "
-        "instead of proxying stdin",
-    )
+# The `cronstable mcp` parser definition lives in cronstable._cliargs so
+# __main__ registers the subcommand without importing this module until the
+# bridge is actually dispatched; re-exported under its original name.
+add_mcp_command = _cliargs.add_mcp_command
 
 
 def dispatch(args: argparse.Namespace) -> int:

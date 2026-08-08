@@ -68,32 +68,12 @@ broken and is later corrected is also re-applied on reload without a restart
 
 ### Binary aborts at startup: "Could not create temporary directory" / "Operation not permitted"
 
-**Symptom.** The downloaded standalone binary aborts at startup with
-`Could not create temporary directory`, or
-`Error loading shared library …: Operation not permitted`.
-
-**Cause.** The standalone binary is a self-extracting PyInstaller executable: on each
-start it unpacks its embedded Python runtime into a temporary directory and loads
-shared libraries from there, so it needs a temp directory that is both **writable**
-and **executable**. Under a read-only root filesystem (a hardened container), `/tmp`
-is read-only too, and the unpack/exec fails. This requirement is unique to the
-standalone binary. The published container image and `pip`/`pipx` installs run
-cronstable as an ordinary Python package and never self-extract.
-
-**Fix.** Provide a small writable, executable temp mount. With Docker, note that
-`--tmpfs` defaults to `noexec`, so you must request `exec` explicitly:
-
-```shell
-docker run --rm --read-only \
-  --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
-  -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
-  your-image-with-the-binary -c /etc/cronstable.d
-```
-
-On Kubernetes mount an `emptyDir` at `/tmp` (writable and executable by default;
-`medium: Memory` for a tmpfs). Alternatively point the binary at any other writable,
-executable directory with `TMPDIR=/path`. See [Installation](Installation) and
-[Production and Container Deployment](Production-Deployment).
+The standalone binary self-extracts on each start and needs a temp directory
+that is both writable and executable; under a read-only root filesystem `/tmp`
+fails that test and startup aborts with one of the errors above. See the
+[standalone binary temp-directory requirement](Installation#standalone-binary-temp-directory-requirement)
+on the Installation page for the Docker `--tmpfs` `exec` recipe, Kubernetes
+`emptyDir` mount, and `TMPDIR` override.
 
 ## Per-job user/group switching
 

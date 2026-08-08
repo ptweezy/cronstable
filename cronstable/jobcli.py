@@ -29,7 +29,9 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
+
+from cronstable import _cliargs
 
 # The env vars the daemon injects (see cronstable.jobapi); the job CLI is the
 # consumer.  Hardcoded here rather than imported so the CLI never pulls aiohttp
@@ -66,7 +68,10 @@ EXIT_DUPLICATE = 5
 
 # Every job-facing action name, so __main__ can tell a `state get` (this
 # module) from a `state backup` (cronstable.state_admin) without guessing.
-STATE_JOB_ACTIONS = frozenset({"get", "set", "delete", "keys"})
+# Owned by cronstable._cliargs (the stdlib-only argparse leaf, so __main__
+# reads it without importing this module's urllib/ssl graph); re-exported
+# here under its original name.
+STATE_JOB_ACTIONS = _cliargs.STATE_JOB_ACTIONS
 
 
 class _CliError(Exception):
@@ -91,7 +96,7 @@ _DEFAULT_TIMEOUT = 30.0
 # --------------------------------------------------------------------------
 
 
-def _endpoint() -> Tuple[str, str]:
+def _endpoint() -> tuple[str, str]:
     url = os.environ.get(ENV_URL)
     token = os.environ.get(ENV_TOKEN)
     if not url or not token:
@@ -111,7 +116,7 @@ def _endpoint() -> Tuple[str, str]:
 # environment cannot change under a running CLI process.  Keyed by path rather
 # than held in a single slot so the cache can never hand back an opener built
 # for a DIFFERENT CA than the one the environment currently names.
-_TLS_OPENERS: Dict[str, urllib.request.OpenerDirector] = {}
+_TLS_OPENERS: dict[str, urllib.request.OpenerDirector] = {}
 
 
 def _opener() -> urllib.request.OpenerDirector:
@@ -158,11 +163,11 @@ def _http(
     method: str,
     path: str,
     *,
-    query: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
+    query: Optional[dict[str, Any]] = None,
+    json_body: Optional[dict[str, Any]] = None,
     data: Optional[bytes] = None,
     timeout: Optional[float] = None,
-) -> Tuple[int, Dict[str, str], bytes]:
+) -> tuple[int, dict[str, str], bytes]:
     """One request to the endpoint; return ``(status, headers, body)``.
 
     The single seam the whole CLI goes through, so a test monkeypatches this
@@ -239,7 +244,7 @@ def _http(
         ) from ex
 
 
-def _parse_body(body: bytes) -> Dict[str, Any]:
+def _parse_body(body: bytes) -> dict[str, Any]:
     """A response body as a dict, tolerating non-JSON.
 
     Error bodies are not always JSON: a daemon that restarted mid-run no
@@ -261,13 +266,13 @@ def _json(
     method: str,
     path: str,
     *,
-    query: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None,
+    query: Optional[dict[str, Any]] = None,
+    json_body: Optional[dict[str, Any]] = None,
     timeout: Optional[float] = None,
-) -> Tuple[int, Dict[str, Any]]:
+) -> tuple[int, dict[str, Any]]:
     # timeout is forwarded only when explicitly set: _http applies the
     # default itself, and test fakes of the _http seam predate the kwarg.
-    kwargs: Dict[str, Any] = {}
+    kwargs: dict[str, Any] = {}
     if timeout is not None:
         kwargs["timeout"] = timeout
     status, _headers, body = _http(
@@ -276,7 +281,7 @@ def _json(
     return status, _parse_body(body)
 
 
-def _ok(status: int, data: Dict[str, Any]) -> Dict[str, Any]:
+def _ok(status: int, data: dict[str, Any]) -> dict[str, Any]:
     """Return the body, or raise the endpoint's error for a 4xx/5xx."""
     if status >= 400:
         raise _CliError(
@@ -577,7 +582,7 @@ def _write_output(path: Optional[str], data: bytes) -> None:
         raise _CliError("cannot write {}: {}".format(path, ex)) from ex
 
 
-def _lock_acquire(args: argparse.Namespace) -> Tuple[bool, Optional[str]]:
+def _lock_acquire(args: argparse.Namespace) -> tuple[bool, Optional[str]]:
     scope = _scope_of(args)
     # a --wait long poll is server-bounded by blockSeconds: the client
     # deadline is that plus margin, so the server (not the socket) ends it.
@@ -656,212 +661,12 @@ def _cmd_lock(args: argparse.Namespace) -> int:
 # argparse wiring (called by cronstable.__main__)
 # --------------------------------------------------------------------------
 
-
-def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--scope",
-        metavar="NAME",
-        help="the namespace to act in (default: this job's own name)",
-    )
-    group.add_argument(
-        "--global",
-        dest="use_global",
-        action="store_true",
-        help="act in the shared `global` scope (cross-job coordination)",
-    )
-
-
-def add_state_job_actions(actions: Any) -> None:
-    """Add the job-facing KV actions to the existing `state` subparser.
-
-    Coexists with cronstable.state_admin's backup/restore/gc/... actions under
-    the same ``cronstable state`` command; the action name disambiguates.
-    """
-    get = actions.add_parser("get", help="print a durable KV value")
-    get.add_argument("key")
-    _add_scope_flags(get)
-
-    setp = actions.add_parser("set", help="set a durable KV value")
-    setp.add_argument("key")
-    setp.add_argument("value")
-    setp.add_argument(
-        "--json",
-        action="store_true",
-        help="parse VALUE as JSON instead of storing it as a string",
-    )
-    _add_scope_flags(setp)
-
-    delete = actions.add_parser("delete", help="delete a durable KV value")
-    delete.add_argument("key")
-    _add_scope_flags(delete)
-
-    keys = actions.add_parser("keys", help="list the keys in a scope")
-    _add_scope_flags(keys)
-
-
-def add_job_commands(sub: Any) -> None:
-    """Add the top-level `cursor|lock|artifact|idempotent|secret` commands."""
-    # cursor
-    cursor = sub.add_parser(
-        "cursor", help="read or advance a monotonic ETL cursor/watermark"
-    )
-    cursor_actions = cursor.add_subparsers(
-        dest="cursor_command", metavar="ACTION"
-    )
-    cget = cursor_actions.add_parser("get", help="print a cursor's value")
-    cget.add_argument("name")
-    _add_scope_flags(cget)
-    cadv = cursor_actions.add_parser(
-        "advance", help="advance a cursor (monotonic unless --force)"
-    )
-    cadv.add_argument("name")
-    cadv.add_argument("value")
-    cadv.add_argument(
-        "--force",
-        action="store_true",
-        help="set the value even if it moves the cursor backwards",
-    )
-    _add_scope_flags(cadv)
-
-    # lock
-    lock = sub.add_parser(
-        "lock", help="a fleet-wide distributed mutex or semaphore"
-    )
-    lock_actions = lock.add_subparsers(dest="lock_command", metavar="ACTION")
-    for verb, help_text in (
-        ("acquire", "take the lock; print its hold token"),
-        ("run", "hold the lock while running a command"),
-    ):
-        p = lock_actions.add_parser(verb, help=help_text)
-        p.add_argument("name")
-        p.add_argument(
-            "--permits",
-            type=int,
-            default=1,
-            help="semaphore capacity (default 1 = a mutex)",
-        )
-        p.add_argument(
-            "--wait",
-            action="store_true",
-            help="block until the lock is free (up to --timeout)",
-        )
-        p.add_argument(
-            "--timeout",
-            type=float,
-            default=0.0,
-            metavar="SECONDS",
-            help="how long --wait blocks before giving up",
-        )
-        p.add_argument(
-            "--ttl",
-            type=float,
-            default=None,
-            metavar="SECONDS",
-            help="lease TTL (default: state.jobApi.lockTtlSeconds)",
-        )
-        _add_scope_flags(p)
-        if verb == "run":
-            # NOT dest "command": the root subparsers already store the
-            # command name (state/lock/...) under args.command, and a same-
-            # named REMAINDER here would clobber it and misroute the whole
-            # invocation.
-            p.add_argument(
-                "run_command",
-                # The command after "--" is split off BEFORE argparse, in
-                # __main__.main_loop (portable across Python versions; see
-                # the note there -- argparse's own "--"/trailing handling is
-                # inconsistent before 3.13, and REMAINDER would swallow our
-                # own --wait/--timeout/--ttl). This positional only holds the
-                # default [] and a command given WITHOUT a "--" separator.
-                nargs="*",
-                metavar="command",
-                help="the command to run while holding the lock (after --)",
-            )
-    lrel = lock_actions.add_parser("release", help="release a held lock")
-    lrel.add_argument("token")
-
-    # artifact
-    artifact = sub.add_parser(
-        "artifact", help="publish or fetch a named artifact blob"
-    )
-    art_actions = artifact.add_subparsers(
-        dest="artifact_command", metavar="ACTION"
-    )
-    aput = art_actions.add_parser(
-        "put", help="publish an artifact (from FILE or stdin)"
-    )
-    aput.add_argument("name")
-    aput.add_argument("file", nargs="?", default=None)
-    _add_scope_flags(aput)
-    aget = art_actions.add_parser(
-        "get", help="fetch an artifact (to -o FILE or stdout)"
-    )
-    aget.add_argument("name")
-    aget.add_argument("-o", "--output", default=None, metavar="FILE")
-    _add_scope_flags(aget)
-    alist = art_actions.add_parser("list", help="list artifact names")
-    _add_scope_flags(alist)
-
-    # idempotent
-    idem = sub.add_parser(
-        "idempotent",
-        help="claim a key once fleet-wide (exit 0 fresh, 5 duplicate, "
-        "1 error)",
-    )
-    idem.add_argument("key")
-    idem.add_argument(
-        "--ttl",
-        type=float,
-        default=0.0,
-        metavar="SECONDS",
-        help="expire the claim after N seconds (0 = permanent)",
-    )
-    idem.add_argument(
-        "--release",
-        action="store_true",
-        help="drop the claim instead of making it",
-    )
-    _add_scope_flags(idem)
-
-    # xcom: cross-task data hand-off within a dag_run
-    xcom = sub.add_parser(
-        "xcom",
-        help="publish or read a DAG task output (XCom) within a dag_run",
-    )
-    xcom_actions = xcom.add_subparsers(dest="xcom_command", metavar="ACTION")
-    xpush = xcom_actions.add_parser(
-        "push", help="publish this task's output under a key (FILE or stdin)"
-    )
-    xpush.add_argument("--key", required=True, help="the XCom key to publish")
-    xpush.add_argument("file", nargs="?", default=None)
-    xpull = xcom_actions.add_parser(
-        "pull", help="read an upstream task's output by key"
-    )
-    xpull.add_argument(
-        "--task", required=True, metavar="TASK", help="the upstream task id"
-    )
-    xpull.add_argument("--key", required=True, help="the XCom key to read")
-    xpull.add_argument(
-        "--map-index",
-        type=int,
-        default=None,
-        metavar="I",
-        help="read a specific mapped instance of the upstream task",
-    )
-    xpull.add_argument("-o", "--output", default=None, metavar="FILE")
-    xcom_actions.add_parser("list", help="list XCom keys in this run")
-
-    # secret
-    secret = sub.add_parser(
-        "secret", help="read a run-scoped secret staged for this run"
-    )
-    secret_actions = secret.add_subparsers(
-        dest="secret_command", metavar="ACTION"
-    )
-    sget = secret_actions.add_parser("get", help="print a secret's value")
-    sget.add_argument("name")
-    secret_actions.add_parser("list", help="list staged secret names")
+# The parser definitions live in cronstable._cliargs, a stdlib-only leaf, so
+# __main__ registers these verbs on every invocation without importing this
+# module (and its urllib.request/ssl/email graph, ~27ms) until one of them is
+# actually dispatched.  Re-exported here under their original public names.
+add_state_job_actions = _cliargs.add_state_job_actions
+add_job_commands = _cliargs.add_job_commands
 
 
 _DISPATCH = {

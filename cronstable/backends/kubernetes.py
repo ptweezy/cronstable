@@ -40,47 +40,36 @@ import logging
 import os
 import ssl
 import tempfile
-import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Optional, TypeVar
 from urllib.parse import quote
 
 import aiohttp
 
 from cronstable.backends import TRANSPORT_LIBRARY, select_transport
+from cronstable.backends._common import (
+    _SKEW_SECONDS,
+    _UNKNOWN_HOLDER,
+    StoreLeaseBackend,
+    _file_signature,  # noqa: F401  (re-exported; backend tests import it)
+    _format_microtime,
+    _monotonic,
+    _parse_microtime,
+    _utcnow,
+    display_deadline,
+)
 from cronstable.config import ClusterConfig, ConfigError
 from cronstable.leadership import (
     REBOOT_RAN_KEY,
-    LeaseBackend,
     decode_reboot_ran,
 )
 
 logger = logging.getLogger("cronstable.backends.kubernetes")
 
 _T = TypeVar("_T")
-
-# How far in advance of the computed lease expiry a holder stops calling itself
-# leader, so a node whose clock runs slightly fast self-demotes *before* a peer
-# would be entitled to steal the lease -- erring is_leader toward False.
-_CLOCK_SKEW = datetime.timedelta(seconds=1)
-_SKEW_SECONDS = _CLOCK_SKEW.total_seconds()
-
-
-def _monotonic() -> float:
-    """A monotonic clock for the lease fence, steal anchor, and quorum window.
-
-    These must never ride the wall clock: a same-node forward step would make a
-    follower's ``observed_at + duration`` steal deadline fire early (stealing a
-    still-valid lease -> two leaders), and a backward step would keep a former
-    holder ``is_leader`` past expiry. ``time.monotonic`` cannot jump, so the
-    timing stays correct across any wall-clock correction (NTP, VM resume). The
-    wall clock is used only for the RFC3339 ``renewTime``/``acquireTime`` we
-    write and the human-readable expiry shown in the dashboard.
-    """
-    return time.monotonic()
-
 
 _API_GROUP = "coordination.k8s.io/v1"
 _SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
@@ -90,16 +79,6 @@ ACTION_CREATE = "create"  # no Lease exists -> create one with us as holder
 ACTION_ACQUIRE = "acquire"  # exists but free/expired -> take it over
 ACTION_RENEW = "renew"  # we already hold it -> refresh renewTime
 ACTION_WAIT = "wait"  # someone else holds a still-valid lease -> not us
-
-# Reported as the holder when we know another node won (we lost an optimistic-
-# concurrency write) but cannot name it -- a 409 on a CREATE (the Lease did not
-# exist when we planned, so we carry no observed holder) and we have no prior
-# observation to fall back to. Reporting a non-None holder keeps leader_name()
-# non-None so a quorate follower defers its PreferLeader jobs (is_available_
-# leader stays False) instead of reading "holder unknown" as "run anyway" and
-# double-running fleet-wide with NO partition. Mirrors etcd's _UNKNOWN_HOLDER.
-# See _apply_round's write_ok==False branch.
-_UNKNOWN_HOLDER = "<unknown holder>"
 
 
 def _join_host_port(host: str, port: str) -> str:
@@ -116,10 +95,6 @@ def _join_host_port(host: str, port: str) -> str:
     if ":" in host and not host.startswith("["):
         host = "[{}]".format(host)
     return "{}:{}".format(host, port)
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def display_holder(raw: Optional[str]) -> Optional[str]:
@@ -152,48 +127,10 @@ class LeaseState:
     # the Lease's metadata.annotations, where the @reboot-ran set is persisted
     # (see cronstable.leadership.REBOOT_RAN_KEY); default {} so positional
     # LeaseState(...) constructions in the tests are unaffected.
-    annotations: Dict[str, str] = field(default_factory=dict)
+    annotations: dict[str, str] = field(default_factory=dict)
 
 
-def _parse_microtime(value: Any) -> Optional[datetime.datetime]:
-    """Parse a Kubernetes ``MicroTime`` (RFC3339 with a ``Z``) to a datetime.
-
-    Tolerant of fewer/more fractional digits than the canonical six, and of an
-    explicit numeric offset, so it survives apiserver formatting variations.
-    Returns ``None`` for anything unparseable (treated as "no time observed").
-    """
-    if not isinstance(value, str) or not value:
-        return None
-    text = value.strip()
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    if "." in text:
-        date_part, _, frac_and_tz = text.partition(".")
-        frac, tzsep = frac_and_tz, ""
-        for sep in ("+", "-"):
-            idx = frac_and_tz.find(sep)
-            if idx != -1:
-                frac, tzsep = frac_and_tz[:idx], frac_and_tz[idx:]
-                break
-        frac = (frac + "000000")[:6]
-        text = "{}.{}{}".format(date_part, frac, tzsep)
-    try:
-        parsed = datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed
-
-
-def _format_microtime(when: datetime.datetime) -> str:
-    """Format a datetime as a Kubernetes ``MicroTime`` string."""
-    return when.astimezone(datetime.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%S.%fZ"
-    )
-
-
-def parse_lease(obj: Optional[Dict[str, Any]]) -> LeaseState:
+def parse_lease(obj: Optional[dict[str, Any]]) -> LeaseState:
     """Extract a :class:`LeaseState` from a decoded ``Lease`` JSON object."""
     spec = (obj or {}).get("spec") or {}
     meta = (obj or {}).get("metadata") or {}
@@ -267,22 +204,6 @@ def _deadline_passed(
     return bool(now >= anchor + datetime.timedelta(seconds=duration))
 
 
-def _file_signature(path: str) -> Optional[Tuple[int, int]]:
-    """A cheap ``(st_mtime_ns, st_size)`` fingerprint of one file, or ``None``.
-
-    ``os.stat`` follows symlinks, so the atomic symlink swap Kubernetes uses
-    for a mounted/projected secret is picked up too.  A stat error (e.g. a file
-    briefly absent mid-rotation) is recorded as ``None`` and simply compares
-    unequal once the file is back -- the safe direction (a spurious rebuild,
-    never a missed one).  Mirrors the gossip backend's ``_tls_file_signature``.
-    """
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_mtime_ns, st.st_size)
-
-
 def decide_lease_action(
     state: Optional[LeaseState],
     identity: str,
@@ -350,8 +271,8 @@ def build_lease_body(
     duration: int,
     state: Optional[LeaseState],
     action: str,
-    annotations: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
+    annotations: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
     """Build the ``Lease`` object to POST (create) or PUT (acquire/renew).
 
     ``acquireTime`` and ``leaseTransitions`` follow client-go: a fresh acquire
@@ -371,7 +292,7 @@ def build_lease_body(
     else:  # create
         acquire_time = now
         transitions = 0
-    metadata: Dict[str, Any] = {"name": name}
+    metadata: dict[str, Any] = {"name": name}
     if namespace:
         metadata["namespace"] = namespace
     if annotations:
@@ -397,7 +318,7 @@ def build_lease_body(
 
 
 def plan_lease_write(
-    lease_obj: Optional[Dict[str, Any]],
+    lease_obj: Optional[dict[str, Any]],
     name: str,
     namespace: Optional[str],
     identity: str,
@@ -405,10 +326,10 @@ def plan_lease_write(
     duration: int,
     observed_at: Optional[Any],
     mono_now: Optional[float] = None,
-    annotations: Optional[Dict[str, str]] = None,
+    annotations: Optional[dict[str, str]] = None,
     last_holder: Optional[str] = None,
     last_observed_at: Optional[Any] = None,
-) -> Tuple[str, Optional[Dict[str, Any]], Optional[LeaseState]]:
+) -> tuple[str, Optional[dict[str, Any]], Optional[LeaseState]]:
     """Pure planning step: observed Lease -> (action, body, state).
 
     ``observed_at`` is the local instant we first saw the current lease record
@@ -443,7 +364,7 @@ def plan_lease_write(
     return action, body, state
 
 
-class KubernetesBackend(LeaseBackend):
+class KubernetesBackend(StoreLeaseBackend):
     """Leadership via a single ``coordination.k8s.io/v1`` ``Lease``."""
 
     backend_name = "kubernetes"
@@ -524,41 +445,24 @@ class KubernetesBackend(LeaseBackend):
         # re-read per request; see _auth_headers). Empty until setup() records
         # them, which keeps tls_files_changed() False (nothing on disk to
         # rotate: embedded -data creds / insecure mode).
-        self._tls_files: List[str] = []
-        self._tls_signature: Dict[str, Optional[Tuple[int, int]]] = {}
+        self._tls_files: list[str] = []
+        self._tls_signature: dict[str, Optional[tuple[int, int]]] = {}
 
-    def _record_tls_files(self, paths: List[Optional[str]]) -> None:
+    def _record_tls_files(self, paths: list[Optional[str]]) -> None:
         """Snapshot the on-disk TLS files the transport loaded.
 
-        Called from a transport's ``setup()``; ``None``/empty entries (embedded
-        ``-data`` creds, ``insecure-skip-tls-verify``) are dropped, so nothing
-        on disk to rotate leaves :meth:`tls_files_changed` ``False``.
+        Called from a transport's ``setup()``; see
+        ``StoreLeaseBackend.tls_files_changed`` (``None``/empty entries,
+        from embedded ``-data`` creds or ``insecure-skip-tls-verify``, are
+        dropped, so nothing on disk to rotate leaves it ``False``).
         """
-        self._tls_files = [p for p in paths if p]
-        self._tls_signature = {p: _file_signature(p) for p in self._tls_files}
-
-    def tls_files_changed(self) -> bool:
-        """Whether any tracked on-disk TLS file changed since ``setup()``.
-
-        The SSLContext is built once at setup() and never reloaded, so -- as
-        for the gossip backend -- an in-place cert/CA rotation (same paths, new
-        bytes) is otherwise invisible until the process restarts.  Reporting
-        the change lets :meth:`cronstable.cron.Cron.start_stop_cluster` rebuild
-        this backend with the fresh material.  ``False`` when nothing was
-        tracked (embedded creds / insecure mode: nothing on disk to rotate).
-        """
-        if not self._tls_files:
-            return False
-        current = {p: _file_signature(p) for p in self._tls_files}
-        return current != self._tls_signature
+        self._record_tls_signature(paths)
 
     # --- pure local-state reads (no I/O) ---------------------------------
 
     def _leader_deadline(self, now: datetime.datetime) -> datetime.datetime:
         """Wall-clock lease expiry, for display only (see ``_apply_round``)."""
-        return (
-            now + datetime.timedelta(seconds=self.lease_duration) - _CLOCK_SKEW
-        )
+        return display_deadline(now, self.lease_duration)
 
     def is_leader(self) -> bool:
         if not self._is_leader or self._leader_until_mono is None:
@@ -567,17 +471,6 @@ class KubernetesBackend(LeaseBackend):
         # self-demotes with no network call, and no wall-clock step can keep us
         # leader past the point the apiserver has expired the lease.
         return _monotonic() < self._leader_until_mono
-
-    def _is_self_demoted_holder(self) -> bool:
-        # raw leadership flag still set (we hold/held the Lease and have not
-        # observed a takeover) but the monotonic fence has lapsed -- the brief
-        # self-demotion window. See LeadershipBackend._is_self_demoted_holder.
-        return self._is_leader and not self.is_leader()
-
-    def leader_name(self) -> Optional[str]:
-        if not self.is_quorate():
-            return None
-        return self._holder
 
     def is_quorate(self) -> bool:
         """Whether we have a *fresh* successful read of the lease store.
@@ -589,7 +482,7 @@ class KubernetesBackend(LeaseBackend):
             return False
         return _monotonic() < self._last_contact_mono + self.lease_duration
 
-    def lease_detail(self) -> Dict[str, Any]:
+    def lease_detail(self) -> dict[str, Any]:
         return {
             "name": self.lease_name,
             "namespace": self.namespace,
@@ -933,7 +826,7 @@ class KubernetesBackend(LeaseBackend):
             state = parse_lease(lease_obj)
             if state.holder != self.identity:
                 return
-            metadata: Dict[str, Any] = {
+            metadata: dict[str, Any] = {
                 "name": self.lease_name,
                 "namespace": self.namespace,
                 "resourceVersion": state.resource_version,
@@ -1004,7 +897,7 @@ def resolve_namespace(
     return configured or context_namespace or incluster_namespace or "default"
 
 
-def _kubeconfig_cert_files(path: str) -> List[Optional[str]]:
+def _kubeconfig_cert_files(path: str) -> list[Optional[str]]:
     """File-referenced CA / client-cert / client-key of a kubeconfig's active
     context, for TLS-rotation tracking (:meth:`KubernetesBackend.tls_files_
     changed`).
@@ -1067,11 +960,11 @@ class _K8sTransport:
 
     async def observe(
         self,
-    ) -> Optional[Dict[str, Any]]:  # pragma: no cover - integration
+    ) -> Optional[dict[str, Any]]:  # pragma: no cover - integration
         raise NotImplementedError
 
     async def write(
-        self, body: Dict[str, Any], *, create: bool
+        self, body: dict[str, Any], *, create: bool
     ) -> bool:  # pragma: no cover - integration
         raise NotImplementedError
 
@@ -1097,7 +990,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         # auth), in which case _auth_token alone is used.
         self._token_path: Optional[str] = None
         self._ssl: Optional[ssl.SSLContext] = None
-        self._tempfiles: List[str] = []
+        self._tempfiles: list[str] = []
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def setup(self) -> None:
@@ -1118,7 +1011,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
         with open(path) as token_file:
             return token_file.read().strip()
 
-    def _auth_headers(self) -> Dict[str, str]:
+    def _auth_headers(self) -> dict[str, str]:
         """Per-request ``Authorization`` header, refreshing a rotating token.
 
         Kubernetes >= 1.22 projects *bound* service-account tokens that the
@@ -1376,7 +1269,7 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             return base
         return "{}/{}".format(base, quote(self.b.lease_name, safe=""))
 
-    async def observe(self) -> Optional[Dict[str, Any]]:
+    async def observe(self) -> Optional[dict[str, Any]]:
         assert self._session is not None
         async with self._session.get(
             self._lease_url(),
@@ -1390,10 +1283,10 @@ class _K8sHttpTransport(_K8sTransport):  # pragma: no cover - network I/O
             if resp.status == 404:
                 return None
             resp.raise_for_status()
-            data: Dict[str, Any] = await resp.json()
+            data: dict[str, Any] = await resp.json()
             return data
 
-    async def write(self, body: Dict[str, Any], *, create: bool) -> bool:
+    async def write(self, body: dict[str, Any], *, create: bool) -> bool:
         """POST (create) or PUT (replace) the Lease; ``False`` on 409 race."""
         assert self._session is not None
         if create:
@@ -1544,10 +1437,10 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
             self.b._record_tls_files([os.path.join(_SA_DIR, "ca.crt")])
         return context_namespace
 
-    async def observe(self) -> Optional[Dict[str, Any]]:
+    async def observe(self) -> Optional[dict[str, Any]]:
         from kubernetes.client.exceptions import ApiException
 
-        def _read() -> Optional[Dict[str, Any]]:
+        def _read() -> Optional[dict[str, Any]]:
             try:
                 lease = self._api.read_namespaced_lease(
                     self.b.lease_name,
@@ -1567,12 +1460,12 @@ class _K8sLibraryTransport(_K8sTransport):  # pragma: no cover - client library
                     return None
                 raise
             sanitize = self._api_client.sanitize_for_serialization
-            result: Dict[str, Any] = sanitize(lease)
+            result: dict[str, Any] = sanitize(lease)
             return result
 
         return await self._offload(_read)
 
-    async def write(self, body: Dict[str, Any], *, create: bool) -> bool:
+    async def write(self, body: dict[str, Any], *, create: bool) -> bool:
         from kubernetes.client.exceptions import ApiException
 
         def _write() -> bool:

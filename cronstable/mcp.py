@@ -32,18 +32,13 @@ import asyncio
 import json as _stdlib_json
 import logging
 import re
+from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
 from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
-    Awaitable,
-    Callable,
-    Dict,
-    Iterator,
-    List,
     Optional,
-    Tuple,
     cast,
 )
 
@@ -84,9 +79,9 @@ RESOURCE_NOT_FOUND = -32002
 
 RESOURCE_MIME = "application/json"
 
-ToolHandler = Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
+ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 _MethodHandler = Callable[
-    [Dict[str, Any]], Awaitable[Optional[Dict[str, Any]]]
+    [dict[str, Any]], Awaitable[Optional[dict[str, Any]]]
 ]
 
 # Tools whose REST counterpart is gated behind a scope BEYOND the `control`
@@ -142,7 +137,7 @@ _METRIC_LINE_RE = re.compile(r"^([A-Za-z_:][\w:]*)(\{[^}]*\})?\s+(\S+)")
 
 def _parse_prometheus(
     text: str, match: Optional[str], limit: int
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int]:
     """Reduce a Prometheus exposition to a compact, filtered sample list.
 
     Returns ``(samples, total_matched)``; ``samples`` is capped at ``limit``.
@@ -150,7 +145,7 @@ def _parse_prometheus(
     ``NaN`` / ``+Inf`` gauge round-trips untouched.
     """
     needle = match.lower() if match else None
-    samples: List[Dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
     total = 0
     for line in text.splitlines():
         line = line.strip()
@@ -175,10 +170,10 @@ def _parse_prometheus(
 
 
 def _filter_metric_samples(
-    samples: Iterator[Tuple[str, str, str]],
+    samples: Iterator[tuple[str, str, str]],
     match: Optional[str],
     limit: int,
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], int]:
     """Filter structured ``(name, label_block, value)`` samples by a
     case-insensitive name substring, capping the returned list at ``limit``
     while still counting every match.
@@ -189,7 +184,7 @@ def _filter_metric_samples(
     the whole exposition text only to regex it back apart.
     """
     needle = match.lower() if match else None
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     total = 0
     for name, labels, value in samples:
         if needle is not None and needle not in name.lower():
@@ -207,7 +202,7 @@ class MCPHandler:
     config; a config reload discards and rebuilds it.
     """
 
-    def __init__(self, cron: "Cron", config: Dict[str, Any]) -> None:
+    def __init__(self, cron: "Cron", config: dict[str, Any]) -> None:
         self._cron = cron
         self._read_only: bool = config["readOnly"]
         self._toolsets = set(config["toolsets"])
@@ -217,7 +212,7 @@ class MCPHandler:
         self._resources_enabled: bool = config.get("resources", True)
         self._prompts_enabled: bool = config.get("prompts", True)
         self._instructions: Optional[str] = config.get("instructions")
-        self._methods: Dict[str, _MethodHandler] = {
+        self._methods: dict[str, _MethodHandler] = {
             "initialize": self._m_initialize,
             "notifications/initialized": self._m_noop,
             "notifications/cancelled": self._m_noop,
@@ -243,7 +238,7 @@ class MCPHandler:
 
     # -- capabilities / visibility ----------------------------------------
 
-    def _capabilities(self) -> Dict[str, Any]:
+    def _capabilities(self) -> dict[str, Any]:
         """Advertise ONLY what is actually registered.
 
         A server MUST NOT advertise a capability it does not implement (a
@@ -251,7 +246,7 @@ class MCPHandler:
         are always present; resources/prompts appear only when enabled AND
         something is registered under the active toolsets.
         """
-        caps: Dict[str, Any] = {"tools": {"listChanged": False}}
+        caps: dict[str, Any] = {"tools": {"listChanged": False}}
         if self._resources_enabled and (
             any(self._resource_visible(r) for r in self._resources)
             or any(self._resource_visible(t) for t in self._templates)
@@ -263,13 +258,13 @@ class MCPHandler:
             caps["prompts"] = {"listChanged": False}
         return caps
 
-    def _resource_visible(self, entry: Dict[str, Any]) -> bool:
+    def _resource_visible(self, entry: dict[str, Any]) -> bool:
         return entry["toolset"] in self._toolsets
 
-    def _prompt_visible(self, entry: Dict[str, Any]) -> bool:
+    def _prompt_visible(self, entry: dict[str, Any]) -> bool:
         return entry["toolset"] in self._toolsets
 
-    def _is_visible(self, tool: Dict[str, Any]) -> bool:
+    def _is_visible(self, tool: dict[str, Any]) -> bool:
         """Whether ``tool`` is exposed under the current config.
 
         Its toolset must be enabled, and a mutating tool is stripped entirely
@@ -283,7 +278,7 @@ class MCPHandler:
 
     # -- JSON-RPC method handlers -----------------------------------------
 
-    async def _m_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _m_initialize(self, params: dict[str, Any]) -> dict[str, Any]:
         requested = params.get("protocolVersion")
         # echo the client's version when we can speak it, else offer ours.
         negotiated = (
@@ -291,7 +286,7 @@ class MCPHandler:
             if requested in SUPPORTED_PROTOCOL_VERSIONS
             else PROTOCOL_VERSION
         )
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "protocolVersion": negotiated,
             "capabilities": self._capabilities(),
             "serverInfo": {
@@ -316,14 +311,14 @@ class MCPHandler:
         return result
 
     async def _m_noop(
-        self, params: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
+        self, params: dict[str, Any]
+    ) -> Optional[dict[str, Any]]:
         return None
 
-    async def _m_ping(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _m_ping(self, params: dict[str, Any]) -> dict[str, Any]:
         return {}
 
-    async def _m_tools_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _m_tools_list(self, params: dict[str, Any]) -> dict[str, Any]:
         tools = [
             {
                 "name": t["name"],
@@ -337,7 +332,7 @@ class MCPHandler:
         ]
         return {"tools": tools}
 
-    async def _m_tools_call(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _m_tools_call(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
         if not isinstance(name, str):
             raise MCPError(INVALID_PARAMS, "tools/call requires a 'name'")
@@ -369,7 +364,7 @@ class MCPHandler:
 
     # -- top-level dispatch (transport-independent, unit-testable) --------
 
-    async def handle_message(self, msg: Any) -> Optional[Dict[str, Any]]:
+    async def handle_message(self, msg: Any) -> Optional[dict[str, Any]]:
         """Dispatch one JSON-RPC message.
 
         Returns the response object for a request, or ``None`` for a
@@ -479,7 +474,7 @@ class MCPHandler:
 
     # -- HTTP response helpers --------------------------------------------
 
-    def _cors_headers(self, origin: Optional[str]) -> Dict[str, str]:
+    def _cors_headers(self, origin: Optional[str]) -> dict[str, str]:
         if origin and origin in self._allowed_origins:
             # credentialed CORS may not use a wildcard; echo the exact origin.
             return {
@@ -493,7 +488,7 @@ class MCPHandler:
         return {}
 
     def _json_response(
-        self, obj: Dict[str, Any], *, origin: Optional[str]
+        self, obj: dict[str, Any], *, origin: Optional[str]
     ) -> web.Response:
         headers = {"MCP-Protocol-Version": PROTOCOL_VERSION}
         headers.update(self._cors_headers(origin))
@@ -539,8 +534,8 @@ class MCPHandler:
         return max(1, min(n, self._max_rows))
 
     def _page(
-        self, items: List[Any], offset: Any, limit: Any
-    ) -> Tuple[List[Any], Dict[str, Any]]:
+        self, items: list[Any], offset: Any, limit: Any
+    ) -> tuple[list[Any], dict[str, Any]]:
         total = len(items)
         try:
             off = max(0, int(offset or 0))
@@ -560,26 +555,21 @@ class MCPHandler:
 
     # -- tool registry -----------------------------------------------------
 
-    def _build_registry(self) -> List[Dict[str, Any]]:
+    def _build_registry(self) -> list[dict[str, Any]]:
         obj = _obj_schema
-        # (toolset, mutating, name, title, description, inputSchema, handler,
-        #  destructive, idempotent)
+        # every entry is a _tool(...) spec; see that factory for the defaults
         specs = [
             # ---- observe (read-only) ----
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_status",
                 "Job status",
                 "One-line status (running/disabled/scheduled) of every job.",
                 obj({"offset": _INT, "limit": _INT}),
                 self._t_get_status,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_list_jobs",
                 "List jobs",
                 "List jobs with schedule, enabled/running state, next run and "
@@ -594,119 +584,89 @@ class MCPHandler:
                     }
                 ),
                 self._t_list_jobs,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_job",
                 "Get one job",
                 "Full detail for one job (schedule, command, last run, live "
                 "resources, retry/slot state).",
                 obj({"name": _STR}, ["name"]),
                 self._t_get_job,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_list_runs",
                 "Run history",
                 "Retained run history + success/duration stats for one job "
                 "(most recent `limit` runs).",
                 obj({"name": _STR, "limit": _INT}, ["name"]),
                 self._t_list_runs,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_job_trends",
                 "SLA trends",
                 "Per-window (1h/24h/7d/30d/all) success-rate and duration "
                 "aggregates over the durable run ledger for one job.",
                 obj({"name": _STR}, ["name"]),
                 self._t_get_job_trends,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_job_resources",
                 "Resource usage",
                 "CPU/RSS time series for a job's live and recent runs "
                 "(monitorResources jobs).",
                 obj({"name": _STR, "runs": _INT}, ["name"]),
                 self._t_get_job_resources,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_cluster",
                 "Cluster view",
                 "This node's cluster/leadership view (peers, quorum, role, "
                 "live load). enabled:false without a cluster section.",
                 obj({}),
                 self._t_get_cluster,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_fleet",
                 "Fleet view",
                 "The cluster-wide jobs x nodes run matrix (single pane of "
                 "glass). enabled:false without a cluster.",
                 obj({}),
                 self._t_get_fleet,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_node",
                 "Node resources",
                 "This node's live whole-host CPU/memory (optionally with the "
                 "retained history ring).",
                 obj({"history": _BOOL}),
                 self._t_get_node,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_query_metrics",
                 "Query metrics",
                 "Parsed samples from the Prometheus /metrics exposition, "
                 "optionally filtered by a metric-name substring `match`.",
                 obj({"match": _STR, "limit": _INT}),
                 self._t_query_metrics,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_get_version",
                 "Version",
                 "Daemon version, job-set id and job count.",
                 obj({}),
                 self._t_get_version,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_tail_job_logs",
                 "Tail job logs",
                 "Last retained stdout/stderr lines of a job, with a `cursor` "
@@ -714,12 +674,9 @@ class MCPHandler:
                 "log stream).",
                 obj({"name": _STR, "tail": _INT, "cursor": _INT}, ["name"]),
                 self._t_tail_job_logs,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_schedule_pressure",
                 "Schedule pressure",
                 "The fleet's collision heatmap: every enabled schedule's "
@@ -728,12 +685,9 @@ class MCPHandler:
                 "jobs fire at :00?' and 'which minutes are empty?'.",
                 obj({"hours": _INT, "tz": _STR}),
                 self._t_schedule_pressure,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_schedule_duplicates",
                 "Duplicate schedules",
                 "Groups of jobs whose schedules fire on the identical "
@@ -741,12 +695,9 @@ class MCPHandler:
                 "Use to spot copy-pasted schedules worth spreading out.",
                 obj({}),
                 self._t_schedule_duplicates,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_suggest_slot",
                 "Suggest a slot",
                 "The least-loaded slot for a new job, from the fleet's real "
@@ -760,12 +711,9 @@ class MCPHandler:
                     }
                 ),
                 self._t_suggest_slot,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_validate_schedule",
                 "Validate a schedule",
                 "Parse and lint a cron expression BEFORE it becomes a job: "
@@ -784,12 +732,9 @@ class MCPHandler:
                     ["expression"],
                 ),
                 self._t_validate_schedule,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_explain_schedule",
                 "Explain a schedule",
                 "Decode a cron expression into a plain-English description, "
@@ -809,12 +754,9 @@ class MCPHandler:
                     ["expression"],
                 ),
                 self._t_explain_schedule,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "observe",
-                False,
                 "cron_why_no_run",
                 "Why no run?",
                 "Explain field-by-field why a job's schedule did or did not "
@@ -827,58 +769,43 @@ class MCPHandler:
                 "(cron_list_runs) instead.",
                 obj({"name": _STR, "at": _STR}, ["name", "at"]),
                 self._t_why_no_run,
-                False,
-                True,
             ),
             # ---- dags ----
-            (
+            _tool(
                 "dags",
-                False,
                 "cron_list_dags",
                 "List DAGs",
                 "Configured orchestration DAGs with their tasks and "
                 "dependencies.",
                 obj({}),
                 self._t_list_dags,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "dags",
-                False,
                 "cron_list_dag_runs",
                 "List DAG runs",
                 "Recent runs of one DAG with per-state task counts.",
                 obj({"dag": _STR, "limit": _INT}, ["dag"]),
                 self._t_list_dag_runs,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "dags",
-                False,
                 "cron_get_dag_run",
                 "Get DAG run",
                 "One DAG run's full document: task states, timing, decisions.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
                 self._t_get_dag_run,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "dags",
-                False,
                 "cron_get_dag_xcom",
                 "DAG XCom",
                 "The XCom values a DAG run's tasks published.",
                 obj({"dag": _STR, "run_key": _STR}, ["dag", "run_key"]),
                 self._t_get_dag_xcom,
-                False,
-                True,
             ),
-            (
+            _tool(
                 "dags",
-                False,
                 "cron_tail_dag_task_logs",
                 "Tail DAG task logs",
                 "Last retained log lines of a currently-running DAG task "
@@ -894,13 +821,10 @@ class MCPHandler:
                     ["dag", "run_key", "taskkey"],
                 ),
                 self._t_tail_dag_task_logs,
-                False,
-                True,
             ),
             # ---- state (read-only inspector) ----
-            (
+            _tool(
                 "state",
-                False,
                 "cron_inspect_state",
                 "Inspect state store",
                 "Metadata-only view of the durable state store: overview "
@@ -910,37 +834,32 @@ class MCPHandler:
                 "secrets are redacted.",
                 obj({"ns": _STR, "stream": _STR, "limit": _INT}),
                 self._t_inspect_state,
-                False,
-                True,
             ),
             # ---- act (mutating job control; readOnly:false to expose) ----
-            (
+            _tool(
                 "act",
-                True,
                 "cron_run_job",
                 "Run job now",
                 "Launch a job immediately (honours its concurrencyPolicy). "
                 "Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
                 self._t_run_job,
-                False,
-                False,
+                mutating=True,
             ),
-            (
+            _tool(
                 "act",
-                True,
                 "cron_cancel_job",
                 "Cancel job",
                 "Terminate a job's running instances (graceful, then kill). "
                 "Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
                 self._t_cancel_job,
-                True,
-                True,
+                mutating=True,
+                destructive=True,
+                idempotent=True,
             ),
-            (
+            _tool(
                 "act",
-                True,
                 "cron_pause_job",
                 "Pause job",
                 "Skip a job's scheduled fires until the window expires "
@@ -956,37 +875,33 @@ class MCPHandler:
                     ["name"],
                 ),
                 self._t_pause_job,
-                False,
-                True,
+                mutating=True,
+                idempotent=True,
             ),
-            (
+            _tool(
                 "act",
-                True,
                 "cron_resume_job",
                 "Resume job",
                 "Lift a job's pause so scheduled fires resume; a no-op when "
                 "the job is not paused. Requires confirm=true.",
                 obj({"name": _STR, "confirm": _BOOL}, ["name"]),
                 self._t_resume_job,
-                False,
-                True,
+                mutating=True,
+                idempotent=True,
             ),
             # ---- dag control (mutating; toolset dags + readOnly:false) ----
-            (
+            _tool(
                 "dags",
-                True,
                 "cron_trigger_dag",
                 "Trigger DAG",
                 "Create and start a manual DAG run now. "
                 "Requires confirm=true.",
                 obj({"dag": _STR, "confirm": _BOOL}, ["dag"]),
                 self._t_trigger_dag,
-                False,
-                False,
+                mutating=True,
             ),
-            (
+            _tool(
                 "dags",
-                True,
                 "cron_backfill_dag",
                 "Backfill DAG",
                 "Replay a scheduled DAG across an ISO date range. dry_run "
@@ -1003,12 +918,11 @@ class MCPHandler:
                     ["dag", "from", "to"],
                 ),
                 self._t_backfill_dag,
-                True,
-                False,
+                mutating=True,
+                destructive=True,
             ),
-            (
+            _tool(
                 "dags",
-                True,
                 "cron_decide_gate",
                 "Decide approval gate",
                 "Approve or reject a DAG approval gate. "
@@ -1026,11 +940,11 @@ class MCPHandler:
                     ["dag", "run_key", "taskkey", "decision"],
                 ),
                 self._t_decide_gate,
-                True,
-                False,
+                mutating=True,
+                destructive=True,
             ),
         ]
-        registry: List[Dict[str, Any]] = []
+        registry: list[dict[str, Any]] = []
         for (
             toolset,
             mutating,
@@ -1066,7 +980,7 @@ class MCPHandler:
 
     # -- observe tool handlers --------------------------------------------
 
-    async def _t_get_status(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_status(self, args: dict[str, Any]) -> dict[str, Any]:
         rows = self._cron.status_payload()
         page, meta = self._page(rows, args.get("offset"), args.get("limit"))
         running = sum(1 for r in page if r.get("status") == "running")
@@ -1075,7 +989,7 @@ class MCPHandler:
         )
         return _result({"status": page, "page": meta}, summary)
 
-    async def _t_list_jobs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_list_jobs(self, args: dict[str, Any]) -> dict[str, Any]:
         rows = self._cron.jobs_payload()
         flt = args.get("filter")
         if isinstance(flt, str) and flt:
@@ -1098,7 +1012,7 @@ class MCPHandler:
             ),
         )
 
-    async def _t_get_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         payload = self._cron.job_detail_payload(name)
         if payload is None:
@@ -1109,7 +1023,7 @@ class MCPHandler:
             )
         return _result(payload, "job {!r}".format(name))
 
-    async def _t_list_runs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_list_runs(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         payload = self._cron.job_runs_payload(name)
         if payload is None:
@@ -1126,7 +1040,7 @@ class MCPHandler:
             ),
         )
 
-    async def _t_get_job_trends(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_job_trends(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         payload = await self._cron.job_trends_payload(name)
         if payload is None:
@@ -1134,8 +1048,8 @@ class MCPHandler:
         return _result(payload, "trends for job {!r}".format(name))
 
     async def _t_get_job_resources(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
         name = _req_str(args, "name")
         max_runs = self._clamp_limit(args.get("runs"))
         payload = self._cron.job_resources_payload(name, max_runs)
@@ -1143,24 +1057,24 @@ class MCPHandler:
             return _tool_error("job not found: {!r}".format(name))
         return _result(payload, "resource series for job {!r}".format(name))
 
-    async def _t_get_cluster(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_cluster(self, args: dict[str, Any]) -> dict[str, Any]:
         payload = self._cron.cluster_payload()
         return _result(
             payload,
             "cluster enabled={}".format(payload.get("enabled")),
         )
 
-    async def _t_get_fleet(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_fleet(self, args: dict[str, Any]) -> dict[str, Any]:
         payload = self._cron.fleet_payload()
         return _result(
             payload, "fleet enabled={}".format(payload.get("enabled"))
         )
 
-    async def _t_get_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_node(self, args: dict[str, Any]) -> dict[str, Any]:
         payload = self._cron.node_payload(history=bool(args.get("history")))
         return _result(payload, "node {}".format(payload.get("node_name")))
 
-    async def _t_query_metrics(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_query_metrics(self, args: dict[str, Any]) -> dict[str, Any]:
         match = args.get("match")
         if match is not None and not isinstance(match, str):
             raise _ToolInputError("`match` must be a string")
@@ -1205,8 +1119,8 @@ class MCPHandler:
         )
 
     async def _t_schedule_pressure(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
         # no clamp here: croninfo.schedule_pressure clamps hours to
         # [1, 168] authoritatively and echoes the clamped value back in
         # the payload; only the default is applied at this layer.
@@ -1239,8 +1153,8 @@ class MCPHandler:
         )
 
     async def _t_schedule_duplicates(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
         # offloaded (see cron.py): the fleet walk must not block the loop.
         payload = await self._cron.schedule_duplicates_payload_async()
         groups = payload["groups"]
@@ -1258,7 +1172,7 @@ class MCPHandler:
             ),
         )
 
-    async def _t_suggest_slot(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_suggest_slot(self, args: dict[str, Any]) -> dict[str, Any]:
         period = args.get("period") or "hourly"
         tz = args.get("tz")
         if tz is not None and not isinstance(tz, str):
@@ -1284,8 +1198,8 @@ class MCPHandler:
 
     @staticmethod
     def _preview_args(
-        args: Dict[str, Any],
-    ) -> Tuple[Optional[str], Optional[str]]:
+        args: dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
         """The shared `tz`/`seed` arguments of the schedule sandboxes."""
         tz = args.get("tz")
         if tz is not None and not isinstance(tz, str):
@@ -1296,8 +1210,8 @@ class MCPHandler:
         return (tz or None), (seed or None)
 
     async def _t_validate_schedule(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
         expr = _req_str(args, "expression")
         tz, seed = self._preview_args(args)
         try:
@@ -1312,8 +1226,8 @@ class MCPHandler:
         return _result(payload, _preview_summary(payload))
 
     async def _t_explain_schedule(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
         expr = _req_str(args, "expression")
         tz, seed = self._preview_args(args)
         count = _opt_int(args.get("count"))
@@ -1326,7 +1240,7 @@ class MCPHandler:
             return _tool_error(str(err))
         return _result(payload, _preview_summary(payload))
 
-    async def _t_why_no_run(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_why_no_run(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         at = _req_str(args, "at")
         try:
@@ -1341,7 +1255,7 @@ class MCPHandler:
             )
         return _result(payload, _why_summary(payload))
 
-    async def _t_get_version(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_version(self, args: dict[str, Any]) -> dict[str, Any]:
         data = {
             "version": _version.version,
             "job_set_id": self._cron.job_set_id(),
@@ -1352,7 +1266,7 @@ class MCPHandler:
             "cronstable {} - {} job(s)".format(data["version"], data["jobs"]),
         )
 
-    async def _t_tail_job_logs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_tail_job_logs(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         tail = self._clamp_limit(args.get("tail"))
         payload = self._cron.job_logs_tail_payload(
@@ -1369,11 +1283,11 @@ class MCPHandler:
 
     # -- dags tool handlers -----------------------------------------------
 
-    async def _t_list_dags(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_list_dags(self, args: dict[str, Any]) -> dict[str, Any]:
         dags = await self._cron.dags_payload()
         return _result({"dags": dags}, "{} DAG(s)".format(len(dags)))
 
-    async def _t_list_dag_runs(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_list_dag_runs(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         limit = self._clamp_limit(args.get("limit"))
         runs = await self._cron._dag.list_runs(dag, limit=limit)
@@ -1384,7 +1298,7 @@ class MCPHandler:
             "dag {!r}: {} run(s)".format(dag, len(runs)),
         )
 
-    async def _t_get_dag_run(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_dag_run(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         run_key = _req_str(args, "run_key")
         body = await self._cron._dag.get_run(dag, run_key)
@@ -1394,7 +1308,7 @@ class MCPHandler:
             )
         return _result(body, "dag {!r} run {!r}".format(dag, run_key))
 
-    async def _t_get_dag_xcom(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_get_dag_xcom(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         run_key = _req_str(args, "run_key")
         result = await self._cron._dag.xcom_for_run(dag, run_key)
@@ -1407,8 +1321,8 @@ class MCPHandler:
         )
 
     async def _t_tail_dag_task_logs(
-        self, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, args: dict[str, Any]
+    ) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         run_key = _req_str(args, "run_key")
         taskkey = _req_str(args, "taskkey")
@@ -1431,7 +1345,7 @@ class MCPHandler:
 
     # -- state tool handler -----------------------------------------------
 
-    async def _t_inspect_state(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_inspect_state(self, args: dict[str, Any]) -> dict[str, Any]:
         ns = args.get("ns")
         stream = args.get("stream")
         if ns is not None and stream is not None:
@@ -1453,13 +1367,13 @@ class MCPHandler:
 
     # -- act (mutating) tool handlers -------------------------------------
 
-    async def _t_run_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_run_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "running")
         await self._cron.start_job_by_name(name)
         return _result({"started": name}, "started job {!r}".format(name))
 
-    async def _t_cancel_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_cancel_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "cancelling")
         count = await self._cron.cancel_job_by_name(name)
@@ -1468,7 +1382,7 @@ class MCPHandler:
             "cancelled {} instance(s) of job {!r}".format(count, name),
         )
 
-    async def _t_pause_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_pause_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "pausing")
         duration: Optional[int] = None
@@ -1487,13 +1401,13 @@ class MCPHandler:
             "paused job {!r} until {}".format(name, record["until"]),
         )
 
-    async def _t_resume_job(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_resume_job(self, args: dict[str, Any]) -> dict[str, Any]:
         name = _req_str(args, "name")
         _require_confirm(args, "resuming")
         await self._cron.resume_job_by_name(name, by="mcp", channel="mcp")
         return _result({"resumed": name}, "resumed job {!r}".format(name))
 
-    async def _t_trigger_dag(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_trigger_dag(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         _require_confirm(args, "triggering")
         run_key = await self._cron._dag.trigger_run(dag)
@@ -1504,7 +1418,7 @@ class MCPHandler:
             "triggered dag {!r} (run {})".format(dag, run_key),
         )
 
-    async def _t_backfill_dag(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_backfill_dag(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         start = _req_str(args, "from")
         end = _req_str(args, "to")
@@ -1538,7 +1452,7 @@ class MCPHandler:
             result, "backfilled dag {!r} from {} to {}".format(dag, start, end)
         )
 
-    async def _t_decide_gate(self, args: Dict[str, Any]) -> Dict[str, Any]:
+    async def _t_decide_gate(self, args: dict[str, Any]) -> dict[str, Any]:
         dag = _req_str(args, "dag")
         run_key = _req_str(args, "run_key")
         taskkey = _req_str(args, "taskkey")
@@ -1559,8 +1473,8 @@ class MCPHandler:
     # -- resources (URI-addressable read-only context) --------------------
 
     async def _m_resources_list(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         resources = [
             {
                 "uri": r["uri"],
@@ -1575,8 +1489,8 @@ class MCPHandler:
         return {"resources": resources}
 
     async def _m_resource_templates_list(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         templates = [
             {
                 "uriTemplate": t["uriTemplate"],
@@ -1591,8 +1505,8 @@ class MCPHandler:
         return {"resourceTemplates": templates}
 
     async def _m_resources_read(
-        self, params: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         uri = params.get("uri")
         if not isinstance(uri, str):
             raise MCPError(INVALID_PARAMS, "resources/read requires a 'uri'")
@@ -1621,7 +1535,7 @@ class MCPHandler:
 
     def _match_resource(
         self, uri: str
-    ) -> Tuple[Optional[Callable[..., Any]], Tuple[str, ...]]:
+    ) -> tuple[Optional[Callable[..., Any]], tuple[str, ...]]:
         """Resolve a URI to a loader + captured args, or ``(None, ())``."""
         fixed = self._resource_by_uri.get(uri)
         if fixed is not None and self._resource_visible(fixed):
@@ -1636,20 +1550,20 @@ class MCPHandler:
 
     def _build_resources(
         self,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         cron = self._cron
 
-        async def version_data() -> Dict[str, Any]:
+        async def version_data() -> dict[str, Any]:
             return {
                 "version": _version.version,
                 "job_set_id": cron.job_set_id(),
                 "jobs": len(cron.cron_jobs),
             }
 
-        async def status_data() -> Dict[str, Any]:
+        async def status_data() -> dict[str, Any]:
             return {"status": cron.status_payload()}
 
-        async def dag_detail(name: str) -> Optional[Dict[str, Any]]:
+        async def dag_detail(name: str) -> Optional[dict[str, Any]]:
             for entry in await cron.dags_payload():
                 if entry.get("name") == name:
                     return entry
@@ -1766,7 +1680,7 @@ class MCPHandler:
 
     # -- prompts (canned triage playbooks) --------------------------------
 
-    async def _m_prompts_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _m_prompts_list(self, params: dict[str, Any]) -> dict[str, Any]:
         prompts = [
             {
                 "name": p["name"],
@@ -1779,7 +1693,7 @@ class MCPHandler:
         ]
         return {"prompts": prompts}
 
-    async def _m_prompts_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _m_prompts_get(self, params: dict[str, Any]) -> dict[str, Any]:
         name = params.get("name")
         prompt = self._prompt_by_name.get(name) if name else None
         if prompt is None or not self._prompt_visible(prompt):
@@ -1798,11 +1712,11 @@ class MCPHandler:
             ],
         }
 
-    def _build_prompts(self) -> List[Dict[str, Any]]:
-        def arg(name: str, desc: str, required: bool = True) -> Dict[str, Any]:
+    def _build_prompts(self) -> list[dict[str, Any]]:
+        def arg(name: str, desc: str, required: bool = True) -> dict[str, Any]:
             return {"name": name, "description": desc, "required": required}
 
-        def triage(a: Dict[str, Any]) -> str:
+        def triage(a: dict[str, Any]) -> str:
             job = a.get("job", "<job>")
             return (
                 "Investigate why the cronstable job '{0}' is failing. Steps:\n"
@@ -1818,7 +1732,7 @@ class MCPHandler:
                 "asking)."
             ).format(job)
 
-        def dag_fail(a: Dict[str, Any]) -> str:
+        def dag_fail(a: dict[str, Any]) -> str:
             return (
                 "Diagnose the failed DAG run '{1}' of dag '{0}'. Use "
                 "cron_get_dag_run(dag='{0}', run_key='{1}') to find the "
@@ -1828,7 +1742,7 @@ class MCPHandler:
                 "what downstream tasks were blocked."
             ).format(a.get("dag", "<dag>"), a.get("run_key", "<run_key>"))
 
-        def blast(a: Dict[str, Any]) -> str:
+        def blast(a: dict[str, Any]) -> str:
             return (
                 "Assess the blast radius of an incident involving '{0}'. Use "
                 "cron_get_status and cron_get_fleet to find other affected "
@@ -1837,7 +1751,7 @@ class MCPHandler:
                 "holds. Summarize what else is at risk if it stays broken."
             ).format(a.get("target", "<target>"))
 
-        def fleet(a: Dict[str, Any]) -> str:
+        def fleet(a: dict[str, Any]) -> str:
             return (
                 "Summarize overall cronstable health for a status update. Use "
                 "cron_get_fleet, cron_get_cluster and cron_get_status to "
@@ -1847,7 +1761,7 @@ class MCPHandler:
                 "important thing."
             )
 
-        def backfill_plan(a: Dict[str, Any]) -> str:
+        def backfill_plan(a: dict[str, Any]) -> str:
             return (
                 "Plan a backfill of dag '{0}' from {1} to {2}. First run "
                 "cron_backfill_dag(dag='{0}', from='{1}', to='{2}') with its "
@@ -1944,14 +1858,14 @@ _INT = {"type": "integer"}
 _BOOL = {"type": "boolean"}
 
 
-def _enum(values: List[str]) -> Dict[str, Any]:
+def _enum(values: list[str]) -> dict[str, Any]:
     return {"type": "string", "enum": values}
 
 
 def _obj_schema(
-    properties: Dict[str, Any], required: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    schema: Dict[str, Any] = {
+    properties: dict[str, Any], required: Optional[list[str]] = None
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
         "type": "object",
         "properties": properties,
         "additionalProperties": False,
@@ -1961,7 +1875,40 @@ def _obj_schema(
     return schema
 
 
-def _result(structured: Dict[str, Any], summary: str) -> Dict[str, Any]:
+def _tool(
+    toolset: str,
+    name: str,
+    title: str,
+    description: str,
+    schema: dict[str, Any],
+    handler: Any,
+    *,
+    mutating: bool = False,
+    destructive: bool = False,
+    idempotent: Optional[bool] = None,
+) -> tuple[Any, ...]:
+    """One registry spec, defaults tuned to the common case.
+
+    Read-only tools take every default; mutating tools default to
+    non-idempotent (a re-run acts again) unless declared otherwise, e.g.
+    pause/resume, whose repeat is a no-op.
+    """
+    if idempotent is None:
+        idempotent = not mutating
+    return (
+        toolset,
+        mutating,
+        name,
+        title,
+        description,
+        schema,
+        handler,
+        destructive,
+        idempotent,
+    )
+
+
+def _result(structured: dict[str, Any], summary: str) -> dict[str, Any]:
     """A successful tool result: a text summary plus the structured object.
 
     The ``text`` block mirrors ``structuredContent`` for clients that do not
@@ -1973,12 +1920,12 @@ def _result(structured: Dict[str, Any], summary: str) -> Dict[str, Any]:
     }
 
 
-def _tool_error(message: str) -> Dict[str, Any]:
+def _tool_error(message: str) -> dict[str, Any]:
     """A tool-execution failure (isError:true), readable by the model."""
     return {"content": [{"type": "text", "text": message}], "isError": True}
 
 
-def _preview_summary(payload: Dict[str, Any]) -> str:
+def _preview_summary(payload: dict[str, Any]) -> str:
     """The one-line verdict of a validate/explain schedule payload."""
     if not payload.get("valid"):
         return "INVALID: {}".format(payload.get("error"))
@@ -2007,7 +1954,7 @@ def _preview_summary(payload: Dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def _why_summary(payload: Dict[str, Any]) -> str:
+def _why_summary(payload: dict[str, Any]) -> str:
     """The one-line verdict of a cron_why_no_run payload."""
     name = payload["job"]
     if payload.get("reboot"):
@@ -2046,7 +1993,7 @@ def _why_summary(payload: Dict[str, Any]) -> str:
     return text
 
 
-def _req_str(args: Dict[str, Any], key: str) -> str:
+def _req_str(args: dict[str, Any], key: str) -> str:
     value = args.get(key)
     if not isinstance(value, str) or not value:
         raise _ToolInputError(
@@ -2067,7 +2014,7 @@ def _opt_int(value: Any) -> Optional[int]:
         return None
 
 
-def _require_confirm(args: Dict[str, Any], gerund: str) -> None:
+def _require_confirm(args: dict[str, Any], gerund: str) -> None:
     if args.get("confirm") is not True:
         raise _ToolInputError(
             "{} changes state; call again with confirm=true to proceed".format(
@@ -2080,7 +2027,7 @@ def _id_of(msg: Any) -> Any:
     return msg.get("id") if isinstance(msg, dict) else None
 
 
-def _error_envelope(msg_id: Any, code: int, message: str) -> Dict[str, Any]:
+def _error_envelope(msg_id: Any, code: int, message: str) -> dict[str, Any]:
     return {
         "jsonrpc": "2.0",
         "id": msg_id,

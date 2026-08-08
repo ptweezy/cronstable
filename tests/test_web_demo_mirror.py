@@ -1,46 +1,46 @@
 """``docs/demo/index.html`` stays a faithful mirror of the shipped dashboard.
 
-The demo page is the shipped dashboard plus a fake-backend layer, maintained
-by hand: no build step generates it, so every dashboard edit has to be ported
-across twice.  That discipline is invisible when it lapses, and a stale demo
-silently misrepresents the product on the docs site, so this pins the mirror
-structurally instead.
-
-Only the deltas the mirror exists for are allowed: the ``<title>``, the
-injected ``cronstable-demo-backend`` script block together with the
-demo-only note that follows it about the inlined logo engine, and the blank
-line at the injection point that the block consumes.  Anything else is drift.
-Pure text comparison, so unlike ``test_web_engine_parity`` this runs
-everywhere, including CI.
+The demo page is the shipped dashboard plus a fake-backend layer.  It is
+GENERATED: ``scripts/build_demo.py`` splices ``docs/demo/_backend.html`` into
+``cronstable/web/index.html`` and swaps the ``<title>``.  A stale demo
+silently misrepresents the product on the docs site, so the mirror test
+rebuilds the page with the same code and demands byte equality with the
+checked-in file.  Pure text comparison, so unlike ``test_web_engine_parity``
+this runs everywhere, including CI.
 
 The file also holds the page's other copy-and-shape guards, the ones that
 want the same "read the HTML and assert on its text" machinery: the streamed
 log panes, the in-flight guard every secondary poll must carry, and the logo
-engine's two other verbatim copies out on the docs site.
+engine's extracted docs-site copy.
 """
 
 import difflib
+import importlib.util
 import os
 import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB = os.path.join(ROOT, "cronstable", "web", "index.html")
 DEMO = os.path.join(ROOT, "docs", "demo", "index.html")
-# the two docs-site pages that inline the same logo engine (see
-# test_logo_engine_is_identical_in_all_four_copies)
+FRAGMENT = os.path.join(ROOT, "docs", "demo", "_backend.html")
+# the engine copy the docs-site pages share via <script src> (see
+# test_logo_engine_extract_matches_the_dashboards_inline_copy)
+ENGINE_JS = os.path.join(ROOT, "docs", "logo-engine.js")
 LAB = os.path.join(ROOT, "docs", "logo-lab.html")
 COMPARISON = os.path.join(ROOT, "docs", "comparison.html")
+# the theme palette those two pages share; the dashboard keeps its own
+# inline copy (self-containment), so the values are pinned by parity below
+PALETTE = os.path.join(ROOT, "docs", "palette.css")
 
-# The injected block, matched by its script id (kept stable for exactly this
-# reason, cf. the banner comments test_web_engine_parity slices on), plus the
-# demo-only note that trails it explaining why the logo engine is inlined.
-# Both are part of the same insertion, so they are stripped together.
-_DEMO_BLOCK = re.compile(
-    r'[ \t]*<script id="cronstable-demo-backend">.*?</script>\n'
-    r"(?:<!-- logo engine: copied verbatim.*?-->\n)?",
-    re.DOTALL,
-)
-_TITLE = re.compile(r"<title>.*?</title>", re.DOTALL)
+
+def _build_demo():
+    """The generator itself, loaded by path: scripts/ is not a package."""
+    spec = importlib.util.spec_from_file_location(
+        "build_demo", os.path.join(ROOT, "scripts", "build_demo.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 # The logo engine block, from its banner comment to the close of the script
 # tag that holds it.  Both ends are stable by construction: the banner is the
@@ -64,37 +64,26 @@ def _fn_body(html, name, path):
     return m.group(0)
 
 
-def test_demo_is_the_dashboard_plus_only_its_fake_backend():
-    web = _read(WEB)
+def test_demo_is_generated_from_the_dashboard_plus_its_fake_backend():
+    rebuilt = _build_demo().build(_read(WEB), _read(FRAGMENT))
     demo = _read(DEMO)
-
-    stripped, count = _DEMO_BLOCK.subn("", demo)
-    assert count == 1, (
-        "expected exactly one <script id='cronstable-demo-backend'> block in "
-        "%s, found %d. If the block was renamed, update this test; it is the "
-        "anchor the mirror check relies on." % (DEMO, count)
-    )
-    # normalise the one intentional content delta
-    stripped = _TITLE.sub(_TITLE.search(web).group(0), stripped, count=1)
-
-    web_lines = web.splitlines(keepends=True)
-    demo_lines = stripped.splitlines(keepends=True)
-    if web_lines == demo_lines:
+    if rebuilt == demo:
         return
-
-    # The injection point absorbs a single blank line; tolerate that one
-    # difference and nothing else.
     diff = [
         line
         for line in difflib.unified_diff(
-            web_lines, demo_lines, "web", "demo", n=0
+            rebuilt.splitlines(keepends=True),
+            demo.splitlines(keepends=True),
+            "rebuilt",
+            "checked in",
+            n=0,
         )
         if line[:1] in "+-" and line[:3] not in ("+++", "---")
     ]
-    assert diff == ["-\n"], (
-        "cronstable/web/index.html and docs/demo/index.html have drifted "
-        "apart. Port the change to both copies. Unexpected differences:\n"
-        + "".join(diff[:40])
+    raise AssertionError(
+        "docs/demo/index.html is stale (it is generated; never edit it by "
+        "hand). Run `python scripts/build_demo.py` and commit the result. "
+        "Differences:\n" + "".join(diff[:40])
     )
 
 
@@ -243,53 +232,137 @@ def test_every_secondary_poll_loader_is_single_flight():
         )
 
 
-def test_logo_engine_is_identical_in_all_four_copies():
-    """The pendulum logo engine is one implementation living in four files.
+def test_logo_engine_extract_matches_the_dashboards_inline_copy():
+    """The pendulum logo engine has two copies left and one is generated.
 
-    The dashboard owns it; the demo mirror, the logo lab and the comparison
-    page each inline a verbatim copy because GitHub Pages serves them with no
-    build step to share a file.  Only the web/demo pair had a drift guard, so
-    a fix applied to three of the four could sit unnoticed on the docs site
-    for as long as nobody happened to diff them.  The check is byte equality,
-    since each copy is pasted in wholesale.
+    The dashboard inlines it (that page must stay a self-contained single
+    file); the logo lab and the comparison page share docs/logo-engine.js
+    via ``<script src>``; the demo mirror's inline copy is generated from
+    the dashboard's by scripts/build_demo.py.  So the only drift still
+    possible is dashboard vs the extracted file, and that is what this pins,
+    byte for byte.
     """
-    blocks = {}
-    for path in (WEB, DEMO, LAB, COMPARISON):
-        found = _ENGINE.findall(_read(path))
-        assert len(found) == 1, (
-            "expected exactly one logo engine block in %s, found %d. If the "
-            "banner comment or the engine's own <script> tag changed, "
-            "update _ENGINE; it is the anchor this check slices on."
-            % (path, len(found))
-        )
-        blocks[path] = found[0]
-
-    canonical = blocks[WEB]
-    for path, block in blocks.items():
-        if block == canonical:
-            continue
+    found = _ENGINE.findall(_read(WEB))
+    assert len(found) == 1, (
+        "expected exactly one logo engine block in %s, found %d. If the "
+        "banner comment or the engine's own <script> tag changed, update "
+        "_ENGINE; it is the anchor this check slices on." % (WEB, len(found))
+    )
+    inline = found[0][: -len("</script>")]
+    extracted = _read(ENGINE_JS)
+    if inline != extracted:
         diff = [
             line
             for line in difflib.unified_diff(
-                canonical.splitlines(keepends=True),
-                block.splitlines(keepends=True),
+                inline.splitlines(keepends=True),
+                extracted.splitlines(keepends=True),
                 WEB,
-                path,
+                ENGINE_JS,
                 n=0,
             )
             if line[:1] in "+-" and line[:3] not in ("+++", "---")
         ]
         raise AssertionError(
-            "the logo engine in %s has drifted from the dashboard's copy in "
-            "%s. Re-copy the block wholesale into every page that inlines it "
-            "(%s, %s, %s). Differences:\n%s"
-            % (path, WEB, DEMO, LAB, COMPARISON, "".join(diff[:40]))
+            "docs/logo-engine.js has drifted from the dashboard's inline "
+            "engine. It is generated; run `python scripts/build_demo.py`. "
+            "Differences:\n" + "".join(diff[:40])
         )
+
+    # and the docs pages actually consume the shared copy, exactly once,
+    # instead of quietly regrowing an inline fork
+    for path in (LAB, COMPARISON):
+        page = _read(path)
+        count = page.count('<script src="logo-engine.js"></script>')
+        assert count == 1, (
+            "%s should load the shared engine via exactly one "
+            '<script src="logo-engine.js"> tag, found %d' % (path, count)
+        )
+        assert not _ENGINE.search(page), (
+            "%s regrew an inline logo engine copy; it must consume "
+            "docs/logo-engine.js instead" % path
+        )
+
+
+_CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+_CSS_DECL = re.compile(r"(--[\w-]+|color-scheme)\s*:\s*([^;}]+)")
+
+
+def _declarations(css):
+    """{selector: {property: whitespace-normalized value}} for flat CSS.
+
+    Good enough for the palette work it serves: comments are stripped, a
+    comma list fans out to one entry per selector, and a selector declared
+    twice merges with the later declaration winning, matching the cascade
+    for equal-specificity rules.
+    """
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    out = {}
+    for selectors, body in _CSS_RULE.findall(css):
+        decls = {
+            prop: re.sub(r"\s+", "", value)
+            for prop, value in _CSS_DECL.findall(body)
+        }
+        if not decls:
+            continue
+        for selector in selectors.split(","):
+            selector = re.sub(r"\s+", " ", selector).strip()
+            if selector:
+                out.setdefault(selector, {}).update(decls)
+    return out
+
+
+def test_docs_palette_matches_the_dashboards_theme_tokens():
+    """Every declaration in docs/palette.css matches the dashboard's value.
+
+    The dashboard cannot link a stylesheet (it must stay a self-contained
+    single file), so the docs pages' shared palette is a hand-maintained
+    re-ink of its theme blocks. The palette drifted once before it was
+    pinned: logo-lab's paper inks sat three shades bright for weeks. The
+    dashboard is canonical; edit it first, then re-ink palette.css.
+    """
+    style = re.search(r"<style>(.*?)</style>", _read(WEB), re.DOTALL)
+    assert style, "no <style> block found in %s" % WEB
+    web_rules = _declarations(style.group(1))
+    palette_rules = _declarations(_read(PALETTE))
+
+    # The lab's data-pal/data-mode selectors ride along in the same rules
+    # (comma lists); the dashboard is matched through the data-theme
+    # selector or :root alone.
+    themed = {
+        selector: decls
+        for selector, decls in palette_rules.items()
+        if selector == ":root" or selector.startswith("html[data-theme")
+    }
+    expected = {":root", 'html[data-theme$="-light"]'} | {
+        'html[data-theme="%s"]' % name
+        for hue in ("carolina", "green", "amber", "modern", "standard")
+        for name in (hue, hue + "-light")
+    }
+    assert set(themed) == expected, (
+        "docs/palette.css no longer declares the full theme set the docs "
+        "pages rely on. Missing: %r, unexpected: %r"
+        % (sorted(expected - set(themed)), sorted(set(themed) - expected))
+    )
+
+    mismatches = []
+    for selector, decls in sorted(themed.items()):
+        web_decls = web_rules.get(selector, {})
+        for prop, value in sorted(decls.items()):
+            if web_decls.get(prop) != value:
+                mismatches.append(
+                    "%s { %s: %s } (dashboard has %s)"
+                    % (selector, prop, value, web_decls.get(prop))
+                )
+    assert not mismatches, (
+        "docs/palette.css has drifted from the dashboard's theme tokens "
+        "(the dashboard's inline copy is canonical):\n"
+        + "\n".join(mismatches)
+    )
 
 
 def test_demo_mirror_has_no_crlf():
     # A Windows editor or a Python open(..., "w") without newline="" rewrites
     # the whole file CRLF, which shows up as a several-thousand-line diff and
     # trips the repo's LF-only CI check.
-    for path in (WEB, DEMO):
+    for path in (WEB, DEMO, FRAGMENT, ENGINE_JS):
         assert "\r\n" not in _read(path), "%s picked up CRLF endings" % path

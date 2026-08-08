@@ -1,0 +1,109 @@
+/* cronstable theme palette, shared by the docs-site pages
+   (logo-lab.html, comparison.html).
+
+   cronstable/web/index.html is the canonical copy: the dashboard must stay
+   a self-contained single file, so it inlines these same values, and
+   tests/test_web_demo_mirror.py pins every declaration here to the
+   dashboard's, token for token. Edit the dashboard first, then re-ink this
+   file to match. The hand-tuning rationale (contrast floors, CVD checks)
+   lives with the dashboard's copy.
+
+   Each rule carries two selectors: the dashboard's html[data-theme="..."]
+   convention (comparison.html) and the logo lab's data-pal/data-mode pair.
+   The lab cannot adopt data-theme: an embedding artifact viewer stamps
+   data-theme="dark|light" on the root, which the lab treats as a host
+   signal, so plain data-theme palette selectors would be clobbered there. */
+
+:root {
+  color-scheme: dark;
+  --shadow-lg: 0 10px 40px rgba(0, 0, 0, .7);
+  /* semantic status inks, tuned for dark phosphor surfaces */
+  --ok: #3fd271; --fail: #ff5f56; --run: #4aa8ff; --pending: #ffbf47;
+  --disabled: #7d8590; --cancelled: #c98bff; --unknown: #9aa5b1;
+  --paused: #56d4dd;
+}
+
+/* ---------- dark phosphor themes ---------- */
+html[data-theme="amber"], html[data-pal="amber"] {
+  --bg: #0a0806; --bg2: #0f0b07; --panel: #110c07; --panel2: #160f08;
+  --hover: #1d1409; --border: #3a2a12; --border2: #523c1a;
+  --fg: #ffb000; --fg-dim: #c98a2c; --fg-faint: #a37a38;
+  --accent: #ffd98a; --glow: rgba(255, 176, 0, .55);
+  --selbg: rgba(255, 176, 0, .12);
+}
+html[data-theme="green"], html[data-pal="green"] {
+  --bg: #020503; --bg2: #04100a; --panel: #05130c; --panel2: #07190f;
+  --hover: #0a2014; --border: #144028; --border2: #1d6038;
+  --fg: #38ff7a; --fg-dim: #1fbf57; --fg-faint: #22a85c;
+  --accent: #b6ffce; --glow: rgba(56, 255, 122, .5);
+  --selbg: rgba(56, 255, 122, .12);
+}
+html[data-theme="modern"] {
+  --bg: #0d1117; --bg2: #0f141b; --panel: #161b22; --panel2: #1b212b;
+  --hover: #1d242e; --border: #2a313c; --border2: #3a424f;
+  --fg: #d6dee8; --fg-dim: #9aa4b2; --fg-faint: #8b95a3;
+  --accent: #79c0ff; --glow: rgba(121, 192, 255, .0);
+  --selbg: rgba(121, 192, 255, .12);
+}
+/* Carolina Blue CRT phosphor: #4B9CD3 is the hero (seated as --fg-dim) */
+html[data-theme="carolina"], html[data-pal="carolina"] {
+  --bg: #04070b; --bg2: #060c13; --panel: #081019; --panel2: #0b1620;
+  --hover: #0f1e2b; --border: #173347; --border2: #22506e;
+  --fg: #5cabde; --fg-dim: #4b9cd3; --fg-faint: #5a90b0;
+  --accent: #b5ddf5; --glow: rgba(92, 171, 222, .5);
+  --selbg: rgba(75, 156, 211, .12);
+}
+html[data-theme="standard"], html[data-pal="standard"] {
+  --bg: #0f1114; --bg2: #14161a; --panel: #171b20; --panel2: #1c2126;
+  --hover: #1f232a; --border: #31383f; --border2: #48505a;
+  --fg: #e6e9ed; --fg-dim: #a6aeb9; --fg-faint: #8f98a3;
+  --accent: #4c8dff; --glow: rgba(76, 141, 255, 0);
+  --selbg: rgba(76, 141, 255, .14);
+}
+
+/* ---------- paper (light) twins ---------- */
+html[data-theme="amber-light"], html[data-pal="amber"][data-mode="light"] {
+  --bg: #f3e9d2; --bg2: #eadcbc; --panel: #faf3e3; --panel2: #f0e5c9;
+  --hover: #e7d8b4; --border: #cdb582; --border2: #a98f52;
+  --fg: #3f2d00; --fg-dim: #6d500b; --fg-faint: #755c20;
+  --accent: #855700; --glow: rgba(138, 90, 0, .28);
+  --selbg: rgba(179, 125, 0, .16);
+}
+html[data-theme="green-light"], html[data-pal="green"][data-mode="light"] {
+  --bg: #e4f2e6; --bg2: #d4e8d8; --panel: #f2faf2; --panel2: #ddefe0;
+  --hover: #cfe6d4; --border: #a9cdb2; --border2: #7fb28c;
+  --fg: #0b3a1e; --fg-dim: #1a6238; --fg-faint: #3a7050;
+  --accent: #0d7034; --glow: rgba(18, 105, 55, .25);
+  --selbg: rgba(24, 128, 68, .15);
+}
+html[data-theme="modern-light"] {
+  --bg: #f6f8fa; --bg2: #eaeef2; --panel: #ffffff; --panel2: #f6f8fa;
+  --hover: #eff2f5; --border: #d0d7de; --border2: #a8b3bd;
+  --fg: #1f2328; --fg-dim: #57606a; --fg-faint: #656e79;
+  --accent: #0969da; --glow: rgba(9, 105, 218, 0);
+  --selbg: rgba(9, 105, 218, .12);
+}
+/* #4B9CD3 is too pale to be ink on paper; the hero moves to --border2 */
+html[data-theme="carolina-light"], html[data-pal="carolina"][data-mode="light"] {
+  --bg: #e7f0f8; --bg2: #d7e6f3; --panel: #f3f8fc; --panel2: #dfecf6;
+  --hover: #d0e2f0; --border: #a8c9e2; --border2: #4b9cd3;
+  --fg: #0e3a5c; --fg-dim: #175e91; --fg-faint: #3b688c;
+  --accent: #0d67ac; --glow: rgba(23, 94, 145, .25);
+  --selbg: rgba(75, 156, 211, .18);
+}
+html[data-theme="standard-light"], html[data-pal="standard"][data-mode="light"] {
+  --bg: #ffffff; --bg2: #f2f4f7; --panel: #ffffff; --panel2: #f7f8fa;
+  --hover: #eceff3; --border: #d9dee5; --border2: #aab3bf;
+  --fg: #14181d; --fg-dim: #4b5563; --fg-faint: #5d6675;
+  --accent: #0b5ed7; --glow: rgba(11, 94, 215, 0);
+  --selbg: rgba(11, 94, 215, .12);
+}
+/* what the dark themes take for granted about the surface: native control
+   scheme, shadow weight, and status inks dark enough for paper */
+html[data-theme$="-light"], html[data-pal][data-mode="light"] {
+  color-scheme: light;
+  --shadow-lg: 0 10px 40px rgba(0, 0, 0, .18);
+  --ok: #12692b; --fail: #b32d23; --run: #0757b8; --pending: #7d5300;
+  --disabled: #565e68; --cancelled: #7a3fd6; --unknown: #57606a;
+  --paused: #12626b;
+}

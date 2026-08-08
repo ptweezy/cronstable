@@ -34,7 +34,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Optional
 
 from cronstable import _json, dag, platform
 from cronstable.cronexpr import CronTab
@@ -151,7 +151,7 @@ DAG_ROLLUP_BULK_THRESHOLD = 8
 #: local completion) already made.
 DAG_SUMMARY_LIST_TTL = 5.0
 
-RunRef = Tuple[str, str]  # (dag_name, run_key)
+RunRef = tuple[str, str]  # (dag_name, run_key)
 
 #: XCom payload size at or above which a mapped fan-out's parse (and its
 #: portability walk) runs on a worker thread instead of the scheduler's
@@ -231,15 +231,15 @@ class DagScheduler:
     def __init__(self, cron: Any) -> None:
         self._cron = cron
         # runs this node owns (holds the advance lease for) -> the held lease.
-        self._owned: Dict[RunRef, Lease] = {}
-        self._renewers: Dict[RunRef, asyncio.Task] = {}
-        self._locks: Dict[RunRef, asyncio.Lock] = {}
+        self._owned: dict[RunRef, Lease] = {}
+        self._renewers: dict[RunRef, asyncio.Task] = {}
+        self._locks: dict[RunRef, asyncio.Lock] = {}
         # refs whose in-flight advance must run once more before its lock
         # is released: the burst-coalescing latch (see advance_one).
-        self._advance_again: Set[RunRef] = set()
+        self._advance_again: set[RunRef] = set()
         # soonest wall-clock instant an owned run wants another advance (a due
         # sensor poke or task retry); drives the loop's sleep cap.
-        self._wake: Dict[RunRef, float] = {}
+        self._wake: dict[RunRef, float] = {}
         # refs whose advance pass is in flight, refcounted (a periodic sweep
         # holds its whole due batch while each ref's own advance_one holds it
         # again).  A held ref's wake hint is polled at ADVANCE_POLL_FLOOR
@@ -249,17 +249,17 @@ class DagScheduler:
         # a full-core housekeeping spin for the pass's whole duration.  Every
         # hold is paired with a drop in a ``finally``, so a failed or
         # cancelled advance cannot leave a run polling forever.
-        self._advance_pending: Dict[RunRef, int] = {}
+        self._advance_pending: dict[RunRef, int] = {}
         # deferred catch-up replays sleeping out their per-dag jitter offset
         # (see _catch_up); cancelled by shutdown() and forget(), since a
         # replay must never land on a torn-down or swapped store.
-        self._catchup_tasks: Set[asyncio.Task] = set()
+        self._catchup_tasks: set[asyncio.Task] = set()
         # dag name -> run keys this node has SEEN terminal.  Terminality is
         # monotonic, so the adopt scan skips re-reading these (see
         # _adopt_one_dag); pruned against each key listing, rebuilt from
         # bodies by every full adopt pass and every GC pass, and a key is
         # evicted when this node (re-)creates a run under it.
-        self._terminal_run_keys: Dict[str, Set[str]] = {}
+        self._terminal_run_keys: dict[str, set[str]] = {}
         # dag name -> {run key -> cached per-run summary} backing list_dags'
         # rollup. A terminal run's summary is immutable, so it is cached and
         # never re-read; non-terminal (running/pending) runs are re-read each
@@ -272,15 +272,15 @@ class DagScheduler:
         # it by key, which is why forget() has to clear it explicitly on a
         # backend swap: run keys are deterministic, so the new store's runs
         # would otherwise read the old store's cached terminal state.
-        self._dag_summary_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._dag_summary_cache: dict[str, dict[str, dict[str, Any]]] = {}
         # dag name -> (monotonic stamp, summaries): the short-TTL memo over
         # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
         # a quiescent dag costs zero store listings between local writes.
         # Popped by _mutate/_delete_run_doc (local changes must render at
         # once), swept with the summary cache in forget(), and pruned of
         # removed dags by list_dags.  See DAG_SUMMARY_LIST_TTL.
-        self._summaries_memo: Dict[
-            str, Tuple[float, List[Dict[str, Any]]]
+        self._summaries_memo: dict[
+            str, tuple[float, list[dict[str, Any]]]
         ] = {}
         # Bumped whenever the memo above is popped or cleared. The pop alone
         # cannot uphold the pop-on-local-write contract: an uncached rebuild
@@ -294,31 +294,31 @@ class DagScheduler:
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
-        self._next_logical: Dict[str, datetime.datetime] = {}
+        self._next_logical: dict[str, datetime.datetime] = {}
         # dag name -> the schedule signature it was seeded under, so a reload
         # that changes a schedule (or disables a dag) re-seeds strictly-future
         # instead of replaying the gap (mirrors the job _refresh_schedule).
-        self._seeded: Dict[str, str] = {}
+        self._seeded: dict[str, str] = {}
         # dag name -> the schedule signature whose seed raised, so a poisoned
         # dag is logged once and skipped (a reload changing its schedule
         # retries) instead of failing -- and spamming -- every seed cadence.
-        self._seed_failed: Dict[str, str] = {}
+        self._seed_failed: dict[str, str] = {}
         # (ref, taskkey) -> a completion whose RMW failed, queued for retry on
         # later service passes (see COMPLETION_RETRY_DELAY).
-        self._pending_completions: Dict[
-            Tuple[RunRef, str], Dict[str, Any]
+        self._pending_completions: dict[
+            tuple[RunRef, str], dict[str, Any]
         ] = {}
         # run ref -> task completions the reaper has handed over but not yet
         # recorded. on_task_finished buffers here; flush_completions (called
         # once the reaper has drained a whole batch of finished jobs) records
         # each run's buffered completions in ONE document RMW instead of one
         # per task -- the win for a mapped fan-out finishing together.
-        self._completion_buffer: Dict[RunRef, List[Dict[str, Any]]] = {}
+        self._completion_buffer: dict[RunRef, list[dict[str, Any]]] = {}
         # (dag, run_key, taskkey) approval gates this node has already fired an
         # `approval_waiting` notification for.  _do_advance observes a waiting
         # gate on every pass while it is parked, so this dedups to one alert
         # per gate; a run's entries drop when it reaches a terminal state.
-        self._approval_notified: Set[Tuple[str, str, str]] = set()
+        self._approval_notified: set[tuple[str, str, str]] = set()
         self._service_task: Optional[asyncio.Task] = None
         self._next_sched_check = 0.0
         self._next_adopt = 0.0
@@ -330,7 +330,7 @@ class DagScheduler:
         backend: Optional[StateBackend] = self._cron.state_backend
         return backend
 
-    def _dags(self) -> Dict[str, Any]:
+    def _dags(self) -> dict[str, Any]:
         return getattr(self._cron, "cron_dags", {})
 
     def has_dags(self) -> bool:
@@ -364,7 +364,7 @@ class DagScheduler:
 
     async def _mutate(
         self, dag_name: str, key: str, transform
-    ) -> "Tuple[Optional[Dict[str, Any]], Any]":
+    ) -> "tuple[Optional[dict[str, Any]], Any]":
         backend = self._backend()
         if backend is None:
             return None, None
@@ -381,7 +381,7 @@ class DagScheduler:
         self._summaries_gen += 1
         return result
 
-    async def _read(self, dag_name: str, key: str) -> Optional[Dict[str, Any]]:
+    async def _read(self, dag_name: str, key: str) -> Optional[dict[str, Any]]:
         backend = self._backend()
         if backend is None:
             return None
@@ -734,7 +734,7 @@ class DagScheduler:
             cutoff = now_dt - datetime.timedelta(seconds=deadline)
             if cutoff > after:
                 after = cutoff
-        missed: List[datetime.datetime] = []
+        missed: list[datetime.datetime] = []
         nxt = self._next_fire(sched, after)
         while (
             nxt is not None and nxt <= now_dt and len(missed) < DAG_MAX_CATCHUP
@@ -808,7 +808,7 @@ class DagScheduler:
     async def _replay_catch_up(
         self,
         dagcfg: Any,
-        targets: List[datetime.datetime],
+        targets: list[datetime.datetime],
         offset: float,
         watermark: str,
     ) -> None:
@@ -1170,7 +1170,7 @@ class DagScheduler:
             )
         except asyncio.TimeoutError:
             return
-        terminal: Set[str] = set()
+        terminal: set[str] = set()
         for body in docs:
             run_key = body.get("runKey")
             if dag.is_terminal_run(body):
@@ -1394,7 +1394,7 @@ class DagScheduler:
         # failed explicitly (exit 127) per task.  Each launch is independent:
         # one failing must not skip the rest of the batch (which would
         # strand them claimed-but-unlaunched).
-        pid_stamps: List[Tuple[str, str, Optional[int], Optional[int]]] = []
+        pid_stamps: list[tuple[str, str, Optional[int], Optional[int]]] = []
         for intent in result.launches:
             try:
                 stamp = await self._launch_task(dagcfg, ref, run_id, intent)
@@ -1461,9 +1461,9 @@ class DagScheduler:
                 self._wake[ref] = self._compute_wake(spec, body, now)
 
     async def _read_expansions(
-        self, dagcfg: Any, run_id: str, body: Dict[str, Any]
-    ) -> Dict[str, Optional[List[Any]]]:
-        expansions: Dict[str, Optional[List[Any]]] = {}
+        self, dagcfg: Any, run_id: str, body: dict[str, Any]
+    ) -> dict[str, Optional[list[Any]]]:
+        expansions: dict[str, Optional[list[Any]]] = {}
         for tid, from_task, key in dag.tasks_awaiting_expansion(
             dagcfg.spec, body
         ):
@@ -1474,7 +1474,7 @@ class DagScheduler:
 
     async def _read_xcom_list(
         self, run_id: str, dag_name: str, taskkey: str, key: str
-    ) -> Optional[List[Any]]:
+    ) -> Optional[list[Any]]:
         """The JSON list an upstream published, for a mapped task to fan out.
 
         Only ever read after the upstream has *succeeded*, so its output is
@@ -1615,7 +1615,7 @@ class DagScheduler:
         return []
 
     def _compute_wake(
-        self, spec: DagSpec, body: Dict[str, Any], now: float
+        self, spec: DagSpec, body: dict[str, Any], now: float
     ) -> float:
         """The soonest instant this run wants advancing again.
 
@@ -1642,7 +1642,7 @@ class DagScheduler:
                 soonest = min(soonest, float(entry["nextRetryAt"]))
         return soonest
 
-    async def _on_terminal(self, ref: RunRef, body: Dict[str, Any]) -> None:
+    async def _on_terminal(self, ref: RunRef, body: dict[str, Any]) -> None:
         logger.info("dag run %s/%s reached a terminal state", ref[0], ref[1])
         # terminality is monotonic: remember it so the adopt scan never
         # re-reads this run's document just to rediscover it finished.
@@ -1661,7 +1661,7 @@ class DagScheduler:
             self._notify_dag_failure(ref, body)
         await self._release(ref)
 
-    def _notify_dag_failure(self, ref: RunRef, body: Dict[str, Any]) -> None:
+    def _notify_dag_failure(self, ref: RunRef, body: dict[str, Any]) -> None:
         """Fire the notify ``dag_failure`` event for a FAILED run."""
         dag_name, run_key = ref
         failed = sorted(
@@ -1683,7 +1683,7 @@ class DagScheduler:
         )
 
     def _notify_pending_approvals(
-        self, dagcfg: Any, ref: RunRef, run_id: str, body: Dict[str, Any]
+        self, dagcfg: Any, ref: RunRef, run_id: str, body: dict[str, Any]
     ) -> None:
         """Fire ``approval_waiting`` once per gate that has begun waiting.
 
@@ -1726,7 +1726,7 @@ class DagScheduler:
 
     async def _launch_task(
         self, dagcfg: Any, ref: RunRef, run_id: str, intent
-    ) -> Optional[Tuple[str, str, Optional[int], Optional[int]]]:
+    ) -> Optional[tuple[str, str, Optional[int], Optional[int]]]:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
         token, env = await self._prepare_task_run(
@@ -1800,7 +1800,7 @@ class DagScheduler:
 
     async def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
-    ) -> Tuple[Optional[str], Dict[str, str]]:
+    ) -> tuple[Optional[str], dict[str, str]]:
         """Register the task run with the loopback API; return its env.
 
         Mirrors ``Cron._prepare_job_api_run`` but scopes the run's default
@@ -1857,7 +1857,7 @@ class DagScheduler:
     async def _set_pids(
         self,
         ref: RunRef,
-        stamps: List[Tuple[str, str, Optional[int], Optional[int]]],
+        stamps: list[tuple[str, str, Optional[int], Optional[int]]],
     ) -> None:
         """Record a whole launch loop's pids in one batched RMW.
 
@@ -1934,22 +1934,10 @@ class DagScheduler:
                     ref[0],
                     ref[1],
                 )
-                for entry in entries:
-                    self._queue_completion(
-                        ref,
-                        entry["taskkey"],
-                        entry["taskId"],
-                        success=entry["success"],
-                        exit_code=entry["exitCode"],
-                        fail_reason=entry["failReason"],
-                        proc=entry["proc"],
-                        attempt=entry["attempt"],
-                        poke=entry["poke"],
-                        resources=entry.get("resources"),
-                    )
+                self._requeue_entries(ref, entries)
 
     async def _flush_run_completions(
-        self, ref: RunRef, entries: List[Dict[str, Any]]
+        self, ref: RunRef, entries: list[dict[str, Any]]
     ) -> None:
         dagcfg = self._dags().get(ref[0])
         if dagcfg is None:
@@ -1958,8 +1946,8 @@ class DagScheduler:
             for entry in entries:
                 self._pending_completions.pop((ref, entry["taskkey"]), None)
             return
-        marks: List[Dict[str, Any]] = []
-        live: List[Dict[str, Any]] = []
+        marks: list[dict[str, Any]] = []
+        live: list[dict[str, Any]] = []
         for entry in entries:
             task = dagcfg.spec.by_id.get(entry["taskId"])
             if task is None:
@@ -1999,19 +1987,7 @@ class DagScheduler:
             # reconciliation trusts forever while this daemon lives (and the
             # lease keeps peers out). So EVERY entry in the batch is queued for
             # retry, not just one.
-            for entry in live:
-                self._queue_completion(
-                    ref,
-                    entry["taskkey"],
-                    entry["taskId"],
-                    success=entry["success"],
-                    exit_code=entry["exitCode"],
-                    fail_reason=entry["failReason"],
-                    proc=entry["proc"],
-                    attempt=entry["attempt"],
-                    poke=entry["poke"],
-                    resources=entry.get("resources"),
-                )
+            self._requeue_entries(ref, live)
         else:
             applied_set = set(applied or [])
             for entry in live:
@@ -2043,7 +2019,7 @@ class DagScheduler:
         proc: Optional[str] = None,
         attempt: Optional[int] = None,
         poke: Optional[int] = None,
-        resources: Optional[Dict[str, Any]] = None,
+        resources: Optional[dict[str, Any]] = None,
     ) -> None:
         task = dagcfg.spec.by_id.get(task_id)
         if task is None:
@@ -2106,6 +2082,24 @@ class DagScheduler:
         # lock (a concurrent periodic advance may hold it).
         self._spawn_advance(ref)
 
+    def _requeue_entries(
+        self, ref: RunRef, entries: list[dict[str, Any]]
+    ) -> None:
+        """Queue buffered completion entries (buffer-key dicts) for retry."""
+        for entry in entries:
+            self._queue_completion(
+                ref,
+                entry["taskkey"],
+                entry["taskId"],
+                success=entry["success"],
+                exit_code=entry["exitCode"],
+                fail_reason=entry["failReason"],
+                proc=entry["proc"],
+                attempt=entry["attempt"],
+                poke=entry["poke"],
+                resources=entry.get("resources"),
+            )
+
     def _queue_completion(
         self,
         ref: RunRef,
@@ -2118,7 +2112,7 @@ class DagScheduler:
         proc: Optional[str],
         attempt: Optional[int],
         poke: Optional[int],
-        resources: Optional[Dict[str, Any]] = None,
+        resources: Optional[dict[str, Any]] = None,
     ) -> None:
         key = (ref, taskkey)
         prior = self._pending_completions.get(key)
@@ -2247,7 +2241,7 @@ class DagScheduler:
 
     async def _reconcile_run(
         self, dagcfg: Any, ref: RunRef
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Fail tasks a crash left running; return the observed document.
 
         The RMW already read the run document under its lock (and
@@ -2287,7 +2281,7 @@ class DagScheduler:
         *,
         approved: bool,
         by: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Record an approval-gate decision, then advance the run."""
         dagcfg = self._dags().get(dag_name)
         if dagcfg is None:
@@ -2338,7 +2332,7 @@ class DagScheduler:
 
     async def backfill(
         self, dag_name: str, start_iso: str, end_iso: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Create runs for every scheduled instant in ``[start, end]``.
 
         A deliberate replay: it is bounded by ``DAG_MAX_CATCHUP`` but ignores
@@ -2371,7 +2365,7 @@ class DagScheduler:
             nxt = self._next_fire(sched, nxt)
         return {"ok": True, "created": created}
 
-    async def list_dags(self) -> List[Dict[str, Any]]:
+    async def list_dags(self) -> list[dict[str, Any]]:
         """Per-DAG summary for the dashboard index.
 
         Carries the static graph (nodes + edges + per-task type/triggerRule/
@@ -2394,7 +2388,7 @@ class DagScheduler:
             del self._dag_summary_cache[stale]
         out = []
         for name, dagcfg in live.items():
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "name": name,
                 "enabled": dagcfg.enabled,
                 "scheduled": dagcfg.schedule_job is not None,
@@ -2419,7 +2413,7 @@ class DagScheduler:
         return out
 
     @staticmethod
-    def _summarize_run(body: Dict[str, Any]) -> Dict[str, Any]:
+    def _summarize_run(body: dict[str, Any]) -> dict[str, Any]:
         """Everything the run listings need from a run document, plus whether
         the run is terminal (so its summary can be cached).
 
@@ -2430,7 +2424,7 @@ class DagScheduler:
         of the body the caller has already parsed, which is cheap next to the
         parse it saves on later calls.
         """
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for entry in body.get("tasks", {}).values():
             st = entry.get("state", "unknown")
             counts[st] = counts.get(st, 0) + 1
@@ -2448,13 +2442,13 @@ class DagScheduler:
 
     @staticmethod
     def _rollup_from_summaries(
-        summaries: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+        summaries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         """latestRun (newest by createdAt), runCounts histogram, totalRuns."""
         if not summaries:
             return {}
         latest = max(summaries, key=lambda s: float(s.get("createdAt") or 0))
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for s in summaries:
             counts[s["state"]] = counts.get(s["state"], 0) + 1
         return {
@@ -2471,7 +2465,7 @@ class DagScheduler:
 
     async def _bulk_summaries(
         self, backend: StateBackend, ns: str, name: str
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[list[dict[str, Any]]]:
         """One list_documents sweep: rebuild the cache from every body. Used
         for the cold cache / large-delta case and when the backend cannot list
         keys only. Returns None on a hiccup, matching the old degrade
@@ -2496,7 +2490,7 @@ class DagScheduler:
 
     async def _bulk_rollup(
         self, backend: StateBackend, ns: str, name: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """The full-sweep rollup: :meth:`_bulk_summaries`, rolled up."""
         summaries = await self._bulk_summaries(backend, ns, name)
         if summaries is None:
@@ -2505,7 +2499,7 @@ class DagScheduler:
 
     async def _run_summaries(
         self, backend: StateBackend, name: str
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[list[dict[str, Any]]]:
         """Every retained run's summary, memoized for DAG_SUMMARY_LIST_TTL.
 
         The memo serves the poll traffic of a QUIESCENT dag from memory:
@@ -2537,7 +2531,7 @@ class DagScheduler:
 
     async def _run_summaries_uncached(
         self, backend: StateBackend, name: str
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[list[dict[str, Any]]]:
         """Every retained run's summary, caching immutable terminal runs.
 
         Lists keys only, drops cache entries for GC'd runs, and re-reads just
@@ -2586,7 +2580,7 @@ class DagScheduler:
 
     async def _dag_run_rollup(
         self, backend: StateBackend, name: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Per-dag run rollup for list_dags, over the cached summaries."""
         summaries = await self._run_summaries(backend, name)
         if summaries is None:
@@ -2595,7 +2589,7 @@ class DagScheduler:
 
     async def get_run(
         self, dag_name: str, run_key: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         if dag_name not in self._dags():
             return None
         return await self._read(dag_name, run_key)
@@ -2607,7 +2601,7 @@ class DagScheduler:
         *,
         max_value_bytes: int = 65536,
         max_entries: int = 500,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Every XCom value published by this run's tasks, for the dashboard.
 
         XCom lives in the artifact store under ``dagxcom/<dag>/<run_id>`` with
@@ -2626,7 +2620,7 @@ class DagScheduler:
         if body is None:
             return None
         run_id = body.get("runId")
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "dag": dag_name,
             "runKey": run_key,
             "runId": run_id,
@@ -2650,7 +2644,7 @@ class DagScheduler:
             full = str(rec.get("name") or "")
             taskkey, _, key = full.partition("/")
             size = rec.get("size")
-            entry: Dict[str, Any] = {
+            entry: dict[str, Any] = {
                 "taskkey": taskkey,
                 "key": key,
                 "sha256": rec.get("sha256"),
@@ -2688,7 +2682,7 @@ class DagScheduler:
 
     async def list_runs(
         self, dag_name: str, *, limit: int = 50
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[list[dict[str, Any]]]:
         """The newest ``limit`` runs of ``dag_name``, newest first.
 
         Served from the same per-key summary cache list_dags' rollup fills, so
@@ -2940,7 +2934,7 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime.datetime]:
     return dt
 
 
-def _listed_run(summary: Dict[str, Any]) -> Dict[str, Any]:
+def _listed_run(summary: dict[str, Any]) -> dict[str, Any]:
     """One run summary as the run-list payload.
 
     Rebuilt field by field rather than returned as-is: a summary carries the

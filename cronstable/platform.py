@@ -28,15 +28,11 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Callable, Iterator
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Dict,
-    Iterator,
-    List,
     Optional,
-    Union,
 )
 
 # asyncio is imported lazily (inside _taskkill_tree, the one function that
@@ -102,7 +98,7 @@ def supports_unix_sockets() -> bool:
 
 
 # --- Subprocess argv ------------------------------------------------------
-def encode_argv(argv: List[str]) -> List[Union[str, bytes]]:
+def encode_argv(argv: list[str]) -> list[str | bytes]:
     """Return ``argv`` in the form this platform's subprocess layer expects.
 
     On POSIX the arguments are encoded to UTF-8 bytes so the child's argv is
@@ -124,7 +120,7 @@ def encode_argv(argv: List[str]) -> List[Union[str, bytes]]:
 TASKKILL_TIMEOUT = 10.0
 
 
-def new_process_group_kwargs() -> Dict[str, Any]:
+def new_process_group_kwargs() -> dict[str, Any]:
     """Subprocess kwargs that isolate a job in its own process group.
 
     A job command routinely leaves descendants behind (``sh -c 'helper &
@@ -288,7 +284,7 @@ def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
     # interpreter; while the Proactor loop is blocked in GetQueuedCompletion
     # Status that can be delayed indefinitely.  A lightweight repeating timer
     # keeps the loop ticking so Ctrl-C is observed within the interval.
-    heartbeat = None  # type: Union[asyncio.TimerHandle, None]
+    heartbeat: asyncio.TimerHandle | None = None
 
     def _tick() -> None:
         nonlocal heartbeat
@@ -384,7 +380,7 @@ def pid_alive(pid: int) -> Optional[bool]:
                 # check the exit code: STILL_ACTIVE (259) means running.
                 STILL_ACTIVE = 259
                 code = ctypes.c_ulong()
-                alive = None  # type: Optional[bool]
+                alive: bool | None = None
                 if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
                     alive = code.value == STILL_ACTIVE
                 kernel32.CloseHandle(handle)

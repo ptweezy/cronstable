@@ -41,20 +41,19 @@ import functools
 import itertools
 import re
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from typing import (
     Any,
-    Dict,
-    FrozenSet,
-    Iterable,
-    List,
     NamedTuple,
     Optional,
-    Sequence,
-    Set,
-    Tuple,
 )
 
-from cronstable.cronexpr import CronTab
+from cronstable.cronexpr import (
+    _DOW_NAMES,
+    _MONTH_NAMES,
+    CronTab,
+    expand_field,
+)
 
 __all__ = [
     "Finding",
@@ -138,103 +137,16 @@ def _list_join(items: Sequence[str]) -> str:
     return "%s and %s" % (", ".join(parts[:-1]), parts[-1])
 
 
-def _field_values(
-    spec: str, lo: int, hi: int, names: Optional[Dict[str, int]] = None
-) -> Optional[List[int]]:
-    """Enumerate a cron field, or ``None`` for an unrestricted ``*``/``?``.
-
-    A tolerant re-implementation of the web page's ``parseField`` (kept
-    here rather than reaching into :class:`CronTab` internals so malformed
-    input degrades to prose instead of raising).
-    """
-    spec = spec.strip().lower()
-    if spec in ("*", "?"):
-        return None
-    out: Set[int] = set()
-    for part in spec.split(","):
-        body, step = part, 1
-        if "/" in part:
-            body, step_text = part.split("/", 1)
-            if not step_text.isdigit() or int(step_text) < 1:
-                raise ValueError("bad step: %s" % part)
-            step = int(step_text)
-
-        def resolve(token: str) -> Optional[int]:
-            token = token.strip().lower()
-            if names and token in names:
-                return names[token]
-            return int(token) if token.isdigit() else None
-
-        if body == "*":
-            start, end = lo, hi
-        elif "-" in body:
-            a, b = body.split("-", 1)
-            start_v, end_v = resolve(a), resolve(b)
-            if start_v is None or end_v is None:
-                raise ValueError("bad field: %s" % part)
-            if hi == 6 and end_v == 0:
-                # a day-of-week range ending in 0 reads its end as
-                # Sunday-as-7, unconditionally, exactly like the engine
-                # (sat-sun works; 0-0 is every day, a preserved quirk),
-                # so the prose cannot claim "Sunday" for a daily schedule
-                end_v = 7
-            start, end = start_v, end_v
-        else:
-            v = resolve(body)
-            if v is None:
-                raise ValueError("bad field: %s" % part)
-            start, end = v, (hi if "/" in part else v)
-        # Iterate range lazily (never list(range(...))): a huge endpoint like
-        # "1-2000000000" would otherwise allocate billions of ints before the
-        # per-value check below rejects it, an OOM that also defeats the
-        # degrade-to-prose guarantee. range is lazy and the loop raises on the
-        # first out-of-range value, so an over-range spec costs O(1) while
-        # every accepted schedule still yields identical values.
-        values: Iterable[int]
-        if start <= end:
-            values = range(start, end + 1, step)
-        else:  # wrap-around range, e.g. fri-mon
-            values = itertools.chain(
-                range(start, hi + 1, step), range(lo, end + 1, step)
-            )
-        for v in values:
-            v = 0 if (hi == 6 and v == 7) else v
-            if v < lo or v > hi:
-                # out-of-range values (month 13, dow 8, minute 60) would
-                # index past the name tables below; degrade to prose.
-                raise ValueError("out of range: %s" % part)
-            out.add(v)
-    return sorted(out)
-
-
-_MON_NAMES = {
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
-    "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
-}
-_DOW_NAMES = {
-    "sun": 0,
-    "mon": 1,
-    "tue": 2,
-    "wed": 3,
-    "thu": 4,
-    "fri": 5,
-    "sat": 6,
-}
+# The tolerant field expansion (and the month/weekday name tables it
+# resolves against) lives beside the engine's own parser these days; the
+# old name stays importable because the test suite pins its tolerant
+# branches (wrap-around ranges, lazy over-range rejection) under it.
+_field_values = expand_field
 
 
 def _finish_split(
-    spec: str, plain: List[str], phrases: List[str]
-) -> Tuple[str, List[str]]:
+    spec: str, plain: list[str], phrases: list[str]
+) -> tuple[str, list[str]]:
     """Shared epilogue of the two special-form splitters below.
 
     Rejects splits :func:`describe_cron` cannot phrase honestly, and
@@ -249,14 +161,14 @@ def _finish_split(
             raise ValueError("special forms beside a star: %s" % spec)
     elif not plain:
         raise ValueError("no usable items: %s" % spec)
-    deduped: List[str] = []
+    deduped: list[str] = []
     for phrase in phrases:
         if phrase not in deduped:
             deduped.append(phrase)
     return ",".join(plain), deduped
 
 
-def _split_special_dom(spec: str) -> Tuple[str, List[str]]:
+def _split_special_dom(spec: str) -> tuple[str, list[str]]:
     """Partition a day-of-month field into plain items and L/W phrases.
 
     Returns the comma-joined plain items (possibly empty when only
@@ -265,8 +177,8 @@ def _split_special_dom(spec: str) -> Tuple[str, List[str]]:
     forms raise, so :func:`describe_cron` degrades to its Custom line,
     matching the engine's own rejections.
     """
-    plain: List[str] = []
-    phrases: List[str] = []
+    plain: list[str] = []
+    phrases: list[str] = []
     for item in spec.strip().lower().split(","):
         if item == "l":
             phrases.append("the last day of the month")
@@ -295,14 +207,14 @@ def _split_special_dom(spec: str) -> Tuple[str, List[str]]:
     return _finish_split(spec, plain, phrases)
 
 
-def _split_special_dow(spec: str) -> Tuple[str, List[str]]:
+def _split_special_dow(spec: str) -> tuple[str, list[str]]:
     """Partition a day-of-week field into plain items and L/# phrases.
 
     The mirror of :func:`_split_special_dom` for ``L<n>`` (and its
     range form) and ``<d>#<n>`` items.
     """
-    plain: List[str] = []
-    phrases: List[str] = []
+    plain: list[str] = []
+    phrases: list[str] = []
     for item in spec.strip().lower().split(","):
         if item.startswith("l") and len(item) > 1:
             a, dash, b = item[1:].partition("-")
@@ -344,15 +256,17 @@ _HASH_HINT = re.compile(r"(?i)(?:^|[\s,])h(?:[\s,/(]|$)")
 def _engine_accepts(expr: str, hash_key: Optional[str]) -> bool:
     """True when the scheduling engine parses ``expr`` as-is.
 
-    The tolerant field parsers below deliberately accept a superset of the
-    engine (wrap-around ranges like ``fri-mon``, steps whose first stride
-    escapes the field, the classic-crontab-only ``@midnight``), which used
-    to keep the prose affirmative for text the daemon then refuses to
-    load.  The confident phrasing is gated on the engine's own verdict
-    instead, per the module contract: what the engine rejects reads as a
-    Custom line.  The web page's ``describeCron`` gates on the same rules
-    (``cronRejected``); the two must move together, and the Playwright
-    differential in tests/test_web_engine_parity.py pins them.
+    The tolerant parsers the describers lean on (the splitters below and
+    :func:`cronstable.cronexpr.expand_field`) deliberately accept a
+    superset of the engine (wrap-around ranges like ``fri-mon``, steps
+    whose first stride escapes the field, the classic-crontab-only
+    ``@midnight``), which used to keep the prose affirmative for text
+    the daemon then refuses to load.  The confident phrasing is gated
+    on the engine's own verdict instead, per the module contract: what
+    the engine rejects reads as a Custom line.  The web page's
+    ``describeCron`` gates on the same rules (``cronRejected``); the two
+    must move together, and the Playwright differential in
+    tests/test_web_engine_parity.py pins them.
     """
     try:
         if hash_key is None:
@@ -407,16 +321,16 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
         mi, hr, dom, mon, dow = core
         dom_plain, dom_phrases = _split_special_dom(dom)
         dow_plain, dow_phrases = _split_special_dow(dow)
-        minutes = _field_values(mi, 0, 59)
-        hours = _field_values(hr, 0, 23)
+        minutes = expand_field(mi, 0, 59)
+        hours = expand_field(hr, 0, 23)
         # an empty plain remainder means the field held ONLY special
         # forms: restricted, but with no plain values to enumerate
-        doms = _field_values(dom_plain, 1, 31) if dom_plain else []
-        months = _field_values(mon, 1, 12, _MON_NAMES)
-        dows = _field_values(dow_plain, 0, 6, _DOW_NAMES) if dow_plain else []
-        seconds = _field_values(sec_spec, 0, 59)
+        doms = expand_field(dom_plain, 1, 31) if dom_plain else []
+        months = expand_field(mon, 1, 12, _MONTH_NAMES)
+        dows = expand_field(dow_plain, 0, 6, _DOW_NAMES) if dow_plain else []
+        seconds = expand_field(sec_spec, 0, 59)
         years = (
-            _field_values(year_spec, 1970, 2099) if year_spec != "*" else None
+            expand_field(year_spec, 1970, 2099) if year_spec != "*" else None
         )
     except (ValueError, KeyError):
         return "Custom schedule: %s" % expr
@@ -481,8 +395,8 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
 def _describe_time(
     mi: str,
     hr: str,
-    minutes: Optional[List[int]],
-    hours: Optional[List[int]],
+    minutes: Optional[list[int]],
+    hours: Optional[list[int]],
 ) -> str:
     """The leading time-of-day phrase of :func:`describe_cron`."""
     step_m = re.match(r"^\*/(\d+)$", mi)
@@ -526,7 +440,7 @@ def _describe_time(
 
 def _describe_seconds(
     sec_spec: str,
-    seconds: Optional[List[int]],
+    seconds: Optional[list[int]],
     base: str,
     top_free: bool,
 ) -> str:
@@ -566,7 +480,7 @@ def next_fires(
     tz: Optional[datetime.tzinfo] = None,
     start: Optional[datetime.datetime] = None,
     hash_key: Optional[str] = None,
-) -> List[datetime.datetime]:
+) -> list[datetime.datetime]:
     """The next ``count`` fire times of a schedule, straight from the
     daemon's own engine (:meth:`CronTab.occurrences`), so the preview
     always agrees with what the scheduler will actually do.  Returns
@@ -643,7 +557,7 @@ def lint_schedule(
     now: Optional[datetime.datetime] = None,
     hash_key: Optional[str] = None,
     tab: Optional[CronTab] = None,
-) -> List[Finding]:
+) -> list[Finding]:
     """Advisory findings for a schedule the engine accepts.
 
     Returns ``[]`` for ``@reboot`` and for text that does not parse:
@@ -677,7 +591,7 @@ def lint_schedule(
         text = str(tab)
     if now is None:
         now = datetime.datetime.now(timezone or datetime.timezone.utc)
-    findings: List[Finding] = []
+    findings: list[Finding] = []
     # NOT `!= text`: on the re-parsing branch above, `text` is the caller's
     # RAW expression, which differs from the canonical `str(tab)` whenever the
     # author used non-single-space separators ("0  0 * * *"). Comparing
@@ -732,7 +646,7 @@ def _never_fires_message(tab: CronTab) -> str:
     )
 
 
-def _lint_day_fields(tab: CronTab) -> List[Finding]:
+def _lint_day_fields(tab: CronTab) -> list[Finding]:
     """Both day fields restricted: the AND-semantics footgun.
 
     This dialect requires a day to satisfy BOTH fields (deliberately, see
@@ -762,7 +676,7 @@ def _lint_day_fields(tab: CronTab) -> List[Finding]:
     return []
 
 
-def _lint_steps(expression: str) -> List[Finding]:
+def _lint_steps(expression: str) -> list[Finding]:
     """Star steps that do not divide their field's span run unevenly.
 
     ``*/7`` in the minute field fires at :56 and then :00 four minutes
@@ -788,7 +702,7 @@ def _lint_steps(expression: str) -> List[Finding]:
         # 5 fields, or 6 where the extra trailing column is the year;
         # zip() drops it either way
         labels = ("minute", "hour", "day-of-month", "month", "day-of-week")
-    findings: List[Finding] = []
+    findings: list[Finding] = []
     # 6-field forms have one more field (the year) than labels; the year
     # column never wraps, so non-strict zip dropping it is the point
     for label, field in zip(labels, fields, strict=False):
@@ -833,7 +747,7 @@ def _lint_steps(expression: str) -> List[Finding]:
     return findings
 
 
-def _lint_month_lengths(tab: CronTab) -> List[Finding]:
+def _lint_month_lengths(tab: CronTab) -> list[Finding]:
     """Selected days that no selected month is long enough to reach.
 
     Plain days and ``nW`` targets miss any month shorter than the day
@@ -849,7 +763,7 @@ def _lint_month_lengths(tab: CronTab) -> List[Finding]:
     offsets = tab.last_day_offsets
     if (not day_like and not offsets) or _FULL_DOM <= dom:
         return []
-    findings: List[Finding] = []
+    findings: list[Finding] = []
     dmin = min(day_like) if day_like else None
     omin = min(offsets) if offsets else None
 
@@ -906,7 +820,7 @@ def _lint_dst(
     tab: CronTab,
     timezone: datetime.tzinfo,
     now: datetime.datetime,
-) -> List[Finding]:
+) -> list[Finding]:
     """DST transition notes for schedules with restricted hours.
 
     Scans the coming year for utcoffset changes in the zone; for each
@@ -932,7 +846,7 @@ def _lint_dst(
     # two-finding cap below is preserved exactly.
     lo = day0.toordinal()  # exclusive: the walk started at day0 + 1 day
     hi = (day0 + datetime.timedelta(days=366)).toordinal()  # inclusive
-    findings: List[Finding] = []
+    findings: list[Finding] = []
     for ordinal in _zone_transitions_in_range(timezone, lo, hi):
         day = datetime.date.fromordinal(ordinal)
         # the offset changed somewhere in the 24h before `day` 00:00;
@@ -958,7 +872,7 @@ def _offset_at(
 @functools.lru_cache(maxsize=512)
 def _zone_transition_ordinals(
     timezone: datetime.tzinfo, year: int
-) -> Tuple[int, ...]:
+) -> tuple[int, ...]:
     """Proleptic-Gregorian ordinals of every day in ``year`` whose 00:00
     UTC offset differs from the previous day's, for ``timezone``.
 
@@ -973,7 +887,7 @@ def _zone_transition_ordinals(
     day = datetime.date(year, 1, 1)
     end = datetime.date(year, 12, 31)
     prev = _offset_at(timezone, day - one)
-    days: List[int] = []
+    days: list[int] = []
     while day <= end:
         offset = _offset_at(timezone, day)
         if offset != prev:
@@ -985,7 +899,7 @@ def _zone_transition_ordinals(
 
 def _zone_transitions_in_range(
     timezone: datetime.tzinfo, lo: int, hi: int
-) -> List[int]:
+) -> list[int]:
     """Ascending transition ordinals ``d`` with ``lo < d <= hi``.
 
     Gathers the memoized per-year scans for every calendar year the
@@ -996,7 +910,7 @@ def _zone_transitions_in_range(
     """
     first_year = datetime.date.fromordinal(lo + 1).year
     last_year = datetime.date.fromordinal(hi).year
-    out: List[int] = []
+    out: list[int] = []
     for year in range(first_year, last_year + 1):
         try:
             ordinals = _zone_transition_ordinals(timezone, year)
@@ -1008,7 +922,7 @@ def _zone_transitions_in_range(
 
 
 @functools.lru_cache(maxsize=4096)
-def _affected_hours(timezone: datetime.tzinfo, ordinal: int) -> FrozenSet[int]:
+def _affected_hours(timezone: datetime.tzinfo, ordinal: int) -> frozenset[int]:
     """Hours of the civil date ``ordinal`` that a transition disturbs.
 
     The 48-probe scan (24 hours, on the hour and the half hour, for the
@@ -1019,7 +933,7 @@ def _affected_hours(timezone: datetime.tzinfo, ordinal: int) -> FrozenSet[int]:
     it per job.
     """
     day = datetime.date.fromordinal(ordinal)
-    affected: Set[int] = set()
+    affected: set[int] = set()
     for hour in range(24):
         for minute in (0, 30):
             civil = datetime.datetime.combine(day, datetime.time(hour, minute))
@@ -1096,7 +1010,7 @@ def _classify(
 # ===================================================================
 def _value_runs(
     values: Iterable[int], names: Optional[Sequence[str]] = None
-) -> List[str]:
+) -> list[str]:
     """Sorted values with consecutive runs collapsed to ``a-b`` ranges.
 
     ``[1, 2, 3, 7]`` becomes ``["1-3", "7"]``; with ``names`` (the
@@ -1109,7 +1023,7 @@ def _value_runs(
         return names[value] if names is not None else str(value)
 
     ordered = sorted(values)
-    runs: List[str] = []
+    runs: list[str] = []
     i = 0
     while i < len(ordered):
         j = i
@@ -1173,7 +1087,7 @@ def why_no_run(
     tab: CronTab,
     when: datetime.datetime,
     timezone: Optional[datetime.tzinfo] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Field-by-field verdict on whether ``tab`` selects the instant
     ``when``, decomposing exactly what :meth:`CronTab.test` computes.
 
@@ -1271,7 +1185,7 @@ def why_no_run(
         },
     ]
     matches = all(check["matched"] for check in checks)
-    notes: List[Finding] = []
+    notes: list[Finding] = []
     dom_restricted = not (_FULL_DOM <= tab.days_of_month)
     dow_restricted = not (_FULL_DOW <= tab.days_of_week)
     # the "Vixie would have fired" claim is only true when the day-field
@@ -1373,10 +1287,10 @@ _NAME_CAP = 10
 #: what a fire walk actually depends on: the resolved schedule text and
 #: the resolved zone.  Everything else about an entry (its name above
 #: all) only decides which bucket the walk's result lands in.
-_WalkKey = Tuple[str, Optional[datetime.tzinfo]]
+_WalkKey = tuple[str, Optional[datetime.tzinfo]]
 
 
-def _minute_tab(tab: CronTab) -> Tuple[CronTab, int]:
+def _minute_tab(tab: CronTab) -> tuple[CronTab, int]:
     """A minute-granular twin of ``tab``, plus its fires per minute.
 
     A 7-field schedule can fire many times inside one minute; walking
@@ -1406,10 +1320,10 @@ def _fire_cells(
     hours: int,
     tz: datetime.tzinfo,
     names: bool = True,
-) -> Tuple[
-    List[List[int]],
-    Dict[Tuple[int, int], List[str]],
-    List[Set[str]],
+) -> tuple[
+    list[list[int]],
+    dict[tuple[int, int], list[str]],
+    list[set[str]],
 ]:
     """Walk every entry's fires over ``[start, start+hours)``.
 
@@ -1429,8 +1343,8 @@ def _fire_cells(
     end = start + datetime.timedelta(hours=hours)
     local_tz = _local_tzinfo()
     grid = [[0] * 60 for _ in range(24)]
-    cell_jobs: Dict[Tuple[int, int], List[str]] = {}
-    minute_jobs: List[Set[str]] = [set() for _ in range(60)]
+    cell_jobs: dict[tuple[int, int], list[str]] = {}
+    minute_jobs: list[set[str]] = [set() for _ in range(60)]
     cap = hours * 60 + 2  # backstop; a minute-granular walk cannot exceed it
     # A fleet duplicates schedules heavily (the whole reason this heatmap
     # exists), and the occurrence walk depends only on the schedule and the
@@ -1442,10 +1356,10 @@ def _fire_cells(
     # per-entry replay was O(jobs x fires).  ``unwalkable`` marks a schedule
     # that failed :func:`_minute_tab`, so its entries are skipped without
     # re-raising.  Everything here is per call: no cross-request state.
-    walk_cache: Dict[_WalkKey, Tuple[List[Tuple[int, int]], int]] = {}
-    unwalkable: Set[_WalkKey] = set()
-    members: Dict[_WalkKey, List[str]] = {}
-    keys: List[_WalkKey] = []
+    walk_cache: dict[_WalkKey, tuple[list[tuple[int, int]], int]] = {}
+    unwalkable: set[_WalkKey] = set()
+    members: dict[_WalkKey, list[str]] = {}
+    keys: list[_WalkKey] = []
     for entry in entries:
         zone = entry.timezone or local_tz
         key = (entry.tab.resolved_source, zone)
@@ -1458,7 +1372,7 @@ def _fire_cells(
             except (ValueError, KeyError):  # pragma: no cover - defensive
                 unwalkable.add(key)
                 continue
-            cells: List[Tuple[int, int]] = []
+            cells: list[tuple[int, int]] = []
             walked = 0
             for when in mtab.occurrences(start.astimezone(zone)):
                 if when >= end or walked >= cap:
@@ -1488,8 +1402,8 @@ def _fire_cells(
 def _fill_cell_jobs(
     entries: Sequence[ScheduleEntry],
     keys: Sequence[_WalkKey],
-    walk_cache: Dict[_WalkKey, Tuple[List[Tuple[int, int]], int]],
-    cell_jobs: Dict[Tuple[int, int], List[str]],
+    walk_cache: dict[_WalkKey, tuple[list[tuple[int, int]], int]],
+    cell_jobs: dict[tuple[int, int], list[str]],
 ) -> None:
     """Fill the per-cell name samples, in the caller's entry order.
 
@@ -1534,7 +1448,7 @@ def schedule_pressure(
     start: Optional[datetime.datetime] = None,
     hours: int = 24,
     tz: Optional[datetime.tzinfo] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The fleet's collision heatmap: every fire over the next 24 hours.
 
     Enumerates each entry's fire instants over ``[start, start+hours)``
@@ -1601,7 +1515,7 @@ def _tz_label(timezone: Optional[datetime.tzinfo]) -> str:
     return str(timezone) if timezone is not None else "local"
 
 
-def _semantic_key(tab: CronTab, tz_label: str) -> Tuple[Any, ...]:
+def _semantic_key(tab: CronTab, tz_label: str) -> tuple[Any, ...]:
     """A hashable stand-in for the engine's semantic ``==``, per zone.
 
     Two CronTabs are equal exactly when every parsed field set matches
@@ -1636,7 +1550,7 @@ def _semantic_key(tab: CronTab, tz_label: str) -> Tuple[Any, ...]:
 
 def duplicate_schedules(
     entries: Sequence[ScheduleEntry],
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Groups of jobs whose schedules fire on the identical instants.
 
     Grouping is SEMANTIC, by the engine's own equality, so ``*/5``,
@@ -1647,11 +1561,11 @@ def duplicate_schedules(
     spelling, a description of the shared schedule, and the member job
     names; groups of one are omitted.  Sorted largest first.
     """
-    groups: Dict[Tuple[Any, ...], List[ScheduleEntry]] = {}
+    groups: dict[tuple[Any, ...], list[ScheduleEntry]] = {}
     for entry in entries:
         key = _semantic_key(entry.tab, _tz_label(entry.timezone))
         groups.setdefault(key, []).append(entry)
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for members in groups.values():
         if len(members) < 2:
             continue
@@ -1679,8 +1593,8 @@ def suggest_slot(
     period: str = "hourly",
     start: Optional[datetime.datetime] = None,
     tz: Optional[datetime.tzinfo] = None,
-    grid: Optional[List[List[int]]] = None,
-) -> Dict[str, Any]:
+    grid: Optional[list[list[int]]] = None,
+) -> dict[str, Any]:
     """The least-loaded slot for a new job, from the fleet's real fires.
 
     ``period="hourly"`` picks a minute (a ``<m> * * * *`` schedule),
@@ -1733,7 +1647,7 @@ def suggest_slot(
             }
             for minute in order[:3]
         ]
-        busiest_out: Dict[str, Any] = {
+        busiest_out: dict[str, Any] = {
             "minute": busiest,
             "fires_in_window": loads[busiest],
         }
