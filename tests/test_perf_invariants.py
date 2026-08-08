@@ -13,7 +13,10 @@ lease-write durability split); benchmarks/README.md's waiver section
 points here.
 """
 
+import functools
 import os
+import subprocess
+import sys
 import textwrap
 
 import pytest
@@ -522,3 +525,183 @@ def test_hoisted_seq_deepcopy_parses_identically_to_the_stock_one():
         assert _deep_repr(getattr(actual, field.name)) == _deep_repr(
             getattr(expected, field.name)
         ), field.name
+
+
+# --- 8. the lazy import doors stay shut ------------------------------------
+#
+# cron.py binds `web` and `aiohttp` to a _AiohttpDoor proxy that imports the
+# real modules on first attribute access, because every consumer of them (the
+# web listener, cluster gossip, the push relay) is optional while the module
+# itself is imported by state_admin, the CLIs and the MCP surface.  Opening
+# that door costs 144 ms and 14 MB of RSS (measured in CI, run 31170258121),
+# so the invariant is a COUNT: importing cronstable.cron loads ZERO aiohttp
+# modules.  A test rather than a timing because the failure is binary and
+# platform-independent, and because the only two metrics that saw it
+# (startup.import_daemon and mem.rss_daemon_import) live in the subprocess
+# tier of a Linux-only perf job, which means a branch can carry the
+# regression for days.
+#
+# The regression this gates shipped exactly once: a module-scope
+# `@web.middleware` decorator, which reads an attribute off the proxy while
+# the module body is still running.  Anything evaluated at import time does
+# it: a decorator, a base class, a default argument, a module constant.
+#
+# discovery.py has the same shape for zeroconf (~24 ms and ~3.6 MB, its own
+# docstring) and cron.py imports discovery unconditionally, so it rides the
+# same probe for one extra string rather than waiting for its own incident.
+#
+# Gated in both directions.  The door must still OPEN on first touch, and
+# opening it must REBIND the module globals: the proxy's whole reason to
+# rebind is that `web.Response` sits on every request path and must not pay a
+# __getattr__ per call, and an import-only door would pass a naive
+# did-aiohttp-load assertion while quietly costing that forever.
+
+
+@functools.lru_cache(maxsize=1)
+def _import_door_probe():
+    """Probe the doors in a child process, once for every test below.
+
+    A child is required because of the SUITE, not this module: importing
+    tests/test_perf_invariants.py leaves both doors shut, but test_cron,
+    test_ui_endpoints and test_web_scopes all start web apps, so under a full
+    run the parent reaches this test with aiohttp long since imported and the
+    AFTER-IMPORT half would be vacuous.  Inlining the assertions passes when
+    this file is run alone and fails (or worse, silently proves nothing) in
+    the full suite.
+
+    Cached because the child costs ~0.3s, most of it importing the aiohttp
+    the zeroconf assertion never looks at, and because two tests reading two
+    DIFFERENT children could disagree about a door without either failing.
+
+    Deliberately NOT isolated (``-I``/``-E``): tox.ini puts the package on
+    PYTHONPATH, so an isolated child cannot import cronstable at all.  The
+    parse below carries the weight instead.  It requires every key and calls
+    ``int()`` without a fallback, so a sitecustomize or shim printing to
+    stdout splices into a key name and fails loudly here, rather than
+    degrading a count to a string and reporting a door state nobody measured.
+    """
+    code = textwrap.dedent(
+        """
+        import sys
+
+        import cronstable.cron as cron
+
+        def loaded(root):
+            return sum(
+                1 for m in sys.modules
+                if m == root or m.startswith(root + ".")
+            )
+
+        print("AIOHTTP-AFTER-IMPORT", loaded("aiohttp"))
+        print("ZEROCONF-AFTER-IMPORT", loaded("zeroconf"))
+        print("ZEROCONF-INSTALLED", int(_zeroconf_installed()))
+        cron.web.Response  # first touch: this is what opens the door
+        print("AIOHTTP-AFTER-TOUCH", loaded("aiohttp"))
+        # the NAME, not type(...).__name__: both globals rebind to modules, so
+        # a door that bound `aiohttp` to aiohttp.web (or either to the wrong
+        # one) reads as "module" on both and slips through.
+        print("WEB-NAME-AFTER-TOUCH", getattr(cron.web, "__name__", "?"))
+        print(
+            "AIOHTTP-NAME-AFTER-TOUCH",
+            getattr(cron.aiohttp, "__name__", "?"),
+        )
+        """
+    )
+    preamble = textwrap.dedent(
+        """
+        import importlib.util
+
+        def _zeroconf_installed():
+            return importlib.util.find_spec("zeroconf") is not None
+        """
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", preamble + code],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    out = {}
+    for line in done.stdout.split("\n"):
+        key, _, value = line.partition(" ")
+        if key.endswith("-NAME-AFTER-TOUCH"):
+            out[key] = value.strip()
+        elif key.endswith(("-AFTER-IMPORT", "-AFTER-TOUCH", "-INSTALLED")):
+            # int(), never a silent fallback: a garbled count must raise here
+            # rather than reach an assertion and be reported as a door that
+            # is open when nothing was measured at all.
+            out[key] = int(value)
+    missing = {
+        "AIOHTTP-AFTER-IMPORT",
+        "ZEROCONF-AFTER-IMPORT",
+        "ZEROCONF-INSTALLED",
+        "AIOHTTP-AFTER-TOUCH",
+        "WEB-NAME-AFTER-TOUCH",
+        "AIOHTTP-NAME-AFTER-TOUCH",
+    } - set(out)
+    assert not missing, "probe child printed no %s\nstdout:\n%s" % (
+        sorted(missing),
+        done.stdout,
+    )
+    return out
+
+
+def test_importing_the_daemon_loads_no_aiohttp_and_first_touch_loads_it():
+    probe = _import_door_probe()
+    assert probe["AIOHTTP-AFTER-IMPORT"] == 0, (
+        "importing cronstable.cron pulled in aiohttp, so the lazy door is "
+        "open at import time: something in the module body reads an "
+        "attribute off the `web`/`aiohttp` proxy (a decorator, a base "
+        "class, a default argument, a module-level constant). Move it onto "
+        "a runtime path. This costs every offline caller 144 ms and 14 MB "
+        "of RSS, and gates startup.import_daemon / mem.rss_daemon_import."
+    )
+    assert probe["AIOHTTP-AFTER-TOUCH"] > 0, (
+        "touching cron.web did not import aiohttp: the door no longer "
+        "resolves the real module, which breaks every web/cluster/push "
+        "path at runtime."
+    )
+    # the import alone is not the contract: __getattr__ must also rebind both
+    # globals, to the RIGHT modules, or every later web.Response(...) on the
+    # request path pays a proxy hop plus a sys.modules lookup forever. Assert
+    # the module names: both rebind to modules, so `type(...).__name__` reads
+    # "module" either way and cannot see a door that bound `aiohttp` to
+    # aiohttp.web. That mutation is one word in cron.py and it breaks the
+    # `except (..., aiohttp.ClientError, ...)` tuples, which is an
+    # AttributeError raised while already handling a failure.
+    assert probe["WEB-NAME-AFTER-TOUCH"] == "aiohttp.web", (
+        "cron.web resolved to %r after the first touch, not aiohttp.web: the "
+        "door imported aiohttp but rebound the global to the wrong object "
+        "(or not at all, leaving the proxy on the request path)."
+        % probe["WEB-NAME-AFTER-TOUCH"]
+    )
+    assert probe["AIOHTTP-NAME-AFTER-TOUCH"] == "aiohttp", (
+        "cron.aiohttp resolved to %r after touching cron.web, not aiohttp: "
+        "the door rebinds only one of the two globals it promises, or binds "
+        "them to the same module."
+        % probe["AIOHTTP-NAME-AFTER-TOUCH"]
+    )
+
+
+def test_importing_the_daemon_loads_no_zeroconf():
+    # discovery.py's own door, same shape and the same blind spot: cron.py
+    # imports discovery unconditionally while web.bonjour is off by default,
+    # so an eager zeroconf import would tax every daemon start,
+    # --validate-config and --job-set-id. Nothing else gates it.
+    probe = _import_door_probe()
+    # zeroconf is an optional extra (pyproject's `discovery`), so a zero here
+    # proves a shut door only when the package is actually installed. Without
+    # this the gate goes permanently green the day a dev-dep prune or a
+    # platform marker drops zeroconf from the row, with the regression live:
+    # discovery.py catches `except Exception` around its import, so hoisting
+    # those imports to module scope stays silent on a machine without it.
+    assert probe["ZEROCONF-INSTALLED"] == 1, (
+        "zeroconf is not installed in this environment, so the door check "
+        "below would pass vacuously. It is required by requirements_dev.txt; "
+        "install the `discovery` extra or fix the environment."
+    )
+    assert probe["ZEROCONF-AFTER-IMPORT"] == 0, (
+        "importing cronstable.cron pulled in zeroconf: discovery.py's "
+        "_probe_zeroconf deferral was defeated, costing ~24 ms and ~3.6 MB "
+        "of RSS on every start that never advertises."
+    )
