@@ -80,6 +80,21 @@ APPROVAL_POLL_INTERVAL = 5.0
 # cron.MAX_CATCHUP_OCCURRENCES so a long outage cannot stampede.
 DAG_MAX_CATCHUP = 100
 
+# Durable checkpoint stream for a dag's catch-up cycles, the dag twin of the
+# job engine's ``catchup/<job>`` stream (cron.CATCHUP_STREAM_PREFIX; a
+# distinct prefix because dag and job names would otherwise share one stream
+# namespace).  An ``open`` record persists the owed watermark BEFORE the
+# jitter sleeper is spawned: the replay targets live only in task memory
+# across the sleep, while the scheduled path (and _fire_past_gap's
+# current-slot create) keeps landing NEWER run documents, so a restart
+# mid-jitter would otherwise recompute "nothing missed" from the advanced
+# document watermark and the backfill would vanish without a log line.  The
+# boot-time _catch_up hoists its watermark back to an open checkpoint's,
+# exactly as Cron._missed_occurrences does.  Keep depth mirrors
+# cron.CATCHUP_STREAM_KEEP.
+DAG_CATCHUP_STREAM_PREFIX = "catchup-dag/"
+DAG_CATCHUP_STREAM_KEEP = 8
+
 # The furthest back _fire_forward will retroactively replay occurrence by
 # occurrence, mirroring cron.CATCHUP_LIMIT for jobs: a gap within this bound
 # is tick overhead (a slow advance pass, many simultaneous fires) and every
@@ -123,7 +138,50 @@ COMPLETION_RETRY_MAX_DELAY = 60.0
 #: cached) stays below this and reads only the few that changed.
 DAG_ROLLUP_BULK_THRESHOLD = 8
 
+#: How long one dag's run-summary LIST may be served from memory before the
+#: store is listed again.  The per-run summary cache above already avoids
+#: re-PARSING terminal runs, but the keys listing itself still hit the store
+#: once per dag per request: with the dashboard's /dags poll (and any open
+#: run drawer) that was N_dags listings every ~3s per viewer, forever, on a
+#: quiescent store.  Every LOCAL write funnels through _mutate/_delete_run_doc
+#: and pops the memo, so this-node changes render immediately; the TTL only
+#: bounds how late another node's writes appear in the index rollup, which is
+#: well inside the gossip staleness the fleet view already tolerates.  Sits
+#: beside the same tradeoff cron's per-job trends cache (5s TTL, busted on
+#: local completion) already made.
+DAG_SUMMARY_LIST_TTL = 5.0
+
 RunRef = Tuple[str, str]  # (dag_name, run_key)
+
+#: XCom payload size at or above which a mapped fan-out's parse (and its
+#: portability walk) runs on a worker thread instead of the scheduler's
+#: event loop.  The payload cap is dag.MAX_MAPPED_XCOM_BYTES (16 MiB), and
+#: parsing a multi-MB list inline stalled every handler and heartbeat for
+#: tens of ms per expansion; below this floor the parse is cheaper than the
+#: thread hop it would buy (a 64 KiB bytes-path parse is a few hundred us,
+#: about the hop's own dispatch cost).
+_XCOM_PARSE_OFFLOAD_MIN = 64 * 1024
+
+
+def _parse_portable_xcom(data: bytes) -> Any:
+    """Parse a mapped-task XCom payload; portability-check a usable list.
+
+    Factored out of :meth:`DagScheduler._mapped_items` so the large-payload
+    branch can run the WHOLE thing on a worker thread.  The bytes go
+    straight to ``_json.loads``: the old ``data.decode()`` allocated a full
+    second copy and forced the str branch, whose wide-int prescan is a
+    whole-payload regex rather than the bytes branch's translate fast path.
+    An over-long list skips the portability walk on purpose:
+    ``_apply_expansions`` rejects it at its own MAX_MAPPED_ITEMS check, so
+    the O(len) walk would be pure waste on a list never embedded in the run
+    document.  Raises ``_json.UnsupportedValue`` for a non-portable value
+    and any other ``ValueError`` for undecodable bytes or invalid JSON,
+    which the caller maps to its existing warn-and-empty arms.
+    """
+    parsed = _json.loads(data)
+    if isinstance(parsed, list) and len(parsed) <= dag.MAX_MAPPED_ITEMS:
+        _json.ensure_portable(parsed)
+    return parsed
 
 
 def _now() -> float:
@@ -192,6 +250,10 @@ class DagScheduler:
         # hold is paired with a drop in a ``finally``, so a failed or
         # cancelled advance cannot leave a run polling forever.
         self._advance_pending: Dict[RunRef, int] = {}
+        # deferred catch-up replays sleeping out their per-dag jitter offset
+        # (see _catch_up); cancelled by shutdown() and forget(), since a
+        # replay must never land on a torn-down or swapped store.
+        self._catchup_tasks: Set[asyncio.Task] = set()
         # dag name -> run keys this node has SEEN terminal.  Terminality is
         # monotonic, so the adopt scan skips re-reading these (see
         # _adopt_one_dag); pruned against each key listing, rebuilt from
@@ -211,6 +273,24 @@ class DagScheduler:
         # backend swap: run keys are deterministic, so the new store's runs
         # would otherwise read the old store's cached terminal state.
         self._dag_summary_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # dag name -> (monotonic stamp, summaries): the short-TTL memo over
+        # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
+        # a quiescent dag costs zero store listings between local writes.
+        # Popped by _mutate/_delete_run_doc (local changes must render at
+        # once), swept with the summary cache in forget(), and pruned of
+        # removed dags by list_dags.  See DAG_SUMMARY_LIST_TTL.
+        self._summaries_memo: Dict[
+            str, Tuple[float, List[Dict[str, Any]]]
+        ] = {}
+        # Bumped whenever the memo above is popped or cleared. The pop alone
+        # cannot uphold the pop-on-local-write contract: an uncached rebuild
+        # spans awaits, and a write landing in that window pops an entry that
+        # does not exist yet, so the rebuild would memoize its pre-write
+        # reads under a fresh stamp. _run_summaries samples this before its
+        # first await and skips the store when it moved (the same guard as
+        # Cron._memo_gen). One counter for the whole memo: a cross-dag write
+        # costing one extra rebuild is cheap.
+        self._summaries_gen = 0
         self._next_full_adopt = 0.0
         # in-memory forward next-fire index per scheduled dag (like the job
         # next-fire index); catch-up of missed runs is a one-time seed step.
@@ -288,10 +368,18 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return None, None
-        return await asyncio.wait_for(
+        result = await asyncio.wait_for(
             backend.mutate_document(self._ns(dag_name), key, transform),
             timeout=STATE_OP_TIMEOUT,
         )
+        # every local run-doc write funnels through here: pop the summary
+        # memo so this node's own changes (create, advance, finish, adopt)
+        # render on the very next poll instead of aging out by TTL. The bump
+        # is the half the pop cannot cover: it voids a rebuild already in
+        # flight, whose entry is not there to pop yet (see _summaries_gen).
+        self._summaries_memo.pop(dag_name, None)
+        self._summaries_gen += 1
+        return result
 
     async def _read(self, dag_name: str, key: str) -> Optional[Dict[str, Any]]:
         backend = self._backend()
@@ -626,8 +714,21 @@ class DagScheduler:
     async def _catch_up(self, dagcfg: Any, now_dt: datetime.datetime) -> None:
         sched = dagcfg.schedule_job
         after = await self._durable_watermark(dagcfg)
+        # Hoist back to an open checkpoint's (older) watermark when a
+        # previous deferred replay never closed (a restart mid-jitter, here
+        # or on a crashed node): ordinary scheduled fires landing after that
+        # cycle opened have advanced the document-derived watermark past the
+        # still-unreplayed slots.  Mirrors Cron._missed_occurrences.
+        pending = await self._pending_catchup_watermark(dagcfg.name)
+        pending_dt = _parse_iso(pending) if pending else None
+        if pending_dt is not None and (after is None or pending_dt < after):
+            after = pending_dt
         if after is None:
             return  # never ran: nothing missed to replay
+        # The cycle's reference watermark: pre-deadline-cutoff, like the job
+        # engine's (the cutoff moves with the clock, so recomputation on
+        # resume re-applies it against the resume-time now).
+        watermark = after.isoformat()
         deadline = sched.startingDeadlineSeconds
         if deadline:
             cutoff = now_dt - datetime.timedelta(seconds=deadline)
@@ -641,15 +742,130 @@ class DagScheduler:
             missed.append(nxt)
             nxt = self._next_fire(sched, nxt)
         if not missed:
+            if pending is not None:
+                # the open cycle was covered meanwhile (another node, or the
+                # deadline expired the slots): close it so restarts stop
+                # resuming it.
+                await self._checkpoint_catchup(dagcfg.name, "close", watermark)
             return
         targets = missed[-1:] if sched.onMissed == "run-once" else missed
+        if (
+            sched.onMissed != "run-once"
+            and len(missed) >= DAG_MAX_CATCHUP
+            and nxt is not None
+            and nxt <= now_dt
+        ):
+            # the job engine's cap (cron._missed_occurrences) warns when it
+            # drops occurrences; truncating a dag's replay must be exactly
+            # as loud, never silent.
+            logger.warning(
+                "dag catch-up: %s missed at least %d runs; replaying %d "
+                "and dropping the rest (set startingDeadlineSeconds to "
+                "bound the window, or use onMissed: run-once)",
+                dagcfg.name,
+                DAG_MAX_CATCHUP,
+                DAG_MAX_CATCHUP,
+            )
+        # The same deterministic per-name spread the job engine applies
+        # (Cron._catchup_offset, stable across boots and the fleet):
+        # ``catchupJitterSeconds`` is accepted and validated on dag
+        # schedules, so it must spread their replays too, not silently
+        # apply to plain jobs only.
+        offset = self._cron._catchup_offset(
+            dagcfg.name, sched.catchupJitterSeconds
+        )
         logger.info(
-            "dag %s: catch-up replaying %d missed run(s)",
+            "dag %s: catch-up replaying %d missed run(s)%s",
             dagcfg.name,
             len(targets),
+            " after a %.1fs jitter offset" % offset if offset > 0 else "",
         )
-        for when in targets:
-            await self._create_run(dagcfg, when, "catchup")
+        if offset <= 0:
+            # Inline, on the service pass: no checkpoint needed for a fresh
+            # cycle (creates ascend, so a crash mid-loop leaves the document
+            # watermark at the last created target and the next boot's
+            # recompute covers the remainder), but a RESUMED cycle must
+            # close its checkpoint once the targets have all landed.
+            for when in targets:
+                await self._create_run(dagcfg, when, "catchup")
+            if pending is not None:
+                await self._checkpoint_catchup(dagcfg.name, "close", watermark)
+            return
+        # Deferred on a spawned task, like Cron._run_catch_up: the seed and
+        # gap-resume paths run on the service pass, which walks every dag
+        # serially and must not sleep out one dag's offset inline.
+        # Checkpoint the intent BEFORE spawning the sleeper (the job twin's
+        # rule, cron._evaluate_catch_up): a crash/restart mid-jitter then
+        # resumes from `watermark` instead of losing the owed slots to the
+        # advancing run-document ledger.
+        await self._checkpoint_catchup(dagcfg.name, "open", watermark)
+        task = asyncio.create_task(
+            self._replay_catch_up(dagcfg, targets, offset, watermark)
+        )
+        self._catchup_tasks.add(task)
+        task.add_done_callback(self._catchup_tasks.discard)
+
+    async def _replay_catch_up(
+        self,
+        dagcfg: Any,
+        targets: List[datetime.datetime],
+        offset: float,
+        watermark: str,
+    ) -> None:
+        """Create ``dagcfg``'s catch-up runs after its jitter offset.
+
+        The dag twin of ``Cron._run_catch_up``'s deferred start.  The dag is
+        re-read after the sleep and REVALIDATED like the job twin: a reload
+        during the offset can remove or disable the dag, drop its schedule,
+        or flip ``onMissed`` to ``skip`` (the operator saying "do not
+        backfill"), and cluster ownership can move, in which case the new
+        owner resumes from the open checkpoint and creating here too would
+        double-run the backfill.  The run documents are materialised from
+        the re-read object, not the one captured when the offset was
+        scheduled: a reload can equally well rewrite the task graph, and
+        creating from the captured config would seed runs against a spec the
+        daemon no longer has.  The missed INSTANTS still come from the
+        original computation, which is correct: the schedule they were
+        derived from is what was actually missed.  The cycle's checkpoint is
+        closed only after the last ``_create_run`` lands; every early return
+        leaves it open on purpose, so a restart (or the new owner, or a
+        re-enable) resumes the still-owed slots instead of losing them.
+        (A backend swap cancels this task outright, see :meth:`forget`.)
+        """
+        try:
+            await asyncio.sleep(offset)
+            current = self._dags().get(dagcfg.name)
+            sched = current.schedule_job if current is not None else None
+            if (
+                current is None
+                or not current.enabled
+                or sched is None
+                or sched.onMissed == "skip"
+                or not isinstance(sched.schedule, CronTab)
+            ):
+                logger.info(
+                    "dag %s: removed or disabled during its catch-up jitter "
+                    "window; dropping the backfill",
+                    dagcfg.name,
+                )
+                return
+            if not self._cron._cluster_allows(sched):
+                logger.info(
+                    "dag %s: ownership moved during its catch-up jitter "
+                    "window; leaving the backfill to the new owner (which "
+                    "resumes from the open checkpoint)",
+                    dagcfg.name,
+                )
+                return
+            for when in targets:
+                await self._create_run(current, when, "catchup")
+            await self._checkpoint_catchup(dagcfg.name, "close", watermark)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - per-dag isolation, like the seed
+            logger.exception(
+                "dag %s: deferred catch-up replay failed", dagcfg.name
+            )
 
     async def _durable_watermark(
         self, dagcfg: Any
@@ -668,6 +884,73 @@ class DagScheduler:
             if when is not None and (latest is None or when > latest):
                 latest = when
         return latest
+
+    @staticmethod
+    def _catchup_stream(dag_name: str) -> str:
+        """The durable checkpoint stream for a dag's catch-up cycles."""
+        return DAG_CATCHUP_STREAM_PREFIX + dag_name
+
+    async def _pending_catchup_watermark(self, dag_name: str) -> Optional[str]:
+        """The watermark of an unfinished backfill cycle, if one is open.
+
+        The dag twin of ``Cron._pending_catchup_watermark``: an ``open``
+        without a following ``close`` means a previous deferred replay (here
+        or on a crashed node) never completed, and catch-up should resume
+        from ITS watermark rather than the run documents': scheduled fires
+        landing after that boot advanced the derived watermark past the
+        still-unreplayed slots.
+        """
+        backend = self._backend()
+        if backend is None:
+            return None
+        recs = await asyncio.wait_for(
+            backend.list_records(
+                self._catchup_stream(dag_name), limit=1, newest_first=True
+            ),
+            timeout=STATE_OP_TIMEOUT,
+        )
+        if recs and recs[0].get("kind") == "open":
+            watermark = recs[0].get("watermark")
+            if isinstance(watermark, str) and watermark:
+                return watermark
+        return None
+
+    async def _checkpoint_catchup(
+        self, dag_name: str, kind: str, watermark: str
+    ) -> None:
+        """Append an ``open``/``close`` catch-up checkpoint (best-effort).
+
+        The dag twin of ``Cron._checkpoint_catchup``, with the same
+        contract: a failure to checkpoint must never block the backfill
+        itself (it only costs crash-resume fidelity, which is logged), and
+        the stream is at-least-once by design; a resumed cycle merely
+        re-creates run documents the create-if-absent dedup already has.
+        """
+        backend = self._backend()
+        if backend is None:
+            return
+        record = {
+            "kind": kind,
+            "watermark": watermark,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        try:
+            await asyncio.wait_for(
+                backend.append_record(
+                    self._catchup_stream(dag_name),
+                    record,
+                    prune_keep=DAG_CATCHUP_STREAM_KEEP,
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except Exception as ex:  # noqa: BLE001 - checkpoint is best-effort
+            logger.warning(
+                "dag %s: could not checkpoint catch-up %r (%s); a restart "
+                "mid-backfill may not resume it",
+                dag_name,
+                kind,
+                ex,
+            )
 
     async def _create_run(
         self, dagcfg: Any, logical_dt: datetime.datetime, kind: str
@@ -1131,7 +1414,9 @@ class DagScheduler:
                     intent.task_id,
                     success=False,
                     exit_code=127,
-                    fail_reason="launch error",
+                    # the one vocabulary for a task that never started, shared
+                    # with _launch_task's own cleanup path below
+                    fail_reason="launch failed",
                     proc=proc,
                     attempt=intent.attempt,
                     poke=intent.poke_number if intent.is_sensor else None,
@@ -1281,8 +1566,34 @@ class DagScheduler:
             return []
         _record, data = got
         try:
-            parsed = _json.loads(data.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+            # parse + portability walk together (see _parse_portable_xcom);
+            # a large payload takes them both to a worker thread, because a
+            # multi-MB inline parse stalls dispatch, every web handler and
+            # the cluster heartbeats for its whole duration.
+            if len(data) >= _XCOM_PARSE_OFFLOAD_MIN:
+                parsed = await asyncio.to_thread(_parse_portable_xcom, data)
+            else:
+                parsed = _parse_portable_xcom(data)
+        except _json.UnsupportedValue as exc:
+            # a value that parses but is not fleet-portable (an int outside
+            # the 64-bit window, a non-finite float): embedding it in the
+            # run document would make _json.dumps_bytes raise on EVERY
+            # advance, wedging the run forever. Treat a mis-published
+            # upstream like the not-a-list case: warn and map to empty.
+            # (Ordered before ValueError: UnsupportedValue subclasses it.)
+            logger.warning(
+                "dag %s: xcom %r from %r contains a non-portable value "
+                "(%s); mapping it to an empty fan-out",
+                dag_name,
+                key,
+                taskkey,
+                exc,
+            )
+            return []
+        except ValueError:
+            # undecodable bytes land here too: the bytes-path loads folds
+            # what used to be the decode()'s UnicodeDecodeError into its
+            # own ValueError.
             logger.warning(
                 "dag %s: xcom %r from %r is not valid JSON; mapping it to an "
                 "empty fan-out",
@@ -1292,29 +1603,6 @@ class DagScheduler:
             )
             return []
         if isinstance(parsed, list):
-            if len(parsed) > dag.MAX_MAPPED_ITEMS:
-                # too many items to materialise; _apply_expansions fails the
-                # task at its own MAX_MAPPED_ITEMS check.  Return it directly
-                # and skip the O(len) portability walk -- pure waste on a list
-                # that is about to be rejected, never embedded in the run doc.
-                return parsed
-            try:
-                _json.ensure_portable(parsed)
-            except _json.UnsupportedValue as exc:
-                # a value that parses but is not fleet-portable (an int outside
-                # the 64-bit window, a non-finite float): embedding it in the
-                # run document would make _json.dumps_bytes raise on EVERY
-                # advance, wedging the run forever. Treat a mis-published
-                # upstream like the not-a-list case -- warn and map to empty.
-                logger.warning(
-                    "dag %s: xcom %r from %r contains a non-portable value "
-                    "(%s); mapping it to an empty fan-out",
-                    dag_name,
-                    key,
-                    taskkey,
-                    exc,
-                )
-                return []
             return parsed
         logger.warning(
             "dag %s: xcom %r from %r is a %s, not a list; mapping it to an "
@@ -1441,7 +1729,7 @@ class DagScheduler:
     ) -> Optional[Tuple[str, str, Optional[int], Optional[int]]]:
         template = dagcfg.task_templates[intent.task_id]
         taskkey = intent.taskkey
-        token, env = self._prepare_task_run(
+        token, env = await self._prepare_task_run(
             dagcfg, run_id, ref[1], intent, template
         )
         dref = _DagRef(
@@ -1463,7 +1751,25 @@ class DagScheduler:
             dag_ref=dref,
         )
         try:
-            await running.start()
+            # a mapped fan-out launches up to MAX_CLAIMS_PER_PASS instances
+            # back to back: share the daemon-wide spawn gate so the burst's
+            # synchronous fork/exec work interleaves with other loop work
+            # (see cron._SPAWN_BURST_LIMIT).
+            async with self._cron._spawn_gate:
+                await running.start()
+        except asyncio.CancelledError:
+            # Shutdown/restart while queued behind the spawn gate (the
+            # minute-boundary burst can hold a launch back there for a
+            # while): the task never started, so recording it FAILED would
+            # persist a wrong terminal state and burn a retry attempt, and
+            # swallowing the cancel would let the launch loop keep
+            # launching the rest of the batch mid-shutdown.  Clean up the
+            # run registration and re-raise, like maybe_launch_job; the
+            # claimed slot is protected by reconciliation (proc was set at
+            # claim), so the next owner resumes it.
+            if token is not None and self._cron._job_api is not None:
+                await self._cron._job_api.finish_run(token)
+            raise
         except BaseException:  # noqa: BLE001 - mirror maybe_launch_job cleanup
             if token is not None and self._cron._job_api is not None:
                 await self._cron._job_api.finish_run(token)
@@ -1480,7 +1786,7 @@ class DagScheduler:
                 poke=dref.poke,
             )
             return None
-        self._cron.running_jobs[template.name].append(running)
+        self._cron._add_running_instance(running)
         self._cron._jobs_running.set()
         pid = running.proc.pid if running.proc is not None else None
         # the pid is NOT stamped here: the caller collects every launched
@@ -1492,7 +1798,7 @@ class DagScheduler:
         # pid), and the reaper will record its completion.
         return (taskkey, dref.proc, pid, dref.attempt)
 
-    def _prepare_task_run(
+    async def _prepare_task_run(
         self, dagcfg: Any, run_id: str, run_key: str, intent, template
     ) -> Tuple[Optional[str], Dict[str, str]]:
         """Register the task run with the loopback API; return its env.
@@ -1501,6 +1807,8 @@ class DagScheduler:
         namespace to the DAG run's XCom scope and injects the
         ``CRONSTABLE_DAG_*``
         vars, so ``cronstable xcom`` / ``artifact`` land in the run scope.
+        Secret staging (including the fromFile executor offload) lives in
+        :func:`cronstable.jobapi.stage_secrets`.
         """
         scope = dag.xcom_scope(dagcfg.name, run_id)
         dag_env = {
@@ -1520,23 +1828,16 @@ class DagScheduler:
         api = self._cron._job_api
         if api is None or api.base_url is None:
             return None, dag_env
-        from cronstable.config import _resolve_secret
-        from cronstable.jobapi import RunContext, run_environment
+        from cronstable.jobapi import (
+            RunContext,
+            run_environment,
+            stage_secrets,
+        )
 
-        secrets: Dict[str, str] = {}
-        for spec in template.secrets:
-            name = spec.get("name")
-            try:
-                value = _resolve_secret(
-                    spec,
-                    "dag {} task {} secret {}".format(
-                        dagcfg.name, intent.task_id, name
-                    ),
-                )
-            except Exception:  # noqa: BLE001 - a bad secret is skipped, 404s
-                continue
-            if name and value is not None:
-                secrets[name] = value
+        secrets = await stage_secrets(
+            template.secrets,
+            "dag {} task {}".format(dagcfg.name, intent.task_id),
+        )
         ctx = RunContext(
             token=os.urandom(32).hex(),
             run_id=os.urandom(16).hex(),
@@ -2083,8 +2384,16 @@ class DagScheduler:
         owns ``schedule_str`` (avoiding a cron<->dagrun import cycle).
         """
         backend = self._backend()
+        # a reload that removed (or renamed) a dag must not leave its run
+        # summaries pinned in the caches for the life of the process; the
+        # live config is the authority on which keys may stay.
+        live = self._dags()
+        for stale in [k for k in self._summaries_memo if k not in live]:
+            del self._summaries_memo[stale]
+        for stale in [k for k in self._dag_summary_cache if k not in live]:
+            del self._dag_summary_cache[stale]
         out = []
-        for name, dagcfg in self._dags().items():
+        for name, dagcfg in live.items():
             entry: Dict[str, Any] = {
                 "name": name,
                 "enabled": dagcfg.enabled,
@@ -2195,6 +2504,38 @@ class DagScheduler:
         return self._rollup_from_summaries(summaries)
 
     async def _run_summaries(
+        self, backend: StateBackend, name: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Every retained run's summary, memoized for DAG_SUMMARY_LIST_TTL.
+
+        The memo serves the poll traffic of a QUIESCENT dag from memory:
+        without it the keys listing below still hit the store once per dag
+        per /dags poll (and per run-drawer refresh) per viewer.  A fresh
+        shallow copy is returned each time because list_runs sorts its
+        result in place.  Failures are never memoized, and local writes pop
+        the entry (see _mutate), so the TTL delays only remote nodes'
+        changes.
+        """
+        memo = self._summaries_memo.get(name)
+        if (
+            memo is not None
+            and time.monotonic() - memo[0] < DAG_SUMMARY_LIST_TTL
+        ):
+            return list(memo[1])
+        # sampled before the rebuild's first await: a local write landing
+        # mid-rebuild pops a memo entry that does not exist yet, so only a
+        # moved generation can flag that the rebuild below saw pre-write
+        # state which must not be memoized, or the pop-on-local-write
+        # contract breaks for a full TTL (see _summaries_gen).
+        gen = self._summaries_gen
+        summaries = await self._run_summaries_uncached(backend, name)
+        if summaries is not None:
+            if gen == self._summaries_gen:
+                self._summaries_memo[name] = (time.monotonic(), summaries)
+            return list(summaries)
+        return None
+
+    async def _run_summaries_uncached(
         self, backend: StateBackend, name: str
     ) -> Optional[List[Dict[str, Any]]]:
         """Every retained run's summary, caching immutable terminal runs.
@@ -2436,6 +2777,11 @@ class DagScheduler:
             backend.delete_document(self._ns(name), run_key),
             timeout=STATE_OP_TIMEOUT,
         )
+        # the other local write shape (_mutate covers the rest): the memo
+        # must not keep serving a run the GC just deleted, and the bump
+        # voids a rebuild in flight, same as _mutate's.
+        self._summaries_memo.pop(name, None)
+        self._summaries_gen += 1
         known = self._terminal_run_keys.get(name)
         if known is not None:
             # the key may legitimately come back (an operator backfill of the
@@ -2513,6 +2859,10 @@ class DagScheduler:
         """Release every held advance lease and stop the renewers."""
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
+        for task in list(self._catchup_tasks):
+            if not task.done():
+                task.cancel()
+        self._catchup_tasks.clear()
         for ref in list(self._owned):
             await self._release(ref)
 
@@ -2529,6 +2879,12 @@ class DagScheduler:
         if self._service_task is not None and not self._service_task.done():
             self._service_task.cancel()
         self._service_task = None
+        # a deferred catch-up replay sleeping out its jitter targeted the
+        # old store; the new store's own seed pass owes it nothing.
+        for task in list(self._catchup_tasks):
+            if not task.done():
+                task.cancel()
+        self._catchup_tasks.clear()
         for renewer in list(self._renewers.values()):
             if not renewer.done():
                 renewer.cancel()
@@ -2555,6 +2911,10 @@ class DagScheduler:
         # pass, but until then it suppresses adoption of the new store's runs,
         # so drop it here and bring that pass forward to now.
         self._dag_summary_cache.clear()
+        self._summaries_memo.clear()
+        # a rebuild in flight across the swap read the OLD store; void it
+        # (see _summaries_gen).
+        self._summaries_gen += 1
         self._terminal_run_keys.clear()
         self._advance_again.clear()
         self._next_sched_check = 0.0

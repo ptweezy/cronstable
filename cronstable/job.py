@@ -1,11 +1,14 @@
 import asyncio
 import asyncio.subprocess
+import atexit
 import html
 import logging
 import os
 import subprocess
 import sys
+import threading
 import time
+import weakref
 from collections import deque
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -25,7 +28,12 @@ from typing import (
 from urllib.parse import urlsplit, urlunsplit
 
 from cronstable import platform, push
-from cronstable.config import JobConfig, schedule_object_to_crontab
+from cronstable.config import (
+    ConfigError,
+    JobConfig,
+    _resolve_secret,
+    schedule_object_to_crontab,
+)
 from cronstable.resources import ResourceMonitor, ResourceUsage
 from cronstable.statsd import StatsdJobMetricWriter
 
@@ -55,7 +63,11 @@ def _compiled_template(source: str) -> "jinja2.Template":
     # import statement is only reached on the first distinct template anyway.
     import jinja2
 
-    return jinja2.Template(source)
+    # assigned through a typed local because jinja2.Template.__new__ is
+    # typed Any-returning (template construction can yield a subclass), and
+    # warn_return_any would flag returning the call directly.
+    template: "jinja2.Template" = jinja2.Template(source)
+    return template
 
 
 if "HOSTNAME" not in os.environ:
@@ -160,6 +172,164 @@ KILLED_STREAM_DRAIN_TIMEOUT = 30.0
 # socket released.
 MAIL_REPORT_TIMEOUT = 60.0
 
+# How long _on_stop waits for the spawned job_started emission before giving
+# up on the start/stop pairing. The start telemetry is spawned rather than
+# awaited inside start() (a stalled statsd resolution must not hold the
+# daemon-wide spawn gate), so a completion racing a slow send joins it here,
+# bounded: a host that cannot get the start datagram out inside this window
+# loses the pair, which is the best-effort trade telemetry already makes.
+STATSD_START_FLUSH_TIMEOUT = 2.0
+
+
+class _MirrorWriter:
+    """The stdout/stderr passthrough's single daemon-wide writer thread.
+
+    Job output mirrored to the daemon's own stdout/stderr used to be
+    written (and flushed) on the event-loop thread.  Batching had already
+    cut it to one write per drained read, but the write itself remained a
+    blocking syscall: with the daemon's pipe full (a stopped
+    ``docker logs``, a Ctrl+S'd console, a dead journald) it parked the
+    loop indefinitely and the whole daemon, scheduling included, froze
+    behind one wedged log consumer.  Now batches queue here and one
+    daemon thread writes them; a wedged consumer wedges only this thread,
+    and the bounded queue (by batch count AND by retained bytes: one
+    batch can carry a multi-megabyte line) sheds the OLDEST batches so
+    memory stays flat however long the consumer sleeps.
+
+    The submit path NEVER logs, and especially never under the lock: it
+    runs on the event-loop thread, and in the exact scenario the shed
+    warning fires for (a wedged shared-fd consumer, where stderr IS the
+    wedged fd) a synchronous root-handler write would park the loop on
+    that same fd, with the lock held so the writer thread could not take
+    its next snapshot either.  So submit only flags the shed, and the
+    writer thread logs it AFTER it has successfully written a batch, i.e.
+    once the consumer is provably draining again and the log write cannot
+    block behind it while holding the logging handler lock.
+
+    One thread for both streams on purpose: it preserves the enqueue
+    order across stdout and stderr, exactly what the inline writes gave.
+    The thread starts lazily on the first mirrored batch, so a daemon
+    with no capturing jobs never creates it, and registers a bounded
+    atexit drain so an orderly shutdown flushes the tail without letting
+    a wedged pipe hold the exit hostage.
+    """
+
+    #: Retained batches (one per drained read) while the consumer stalls.
+    #: At the reader's chunk size a batch is a few KB, so the cap bounds a
+    #: fully wedged consumer to a few MB, not the run's whole output.
+    MAX_PENDING_BATCHES = 512
+
+    #: Byte ceiling over the same queue.  The batch count alone bounds
+    #: nothing when batches are large (``maxLineLength`` is configurable
+    #: up to 16 MiB, so 512 retained batches could pin gigabytes); the
+    #: shed also triggers once the retained bytes would exceed this.  A
+    #: single batch larger than the whole ceiling is still queued alone
+    #: (newest output wins, exactly as the count shed keeps the newest),
+    #: so the true bound is this plus one batch.
+    MAX_PENDING_BYTES = 8 * 1024 * 1024
+
+    def __init__(self) -> None:
+        self._batches: Deque[Tuple[str, str, str]] = deque()
+        self._pending_bytes = 0
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._thread: Optional[threading.Thread] = None
+        self.dropped_batches = 0
+        self._drop_logged = False
+        self._drop_warn_pending = False
+
+    def submit(self, job_name: str, stream_name: str, text: str) -> None:
+        """Queue one passthrough batch; never blocks, sheds when full."""
+        start = False
+        size = len(text)
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="cronstable-mirror",
+                    daemon=True,
+                )
+                start = True
+            while self._batches and (
+                len(self._batches) >= self.MAX_PENDING_BATCHES
+                or self._pending_bytes + size > self.MAX_PENDING_BYTES
+            ):
+                shed = self._batches.popleft()
+                self._pending_bytes -= len(shed[2])
+                self.dropped_batches += 1
+                if not self._drop_logged:
+                    # flag only; the writer thread logs it outside the lock
+                    # (see the class docstring for why logging here would
+                    # re-freeze the daemon in the mirror's own flagship
+                    # scenario).
+                    self._drop_logged = True
+                    self._drop_warn_pending = True
+            self._batches.append((job_name, stream_name, text))
+            self._pending_bytes += size
+            self._idle.clear()
+            self._wake.set()
+        if start:
+            self._thread.start()
+            # bounded: an orderly exit flushes the tail, a wedged consumer
+            # cannot hold the process open past the timeout.
+            atexit.register(self._idle.wait, 1.0)
+
+    def drain(self, timeout: float) -> bool:
+        """Wait until every queued batch was written (tests, atexit)."""
+        return self._idle.wait(timeout)
+
+    def _run(self) -> None:
+        while True:
+            self._wake.wait()
+            with self._lock:
+                batch = list(self._batches)
+                self._batches.clear()
+                self._pending_bytes = 0
+                self._wake.clear()
+            wrote = False
+            for job_name, stream_name, text in batch:
+                out = sys.stdout if stream_name == "stdout" else sys.stderr
+                try:
+                    StreamReader._emit(out, text)
+                    wrote = True
+                except Exception:  # noqa: BLE001 - this thread must survive
+                    # The daemon's own stdout/stderr is broken, closed, or
+                    # rejecting the payload (a dead pipe consumer raises
+                    # OSError/ValueError; an exotic replacement stream can
+                    # raise anything).  The passthrough copy is best-effort
+                    # and this is the process's ONE mirror thread: any
+                    # escaping exception would kill it silently and end the
+                    # passthrough for the daemon's life, so log per batch
+                    # and keep going, whatever the type.
+                    logger.warning(
+                        "job %s: could not mirror %s to the daemon's own "
+                        "stream",
+                        job_name,
+                        stream_name,
+                        exc_info=True,
+                    )
+            if wrote:
+                # a write just succeeded, so the consumer is draining and
+                # this cannot block behind a wedged fd (see class docstring)
+                with self._lock:
+                    warn = self._drop_warn_pending
+                    self._drop_warn_pending = False
+                if warn:
+                    logger.warning(
+                        "passthrough mirror is backed up (its consumer is "
+                        "not reading the daemon's output); shedding oldest "
+                        "batches until it drains"
+                    )
+            with self._lock:
+                if not self._batches:
+                    self._idle.set()
+
+
+#: The one mirror writer for the process; see :class:`_MirrorWriter`.
+_MIRROR = _MirrorWriter()
+
 
 class JobOutputStream:
     """In-memory, broadcastable view of a job run's captured output.
@@ -169,9 +339,12 @@ class JobOutputStream:
     buffer of the most recent lines is retained so a viewer that connects
     mid-run, or just after the run finished, still sees recent context.
 
-    Nothing is ever written to disk: this lives only for as long as the run's
-    record is kept in memory, preserving cronstable's read-only-filesystem
-    deployment story.
+    Nothing is ever written to disk, preserving cronstable's
+    read-only-filesystem deployment story. The ring itself lives only while
+    this run is its job's newest (or still running): once a newer run's
+    record supersedes it the scheduler calls :meth:`release_lines`, because
+    nothing can replay a superseded ring and the bounded run history would
+    otherwise pin one full ring per retained record.
     """
 
     def __init__(self, limit: int = LIVE_LOG_LIMIT) -> None:
@@ -249,6 +422,22 @@ class JobOutputStream:
         for queue in self._subscribers:
             self._offer(queue, None)
 
+    def release_lines(self) -> None:
+        """Drop the retained ring buffer; counters and subscribers stay.
+
+        Called when this run's record stops being its job's newest finished
+        run: the log endpoints replay only the newest finished run (or a
+        live one), so a superseded record's ring is unreachable payload,
+        yet each one held up to its full ring for as long as the record sat
+        in the bounded run history. That made steady-state memory scale
+        with history depth times ring size per job instead of one ring per
+        job. ``published``/``dropped`` are kept (they are plain counters,
+        still shown in history rows), and any still-attached subscriber
+        already received the end sentinel via :meth:`close`, so nothing
+        observes the lines vanishing.
+        """
+        self.lines.clear()
+
 
 #: Bytes pulled from a job's pipe per read.  ``StreamReader.read`` returns
 #: as soon as ANY data is buffered, so a bigger chunk never delays a live
@@ -283,10 +472,12 @@ class StreamReader:
         # Longest line kept, in BYTES before decoding.  Reading in chunks
         # means asyncio's own StreamReader limit no longer bounds a line
         # (that bound came from readuntil, which _read no longer calls), so
-        # the cap is enforced by hand below.  Defaulting to the stream's
-        # own limit leaves the cap exactly where it was for a caller that
-        # passes none; the daemon passes maxLineLength explicitly, which is
-        # the same number it hands the subprocess pipe.
+        # the cap is enforced by hand below.  The daemon always passes
+        # maxLineLength explicitly; the fallback is for a caller (a test, a
+        # benchmark) that passes none, and reading the stream's own limit
+        # leaves that caller's cap exactly where it was.  That limit is NOT
+        # the pipe's watermark any more: RunningJob.start pins the watermark
+        # to the read chunk size, a buffering choice rather than a line cap.
         if max_line_length is None:
             max_line_length = getattr(
                 stream, "_limit", DEFAULT_MAX_LINE_LENGTH
@@ -319,20 +510,13 @@ class StreamReader:
             return
         text = "".join(self._emit_buffer)
         self._emit_buffer.clear()
-        out = sys.stdout if self.stream_name == "stdout" else sys.stderr
-        try:
-            self._emit(out, text)
-        except (OSError, ValueError):
-            # The daemon's own stdout/stderr is broken or closed (a dead
-            # pipe consumer). The passthrough copy is best-effort; the
-            # capture buffers and live-tail publish above are unaffected,
-            # so log once per batch and keep reading the job's output.
-            logger.warning(
-                "job %s: could not mirror %s to the daemon's own stream",
-                self.job_name,
-                self.stream_name,
-                exc_info=True,
-            )
+        # Hand the batch to the mirror's writer thread rather than writing
+        # here: this method runs on the EVENT LOOP thread, and a write to a
+        # full pipe (a stopped `docker logs`, a Ctrl+S'd console, a dead
+        # journald) blocks until the consumer drains it, which used to
+        # freeze the entire daemon, scheduling included, behind one wedged
+        # log reader.
+        _MIRROR.submit(self.job_name, self.stream_name, text)
 
     def _queue_emit(self, out_line: str) -> None:
         # One write+flush per DRAINED READ, not per line: readline() completes
@@ -391,16 +575,36 @@ class StreamReader:
         save_bottom = self.save_bottom
         discarded = self.discarded_lines
         # Bytes after the last newline seen: not a line until the next
-        # chunk (or EOF) terminates it.
-        tail = b""
+        # chunk (or EOF) terminates it.  Held as the LIST of chunks that have
+        # gone by unterminated, plus their running length, and joined exactly
+        # once, when a newline finally terminates it or at EOF.  It used
+        # to be one bytes object rebuilt as `tail + chunk` per read, which
+        # made an unterminated run quadratic on the event-loop thread: with
+        # _READ_CHUNK at 64 KiB and maxLineLength defaulting to 16 MiB, a job
+        # emitting a progress bar, a binary blob or a stuck writer's output
+        # paid ~256 growing memcpys, each up to the full cap, before the
+        # over-cap drop below could even look at it.
+        tail_parts: List[bytes] = []
+        tail_len = 0
         while True:
             chunk = await stream.read(_READ_CHUNK)
             if chunk:
-                if tail:
-                    chunk = tail + chunk
+                buffered = tail_len + len(chunk)
                 parts = chunk.split(b"\n")
-                tail = parts.pop()
-                if len(chunk) > cap:
+                rest = parts.pop()
+                if parts:
+                    # a newline in this chunk terminates the carried tail:
+                    # join it onto the first segment, once.
+                    if tail_parts:
+                        parts[0] = b"".join(tail_parts) + parts[0]
+                    tail_parts = [rest]
+                    tail_len = len(rest)
+                else:
+                    # no newline at all: carry the chunk without copying
+                    # anything that came before it.
+                    tail_parts.append(rest)
+                    tail_len = buffered
+                if buffered > cap:
                     # A segment can never be longer than the buffer it was
                     # cut from, so the per-line cap check is only reachable
                     # once the buffer itself has passed the cap: one
@@ -412,8 +616,10 @@ class StreamReader:
                     raw.decode("utf-8", errors="replace") + "\n"
                     for raw in parts
                 ]
-            elif tail and not self._too_long(tail, cap):
-                lines = [tail.decode("utf-8", errors="replace")]
+            elif tail_len and not self._over_cap(tail_len, cap):
+                lines = [
+                    b"".join(tail_parts).decode("utf-8", errors="replace")
+                ]
             else:
                 lines = []
             for line in lines:
@@ -442,15 +648,22 @@ class StreamReader:
                 # already-scheduled callback then finds an empty buffer).
                 self._flush_emit_buffer()
                 return
-            if self._too_long(tail, cap):
+            if self._over_cap(tail_len, cap):
                 # An unterminated run past the cap. Drop what has piled up
                 # and keep reading: the readuntil limit cleared its buffer
-                # and carried on in exactly the same way.
-                tail = b""
+                # and carried on in exactly the same way.  Measured on the
+                # running length, so an over-cap run is dropped without ever
+                # being joined into one buffer.
+                tail_parts = []
+                tail_len = 0
 
     def _too_long(self, raw: bytes, cap: int) -> bool:
         """Whether ``raw`` breaks the line cap, warning once when it does."""
-        if len(raw) <= cap:
+        return self._over_cap(len(raw), cap)
+
+    def _over_cap(self, size: int, cap: int) -> bool:
+        """:meth:`_too_long` on a length alone, for the unjoined tail."""
+        if size <= cap:
             return False
         logger.warning("job %s: ignored a very long line", self.job_name)
         return True
@@ -515,21 +728,20 @@ class SentryReporter(Reporter):
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
         config = config["sentry"]
-        if config["dsn"]["value"]:
-            dsn = config["dsn"]["value"]
-        elif config["dsn"]["fromFile"]:
-            with open(config["dsn"]["fromFile"], "rt") as dsn_file:
-                dsn = dsn_file.read().strip()
-        elif config["dsn"]["fromEnvVar"]:
-            env_var = config["dsn"]["fromEnvVar"]
-            dsn = os.environ.get(env_var, "")
-            if not dsn:
-                logger.error(
-                    "sentry: dsn env var %r is not set; not reporting",
-                    env_var,
-                )
-                return
-        else:
+        try:
+            # One resolver for every value/fromFile/fromEnvVar triple
+            # (config._resolve_secret, shared with the cluster/push/job-API
+            # secrets): an unreadable fromFile or an unset env var is a
+            # clean skip, never a traceback out of the completion path.
+            # Its messages name the config key, not the env var name; the
+            # name is config-derived and tied to a secret, so it stays out
+            # of the logs (the rule MailReporter always had, now shared by
+            # all three reporters).
+            dsn = _resolve_secret(config["dsn"], "sentry.dsn")
+        except ConfigError as ex:
+            logger.error("sentry: %s; not reporting", ex)
+            return
+        if dsn is None:
             return  # sentry disabled: early return
 
         # Imported here, past the disabled/no-DSN early returns, so the ~130ms
@@ -591,26 +803,14 @@ class MailReporter(Reporter):
         smtp_host = mail["smtpHost"]
         smtp_port = mail["smtpPort"]
 
-        password = None  # type: Optional[str]
-        username = None  # type: Optional[str]
-
-        if mail["password"]["value"]:
-            password = mail["password"]["value"]
-        elif mail["password"]["fromFile"]:
-            with open(mail["password"]["fromFile"], "rt") as pass_file:
-                password = pass_file.read().strip()
-        elif mail["password"]["fromEnvVar"]:
-            env_var = mail["password"]["fromEnvVar"]
-            password = os.environ.get(env_var)
-            if not password:
-                # The env var *name* is config-derived and tied to a secret,
-                # so we don't echo it to the logs.
-                logger.error(
-                    "mail: password env var is not set; not sending email"
-                )
-                return
-        else:
-            password = None
+        try:
+            # Shared secret resolver; see SentryReporter for the rationale
+            # (clean skip on a bad source, env var names stay out of logs).
+            # None (no source configured) means unauthenticated SMTP.
+            password = _resolve_secret(mail["password"], "mail.password")
+        except ConfigError as ex:
+            logger.error("mail: %s; not sending email", ex)
+            return
         username = mail.get("username")
 
         tmpl_vars = job.template_vars
@@ -885,28 +1085,168 @@ def _scrub_url_in(text: str, url: str) -> str:
     return out
 
 
+#: How long an idle webhook connection is kept in the pool waiting for the
+#: next report.  aiohttp's own default is 15 seconds, which is shorter than
+#: the gap between two runs of a minutely job: the pool would then be empty
+#: exactly when the next report arrives and every report would pay a fresh
+#: connect (and, on https, a fresh TLS handshake).  90 seconds covers
+#: minutely reporting with margin while still letting a socket to a webhook
+#: receiver go away promptly once the jobs that used it stop failing.
+WEBHOOK_KEEPALIVE_SECONDS = 90
+
+#: One connection pool per event loop for :class:`WebhookReporter`, the same
+#: shape as the pooled statsd endpoints in cronstable.statsd.  The reporter
+#: used to build its own ClientSession per report, which cost a TCP connect,
+#: a TLS handshake and an SSL context per reported run: on a fleet where every
+#: job reports, that is the dominant cost of reporting, paid on the reaper,
+#: the one loop that handles every job's completion.
+#:
+#: Weak keys match that shape but reclaim nothing: aiohttp's connector stores
+#: the loop it was built on, so the value holds its own key alive and an entry
+#: never expires by itself.  The daemon releases its pool through
+#: :func:`close_webhook_pool` on shutdown, and any other loop's is swept by
+#: :func:`_drop_dead_webhook_pools` on the next report.
+_WEBHOOK_CONNECTORS: "weakref.WeakKeyDictionary[Any, Any]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _drop_dead_webhook_pools() -> None:
+    """Release the pools of loops that have gone away.
+
+    The entries cannot expire on their own, for the reason given above the
+    dict: the value holds its own key alive.  The daemon runs one loop and
+    closes its pool on the way out, so this sweep is for processes that build
+    a loop per unit of work.  The test suite builds one per test, and every
+    loop that reported was left holding a connector and its idle sockets,
+    which aiohttp announces as an "Unclosed connector" at exit.
+
+    The async close needs a running loop, so it is no use here.  The
+    synchronous half does the transport teardown that matters, returning
+    waiters for handshakes that will never happen.  It is a private aiohttp
+    API, so a version without it degrades to merely forgetting the connector.
+
+    One pool would otherwise always survive, since the loop that reported
+    last has no later report to clear it.  In the daemon that one is closed
+    by :func:`close_webhook_pool` on a graceful stop; for processes that
+    report and then exit (the test suite, an embedder, a one-shot script)
+    :func:`_close_webhook_pools_atexit` sweeps whatever is left, so pooling
+    does not trade per-report connector churn for an "Unclosed connector"
+    line the un-pooled code never printed.
+    """
+    for dead in [lp for lp in list(_WEBHOOK_CONNECTORS) if lp.is_closed()]:
+        _sync_close_webhook_pool(_WEBHOOK_CONNECTORS.pop(dead, None))
+
+
+def _sync_close_webhook_pool(stale: Any) -> None:
+    """Tear a connector's transports down without a running loop.
+
+    ``close()`` is a coroutine and needs a loop, which neither the dead-loop
+    sweep nor the interpreter-exit hook has.  The private synchronous half
+    does the part that matters (closing the transports and returning the
+    waiters for handshakes that will never happen); a version of aiohttp
+    without it degrades to merely forgetting the connector, which is what
+    the code did before this existed.
+    """
+    closer = getattr(stale, "_close", None)
+    if closer is None:
+        return
+    try:
+        closer()
+    except Exception as ex:  # noqa: BLE001 - degrade, never crash
+        logger.debug("cannot close a stale webhook pool: %s", ex)
+
+
+@atexit.register
+def _close_webhook_pools_atexit() -> None:
+    """Release every webhook pool still held at interpreter exit.
+
+    The backstop for the last loop's pool, which no later report can sweep
+    and no :func:`close_webhook_pool` reaches in a process that never shuts
+    the daemon down gracefully.  Registered rather than left to the garbage
+    collector because that is precisely what emits aiohttp's "Unclosed
+    connector" warning: the object is collected during interpreter teardown
+    with its transports still open.  Runs before that teardown, so the
+    sockets are released and the warning has nothing to report.
+    """
+    while _WEBHOOK_CONNECTORS:
+        try:
+            _, stale = _WEBHOOK_CONNECTORS.popitem()
+        except KeyError:  # pragma: no cover - emptied under us
+            return
+        _sync_close_webhook_pool(stale)
+
+
+def _webhook_connector() -> Any:
+    """The pooled connector for this loop's webhook reports."""
+    # Re-imported per call rather than passed in by the caller: past the
+    # first report this is a sys.modules hit, nothing next to the request
+    # that follows, and it keeps this helper usable without a module-scope
+    # aiohttp (WebhookReporter.report says why that import is deferred at
+    # all).
+    import aiohttp
+
+    loop = asyncio.get_running_loop()
+    _drop_dead_webhook_pools()
+    connector = _WEBHOOK_CONNECTORS.get(loop)
+    # `closed` covers the shutdown-then-report order: close_webhook_pool
+    # drops the entry, but a connector someone else closed must be replaced
+    # too rather than handed out dead, which would fail every later report.
+    if connector is None or connector.closed:
+        # limit=0 (unlimited) rather than aiohttp's default of 100.  That
+        # default is a per-connector cap, and before pooling every report
+        # built its own connector, so reports never queued on each other.
+        # One shared pool with the default would cap the whole daemon at 100
+        # webhook reports in flight across every job and every receiver, and
+        # the wait for a slot happens inside each report's own ClientTimeout:
+        # a fleet-wide burst of completions at :00 could time reports out on
+        # connection acquisition alone, and a job with a long webhook.timeout
+        # could hold a slot while short-timeout reports expire behind it.
+        connector = aiohttp.TCPConnector(
+            keepalive_timeout=WEBHOOK_KEEPALIVE_SECONDS, limit=0
+        )
+        _WEBHOOK_CONNECTORS[loop] = connector
+    return connector
+
+
+async def close_webhook_pool() -> None:
+    """Close this loop's pooled webhook connections (daemon shutdown).
+
+    Safe to call more than once and outside a loop; the next report opens a
+    fresh pool.  Without it the idle keepalive sockets are released only when
+    the loop is garbage collected, which logs aiohttp's "Unclosed connector"
+    on teardown, the same noise :func:`cronstable.statsd.close_endpoints`
+    exists to avoid.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    connector = _WEBHOOK_CONNECTORS.pop(loop, None)
+    if connector is not None:
+        # awaited, not fired and forgotten: close() shuts the transports
+        # down synchronously but returns a waiter for the TLS shutdown
+        # handshakes, and dropping that waiter unawaited earns a
+        # DeprecationWarning from aiohttp.
+        await connector.close()
+
+
 class WebhookReporter(Reporter):
     async def report(
         self, success: bool, job: "RunningJob", config: Dict[str, Any]
     ) -> None:
         webhook = config["webhook"]
 
-        url_config = webhook["url"]
-        if url_config["value"]:
-            url = url_config["value"]
-        elif url_config["fromFile"]:
-            with open(url_config["fromFile"], "rt") as url_file:
-                url = url_file.read().strip()
-        elif url_config["fromEnvVar"]:
-            env_var = url_config["fromEnvVar"]
-            url = os.environ.get(env_var, "")
-            if not url:
-                logger.error(
-                    "webhook: url env var %r is not set; not reporting",
-                    env_var,
-                )
-                return
-        else:
+        try:
+            # Shared secret resolver; see SentryReporter for the rationale
+            # (clean skip on a bad source, env var names stay out of logs;
+            # webhook.url's secret part IS the URL, so that rule matters
+            # here most of all).
+            url = _resolve_secret(webhook["url"], "webhook.url")
+        except ConfigError as ex:
+            logger.error("webhook: %s; not reporting", ex)
+            return
+        if url is None:
             return  # webhook disabled: early return
 
         template = _compiled_template(webhook["body"])
@@ -917,7 +1257,7 @@ class WebhookReporter(Reporter):
 
         # aiohttp is imported here, not at module top: this module is on the
         # daemon's unconditional import graph (cron -> dagrun -> job), and
-        # aiohttp is ~155 ms and ~21 MB of RSS. The webhook reporter is the
+        # aiohttp is ~144 ms and ~14 MB of RSS. The webhook reporter is the
         # only thing in this file that wants it, so a daemon whose jobs never
         # report over HTTP pays none of it, and neither does an offline path
         # that merely imports the module. By the time control reaches here the
@@ -932,7 +1272,21 @@ class WebhookReporter(Reporter):
         # worth _report_common's traceback, not a "check webhook.url and
         # the network" line about a request that was never attempted.
         data = body.encode("utf-8")
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # A fresh session per report, over a SHARED connector: the session is
+        # bookkeeping (cookie jar, default headers, this report's timeout)
+        # and costs nothing to build, while the connector owns the sockets,
+        # the pool and the SSL context. Sharing the session instead would
+        # share its cookie jar across jobs, so a receiver that sets a cookie
+        # for one job's report would have it sent with every other job's;
+        # sharing only the connector keeps each report as isolated as it has
+        # always been. connector_owner=False so leaving this `async with`
+        # closes the session and leaves the pool open for the next report;
+        # close_webhook_pool closes the pool itself.
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            connector=_webhook_connector(),
+            connector_owner=False,
+        ) as session:
             try:
                 async with session.request(
                     webhook["method"],
@@ -1068,6 +1422,44 @@ def report_config_enabled(report_config: Dict[str, Any]) -> bool:
     return bool((report_config.get("push") or {}).get("enabled"))
 
 
+#: The key set every reporting context's ``template_vars`` exposes.
+#:
+#: A user-facing contract rather than an implementation detail: operators
+#: write mail/sentry/webhook/shell templates against these names, and
+#: wiki/Reporting.md documents them.  Three classes build the dict and have
+#: to stay key-for-key in step, so that a template written for a job run
+#: renders unchanged on an SLA breach and on a notify event:
+#: :meth:`RunningJob.template_vars` (the real values),
+#: :meth:`SlaBreachContext.template_vars` (a job that did NOT run, plus the
+#: four ``sla_*``/threshold keys) and
+#: :meth:`NotifyEventContext.template_vars` (no job at all, plus ``event``,
+#: ``subject`` and ``message``).  The values differ per context, so each
+#: still builds its own dict; listing the keys here is the single source of
+#: truth all three are checked against.  That check lives in
+#: tests/test_job.py, and it is what catches a key added to one context and
+#: forgotten in the other two: the drift is invisible at runtime, since a
+#: template referencing a missing name renders empty rather than raising.
+STANDARD_TEMPLATE_VARS = (
+    "name",
+    "success",
+    "fail_reason",
+    "stdout",
+    "stderr",
+    "exit_code",
+    "command",
+    "shell",
+    "environment",
+    "host",
+    "schedule",
+    "started_at",
+    "run_id",
+    "cpu_seconds",
+    "cpu_user_seconds",
+    "cpu_system_seconds",
+    "max_rss_bytes",
+)
+
+
 class JobRetryState:
     def __init__(
         self, initial_delay: float, multiplier: float, max_delay: float
@@ -1191,6 +1583,9 @@ class RunningJob:
             )  # type: Optional[StatsdJobMetricWriter]
         else:
             self.statsd_writer = None
+        # the spawned job_started emission (see start()); _on_stop joins it,
+        # bounded, so job_started still precedes job_stopped on the wire.
+        self._start_telemetry = None  # type: Optional[asyncio.Task]
 
     async def _on_start(self) -> None:
         if self.statsd_writer:
@@ -1231,10 +1626,39 @@ class RunningJob:
                 )
             finally:
                 self._resource_monitor = None
+        task = self._start_telemetry
+        self._start_telemetry = None
+        if task is not None and task.done():
+            # already finished: retrieve the outcome anyway, or an exception
+            # that escaped _on_start's OSError net (the statsd endpoint
+            # machinery raises RuntimeError on a closing transport) surfaces
+            # at GC time as an asyncio "Task exception was never retrieved"
+            # error. Cancelled tasks carry no outcome to retrieve.
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "Job %s: failed to send statsd job_started metric",
+                    self.config.name,
+                    exc_info=task.exception(),
+                )
+        elif task is not None:
+            # bounded join: with a merely-slow host the start datagram
+            # still goes out before the stop one; a host that cannot
+            # manage it inside the bound loses the pair (wait_for cancels
+            # the task). See STATSD_START_FLUSH_TIMEOUT.
+            try:
+                await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - telemetry is best-effort
+                pass
         if self.statsd_writer:
+            # best-effort like the start datagram: the statsd machinery can
+            # raise beyond OSError (RuntimeError on a closing transport),
+            # and a telemetry failure must never break the completion
+            # accounting every run funnels through here.
             try:
                 await self.statsd_writer.job_stopped()
-            except OSError:
+            except Exception:  # noqa: BLE001 - telemetry is best-effort
                 logger.warning(
                     "Job %s: failed to send statsd job_stopped metric",
                     self.config.name,
@@ -1286,7 +1710,20 @@ class RunningJob:
                 time.perf_counter() + self.config.executionTimeout
             )
         if self.config.captureStderr or self.config.captureStdout:
-            kwargs["limit"] = self.config.maxLineLength
+            # The pipe's flow-control watermark, NOT the line cap. It used to
+            # be maxLineLength (16 MiB by default) because the reader called
+            # readuntil, which raises once a line outgrows the stream's own
+            # limit; the cap therefore had to live on the transport. The
+            # reader reads in chunks now and enforces maxLineLength by hand
+            # (see StreamReader._read), so the only thing this number still
+            # decides is how much unread output asyncio buffers per pipe
+            # before it pauses the child: at 16 MiB that was up to 32 MiB of
+            # RSS per stream per running job (asyncio pauses at twice the
+            # limit), charged to the daemon for output nobody had asked for
+            # yet. Pinned to the reader's own chunk size, so one full read is
+            # always buffered ahead and a chatty job is backpressured instead
+            # of held in the daemon's memory.
+            kwargs["limit"] = _READ_CHUNK
 
         try:
             # POSIX wants UTF-8 bytes argv (locale-independent); Windows wants
@@ -1329,7 +1766,16 @@ class RunningJob:
             self.start_failed = True
             return
 
-        await self._on_start()
+        # Spawned, not awaited: every launch path holds the daemon-wide
+        # spawn gate around start(), and the statsd send can stall
+        # arbitrarily long in endpoint resolution (a dead DNS server, a
+        # black-holed route).  Awaiting it here held one of the gate's
+        # permits for the whole stall, so a dead statsd host drained a
+        # 500-job backlog 16 launches at a time and wedged DAG-task
+        # launches with no statsd config of their own.  _on_stop joins the
+        # task (bounded) so the start/stop pair still orders on the wire.
+        if self.statsd_writer:
+            self._start_telemetry = asyncio.create_task(self._on_start())
 
         if self.config.monitorResources and self.proc.pid is not None:
             # Begin sampling the child's process tree. Best-effort: if psutil
@@ -1638,6 +2084,9 @@ class RunningJob:
 
     @property
     def template_vars(self) -> dict:
+        # The reporting contract in full; SlaBreachContext and
+        # NotifyEventContext below mirror these keys, with the run-shaped
+        # ones empty. See STANDARD_TEMPLATE_VARS.
         fail_reason = self.fail_reason
         usage = self.resource_usage
         return {
@@ -1714,7 +2163,7 @@ class SlaBreachContext:
         self.stdout_discarded = 0
         self.stderr_discarded = 0
         self.resource_usage = None  # type: Optional[ResourceUsage]
-        self.env = {"HOSTNAME": os.environ.get("HOSTNAME", "")}
+        self.env = {"HOSTNAME": report_hostname()}
         # read by ShellReporter for the CRONSTABLE_SLA_* exports.
         self.sla_vars = {
             "sla_check": check,
@@ -1725,6 +2174,8 @@ class SlaBreachContext:
 
     @property
     def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus the
+        # four breach-detail keys.
         return {
             "name": self.config.name,
             "success": False,
@@ -1755,7 +2206,7 @@ class SlaBreachContext:
 async def report_sla_breach(
     ctx: SlaBreachContext, report_config: dict
 ) -> None:
-    """Fan one SLA breach out to all four reporters (the onLate hook).
+    """Fan one SLA breach out to every reporter (the onLate hook).
 
     The ``_report_common`` gather idiom with ``success=False``
     throughout: an overdue job is bad news, so MailReporter's empty-body
@@ -1811,7 +2262,7 @@ class NotifyEventContext:
     block): a DAG run failure, an approval gate awaiting a decision, or a
     leadership / quorum change; none of which is a job run.
 
-    Quacks like a :class:`RunningJob` exactly as far as the four reporters read
+    Quacks like a :class:`RunningJob` exactly as far as the reporters read
     one (a minimal :class:`_NotifyJobShim` ``config``, the run-shaped fields
     empty, and a ``template_vars`` carrying the standard key set so operator
     templates written for a job render unchanged), plus the event detail:
@@ -1850,6 +2301,8 @@ class NotifyEventContext:
 
     @property
     def template_vars(self) -> dict:
+        # STANDARD_TEMPLATE_VARS with the run-shaped keys emptied, plus the
+        # event detail (and whatever `fields` the event carries).
         base = {
             "name": self.config.name,
             "success": self._success,

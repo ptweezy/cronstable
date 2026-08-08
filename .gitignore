@@ -87,3 +87,7 @@ target/
 /CLAUDE.md
 /.claude/*
 !/.claude/settings.json
+
+# CI-only: the QEMU binary jobs persist pip's cache here via actions/cache
+# (see binaries-musl in .github/workflows/release.yml); never tracked.
+/.pip-cache/

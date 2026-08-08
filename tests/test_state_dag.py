@@ -2192,6 +2192,41 @@ def test_maybe_terminalise_ignores_unmaterialised_mapped_task():
     assert result.changed is True
 
 
+# _mapped_instance_state: the barrier and the terminaliser share one
+# absent-entry rule
+
+
+def test_absent_mapped_instance_holds_run_open_like_the_barrier():
+    # regression: the terminaliser once SKIPPED an entry missing for a
+    # run-recorded instance index while the fan-in barrier read the same
+    # hole as pending, so a damaged run document could complete as a run
+    # whose mapped group still read "running" to every downstream.  Both
+    # consumers now share _mapped_instance_state: the hole holds the run
+    # open, where the reconcile paths can see it.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["mapped"]["w"] = {"items": ["a", "b"], "expandedAt": 1.0}
+    body["tasks"]["w#0"] = {"id": "w", "state": dag.SUCCESS}
+    body["tasks"].pop("w#1", None)  # the hole: a run-recorded index, absent
+    assert dag._mapped_group_state(body, "w") == dag.RUNNING  # barrier holds
+    result = dag.AdvanceResult()
+    dag._maybe_terminalise(spec, body, 5.0, result)
+    assert result.run_terminal is False  # ...and so must the run
+    # both verdicts agree once the hole is filled terminally
+    body["tasks"]["w#1"] = {"id": "w", "state": dag.SUCCESS}
+    assert dag._mapped_group_state(body, "w") == dag.SUCCESS
+    dag._maybe_terminalise(spec, body, 6.0, result)
+    assert result.run_terminal is True
+
+
 # set_task_pid: no-op on missing run / non-running entry
 
 
@@ -2453,6 +2488,85 @@ def test_reload_retyped_to_mapped_while_pending_still_expands():
     assert _state(body, "w#1") == dag.SUCCESS
     assert dag.is_terminal_run(body)
     assert body["state"] == dag.SUCCESS
+
+
+def test_renamed_expand_source_does_not_wedge_an_inflight_run():
+    # A reload renames the task a mapped task fans out from (expand.fromTask).
+    # validate_graph accepts it (the NEW spec is internally consistent), but
+    # the in-flight run document has an entry for the OLD name and none for the
+    # new one. effective_state defaults a missing entry to PENDING, so the
+    # mapped placeholder waited on a task that would never appear: the run
+    # never reached a terminal state, its dagadvance lease was renewed for the
+    # life of the daemon, retention GC could never collect it, and every
+    # advance pass paid a full document deepcopy to change nothing.
+    #
+    # _deps_verdict and _maybe_terminalise both already implement the rule
+    # ("no entry in the run document -> added after the run was created, so it
+    # cannot gate anything"); only the mapped-expansion path was missing it.
+    old = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(old)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["gen"]["finishedAt"] = 5.0
+
+    renamed = _spec(
+        TaskSpec("generate"),
+        TaskSpec(
+            "work",
+            depends_on=("generate",),
+            expand=ExpandSpec(from_task="generate", key="items"),
+        ),
+    )
+    dag.validate_graph(renamed)  # the new spec is internally fine
+    # the source has no entry in THIS run, so there is nothing to expand from
+    assert dag.tasks_awaiting_expansion(renamed, body) == []
+
+    ex = _Executor(renamed)
+    body = ex.run(body)
+    assert ex.launched == []  # the fan-out can never be built
+    assert _state(body, "work") == dag.FAILED
+    assert "expand source 'generate'" in body["tasks"]["work"]["failReason"]
+    # and the run finishes, so the lease is released and the doc is prunable
+    assert dag.is_terminal_run(body)
+    assert body["state"] == dag.FAILED
+
+
+def test_unmaterialised_expand_source_leaves_downstreams_resolvable():
+    # the resolution must unblock the placeholder and whatever waits on the
+    # mapped task: a downstream all_success task sees the group as
+    # upstream_failed and terminalises rather than pending forever.
+    renamed = _spec(
+        TaskSpec("generate"),
+        TaskSpec(
+            "work",
+            depends_on=("generate",),
+            expand=ExpandSpec(from_task="generate", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    old = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "work",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+        TaskSpec("collect", depends_on=("work",)),
+    )
+    body = _body(old)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["tasks"]["gen"]["finishedAt"] = 5.0
+    ex = _Executor(renamed)
+    body = ex.run(body)
+    assert _state(body, "work") == dag.FAILED
+    assert _state(body, "collect") == dag.UPSTREAM_FAILED
+    assert dag.is_terminal_run(body)
 
 
 def test_expand_removed_by_reload_still_dispatches_and_terminalises():

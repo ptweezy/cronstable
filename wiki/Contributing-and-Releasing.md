@@ -30,7 +30,7 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 
 The editable dev install (`pip install -e ".[dev]"`) and the checks (`pytest`, `ruff`, `mypy`) all run natively on Windows too. Use `.venv\Scripts\activate` to enter the venv as shown above.
 
-The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: `bandit`, `mypy`, `mypy-extensions`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv` (the plugin that makes `tox` provision and install with uv). The console entry point `cronstable = cronstable.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
+The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requirements_dev.txt` both pull in: the check tooling (`bandit`, `mypy`, `mypy-extensions`, `openapi-spec-validator`, `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `tox`, and `tox-uv`, the plugin that makes `tox` provision and install with uv) plus the optional-feature libraries the test suite must really exercise (`orjson`, `pynacl`, `zeroconf`, and `cryptography`, some gated by platform markers; requirements_dev.txt documents why each is there). The two lists are pinned equal by `tests/test_dev_deps_parity.py`. The console entry point `cronstable = cronstable.__main__:main` is installed by the editable install (see [Command-Line Reference](CLI-Reference)).
 
 ## Running the checks
 
@@ -48,18 +48,18 @@ tox -e py      # pytest on the current interpreter
 | --- | --- | --- |
 | `py313`, `py314` | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` |
 | `lint` | no (`skip_install = true`) | `ruff check cronstable` then `ruff format --check cronstable` |
-| `mypy` | no (`skip_install = true`, `basepython=python3`) | `mypy -p cronstable --ignore-missing-imports` |
+| `mypy` | yes | `mypy -p cronstable` |
 | `bandit` | no (`skip_install = true`) | `bandit -c pyproject.toml -r cronstable --severity-level=medium` |
 
 `tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and installs dependencies with uv automatically (much faster; behavior-identical). Force the legacy virtualenv+pip path with `tox --runner virtualenv` if ever needed.
 
-The `lint`, `mypy`, and `bandit` envs deliberately skip installing the package: ruff, mypy, and bandit analyze the source tree directly, so they avoid imposing the project's `requires-python` on those interpreters.
+The `lint` and `bandit` envs deliberately skip installing the package: ruff and bandit analyze the source tree directly, so they avoid imposing the project's `requires-python` on those interpreters. The `mypy` env does install it, so the runtime dependencies resolve for real; the imports that legitimately cannot resolve (optional extras, untyped libraries) are enumerated per-module in `pyproject.toml`'s `[[tool.mypy.overrides]]` tables rather than blanket-ignored.
 
 ### Tool configuration
 
 `pyproject.toml` configures the tooling:
 
-- **ruff**: `target-version = "py313"`, `line-length = 79`. Lint rule sets selected: `B`, `B9` (bugbear), `C` (mccabe complexity), `E` (pycodestyle errors), `F` (pyflakes), `W` (pycodestyle warnings), `I` (import sorting). `pyupgrade` (`UP`) is present but commented out. `max-complexity = 20`.
+- **ruff**: `target-version = "py310"`, `line-length = 79`. Lint rule sets selected: `B`, `B9` (bugbear), `C` (mccabe complexity), `E` (pycodestyle errors), `F` (pyflakes), `W` (pycodestyle warnings), `I` (import sorting). `pyupgrade` (`UP`) is present but commented out. `max-complexity = 20`.
 - **mypy**: `no_implicit_optional = true`, `warn_no_return = true`, `warn_return_any = true`, `strict_optional = true`.
 - **pytest**: `asyncio_mode = "auto"`, `testpaths = ["tests"]`.
 - **bandit**: `exclude_dirs = ["tests"]` and `skips = ["B104"]` (B104's only matches are non-bind wildcard-listen host constants in `config.py`). CI runs it at medium severity via `tox -e bandit`.

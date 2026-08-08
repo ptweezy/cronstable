@@ -19,8 +19,10 @@ over the loopback endpoint.
 """
 
 import asyncio
+import copy
 import datetime
 import json
+import logging
 import sys
 
 import pytest
@@ -331,6 +333,60 @@ async def test_mapped_upstream_publishes_nothing_expands_empty(tmp_path):
         await _teardown(cron)
 
 
+async def test_xcom_fanout_parses_bytes_and_offloads_large_payloads(
+    tmp_path, monkeypatch
+):
+    # The fan-out parse must take the artifact's BYTES straight to the
+    # decoder (the old decode() forced the slower str branch and a second
+    # full copy) and, past the offload floor, run on a worker thread: a
+    # multi-MB inline parse stalled the whole event loop per expansion.
+    import threading
+
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        backend = cron.state_backend
+        calls = []
+        real_parse = dagrun._parse_portable_xcom
+
+        def spying_parse(data):
+            calls.append(
+                (
+                    type(data),
+                    len(data),
+                    threading.current_thread() is threading.main_thread(),
+                )
+            )
+            return real_parse(data)
+
+        monkeypatch.setattr(dagrun, "_parse_portable_xcom", spying_parse)
+
+        async def publish_and_read(items, run_id):
+            scope = dag.xcom_scope("lin", run_id)
+            name = dag.xcom_name("gen", "items")
+            await jobstate.artifact_put(
+                backend, scope, name, json.dumps(items).encode()
+            )
+            return await cron._dag._read_xcom_list(
+                run_id, "lin", "gen", "items"
+            )
+
+        # small payload: parsed inline on the loop thread, from bytes
+        small = ["alpha", "beta"]
+        assert await publish_and_read(small, "r-small") == small
+        assert calls == [(bytes, len(json.dumps(small)), True)]
+
+        # large payload (past the offload floor, under MAX_MAPPED_ITEMS):
+        # same result, parsed on a worker thread, still from bytes
+        big = ["item-%04d-%s" % (i, "x" * 80) for i in range(900)]
+        assert len(json.dumps(big)) >= dagrun._XCOM_PARSE_OFFLOAD_MIN
+        assert await publish_and_read(big, "r-big") == big
+        kind, size, on_loop_thread = calls[-1]
+        assert kind is bytes
+        assert not on_loop_thread
+    finally:
+        await _teardown(cron)
+
+
 async def test_mapped_expansion_transient_read_error_is_not_an_empty_fanout(
     tmp_path, monkeypatch
 ):
@@ -601,6 +657,66 @@ async def test_list_dags_caches_terminal_runs(tmp_path):
         assert lin2["runCounts"] == {"success": 3}
         assert lin2["latestRun"] == lin["latestRun"]
         assert calls == {"list_documents": 0, "read_document": 0}
+    finally:
+        await _teardown(cron)
+
+
+async def test_list_dags_memoizes_the_keys_listing(tmp_path, monkeypatch):
+    # The per-run summary cache (above) stops re-PARSING terminal runs, but
+    # the namespace keys listing itself still hit the store once per dag per
+    # request: the dashboard's ~3s /dags poll on a quiescent store. The
+    # short-TTL memo must absorb repeat listings, share them with list_runs,
+    # drop out on a local write, and honour its TTL.
+    from cronstable import dagrun as dagrun_mod
+
+    # widened so the exact listing counts below cannot be broken by a stall
+    # between awaits (CPU steal on a loaded runner under --cov ages the
+    # memo out past the real 5s TTL); the expiry step at the end pins the
+    # TTL to zero explicitly, so nothing here rides the real value.
+    monkeypatch.setattr(dagrun_mod, "DAG_SUMMARY_LIST_TTL", 3600.0)
+    cron = await _make_cron(tmp_path, _LINEAR)
+    try:
+        _set_cmd(cron, "lin", "a", [_PY, "-c", "pass"])
+        _set_cmd(cron, "lin", "b", [_PY, "-c", "pass"])
+        rk = await cron._dag.trigger_run("lin")
+        body = await _drive(cron, "lin", rk)
+        assert body["state"] == dag.SUCCESS
+
+        backend = cron.state_backend
+        listings = []
+        real_keys = backend.list_document_keys
+
+        async def counting_keys(ns):
+            listings.append(ns)
+            return await real_keys(ns)
+
+        backend.list_document_keys = counting_keys
+
+        # the run's own writes popped the memo, so the first poll lists once
+        first = await cron._dag.list_dags()
+        assert next(d for d in first if d["name"] == "lin")["totalRuns"] == 1
+        assert len(listings) == 1
+
+        # repeat polls inside the TTL are served from the memo: no listing,
+        # and list_runs rides the same memo as the /dags rollup.
+        again = await cron._dag.list_dags()
+        assert next(d for d in again if d["name"] == "lin")["totalRuns"] == 1
+        runs = await cron._dag.list_runs("lin")
+        assert [r["state"] for r in runs] == [dag.SUCCESS]
+        assert len(listings) == 1
+
+        # a local write (a new run document) must render on the very next
+        # poll: the memo is popped, so the store is listed again.
+        await cron._dag.trigger_run("lin")
+        fresh = await cron._dag.list_dags()
+        assert next(d for d in fresh if d["name"] == "lin")["totalRuns"] == 2
+        assert len(listings) == 2
+
+        # and the memo expires: with the TTL forced to zero every poll
+        # lists again (the other-nodes-wrote freshness bound).
+        monkeypatch.setattr(dagrun_mod, "DAG_SUMMARY_LIST_TTL", 0.0)
+        await cron._dag.list_dags()
+        assert len(listings) == 3
     finally:
         await _teardown(cron)
 
@@ -1788,7 +1904,11 @@ async def test_one_launch_failure_does_not_skip_the_batch(tmp_path):
         body = await cron._dag.get_run("lf", run_key)
         assert body["tasks"]["a"]["state"] == dag.FAILED
         assert body["tasks"]["a"]["exitCode"] == 127
-        assert body["tasks"]["a"]["failReason"] == "launch error"
+        # the one never-started vocabulary, shared with the start()-blew-up
+        # path (test_subprocess_start_failure_fails_task_cleanly below);
+        # this arm used to say "launch error" while that one said
+        # "launch failed" for the same operator-visible situation.
+        assert body["tasks"]["a"]["failReason"] == "launch failed"
         # b was still launched (and its pid recorded) despite a's failure
         assert body["tasks"]["b"]["state"] in (dag.RUNNING, dag.SUCCESS)
         cron._dag._launch_task = orig
@@ -1829,6 +1949,50 @@ async def test_subprocess_start_failure_fails_task_cleanly(
         assert entry["exitCode"] == 127
         assert entry["failReason"] == "launch failed"
         assert entry["pid"] is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_cancelled_launch_is_not_recorded_as_task_failure(
+    tmp_path, monkeypatch
+):
+    # A CancelledError out of the launch (shutdown/restart while queued
+    # behind the daemon-wide spawn gate) is NOT a launch failure: the task
+    # never started, so recording FAILED exit 127 would persist a wrong
+    # terminal state and burn a retry attempt, and swallowing the cancel
+    # would let the launch loop keep launching the rest of the batch
+    # mid-shutdown.  The launch path must clean up and re-raise, like
+    # maybe_launch_job.
+    from cronstable.job import RunningJob
+
+    yaml = (
+        "dags:\n  - name: cl\n    tasks:\n"
+        "      - id: a\n        command: 'x'\n"
+    )
+    cron = await _make_cron(tmp_path, yaml)
+    try:
+        _set_cmd(cron, "cl", "a", [_PY, "-c", "pass"])
+
+        async def cancelled(self):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(RunningJob, "start", cancelled)
+        run_key = None
+        try:
+            run_key = await cron._dag.trigger_run("cl")
+        except asyncio.CancelledError:
+            pass  # propagated out of an inline advance: the fix working
+        monkeypatch.undo()
+        await _drain_pending(cron)
+        if run_key is None:
+            keys = list((await cron._dag.list_runs("cl", limit=10)) or [])
+            assert keys
+            run_key = keys[0]["runKey"]
+        body = await cron._dag.get_run("cl", run_key)
+        entry = (body or {}).get("tasks", {}).get("a", {})
+        assert entry.get("failReason") != "launch failed"
+        assert entry.get("state") != dag.FAILED
+        assert (body or {}).get("state") != dag.FAILED
     finally:
         await _teardown(cron)
 
@@ -1911,6 +2075,244 @@ async def test_catch_up_honours_starting_deadline(tmp_path):
         runs = await cron._dag.list_runs("cu", limit=10)
         # only 03:00 is younger than the 1h deadline window
         assert [r["kind"] for r in runs].count("catchup") == 1
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_cap_truncation_is_loud(tmp_path, monkeypatch, caplog):
+    # DAG_MAX_CATCHUP truncating a run-all replay used to be silent, while
+    # the job engine's twin cap (cron.MAX_CATCHUP_OCCURRENCES) warns and
+    # names the escape hatches; dropping a dag's owed runs must be exactly
+    # as loud.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        monkeypatch.setattr(dagrun, "DAG_MAX_CATCHUP", 2)
+        dagcfg = cron.cron_dags["cu"]
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+            await cron._dag._catch_up(dagcfg, now_dt)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 2
+        warned = [
+            r
+            for r in caplog.records
+            if "missed at least 2 runs" in r.getMessage()
+        ]
+        assert warned, "the truncated replay must warn"
+        # run-once coalesces by design: one launch is the contract, so the
+        # cap dropping the older slots is not a truncation worth warning on.
+        caplog.clear()
+        dagcfg1 = cron.cron_dags["cu1"]
+        await cron._dag._create_run(dagcfg1, base, "scheduled")
+        with caplog.at_level(logging.WARNING, logger="cronstable.dagrun"):
+            await cron._dag._catch_up(dagcfg1, now_dt)
+        assert not [
+            r for r in caplog.records if "missed at least" in r.getMessage()
+        ]
+    finally:
+        await _teardown(cron)
+
+
+async def test_catch_up_applies_the_dag_jitter_offset(tmp_path, monkeypatch):
+    # catchupJitterSeconds is accepted and validated on dag schedules
+    # (config copies it onto the synthetic schedule job), but the DAG
+    # engine used to fire every replayed run inline, jitter or not.  The
+    # replay now defers onto a spawned task by the same deterministic
+    # per-name offset the job engine uses (Cron._catchup_offset).
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        seen = []
+        real_offset = Cron._catchup_offset
+
+        def spy_offset(name, jitter):
+            seen.append((name, jitter, real_offset(name, jitter)))
+            return 0.01  # keep the test fast; the real spread is pinned below
+
+        monkeypatch.setattr(Cron, "_catchup_offset", staticmethod(spy_offset))
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        # deferred onto a spawned task: nothing replayed inline
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
+        assert cron._dag._catchup_tasks
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+        # the offset came from the shared deterministic spread, fed with
+        # the dag's own name and configured jitter
+        assert seen == [("cu", 300, real_offset("cu", 300))]
+        assert 0.0 <= seen[0][2] < 300.0
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_skips_a_dag_removed_meanwhile(
+    tmp_path, monkeypatch
+):
+    # a reload can remove (or disable) the dag while its jitter offset
+    # elapses; the deferred replay must then write nothing.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        del cron.cron_dags["cu"]  # as a reload dropping the dag would
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        cron.cron_dags["cu"] = dagcfg  # restore so list_runs resolves
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_replays_the_reloaded_dag(
+    tmp_path, monkeypatch
+):
+    # A reload during the jitter offset can rewrite the graph as well as
+    # remove the dag. The replay re-reads the dag after the sleep and
+    # materialises runs from THAT object, so it cannot seed runs against a
+    # spec the daemon no longer has. The missed instants still come from the
+    # original computation: that is the schedule that was actually missed.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+
+        seen = []
+        real_create = cron._dag._create_run
+
+        async def spy_create(cfg, when, kind):
+            seen.append(cfg)
+            return await real_create(cfg, when, kind)
+
+        monkeypatch.setattr(cron._dag, "_create_run", spy_create)
+        # as a reload swapping the definition would
+        replacement = copy.copy(dagcfg)  # a distinct object, same definition
+        cron.cron_dags["cu"] = replacement
+        await asyncio.gather(*cron._dag._catchup_tasks)
+
+        assert seen  # the replay did run
+        assert all(cfg is replacement for cfg in seen)
+        assert not any(cfg is dagcfg for cfg in seen)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_checkpoint_survives_a_restart(
+    tmp_path, monkeypatch
+):
+    # The replay targets live only in task memory across the jitter sleep
+    # while the scheduled path keeps landing NEWER run documents.  A restart
+    # mid-sleep used to recompute "nothing missed" from the advanced
+    # document watermark and silently lose the whole backfill; the open
+    # checkpoint (written BEFORE the sleeper spawns, like the job engine's)
+    # now pins the owed watermark durably, and the next boot's catch-up
+    # hoists back to it.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron,
+            "_catchup_offset",
+            staticmethod(lambda name, jitter: 3600.0 if jitter else 0.0),
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        # the intent is durable before the sleeper has done anything
+        assert await cron._dag._pending_catchup_watermark("cu") is not None
+        # the restart: the sleeper dies mid-jitter...
+        for task in list(cron._dag._catchup_tasks):
+            task.cancel()
+        await asyncio.gather(
+            *cron._dag._catchup_tasks, return_exceptions=True
+        )
+        cron._dag._catchup_tasks.clear()
+        # ...and a scheduled fire leapfrogs the un-replayed slots, advancing
+        # the document-derived watermark past them
+        leap = datetime.datetime(2026, 1, 1, 4, 0, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, leap, "scheduled")
+        # next boot, no jitter: the recompute must resume from the
+        # checkpoint, not trust the leapfrogged document watermark
+        dagcfg.schedule_job.catchupJitterSeconds = 0
+        await cron._dag._catch_up(
+            dagcfg, datetime.datetime(2026, 1, 1, 4, 30, tzinfo=_UTC)
+        )
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+        # the resumed cycle closed its checkpoint: nothing left to resume
+        assert await cron._dag._pending_catchup_watermark("cu") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_closes_its_checkpoint(tmp_path, monkeypatch):
+    # a replay that runs to completion must close the cycle it opened, or
+    # every later boot would re-walk (and re-dedup) the same slots forever.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 3
+        assert await cron._dag._pending_catchup_watermark("cu") is None
+    finally:
+        await _teardown(cron)
+
+
+async def test_deferred_catch_up_honours_onmissed_flipped_to_skip(
+    tmp_path, monkeypatch
+):
+    # a reload can flip onMissed to "skip" (the operator saying "do not
+    # backfill") while the jitter elapses; the old revalidation checked only
+    # removed/disabled, so the replay fired anyway.  The job twin has always
+    # dropped here (Cron._run_catch_up); the dag replay must too.
+    cron = await _make_cron(tmp_path, _HOURLY)
+    try:
+        dagcfg = cron.cron_dags["cu"]
+        dagcfg.schedule_job.catchupJitterSeconds = 300
+        monkeypatch.setattr(
+            Cron, "_catchup_offset", staticmethod(lambda name, jitter: 0.01)
+        )
+        base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+        now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+        await cron._dag._create_run(dagcfg, base, "scheduled")
+        await cron._dag._catch_up(dagcfg, now_dt)
+        dagcfg.schedule_job.onMissed = "skip"  # as a reload edit would
+        await asyncio.gather(*cron._dag._catchup_tasks)
+        runs = await cron._dag.list_runs("cu", limit=10)
+        assert [r["kind"] for r in runs].count("catchup") == 0
     finally:
         await _teardown(cron)
 
@@ -2602,6 +3004,57 @@ async def test_dag_run_rollup_missing_body_is_skipped(tmp_path, monkeypatch):
         await _teardown(cron)
 
 
+async def test_run_summaries_mid_rebuild_write_is_not_memoized(
+    tmp_path, monkeypatch
+):
+    # The uncached rebuild spans awaits, so a local write can land between
+    # two of them: its _mutate pop finds no memo entry (a no-op) and, without
+    # the generation guard, the rebuild would memoize its pre-write reads
+    # under a fresh stamp, hiding the write until the TTL aged it out.
+    #
+    # The TTL is widened so a wrongly-stored entry cannot expire on its own
+    # and mask the regression: the second call below must rebuild because
+    # nothing was memoized, not because the TTL ran out.
+    monkeypatch.setattr(dagrun, "DAG_SUMMARY_LIST_TTL", 3600.0)
+    cron = await _make_cron(tmp_path, _XC_YAML)
+    try:
+        await _mint_run(cron, "r1")
+
+        backend = cron.state_backend
+        real_read = backend.read_document
+        fired = []
+
+        def _finish(body):
+            body["state"] = dag.SUCCESS
+            return body, None
+
+        async def racing_read(ns, key):
+            body = await real_read(ns, key)
+            if not fired:
+                fired.append(key)
+                # the run finishes mid-rebuild through the real _mutate path
+                # (pop + generation bump); ``body`` above is the pre-write
+                # read the rebuild goes on to summarize.
+                await cron._dag._mutate("xc", "r1", _finish)
+            return body
+
+        backend.read_document = racing_read
+
+        # the racing rebuild still returns its (pre-write) result to the
+        # caller...
+        first = await cron._dag._run_summaries(backend, "xc")
+        assert fired == ["r1"]
+        assert [s["state"] for s in first] == [dag.RUNNING]
+        # ...but must not memoize it under a fresh stamp
+        assert "xc" not in cron._dag._summaries_memo
+        # so the very next call rebuilds and reflects the write at once,
+        # without waiting out the (here: huge) TTL.
+        second = await cron._dag._run_summaries(backend, "xc")
+        assert [s["state"] for s in second] == [dag.SUCCESS]
+    finally:
+        await _teardown(cron)
+
+
 # --------------------------------------------------------------------------
 # forget() on a backend swap: every per-store cache is dropped, so /dags stops
 # serving the OLD store's finished run for the NEW store's live one.
@@ -2938,7 +3391,7 @@ async def test_lease_usable_live_stale_and_taken_over(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 
-async def test_prepare_task_run_env_and_secrets(tmp_path):
+async def test_prepare_task_run_env_and_secrets(tmp_path, caplog):
     missing = tmp_path / "nope.secret"  # never created -> fromFile raises
     yaml = (
         "dags:\n  - name: sec\n    tasks:\n"
@@ -2965,7 +3418,7 @@ async def test_prepare_task_run_env_and_secrets(tmp_path):
         # is still returned, token is None.
         api = cron._job_api
         cron._job_api = None
-        token, env = cron._dag._prepare_task_run(
+        token, env = await cron._dag._prepare_task_run(
             dagcfg, run_id, "manual-1", intent, template
         )
         assert token is None
@@ -2975,9 +3428,14 @@ async def test_prepare_task_run_env_and_secrets(tmp_path):
         cron._job_api = api
 
         # With the API up, the secret loop stages GOOD and skips the broken
-        # BAD (its fromFile cannot be read) rather than failing the launch.
-        token, env = cron._dag._prepare_task_run(
-            dagcfg, run_id, "manual-1", intent, template
+        # BAD (its fromFile cannot be read) rather than failing the launch,
+        # and the skip is logged rather than silent.
+        with caplog.at_level(logging.WARNING, logger="cronstable.jobapi"):
+            token, env = await cron._dag._prepare_task_run(
+                dagcfg, run_id, "manual-1", intent, template
+            )
+        assert any(
+            "could not stage secret" in r.message for r in caplog.records
         )
         assert token is not None
         ctx = cron._job_api._runs[token]

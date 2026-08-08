@@ -420,7 +420,7 @@ check that the host resolves and is reachable from the daemon. See
 
 **Symptom.** Expected metrics never reach statsd. cronstable emits four per job:
 `start`, `stop`, and `success` as gauges (`|g`) and `duration` as a timer
-(`|ms|@0.1`), prefixed by the job's `statsd.prefix`. At most a log warning
+(`|ms`), prefixed by the job's `statsd.prefix`. At most a log warning
 `Job <name>: failed to send statsd … metric` or an error
 `UDP error received: <exc>`.
 

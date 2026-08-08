@@ -464,6 +464,26 @@ class ReconcileAdvanceResult:
 # --------------------------------------------------------------------------
 
 
+def _mapped_instance_state(
+    tasks: Dict[str, Any], prefix: str, index: int
+) -> str:
+    """The state of one ``<id>#<i>`` instance of an expanded task.
+
+    THE one absent-entry rule, shared by the fan-in barrier
+    (:func:`_mapped_group_state`) and the run terminaliser
+    (:func:`_maybe_terminalise`).  Expansion materialises every instance in
+    the same RMW that records the item list, so an entry missing for a
+    run-recorded index can only mean a foreign or damaged run document; it
+    reads as ``pending`` (non-terminal) in BOTH consumers.  The two once
+    disagreed (barrier held, terminaliser skipped), so the same document
+    could complete as a run while its group still read ``running`` to every
+    downstream; under the shared rule a hole holds the run open instead,
+    where the reconcile/GC paths can see it.
+    """
+    entry = tasks.get(prefix + str(index))
+    return PENDING if entry is None else str(entry.get("state", PENDING))
+
+
 def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
     """The aggregate state of a mapped task, for downstream dep checks.
 
@@ -492,8 +512,7 @@ def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
     skipped = False
     prefix = task_id + "#"
     for i in range(len(items)):
-        entry = tasks.get(prefix + str(i))
-        state = PENDING if entry is None else entry.get("state", PENDING)
+        state = _mapped_instance_state(tasks, prefix, i)
         if state not in TERMINAL_STATES:
             return RUNNING  # fan-in barrier: not every instance is terminal
         if state in FAILURE_STATES:
@@ -819,7 +838,27 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
     # so an ``all_done`` mapped task (whose deps verdict is "ready", never
     # "fail"/"skip") does not wedge the run when its source fails/skips.
     if task.expand is not None:
-        src = effective_state(spec, body, task.expand.from_task)
+        from_task = task.expand.from_task
+        in_run = from_task in body.get("tasks", {}) or from_task in body.get(
+            "mapped", {}
+        )
+        if not in_run:
+            # The expand source has NO entry in this run document, so it was
+            # added (or renamed into existence) by a config reload after the
+            # run was created (run creation materialises every then-current
+            # task).  It is not part of this run's plan and will never produce
+            # an item list, so the fan-out can never be built.  The same
+            # "not materialised" rule that _deps_verdict and _maybe_terminalise
+            # already apply, which this path was missing: effective_state
+            # defaults an absent entry to PENDING, so without this arm the
+            # placeholder waits on a task that will never appear.  Nothing
+            # then reaches a terminal state, so the dagadvance lease is
+            # renewed for the life of the daemon, retention GC can never
+            # collect the run, and every advance pass pays a full document
+            # deepcopy to change nothing.
+            _resolve_unmaterialised_source(task, entry, now, result)
+            return
+        src = effective_state(spec, body, from_task)
         if src in (FAILED, UPSTREAM_FAILED):
             _terminalise_task(entry, UPSTREAM_FAILED, now, result)
             return
@@ -831,6 +870,32 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
         _terminalise_task(entry, UPSTREAM_FAILED, now, result)
     elif verdict == "skip":
         _terminalise_task(entry, SKIPPED, now, result)
+
+
+def _resolve_unmaterialised_source(task, entry, now, result) -> None:
+    """Fail a mapped placeholder whose expand source is not in this run.
+
+    Reached from :func:`_propagate_placeholder` when ``expand.fromTask`` names
+    a task with no entry in the run document: a config reload renamed the
+    source (or added it) after the run was created, and ``validate_graph``
+    accepts that because the NEW spec is internally consistent.  The source
+    will never run in THIS run, so its XCom item list will never exist and the
+    placeholder can never fan out.
+
+    Failed rather than skipped, and with a reason, for the same purpose
+    :func:`_resolve_stale_placeholder` fails its case: the task genuinely
+    cannot run under this run's plan, an operator wants to see why, and a
+    silent skip would let the run report success for work that never
+    happened.  Terminalising it lets the run finish, release its lease and be
+    pruned; the next run, created wholly under the new spec, expands cleanly.
+    """
+    entry["failReason"] = (
+        "expand source {!r} has no entry in this run: it was added or "
+        "renamed by a config reload after the run was created, so its item "
+        "list can never exist and this task cannot fan out (the next run "
+        "expands normally)".format(task.expand.from_task)
+    )
+    _terminalise_task(entry, FAILED, now, result)
 
 
 def _resolve_stale_placeholder(task, entry, now, result) -> None:
@@ -1086,10 +1151,11 @@ def _maybe_terminalise(spec, body, now, result) -> None:
         items = mapped.get("items", []) if mapped is not None else []
         prefix = task.id + "#"
         for i in range(len(items)):
-            entry = tasks.get(prefix + str(i))
-            if entry is None:
-                continue  # spec task not materialised in this run: skip it
-            st = entry.get("state")
+            # _mapped_instance_state is the shared absent-entry rule: an
+            # entry missing for a run-recorded index reads as pending, so a
+            # damaged document holds the run open (matching the fan-in
+            # barrier's verdict) instead of completing around the hole.
+            st = _mapped_instance_state(tasks, prefix, i)
             if st not in TERMINAL_STATES:
                 return
             if st in FAILURE_STATES:
@@ -1421,8 +1487,8 @@ def mark_task_finished(
 
     A sensor whose poke exited non-zero is rescheduled (``nextPokeAt`` bumped)
     rather than failed, until it succeeds or times out.  A failed plain task
-    with retries left is parked ``failed`` with ``nextRetryAt`` set; the next
-    advance re-claims it.  Otherwise the instance is terminal.
+    with retries left is parked ``up_for_retry`` with ``nextRetryAt`` set; the
+    next advance re-claims it.  Otherwise the instance is terminal.
 
     ``resources`` is the finished instance's sampled CPU/memory usage as an
     already-serialised dict (``ResourceUsage.to_dict()``), recorded verbatim

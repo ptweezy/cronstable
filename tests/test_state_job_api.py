@@ -455,6 +455,25 @@ async def test_secret_is_run_scoped(tmp_path):
         await backend.stop()
 
 
+async def test_stage_secrets_warns_and_skips_unresolvable(
+    monkeypatch, caplog
+):
+    # direct unit test of the shared stager (jobs and dag tasks both call
+    # it): an unresolvable secret is skipped with a warning, never fatal;
+    # the run sees a 404 for it and fails as it sees fit.
+    monkeypatch.delenv("JOBAPI_UNSET_SECRET", raising=False)
+    specs = [
+        {"name": "good", "value": "v"},
+        {"name": "bad", "fromEnvVar": "JOBAPI_UNSET_SECRET"},
+    ]
+    with caplog.at_level(logging.WARNING, logger="cronstable.jobapi"):
+        staged = await jobapi.stage_secrets(specs, "job x")
+    assert staged == {"good": "v"}
+    assert any(
+        "could not stage secret" in r.message for r in caplog.records
+    )
+
+
 # --------------------------------------------------------------------------
 # Locks (mutex / semaphore) over HTTP
 # --------------------------------------------------------------------------
@@ -786,7 +805,7 @@ async def test_cron_starts_job_api_and_injects_env(tmp_path):
     try:
         assert cron._job_api is not None
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
         assert token is not None
         assert env["CRONSTABLE_STATE_URL"].startswith("http://127.0.0.1:")
         assert env["CRONSTABLE_STATE_TOKEN"] == token
@@ -816,7 +835,7 @@ async def test_cron_jobapi_disabled(tmp_path):
     try:
         assert cron._job_api is None
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
         assert token is None
         assert env == {}
     finally:
@@ -833,7 +852,7 @@ async def test_end_to_end_real_subprocess(tmp_path):
     await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
     try:
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
         child_env = {**os.environ, **env}
         # run via create_subprocess_exec (not blocking subprocess.run) so the
         # daemon's event loop stays free to serve the child's loopback request.
@@ -874,7 +893,7 @@ async def test_cli_subprocess_ignores_proxy_env(tmp_path):
     await cron.start_stop_state(_state_cfg(_ONE_JOB.format(path=tmp_path)))
     try:
         job = parse_config_string(_ONE_JOB.format(path=tmp_path), "").jobs[0]
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
         proxy = "http://127.0.0.1:1"
         child_env = {
             **os.environ,
@@ -924,7 +943,7 @@ async def test_cron_stages_secrets(tmp_path):
     await cron.start_stop_state(_state_cfg(yaml))
     try:
         job = parse_config_string(yaml, "").jobs[0]
-        token, env = cron._prepare_job_api_run(job, None)
+        token, env = await cron._prepare_job_api_run(job, None)
         async with aiohttp.ClientSession(
             headers={"Authorization": "Bearer " + token}
         ) as s:

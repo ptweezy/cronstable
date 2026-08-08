@@ -269,8 +269,15 @@ async def test_records_are_immutable_and_versioned(tmp_path):
     files = [n for n in os.listdir(stream_dir) if n.endswith(".json")]
     assert len(files) == 1
     on_disk = json.loads((open(os.path.join(stream_dir, files[0])).read()))
-    assert on_disk["schemaVersion"] == state.SCHEME_VERSION
+    assert on_disk["schemaVersion"] == state.SCHEMA_VERSION
     assert on_disk["data"] == {"k": "v"}
+
+
+def test_the_old_scheme_version_spelling_still_resolves():
+    # SCHEMA_VERSION was renamed off its collision with the unrelated
+    # fingerprint.SCHEME_VERSION. The old spelling is a module-level name a
+    # downstream script may import, so it stays as an alias.
+    assert state.SCHEME_VERSION == state.SCHEMA_VERSION
 
 
 async def test_derive_max_is_order_independent(tmp_path):
@@ -740,7 +747,7 @@ async def test_malformed_record_shape_is_still_quarantined(tmp_path):
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-bad.json"), "w") as fobj:
         json.dump(
-            {"schemaVersion": state.SCHEME_VERSION, "data": "not-a-dict"}, fobj
+            {"schemaVersion": state.SCHEMA_VERSION, "data": "not-a-dict"}, fobj
         )
     assert await backend.list_records("s") == []
     assert "00001-bad.json" not in os.listdir(stream_dir)
@@ -1045,6 +1052,56 @@ def test_fs_safe_is_injective_and_portable():
     assert "/" not in _fs_safe("a/b c")
     assert _fs_safe("a/b") != _fs_safe("a-b")  # no collision
     assert _fs_safe("") == "_"
+
+
+def test_decode_fs_token_inverts_fs_safe_including_every_escape_hatch():
+    # _decode_fs_token has a fast path that hands an all-_FS_SAFE token back
+    # unchanged, which is only sound because _fs_safe would re-emit such a
+    # name verbatim. _fs_safe has three escape hatches that break that, and
+    # the fast path spends one guard on each; with no coverage a guard can be
+    # deleted with the whole suite green, and the function then returns names
+    # the encoder cannot have produced. state_admin's GC keep-set re-encodes
+    # every decoded name, so such a name reads an absent directory and the
+    # live state behind it is collected as garbage.
+    #
+    # One case per hatch, asserted against _fs_safe rather than a literal, so
+    # the test follows the encoder if its spelling ever changes.
+    for hatch, name in [
+        ("empty name", ""),
+        ("reserved device", "con"),
+        ("over length", "a" * (state._FS_SAFE_MAX + 1)),
+    ]:
+        assert _fs_safe(name) != name, hatch  # the hatch really did rewrite it
+        # the RAW name is not a token the encoder can emit, so decoding it
+        # must refuse rather than hand it straight back.
+        assert state._decode_fs_token(name) is None, hatch
+
+    # a truncated token is unrecoverable by design (its tail became a digest),
+    # so even the encoder's own output is refused for the over-length case.
+    assert (
+        state._decode_fs_token(_fs_safe("a" * (state._FS_SAFE_MAX + 1)))
+        is None
+    )
+
+    # everything else round-trips exactly, escaped or not.
+    for name in [
+        "plain-name_1",
+        "manual-9f2c1ab4",
+        "runs/nightly-backup",
+        "2026-08-07T12:00:00+00:00",
+        "Backup",
+        "a/b c",
+        chr(0xDCFF),  # lone surrogate, as os.fsdecode can produce
+        "n" + chr(0x00EF) + "code",
+        "con-x",
+        "a" * state._FS_SAFE_MAX,
+    ]:
+        assert state._decode_fs_token(_fs_safe(name)) == name, name
+
+    # a token the encoder cannot have produced is refused, never mangled:
+    # lowercase-hex aliases and foreign filenames re-encode differently.
+    assert state._decode_fs_token("%2f") is None  # the encoder emits %2F
+    assert state._decode_fs_token("Backup") is None  # uppercase is escaped
 
 
 def test_fs_safe_case_insensitive_injectivity():
@@ -2132,6 +2189,42 @@ async def test_list_document_keys_foreign_filename_reports_unable(tmp_path):
     await backend.stop()
 
 
+async def test_list_document_keys_round_trip_guard(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    await backend.mutate_document("ns", "real", lambda c: ({"v": 1}, None))
+    ns_dir = backend._doc_dir("ns")
+    # tokens that DECODE cleanly but that the encoder can never have
+    # produced: uppercase letters (which _fs_safe escapes) and a
+    # lowercase-hex alias of an escape.  A bare unquote once returned "KEY"
+    # and "/" for these, keys that address a different (or no) document;
+    # the _decode_fs_token round-trip check reports the listing unable
+    # instead, the same contract as the truncated-token branch.
+    for foreign in ("KEY.doc", "%2f.doc"):
+        with open(os.path.join(ns_dir, foreign), "wb") as fobj:
+            fobj.write(b"{}")
+        assert await backend.list_document_keys("ns") is None
+        os.unlink(os.path.join(ns_dir, foreign))
+    assert await backend.list_document_keys("ns") == ["real"]
+    await backend.stop()
+
+
+async def test_list_document_keys_surrogate_key_round_trips(tmp_path):
+    backend = _backend(tmp_path)
+    await backend.start()
+    # a key carrying a lone surrogate (names come from os.fsdecode'd
+    # sources elsewhere in the store) encodes via surrogatepass; the
+    # listing must hand back the SAME key, not report unable (the old
+    # strict-utf-8 unquote could not decode it) and never a U+FFFD-mangled
+    # spelling that addresses a nonexistent document.
+    key = "job-\udcff"
+    assert await backend.mutate_document(
+        "ns", key, lambda c: ({"v": 1}, None)
+    )
+    assert await backend.list_document_keys("ns") == [key]
+    await backend.stop()
+
+
 async def test_list_document_namespaces_lists_and_filters(tmp_path):
     backend = _backend(tmp_path)
     await backend.start()
@@ -2673,6 +2766,126 @@ async def test_gc_sweeps_orphan_document_lock_only_when_doc_absent(
     assert os.path.exists(kept_lock)
     assert os.path.exists(young_lock)
     assert not os.path.exists(dead_lock)
+
+
+async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
+    # A ttl>0 idempotency claim used to leave its .doc behind forever after
+    # expiry (the documented per-event key pattern mints one per event, so
+    # a busy dedupe scope grew its flat namespace without bound). The GC
+    # must sweep exactly the claims whose expiry lapsed a whole grace ago:
+    # permanent claims (no expiresAt), still-live TTLs, and every other
+    # docs/ namespace stay untouched.
+    from cronstable import jobstate
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "permanent")
+        await jobstate.idempotency_claim(backend, "scope", "lapsed", ttl=5.0)
+        await jobstate.idempotency_claim(
+            backend, "scope", "alive", ttl=999999.0
+        )
+        # a KV doc in a non-idem namespace, as the never-swept control
+        await jobstate.kv_set(backend, "scope", "keep", {"v": 1})
+
+        grace = 3600.0
+        future = time.time() + 4000.0  # "lapsed" expired ~4000s ago > grace
+        monkeypatch.setattr(state, "_now", lambda: future)
+
+        dry = backend._gc_sync({"runs/": set()}, grace, (), True)
+        assert dry["idem_docs_removed"] == 1
+        ns_dir = backend._doc_dir("idem/scope")
+        assert (
+            len([n for n in os.listdir(ns_dir) if n.endswith(".doc")]) == 3
+        )  # dry run deleted nothing
+
+        gc = backend._gc_sync({"runs/": set()}, grace, (), False)
+        assert gc["idem_docs_removed"] == 1
+        docs = sorted(
+            n for n in os.listdir(ns_dir) if n.endswith(".doc")
+        )
+        assert docs == ["alive.doc", "permanent.doc"]
+        # the survivors still dedupe, and the KV control is untouched
+        again = await jobstate.idempotency_claim(
+            backend, "scope", "permanent"
+        )
+        assert again["fresh"] is False
+        kept = await jobstate.kv_get(backend, "scope", "keep")
+        assert kept is not None and kept["value"] == {"v": 1}
+        # a second pass finds nothing left to sweep
+        assert (
+            backend._gc_sync({"runs/": set()}, grace, (), False)[
+                "idem_docs_removed"
+            ]
+            == 0
+        )
+    finally:
+        await backend.stop()
+
+
+async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(tmp_path):
+    # REGRESSION: the idem-doc sweep used to take each candidate's flock
+    # with the blocking _locked, so on a shared store one peer wedged
+    # mid-claim stalled the entire gc() call (and its worker slot) behind
+    # that single doc. The sweep now try-locks: a held lock skips the doc
+    # for this pass and a later pass collects it once released. Both
+    # platforms' lock primitives conflict across two descriptors of one
+    # file inside a single process (POSIX flock is per-open-file-
+    # description, Windows byte-range locks are per-handle; pinned by
+    # test_platform.test_nonblocking_lock_raises_on_contention), so a
+    # plain second fd stands in for the wedged peer and no subprocess or
+    # platform gate is needed.
+    from cronstable import jobstate
+    from cronstable.platform import exclusive_file_lock
+
+    backend = _backend(tmp_path)
+    await backend.start()
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "held", ttl=5.0)
+        await jobstate.idempotency_claim(backend, "scope", "free", ttl=5.0)
+        cutoff = time.time() + 4000.0  # both claims lapsed vs this cutoff
+
+        held_lock, held_doc = backend._doc_paths("idem/scope", "held")
+        _free_lock, free_doc = backend._doc_paths("idem/scope", "free")
+
+        result = {}
+
+        def _sweep():
+            result["removed"] = backend._gc_idem_docs_sync(cutoff, False)
+
+        fd = os.open(held_lock, os.O_RDWR)
+        try:
+            with exclusive_file_lock(fd, blocking=False):
+                # daemon so a regression (the sweep blocking forever on
+                # the held flock) fails the join assert instead of
+                # hanging the whole run.
+                worker = threading.Thread(target=_sweep, daemon=True)
+                worker.start()
+                worker.join(timeout=30.0)
+                assert not worker.is_alive(), (
+                    "gc stalled behind a held idempotency-doc lock"
+                )
+        finally:
+            os.close(fd)
+
+        assert result["removed"] == 1  # the uncontended doc only
+        assert os.path.exists(held_doc)
+        assert not os.path.exists(free_doc)
+
+        # lock released: the next pass collects the skipped doc.
+        assert backend._gc_idem_docs_sync(cutoff, False) == 1
+        assert not os.path.exists(held_doc)
+    finally:
+        await backend.stop()
+
+
+def test_idem_prefix_mirror_stays_in_sync():
+    # state cannot import jobstate (layering), so the GC recognises the
+    # idempotency namespaces by a mirrored prefix constant; this pin is
+    # what makes the mirror safe.
+    from cronstable import jobstate
+
+    assert state._IDEM_DOC_NS_PREFIX == jobstate.IDEM_NS_PREFIX
 
 
 async def test_gc_sweeps_bare_lease_lock_idle_past_grace(tmp_path):

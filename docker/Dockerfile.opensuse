@@ -14,18 +14,54 @@ ARG LEAP_VERSION=16.0
 # ---- build stage --------------------------------------------------------
 FROM opensuse/leap:${LEAP_VERSION} AS builder
 
-ARG VERSION=""
-
 WORKDIR /src
-COPY . .
+
+# Layer contract, load-bearing for CI speed: everything from here through the
+# orjson step reads nothing from the source tree except pyproject.toml and
+# docker/extract_deps.py and never references the per-commit VERSION arg, so
+# buildx's GHA cache reuses these expensive layers (toolchain plus every
+# dependency, source-compiled under QEMU on the wheel-less arches) across
+# source-only commits; a typical push rebuilds only the cheap project
+# install at the bottom of this stage.
+# CI sets DEPS_REFRESH to the run id on a RELEASE so a release re-resolves
+# every dependency fresh; ordinary pushes leave it "" and ride the cache.
+ARG DEPS_REFRESH=""
 
 # python313 is Leap 16's modern, parallel-installable interpreter (Python 3.13).
 # Unlike Leap 15 (which split pip into a python311-pip package), Leap 16 bundles
 # ensurepip in python313, so `python3.13 -m venv` bootstraps pip into the venv
 # with no separate -pip package to install. Add a toolchain so pip can
 # source-compile any dep without a wheel for the target arch; it stays in this
-# builder stage. git is pulled in only for a plain local build (empty VERSION),
-# where setuptools_scm reads the version from .git.
+# builder stage. git is now installed unconditionally: a plain local build
+# needs it for setuptools_scm to read .git, and gating it on VERSION (as this
+# layer once did) would put the per-commit version into the cache key and
+# rebuild the toolchain on every push.
+# retry() re-runs a network step (package refresh/install, pip download) a few
+# times with backoff. zypper exit 106 means a repo mirror was unreachable, so
+# the refresh is retried explicitly before install.
+RUN set -eux; \
+    : "deps-refresh=${DEPS_REFRESH}"; \
+    retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
+    retry zypper --non-interactive refresh; \
+    retry zypper --non-interactive install python313 python313-devel gcc make libffi-devel libsodium-devel git; \
+    zypper clean --all
+
+# Only pyproject.toml and the shared extraction helper reach the dependency
+# layer: its cache key is the dependency metadata plus the small script that
+# reads it, never the rest of the tree.
+COPY pyproject.toml /tmp/deps/pyproject.toml
+COPY docker/extract_deps.py /tmp/deps/extract_deps.py
+
+# Install the third-party dependencies into the venv the runtime stage will
+# copy. The requirement strings are read out of pyproject.toml by the COPYd
+# extract_deps.py helper (core dependencies plus the push and discovery
+# extras), the exact strings `pip install ".[push,discovery]"` would
+# resolve, so the two can never drift and a renamed extra fails the build
+# loudly (KeyError). The build backend (build-system.requires) goes into a
+# throwaway venv, /tmp/deps/buildenv: the project install below uses it to
+# build the wheel without network access, and it never pollutes the shipped
+# /opt/venv.
+#
 # libsodium-devel + SODIUM_INSTALL=system: on the archs with no PyNaCl wheel
 # (ppc64le/s390x) pip builds PyNaCl from its sdist, and with SODIUM_INSTALL
 # unset that build compiles the BUNDLED libsodium and runs its whole autotools
@@ -38,21 +74,15 @@ COPY . .
 # floor), which the distro compiled and tested on real hardware. The sealed-
 # box self-test below still proves the pairing works under emulation. On
 # amd64/arm64 PyNaCl installs as a wheel and the variable is inert.
-# retry() re-runs a network step (package refresh/install, pip download) a few
-# times with backoff. zypper exit 106 means a repo mirror was unreachable, so
-# the refresh is retried explicitly before install.
 RUN set -eux; \
     retry() { n=0; until "$@"; do n=$((n+1)); if [ "$n" -ge 5 ]; then return 1; fi; echo "retry $n: $*"; sleep $((n*5)); done; }; \
-    pkgs="python313 python313-devel gcc make libffi-devel libsodium-devel"; \
-    if [ -z "$VERSION" ]; then pkgs="$pkgs git"; fi; \
-    retry zypper --non-interactive refresh; \
-    retry zypper --non-interactive install $pkgs; \
-    zypper clean --all; \
-    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
     export SODIUM_INSTALL=system; \
     python3.13 -m venv /opt/venv; \
     retry /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 ".[push,discovery]"
+    /opt/venv/bin/python /tmp/deps/extract_deps.py /tmp/deps/pyproject.toml; \
+    retry /opt/venv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/requirements.txt; \
+    python3.13 -m venv /tmp/deps/buildenv; \
+    retry /tmp/deps/buildenv/bin/pip install --no-cache-dir --timeout 60 -r /tmp/deps/build-requires.txt
 
 # The push (PyNaCl) and discovery (zeroconf) extras above are part of the
 # image contract: a `push:` or `web.bonjour` section fails closed at config
@@ -85,6 +115,27 @@ RUN set -eux; \
         /opt/venv/bin/pip uninstall -y orjson || true; \
     fi; \
     zypper clean --all
+
+# ---- project install: the only per-commit layers ------------------------
+
+# In CI we pass the already-computed release version so the build is
+# deterministic and needs no git history. A plain local build leaves it empty
+# and setuptools_scm reads the version from .git (kept in the context by
+# .dockerignore; the toolchain layer's git binary serves).
+ARG VERSION=""
+
+COPY . .
+
+# Build the wheel with the cached buildenv's backend (--no-build-isolation:
+# no per-commit network fetch of setuptools/setuptools_scm) and install it
+# with --no-deps: every dependency is already in /opt/venv from the cached
+# layer above, and adding one edits pyproject.toml, which rebuilds that
+# layer. `pip check` then proves the split left nothing unsatisfied.
+RUN set -eux; \
+    if [ -n "$VERSION" ]; then export SETUPTOOLS_SCM_PRETEND_VERSION="$VERSION"; fi; \
+    /tmp/deps/buildenv/bin/pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/deps/wheelhouse .; \
+    /opt/venv/bin/pip install --no-cache-dir --no-deps /tmp/deps/wheelhouse/cronstable-*.whl; \
+    /opt/venv/bin/pip check
 
 # Drop pip from the venv before it ships. The runtime image installs nothing
 # (no package manager, read-only root filesystem), so pip and its vendored

@@ -537,9 +537,10 @@ The **`▦ heat`** header button (or *Toggle activity heatmap* in the palette)
 adds a punchcard card: one row per job, 24 time buckets across a **6h / 24h /
 7d** window, each cell colored by the worst outcome in that bucket and shaded
 by run volume. Hover a cell for the bucket's tally (e.g. `3 ok / 1 fail`);
-click a cell or a job name to open that job. It is built by fetching each
-job's [run history](HTTP-API#get-jobsnameruns) (capped and cached in the
-browser), so its horizon is bounded by the daemon's in-memory history.
+click a cell or a job name to open that job. It is filled by one batched
+[`GET /activity`](HTTP-API#get-activity) fetch (falling back to per-job
+[run history](HTTP-API#get-jobsnameruns) fetches against an older daemon),
+so its horizon is bounded by the daemon's in-memory history.
 
 ## Schedule pressure
 
@@ -700,7 +701,7 @@ The dashboard is a thin client over the [HTTP Control API](HTTP-API):
 - while the [fleet view](#fleet-view-every-nodes-runs-in-one-pane) is open, `GET /fleet` rides the same poll (the daemon answers it from gossip state it already holds);
 - the [state inspector](#durable-state-inspector) probes `GET /state` once at load (to decide whether to offer its button), polls it only while the card is open, and drills into scopes with `GET /state/documents` / `GET /state/records`;
 - the **node resources** card refetches `GET /node/history` while it is open;
-- opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) batches the same endpoint across jobs (capped, with a short-lived cache);
+- opening a job's **History** tab fetches `GET /jobs/{name}/runs` (full retained history plus aggregate stats); the [activity heatmap](#activity-heatmap) fills from one batched [`GET /activity`](HTTP-API#get-activity) fetch and keeps the capped per-job loop as a fallback against an older daemon;
 - opening a job's **Resources** tab fetches `GET /jobs/{name}/resources` — lazily, never on the poll loop — and refetches it at the live view's selectable pace while the tab stays open;
 - opening the **Logs** tab opens the `GET /jobs/{name}/logs` SSE stream;
 - the [multi-tail console](#merged-multi-tail) opens up to four of those SSE streams at once (one per tailed job) and re-attaches them as runs come and go;
