@@ -25,18 +25,8 @@ import cronstable.state as state_mod
 from cronstable import jobstate
 from cronstable.cron import Cron
 from cronstable.jobstate import JobStateError
-from cronstable.state import FilesystemStateBackend
-
 from tests._commands import cmd_print, yaml_command
-from tests.test_state import _drain_state_writes, _state_cfg
-
-
-def _backend(path):
-    return FilesystemStateBackend(
-        {"path": str(path), "topology": "single-node", "deploymentId": None},
-        lambda: "test-jobset",
-    )
-
+from tests._helpers import _backend, _drain_state_writes, _state_cfg
 
 # --- 1. the fsync barrier protocol ----------------------------------------
 #
@@ -230,7 +220,9 @@ async def test_one_run_writes_open_record_close_and_nothing_else(tmp_path):
         inflight = [kind for stream, kind in events if stream == "inflight/j"]
         runs = [kind for stream, kind in events if stream == "runs/j"]
         counters = [
-            stream for stream, _kind in events if stream.startswith("counters/")
+            stream
+            for stream, _kind in events
+            if stream.startswith("counters/")
         ]
         assert inflight == ["open", "closed"], (
             "the inflight stream must see exactly open then closed; got %r"

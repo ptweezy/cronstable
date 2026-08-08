@@ -1,9 +1,9 @@
 """Shared fixtures, constants, and helpers for the test_cron_* split files.
 
-Extracted verbatim from the former tests/test_cron.py so the six split
-modules can import them by name. The autouse fixed_current_time fixture
-freezes cronstable.cron.get_now at 1999-12-31 12:00:00 in every module
-that imports it.
+Extracted from the former tests/test_cron.py so the six split modules can
+import them by name. The autouse fixed_current_time fixture freezes
+cronstable.cron.get_now at 1999-12-31 12:00:00 in every module that
+imports it.
 """
 
 import datetime
@@ -12,6 +12,7 @@ import pytest
 
 import cronstable.cron
 from tests._commands import cmd_print, cmd_sleep, yaml_command
+from tests._configs import job_yaml
 
 
 async def _noop():
@@ -19,22 +20,32 @@ async def _noop():
     return None
 
 
-@pytest.fixture(autouse=True)
-def fixed_current_time(monkeypatch):
-    FIXED_TIME = datetime.datetime(
-        year=1999, month=12, day=31, hour=12, minute=0, second=0
-    )
+FIXED_TIME = datetime.datetime(
+    year=1999, month=12, day=31, hour=12, minute=0, second=0
+)
 
+
+def _set_now(monkeypatch, holder):
+    # a controllable clock: holder["now"] is a naive datetime, localized to
+    # the requested timezone (adopt the tz when naive, convert when aware).
+    # The autouse fixed_current_time fixture is this clock frozen at
+    # FIXED_TIME.
     def get_now(timezone):
-        now = FIXED_TIME
+        now = holder["now"]
         if timezone is not None:
-            if now.tzinfo is None:
-                now = now.replace(tzinfo=timezone)
-            else:
-                now = now.astimezone(timezone)
+            now = (
+                now.replace(tzinfo=timezone)
+                if now.tzinfo is None
+                else now.astimezone(timezone)
+            )
         return now
 
     monkeypatch.setattr("cronstable.cron.get_now", get_now)
+
+
+@pytest.fixture(autouse=True)
+def fixed_current_time(monkeypatch):
+    _set_now(monkeypatch, {"now": FIXED_TIME})
 
 
 JOB_THAT_SUCCEEDS = (
@@ -145,12 +156,7 @@ def _reboot_mgr(
     return _Mgr()
 
 
-_WEB_ONE_JOB = """
-jobs:
-  - name: alpha
-    command: echo alpha
-    schedule: "*/5 * * * *"
-"""
+_WEB_ONE_JOB = job_yaml("alpha", schedule="*/5 * * * *")
 
 
 _SECONDS_JOB = """
@@ -162,22 +168,6 @@ jobs:
     command: echo min
     schedule: "* * * * *"
 """
-
-
-def _set_now(monkeypatch, holder):
-    # a controllable clock: holder["now"] is a naive datetime, localised to the
-    # requested timezone exactly as the real fixed_current_time fixture does.
-    def get_now(timezone):
-        now = holder["now"]
-        if timezone is not None:
-            now = (
-                now.replace(tzinfo=timezone)
-                if now.tzinfo is None
-                else now.astimezone(timezone)
-            )
-        return now
-
-    monkeypatch.setattr("cronstable.cron.get_now", get_now)
 
 
 _EVERY_SECOND_AND_MINUTE = """

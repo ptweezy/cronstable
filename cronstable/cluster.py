@@ -2700,7 +2700,10 @@ class ClusterManager(LeadershipBackend):
                 return False
         return True
 
-    # the tests exercise the settle hold through the old private name.
+    # the tests exercise the settle hold through the old private name. This
+    # alias is a frozen snapshot for those read-only callers: the gates call
+    # view_settled(), so an override of _view_settled is never consulted
+    # (override or patch view_settled instead).
     _view_settled = view_settled
 
     @_memoized_derived

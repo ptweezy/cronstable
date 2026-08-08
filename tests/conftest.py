@@ -67,7 +67,7 @@ def _cron(yaml):
 
 
 @pytest.fixture
-async def fs_backend(tmp_path):
+async def fs_backend(fs_backend_factory):
     """A started FilesystemStateBackend in tmp_path, stopped on teardown.
 
     Replaces the ``backend = _backend(tmp_path); await backend.start()``
@@ -75,10 +75,7 @@ async def fs_backend(tmp_path):
     that stops the backend itself (e.g. to assert post-stop behavior) can
     still use this fixture.
     """
-    backend = _backend(tmp_path)
-    await backend.start()
-    yield backend
-    await backend.stop()
+    return await fs_backend_factory()
 
 
 @pytest.fixture
@@ -194,42 +191,67 @@ class JobApiHarness:
 
 
 @pytest.fixture
-async def job_api(fs_backend):
-    import aiohttp
+async def job_api_factory(fs_backend_factory):
+    """Factory for the ``job_api`` harness with config and run overrides.
 
-    from cronstable.jobapi import JobStateAPI, RunContext
+    ``make(ctx=None, **cfg_over)`` builds the same harness on a fresh
+    backend, with the default config (maxValueBytes/maxArtifactBytes 0,
+    lockTtlSeconds 5) updated by ``cfg_over`` (the size-limit and
+    lockTtlSeconds cases) and the default run replaced by ``ctx`` when
+    given; the session's bearer token follows the registered run.
+    Teardown per harness, in reverse creation order: session close, api
+    stop (each backend is stopped by ``fs_backend_factory``'s own
+    finalizer, after these).
+    """
+    harnesses = []
 
-    api = JobStateAPI(
-        lambda: fs_backend,
-        base_holder="h#proc",
-        config={
+    async def make(ctx=None, **cfg_over):
+        import aiohttp
+
+        from cronstable.jobapi import JobStateAPI, RunContext
+
+        backend = await fs_backend_factory()
+        config = {
             "maxValueBytes": 0,
             "maxArtifactBytes": 0,
             "lockTtlSeconds": 5,
-        },
-    )
-    await api.start()
-    # the source file's _ctx() defaults, verbatim
-    ctx = RunContext(
-        token="tok",
-        run_id="rid-tok",
-        job_name="job",
-        attempt=0,
-        scheduled_at=None,
-        host="h",
-        default_scope="job",
-        allowed_scopes=set(),
-        secrets={},
-    )
-    api.register_run(ctx)
-    session = aiohttp.ClientSession(
-        headers={"Authorization": "Bearer tok"}
-    )
-    try:
-        yield JobApiHarness(api, fs_backend, session, ctx)
-    finally:
-        await session.close()
-        await api.stop()
+        }
+        config.update(cfg_over)
+        api = JobStateAPI(
+            lambda: backend, base_holder="h#proc", config=config
+        )
+        await api.start()
+        if ctx is None:
+            # the source file's _ctx() defaults, verbatim
+            ctx = RunContext(
+                token="tok",
+                run_id="rid-tok",
+                job_name="job",
+                attempt=0,
+                scheduled_at=None,
+                host="h",
+                default_scope="job",
+                allowed_scopes=set(),
+                secrets={},
+            )
+        api.register_run(ctx)
+        session = aiohttp.ClientSession(
+            headers={"Authorization": "Bearer " + ctx.token}
+        )
+        harness = JobApiHarness(api, backend, session, ctx)
+        harnesses.append(harness)
+        return harness
+
+    yield make
+    for harness in reversed(harnesses):
+        await harness.session.close()
+        await harness.api.stop()
+
+
+@pytest.fixture
+async def job_api(job_api_factory):
+    # the fixed default harness: job_api_factory's zero-argument make.
+    return await job_api_factory()
 
 
 # --- CLI runner (finding B12) ------------------------------------------------
@@ -247,10 +269,6 @@ class CliRunner:
     ``CRONSTABLE_STATE_URL``/``_TOKEN``); any extra monkeypatching (e.g.
     ``jobcli._http``) is the caller's, done before invoking.
     """
-
-    ExitError = ExitError
-    raise_exit = staticmethod(_exit)
-    run_coro = staticmethod(asyncio.run)  # test_state_admin.py's _run
 
     def __init__(self, monkeypatch):
         self._monkeypatch = monkeypatch

@@ -87,14 +87,16 @@ from typing import Any, Optional
 from cronstable.backends._common import (
     _SKEW_SECONDS,
     _UNKNOWN_HOLDER,
+    ElectionReadsBase,
     _monotonic,
+    fence_deadline,
 )
 from cronstable.config import ClusterConfig, ConfigError, StateConfig
 
 # RebootRanUnknownError is re-exported here for compatibility: it was born in
 # this module and is documented/imported as its conservative-gate error; it
 # now lives in cronstable.leadership so the etcd backend can share the gate.
-from cronstable.leadership import LeaseBackend, RebootRanUnknownError
+from cronstable.leadership import RebootRanUnknownError
 from cronstable.platform import IS_WINDOWS
 from cronstable.state import FilesystemStateBackend, Lease
 
@@ -157,7 +159,7 @@ def display_name(holder: Optional[str]) -> Optional[str]:
     return name or _UNKNOWN_HOLDER
 
 
-class FilesystemBackend(LeaseBackend):
+class FilesystemBackend(ElectionReadsBase):
     """Leader election through a TTL lease on a shared POSIX mount."""
 
     backend_name = "filesystem"
@@ -284,17 +286,6 @@ class FilesystemBackend(LeaseBackend):
         # cannot keep us "leader" past the real lease expiry.
         return _monotonic() < self._lease_deadline_mono
 
-    def _is_self_demoted_holder(self) -> bool:
-        # raw win flag still set (we acquired and have not observed another
-        # holder) but the monotonic fence lapsed or a renew was refused --
-        # the brief self-demotion window. See the LeadershipBackend base.
-        return self._is_leader and not self.is_leader()
-
-    def leader_name(self) -> Optional[str]:
-        if not self.is_quorate():
-            return None
-        return self._holder
-
     def is_quorate(self) -> bool:
         if self._quorum_deadline_mono is None:
             return False
@@ -346,7 +337,7 @@ class FilesystemBackend(LeaseBackend):
         self._observed_fence = fence
         if is_leader:
             fence_anchor = lease_mono if lease_mono is not None else mono
-            self._lease_deadline_mono = fence_anchor + self.ttl - _SKEW_SECONDS
+            self._lease_deadline_mono = fence_deadline(fence_anchor, self.ttl)
         else:
             self._lease_deadline_mono = None
             self._lease = None

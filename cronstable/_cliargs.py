@@ -15,19 +15,15 @@ tests/test_cli_stubs.py pins that lazy-import property.
 Like :mod:`cronstable.tlsutil`, this module is a deliberate leaf: it imports
 nothing from ``cronstable`` and nothing outside the standard library, so
 ``cronstable.__main__`` and each surface module can import it at module
-level for free.  Each surface re-exports its registration function and
-constants under their original public names, so ``from cronstable.tui
+level for free.  mcpcli and tui re-export their registration function and
+constants under the original public names, so ``from cronstable.tui
 import add_tui_command`` (and every test that reaches these through the
-surface modules) keeps working.
+surface modules) keeps working; jobcli imports nothing from here, its
+parsers are registered directly by ``cronstable.__main__``.
 """
 
 import argparse
 from typing import Any
-
-# Every job-facing `state` action name, so __main__ can tell a `state get`
-# (cronstable.jobcli) from a `state backup` (cronstable.state_admin) without
-# importing either.
-STATE_JOB_ACTIONS = frozenset({"get", "set", "delete", "keys"})
 
 # Client-side conventions shared with the web dashboard: the default listener
 # URL, the bearer-token env var cronstable's own docs use, and the env
@@ -71,32 +67,57 @@ def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_get_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("key")
+    _add_scope_flags(parser)
+
+
+def _add_set_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("key")
+    parser.add_argument("value")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="parse VALUE as JSON instead of storing it as a string",
+    )
+    _add_scope_flags(parser)
+
+
+def _add_delete_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("key")
+    _add_scope_flags(parser)
+
+
+def _add_keys_args(parser: argparse.ArgumentParser) -> None:
+    _add_scope_flags(parser)
+
+
+# One row per job-facing `state` verb: name, subcommand help, and the
+# function that declares the verb's arguments. add_state_job_actions
+# registers the rows in order, and STATE_JOB_ACTIONS is derived from the
+# same rows, so a verb added here is routed to jobcli by __main__
+# automatically; there is no second list to keep in step.
+_STATE_JOB_ACTION_TABLE = (
+    ("get", "print a durable KV value", _add_get_args),
+    ("set", "set a durable KV value", _add_set_args),
+    ("delete", "delete a durable KV value", _add_delete_args),
+    ("keys", "list the keys in a scope", _add_keys_args),
+)
+
+# Every job-facing `state` action name, so __main__ can tell a `state get`
+# (cronstable.jobcli) from a `state backup` (cronstable.state_admin) without
+# importing either.
+STATE_JOB_ACTIONS = frozenset(name for name, _, _ in _STATE_JOB_ACTION_TABLE)
+
+
 def add_state_job_actions(actions: Any) -> None:
     """Add the job-facing KV actions to the existing `state` subparser.
 
     Coexists with cronstable.state_admin's backup/restore/gc/... actions under
     the same ``cronstable state`` command; the action name disambiguates.
     """
-    get = actions.add_parser("get", help="print a durable KV value")
-    get.add_argument("key")
-    _add_scope_flags(get)
-
-    setp = actions.add_parser("set", help="set a durable KV value")
-    setp.add_argument("key")
-    setp.add_argument("value")
-    setp.add_argument(
-        "--json",
-        action="store_true",
-        help="parse VALUE as JSON instead of storing it as a string",
-    )
-    _add_scope_flags(setp)
-
-    delete = actions.add_parser("delete", help="delete a durable KV value")
-    delete.add_argument("key")
-    _add_scope_flags(delete)
-
-    keys = actions.add_parser("keys", help="list the keys in a scope")
-    _add_scope_flags(keys)
+    for name, help_text, add_args in _STATE_JOB_ACTION_TABLE:
+        add_args(actions.add_parser(name, help=help_text))
 
 
 def add_job_commands(sub: Any) -> None:
@@ -263,18 +284,26 @@ def add_job_commands(sub: Any) -> None:
     secret_actions.add_parser("list", help="list staged secret names")
 
 
-def add_mcp_command(sub: Any) -> None:
-    """Register the ``cronstable mcp`` subcommand on the subparsers."""
-    parser = sub.add_parser(
-        "mcp",
-        help="run the MCP stdio bridge to a running daemon's /mcp endpoint "
-        "(for desktop MCP clients)",
-    )
+def _add_web_client_flags(
+    parser: argparse.ArgumentParser,
+    *,
+    url_help: str,
+    token_env_default: str | None = None,
+) -> None:
+    """Declare the connection flags every web-listener client takes.
+
+    The `mcp` and `tui` subcommands accept the same seven flags with the
+    same dests, actions and defaults, so both surfaces' _resolve_token /
+    _resolve_tls plumbing sees one shape. Only the --url help (each
+    surface names its own endpoint) and the --token-env declaration
+    default vary per caller; the latter is cosmetic, both surfaces fall
+    back to WEB_ENV_TOKEN at runtime either way.
+    """
     parser.add_argument(
         "--url",
         default=WEB_DEFAULT_URL,
         metavar="URL",
-        help="daemon web base URL serving /mcp (default: %(default)s)",
+        help=url_help,
     )
     parser.add_argument(
         "--token",
@@ -285,7 +314,7 @@ def add_mcp_command(sub: Any) -> None:
     )
     parser.add_argument(
         "--token-env",
-        default=None,
+        default=token_env_default,
         metavar="VAR",
         help="env var holding the bearer token (default: {} if set)".format(
             WEB_ENV_TOKEN
@@ -318,12 +347,24 @@ def add_mcp_command(sub: Any) -> None:
     )
     parser.add_argument(
         "--insecure",
-        default=False,
         action="store_true",
         help="skip TLS verification entirely; the bearer token is still sent, "
         "so it goes to whoever answers (set {}=1 for the same)".format(
             WEB_ENV_INSECURE
         ),
+    )
+
+
+def add_mcp_command(sub: Any) -> None:
+    """Register the ``cronstable mcp`` subcommand on the subparsers."""
+    parser = sub.add_parser(
+        "mcp",
+        help="run the MCP stdio bridge to a running daemon's /mcp endpoint "
+        "(for desktop MCP clients)",
+    )
+    _add_web_client_flags(
+        parser,
+        url_help="daemon web base URL serving /mcp (default: %(default)s)",
     )
     parser.add_argument(
         "--protocol-version",
@@ -365,56 +406,10 @@ def add_tui_command(sub: Any) -> None:
             "palette, ? lists every key."
         ),
     )
-    parser.add_argument(
-        "--url",
-        default=WEB_DEFAULT_URL,
-        help="daemon web listener (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="bearer token for web.authToken-protected daemons",
-    )
-    parser.add_argument(
-        "--token-env",
-        default=WEB_ENV_TOKEN,
-        metavar="VAR",
-        help=(
-            "environment variable to read the token from when --token "
-            "is not given (default: %(default)s)"
-        ),
-    )
-    parser.add_argument(
-        "--cacert",
-        default=None,
-        metavar="PATH",
-        help=(
-            "verify an https:// listener against this CA file instead "
-            "of the system trust store (env: %s)" % WEB_ENV_CACERT
-        ),
-    )
-    parser.add_argument(
-        "--client-cert",
-        default=None,
-        metavar="PATH",
-        help=(
-            "certificate to present to a listener that requires one "
-            "(web.tls.clientCa is set) (env: %s)" % WEB_ENV_CLIENT_CERT
-        ),
-    )
-    parser.add_argument(
-        "--client-key",
-        default=None,
-        metavar="PATH",
-        help="private key for --client-cert (env: %s)" % WEB_ENV_CLIENT_KEY,
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help=(
-            "skip certificate verification; the token is still sent, so "
-            "it reaches whoever answers (env: %s)" % WEB_ENV_INSECURE
-        ),
+    _add_web_client_flags(
+        parser,
+        url_help="daemon web listener (default: %(default)s)",
+        token_env_default=WEB_ENV_TOKEN,
     )
     parser.add_argument(
         "--theme",

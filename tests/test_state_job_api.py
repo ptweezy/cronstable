@@ -9,9 +9,9 @@ lease-backed lock manager, and run-scoped secrets.  It then checks the cron
 wiring end to end: env injection at launch and token/lock cleanup at finish.
 
 Style: bare ``async def`` tests, real temp store via the conftest ``job_api``
-harness (the config-override cases build their own via ``_make_api``), no
-frozen clock (lock TTLs are kept at the floor and never waited on for a
-renewal).
+harness (the config-override cases build theirs via its conftest sibling,
+``job_api_factory``), no frozen clock (lock TTLs are kept at the floor and
+never waited on for a renewal).
 """
 
 import asyncio
@@ -38,7 +38,7 @@ from cronstable.jobapi import (
 )
 from cronstable.jobstate import JobStateError
 from cronstable.state import Lease
-from tests._helpers import _backend, _instant_sleep, _state_cfg
+from tests._helpers import _instant_sleep, _state_cfg
 
 _ONE_JOB = (
     "state:\n  path: {path}\n"
@@ -58,19 +58,6 @@ def _ctx(token="tok", job="job", secrets=None, allowed_scopes=None):
         allowed_scopes=set(allowed_scopes or ()),
         secrets=secrets or {},
     )
-
-
-async def _make_api(tmp_path, **cfg_over):
-    # kept only for the config-override cases (size limits, lockTtlSeconds)
-    # that the fixed-config conftest job_api fixture cannot express; every
-    # default-config test uses the fixture instead (finding B11).
-    backend = _backend(tmp_path)
-    await backend.start()
-    config = {"maxValueBytes": 0, "maxArtifactBytes": 0, "lockTtlSeconds": 5}
-    config.update(cfg_over)
-    api = JobStateAPI(lambda: backend, base_holder="h#proc", config=config)
-    await api.start()
-    return api, backend
 
 
 def _auth(token="tok"):
@@ -208,19 +195,13 @@ async def test_kv_scope_allowlisted_explicitly_permitted(job_api):
         assert (await r.json())["value"] == "v"
 
 
-async def test_kv_value_size_limit_413(tmp_path):
-    api, backend = await _make_api(tmp_path, maxValueBytes=8)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "x" * 100},
-            )
-            assert r.status == 413
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_kv_value_size_limit_413(job_api_factory):
+    job_api = await job_api_factory(maxValueBytes=8)
+    r = await job_api.session.post(
+        job_api.url("/v1/kv/set"),
+        json={"key": "k", "value": "x" * 100},
+    )
+    assert r.status == 413
 
 
 # --------------------------------------------------------------------------
@@ -283,18 +264,12 @@ async def test_artifact_http(job_api):
     assert r.status == 404
 
 
-async def test_artifact_size_limit_413(tmp_path):
-    api, backend = await _make_api(tmp_path, maxArtifactBytes=4)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/artifact/put?name=big", data=b"x" * 100
-            )
-            assert r.status == 413
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_artifact_size_limit_413(job_api_factory):
+    job_api = await job_api_factory(maxArtifactBytes=4)
+    r = await job_api.session.post(
+        job_api.url("/v1/artifact/put?name=big"), data=b"x" * 100
+    )
+    assert r.status == 413
 
 
 async def test_artifact_put_2mib_with_no_limit(job_api):
@@ -309,52 +284,39 @@ async def test_artifact_put_2mib_with_no_limit(job_api):
     assert (await r.json())["size"] == len(payload)
 
 
-async def test_artifact_and_kv_2mib_within_raised_limits(tmp_path):
+async def test_artifact_and_kv_2mib_within_raised_limits(job_api_factory):
     # with finite limits the transport cap is derived from them: a payload
     # under the configured maxArtifactBytes/maxValueBytes but over aiohttp's
     # 1 MiB default must succeed (xcom push rides the same artifact route).
-    api, backend = await _make_api(
-        tmp_path,
+    job_api = await job_api_factory(
         maxArtifactBytes=8 * 1024 * 1024,
         maxValueBytes=8 * 1024 * 1024,
     )
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/artifact/put?name=big",
-                data=b"x" * (2 * 1024 * 1024),
-            )
-            assert r.status == 200
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "v" * (2 * 1024 * 1024)},
-            )
-            assert r.status == 200
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await job_api.session.post(
+        job_api.url("/v1/artifact/put?name=big"),
+        data=b"x" * (2 * 1024 * 1024),
+    )
+    assert r.status == 200
+    r = await job_api.session.post(
+        job_api.url("/v1/kv/set"),
+        json={"key": "k", "value": "v" * (2 * 1024 * 1024)},
+    )
+    assert r.status == 200
 
 
-async def test_json_body_over_transport_cap_is_413_not_400(tmp_path):
+async def test_json_body_over_transport_cap_is_413_not_400(job_api_factory):
     # a JSON body larger than the derived transport cap is a 413 and must
     # surface as one: _json_body used to swallow HTTPRequestEntityTooLarge
     # and mislabel it 400 "request body is not valid JSON".
-    api, backend = await _make_api(
-        tmp_path, maxValueBytes=1024, maxArtifactBytes=1024
+    job_api = await job_api_factory(
+        maxValueBytes=1024, maxArtifactBytes=1024
     )
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "v" * (512 * 1024)},
-            )
-            assert r.status == 413
-            assert "not valid JSON" not in (await r.text())
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await job_api.session.post(
+        job_api.url("/v1/kv/set"),
+        json={"key": "k", "value": "v" * (512 * 1024)},
+    )
+    assert r.status == 413
+    assert "not valid JSON" not in (await r.text())
 
 
 # --------------------------------------------------------------------------
@@ -503,20 +465,16 @@ async def test_lock_acquire_after_run_ended_does_not_leak(job_api):
     assert r["acquired"] is True
 
 
-async def test_lock_per_acquire_ttl_used_for_hold(tmp_path):
+async def test_lock_per_acquire_ttl_used_for_hold(job_api_factory):
     # a per-acquire --ttl must drive the hold (and thus the renewer), not the
     # manager default -- otherwise a short lease lapses before its first renew.
-    api, backend = await _make_api(tmp_path, lockTtlSeconds=30)
-    api.register_run(_ctx(token="a"))
-    try:
-        r = await api.locks.acquire("a", "s", "L", ttl=6)
-        assert r["acquired"] is True
-        assert r["ttl"] == 6  # reply reports the actual ttl, not the default
-        hold = api.locks._holds[r["token"]]
-        assert hold.ttl == 6  # the renewer renews on 6, not 30
-    finally:
-        await api.stop()
-        await backend.stop()
+    job_api = await job_api_factory(ctx=_ctx(token="a"), lockTtlSeconds=30)
+    api = job_api.api
+    r = await api.locks.acquire("a", "s", "L", ttl=6)
+    assert r["acquired"] is True
+    assert r["ttl"] == 6  # reply reports the actual ttl, not the default
+    hold = api.locks._holds[r["token"]]
+    assert hold.ttl == 6  # the renewer renews on 6, not 30
 
 
 async def test_lock_acquire_non_numeric_fields_400(job_api):
@@ -630,19 +588,13 @@ async def test_idempotency_claim_non_numeric_ttl_400(job_api):
     assert r.status == 400
 
 
-async def test_cursor_value_size_limit_413(tmp_path):
-    api, backend = await _make_api(tmp_path, maxValueBytes=8)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/cursor/advance",
-                json={"name": "wm", "value": "x" * 100},
-            )
-            assert r.status == 413
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_cursor_value_size_limit_413(job_api_factory):
+    job_api = await job_api_factory(maxValueBytes=8)
+    r = await job_api.session.post(
+        job_api.url("/v1/cursor/advance"),
+        json={"name": "wm", "value": "x" * 100},
+    )
+    assert r.status == 413
 
 
 async def test_finish_run_revokes_token(job_api):

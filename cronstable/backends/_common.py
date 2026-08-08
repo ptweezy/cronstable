@@ -1,12 +1,13 @@
-"""Members the etcd and kubernetes backends share byte-for-byte.
+"""Members the lease backends (etcd, kubernetes, filesystem) share.
 
-Both backends keep the same local election state (a raw win flag, the
-observed holder, monotonic deadlines) and track their on-disk client-TLS
-material the same way, so the previously duplicated helpers live here
-once.  The time helpers are imported into each backend module under
-their own names: call sites resolve them through the importing module's
-globals, so the tests' per-module monkeypatching (for example
-``cronstable.backends.etcd._monotonic``) keeps working.
+All three keep the same local election state (a raw win flag, the
+observed holder, monotonic deadlines); etcd and kubernetes additionally
+track their on-disk client-TLS material the same way.  The previously
+duplicated helpers live here once.  The time helpers are imported into
+each backend module under their own names: call sites resolve them
+through the importing module's globals, so the tests' per-module
+monkeypatching (for example ``cronstable.backends.etcd._monotonic``)
+keeps working.
 """
 
 import datetime
@@ -52,16 +53,29 @@ def _monotonic() -> float:
     return time.monotonic()
 
 
+def fence_deadline(anchor: float, ttl_seconds: float) -> float:
+    """Skew-adjusted lease deadline: ``anchor`` plus ttl minus the margin.
+
+    The single definition of the :data:`_CLOCK_SKEW` subtraction.  Each
+    backend's ``_apply_round`` computes its monotonic ``is_leader``
+    fence from this, anchored at its conservative lower bound on when
+    the store's TTL countdown restarted; :func:`display_deadline`
+    derives the wall-clock display twin from the same expression.
+    """
+    return anchor + ttl_seconds - _SKEW_SECONDS
+
+
 def display_deadline(
     now: datetime.datetime, ttl_seconds: float
 ) -> datetime.datetime:
     """Wall-clock lease expiry, for display only.
 
-    The :data:`_CLOCK_SKEW` margin matches the monotonic fence
-    arithmetic in each backend's ``_apply_round``, so the dashboard
-    never shows an expiry the fence has already given up on.
+    Built on :func:`fence_deadline`, so the etcd and kubernetes
+    dashboards never show an expiry the monotonic fence has already
+    given up on.  (The filesystem backend has no use for this: its
+    display expiry is the ``expires_at`` its store wrote.)
     """
-    return now + datetime.timedelta(seconds=ttl_seconds) - _CLOCK_SKEW
+    return now + datetime.timedelta(seconds=fence_deadline(0.0, ttl_seconds))
 
 
 def _parse_microtime(value: object) -> datetime.datetime | None:
@@ -106,20 +120,18 @@ def _format_microtime(when: datetime.datetime) -> str:
     )
 
 
-class StoreLeaseBackend(LeaseBackend):
-    """Shared base of the store-backed lease backends (etcd, kubernetes).
+class ElectionReadsBase(LeaseBackend):
+    """The election reads every lease backend answers identically.
 
-    Everything here reads only state both subclasses maintain the same
-    way: the raw ``_is_leader`` win flag and observed ``_holder`` their
-    renew rounds write, and the TLS snapshot taken when the client
-    material is loaded.
+    Both methods read only the raw ``_is_leader`` win flag and observed
+    ``_holder`` the subclass's renew rounds write, through the
+    ``is_quorate()`` / ``is_leader()`` gates the subclass defines over
+    its own monotonic deadlines.
     """
 
     # written by the subclass (__init__ and its renew rounds)
     _is_leader: bool
     _holder: str | None
-    _tls_files: list[str]
-    _tls_signature: dict[str, tuple[int, int] | None]
 
     def leader_name(self) -> str | None:
         if not self.is_quorate():
@@ -128,18 +140,39 @@ class StoreLeaseBackend(LeaseBackend):
 
     def _is_self_demoted_holder(self) -> bool:
         # raw win flag still set (we hold/held the fence and have not
-        # observed a loss) but the monotonic fence has lapsed: the brief
-        # self-demotion window. See LeadershipBackend.
+        # observed a loss) but is_leader() answers False: the monotonic
+        # fence has lapsed, or a refused renew fenced it closed (the
+        # backends carrying a _lease_lost flag). The brief self-demotion
+        # window. See LeadershipBackend.
         return self._is_leader and not self.is_leader()
 
-    def _record_tls_signature(self, paths: Sequence[str | None]) -> None:
+
+class StoreLeaseBackend(ElectionReadsBase):
+    """Shared base of the store-backed lease backends (etcd, kubernetes).
+
+    Adds client-TLS rotation tracking to the shared election reads.
+    ``FilesystemBackend`` deliberately inherits only
+    :class:`ElectionReadsBase`: ``start_stop_cluster`` calls
+    :meth:`tls_files_changed` on every manager, and with no client-TLS
+    material to track the filesystem backend must keep the
+    ``LeadershipBackend`` ``False`` default rather than read a snapshot
+    it never initializes.
+    """
+
+    # initialized empty by the subclass __init__, rewritten by
+    # _record_tls_files
+    _tls_signature: dict[str, tuple[int, int] | None]
+
+    def _record_tls_files(self, paths: Sequence[str | None]) -> None:
         """Snapshot the on-disk TLS files the client material was built from.
 
-        ``None``/empty entries (embedded creds, plain http) are dropped, so
-        nothing on disk to rotate leaves :meth:`tls_files_changed` ``False``.
+        Called once that material is loaded: etcd's ``start`` (after
+        ``_build_ssl``), a kubernetes transport's ``setup``.  ``None``/
+        empty entries (embedded ``-data`` creds, plain http,
+        ``insecure-skip-tls-verify``) are dropped, so nothing on disk to
+        rotate leaves :meth:`tls_files_changed` ``False``.
         """
-        self._tls_files = [p for p in paths if p]
-        self._tls_signature = {p: _file_signature(p) for p in self._tls_files}
+        self._tls_signature = {p: _file_signature(p) for p in paths if p}
 
     def tls_files_changed(self) -> bool:
         """Whether any tracked on-disk TLS file changed since the snapshot.
@@ -152,7 +185,6 @@ class StoreLeaseBackend(LeaseBackend):
         :meth:`cronstable.cron.Cron.start_stop_cluster` rebuild the backend.
         ``False`` when nothing was tracked.
         """
-        if not self._tls_files:
-            return False
-        current = {p: _file_signature(p) for p in self._tls_files}
-        return current != self._tls_signature
+        return {
+            p: _file_signature(p) for p in self._tls_signature
+        } != self._tls_signature

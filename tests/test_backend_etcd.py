@@ -293,7 +293,8 @@ def test_tls_files_changed_detects_in_place_rotation(tmp_path):
         "      key: " + str(key).replace("\\", "/") + "\n"
     )
     b = _backend(extra=extra, endpoint="https://127.0.0.1:2379")
-    b._record_tls_files()  # snapshot, as start() does after _build_ssl
+    # snapshot, as start() does after _build_ssl
+    b._record_tls_files(b._tls_file_paths())
     assert b.tls_files_changed() is False
     # an in-place rotation: same path, new (longer) bytes -> new size/mtime
     cert.write_text("new-client-cert-material-much-longer")
@@ -305,8 +306,8 @@ def test_tls_files_changed_false_for_plain_http():
     # rotate and tls_files_changed stays False (the inherited lease default),
     # never spuriously rebuilding the backend.
     b = _backend()  # http endpoint, no tls material
-    b._record_tls_files()
-    assert b._tls_files == []
+    b._record_tls_files(b._tls_file_paths())
+    assert b._tls_signature == {}
     assert b.tls_files_changed() is False
 
 

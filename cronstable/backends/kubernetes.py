@@ -51,15 +51,20 @@ import aiohttp
 
 from cronstable.backends import TRANSPORT_LIBRARY, select_transport
 from cronstable.backends._common import (
-    _SKEW_SECONDS,
+    _SKEW_SECONDS,  # noqa: F401  (re-exported; every backend keeps it)
     _UNKNOWN_HOLDER,
     StoreLeaseBackend,
-    _file_signature,  # noqa: F401  (re-exported; backend tests import it)
+    # Re-exported; backend tests import it. Rotation detection
+    # (tls_files_changed) resolves the name in cronstable.backends._common,
+    # so a patch must target _common, not this module (unlike _monotonic,
+    # whose call sites stay here and patch per-module).
+    _file_signature,  # noqa: F401
     _format_microtime,
     _monotonic,
     _parse_microtime,
     _utcnow,
     display_deadline,
+    fence_deadline,
 )
 from cronstable.config import ClusterConfig, ConfigError
 from cronstable.leadership import (
@@ -445,18 +450,7 @@ class KubernetesBackend(StoreLeaseBackend):
         # re-read per request; see _auth_headers). Empty until setup() records
         # them, which keeps tls_files_changed() False (nothing on disk to
         # rotate: embedded -data creds / insecure mode).
-        self._tls_files: list[str] = []
         self._tls_signature: dict[str, Optional[tuple[int, int]]] = {}
-
-    def _record_tls_files(self, paths: list[Optional[str]]) -> None:
-        """Snapshot the on-disk TLS files the transport loaded.
-
-        Called from a transport's ``setup()``; see
-        ``StoreLeaseBackend.tls_files_changed`` (``None``/empty entries,
-        from embedded ``-data`` creds or ``insecure-skip-tls-verify``, are
-        dropped, so nothing on disk to rotate leaves it ``False``).
-        """
-        self._record_tls_signature(paths)
 
     # --- pure local-state reads (no I/O) ---------------------------------
 
@@ -588,8 +582,8 @@ class KubernetesBackend(StoreLeaseBackend):
             self._is_leader = True
             self._holder = self.display_identity
             self._leader_until = self._leader_deadline(now)
-            self._leader_until_mono = (
-                mono + self.lease_duration - _SKEW_SECONDS
+            self._leader_until_mono = fence_deadline(
+                mono, self.lease_duration
             )
         else:
             # lost the optimistic-concurrency race (a 409): not leader now.
