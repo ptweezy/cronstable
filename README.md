@@ -218,8 +218,7 @@ Already have a crontab? You don't have to translate it:
 
 Prebuilt multi-architecture images (seven Linux platforms) are published on
 every release to two registries, the GitHub Container Registry
-(`ghcr.io/ptweezy/cronstable`) and Docker Hub (`ptweezy/cronstable`); they are
-identical, so pull from whichever you prefer. Mount your crontab and go:
+(`ghcr.io/ptweezy/cronstable`) and Docker Hub (`ptweezy/cronstable`). Mount your crontab and go:
 
 ```shell
 docker run --rm \
