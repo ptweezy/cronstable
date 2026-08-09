@@ -123,42 +123,44 @@ def test_fail_closed_routable_no_token():
         _parse(yaml)
 
 
-def test_loopback_no_token_allowed():
-    yaml = (
-        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
-        "mcp:\n  enabled: true\n"
-    )
-    assert _parse(yaml).mcp_config["enabled"] is True
-
-
-def test_scoped_tokens_satisfy_mcp_fail_closed_gate():
-    # a routable listener with mcp.enabled and ONLY scoped web.authTokens (no
-    # scalar authToken) still authenticates /mcp, so the gate must pass.
-    yaml = (
-        "web:\n  listen:\n    - http://0.0.0.0:8080\n"
-        "  authTokens:\n"
-        "    - label: agent\n"
-        "      scopes:\n        - control\n"
-        "      value: s3cret\n"
-        "mcp:\n  enabled: true\n"
-    )
-    assert _parse(yaml).mcp_config["enabled"] is True
-
-
-def test_routable_with_token_allowed():
-    yaml = (
-        "web:\n  listen:\n    - http://0.0.0.0:8080\n"
-        "  authToken:\n    value: sekret\nmcp:\n  enabled: true\n"
-    )
-    assert _parse(yaml).mcp_config["enabled"] is True
-
-
-def test_routable_allow_unauthenticated_escape_hatch():
-    yaml = (
-        "web:\n  listen:\n    - http://0.0.0.0:8080\n"
-        "mcp:\n  enabled: true\n  allowUnauthenticated: true\n"
-    )
-    assert _parse(yaml).mcp_config["allowUnauthenticated"] is True
+@pytest.mark.parametrize(
+    ("yaml", "key"),
+    [
+        pytest.param(
+            "web:\n  listen:\n    - http://127.0.0.1:8080\n"
+            "mcp:\n  enabled: true\n",
+            "enabled",
+            id="loopback-no-token",
+        ),
+        # a routable listener with mcp.enabled and ONLY scoped web.authTokens
+        # (no scalar authToken) still authenticates /mcp, so the gate must
+        # pass.
+        pytest.param(
+            "web:\n  listen:\n    - http://0.0.0.0:8080\n"
+            "  authTokens:\n"
+            "    - label: agent\n"
+            "      scopes:\n        - control\n"
+            "      value: s3cret\n"
+            "mcp:\n  enabled: true\n",
+            "enabled",
+            id="scoped-tokens-satisfy-the-gate",
+        ),
+        pytest.param(
+            "web:\n  listen:\n    - http://0.0.0.0:8080\n"
+            "  authToken:\n    value: sekret\nmcp:\n  enabled: true\n",
+            "enabled",
+            id="routable-with-token",
+        ),
+        pytest.param(
+            "web:\n  listen:\n    - http://0.0.0.0:8080\n"
+            "mcp:\n  enabled: true\n  allowUnauthenticated: true\n",
+            "allowUnauthenticated",
+            id="routable-allow-unauthenticated-escape-hatch",
+        ),
+    ],
+)
+def test_fail_closed_gate_passes(yaml, key):
+    assert _parse(yaml).mcp_config[key] is True
 
 
 def test_enabled_without_web_rejected():
@@ -265,6 +267,50 @@ async def test_read_tools_annotations():
         assert t["annotations"]["openWorldHint"] is False
 
 
+async def test_mutating_tool_annotations_are_declared_correctly():
+    # destructiveHint/idempotentHint used to be spelled per tool; _tool()
+    # now DERIVES them from its keywords (idempotent defaults to `not
+    # mutating`), and nothing asserted either one, so a tool declared with
+    # the wrong keyword would advertise the wrong safety hint to an agent
+    # that uses these to decide what it may retry or must confirm. Pin the
+    # whole triple per tool, the way the TUI DAG-state map is pinned.
+    h = _handler({"readOnly": False, "toolsets": ["observe", "act", "dags"]})
+    tools = {
+        t["name"]: t["annotations"]
+        for t in (await _req(h, "tools/list"))["result"]["tools"]
+    }
+    expected = {
+        # (readOnlyHint, destructiveHint, idempotentHint)
+        # launching is not destructive but is not repeatable either: two
+        # calls are two runs
+        "cron_run_job": (False, False, False),
+        # cancelling terminates a run (destructive) but re-cancelling a
+        # stopped job changes nothing
+        "cron_cancel_job": (False, True, True),
+        "cron_pause_job": (False, False, True),
+        "cron_resume_job": (False, False, True),
+        "cron_trigger_dag": (False, False, False),
+        # a backfill and a gate decision both overwrite run state
+        "cron_backfill_dag": (False, True, False),
+        "cron_decide_gate": (False, True, False),
+    }
+    for name, triple in expected.items():
+        assert name in tools, "{} is gone; update this table".format(name)
+        ann = tools[name]
+        got = (
+            ann["readOnlyHint"],
+            ann["destructiveHint"],
+            ann["idempotentHint"],
+        )
+        assert got == triple, (name, got, triple)
+    # every OTHER tool in this fully-enabled handler is read-only, so the
+    # table above is the complete mutating set and a new mutating tool
+    # cannot slip in unannotated
+    for name, ann in tools.items():
+        if name not in expected:
+            assert ann["readOnlyHint"] is True, name
+
+
 async def test_input_schemas_are_object_2020_12_shaped():
     h = _handler({"readOnly": False, "toolsets": ["observe", "act", "dags"]})
     for t in (await _req(h, "tools/list"))["result"]["tools"]:
@@ -291,9 +337,7 @@ async def test_call_read_tool_returns_structured_and_text():
 
 async def test_call_unknown_tool_is_invalid_params():
     h = _handler()
-    resp = await _req(
-        h, "tools/call", {"name": "cron_nope", "arguments": {}}
-    )
+    resp = await _req(h, "tools/call", {"name": "cron_nope", "arguments": {}})
     assert resp["error"]["code"] == -32602
 
 
@@ -363,20 +407,6 @@ async def test_run_job_requires_confirm():
     assert "confirm=true" in resp["result"]["content"][0]["text"]
 
 
-async def test_cancel_job_not_running_is_tool_error():
-    h = _handler({"readOnly": False, "toolsets": ["act"]})
-    resp = await _req(
-        h,
-        "tools/call",
-        {
-            "name": "cron_cancel_job",
-            "arguments": {"name": "hello", "confirm": True},
-        },
-    )
-    assert resp["result"]["isError"] is True
-    assert "not running" in resp["result"]["content"][0]["text"]
-
-
 async def test_backfill_dry_run_is_default_preview():
     h = _handler({"readOnly": False, "toolsets": ["dags"]}, yaml=_YAML)
     # unknown dag -> tool error even in dry-run (validated first)
@@ -385,8 +415,11 @@ async def test_backfill_dry_run_is_default_preview():
         "tools/call",
         {
             "name": "cron_backfill_dag",
-            "arguments": {"dag": "ghost", "from": "2026-01-01",
-                          "to": "2026-01-02"},
+            "arguments": {
+                "dag": "ghost",
+                "from": "2026-01-01",
+                "to": "2026-01-02",
+            },
         },
     )
     assert resp["result"]["isError"] is True
@@ -447,15 +480,31 @@ async def test_http_get_is_405():
     assert "POST" in resp.headers["Allow"]
 
 
-async def test_http_origin_refused_when_not_allowlisted():
-    h = _handler()  # allowedOrigins empty -> any Origin refused
+@pytest.mark.parametrize(
+    ("headers", "status"),
+    [
+        # allowedOrigins empty -> any Origin refused
+        pytest.param(
+            {"Origin": "http://evil.example"},
+            403,
+            id="origin-not-allowlisted",
+        ),
+        pytest.param({"Accept": "text/html"}, 406, id="bad-accept"),
+        pytest.param(
+            {"MCP-Protocol-Version": "1999-01-01"},
+            400,
+            id="unsupported-protocol-version",
+        ),
+    ],
+)
+async def test_http_post_header_gates(headers, status):
+    h = _handler()
     resp = await h.handle_http(
         _post_req(
-            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            headers={"Origin": "http://evil.example"},
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"}, headers=headers
         )
     )
-    assert resp.status == 403
+    assert resp.status == status
 
 
 async def test_http_origin_allowlisted_passes_with_cors():
@@ -467,9 +516,7 @@ async def test_http_origin_allowlisted_passes_with_cors():
         )
     )
     assert resp.status == 200
-    assert (
-        resp.headers["Access-Control-Allow-Origin"] == "http://ok.example"
-    )
+    assert resp.headers["Access-Control-Allow-Origin"] == "http://ok.example"
 
 
 async def test_http_preflight_options():
@@ -479,28 +526,6 @@ async def test_http_preflight_options():
     )
     assert resp.status == 204
     assert "POST" in resp.headers["Access-Control-Allow-Methods"]
-
-
-async def test_http_bad_accept_is_406():
-    h = _handler()
-    resp = await h.handle_http(
-        _post_req(
-            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            headers={"Accept": "text/html"},
-        )
-    )
-    assert resp.status == 406
-
-
-async def test_http_unsupported_protocol_version_is_400():
-    h = _handler()
-    resp = await h.handle_http(
-        _post_req(
-            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-            headers={"MCP-Protocol-Version": "1999-01-01"},
-        )
-    )
-    assert resp.status == 400
 
 
 async def test_http_oversized_body_is_413():
@@ -540,23 +565,17 @@ async def test_resources_list_observe_scope():
 
 async def test_resource_read_fixed_and_template():
     h = _handler()
-    ver = await _req(
-        h, "resources/read", {"uri": "cronstable://version"}
-    )
+    ver = await _req(h, "resources/read", {"uri": "cronstable://version"})
     contents = ver["result"]["contents"][0]
     assert contents["mimeType"] == "application/json"
     assert json.loads(contents["text"])["jobs"] == 2
-    job = await _req(
-        h, "resources/read", {"uri": "cronstable://jobs/hello"}
-    )
+    job = await _req(h, "resources/read", {"uri": "cronstable://jobs/hello"})
     assert json.loads(job["result"]["contents"][0]["text"])["name"] == "hello"
 
 
 async def test_resource_read_unknown_is_32002():
     h = _handler()
-    resp = await _req(
-        h, "resources/read", {"uri": "cronstable://jobs/ghost"}
-    )
+    resp = await _req(h, "resources/read", {"uri": "cronstable://jobs/ghost"})
     assert resp["error"]["code"] == -32002
 
 

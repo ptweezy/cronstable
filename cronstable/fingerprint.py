@@ -43,15 +43,11 @@ which HA replicas are.
 
 import hashlib
 import json
+from collections.abc import Iterable
 from typing import (
     Any,
-    Dict,
-    Iterable,
-    List,
     NamedTuple,
     Optional,
-    Tuple,
-    Union,
 )
 
 from cronstable.config import (
@@ -74,9 +70,9 @@ _SECRET_PLACEHOLDER = "<redacted>"
 # A memo entry keeps its source node alive alongside the derived value: the
 # key is id(source), and a freed source would let CPython hand the same id to
 # an unrelated object.
-_Hook = Dict[str, Any]
-_RedactTable = Dict[int, Tuple[_Hook, _Hook]]
-_NormalizeTable = Dict[int, Tuple[Any, Any]]
+_Hook = dict[str, Any]
+_RedactTable = dict[int, tuple[_Hook, _Hook]]
+_NormalizeTable = dict[int, tuple[Any, Any]]
 
 
 class SharedNodeMemo(NamedTuple):
@@ -132,7 +128,7 @@ def _schedule_repr(job: JobConfig) -> str:
     return schedule_object_to_crontab(unparsed)
 
 
-def _command_repr(command: Union[str, List[str]]) -> Dict[str, Any]:
+def _command_repr(command: str | list[str]) -> dict[str, Any]:
     """Structural representation of a job's command.
 
     Keeps the shell-string vs argv-list distinction (they behave differently),
@@ -144,7 +140,7 @@ def _command_repr(command: Union[str, List[str]]) -> Dict[str, Any]:
     return {"shell_command": command}
 
 
-def _redact_report(report: Dict[str, Any]) -> Dict[str, Any]:
+def _redact_report(report: dict[str, Any]) -> dict[str, Any]:
     """Copy a report block, replacing inline secret values with a marker.
 
     Only the literal ``value`` of a sentry DSN / mail password / webhook URL
@@ -198,7 +194,7 @@ def _redact_report(report: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _omit_default_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
+def _omit_default_report_fields(report: dict[str, Any]) -> dict[str, Any]:
     """Drop report fields that post-date the v1 scheme while still at default.
 
     The omit-when-default rule (see :func:`canonical_job`) applies to nested
@@ -233,8 +229,8 @@ def _omit_default_report_fields(report: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _redact_action(
-    action: Dict[str, Any], memo: Optional[SharedNodeMemo] = None
-) -> Dict[str, Any]:
+    action: dict[str, Any], memo: Optional[SharedNodeMemo] = None
+) -> dict[str, Any]:
     """Copy an on{Failure,PermanentFailure,Success} block, redacting secrets.
 
     Preserves everything else (e.g. the ``retry`` policy under ``onFailure``).
@@ -262,7 +258,7 @@ def _redact_action(
 
 def canonical_job(
     job: JobConfig, memo: Optional[SharedNodeMemo] = None
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the canonical, host-independent identity dict for one job.
 
     Includes every behavior-affecting field of the effective config.  The

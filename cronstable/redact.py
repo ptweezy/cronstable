@@ -15,19 +15,20 @@ default and can be turned off per job with ``redactArchivedSecrets: false``.
 """
 
 import re
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from collections.abc import Callable, Iterable
+from typing import Optional
 
 #: What a redacted span is replaced with.
 REDACTED = "***REDACTED***"
 
-_Repl = Union[str, Callable[[re.Match], str]]
+_Repl = str | Callable[[re.Match], str]
 
 #: The keyword alternatives inside the key=value pattern's key group, in
 #: match order.  Held as data rather than spelled inline in the pattern
 #: source so the casefold gate below can be checked against them at import:
 #: a keyword added here that no gate word covers would silently stop being
 #: redacted, which in this module is a leak, not a slowdown.
-_KEY_KEYWORDS: Tuple[str, ...] = (
+_KEY_KEYWORDS: tuple[str, ...] = (
     "password",
     "passwd",
     "pwd",
@@ -49,7 +50,7 @@ _KEY_KEYWORDS: Tuple[str, ...] = (
 # (compiled pattern, replacement) applied in order.  Replacements that need to
 # keep surrounding context (a key name, a URL host) use a callable; the rest
 # replace the whole match, which is itself the secret.
-_PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
+_PATTERNS: list[tuple[re.Pattern, _Repl]] = [
     # key = value / key: value where the key names a secret.  Keeps the key
     # and separator, redacts the value.  Deliberately loose around the key:
     #
@@ -180,7 +181,7 @@ _PATTERNS: List[Tuple[re.Pattern, _Repl]] = [
 #: "authorization" would be invisible to "credentıal", i.e. a redaction FALSE
 #: negative in a module whose bias is meant to run the other way.  Every
 #: keyword is checked against these at import (see below).
-_GATE_KEY: Tuple[str, ...] = (
+_GATE_KEY: tuple[str, ...] = (
     "passw",  # password, passwd
     "pwd",
     "secret",  # secret, secret_key
@@ -207,7 +208,7 @@ _GATE_KEY: Tuple[str, ...] = (
 # can never spuriously trip a later gate. Kept in lockstep with _PATTERNS by
 # the checks below: plain `if`s, deliberately not `assert`s, because the
 # release binary runs under -OO, which strips asserts.
-_PATTERN_GATES: Tuple[Union[str, Tuple[str, ...]], ...] = (
+_PATTERN_GATES: tuple[str | tuple[str, ...], ...] = (
     _GATE_KEY,  # 1. key = value / key: value (case-insensitive keywords)
     "://",  # 2. scheme://user:PASSWORD@host
     ("bearer",),  # 3. Bearer <token> (case-insensitive)
@@ -268,8 +269,8 @@ if any(  # pragma: no cover - dev invariant
 #: import.  The literal gate is ``""`` (never consulted) on a fold-gated
 #: entry.  Per call this replaces a fresh ``zip(..., strict=True)`` and a
 #: nested tuple unpack, which together cost more than the gate tests they fed.
-_STEPS: Tuple[
-    Tuple[str, Optional[Tuple[str, ...]], Callable[..., str], _Repl], ...
+_STEPS: tuple[
+    tuple[str, Optional[tuple[str, ...]], Callable[..., str], _Repl], ...
 ] = tuple(
     (gate, None, pattern.sub, repl)
     if isinstance(gate, str)
@@ -339,7 +340,7 @@ def _pem_state_after(line: str, in_pem: bool) -> bool:
         pos = match.end()
 
 
-def _starts_mid_pem(lines: List[str]) -> bool:
+def _starts_mid_pem(lines: list[str]) -> bool:
     """Whether ``lines`` begins INSIDE a PEM block whose BEGIN was truncated.
 
     ``True`` iff the first PEM marker in the batch (in position order) is an
@@ -363,7 +364,7 @@ def _starts_mid_pem(lines: List[str]) -> bool:
     return False
 
 
-def redact_lines(lines: Iterable[str]) -> List[str]:
+def redact_lines(lines: Iterable[str]) -> list[str]:
     """Redact an ordered sequence of output lines, tracking PEM blocks.
 
     Applies :func:`redact_secrets` to each line, and additionally replaces
@@ -382,7 +383,7 @@ def redact_lines(lines: Iterable[str]) -> List[str]:
     to a truncated trailing ``END``.
     """
     materialised = list(lines)
-    out: List[str] = []
+    out: list[str] = []
     in_pem = _starts_mid_pem(materialised)
     for line in materialised:
         if in_pem:

@@ -344,3 +344,25 @@ def test_loads_rejects_out_of_window_integer_literals_uniformly(flavour):
     assert mod.loads(b'{"t": 1752900000000000000}') == {
         "t": 1752900000000000000  # 19-digit epoch-nanos, in-window
     }
+
+
+@pytest.mark.parametrize("flavour", ["installed", "stdlib"])
+def test_loads_rejects_non_utf8_bytes_uniformly(flavour):
+    # CPython's json sniffs a bytes payload's encoding (detect_encoding):
+    # a UTF-8 BOM (PowerShell Set-Content's default) or a UTF-16 payload
+    # (Out-File's default) parsed fine on a stdlib host while orjson
+    # refused the same bytes, so a mapped fan-out's verdict depended on
+    # which node parsed the XCom.  loads() now decodes bytes as strict
+    # UTF-8 on the stdlib path, so both flavours reject these the same
+    # way (always some ValueError; the caller arms catch that).
+    mod = _json if flavour == "installed" else _load_json_without_orjson()
+    for blob in (
+        b"\xef\xbb\xbf[1,2]",  # UTF-8 BOM
+        "[1,2]".encode("utf-16"),  # BOM + UTF-16-LE
+        "[1,2]".encode("utf-32"),
+    ):
+        with pytest.raises(ValueError):
+            mod.loads(blob)
+    # clean UTF-8 bytes (and str) stay accepted on both
+    assert mod.loads(b"[1,2]") == [1, 2]
+    assert mod.loads('{"k": "café"}'.encode()) == {"k": "café"}

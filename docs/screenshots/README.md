@@ -16,11 +16,14 @@ clipping. To refresh them after a UI change:
    ```
 
 2. **Run the capture script** (needs `playwright` + its Chromium in the
-   environment; shots land in a `shots/` directory next to the script):
+   environment; shots land in a `shots/` directory next to the script). All
+   the capture jobs live in one `capture.py` behind a target subcommand
+   (`dashboard`, `tui`, `showcase`, `logo`, `social`, `logs`); each target
+   keeps the flags and output paths its old standalone script had:
 
    ```shell
-   python docs/screenshots/capture_dashboard.py                    # everything
-   python docs/screenshots/capture_dashboard.py dashboard-overview # one shot
+   python docs/screenshots/capture.py dashboard                    # everything
+   python docs/screenshots/capture.py dashboard dashboard-overview # one shot
    ```
 
    The script stages the board deliberately: it starts a CPU-burner and a
@@ -34,7 +37,7 @@ clipping. To refresh them after a UI change:
 
    ```shell
    cronstable -c docs/screenshots/logs-demo.yaml &
-   python docs/screenshots/capture_logs_closeup.py
+   python docs/screenshots/capture.py logs
    ```
 
 4. **The pendulum-logo loops** (`logo-balance` + `logo-balance-light`, each a
@@ -54,7 +57,7 @@ clipping. To refresh them after a UI change:
    captured. Needs Pillow alongside playwright:
 
    ```shell
-   python docs/screenshots/capture_logo_gif.py
+   python docs/screenshots/capture.py logo
    ```
 
 5. **The GitHub social-preview card** (`social-preview.png`, 1280x640) is
@@ -63,7 +66,7 @@ clipping. To refresh them after a UI change:
    regenerate that overview first if the UI changed. Also needs Pillow:
 
    ```shell
-   python docs/screenshots/capture_social_card.py
+   python docs/screenshots/capture.py social
    ```
 
    GitHub has no API for the social preview: after regenerating, upload
@@ -79,8 +82,8 @@ clipping. To refresh them after a UI change:
    at deviceScaleFactor 2, in a terminal-window card set in Cascadia Mono:
 
    ```shell
-   python docs/screenshots/capture_tui.py                 # everything
-   python docs/screenshots/capture_tui.py tui-overview    # one shot
+   python docs/screenshots/capture.py tui                 # everything
+   python docs/screenshots/capture.py tui tui-overview    # one shot
    ```
 
    The incident shots (`tui-incident*`, `tui-wallboard`) wait for the
@@ -105,8 +108,8 @@ as the stills above (so boot it first, per step 1, and let it warm):
 #    interface font, colour-vision palette, larger UI scale) by driving the
 #    dashboard's own settings <select>s live — so the frames are pixel-stable
 #    and only the palette / font / scale changes. Frames land in ./reel/.
-python docs/screenshots/capture_showcase.py                 # every scene
-python docs/screenshots/capture_showcase.py overview a11y   # just some
+python docs/screenshots/capture.py showcase                 # every scene
+python docs/screenshots/capture.py showcase overview a11y   # just some
 
 # 2. stitch the stills into the loops (needs Pillow; no daemon):
 python docs/screenshots/build_reel.py                       # both
@@ -142,5 +145,5 @@ Notes:
   animation).
 * The header mark is a live pendulum simulation, so the still-capture scripts
   park it balanced at exact upright the moment it mounts (an init-script hook
-  around `CronstableLogo.mountGlyph` — see `capture_dashboard.py`); every
+  around `CronstableLogo.mountGlyph` — see `PARK_HOOK` in `capture.py`); every
   frame is then pixel-identical across themes, fonts, and reloads.
