@@ -366,37 +366,12 @@ listeners such as `http://0.0.0.0:8080` need no writable path.) The optional
 ### 2. The standalone binary under a read-only rootfs
 
 This applies only if you deploy the standalone *binary* (from the GitHub
-releases) instead of the published image. The binary is a self-extracting
-executable: on each start it unpacks its embedded Python runtime into a temporary
-directory and loads shared libraries from there, so it needs a temp directory
-that is both **writable and executable**. On an ordinary system `/tmp` already
-satisfies this and no setup is needed.
-
-Under a read-only root filesystem, `/tmp` is read-only too and the binary aborts
-at startup with `Could not create temporary directory` or
-`Error loading shared library …: Operation not permitted`. Provide a writable,
-executable temp mount:
-
-* **Docker**: `--tmpfs /tmp:rw,exec,nosuid,nodev,size=64m`. The `exec` is
-  required: Docker's `--tmpfs` defaults to `noexec`, but the binary must execute
-  the libraries it unpacks.
-
-  ```shell
-  docker run --rm --read-only \
-    --tmpfs /tmp:rw,exec,nosuid,nodev,size=64m \
-    -v "$PWD/cronstable.yaml:/etc/cronstable.d/cronstable.yaml:ro" \
-    your-image-with-the-binary -c /etc/cronstable.d
-  ```
-
-* **Kubernetes**: mount an `emptyDir` at `/tmp` (writable and executable by
-  default; use `medium: Memory` for a tmpfs).
-* **Either**: point the binary at another writable, executable directory with
-  `TMPDIR=/path`.
-
-This requirement is unique to the standalone binary. The published image and
-`pip`/`pipx` installs run cronstable as a normal Python package with the interpreter
-on disk; they never self-extract and need no writable temp directory. See
-[Installation](Installation) for the binary download.
+releases) instead of the published image: the binary self-extracts on each
+start, so it needs a temp directory that is both writable and executable, and a
+read-only root filesystem makes `/tmp` fail that test. See the
+[standalone binary temp-directory requirement](Installation#standalone-binary-temp-directory-requirement)
+on the Installation page for the error messages and the Docker `--tmpfs`
+`exec` recipe, Kubernetes `emptyDir` mount, and `TMPDIR` override.
 
 ## Operational notes
 

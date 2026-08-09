@@ -122,16 +122,23 @@ x-node: &node
 
 services:
   # Mints a throwaway cluster CA + one leaf cert per node into the shared certs
-  # volume before the nodes start. Demo-only: see gen-certs.sh for the caveats.
-  # The gossip backend uses these for election; BACKEND=filesystem elects over
-  # the lease instead but still uses them for its observability overlay (the
-  # gossip mesh that shares per-node CPU/memory -- see node-entrypoint.sh).
+  # volume before the nodes start. Demo-only: see the shared
+  # example/_shared/gen-certs.sh for the caveats; the env below names the nine
+  # Meridian nodes. The gossip backend uses these for election;
+  # BACKEND=filesystem elects over the lease instead but still uses them for
+  # its observability overlay (the gossip mesh that shares per-node CPU/memory;
+  # see node-entrypoint.sh).
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]
+    environment:
+      NODES: "meridian-a meridian-b meridian-c meridian-d meridian-e meridian-f
+        meridian-g meridian-h meridian-i"
+      CA_CN: meridian-grand-tour-ca
+      PROJECT: example/grand-tour
     volumes:
       - gt-certs:/certs
-      - ./gen-certs.sh:/gen-certs.sh:ro
+      - ../_shared/gen-certs.sh:/gen-certs.sh:ro
 
   # A Docker named volume is created root-owned, but the cronstable image runs as
   # an unprivileged user (uid 65534). This one-shot makes the shared state store

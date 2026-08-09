@@ -25,7 +25,7 @@ you can read it top to bottom and know what it proves.
 If you only run one example, run this one. For a gentler start see
 [`example/demo`](../demo) (single node), [`example/dag`](../dag) (DAGs alone),
 [`example/job-state`](../job-state) (state primitives alone), or the
-[`acme-platform`](../acme-platform) cluster showcase this one extends.
+[`example/cluster`](../cluster) three-node cluster.
 
 ## Run it
 
@@ -328,7 +328,7 @@ See [`example/kubernetes`](../kubernetes) and
 | [`legacy.crontab`](legacy.crontab) | a classic Vixie crontab, loaded as-is from the same config dir |
 | [`platform.env`](platform.env) | `env_file` for `backup-warehouse` |
 | [`secrets/signing.key`](secrets/signing.key) | demo file for a `fromFile` run-scoped secret |
-| [`gen-certs.sh`](gen-certs.sh) | mints the throwaway cluster CA + per-node leaf certs (gossip backend) |
+| [`../_shared/gen-certs.sh`](../_shared/gen-certs.sh) | mints the throwaway cluster CA + per-node leaf certs (gossip backend); shared by all the cluster demos, node names come from the compose file's NODES env var |
 | [`node-entrypoint.sh`](node-entrypoint.sh) | generates each node's `cluster:` section (gossip **or** filesystem) and assembles the config dir |
 
 > **Note.** These nodes mount a writable state volume, so they do not run with a

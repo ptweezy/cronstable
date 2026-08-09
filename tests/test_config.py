@@ -278,8 +278,16 @@ jobs:
     assert dict_environment["VAR_TEST_EQUAL_SIGN"] == "ENV_FILE==="
 
 
-def test_invalid_environ_file():
-    # invalid file (no key-value)
+@pytest.mark.parametrize(
+    "env_file",
+    [
+        # invalid file (no key-value)
+        pytest.param("tests/fixtures/.testenv-invalid", id="invalid-file"),
+        # non-existent file should raise ConfigError, not OSError
+        pytest.param(".testenv-nonexistent", id="nonexistent-file"),
+    ],
+)
+def test_invalid_environ_file(env_file):
     with pytest.raises(ConfigError) as exc:
         config.parse_config_string(
             """
@@ -300,36 +308,8 @@ def test_invalid_environ_file():
               value: STD
             - key: VAR_OVERRIDE
               value: STD
-        env_file: tests/fixtures/.testenv-invalid
-    """,
-            "",
-        )
-
-    assert "env_file" in str(exc.value)
-
-    # non-existent file should raise ConfigError, not OSError
-    with pytest.raises(ConfigError) as exc:
-        config.parse_config_string(
-            """
-    defaults:
-      shell: /bin/bash
-
-    jobs:
-      - name: test
-        command: |
-          echo VAR_STD: $VAR_STD
-          echo VAR_ENV_FILE: $VAR_ENV_FILE
-          echo VAR_OVERRIDE: $VAR_OVERRIDE
-        schedule:
-          minute: "*"
-        captureStderr: true
-        environment:
-            - key: VAR_STD
-              value: STD
-            - key: VAR_OVERRIDE
-              value: STD
-        env_file: .testenv-nonexistent
-    """,
+        env_file: {}
+    """.format(env_file),
             "",
         )
 
@@ -659,37 +639,38 @@ def test_parse_config_dir_cache_validates_content_not_mtime(tmp_path):
     assert str(second.jobs[0].schedule) == "0 5 * * *"  # not the stale 0 3
 
 
-def test_parse_config_dir_multiple_web(tmp_path):
-    (tmp_path / "a.yaml").write_text(
-        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
-    )
-    (tmp_path / "b.yaml").write_text(
-        "web:\n  listen:\n    - http://127.0.0.1:8081\n"
-    )
-    with pytest.raises(ConfigError) as exc:
-        config.parse_config(str(tmp_path))
-    assert "Multiple 'web'" in str(exc.value)
-
-
 @pytest.mark.parametrize(
-    "field, value, message",
+    "snippet, message",
     [
-        ("saveLimit", -1, "saveLimit"),
-        ("maxLineLength", 0, "maxLineLength"),
-        ("killTimeout", -5, "killTimeout"),
-        ("executionTimeout", -1, "executionTimeout"),
+        pytest.param("    saveLimit: -1\n", "saveLimit", id="saveLimit"),
+        pytest.param(
+            "    maxLineLength: 0\n", "maxLineLength", id="maxLineLength"
+        ),
+        pytest.param("    killTimeout: -5\n", "killTimeout", id="killTimeout"),
+        pytest.param(
+            "    executionTimeout: -1\n",
+            "executionTimeout",
+            id="executionTimeout",
+        ),
+        pytest.param(
+            "    onFailure:\n"
+            "      retry:\n"
+            "        maximumRetries: 3\n"
+            "        initialDelay: 1\n"
+            "        maximumDelay: 10\n"
+            "        backoffMultiplier: 0\n",
+            "backoffMultiplier",
+            id="retry-backoffMultiplier",
+        ),
     ],
 )
-def test_invalid_numeric_ranges(field, value, message):
+def test_invalid_numeric_ranges(snippet, message):
     with pytest.raises(ConfigError) as exc:
         config.parse_config_string(
-            f"""
-jobs:
-  - name: test
-    command: foo
-    schedule: "* * * * *"
-    {field}: {value}
-""",
+            "jobs:\n"
+            "  - name: test\n"
+            "    command: foo\n"
+            '    schedule: "* * * * *"\n' + snippet,
             "",
         )
     assert message in str(exc.value)
@@ -739,26 +720,6 @@ def test_nan_rejected_on_float_ranges(snippet, message):
             "",
         )
     assert message in str(exc.value)
-
-
-def test_invalid_retry_backoff():
-    with pytest.raises(ConfigError) as exc:
-        config.parse_config_string(
-            """
-jobs:
-  - name: test
-    command: foo
-    schedule: "* * * * *"
-    onFailure:
-      retry:
-        maximumRetries: 3
-        initialDelay: 1
-        maximumDelay: 10
-        backoffMultiplier: 0
-""",
-            "",
-        )
-    assert "backoffMultiplier" in str(exc.value)
 
 
 def test_sentry_fingerprint_override_replaces():
@@ -926,13 +887,22 @@ def test_quoted_numeric_user_is_still_a_uid(monkeypatch):
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
-def test_user_not_found_raises(monkeypatch):
-    def getpwnam(name):
+@pytest.mark.parametrize(
+    "db_kwarg, line, match",
+    [
+        pytest.param("pwnam", "user: ghost", "User not found", id="user"),
+        pytest.param(
+            "grnam", "group: nogroup", "Group not found", id="group"
+        ),
+    ],
+)
+def test_user_or_group_not_found_raises(monkeypatch, db_kwarg, line, match):
+    def not_found(name):
         raise KeyError(name)
 
-    _mock_userdb(monkeypatch, pwnam=getpwnam)
-    with pytest.raises(ConfigError, match="User not found"):
-        _parse_user_group("user: ghost")
+    _mock_userdb(monkeypatch, **{db_kwarg: not_found})
+    with pytest.raises(ConfigError, match=match):
+        _parse_user_group(line)
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
@@ -954,16 +924,6 @@ def test_numeric_group_sets_gid_directly(monkeypatch):
     job = _parse_user_group("group: 3000").jobs[0]
     assert job.gid == 3000
     assert job.group == 3000
-
-
-@pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
-def test_group_not_found_raises(monkeypatch):
-    def getgrnam(name):
-        raise KeyError(name)
-
-    _mock_userdb(monkeypatch, grnam=getgrnam)
-    with pytest.raises(ConfigError, match="Group not found"):
-        _parse_user_group("group: nogroup")
 
 
 @pytest.mark.skipif(IS_WINDOWS, reason="user/group resolution is POSIX-only")
@@ -1017,45 +977,37 @@ def test_web_metrics_map_form():
     assert metrics["durationBuckets"] == [0.5, 30.0]
 
 
-def test_web_metrics_buckets_must_increase():
+@pytest.mark.parametrize(
+    "buckets_yaml",
+    [
+        pytest.param("      - 10\n      - 5\n", id="decreasing"),
+        pytest.param("      - -1\n      - 5\n", id="negative"),
+    ],
+)
+def test_web_metrics_buckets_must_increase(buckets_yaml):
     with pytest.raises(ConfigError, match="strictly increasing"):
         config.parse_config_string(
             _WEB_METRICS_BASE
             + "  metrics:\n"
             + "    durationBuckets:\n"
-            + "      - 10\n"
-            + "      - 5\n",
+            + buckets_yaml,
             "",
         )
 
 
-def test_web_metrics_buckets_must_be_positive():
-    with pytest.raises(ConfigError, match="strictly increasing"):
-        config.parse_config_string(
-            _WEB_METRICS_BASE
-            + "  metrics:\n"
-            + "    durationBuckets:\n"
-            + "      - -1\n"
-            + "      - 5\n",
-            "",
-        )
-
-
-def test_web_metrics_buckets_must_not_be_empty():
-    # strictyaml cannot express an empty block sequence, so the empty case
-    # is validated directly against the builder-level check
-    with pytest.raises(ConfigError, match="must not be empty"):
+# strictyaml cannot express an empty block sequence, so these cases are
+# validated directly against the builder-level check
+@pytest.mark.parametrize(
+    "buckets, match",
+    [
+        pytest.param([], "must not be empty", id="empty"),
+        pytest.param([1.0, float("inf")], "finite", id="non-finite"),
+    ],
+)
+def test_web_metrics_buckets_builder_level_checks(buckets, match):
+    with pytest.raises(ConfigError, match=match):
         config._validate_web_config(
-            config.WebConfig({"metrics": {"durationBuckets": []}})
-        )
-
-
-def test_web_metrics_buckets_must_be_finite():
-    with pytest.raises(ConfigError, match="finite"):
-        config._validate_web_config(
-            config.WebConfig(
-                {"metrics": {"durationBuckets": [1.0, float("inf")]}}
-            )
+            config.WebConfig({"metrics": {"durationBuckets": buckets}})
         )
 
 
@@ -1125,15 +1077,22 @@ def test_schedule_object_minute_only_unchanged():
     )
 
 
-def test_out_of_range_second_reports_config_error():
+@pytest.mark.parametrize(
+    "schedule",
+    [
+        pytest.param(
+            '    schedule: "99 * * * * * *"\n', id="second-out-of-range"
+        ),
+        # a malformed field is a ConfigError (was an anonymous ValueError
+        # before)
+        pytest.param(
+            '    schedule: "* * * notamonth *"\n', id="malformed-field"
+        ),
+    ],
+)
+def test_bad_schedule_string_reports_config_error(schedule):
     with pytest.raises(ConfigError, match="invalid schedule"):
-        _one_job('    schedule: "99 * * * * * *"\n')
-
-
-def test_bad_schedule_string_reports_config_error():
-    # a malformed field is a ConfigError (was an anonymous ValueError before)
-    with pytest.raises(ConfigError, match="invalid schedule"):
-        _one_job('    schedule: "* * * notamonth *"\n')
+        _one_job(schedule)
 
 
 @pytest.mark.parametrize("blank", ['""', '" "'])
@@ -1224,14 +1183,24 @@ def test_monitor_resources_defaults_block_merges_with_job_map():
     assert job.monitorResourcesHistory == 50
 
 
-def test_monitor_resources_interval_floor():
-    with pytest.raises(ConfigError, match="monitorResources.interval"):
-        _monitor_job("    monitorResources:\n      interval: 0.01\n")
-
-
-def test_monitor_resources_history_ceiling():
-    with pytest.raises(ConfigError, match="monitorResources.history"):
-        _monitor_job("    monitorResources:\n      history: 5000\n")
+@pytest.mark.parametrize(
+    "snippet, match",
+    [
+        pytest.param(
+            "    monitorResources:\n      interval: 0.01\n",
+            "monitorResources.interval",
+            id="interval-floor",
+        ),
+        pytest.param(
+            "    monitorResources:\n      history: 5000\n",
+            "monitorResources.history",
+            id="history-ceiling",
+        ),
+    ],
+)
+def test_monitor_resources_out_of_range(snippet, match):
+    with pytest.raises(ConfigError, match=match):
+        _monitor_job(snippet)
 
 
 # ---- web.nodeHistory validation ---------------------------------------------
@@ -1250,41 +1219,57 @@ def test_web_node_history_forms_parse():
     assert cfg["nodeHistory"] == {"interval": 2.0, "points": 120}
 
 
-def test_web_node_history_interval_floor():
-    with pytest.raises(ConfigError, match="nodeHistory.interval"):
-        _web_config("  nodeHistory:\n    interval: 0.5\n")
-
-
-def test_web_node_history_points_range():
-    with pytest.raises(ConfigError, match="nodeHistory.points"):
-        _web_config("  nodeHistory:\n    points: 5\n")
-    with pytest.raises(ConfigError, match="nodeHistory.points"):
-        _web_config("  nodeHistory:\n    points: 999999\n")
+@pytest.mark.parametrize(
+    "snippet, match",
+    [
+        pytest.param(
+            "  nodeHistory:\n    interval: 0.5\n",
+            "nodeHistory.interval",
+            id="interval-floor",
+        ),
+        pytest.param(
+            "  nodeHistory:\n    points: 5\n",
+            "nodeHistory.points",
+            id="points-too-few",
+        ),
+        pytest.param(
+            "  nodeHistory:\n    points: 999999\n",
+            "nodeHistory.points",
+            id="points-too-many",
+        ),
+    ],
+)
+def test_web_node_history_out_of_range(snippet, match):
+    with pytest.raises(ConfigError, match=match):
+        _web_config(snippet)
 
 
 # ---- _resolve_secret hardening ----------------------------------------------
 
 
-def test_resolve_secret_binary_file_is_config_error(tmp_path):
-    # A fromFile pointing at binary data (a .p12 bundle, a gzip, a key with a
-    # stray high byte) raises UnicodeDecodeError from read(). It must surface
-    # as ConfigError -- the only exception callers handle: the job-secret
-    # staging path (cron._prepare_job_api_run) then skips the secret with a
-    # warning, instead of the raw UnicodeDecodeError escaping the scheduler
-    # loop and crash-looping the daemon at every fire of that job.
+# A fromFile that cannot be read must surface as ConfigError -- the only
+# exception callers handle: the job-secret staging path
+# (cron._prepare_job_api_run) then skips the secret with a warning, instead
+# of the raw error escaping the scheduler loop and crash-looping the daemon
+# at every fire of that job.
+@pytest.mark.parametrize(
+    "content",
+    [
+        # Binary data (a .p12 bundle, a gzip, a key with a stray high byte)
+        # raises UnicodeDecodeError from read().  These bytes are invalid in
+        # UTF-8 (lone continuation bytes), cp1252 (0x9d undefined) and, via
+        # the dangling 0xff lead at EOF, the common CJK multibyte codecs too.
+        pytest.param(b"\x9d\x80\x00\xff", id="binary-data"),
+        # a missing file raises OSError from open(); same ConfigError contract
+        pytest.param(None, id="missing-file"),
+    ],
+)
+def test_resolve_secret_unreadable_file_is_config_error(tmp_path, content):
     blob = tmp_path / "secret.bin"
-    # invalid in UTF-8 (lone continuation bytes), cp1252 (0x9d undefined) and,
-    # via the dangling 0xff lead at EOF, the common CJK multibyte codecs too.
-    blob.write_bytes(b"\x9d\x80\x00\xff")
+    if content is not None:
+        blob.write_bytes(content)
     with pytest.raises(ConfigError, match="could not be read"):
         config._resolve_secret({"fromFile": str(blob)}, "job j secret s")
-
-
-def test_resolve_secret_missing_file_is_config_error(tmp_path):
-    with pytest.raises(ConfigError, match="could not be read"):
-        config._resolve_secret(
-            {"fromFile": str(tmp_path / "nope")}, "job j secret s"
-        )
 
 
 def test_web_allowed_origins_parse():
@@ -1316,29 +1301,34 @@ def test_schedule_invalid_type_is_config_error():
         JobConfig(job_dict)
 
 
-def test_unknown_timezone_is_config_error():
-    yaml = (
-        "jobs:\n"
-        "  - name: j\n"
-        "    command: true\n"
-        "    schedule: '* * * * *'\n"
-        "    timezone: Not/AZone\n"
-    )
-    with pytest.raises(ConfigError, match="unknown timezone"):
-        parse_config_string(yaml, "")
-
-
-def test_dag_level_job_error_names_the_dag():
-    yaml = (
-        "dags:\n"
-        "  - name: etl\n"
-        "    schedule: '0 2 * * *'\n"
-        "    timezone: Not/AZone\n"
-        "    tasks:\n"
-        "      - id: a\n"
-        "        command: 'true'\n"
-    )
-    with pytest.raises(ConfigError, match="dag 'etl'.*unknown timezone"):
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        pytest.param(
+            "jobs:\n"
+            "  - name: j\n"
+            "    command: true\n"
+            "    schedule: '* * * * *'\n"
+            "    timezone: Not/AZone\n",
+            "unknown timezone",
+            id="job-unknown-timezone",
+        ),
+        # the same failure on a dag surfaces wrapped with the dag's name
+        pytest.param(
+            "dags:\n"
+            "  - name: etl\n"
+            "    schedule: '0 2 * * *'\n"
+            "    timezone: Not/AZone\n"
+            "    tasks:\n"
+            "      - id: a\n"
+            "        command: 'true'\n",
+            "dag 'etl'.*unknown timezone",
+            id="dag-error-names-the-dag",
+        ),
+    ],
+)
+def test_unknown_timezone_is_config_error(yaml, match):
+    with pytest.raises(ConfigError, match=match):
         parse_config_string(yaml, "")
 
 
@@ -1357,18 +1347,34 @@ def _cluster_yaml(extra):
     )
 
 
-def test_cluster_connect_timeout_must_be_positive():
-    with pytest.raises(ConfigError, match="connectTimeout must be > 0"):
-        parse_config_string(_cluster_yaml("  connectTimeout: 0\n"), "")
-
-
-def test_cluster_ipv6_peer_needs_valid_port():
-    yaml = (
-        "cluster:\n"
-        "  listen: '0.0.0.0:8443'\n" + _TLS + "  peers:\n"
-        "    - host: '[::1]:notaport'\n"
-    )
-    with pytest.raises(ConfigError, match=r"must be \[ipv6\]:port"):
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        pytest.param(
+            _cluster_yaml("  connectTimeout: 0\n"),
+            "connectTimeout must be > 0",
+            id="connect-timeout-zero",
+        ),
+        pytest.param(
+            "cluster:\n"
+            "  listen: '0.0.0.0:8443'\n" + _TLS + "  peers:\n"
+            "    - host: '[::1]:notaport'\n",
+            r"must be \[ipv6\]:port",
+            id="ipv6-peer-bad-port",
+        ),
+        pytest.param(
+            "cluster:\n"
+            "  backend: kubernetes\n"
+            "  nodeName: node-a\n"
+            "  kubernetes:\n"
+            "    leaseNamespace: 'Bad_NS'\n",
+            "leaseNamespace must be a valid",
+            id="k8s-lease-namespace-charset",
+        ),
+    ],
+)
+def test_cluster_validation_guards(yaml, match):
+    with pytest.raises(ConfigError, match=match):
         parse_config_string(yaml, "")
 
 
@@ -1390,18 +1396,6 @@ def test_observability_mesh_tuning_keys_forwarded():
     assert mesh["interval"] == 7
 
 
-def test_kubernetes_lease_namespace_charset():
-    yaml = (
-        "cluster:\n"
-        "  backend: kubernetes\n"
-        "  nodeName: node-a\n"
-        "  kubernetes:\n"
-        "    leaseNamespace: 'Bad_NS'\n"
-    )
-    with pytest.raises(ConfigError, match="leaseNamespace must be a valid"):
-        parse_config_string(yaml, "")
-
-
 # ---------------------------------------------------------------------------
 # state.jobApi validation guards
 # ---------------------------------------------------------------------------
@@ -1411,21 +1405,38 @@ def _state_yaml(extra):
     return "state:\n  path: /tmp/st\n  jobApi:\n    enabled: true\n" + extra
 
 
-def test_job_api_max_value_bytes_negative():
-    with pytest.raises(ConfigError, match="maxValueBytes must be >= 0"):
-        parse_config_string(_state_yaml("    maxValueBytes: -1\n"), "")
-
-
-def test_job_api_max_artifact_bytes_negative():
-    with pytest.raises(ConfigError, match="maxArtifactBytes must be >= 0"):
-        parse_config_string(_state_yaml("    maxArtifactBytes: -1\n"), "")
-
-
-def test_job_api_listen_port_out_of_range():
-    with pytest.raises(ConfigError, match="invalid port"):
-        parse_config_string(
-            _state_yaml("    listen: 'http://127.0.0.1:70000'\n"), ""
-        )
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        pytest.param(
+            _state_yaml("    maxValueBytes: -1\n"),
+            "maxValueBytes must be >= 0",
+            id="maxValueBytes-negative",
+        ),
+        pytest.param(
+            _state_yaml("    maxArtifactBytes: -1\n"),
+            "maxArtifactBytes must be >= 0",
+            id="maxArtifactBytes-negative",
+        ),
+        pytest.param(
+            _state_yaml("    listen: 'http://127.0.0.1:70000'\n"),
+            "invalid port",
+            id="listen-url-port-out-of-range",
+        ),
+        # a listen authority whose port is out of range makes urlparse.port
+        # raise ValueError; the state builder turns that into a clean
+        # ConfigError instead of letting it escape and permanently disable the
+        # loopback endpoint.
+        pytest.param(
+            "state:\n  path: /x\n  jobApi:\n    listen: 127.0.0.1:70000\n",
+            "invalid port",
+            id="listen-bare-port-out-of-range",
+        ),
+    ],
+)
+def test_job_api_validation_guards(yaml, match):
+    with pytest.raises(ConfigError, match=match):
+        parse_config_string(yaml, "")
 
 
 # ---------------------------------------------------------------------------
@@ -1477,23 +1488,22 @@ def test_web_auth_tokens_parse():
     assert entries[0]["value"] == "secret-tok"
 
 
-def test_web_auth_tokens_reject_unknown_scope():
+@pytest.mark.parametrize(
+    "tokens_yaml",
+    [
+        pytest.param(
+            "    - scopes:\n        - bogus\n      value: secret-tok\n",
+            id="unknown-scope",
+        ),
+        # `scopes` is required on each entry (a scopeless token is
+        # meaningless).
+        pytest.param("    - value: secret-tok\n", id="missing-scopes"),
+    ],
+)
+def test_web_auth_tokens_rejected(tokens_yaml):
     yaml = (
         "web:\n  listen:\n    - http://127.0.0.1:8080\n"
-        "  authTokens:\n"
-        "    - scopes:\n        - bogus\n"
-        "      value: secret-tok\n"
-    )
-    with pytest.raises(ConfigError):
-        parse_config_string(yaml, "")
-
-
-def test_web_auth_tokens_require_scopes():
-    # `scopes` is required on each entry (a scopeless token is meaningless).
-    yaml = (
-        "web:\n  listen:\n    - http://127.0.0.1:8080\n"
-        "  authTokens:\n"
-        "    - value: secret-tok\n"
+        "  authTokens:\n" + tokens_yaml
     )
     with pytest.raises(ConfigError):
         parse_config_string(yaml, "")
@@ -1587,29 +1597,45 @@ def test_include_duplicate_section_conflicts(tmp_path, section, inline):
 # ---------------------------------------------------------------------------
 
 
-def test_parse_config_dir_multiple_cluster(tmp_path):
-    cluster = (
-        "cluster:\n"
-        "  listen: '0.0.0.0:8443'\n" + _TLS + "  peers:\n"
-        "    - host: b:8443\n"
-    )
-    _write(tmp_path / "a.yaml", cluster)
-    _write(tmp_path / "b.yaml", cluster)
-    with pytest.raises(ConfigError, match="Multiple 'cluster'"):
-        config.parse_config(str(tmp_path))
+_CLUSTER_SECTION = (
+    "cluster:\n"
+    "  listen: '0.0.0.0:8443'\n" + _TLS + "  peers:\n"
+    "    - host: b:8443\n"
+)
 
 
-def test_parse_config_dir_multiple_mcp(tmp_path):
-    _write(tmp_path / "a.yaml", "mcp:\n  enabled: true\n")
-    _write(tmp_path / "b.yaml", "mcp:\n  enabled: false\n")
-    with pytest.raises(ConfigError, match="Multiple 'mcp'"):
-        config.parse_config(str(tmp_path))
-
-
-def test_parse_config_dir_multiple_logging(tmp_path):
-    _write(tmp_path / "a.yaml", "logging:\n  version: 1\n")
-    _write(tmp_path / "b.yaml", "logging:\n  version: 1\n")
-    with pytest.raises(ConfigError, match="Multiple 'logging'"):
+@pytest.mark.parametrize(
+    "section, text_a, text_b",
+    [
+        pytest.param(
+            "web",
+            "web:\n  listen:\n    - http://127.0.0.1:8080\n",
+            "web:\n  listen:\n    - http://127.0.0.1:8081\n",
+            id="web",
+        ),
+        pytest.param(
+            "cluster", _CLUSTER_SECTION, _CLUSTER_SECTION, id="cluster"
+        ),
+        pytest.param(
+            "mcp",
+            "mcp:\n  enabled: true\n",
+            "mcp:\n  enabled: false\n",
+            id="mcp",
+        ),
+        pytest.param(
+            "logging",
+            "logging:\n  version: 1\n",
+            "logging:\n  version: 1\n",
+            id="logging",
+        ),
+    ],
+)
+def test_parse_config_dir_multiple_section_conflicts(
+    tmp_path, section, text_a, text_b
+):
+    _write(tmp_path / "a.yaml", text_a)
+    _write(tmp_path / "b.yaml", text_b)
+    with pytest.raises(ConfigError, match="Multiple '{}'".format(section)):
         config.parse_config(str(tmp_path))
 
 
@@ -1633,33 +1659,31 @@ def test_parse_config_dir_records_oserror(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dag_task_wraps_job_template_config_error():
-    # a launch field that JobConfig rejects (executionTimeout must be > 0)
-    # surfaces wrapped with the dag/task context, not as a bare Job error.
-    with pytest.raises(ConfigError, match=r"dag 'd': task 't1':"):
-        DagConfig(
+@pytest.mark.parametrize(
+    "dag_dict, match",
+    [
+        # a launch field that JobConfig rejects (executionTimeout must be > 0)
+        # surfaces wrapped with the dag/task context, not as a bare Job error.
+        pytest.param(
             {
                 "name": "d",
                 "tasks": [
                     {"id": "t1", "command": "true", "executionTimeout": 0}
                 ],
-            }
-        )
-
-
-def test_dag_requires_at_least_one_task():
-    with pytest.raises(ConfigError, match="needs at least one task"):
-        DagConfig({"name": "d", "tasks": []})
-
-
-def test_state_jobapi_listen_invalid_port_rejected():
-    # a listen authority whose port is out of range makes urlparse.port raise
-    # ValueError; the state builder turns that into a clean ConfigError instead
-    # of letting it escape and permanently disable the loopback endpoint.
-    with pytest.raises(ConfigError, match="invalid port"):
-        parse_config_string(
-            "state:\n  path: /x\n  jobApi:\n    listen: 127.0.0.1:70000\n", ""
-        )
+            },
+            r"dag 'd': task 't1':",
+            id="task-wraps-job-template-error",
+        ),
+        pytest.param(
+            {"name": "d", "tasks": []},
+            "needs at least one task",
+            id="needs-at-least-one-task",
+        ),
+    ],
+)
+def test_dag_config_builder_errors(dag_dict, match):
+    with pytest.raises(ConfigError, match=match):
+        DagConfig(dag_dict)
 
 
 def test_etcd_endpoints_must_be_non_empty():
