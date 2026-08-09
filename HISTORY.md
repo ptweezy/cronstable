@@ -5,6 +5,81 @@ continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
 entries from 0.19.0 onward document the history of the original yacron
 project, on which cronstable is based.
 
+## 1.2.38
+
+Reduction of code. Fixing of bugs and optimizations throughout.
+
+- The package is about 4,600 lines smaller. None of it was meant to change
+  behavior. `cron.py`, `cluster.py` and `__main__.py` account for most of
+  it, the backends share their lease helpers through
+  `cronstable/backends/_common.py`, and the argparse definitions moved to a
+  stdlib-only leaf, so no CLI invocation pulls in the client HTTP and TLS
+  graph just to build its parser. The suite follows: `test_cron.py` is
+  split by subject and the fixtures every file was copying now live in one
+  place.
+- The README is a third shorter, each example stack shares one certificate
+  generator and node entrypoint instead of carrying its own, the six
+  screenshot scripts became one, and the logo engine has a single
+  hand-maintained copy that the demo page and logo lab are generated from.
+- Every web API failure reaches the client as the JSON error envelope. An
+  unhandled error used to escape to aiohttp's own handler, which answers
+  plain text (or HTML on an `Accept`), so the 500 was the one status a
+  client could not parse the way it parses the rest. A store call that
+  outruns its budget answers 504 rather than 500. The reason goes to the
+  log, never into the body.
+- The three endpoints that serve text (`/version`, `/job-set-id` without a
+  JSON `Accept`, and the schedule lint's text form) ignore a `Content-Type`
+  set under `web.headers`, like every other route. A deployment that set
+  one saw those three come back as 500s.
+- `GET /activity` takes the same clamped `limit` the other capped listings
+  take. Its default still serves the whole retained window.
+- A DAG catch-up offset elapsing during a graceful stop no longer creates
+  runs and forks task subprocesses on the way out. The sleepers are
+  interruptible and are cancelled with the rest of the launch-adjacent
+  work, and the checkpoint stays open, so the next boot resumes the slots
+  still owed.
+- A run document recording a mapped index it holds no entry for is repaired
+  instead of wedging. The claim pass materialises the missing instance and
+  fails it with a reason, so the run terminalises, releases its advance
+  lease and becomes eligible for retention. Under 1.2.37's absent-instance
+  rule alone, such a run stayed open for the life of the daemon.
+- The DAG summary memo is invalidated even when the write that should have
+  busted it times out or raises. An abandoned store call can still land, so
+  a failure could leave the fleet reading a stale run summary for the whole
+  memo window.
+- One unreadable job during boot reconciliation degrades to a logged skip.
+  It used to abort the rest of the boot tail (DAG reconcile, retry re-arm,
+  the job API start) while the other workers kept mutating scheduler state
+  behind it.
+- The mail, Sentry and webhook reporters read a `fromFile` secret on the
+  executor, the rule the launch path already followed, so a hung secret
+  mount no longer blocks the scheduler from the completion path. A start
+  cancelled while staging those secrets hands its concurrency slot back.
+- Two warnings that latched for the life of the process now re-arm per
+  episode: the passthrough mirror's "backed up, dropping output" once its
+  consumer drains, and the candidate-set truncation once the fleet fits the
+  cap again. The truncation warning also stops re-firing every poll round
+  on ordinary membership churn, and `candidates_truncated` is re-derived on
+  a node nobody polls rather than reporting whatever the last build saw.
+- An oversized `/peer` response that shedding the fleet view cannot bring
+  under the cap is logged as an error saying peers will record the node
+  oversized and drop it from their quorum. A peer advertising an empty node
+  name is refused rather than counted toward quorum.
+- A statsd `job_started` emission cancelled while its transport is still
+  opening no longer evicts that live transport from the pool, and one that
+  fails is logged the same way whichever arm catches it.
+- Filesystem store housekeeping stats an idempotency document before
+  reading it, so a GC pass no longer opens and parses every permanent claim
+  and every live TTL on the one lane its budget shares. A JSON `true` in
+  `expiresAt` reads as unclassifiable rather than as expired.
+- Byte payloads decode as strict UTF-8 on hosts without orjson, matching
+  orjson's own contract, so a BOM or a UTF-16 mapped-task XCom is refused
+  everywhere instead of parsing on one host and failing on the next.
+- The terminal dashboard's activity card retains the same 80 jobs the web
+  card and its own fan-out fallback do, instead of holding a row list per
+  job at fleet scale, and an approval gate parked on a decision paints as
+  pending again.
+
 ## 1.2.37
 
 - `catchupJitterSeconds` now spreads DAG catch-up replays the way it always
