@@ -8,8 +8,10 @@ port) and drives it over real HTTP with an aiohttp client -- the same wire the
 lease-backed lock manager, and run-scoped secrets.  It then checks the cron
 wiring end to end: env injection at launch and token/lock cleanup at finish.
 
-Style: bare ``async def`` tests, real temp store via ``_backend``, no frozen
-clock (lock TTLs are kept at the floor and never waited on for a renewal).
+Style: bare ``async def`` tests, real temp store via the conftest ``job_api``
+harness (the config-override cases build theirs via its conftest sibling,
+``job_api_factory``), no frozen clock (lock TTLs are kept at the floor and
+never waited on for a renewal).
 """
 
 import asyncio
@@ -36,7 +38,7 @@ from cronstable.jobapi import (
 )
 from cronstable.jobstate import JobStateError
 from cronstable.state import Lease
-from tests.test_state import _backend, _state_cfg
+from tests._helpers import _instant_sleep, _state_cfg
 
 _ONE_JOB = (
     "state:\n  path: {path}\n"
@@ -58,18 +60,6 @@ def _ctx(token="tok", job="job", secrets=None, allowed_scopes=None):
     )
 
 
-async def _make_api(tmp_path, **cfg_over):
-    backend = _backend(tmp_path)
-    await backend.start()
-    config = {"maxValueBytes": 0, "maxArtifactBytes": 0, "lockTtlSeconds": 5}
-    config.update(cfg_over)
-    api = JobStateAPI(
-        lambda: backend, base_holder="h#proc", config=config
-    )
-    await api.start()
-    return api, backend
-
-
 def _auth(token="tok"):
     return {"Authorization": "Bearer " + token}
 
@@ -79,40 +69,29 @@ def _auth(token="tok"):
 # --------------------------------------------------------------------------
 
 
-async def test_auth_required(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession() as s:
-            r = await s.get(api.base_url + "/v1/run")
-            assert r.status == 401
-            r = await s.get(api.base_url + "/v1/run", headers=_auth("wrong"))
-            assert r.status == 401
-            r = await s.get(api.base_url + "/v1/run", headers=_auth())
-            assert r.status == 200
-            body = await r.json()
-            assert body["job"] == "job"
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_auth_required(job_api):
+    api = job_api.api
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(api.base_url + "/v1/run")
+        assert r.status == 401
+        r = await s.get(api.base_url + "/v1/run", headers=_auth("wrong"))
+        assert r.status == 401
+        r = await s.get(api.base_url + "/v1/run", headers=_auth())
+        assert r.status == 200
+        body = await r.json()
+        assert body["job"] == "job"
 
 
-async def test_auth_non_ascii_token_is_401_not_500(tmp_path):
+async def test_auth_non_ascii_token_is_401_not_500(job_api):
     # compare_digest raises TypeError for a non-ASCII str, which used to
     # escape the auth check as a 500 + logged traceback; a garbage token can
     # never validate, so the answer on this boundary must be a clean 401.
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession() as s:
-            r = await s.get(
-                api.base_url + "/v1/run",
-                headers={"Authorization": "Bearer t\xf6k"},
-            )
-            assert r.status == 401
-    finally:
-        await api.stop()
-        await backend.stop()
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(
+            job_api.url("/v1/run"),
+            headers={"Authorization": "Bearer t\xf6k"},
+        )
+        assert r.status == 401
 
 
 # --------------------------------------------------------------------------
@@ -120,138 +99,109 @@ async def test_auth_non_ascii_token_is_401_not_500(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_kv_http_roundtrip(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/kv/set", json={"key": "k", "value": "v"}
-            )
-            assert r.status == 200
-            r = await s.get(api.base_url + "/v1/kv/get?key=k")
-            assert (await r.json())["value"] == "v"
-            r = await s.get(api.base_url + "/v1/kv/get?key=absent")
-            assert r.status == 404
-            r = await s.get(api.base_url + "/v1/kv/list")
-            assert [k["key"] for k in (await r.json())["keys"]] == ["k"]
-            r = await s.post(api.base_url + "/v1/kv/delete", json={"key": "k"})
-            assert (await r.json())["existed"] is True
-            r = await s.get(api.base_url + "/v1/kv/get?key=k")
-            assert r.status == 404
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_kv_http_roundtrip(job_api):
+    api, s = job_api.api, job_api.session
+    r = await s.post(
+        api.base_url + "/v1/kv/set", json={"key": "k", "value": "v"}
+    )
+    assert r.status == 200
+    r = await s.get(api.base_url + "/v1/kv/get?key=k")
+    assert (await r.json())["value"] == "v"
+    r = await s.get(api.base_url + "/v1/kv/get?key=absent")
+    assert r.status == 404
+    r = await s.get(api.base_url + "/v1/kv/list")
+    assert [k["key"] for k in (await r.json())["keys"]] == ["k"]
+    r = await s.post(api.base_url + "/v1/kv/delete", json={"key": "k"})
+    assert (await r.json())["existed"] is True
+    r = await s.get(api.base_url + "/v1/kv/get?key=k")
+    assert r.status == 404
 
 
-async def test_kv_default_scope_is_job_name(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_kv_default_scope_is_job_name(job_api):
+    api, backend = job_api.api, job_api.backend
+    # re-registering "tok" replaces the fixture's default run: same token,
+    # but the job (and so the default scope) is now "alpha".
     api.register_run(_ctx(job="alpha"))
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            await s.post(
-                api.base_url + "/v1/kv/set", json={"key": "k", "value": "v"}
-            )
-        # landed in the job's own scope, not some global default.
-        from cronstable import jobstate
+    await job_api.session.post(
+        api.base_url + "/v1/kv/set", json={"key": "k", "value": "v"}
+    )
+    # landed in the job's own scope, not some global default.
+    from cronstable import jobstate
 
-        assert (await jobstate.kv_get(backend, "alpha", "k"))["value"] == "v"
-        assert await jobstate.kv_get(backend, "global", "k") is None
-    finally:
-        await api.stop()
-        await backend.stop()
+    assert (await jobstate.kv_get(backend, "alpha", "k"))["value"] == "v"
+    assert await jobstate.kv_get(backend, "global", "k") is None
 
 
-async def test_kv_explicit_scope_shared(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_kv_explicit_scope_shared(job_api):
+    api = job_api.api
     api.register_run(_ctx(token="a", job="alpha"))
     api.register_run(_ctx(token="b", job="beta"))
-    try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"scope": "global", "key": "shared", "value": "x"},
-                headers=_auth("a"),
-            )
-            r = await s.get(
-                api.base_url + "/v1/kv/get?scope=global&key=shared",
-                headers=_auth("b"),
-            )
-            assert (await r.json())["value"] == "x"
-    finally:
-        await api.stop()
-        await backend.stop()
+    async with aiohttp.ClientSession() as s:
+        await s.post(
+            api.base_url + "/v1/kv/set",
+            json={"scope": "global", "key": "shared", "value": "x"},
+            headers=_auth("a"),
+        )
+        r = await s.get(
+            api.base_url + "/v1/kv/get?scope=global&key=shared",
+            headers=_auth("b"),
+        )
+        assert (await r.json())["value"] == "x"
 
 
-async def test_kv_scope_naming_another_jobs_scope_is_forbidden(tmp_path):
+async def test_kv_scope_naming_another_jobs_scope_is_forbidden(job_api):
     # "beta" is job alpha's own private default scope: without an explicit
     # allowlist entry, alpha may not name it (would let one job read/write/
     # destroy an unrelated job's state -- see cronstable.jobapi._scope).
-    api, backend = await _make_api(tmp_path)
+    api = job_api.api
     api.register_run(_ctx(token="a", job="alpha"))
     api.register_run(_ctx(token="b", job="beta"))
-    try:
-        async with aiohttp.ClientSession() as s:
-            await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "secret"},
-                headers=_auth("b"),
-            )
-            r = await s.get(
-                api.base_url + "/v1/kv/get?scope=beta&key=k",
-                headers=_auth("a"),
-            )
-            assert r.status == 403
-            r = await s.post(
-                api.base_url + "/v1/kv/delete",
-                json={"scope": "beta", "key": "k"},
-                headers=_auth("a"),
-            )
-            assert r.status == 403
-        # beta's value survived the attempted cross-job reach-in.
-        from cronstable import jobstate
+    async with aiohttp.ClientSession() as s:
+        await s.post(
+            api.base_url + "/v1/kv/set",
+            json={"key": "k", "value": "secret"},
+            headers=_auth("b"),
+        )
+        r = await s.get(
+            api.base_url + "/v1/kv/get?scope=beta&key=k",
+            headers=_auth("a"),
+        )
+        assert r.status == 403
+        r = await s.post(
+            api.base_url + "/v1/kv/delete",
+            json={"scope": "beta", "key": "k"},
+            headers=_auth("a"),
+        )
+        assert r.status == 403
+    # beta's value survived the attempted cross-job reach-in.
+    from cronstable import jobstate
 
-        got = await jobstate.kv_get(backend, "beta", "k")
-        assert got["value"] == "secret"
-    finally:
-        await api.stop()
-        await backend.stop()
+    got = await jobstate.kv_get(job_api.backend, "beta", "k")
+    assert got["value"] == "secret"
 
 
-async def test_kv_scope_allowlisted_explicitly_permitted(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_kv_scope_allowlisted_explicitly_permitted(job_api):
+    api = job_api.api
     api.register_run(
         _ctx(token="a", job="alpha", allowed_scopes=["shared-team"])
     )
-    try:
-        async with aiohttp.ClientSession(headers=_auth("a")) as s:
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"scope": "shared-team", "key": "k", "value": "v"},
-            )
-            assert r.status == 200
-            r = await s.get(
-                api.base_url + "/v1/kv/get?scope=shared-team&key=k"
-            )
-            assert (await r.json())["value"] == "v"
-    finally:
-        await api.stop()
-        await backend.stop()
+    async with aiohttp.ClientSession(headers=_auth("a")) as s:
+        r = await s.post(
+            api.base_url + "/v1/kv/set",
+            json={"scope": "shared-team", "key": "k", "value": "v"},
+        )
+        assert r.status == 200
+        r = await s.get(api.base_url + "/v1/kv/get?scope=shared-team&key=k")
+        assert (await r.json())["value"] == "v"
 
 
-async def test_kv_value_size_limit_413(tmp_path):
-    api, backend = await _make_api(tmp_path, maxValueBytes=8)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "x" * 100},
-            )
-            assert r.status == 413
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_kv_value_size_limit_413(job_api_factory):
+    job_api = await job_api_factory(maxValueBytes=8)
+    r = await job_api.session.post(
+        job_api.url("/v1/kv/set"),
+        json={"key": "k", "value": "x" * 100},
+    )
+    assert r.status == 413
 
 
 # --------------------------------------------------------------------------
@@ -259,26 +209,20 @@ async def test_kv_value_size_limit_413(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_cursor_http_monotonic(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/cursor/advance",
-                json={"name": "wm", "value": 100},
-            )
-            assert (await r.json()) == {"value": 100, "advanced": True}
-            r = await s.post(
-                api.base_url + "/v1/cursor/advance",
-                json={"name": "wm", "value": 50},
-            )
-            assert (await r.json()) == {"value": 100, "advanced": False}
-            r = await s.get(api.base_url + "/v1/cursor/get?name=wm")
-            assert (await r.json())["value"] == 100
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_cursor_http_monotonic(job_api):
+    api, s = job_api.api, job_api.session
+    r = await s.post(
+        api.base_url + "/v1/cursor/advance",
+        json={"name": "wm", "value": 100},
+    )
+    assert (await r.json()) == {"value": 100, "advanced": True}
+    r = await s.post(
+        api.base_url + "/v1/cursor/advance",
+        json={"name": "wm", "value": 50},
+    )
+    assert (await r.json()) == {"value": 100, "advanced": False}
+    r = await s.get(api.base_url + "/v1/cursor/get?name=wm")
+    assert (await r.json())["value"] == 100
 
 
 # --------------------------------------------------------------------------
@@ -286,22 +230,16 @@ async def test_cursor_http_monotonic(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_idempotency_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/idempotency/claim", json={"key": "order-1"}
-            )
-            assert (await r.json())["fresh"] is True
-            r = await s.post(
-                api.base_url + "/v1/idempotency/claim", json={"key": "order-1"}
-            )
-            assert (await r.json())["fresh"] is False
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_idempotency_http(job_api):
+    api, s = job_api.api, job_api.session
+    r = await s.post(
+        api.base_url + "/v1/idempotency/claim", json={"key": "order-1"}
+    )
+    assert (await r.json())["fresh"] is True
+    r = await s.post(
+        api.base_url + "/v1/idempotency/claim", json={"key": "order-1"}
+    )
+    assert (await r.json())["fresh"] is False
 
 
 # --------------------------------------------------------------------------
@@ -309,109 +247,76 @@ async def test_idempotency_http(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_artifact_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/artifact/put?name=report.csv",
-                data=b"a,b,c\n",
-            )
-            assert r.status == 200
-            assert (await r.json())["size"] == 6
-            r = await s.get(api.base_url + "/v1/artifact/get?name=report.csv")
-            assert await r.read() == b"a,b,c\n"
-            assert r.headers["X-Cronstable-Size"] == "6"
-            r = await s.get(api.base_url + "/v1/artifact/list")
-            assert [a["name"] for a in (await r.json())["artifacts"]] == [
-                "report.csv"
-            ]
-            r = await s.get(api.base_url + "/v1/artifact/get?name=nope")
-            assert r.status == 404
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_artifact_http(job_api):
+    api, s = job_api.api, job_api.session
+    r = await s.post(
+        api.base_url + "/v1/artifact/put?name=report.csv",
+        data=b"a,b,c\n",
+    )
+    assert r.status == 200
+    assert (await r.json())["size"] == 6
+    r = await s.get(api.base_url + "/v1/artifact/get?name=report.csv")
+    assert await r.read() == b"a,b,c\n"
+    assert r.headers["X-Cronstable-Size"] == "6"
+    r = await s.get(api.base_url + "/v1/artifact/list")
+    assert [a["name"] for a in (await r.json())["artifacts"]] == ["report.csv"]
+    r = await s.get(api.base_url + "/v1/artifact/get?name=nope")
+    assert r.status == 404
 
 
-async def test_artifact_size_limit_413(tmp_path):
-    api, backend = await _make_api(tmp_path, maxArtifactBytes=4)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/artifact/put?name=big", data=b"x" * 100
-            )
-            assert r.status == 413
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_artifact_size_limit_413(job_api_factory):
+    job_api = await job_api_factory(maxArtifactBytes=4)
+    r = await job_api.session.post(
+        job_api.url("/v1/artifact/put?name=big"), data=b"x" * 100
+    )
+    assert r.status == 413
 
 
-async def test_artifact_put_2mib_with_no_limit(tmp_path):
+async def test_artifact_put_2mib_with_no_limit(job_api):
     # maxArtifactBytes 0 is the documented "no limit": aiohttp's default
     # 1 MiB client_max_size must not override it with a spurious 413.
-    api, backend = await _make_api(tmp_path)  # _make_api sets both limits 0
-    api.register_run(_ctx())
+    # (the job_api fixture sets both size limits to 0)
     payload = b"x" * (2 * 1024 * 1024)
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/artifact/put?name=big", data=payload
-            )
-            assert r.status == 200
-            assert (await r.json())["size"] == len(payload)
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await job_api.session.post(
+        job_api.url("/v1/artifact/put?name=big"), data=payload
+    )
+    assert r.status == 200
+    assert (await r.json())["size"] == len(payload)
 
 
-async def test_artifact_and_kv_2mib_within_raised_limits(tmp_path):
+async def test_artifact_and_kv_2mib_within_raised_limits(job_api_factory):
     # with finite limits the transport cap is derived from them: a payload
     # under the configured maxArtifactBytes/maxValueBytes but over aiohttp's
     # 1 MiB default must succeed (xcom push rides the same artifact route).
-    api, backend = await _make_api(
-        tmp_path,
+    job_api = await job_api_factory(
         maxArtifactBytes=8 * 1024 * 1024,
         maxValueBytes=8 * 1024 * 1024,
     )
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/artifact/put?name=big",
-                data=b"x" * (2 * 1024 * 1024),
-            )
-            assert r.status == 200
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "v" * (2 * 1024 * 1024)},
-            )
-            assert r.status == 200
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await job_api.session.post(
+        job_api.url("/v1/artifact/put?name=big"),
+        data=b"x" * (2 * 1024 * 1024),
+    )
+    assert r.status == 200
+    r = await job_api.session.post(
+        job_api.url("/v1/kv/set"),
+        json={"key": "k", "value": "v" * (2 * 1024 * 1024)},
+    )
+    assert r.status == 200
 
 
-async def test_json_body_over_transport_cap_is_413_not_400(tmp_path):
+async def test_json_body_over_transport_cap_is_413_not_400(job_api_factory):
     # a JSON body larger than the derived transport cap is a 413 and must
     # surface as one: _json_body used to swallow HTTPRequestEntityTooLarge
     # and mislabel it 400 "request body is not valid JSON".
-    api, backend = await _make_api(
-        tmp_path, maxValueBytes=1024, maxArtifactBytes=1024
+    job_api = await job_api_factory(
+        maxValueBytes=1024, maxArtifactBytes=1024
     )
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                json={"key": "k", "value": "v" * (512 * 1024)},
-            )
-            assert r.status == 413
-            assert "not valid JSON" not in (await r.text())
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await job_api.session.post(
+        job_api.url("/v1/kv/set"),
+        json={"key": "k", "value": "v" * (512 * 1024)},
+    )
+    assert r.status == 413
+    assert "not valid JSON" not in (await r.text())
 
 
 # --------------------------------------------------------------------------
@@ -419,45 +324,36 @@ async def test_json_body_over_transport_cap_is_413_not_400(tmp_path):
 # --------------------------------------------------------------------------
 
 
-async def test_secret_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_secret_http(job_api):
+    api, s = job_api.api, job_api.session
+    # re-registering "tok" replaces the fixture's default run, this time
+    # with a staged secret.
     api.register_run(_ctx(secrets={"TOKEN": "hunter2"}))
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.get(api.base_url + "/v1/secret/get?name=TOKEN")
-            assert (await r.json())["value"] == "hunter2"
-            r = await s.get(api.base_url + "/v1/secret/list")
-            assert (await r.json())["names"] == ["TOKEN"]
-            r = await s.get(api.base_url + "/v1/secret/get?name=OTHER")
-            assert r.status == 404
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await s.get(api.base_url + "/v1/secret/get?name=TOKEN")
+    assert (await r.json())["value"] == "hunter2"
+    r = await s.get(api.base_url + "/v1/secret/list")
+    assert (await r.json())["names"] == ["TOKEN"]
+    r = await s.get(api.base_url + "/v1/secret/get?name=OTHER")
+    assert r.status == 404
 
 
-async def test_secret_is_run_scoped(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_secret_is_run_scoped(job_api):
+    api = job_api.api
     api.register_run(_ctx(token="a", secrets={"S": "sekret"}))
     api.register_run(_ctx(token="b", secrets={}))
-    try:
-        async with aiohttp.ClientSession() as s:
-            r = await s.get(
-                api.base_url + "/v1/secret/get?name=S", headers=_auth("a")
-            )
-            assert (await r.json())["value"] == "sekret"
-            # run b never had it staged.
-            r = await s.get(
-                api.base_url + "/v1/secret/get?name=S", headers=_auth("b")
-            )
-            assert r.status == 404
-    finally:
-        await api.stop()
-        await backend.stop()
+    async with aiohttp.ClientSession() as s:
+        r = await s.get(
+            api.base_url + "/v1/secret/get?name=S", headers=_auth("a")
+        )
+        assert (await r.json())["value"] == "sekret"
+        # run b never had it staged.
+        r = await s.get(
+            api.base_url + "/v1/secret/get?name=S", headers=_auth("b")
+        )
+        assert r.status == 404
 
 
-async def test_stage_secrets_warns_and_skips_unresolvable(
-    monkeypatch, caplog
-):
+async def test_stage_secrets_warns_and_skips_unresolvable(monkeypatch, caplog):
     # direct unit test of the shared stager (jobs and dag tasks both call
     # it): an unresolvable secret is skipped with a warning, never fatal;
     # the run sees a 404 for it and fails as it sees fit.
@@ -469,9 +365,7 @@ async def test_stage_secrets_warns_and_skips_unresolvable(
     with caplog.at_level(logging.WARNING, logger="cronstable.jobapi"):
         staged = await jobapi.stage_secrets(specs, "job x")
     assert staged == {"good": "v"}
-    assert any(
-        "could not stage secret" in r.message for r in caplog.records
-    )
+    assert any("could not stage secret" in r.message for r in caplog.records)
 
 
 # --------------------------------------------------------------------------
@@ -479,230 +373,182 @@ async def test_stage_secrets_warns_and_skips_unresolvable(
 # --------------------------------------------------------------------------
 
 
-async def test_lock_mutex_excludes(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_lock_mutex_excludes(job_api):
+    api = job_api.api
     api.register_run(_ctx(token="a", job="alpha"))
     api.register_run(_ctx(token="b", job="alpha"))
-    try:
-        async with aiohttp.ClientSession() as s:
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"scope": "global", "name": "L"},
-                headers=_auth("a"),
-            )
-            got_a = await r.json()
-            assert got_a["acquired"] is True
-            # a second run cannot take the held mutex.
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"scope": "global", "name": "L"},
-                headers=_auth("b"),
-            )
-            assert (await r.json())["acquired"] is False
-            # once released, it is free again.
-            r = await s.post(
-                api.base_url + "/v1/lock/release",
-                json={"token": got_a["token"]},
-                headers=_auth("a"),
-            )
-            assert (await r.json())["released"] is True
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"scope": "global", "name": "L"},
-                headers=_auth("b"),
-            )
-            assert (await r.json())["acquired"] is True
-    finally:
-        await api.stop()
-        await backend.stop()
+    async with aiohttp.ClientSession() as s:
+        r = await s.post(
+            api.base_url + "/v1/lock/acquire",
+            json={"scope": "global", "name": "L"},
+            headers=_auth("a"),
+        )
+        got_a = await r.json()
+        assert got_a["acquired"] is True
+        # a second run cannot take the held mutex.
+        r = await s.post(
+            api.base_url + "/v1/lock/acquire",
+            json={"scope": "global", "name": "L"},
+            headers=_auth("b"),
+        )
+        assert (await r.json())["acquired"] is False
+        # once released, it is free again.
+        r = await s.post(
+            api.base_url + "/v1/lock/release",
+            json={"token": got_a["token"]},
+            headers=_auth("a"),
+        )
+        assert (await r.json())["released"] is True
+        r = await s.post(
+            api.base_url + "/v1/lock/acquire",
+            json={"scope": "global", "name": "L"},
+            headers=_auth("b"),
+        )
+        assert (await r.json())["acquired"] is True
 
 
-async def test_lock_semaphore_two_permits(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_lock_semaphore_two_permits(job_api):
+    api = job_api.api
     for t in ("a", "b", "c"):
         api.register_run(_ctx(token=t, job="alpha"))
-    try:
-        async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession() as s:
 
-            async def acq(token):
-                r = await s.post(
-                    api.base_url + "/v1/lock/acquire",
-                    json={"scope": "global", "name": "S", "permits": 2},
-                    headers=_auth(token),
-                )
-                return await r.json()
+        async def acq(token):
+            r = await s.post(
+                api.base_url + "/v1/lock/acquire",
+                json={"scope": "global", "name": "S", "permits": 2},
+                headers=_auth(token),
+            )
+            return await r.json()
 
-            a, b = await acq("a"), await acq("b")
-            assert a["acquired"] and b["acquired"]
-            assert {a["slot"], b["slot"]} == {0, 1}
-            # both permits taken: the third is refused.
-            assert (await acq("c"))["acquired"] is False
-    finally:
-        await api.stop()
-        await backend.stop()
+        a, b = await acq("a"), await acq("b")
+        assert a["acquired"] and b["acquired"]
+        assert {a["slot"], b["slot"]} == {0, 1}
+        # both permits taken: the third is refused.
+        assert (await acq("c"))["acquired"] is False
 
 
-async def test_lock_released_on_finish_run(tmp_path):
-    api, backend = await _make_api(tmp_path)
+async def test_lock_released_on_finish_run(job_api):
+    api = job_api.api
     api.register_run(_ctx(token="a", job="alpha"))
     api.register_run(_ctx(token="b", job="alpha"))
-    try:
-        async with aiohttp.ClientSession() as s:
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"scope": "global", "name": "L"},
-                headers=_auth("a"),
-            )
-            assert (await r.json())["acquired"] is True
-            # run a ends without releasing: finish_run must free its lock.
-            await api.finish_run("a")
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"scope": "global", "name": "L"},
-                headers=_auth("b"),
-            )
-            assert (await r.json())["acquired"] is True
-    finally:
-        await api.stop()
-        await backend.stop()
+    async with aiohttp.ClientSession() as s:
+        r = await s.post(
+            api.base_url + "/v1/lock/acquire",
+            json={"scope": "global", "name": "L"},
+            headers=_auth("a"),
+        )
+        assert (await r.json())["acquired"] is True
+        # run a ends without releasing: finish_run must free its lock.
+        await api.finish_run("a")
+        r = await s.post(
+            api.base_url + "/v1/lock/acquire",
+            json={"scope": "global", "name": "L"},
+            headers=_auth("b"),
+        )
+        assert (await r.json())["acquired"] is True
 
 
-async def test_lock_acquire_after_run_ended_does_not_leak(tmp_path):
+async def test_lock_acquire_after_run_ended_does_not_leak(job_api):
     # a blocking acquire that lands AFTER its run was already finished must not
     # record a hold or start a renewer (that would pin the lease forever).
-    api, backend = await _make_api(tmp_path)
+    api = job_api.api
     api.register_run(_ctx(token="a", job="alpha"))
     api.register_run(_ctx(token="b", job="alpha"))
-    try:
-        await api.finish_run("a")  # run a ends before its acquire lands
-        result = await api.locks.acquire("a", "global", "L")
-        assert result["acquired"] is False
-        assert result.get("runEnded") is True
-        assert api.locks._holds == {}  # nothing recorded, no renewer
-        # the lease was handed straight back, so a live run can take it.
-        r = await api.locks.acquire("b", "global", "L")
-        assert r["acquired"] is True
-    finally:
-        await api.stop()
-        await backend.stop()
+    await api.finish_run("a")  # run a ends before its acquire lands
+    result = await api.locks.acquire("a", "global", "L")
+    assert result["acquired"] is False
+    assert result.get("runEnded") is True
+    assert api.locks._holds == {}  # nothing recorded, no renewer
+    # the lease was handed straight back, so a live run can take it.
+    r = await api.locks.acquire("b", "global", "L")
+    assert r["acquired"] is True
 
 
-async def test_lock_per_acquire_ttl_used_for_hold(tmp_path):
+async def test_lock_per_acquire_ttl_used_for_hold(job_api_factory):
     # a per-acquire --ttl must drive the hold (and thus the renewer), not the
     # manager default -- otherwise a short lease lapses before its first renew.
-    api, backend = await _make_api(tmp_path, lockTtlSeconds=30)
-    api.register_run(_ctx(token="a"))
-    try:
-        r = await api.locks.acquire("a", "s", "L", ttl=6)
-        assert r["acquired"] is True
-        assert r["ttl"] == 6  # reply reports the actual ttl, not the default
-        hold = api.locks._holds[r["token"]]
-        assert hold.ttl == 6  # the renewer renews on 6, not 30
-    finally:
-        await api.stop()
-        await backend.stop()
+    job_api = await job_api_factory(ctx=_ctx(token="a"), lockTtlSeconds=30)
+    api = job_api.api
+    r = await api.locks.acquire("a", "s", "L", ttl=6)
+    assert r["acquired"] is True
+    assert r["ttl"] == 6  # reply reports the actual ttl, not the default
+    hold = api.locks._holds[r["token"]]
+    assert hold.ttl == 6  # the renewer renews on 6, not 30
 
 
-async def test_lock_acquire_non_numeric_fields_400(tmp_path):
+async def test_lock_acquire_non_numeric_fields_400(job_api):
     # ttl/blockSeconds that cannot convert are the caller's bad input: a
     # clean 400 (like permits two lines above), not ValueError -> 500.
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            for body in (
-                {"name": "L", "ttl": "abc"},
-                {"name": "L", "blockSeconds": "zz"},
-                {"name": "L", "ttl": {"nested": 1}},
-            ):
-                r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
-                assert r.status == 400, body
-    finally:
-        await api.stop()
-        await backend.stop()
+    for body in (
+        {"name": "L", "ttl": "abc"},
+        {"name": "L", "blockSeconds": "zz"},
+        {"name": "L", "ttl": {"nested": 1}},
+    ):
+        r = await job_api.session.post(
+            job_api.url("/v1/lock/acquire"), json=body
+        )
+        assert r.status == 400, body
 
 
-async def test_lock_acquire_non_finite_ttl_400_lock_not_bricked(tmp_path):
+async def test_lock_acquire_non_finite_ttl_400_lock_not_bricked(job_api):
     # --ttl inf sails through argparse type=float; expires_at = now + inf
     # would then be persisted by orjson as expiresAt: null -- an unreadable
     # lease that acquire, release AND the sweeper all fail closed on,
     # permanently bricking that lock fleet-wide. Non-finite must be the
     # caller's clean 400 up front, and the lock must remain acquirable.
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            for bad in ("inf", "-inf", "nan", "1e999"):
-                for body in (
-                    {"name": "L", "ttl": bad},
-                    {"name": "L", "wait": True, "blockSeconds": bad},
-                ):
-                    r = await s.post(
-                        api.base_url + "/v1/lock/acquire", json=body
-                    )
-                    assert r.status == 400, body
-            # a huge but FINITE ttl is clamped to the ceiling, not rejected,
-            # and the reply reports the ttl actually used (finite -> the
-            # lease file stays readable and reclaimable).
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"name": "L", "ttl": 1e308},
-            )
-            granted = await r.json()
-            assert granted["acquired"] is True
-            assert granted["ttl"] == MAX_LOCK_TTL
-            r = await s.post(
-                api.base_url + "/v1/lock/release",
-                json={"token": granted["token"]},
-            )
-            assert (await r.json())["released"] is True
-            # the lock is not bricked: a normal acquire still succeeds.
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire", json={"name": "L"}
-            )
-            assert (await r.json())["acquired"] is True
-    finally:
-        await api.stop()
-        await backend.stop()
+    api, s = job_api.api, job_api.session
+    for bad in ("inf", "-inf", "nan", "1e999"):
+        for body in (
+            {"name": "L", "ttl": bad},
+            {"name": "L", "wait": True, "blockSeconds": bad},
+        ):
+            r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
+            assert r.status == 400, body
+    # a huge but FINITE ttl is clamped to the ceiling, not rejected,
+    # and the reply reports the ttl actually used (finite -> the
+    # lease file stays readable and reclaimable).
+    r = await s.post(
+        api.base_url + "/v1/lock/acquire",
+        json={"name": "L", "ttl": 1e308},
+    )
+    granted = await r.json()
+    assert granted["acquired"] is True
+    assert granted["ttl"] == MAX_LOCK_TTL
+    r = await s.post(
+        api.base_url + "/v1/lock/release",
+        json={"token": granted["token"]},
+    )
+    assert (await r.json())["released"] is True
+    # the lock is not bricked: a normal acquire still succeeds.
+    r = await s.post(api.base_url + "/v1/lock/acquire", json={"name": "L"})
+    assert (await r.json())["acquired"] is True
 
 
-async def test_idempotency_claim_non_finite_ttl_400(tmp_path):
+async def test_idempotency_claim_non_finite_ttl_400(job_api):
     # inf would make the claim's expiresAt non-finite, which is not
     # fleet-portable JSON (orjson rewrites it to null): a clean 400 up front.
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            for bad in ("inf", "nan"):
-                r = await s.post(
-                    api.base_url + "/v1/idempotency/claim",
-                    json={"key": "k", "ttl": bad},
-                )
-                assert r.status == 400, bad
-    finally:
-        await api.stop()
-        await backend.stop()
+    for bad in ("inf", "nan"):
+        r = await job_api.session.post(
+            job_api.url("/v1/idempotency/claim"),
+            json={"key": "k", "ttl": bad},
+        )
+        assert r.status == 400, bad
 
 
-async def test_lock_acquire_permits_over_cap_400(tmp_path):
+async def test_lock_acquire_permits_over_cap_400(job_api):
     # permits comes straight from the request body, and every permit is a
     # SEQUENTIALLY probed lease per acquire pass: an absurd count
     # (--permits 1000000000) must be the caller's clean 400 up front, not a
     # store-hammering scan.
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            body = {"name": "L", "permits": MAX_LOCK_PERMITS + 1}
-            r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
-            assert r.status == 400
-            # the ceiling itself is accepted (slot 0 is free: instant grant).
-            body = {"name": "L", "permits": MAX_LOCK_PERMITS}
-            r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
-            assert (await r.json())["acquired"] is True
-    finally:
-        await api.stop()
-        await backend.stop()
+    api, s = job_api.api, job_api.session
+    body = {"name": "L", "permits": MAX_LOCK_PERMITS + 1}
+    r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
+    assert r.status == 400
+    # the ceiling itself is accepted (slot 0 is free: instant grant).
+    body = {"name": "L", "permits": MAX_LOCK_PERMITS}
+    r = await s.post(api.base_url + "/v1/lock/acquire", json=body)
+    assert (await r.json())["acquired"] is True
 
 
 def test_json_response_is_compact_and_falls_back():
@@ -734,47 +580,28 @@ def test_bracket_host_formats_ipv6_authority():
     assert _bracket_host("fe80::1%eth0") == "[fe80::1%eth0]"
 
 
-async def test_idempotency_claim_non_numeric_ttl_400(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/idempotency/claim",
-                json={"key": "k", "ttl": "abc"},
-            )
-            assert r.status == 400
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_idempotency_claim_non_numeric_ttl_400(job_api):
+    r = await job_api.session.post(
+        job_api.url("/v1/idempotency/claim"),
+        json={"key": "k", "ttl": "abc"},
+    )
+    assert r.status == 400
 
 
-async def test_cursor_value_size_limit_413(tmp_path):
-    api, backend = await _make_api(tmp_path, maxValueBytes=8)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/cursor/advance",
-                json={"name": "wm", "value": "x" * 100},
-            )
-            assert r.status == 413
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_cursor_value_size_limit_413(job_api_factory):
+    job_api = await job_api_factory(maxValueBytes=8)
+    r = await job_api.session.post(
+        job_api.url("/v1/cursor/advance"),
+        json={"name": "wm", "value": "x" * 100},
+    )
+    assert r.status == 413
 
 
-async def test_finish_run_revokes_token(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx(token="a"))
-    try:
-        await api.finish_run("a")
-        async with aiohttp.ClientSession() as s:
-            r = await s.get(api.base_url + "/v1/run", headers=_auth("a"))
-            assert r.status == 401  # token no longer valid
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_finish_run_revokes_token(job_api):
+    # finishing the fixture's default registered run ("tok") revokes it.
+    await job_api.api.finish_run("tok")
+    r = await job_api.session.get(job_api.url("/v1/run"))
+    assert r.status == 401  # token no longer valid
 
 
 # --------------------------------------------------------------------------
@@ -996,15 +823,6 @@ def _manager(backend, ttl=5.0, live=True):
     )
 
 
-def _instant_sleep(monkeypatch):
-    real_sleep = asyncio.sleep
-
-    async def fast(_delay):
-        await real_sleep(0)
-
-    monkeypatch.setattr(asyncio, "sleep", fast)
-
-
 # ---------------------------------------------------------------------------
 # acquire: validation + degraded backends
 # ---------------------------------------------------------------------------
@@ -1085,6 +903,9 @@ async def test_release_wrong_run_or_unknown_hold():
 
 
 async def test_release_swallows_backend_errors():
+    # Same name as a test in test_state_dag_run.py, but not a duplicate:
+    # JobLockManager._release_hold (jobapi.py) has its own swallow,
+    # separate from DagCoordinator._release (dagrun.py). Keep both.
     class _Broken(_ScriptedBackend):
         async def release_lease(self, lease):
             raise RuntimeError("boom")
@@ -1108,13 +929,8 @@ async def test_release_all_tolerates_stale_hold_tokens():
     assert mgr._holds == {}
 
 
-async def test_finish_run_without_token_is_noop(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    try:
-        await api.finish_run("")  # a run that never registered
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_finish_run_without_token_is_noop(job_api):
+    await job_api.api.finish_run("")  # a run that never registered
 
 
 # ---------------------------------------------------------------------------
@@ -1172,99 +988,72 @@ async def test_renew_stops_when_hold_vanishes(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_body_guards_over_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            # no body at all: an empty payload, so `key` is missing
-            r = await s.post(api.base_url + "/v1/kv/set")
-            assert r.status == 400
-            assert "key is required" in (await r.json())["error"]
-            # malformed JSON
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                data=b"{nope",
-                headers={"Content-Type": "application/json"},
-            )
-            assert r.status == 400
-            assert "not valid JSON" in (await r.json())["error"]
-            # valid JSON, wrong shape
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                data=b"[1, 2]",
-                headers={"Content-Type": "application/json"},
-            )
-            assert r.status == 400
-            assert "JSON object" in (await r.json())["error"]
-            # a non-portable value fails closed as the caller's 400
-            r = await s.post(
-                api.base_url + "/v1/kv/set",
-                data=b'{"key": "k", "value": Infinity}',
-                headers={"Content-Type": "application/json"},
-            )
-            assert r.status == 400
-            assert "not portable" in (await r.json())["error"]
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_body_guards_over_http(job_api):
+    api, s = job_api.api, job_api.session
+    # no body at all: an empty payload, so `key` is missing
+    r = await s.post(api.base_url + "/v1/kv/set")
+    assert r.status == 400
+    assert "key is required" in (await r.json())["error"]
+    # malformed JSON
+    r = await s.post(
+        api.base_url + "/v1/kv/set",
+        data=b"{nope",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status == 400
+    assert "not valid JSON" in (await r.json())["error"]
+    # valid JSON, wrong shape
+    r = await s.post(
+        api.base_url + "/v1/kv/set",
+        data=b"[1, 2]",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status == 400
+    assert "JSON object" in (await r.json())["error"]
+    # a non-portable value fails closed as the caller's 400
+    r = await s.post(
+        api.base_url + "/v1/kv/set",
+        data=b'{"key": "k", "value": Infinity}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status == 400
+    assert "not portable" in (await r.json())["error"]
 
 
-async def test_cursor_guards_over_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.get(api.base_url + "/v1/cursor/get?name=missing")
-            assert r.status == 404
-            r = await s.post(
-                api.base_url + "/v1/cursor/advance", json={"name": "c"}
-            )
-            assert r.status == 400
-            assert "value is required" in (await r.json())["error"]
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_cursor_guards_over_http(job_api):
+    api, s = job_api.api, job_api.session
+    r = await s.get(api.base_url + "/v1/cursor/get?name=missing")
+    assert r.status == 404
+    r = await s.post(api.base_url + "/v1/cursor/advance", json={"name": "c"})
+    assert r.status == 400
+    assert "value is required" in (await r.json())["error"]
 
 
-async def test_idempotency_release_over_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/idempotency/claim",
-                json={"key": "k", "ttl": 60},
-            )
-            assert (await r.json())["fresh"] is True
-            r = await s.post(
-                api.base_url + "/v1/idempotency/release", json={"key": "k"}
-            )
-            assert (await r.json())["released"] is True
-            r = await s.post(
-                api.base_url + "/v1/idempotency/release",
-                json={"key": "never-claimed"},
-            )
-            assert (await r.json())["released"] is False
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_idempotency_release_over_http(job_api):
+    api, s = job_api.api, job_api.session
+    r = await s.post(
+        api.base_url + "/v1/idempotency/claim",
+        json={"key": "k", "ttl": 60},
+    )
+    assert (await r.json())["fresh"] is True
+    r = await s.post(
+        api.base_url + "/v1/idempotency/release", json={"key": "k"}
+    )
+    assert (await r.json())["released"] is True
+    r = await s.post(
+        api.base_url + "/v1/idempotency/release",
+        json={"key": "never-claimed"},
+    )
+    assert (await r.json())["released"] is False
 
 
-async def test_lock_permits_must_be_integer_over_http(tmp_path):
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.post(
-                api.base_url + "/v1/lock/acquire",
-                json={"name": "l", "permits": "many"},
-            )
-            assert r.status == 400
-            assert "permits must be an integer" in (await r.json())["error"]
-    finally:
-        await api.stop()
-        await backend.stop()
+async def test_lock_permits_must_be_integer_over_http(job_api):
+    r = await job_api.session.post(
+        job_api.url("/v1/lock/acquire"),
+        json={"name": "l", "permits": "many"},
+    )
+    assert r.status == 400
+    assert "permits must be an integer" in (await r.json())["error"]
 
 
 async def test_backend_gone_is_503_over_http(tmp_path):
@@ -1284,28 +1073,20 @@ async def test_backend_gone_is_503_over_http(tmp_path):
         await api.stop()
 
 
-async def test_backend_document_error_is_503_over_http(tmp_path, monkeypatch):
+async def test_backend_document_error_is_503_over_http(job_api, monkeypatch):
     from cronstable.state import _DocumentUnreadable
-
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
 
     async def broken(*args, **kwargs):
         raise _DocumentUnreadable("kv/x", "corrupt")
 
     monkeypatch.setattr(jobapi.jobstate, "kv_get", broken)
-    try:
-        async with aiohttp.ClientSession(headers=_auth()) as s:
-            r = await s.get(api.base_url + "/v1/kv/get?key=k")
-            assert r.status == 503
-    finally:
-        await api.stop()
-        await backend.stop()
+    r = await job_api.session.get(job_api.url("/v1/kv/get?key=k"))
+    assert r.status == 503
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
 async def test_backend_error_503_keeps_the_store_detail_in_the_log(
-    tmp_path, monkeypatch, caplog, wrapped
+    job_api, tmp_path, monkeypatch, caplog, wrapped
 ):
     # The 503 body is the fact, not the store's own words.  An OSError out
     # of the store reads "[Errno 13] Permission denied: <absolute document
@@ -1317,8 +1098,6 @@ async def test_backend_error_503_keeps_the_store_detail_in_the_log(
     # tests/test_push.py, which pins the same split for the push registry.
     from cronstable.state import _DocumentUnreadable
 
-    api, backend = await _make_api(tmp_path)
-    api.register_run(_ctx())
     # forward slashes on purpose: OSError renders its filename through
     # repr, which on Windows would double every backslash and stop this
     # test's own substring check from matching the path it planted.
@@ -1331,15 +1110,10 @@ async def test_backend_error_503_keeps_the_store_detail_in_the_log(
         raise OSError(13, "Permission denied", doc)
 
     monkeypatch.setattr(jobapi.jobstate, "kv_get", broken)
-    try:
-        with caplog.at_level(logging.WARNING, logger="cronstable"):
-            async with aiohttp.ClientSession(headers=_auth()) as s:
-                r = await s.get(api.base_url + "/v1/kv/get?key=k")
-                assert r.status == 503
-                body = await r.text()
-    finally:
-        await api.stop()
-        await backend.stop()
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        r = await job_api.session.get(job_api.url("/v1/kv/get?key=k"))
+        assert r.status == 503
+        body = await r.text()
     assert doc not in body
     assert "Errno" not in body
     assert json.loads(body)["error"] == (

@@ -11,7 +11,6 @@ test_state_job_api.py).
 """
 
 import argparse
-import asyncio
 import io
 import json
 import ssl
@@ -21,16 +20,7 @@ import urllib.request
 
 import pytest
 
-import cronstable.__main__
 from cronstable import jobcli
-
-
-class ExitError(Exception):
-    pass
-
-
-def _exit(code=0):
-    raise ExitError(code)
 
 
 class _FakeHTTP:
@@ -67,20 +57,24 @@ class _FakeHTTP:
         return status, {}, payload
 
 
-def _cli(monkeypatch, argv, http=None, stdin=b"", url="http://127.0.0.1:1"):
-    monkeypatch.setenv("CRONSTABLE_STATE_URL", url)
-    monkeypatch.setenv("CRONSTABLE_STATE_TOKEN", "tok")
-    if http is not None:
-        monkeypatch.setattr(jobcli, "_http", http)
-    loop = asyncio.new_event_loop()
-    try:
-        monkeypatch.setattr(sys, "argv", ["cronstable"] + argv)
-        monkeypatch.setattr(sys, "exit", _exit)
-        with pytest.raises(ExitError) as excinfo:
-            cronstable.__main__.main_loop(loop)
-        return excinfo.value.args[0]
-    finally:
-        loop.close()
+@pytest.fixture
+def job_cli(cli_runner, monkeypatch):
+    """This file's runner (finding B12): the conftest ``cli_runner`` plus the
+    injected ``CRONSTABLE_STATE_*`` environment and the optional
+    ``jobcli._http`` recorder seam; only that wrapper stays local."""
+
+    def run(argv, http=None, url="http://127.0.0.1:1"):
+        if http is not None:
+            monkeypatch.setattr(jobcli, "_http", http)
+        return cli_runner(
+            argv,
+            env={
+                "CRONSTABLE_STATE_URL": url,
+                "CRONSTABLE_STATE_TOKEN": "tok",
+            },
+        )
+
+    return run
 
 
 # --------------------------------------------------------------------------
@@ -88,64 +82,64 @@ def _cli(monkeypatch, argv, http=None, stdin=b"", url="http://127.0.0.1:1"):
 # --------------------------------------------------------------------------
 
 
-def test_state_set_builds_request(monkeypatch, capsys):
+def test_state_set_builds_request(job_cli, capsys):
     http = _FakeHTTP({"/v1/kv/set": (200, {"ok": True})})
-    assert _cli(monkeypatch, ["state", "set", "k", "v"], http) == 0
+    assert job_cli(["state", "set", "k", "v"], http) == 0
     call = http.calls[0]
     assert call["method"] == "POST" and call["path"] == "/v1/kv/set"
     assert call["json"] == {"scope": None, "key": "k", "value": "v"}
 
 
-def test_state_get_prints_value(monkeypatch, capsys):
+def test_state_get_prints_value(job_cli, capsys):
     http = _FakeHTTP({"/v1/kv/get": (200, {"value": "hello"})})
-    assert _cli(monkeypatch, ["state", "get", "k"], http) == 0
+    assert job_cli(["state", "get", "k"], http) == 0
     assert capsys.readouterr().out == "hello\n"
 
 
-def test_state_get_missing_exit_4(monkeypatch, capsys):
+def test_state_get_missing_exit_4(job_cli, capsys):
     http = _FakeHTTP({"/v1/kv/get": (404, {})})
-    assert _cli(monkeypatch, ["state", "get", "k"], http) == 4
+    assert job_cli(["state", "get", "k"], http) == 4
 
 
-def test_state_set_json_flag(monkeypatch):
+def test_state_set_json_flag(job_cli):
     http = _FakeHTTP({"/v1/kv/set": (200, {"ok": True})})
-    _cli(monkeypatch, ["state", "set", "k", '{"a": 1}', "--json"], http)
+    job_cli(["state", "set", "k", '{"a": 1}', "--json"], http)
     assert http.calls[0]["json"]["value"] == {"a": 1}
 
 
-def test_state_global_scope(monkeypatch):
+def test_state_global_scope(job_cli):
     http = _FakeHTTP({"/v1/kv/get": (200, {"value": "x"})})
-    _cli(monkeypatch, ["state", "get", "k", "--global"], http)
+    job_cli(["state", "get", "k", "--global"], http)
     assert http.calls[0]["query"] == {"scope": "global", "key": "k"}
 
 
-def test_state_keys_lists(monkeypatch, capsys):
+def test_state_keys_lists(job_cli, capsys):
     http = _FakeHTTP(
         {"/v1/kv/list": (200, {"keys": [{"key": "a"}, {"key": "b"}]})}
     )
-    assert _cli(monkeypatch, ["state", "keys"], http) == 0
+    assert job_cli(["state", "keys"], http) == 0
     assert capsys.readouterr().out == "a\nb\n"
 
 
-def test_state_delete_absent_exit_4(monkeypatch):
+def test_state_delete_absent_exit_4(job_cli):
     http = _FakeHTTP({"/v1/kv/delete": (200, {"existed": False})})
-    assert _cli(monkeypatch, ["state", "delete", "k"], http) == 4
+    assert job_cli(["state", "delete", "k"], http) == 4
 
 
-def test_error_surfaced_exit_1(monkeypatch, capsys):
+def test_error_surfaced_exit_1(job_cli, capsys):
     http = _FakeHTTP({"/v1/kv/set": (413, {"error": "value too large"})})
-    assert _cli(monkeypatch, ["state", "set", "k", "v"], http) == 1
+    assert job_cli(["state", "set", "k", "v"], http) == 1
     assert "value too large" in capsys.readouterr().err
 
 
-def test_state_admin_still_routes(monkeypatch, capsys, tmp_path):
+def test_state_admin_still_routes(job_cli, capsys, tmp_path):
     # a non-job `state` action must still reach the offline admin dispatcher,
     # not the job CLI. `check` on a missing state section exits 1 via admin.
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
     )
-    code = _cli(monkeypatch, ["state", "check", "-c", str(cfg)])
+    code = job_cli(["state", "check", "-c", str(cfg)])
     assert code == 1
     assert "no `state:` section" in capsys.readouterr().err
 
@@ -155,26 +149,26 @@ def test_state_admin_still_routes(monkeypatch, capsys, tmp_path):
 # --------------------------------------------------------------------------
 
 
-def test_cursor_advance_typed_int(monkeypatch, capsys):
+def test_cursor_advance_typed_int(job_cli, capsys):
     http = _FakeHTTP({"/v1/cursor/advance": (200, {"value": 100})})
-    assert _cli(monkeypatch, ["cursor", "advance", "wm", "100"], http) == 0
+    assert job_cli(["cursor", "advance", "wm", "100"], http) == 0
     assert http.calls[0]["json"]["value"] == 100  # parsed as int, not "100"
     assert capsys.readouterr().out == "100\n"
 
 
-def test_cursor_advance_iso_string(monkeypatch):
+def test_cursor_advance_iso_string(job_cli):
     http = _FakeHTTP({"/v1/cursor/advance": (200, {"value": "x"})})
-    _cli(monkeypatch, ["cursor", "advance", "ts", "2026-07-01T00:00:00"], http)
+    job_cli(["cursor", "advance", "ts", "2026-07-01T00:00:00"], http)
     assert http.calls[0]["json"]["value"] == "2026-07-01T00:00:00"
 
 
-def test_cursor_get_missing_exit_4(monkeypatch):
+def test_cursor_get_missing_exit_4(job_cli):
     http = _FakeHTTP({"/v1/cursor/get": (404, {})})
-    assert _cli(monkeypatch, ["cursor", "get", "wm"], http) == 4
+    assert job_cli(["cursor", "get", "wm"], http) == 4
 
 
-def test_cursor_no_action_exit_2(monkeypatch):
-    assert _cli(monkeypatch, ["cursor"], _FakeHTTP()) == 2
+def test_cursor_no_action_exit_2(job_cli):
+    assert job_cli(["cursor"], _FakeHTTP()) == 2
 
 
 # --------------------------------------------------------------------------
@@ -182,31 +176,31 @@ def test_cursor_no_action_exit_2(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_idempotent_fresh_exit_0(monkeypatch):
+def test_idempotent_fresh_exit_0(job_cli):
     http = _FakeHTTP({"/v1/idempotency/claim": (200, {"fresh": True})})
-    assert _cli(monkeypatch, ["idempotent", "order-1"], http) == 0
+    assert job_cli(["idempotent", "order-1"], http) == 0
 
 
-def test_idempotent_duplicate_exit_5(monkeypatch):
+def test_idempotent_duplicate_exit_5(job_cli):
     # "a prior caller did the work" must not share exit 1 with transport/
     # store errors, or an outage masquerades as "already done" to a guard
     # script; the duplicate outcome has its own code.
     http = _FakeHTTP({"/v1/idempotency/claim": (200, {"fresh": False})})
-    assert _cli(monkeypatch, ["idempotent", "order-1"], http) == 5
+    assert job_cli(["idempotent", "order-1"], http) == 5
 
 
-def test_idempotent_store_error_exit_1(monkeypatch, capsys):
+def test_idempotent_store_error_exit_1(job_cli, capsys):
     # a state endpoint failure is a real error (1), distinct from the
     # duplicate skip (5), so `if cronstable idempotent K; then ...` cannot
     # silently drop the side effect for the length of a store outage.
     http = _FakeHTTP({"/v1/idempotency/claim": (503, {"error": "store down"})})
-    assert _cli(monkeypatch, ["idempotent", "order-1"], http) == 1
+    assert job_cli(["idempotent", "order-1"], http) == 1
     assert "store down" in capsys.readouterr().err
 
 
-def test_idempotent_release(monkeypatch):
+def test_idempotent_release(job_cli):
     http = _FakeHTTP({"/v1/idempotency/release": (200, {"released": True})})
-    assert _cli(monkeypatch, ["idempotent", "order-1", "--release"], http) == 0
+    assert job_cli(["idempotent", "order-1", "--release"], http) == 0
     assert http.calls[0]["path"] == "/v1/idempotency/release"
 
 
@@ -215,20 +209,20 @@ def test_idempotent_release(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_lock_acquire_prints_token(monkeypatch, capsys):
+def test_lock_acquire_prints_token(job_cli, capsys):
     http = _FakeHTTP(
         {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
     )
-    assert _cli(monkeypatch, ["lock", "acquire", "L"], http) == 0
+    assert job_cli(["lock", "acquire", "L"], http) == 0
     assert capsys.readouterr().out == "h1\n"
 
 
-def test_lock_acquire_denied_exit_3(monkeypatch):
+def test_lock_acquire_denied_exit_3(job_cli):
     http = _FakeHTTP({"/v1/lock/acquire": (200, {"acquired": False})})
-    assert _cli(monkeypatch, ["lock", "acquire", "L"], http) == 3
+    assert job_cli(["lock", "acquire", "L"], http) == 3
 
 
-def test_lock_run_wraps_command(monkeypatch):
+def test_lock_run_wraps_command(job_cli):
     http = _FakeHTTP(
         {
             "/v1/lock/acquire": (200, {"acquired": True, "token": "h1"}),
@@ -244,12 +238,12 @@ def test_lock_run_wraps_command(monkeypatch):
         "-c",
         "import sys; sys.exit(7)",
     ]
-    assert _cli(monkeypatch, argv, http) == 7
+    assert job_cli(argv, http) == 7
     # the lock was released after the wrapped command.
     assert any(c["path"] == "/v1/lock/release" for c in http.calls)
 
 
-def test_lock_run_denied_does_not_run(monkeypatch):
+def test_lock_run_denied_does_not_run(job_cli):
     http = _FakeHTTP({"/v1/lock/acquire": (200, {"acquired": False})})
     argv = [
         "lock",
@@ -260,11 +254,11 @@ def test_lock_run_denied_does_not_run(monkeypatch):
         "-c",
         "import sys; sys.exit(0)",
     ]
-    assert _cli(monkeypatch, argv, http) == 3
+    assert job_cli(argv, http) == 3
     assert not any(c["path"] == "/v1/lock/release" for c in http.calls)
 
 
-def test_lock_acquire_wait_passes_client_deadline(monkeypatch):
+def test_lock_acquire_wait_passes_client_deadline(job_cli):
     # a --wait long poll is ended by the server (blockSeconds); the client
     # deadline is that plus margin, so a wedged daemon still cannot hang
     # the job forever while a healthy long poll is never cut short.
@@ -272,21 +266,21 @@ def test_lock_acquire_wait_passes_client_deadline(monkeypatch):
         {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
     )
     argv = ["lock", "acquire", "L", "--wait", "--timeout", "300"]
-    assert _cli(monkeypatch, argv, http) == 0
+    assert job_cli(argv, http) == 0
     assert http.calls[0]["timeout"] == 300.0 + jobcli._DEFAULT_TIMEOUT
 
 
-def test_lock_acquire_non_wait_uses_default_deadline(monkeypatch):
+def test_lock_acquire_non_wait_uses_default_deadline(job_cli):
     # without --wait no explicit deadline is passed; _http applies
     # _DEFAULT_TIMEOUT (every request must have one).
     http = _FakeHTTP(
         {"/v1/lock/acquire": (200, {"acquired": True, "token": "h1"})}
     )
-    assert _cli(monkeypatch, ["lock", "acquire", "L"], http) == 0
+    assert job_cli(["lock", "acquire", "L"], http) == 0
     assert http.calls[0]["timeout"] is None
 
 
-def test_lock_run_parses_flags_before_command(monkeypatch):
+def test_lock_run_parses_flags_before_command(job_cli):
     # the documented form puts our flags BEFORE the `--`:
     #   lock run NAME --wait --timeout 300 -- cmd
     # argparse must PARSE --wait/--timeout/--ttl (nargs=REMAINDER swallowed
@@ -312,7 +306,7 @@ def test_lock_run_parses_flags_before_command(monkeypatch):
         "-c",
         "import sys; sys.exit(7)",
     ]
-    assert _cli(monkeypatch, argv, http) == 7  # the wrapped command ran
+    assert job_cli(argv, http) == 7  # the wrapped command ran
     acquire = next(c for c in http.calls if c["path"] == "/v1/lock/acquire")
     assert acquire["json"]["wait"] is True
     assert acquire["json"]["blockSeconds"] == 300.0
@@ -324,62 +318,62 @@ def test_lock_run_parses_flags_before_command(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_artifact_put_from_file(monkeypatch, capsys, tmp_path):
+def test_artifact_put_from_file(job_cli, capsys, tmp_path):
     src = tmp_path / "a.txt"
     src.write_bytes(b"payload")
     http = _FakeHTTP({"/v1/artifact/put": (200, {"sha256": "abc", "size": 7})})
-    assert _cli(monkeypatch, ["artifact", "put", "a.txt", str(src)], http) == 0
+    assert job_cli(["artifact", "put", "a.txt", str(src)], http) == 0
     assert http.calls[0]["data"] == b"payload"
     assert capsys.readouterr().out == "abc\n"
 
 
-def test_artifact_get_to_file(monkeypatch, tmp_path):
+def test_artifact_get_to_file(job_cli, tmp_path):
     http = _FakeHTTP({"/v1/artifact/get": (200, b"the-bytes")})
     out = tmp_path / "out.bin"
     assert (
-        _cli(monkeypatch, ["artifact", "get", "a", "-o", str(out)], http) == 0
+        job_cli(["artifact", "get", "a", "-o", str(out)], http) == 0
     )
     assert out.read_bytes() == b"the-bytes"
 
 
-def test_artifact_list(monkeypatch, capsys):
+def test_artifact_list(job_cli, capsys):
     http = _FakeHTTP(
         {"/v1/artifact/list": (200, {"artifacts": [{"name": "x"}]})}
     )
-    assert _cli(monkeypatch, ["artifact", "list"], http) == 0
+    assert job_cli(["artifact", "list"], http) == 0
     assert capsys.readouterr().out == "x\n"
 
 
-def test_artifact_get_plaintext_error_body_clean_error(monkeypatch, capsys):
+def test_artifact_get_plaintext_error_body_clean_error(job_cli, capsys):
     # a daemon that restarted mid-run no longer knows the run token; its
     # bare 401 renders as PLAINTEXT "401: Unauthorized", not JSON. That must
     # surface as the endpoint's HTTP error (a clean _CliError), never a
     # JSONDecodeError traceback -- the binary artifact/xcom verbs used to
     # parse error bodies unguarded, unlike every _json-routed verb.
     http = _FakeHTTP({"/v1/artifact/get": (401, b"401: Unauthorized")})
-    assert _cli(monkeypatch, ["artifact", "get", "a"], http) == 1
+    assert job_cli(["artifact", "get", "a"], http) == 1
     assert "HTTP 401" in capsys.readouterr().err
 
 
 def test_artifact_put_plaintext_error_body_clean_error(
-    monkeypatch, capsys, tmp_path
+    job_cli, capsys, tmp_path
 ):
     src = tmp_path / "a.txt"
     src.write_bytes(b"payload")
     http = _FakeHTTP({"/v1/artifact/put": (401, b"401: Unauthorized")})
-    assert _cli(monkeypatch, ["artifact", "put", "a.txt", str(src)], http) == 1
+    assert job_cli(["artifact", "put", "a.txt", str(src)], http) == 1
     assert "HTTP 401" in capsys.readouterr().err
 
 
-def test_secret_get(monkeypatch, capsys):
+def test_secret_get(job_cli, capsys):
     http = _FakeHTTP({"/v1/secret/get": (200, {"value": "sekret"})})
-    assert _cli(monkeypatch, ["secret", "get", "TOKEN"], http) == 0
+    assert job_cli(["secret", "get", "TOKEN"], http) == 0
     assert capsys.readouterr().out == "sekret\n"
 
 
-def test_secret_get_missing_exit_4(monkeypatch):
+def test_secret_get_missing_exit_4(job_cli):
     http = _FakeHTTP({"/v1/secret/get": (404, {})})
-    assert _cli(monkeypatch, ["secret", "get", "NOPE"], http) == 4
+    assert job_cli(["secret", "get", "NOPE"], http) == 4
 
 
 # --------------------------------------------------------------------------
@@ -387,19 +381,13 @@ def test_secret_get_missing_exit_4(monkeypatch):
 # --------------------------------------------------------------------------
 
 
-def test_no_env_errors(monkeypatch, capsys):
+def test_no_env_errors(monkeypatch, cli_runner, capsys):
+    # the bare conftest cli_runner, not job_cli: the point is the
+    # CRONSTABLE_STATE_* environment being absent.
     monkeypatch.delenv("CRONSTABLE_STATE_URL", raising=False)
     monkeypatch.delenv("CRONSTABLE_STATE_TOKEN", raising=False)
-    loop = asyncio.new_event_loop()
-    try:
-        monkeypatch.setattr(sys, "argv", ["cronstable", "state", "get", "k"])
-        monkeypatch.setattr(sys, "exit", _exit)
-        with pytest.raises(ExitError) as ei:
-            cronstable.__main__.main_loop(loop)
-        assert ei.value.args[0] == 1
-        assert "not running inside a cronstable job" in capsys.readouterr().err
-    finally:
-        loop.close()
+    assert cli_runner(["state", "get", "k"]) == 1
+    assert "not running inside a cronstable job" in capsys.readouterr().err
 
 
 def test_typed_value_parsing():
@@ -429,26 +417,26 @@ def test_http_opener_carries_no_proxies():
 # --------------------------------------------------------------------------
 
 
-def test_state_set_bad_json_clean_error(monkeypatch, capsys):
+def test_state_set_bad_json_clean_error(job_cli, capsys):
     http = _FakeHTTP()
-    code = _cli(monkeypatch, ["state", "set", "k", "not json", "--json"], http)
+    code = job_cli(["state", "set", "k", "not json", "--json"], http)
     assert code == 1
     assert "not valid JSON" in capsys.readouterr().err
     assert http.calls == []  # failed before any request
 
 
-def test_lock_run_no_command_exit_1(monkeypatch, capsys):
+def test_lock_run_no_command_exit_1(job_cli, capsys):
     http = _FakeHTTP(
         {"/v1/lock/acquire": (200, {"acquired": True, "token": "h"})}
     )
     # `lock run L --` with nothing after -- leaves an empty command.
-    assert _cli(monkeypatch, ["lock", "run", "L", "--"], http) == 1
+    assert job_cli(["lock", "run", "L", "--"], http) == 1
     assert "needs a command" in capsys.readouterr().err
     # rejected before taking the lock.
     assert not any(c["path"] == "/v1/lock/acquire" for c in http.calls)
 
 
-def test_lock_run_bad_command_clean_error(monkeypatch, capsys):
+def test_lock_run_bad_command_clean_error(job_cli, capsys):
     http = _FakeHTTP(
         {
             "/v1/lock/acquire": (200, {"acquired": True, "token": "h"}),
@@ -456,21 +444,21 @@ def test_lock_run_bad_command_clean_error(monkeypatch, capsys):
         }
     )
     argv = ["lock", "run", "L", "--", "/no/such/command-xyz"]
-    assert _cli(monkeypatch, argv, http) == 1
+    assert job_cli(argv, http) == 1
     assert "cannot run" in capsys.readouterr().err
     # the lock is still released despite the failure.
     assert any(c["path"] == "/v1/lock/release" for c in http.calls)
 
 
-def test_artifact_put_bad_file_clean_error(monkeypatch, capsys, tmp_path):
+def test_artifact_put_bad_file_clean_error(job_cli, capsys, tmp_path):
     http = _FakeHTTP()
     missing = str(tmp_path / "does-not-exist.bin")
-    assert _cli(monkeypatch, ["artifact", "put", "n", missing], http) == 1
+    assert job_cli(["artifact", "put", "n", missing], http) == 1
     assert "cannot read" in capsys.readouterr().err
     assert http.calls == []  # failed before any request
 
 
-def test_response_timeout_clean_error(monkeypatch, capsys):
+def test_response_timeout_clean_error(monkeypatch, job_cli, capsys):
     # a daemon that ACCEPTS the connection but never answers (state store
     # wedged on a dead mount -- the exact case the request deadline was
     # added for) must fail like every other transport error: exit 1 with
@@ -488,8 +476,7 @@ def test_response_timeout_clean_error(monkeypatch, capsys):
     port = srv.getsockname()[1]
     monkeypatch.setattr(jobcli, "_DEFAULT_TIMEOUT", 0.25)
     try:
-        code = _cli(
-            monkeypatch,
+        code = job_cli(
             ["state", "get", "k"],
             url="http://127.0.0.1:{}".format(port),
         )
@@ -708,15 +695,15 @@ def test_parse_body_wraps_non_object_json():
 # ---------------------------------------------------------------------------
 
 
-def test_cursor_get_prints_value(monkeypatch, capsys):
+def test_cursor_get_prints_value(job_cli, capsys):
     http = _FakeHTTP({"/v1/cursor/get": (200, {"value": 42})})
-    assert _cli(monkeypatch, ["cursor", "get", "c"], http) == 0
+    assert job_cli(["cursor", "get", "c"], http) == 0
     assert capsys.readouterr().out.strip() == "42"
 
 
-def test_secret_list_prints_names(monkeypatch, capsys):
+def test_secret_list_prints_names(job_cli, capsys):
     http = _FakeHTTP({"/v1/secret/list": (200, {"names": ["db", "api"]})})
-    assert _cli(monkeypatch, ["secret", "list"], http) == 0
+    assert job_cli(["secret", "list"], http) == 0
     assert capsys.readouterr().out.splitlines() == ["db", "api"]
 
 
@@ -725,66 +712,64 @@ def test_secret_list_prints_names(monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_artifact_put_reads_stdin(monkeypatch):
+def test_artifact_put_reads_stdin(monkeypatch, job_cli):
     http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
 
     class _Stdin:
         buffer = io.BytesIO(b"payload-bytes")
 
     monkeypatch.setattr(jobcli.sys, "stdin", _Stdin())
-    assert _cli(monkeypatch, ["artifact", "put", "report"], http) == 0
+    assert job_cli(["artifact", "put", "report"], http) == 0
     assert http.calls[0]["data"] == b"payload-bytes"
 
 
-def test_artifact_put_reads_file(monkeypatch, tmp_path):
+def test_artifact_put_reads_file(job_cli, tmp_path):
     http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
     src = tmp_path / "blob.bin"
     src.write_bytes(b"\x01\x02")
-    code = _cli(
-        monkeypatch, ["artifact", "put", "report", str(src)], http
+    code = job_cli(
+        ["artifact", "put", "report", str(src)], http
     )
     assert code == 0
     assert http.calls[0]["data"] == b"\x01\x02"
 
 
-def test_artifact_put_unreadable_file(monkeypatch, tmp_path):
+def test_artifact_put_unreadable_file(job_cli, tmp_path):
     http = _FakeHTTP()
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["artifact", "put", "report", str(tmp_path / "ghost")],
         http,
     )
     assert code == 1
 
 
-def test_artifact_get_not_found(monkeypatch, capsys):
+def test_artifact_get_not_found(job_cli, capsys):
     http = _FakeHTTP({"/v1/artifact/get": (404, b"")})
-    code = _cli(monkeypatch, ["artifact", "get", "report"], http)
+    code = job_cli(["artifact", "get", "report"], http)
     assert code == 4
     assert "artifact not found" in capsys.readouterr().err
 
 
-def test_artifact_get_writes_stdout(monkeypatch, capsysbinary):
+def test_artifact_get_writes_stdout(job_cli, capsysbinary):
     http = _FakeHTTP({"/v1/artifact/get": (200, b"blob-bytes")})
-    assert _cli(monkeypatch, ["artifact", "get", "report"], http) == 0
+    assert job_cli(["artifact", "get", "report"], http) == 0
     assert b"blob-bytes" in capsysbinary.readouterr().out
 
 
-def test_artifact_get_writes_file(monkeypatch, tmp_path):
+def test_artifact_get_writes_file(job_cli, tmp_path):
     http = _FakeHTTP({"/v1/artifact/get": (200, b"blob-bytes")})
     out = tmp_path / "out.bin"
-    code = _cli(
-        monkeypatch, ["artifact", "get", "report", "-o", str(out)], http
+    code = job_cli(
+        ["artifact", "get", "report", "-o", str(out)], http
     )
     assert code == 0
     assert out.read_bytes() == b"blob-bytes"
 
 
-def test_artifact_get_unwritable_output(monkeypatch, tmp_path):
+def test_artifact_get_unwritable_output(job_cli, tmp_path):
     http = _FakeHTTP({"/v1/artifact/get": (200, b"blob")})
     # the output path is a directory: open(..., "wb") fails with OSError
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["artifact", "get", "report", "-o", str(tmp_path)],
         http,
     )
@@ -802,25 +787,24 @@ def _xcom_env(monkeypatch, taskkey="a"):
         monkeypatch.setenv(jobcli.ENV_DAG_TASKKEY, taskkey)
 
 
-def test_xcom_push_requires_taskkey(monkeypatch):
+def test_xcom_push_requires_taskkey(monkeypatch, job_cli):
     _xcom_env(monkeypatch, taskkey=None)
     monkeypatch.delenv(jobcli.ENV_DAG_TASKKEY, raising=False)
-    code = _cli(monkeypatch, ["xcom", "push", "--key", "k"], _FakeHTTP())
+    code = job_cli(["xcom", "push", "--key", "k"], _FakeHTTP())
     assert code == 1
 
 
-def test_xcom_pull_server_error_is_cli_error(monkeypatch):
+def test_xcom_pull_server_error_is_cli_error(monkeypatch, job_cli):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/get": (500, {"error": "boom"})})
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["xcom", "pull", "--task", "b", "--key", "k"],
         http,
     )
     assert code == 1
 
 
-def test_xcom_list_prints_names(monkeypatch, capsys):
+def test_xcom_list_prints_names(monkeypatch, job_cli, capsys):
     _xcom_env(monkeypatch)
     http = _FakeHTTP(
         {
@@ -830,16 +814,16 @@ def test_xcom_list_prints_names(monkeypatch, capsys):
             )
         }
     )
-    assert _cli(monkeypatch, ["xcom", "list"], http) == 0
+    assert job_cli(["xcom", "list"], http) == 0
     assert capsys.readouterr().out.splitlines() == ["a/k", "b/j"]
 
 
-def test_xcom_outside_dag_task(monkeypatch):
+def test_xcom_outside_dag_task(monkeypatch, job_cli):
     monkeypatch.delenv(jobcli.ENV_DAG_XCOM_SCOPE, raising=False)
-    assert _cli(monkeypatch, ["xcom", "list"], _FakeHTTP()) == 1
+    assert job_cli(["xcom", "list"], _FakeHTTP()) == 1
 
 
-def test_xcom_push_from_stdin(monkeypatch):
+def test_xcom_push_from_stdin(monkeypatch, job_cli):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
 
@@ -847,39 +831,37 @@ def test_xcom_push_from_stdin(monkeypatch):
         buffer = io.BytesIO(b"result-bytes")
 
     monkeypatch.setattr(jobcli.sys, "stdin", _Stdin())
-    assert _cli(monkeypatch, ["xcom", "push", "--key", "k"], http) == 0
+    assert job_cli(["xcom", "push", "--key", "k"], http) == 0
     call = http.calls[0]
     assert call["data"] == b"result-bytes"
     assert call["query"]["name"] == "a/k"
 
 
-def test_xcom_push_from_file(monkeypatch, tmp_path):
+def test_xcom_push_from_file(monkeypatch, job_cli, tmp_path):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/put": (200, {"ok": True})})
     src = tmp_path / "out.json"
     src.write_bytes(b'{"rows": 3}')
-    code = _cli(
-        monkeypatch, ["xcom", "push", "--key", "k", str(src)], http
+    code = job_cli(
+        ["xcom", "push", "--key", "k", str(src)], http
     )
     assert code == 0
     assert http.calls[0]["data"] == b'{"rows": 3}'
 
 
-def test_xcom_push_unreadable_file(monkeypatch, tmp_path):
+def test_xcom_push_unreadable_file(monkeypatch, job_cli, tmp_path):
     _xcom_env(monkeypatch)
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["xcom", "push", "--key", "k", str(tmp_path / "ghost")],
         _FakeHTTP(),
     )
     assert code == 1
 
 
-def test_xcom_pull_not_found(monkeypatch, capsys):
+def test_xcom_pull_not_found(monkeypatch, job_cli, capsys):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/get": (404, b"")})
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["xcom", "pull", "--task", "b", "--key", "k"],
         http,
     )
@@ -887,11 +869,10 @@ def test_xcom_pull_not_found(monkeypatch, capsys):
     assert "no xcom" in capsys.readouterr().err
 
 
-def test_xcom_pull_to_stdout_and_map_index(monkeypatch, capsysbinary):
+def test_xcom_pull_to_stdout_and_map_index(monkeypatch, job_cli, capsysbinary):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["xcom", "pull", "--task", "b", "--key", "k", "--map-index", "2"],
         http,
     )
@@ -900,12 +881,11 @@ def test_xcom_pull_to_stdout_and_map_index(monkeypatch, capsysbinary):
     assert http.calls[0]["query"]["name"] == "b#2/k"
 
 
-def test_xcom_pull_to_file(monkeypatch, tmp_path):
+def test_xcom_pull_to_file(monkeypatch, job_cli, tmp_path):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
     out = tmp_path / "in.bin"
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["xcom", "pull", "--task", "b", "--key", "k", "-o", str(out)],
         http,
     )
@@ -913,11 +893,10 @@ def test_xcom_pull_to_file(monkeypatch, tmp_path):
     assert out.read_bytes() == b"payload"
 
 
-def test_xcom_pull_unwritable_output(monkeypatch, tmp_path):
+def test_xcom_pull_unwritable_output(monkeypatch, job_cli, tmp_path):
     _xcom_env(monkeypatch)
     http = _FakeHTTP({"/v1/artifact/get": (200, b"payload")})
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["xcom", "pull", "--task", "b", "--key", "k", "-o", str(tmp_path)],
         http,
     )
@@ -934,15 +913,14 @@ _LOCK_OK = {
 }
 
 
-def test_lock_run_requires_a_command(monkeypatch):
-    code = _cli(monkeypatch, ["lock", "run", "l"], _FakeHTTP(_LOCK_OK))
+def test_lock_run_requires_a_command(job_cli):
+    code = job_cli(["lock", "run", "l"], _FakeHTTP(_LOCK_OK))
     assert code == 1
 
 
-def test_lock_run_unrunnable_command_releases(monkeypatch):
+def test_lock_run_unrunnable_command_releases(job_cli):
     http = _FakeHTTP(_LOCK_OK)
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["lock", "run", "l", "--", "definitely-not-a-command-xyz"],
         http,
     )
@@ -954,14 +932,14 @@ def test_lock_run_unrunnable_command_releases(monkeypatch):
     ]
 
 
-def test_lock_release_verb(monkeypatch):
+def test_lock_release_verb(job_cli):
     http = _FakeHTTP(_LOCK_OK)
-    assert _cli(monkeypatch, ["lock", "release", "T"], http) == 0
+    assert job_cli(["lock", "release", "T"], http) == 0
     assert http.calls[0]["path"] == "/v1/lock/release"
     assert http.calls[0]["json"] == {"token": "T"}
 
 
-def test_lock_run_swallows_release_failure(monkeypatch):
+def test_lock_run_swallows_release_failure(job_cli):
     import sys as real_sys
 
     http = _FakeHTTP(
@@ -970,8 +948,7 @@ def test_lock_run_swallows_release_failure(monkeypatch):
             "/v1/lock/release": (500, {"error": "gone"}),
         }
     )
-    code = _cli(
-        monkeypatch,
+    code = job_cli(
         ["lock", "run", "l", "--", real_sys.executable, "-c", "pass"],
         http,
     )

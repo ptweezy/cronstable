@@ -19,8 +19,9 @@
 #
 # This file is mounted IDENTICALLY into all three nodes (that is what lets their
 # job-set ids match so a quorum/leader can form). The per-node bits (nodeName,
-# peers, TLS identity) live in node-a.yaml / node-b.yaml / node-c.yaml, which do
-# NOT change the job-set id. Node identity in the output comes from $HOSTNAME.
+# peers, TLS identity) are generated at start from environment variables by the
+# shared example/_shared/node-entrypoint.sh; they do NOT change the job-set id.
+# Node identity in the output comes from $HOSTNAME.
 #
 # See example/pulse-cluster/README.md for the full walkthrough.
 

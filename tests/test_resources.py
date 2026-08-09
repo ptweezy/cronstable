@@ -367,24 +367,26 @@ def test_cgroup_reader_needs_v2_marker(tmp_path):
     assert reader.cpu_usage_seconds() is None
 
 
-def test_cgroup_reader_inert_when_own_dir_missing(tmp_path):
-    # a host-side path that is not mounted here (container without cgroupns).
-    root, d, proc = _fake_cgroup(
-        tmp_path, proc_line="0::/system.slice/docker-beef.scope\n"
-    )
-    assert not _reader(root, proc).available
-
-
-def test_cgroup_reader_inert_without_v2_entry(tmp_path):
-    # a pure v1 /proc/self/cgroup has controller names, no "0::" line.
-    root, d, proc = _fake_cgroup(
-        tmp_path, proc_line="12:memory:/foo\n3:cpu,cpuacct:/foo\n"
-    )
-    assert not _reader(root, proc).available
-
-
-def test_cgroup_reader_rejects_escaping_path(tmp_path):
-    root, d, proc = _fake_cgroup(tmp_path, proc_line="0::/../../etc\n")
+@pytest.mark.parametrize(
+    "proc_line",
+    [
+        # a host-side path that is not mounted here (container without
+        # cgroupns).
+        pytest.param(
+            "0::/system.slice/docker-beef.scope\n", id="own-dir-missing"
+        ),
+        # a pure v1 /proc/self/cgroup has controller names, no "0::" line.
+        pytest.param(
+            "12:memory:/foo\n3:cpu,cpuacct:/foo\n", id="without-v2-entry"
+        ),
+        # a v2 entry whose path would escape the mount root is rejected.
+        pytest.param("0::/../../etc\n", id="rejects-escaping-path"),
+    ],
+)
+def test_cgroup_reader_inert_proc_line(tmp_path, proc_line):
+    # the (proc_line, expect) family (finding B17): every /proc/self/cgroup
+    # shape that cannot resolve to a usable slice leaves the reader inert.
+    root, d, proc = _fake_cgroup(tmp_path, proc_line=proc_line)
     assert not _reader(root, proc).available
 
 
@@ -400,25 +402,86 @@ def test_cgroup_reader_namespaced_root(tmp_path):
     assert reader.memory_used() == 200 * MIB  # no memory.stat -> raw figure
 
 
-def test_cgroup_memory_limit_is_lowest_on_path(tmp_path):
-    # limits are hierarchical: an unlimited leaf under a limited parent is
-    # still limited, and the lowest limit on the path wins.
-    root, d, proc = _fake_cgroup(tmp_path, rel="parent/leaf")
-    (d / "memory.max").write_text("max\n")
-    (root / "parent" / "memory.max").write_text(f"{512 * MIB}\n")
-    (root / "memory.max").write_text(f"{1024 * MIB}\n")
-    assert _reader(root, proc).memory_limit() == 512 * MIB
-
-
-def test_cgroup_memory_unlimited_and_malformed(tmp_path):
-    root, d, proc = _fake_cgroup(tmp_path)
-    (d / "memory.max").write_text("max\n")
-    reader = _reader(root, proc)
-    assert reader.memory_limit() is None
-    (d / "memory.max").write_text("banana\n")
-    assert reader.memory_limit() is None
-    (d / "memory.current").write_text("banana\n")
-    assert reader.memory_used() is None
+@pytest.mark.parametrize(
+    "rel, files, method, expected",
+    [
+        # limits are hierarchical: an unlimited leaf under a limited parent
+        # is still limited, and the lowest limit on the path wins.
+        (
+            "parent/leaf",
+            {
+                "parent/leaf/memory.max": "max\n",
+                "parent/memory.max": f"{512 * MIB}\n",
+                "memory.max": f"{1024 * MIB}\n",
+            },
+            "memory_limit",
+            512 * MIB,
+        ),
+        # "max" is unlimited; a malformed figure also reads as no limit.
+        ("box", {"box/memory.max": "max\n"}, "memory_limit", None),
+        ("box", {"box/memory.max": "banana\n"}, "memory_limit", None),
+        ("box", {"box/memory.current": "banana\n"}, "memory_used", None),
+        (
+            "box",
+            {"box/cpu.max": "150000 100000\n"},
+            "cpu_limit",
+            pytest.approx(1.5),
+        ),
+        ("box", {"box/cpu.max": "max 100000\n"}, "cpu_limit", None),
+        # malformed: never a zero quota
+        ("box", {"box/cpu.max": "0 0\n"}, "cpu_limit", None),
+        (
+            "parent/leaf",
+            {
+                "parent/leaf/cpu.max": "max 100000\n",
+                "parent/cpu.max": "200000 100000\n",
+            },
+            "cpu_limit",
+            pytest.approx(2.0),
+        ),
+        # a non-integer quota field raises ValueError inside the parse and
+        # that ancestor is skipped rather than crashing the reader.
+        ("box", {"box/cpu.max": "banana 100000\n"}, "cpu_limit", None),
+        # the leaf carries the lower quota; a higher ancestor quota must not
+        # replace it (the "not lower" side of the min comparison).
+        (
+            "parent/leaf",
+            {
+                "parent/leaf/cpu.max": "100000 100000\n",  # 1.0 CPU
+                "parent/cpu.max": "200000 100000\n",  # 2.0 CPU
+            },
+            "cpu_limit",
+            pytest.approx(1.0),
+        ),
+    ],
+    ids=[
+        "memory-limit-lowest-on-path",
+        "memory-limit-unlimited",
+        "memory-limit-malformed",
+        "memory-used-malformed",
+        "cpu-limit-parses-quota",
+        "cpu-limit-unlimited",
+        "cpu-limit-zero-quota",
+        "cpu-limit-lowest-on-path",
+        "cpu-limit-malformed-quota-skipped",
+        "cpu-limit-keeps-lowest-under-higher-ancestor",
+    ],
+)
+def test_cgroup_limit_files(tmp_path, rel, files, method, expected):
+    # the (limit_files, expect) family (finding B17): each row is one fake
+    # tree's limit files (paths relative to the mount root) and the reader
+    # value they must produce.
+    root, d, proc = _fake_cgroup(tmp_path, rel=rel)
+    for name, content in files.items():
+        path = root
+        for part in name.split("/"):
+            path = path / part
+        path.write_text(content)
+    got = getattr(_reader(root, proc), method)()
+    if expected is None:
+        assert got is None
+    else:
+        assert got == expected
 
 
 def test_cgroup_memory_used_subtracts_inactive_file(tmp_path):
@@ -433,24 +496,6 @@ def test_cgroup_memory_used_subtracts_inactive_file(tmp_path):
     assert reader.memory_used() == 150 * MIB
     (d / "memory.stat").write_text(f"inactive_file {900 * MIB}\n")
     assert reader.memory_used() == 0
-
-
-def test_cgroup_cpu_limit_parsing(tmp_path):
-    root, d, proc = _fake_cgroup(tmp_path)
-    (d / "cpu.max").write_text("150000 100000\n")
-    reader = _reader(root, proc)
-    assert reader.cpu_limit() == pytest.approx(1.5)
-    (d / "cpu.max").write_text("max 100000\n")
-    assert reader.cpu_limit() is None
-    (d / "cpu.max").write_text("0 0\n")  # malformed: never a zero quota
-    assert reader.cpu_limit() is None
-
-
-def test_cgroup_cpu_limit_is_lowest_on_path(tmp_path):
-    root, d, proc = _fake_cgroup(tmp_path, rel="parent/leaf")
-    (d / "cpu.max").write_text("max 100000\n")
-    (root / "parent" / "cpu.max").write_text("200000 100000\n")
-    assert _reader(root, proc).cpu_limit() == pytest.approx(2.0)
 
 
 def test_cgroup_cpu_usage_seconds(tmp_path):
@@ -1189,23 +1234,6 @@ def test_cgroup_memory_used_none_when_current_missing(tmp_path):
     # no memory.current file at all -> the first-line read is None -> used None.
     root, d, proc = _fake_cgroup(tmp_path)
     assert _reader(root, proc).memory_used() is None
-
-
-def test_cgroup_cpu_limit_malformed_quota_is_skipped(tmp_path):
-    # a non-integer quota field raises ValueError inside the parse and that
-    # ancestor is skipped rather than crashing the reader.
-    root, d, proc = _fake_cgroup(tmp_path)
-    (d / "cpu.max").write_text("banana 100000\n")
-    assert _reader(root, proc).cpu_limit() is None
-
-
-def test_cgroup_cpu_limit_keeps_lowest_when_ancestor_is_higher(tmp_path):
-    # the leaf carries the lower quota; a higher ancestor quota must not
-    # replace it (the "not lower" side of the min comparison).
-    root, d, proc = _fake_cgroup(tmp_path, rel="parent/leaf")
-    (d / "cpu.max").write_text("100000 100000\n")  # 1.0 CPU
-    (root / "parent" / "cpu.max").write_text("200000 100000\n")  # 2.0 CPU
-    assert _reader(root, proc).cpu_limit() == pytest.approx(1.0)
 
 
 # ---- _SharedSampleTicker register / run scheduling branches ----------------

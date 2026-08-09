@@ -30,18 +30,11 @@ import logging
 import math
 import re
 import time
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
     Optional,
-    Sequence,
-    Tuple,
-    Union,
 )
 
 import cronstable.version
@@ -140,7 +133,7 @@ _EXACT_INT_MIN = -9007199254740992.0  # -2**53
 _EXACT_INT_MAX = 9007199254740992.0  # 2**53
 
 
-def format_value(value: Union[int, float]) -> str:
+def format_value(value: int | float) -> str:
     # Almost every sample is a small integral float (MetricFamily.add coerces
     # with float()), so lead with the bounds test that case needs anyway:
     # one comparison pair and ONE int() replace isinf + isnan + an int() for
@@ -183,12 +176,12 @@ class MetricFamily:
         self.mtype = mtype  # "counter" | "gauge" | "histogram" | "info"
         self.help_text = help_text
         # (suffix, labels, value)
-        self.samples: List[Tuple[str, Dict[str, str], float]] = []
+        self.samples: list[tuple[str, dict[str, str], float]] = []
 
     def add(
         self,
-        labels: Dict[str, str],
-        value: Union[int, float],
+        labels: dict[str, str],
+        value: int | float,
         suffix: str = "",
     ) -> None:
         self.samples.append((suffix, labels, float(value)))
@@ -228,12 +221,12 @@ def _sample_base(family: MetricFamily) -> str:
 #: its values, and prune() clears the memo whenever the job set can shrink.
 LABEL_BLOCK_CACHE_MAX = 32768
 
-_LabelBlockCache = Dict[Tuple[Tuple[str, str], ...], str]
+_LabelBlockCache = dict[tuple[tuple[str, str], ...], str]
 
 
 def _make_label_block_builder(
     cache: Optional[_LabelBlockCache] = None,
-) -> Callable[[Dict[str, str]], str]:
+) -> Callable[[dict[str, str]], str]:
     """A builder for the ``{k="v",...}`` block that memoizes whole blocks.
 
     Escaping alone was memoized before, but the *assembly* (a generator
@@ -259,7 +252,7 @@ def _make_label_block_builder(
     """
     memo: _LabelBlockCache = {} if cache is None else cache
 
-    def block_for(labels: Dict[str, str]) -> str:
+    def block_for(labels: dict[str, str]) -> str:
         key = tuple(labels.items())
         block = memo.get(key)
         if block is None:
@@ -298,9 +291,9 @@ def _make_label_block_builder(
 def _sample_fields(
     sample_base: str,
     suffix: str,
-    labels: Dict[str, str],
-    block_for: Callable[[Dict[str, str]], str],
-) -> Tuple[str, str]:
+    labels: dict[str, str],
+    block_for: Callable[[dict[str, str]], str],
+) -> tuple[str, str]:
     """One sample's ``(name, label_block)`` where ``label_block`` is the
     brace-wrapped ``{k="v",...}`` string, or ``""`` when unlabelled."""
     name = sample_base + suffix
@@ -312,7 +305,7 @@ def _sample_fields(
 def iter_family_samples(
     families: Iterable[MetricFamily],
     label_cache: Optional[_LabelBlockCache] = None,
-) -> Iterator[Tuple[str, str, str]]:
+) -> Iterator[tuple[str, str, str]]:
     """Yield ``(sample_name, label_block, value)`` for every sample.
 
     ``label_block`` is ``{...}`` (braces included) or ``""``; ``value`` is
@@ -355,7 +348,7 @@ def render_families(
     :func:`_make_label_block_builder`); without one the memo is per render
     and every block is re-escaped and re-assembled from cold.
     """
-    out: List[str] = []
+    out: list[str] = []
     block_for = _make_label_block_builder(label_cache)
     for family in families:
         if not family.samples:
@@ -388,8 +381,8 @@ def render_families(
 
 
 def resolve_metrics_config(
-    web_config: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+    web_config: dict[str, Any],
+) -> Optional[dict[str, Any]]:
     """Resolve the raw ``web.metrics`` option into effective settings.
 
     Returns ``None`` when the endpoint is disabled, else a dict with
@@ -437,7 +430,7 @@ class _JobMetrics:
     )
 
     def __init__(self, n_buckets: int) -> None:
-        self.runs: Dict[str, int] = {}
+        self.runs: dict[str, int] = {}
         self.retries = 0
         self.permanent_failures = 0
         self.start_failures = 0
@@ -462,11 +455,11 @@ class _JobMetrics:
         # SLA latch state and breach counts, keyed by check name. sla_late
         # holds the current 0/1 latch per check; sla_breaches counts
         # ok-to-breached transitions and rides the counter snapshot.
-        self.sla_late: Dict[str, int] = {}
-        self.sla_breaches: Dict[str, int] = {}
+        self.sla_late: dict[str, int] = {}
+        self.sla_breaches: dict[str, int] = {}
 
 
-def _seed_counter_map(target: Dict[str, int], raw: Any) -> None:
+def _seed_counter_map(target: dict[str, int], raw: Any) -> None:
     """ADD a persisted ``{key: count}`` mapping into a live counter dict.
 
     Shared by the outcome counters and the SLA breach counters, whose
@@ -496,13 +489,13 @@ class PrometheusMetrics:
     """
 
     def __init__(self) -> None:
-        self._jobs: Dict[str, _JobMetrics] = {}
-        self._buckets: Tuple[float, ...] = DEFAULT_DURATION_BUCKETS
+        self._jobs: dict[str, _JobMetrics] = {}
+        self._buckets: tuple[float, ...] = DEFAULT_DURATION_BUCKETS
         # The histogram "le" label strings are a pure function of the (fixed
         # between config changes) bucket bounds, so render them once here (and
         # in set_duration_buckets) rather than repr()-ing every bound for every
         # job on every scrape.
-        self._bucket_bound_strs: Tuple[str, ...] = tuple(
+        self._bucket_bound_strs: tuple[str, ...] = tuple(
             _bucket_bound(b) for b in self._buckets
         )
         self._start_time = time.time()
@@ -512,7 +505,7 @@ class PrometheusMetrics:
         self._quorum_transitions = 0
         # durable-state writes that failed and were dropped, by kind
         # (run-record, checkpoint, retry, reboot-marker, counters, manifest)
-        self._state_dropped: Dict[str, int] = {}
+        self._state_dropped: dict[str, int] = {}
         # Whole {k="v",...} label blocks, kept ACROSS scrapes: the label
         # universe is a pure function of the job set and a fixed set of
         # static labels, so a scrape that rebuilds it from cold re-escapes
@@ -530,7 +523,7 @@ class PrometheusMetrics:
         # slot: adopted when the bounds it applies equal the parked ones,
         # dropped otherwise (the snapshot is then genuinely stale).
         self._pending_histogram_seed: Optional[
-            Tuple[Tuple[float, ...], Dict[str, Dict[str, Any]]]
+            tuple[tuple[float, ...], dict[str, dict[str, Any]]]
         ] = None
 
     # -- configuration ----------------------------------------------------
@@ -661,7 +654,7 @@ class PrometheusMetrics:
     # -- durable counter snapshots (cronstable.cron state backend)
     # -------------
 
-    def counters_snapshot(self) -> Dict[str, Any]:
+    def counters_snapshot(self) -> dict[str, Any]:
         """A JSON-safe snapshot of the per-job counter accumulators.
 
         Persisted by the scheduler to the durable state store so counters
@@ -670,7 +663,7 @@ class PrometheusMetrics:
         can tell whether the histogram state still lines up with the
         configured buckets.
         """
-        jobs: Dict[str, Any] = {}
+        jobs: dict[str, Any] = {}
         for name, job in self._jobs.items():
             jobs[name] = {
                 "runs": dict(job.runs),
@@ -691,7 +684,7 @@ class PrometheusMetrics:
         return {"buckets": list(self._buckets), "jobs": jobs}
 
     def seed_counters(
-        self, snapshot: Dict[str, Any], keep: Iterable[str]
+        self, snapshot: dict[str, Any], keep: Iterable[str]
     ) -> int:
         """ADD a persisted snapshot into the accumulators; return jobs seeded.
 
@@ -717,14 +710,14 @@ class PrometheusMetrics:
         if not isinstance(jobs, dict):
             return 0
         raw_buckets = snapshot.get("buckets")
-        snapshot_buckets: Optional[Tuple[float, ...]] = None
+        snapshot_buckets: Optional[tuple[float, ...]] = None
         if isinstance(raw_buckets, list):
             try:
                 snapshot_buckets = tuple(float(b) for b in raw_buckets)
             except (TypeError, ValueError):
                 snapshot_buckets = None
         buckets_match = snapshot_buckets == self._buckets
-        pending_jobs: Dict[str, Dict[str, Any]] = {}
+        pending_jobs: dict[str, dict[str, Any]] = {}
         keep_set = set(keep)
         seeded = 0
         for name, data in jobs.items():
@@ -800,7 +793,7 @@ class PrometheusMetrics:
             self._pending_histogram_seed = (snapshot_buckets, pending_jobs)
         return seeded
 
-    def _seed_histogram(self, job: _JobMetrics, data: Dict[str, Any]) -> None:
+    def _seed_histogram(self, job: _JobMetrics, data: dict[str, Any]) -> None:
         duration_sum = data.get("duration_sum")
         duration_count = data.get("duration_count")
         bucket_counts = data.get("bucket_counts")
@@ -827,9 +820,12 @@ class PrometheusMetrics:
     # -- rendering ---------------------------------------------------------
 
     def render(self, cron: "Cron", openmetrics: bool = False) -> str:
+        # One-call convenience with no daemon callers: the scrape path runs
+        # the two phases itself so phase two can go to an executor (see
+        # cron._build_metrics_product). Kept for the tests and benchmarks.
         return self.render_prepared(self.families(cron), openmetrics)
 
-    def families(self, cron: "Cron") -> List[MetricFamily]:
+    def families(self, cron: "Cron") -> list[MetricFamily]:
         """This scrape's metric families, read from live scheduler state.
 
         Phase one of the two-phase render.  It reads ``cron``'s mutable
@@ -838,10 +834,14 @@ class PrometheusMetrics:
         The list it returns is freshly built and referenced by nobody else,
         which is what makes phase two safe to hand to a worker thread.
         """
-        return self._families(cron)
+        families = self._daemon_families(cron)
+        families.extend(self._job_families(cron))
+        families.extend(self._state_families(cron))
+        families.extend(self._cluster_families(cron))
+        return families
 
     def render_prepared(
-        self, families: List[MetricFamily], openmetrics: bool = False
+        self, families: list[MetricFamily], openmetrics: bool = False
     ) -> str:
         """Render families produced by :meth:`families` into exposition text.
 
@@ -853,20 +853,13 @@ class PrometheusMetrics:
         """
         return render_families(families, openmetrics, self._label_blocks)
 
-    def iter_samples(self, cron: "Cron") -> Iterator[Tuple[str, str, str]]:
+    def iter_samples(self, cron: "Cron") -> Iterator[tuple[str, str, str]]:
         """This scrape's samples as ``(name, label_block, value)`` triples,
         built straight from the metric families -- no exposition render and
         no re-parse (see :func:`iter_family_samples`)."""
-        return iter_family_samples(self._families(cron), self._label_blocks)
+        return iter_family_samples(self.families(cron), self._label_blocks)
 
-    def _families(self, cron: "Cron") -> List[MetricFamily]:
-        families = self._daemon_families(cron)
-        families.extend(self._job_families(cron))
-        families.extend(self._state_families(cron))
-        families.extend(self._cluster_families(cron))
-        return families
-
-    def _state_families(self, cron: "Cron") -> List[MetricFamily]:
+    def _state_families(self, cron: "Cron") -> list[MetricFamily]:
         """Durable-state self-observability families.
 
         The dropped-write counter is an accumulator here (the scheduler
@@ -878,7 +871,7 @@ class PrometheusMetrics:
         lock/throttle counters appear only once nonzero -- a store that
         never leases or throttles should not export frozen zeros forever.
         """
-        families: List[MetricFamily] = []
+        families: list[MetricFamily] = []
         if self._state_dropped:
             dropped = MetricFamily(
                 "cronstable_state_dropped_writes",
@@ -1014,7 +1007,7 @@ class PrometheusMetrics:
             families.append(peak)
         return families
 
-    def _daemon_families(self, cron: "Cron") -> List[MetricFamily]:
+    def _daemon_families(self, cron: "Cron") -> list[MetricFamily]:
         families = []
         info = MetricFamily(
             "cronstable", "info", "cronstable build information."
@@ -1068,7 +1061,7 @@ class PrometheusMetrics:
             families.append(reload_time)
         return families
 
-    def _job_families(self, cron: "Cron") -> List[MetricFamily]:
+    def _job_families(self, cron: "Cron") -> list[MetricFamily]:
         # Local import: cron.py imports this module, so the cycle can only
         # be broken at call time (mirrors the deferred imports elsewhere).
         # get_now/datetime are only touched by the next-fire fallback below.
@@ -1340,7 +1333,7 @@ class PrometheusMetrics:
             last_run_max_rss,
         ]
 
-    def _cluster_families(self, cron: "Cron") -> List[MetricFamily]:
+    def _cluster_families(self, cron: "Cron") -> list[MetricFamily]:
         families = []
         manager = cron.cluster_manager
         enabled = MetricFamily(

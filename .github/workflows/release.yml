@@ -128,6 +128,7 @@ jobs:
       release: ${{ steps.d.outputs.release }}
       bump: ${{ steps.d.outputs.bump }}
       new: ${{ steps.ver.outputs.new }}
+      docker-matrix: ${{ steps.distros.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -241,6 +242,19 @@ jobs:
             exit 1
           fi
           echo "new=$new" >> "$GITHUB_OUTPUT"
+      # The ONE distro matrix (.github/docker-matrix.json): `docker` (the
+      # build-only gate) and `docker-push` both fromJSON this output, so the
+      # two lists can never drift apart (they were written twice and did).
+      # The gate ignores the per-row `suffix`; only the push tags use it.
+      - name: Emit the docker distro matrix
+        id: distros
+        run: |
+          set -euo pipefail
+          {
+            echo 'matrix<<JSON'
+            cat .github/docker-matrix.json
+            echo 'JSON'
+          } >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Gate: tests + all binaries + all Docker images. Runs on EVERY event, in
@@ -376,7 +390,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
           set -euo pipefail
-          .tox/py/bin/python -m pytest tests/test_web_engine_parity.py \
+          .tox/py/bin/python -m pytest \
+            tests/test_web_engine_parity.py \
+            tests/test_web_heat_e2e.py \
+            tests/test_web_drawer_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
           .tox/py/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
@@ -465,8 +482,8 @@ jobs:
 
   # Self-contained glibc PyInstaller binaries (amd64, arm64) on native runners
   # (no QEMU). The per-arch `--version` smoke test catches a bad bundle here.
-  # These target glibc (the Ubuntu runner's libc); `binaries-musl` covers
-  # Alpine/musl hosts.
+  # These target glibc (the Ubuntu runner's libc); `binaries-container` covers
+  # Alpine/musl hosts and the remaining glibc arches.
   binaries:
     needs: version
     strategy:
@@ -502,12 +519,12 @@ jobs:
           # Bundle uvloop (the `speedups` extra) so the binary runs the faster
           # event loop. Install a wheel where one exists, else build it from
           # sdist (ship uvloop as broadly as it compiles); a failed install
-          # falls back to asyncio. verify_uvloop.py then proves the result
-          # actually runs a loop (a source build can miscompile under emulation)
-          # and uninstalls it if not, so a broken uvloop is never frozen in and
-          # the binary cleanly uses asyncio.
-          uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-          uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
+          # falls back to asyncio. The shared script then has verify_extra.py
+          # prove the result actually runs a loop (a source build can
+          # miscompile under emulation) and uninstalls it if not, so a broken
+          # uvloop is never frozen in and the binary cleanly uses asyncio.
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
           # Bundle orjson (the `speedups` extra) to accelerate the durable-state
           # and cluster JSON paths; amd64/arm64 and macOS ship wheels (no Rust
           # needed). The shared script round-trip-verifies it and drops a broken
@@ -518,18 +535,18 @@ jobs:
           # so on this lane absence means a broken build, never a missing
           # wheel. Install and verify are HARD failures here: a soft-fail
           # would let a transient index blip silently ship the advertised
-          # push channel disabled. verify_pynacl.py round-trips a real
+          # push channel disabled. verify_extra.py round-trips a real
           # sealed box so a miscompiled libsodium also fails the job.
-          uv pip install "pynacl>=1.5"
-          uv run python pyinstaller/verify_pynacl.py
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
           # Bundle zeroconf (the `discovery` extra) for web.bonjour. Pure
           # Python with optional speedups, so the install works on every
           # arch and is a HARD failure too. It is LGPL-2.1: the notice
           # ships inside the binary (--third-party-licenses), the source
           # archive is attached to the Release, and the public build
           # recipe is the relink path. See LICENSING.md.
-          uv pip install "zeroconf>=0.132"
-          uv run python -c "import zeroconf, zeroconf.asyncio"
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too: a
@@ -546,47 +563,55 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Self-contained musl/Alpine binaries, one per arch. Runners are glibc, so the
-  # build runs inside an Alpine container via `docker run` (checkout + upload
-  # stay on the glibc host). amd64/arm64 build natively; i686 runs natively on
-  # the amd64 runner; armv7, armv6, ppc64le, s390x and riscv64 run under QEMU.
-  # armv6 is musl-only (Debian/glibc ships no arm32v6). Same pyinstaller pin and
-  # `--version` smoke test as the glibc job; the asset carries a `-musl` suffix.
-  binaries-musl:
+  # Self-contained container-built Linux binaries, one per arch x libc pair.
+  # PyInstaller is not a cross-compiler and the runners are glibc, so every
+  # row builds inside `docker run --platform` (checkout + upload stay on the
+  # host). musl rows build on python:3.14-alpine and ship with a `-musl`
+  # suffix for Alpine/musl hosts; glibc rows build on python:3.14-slim and
+  # cover the arches the native `binaries` job has no runner for. amd64,
+  # arm64 and i686 execute natively; armv7, armv6, ppc64le, s390x and
+  # riscv64 run under QEMU. armv6 is musl-only (Debian/glibc ships no
+  # arm32v6); glibc amd64/arm64 are the native job above. Same pyinstaller
+  # pin and `--version` smoke test as that job; the per-libc bits (base
+  # image, package-manager commands, artifact suffix) ride the matrix.
+  binaries-container:
     needs: version
     strategy:
       fail-fast: false
       matrix:
+        libc: [musl, glibc]
+        arch: [amd64, arm64, i686, armv7, armv6, ppc64le, s390x, riscv64]
+        exclude:
+          # glibc amd64/arm64 build natively in `binaries`; armv6 is musl-only
+          - { libc: glibc, arch: amd64 }
+          - { libc: glibc, arch: arm64 }
+          - { libc: glibc, arch: armv6 }
         include:
-          - arch: amd64
-            runner: ubuntu-24.04
-            platform: linux/amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            platform: linux/arm64
-          - arch: i686
-            runner: ubuntu-24.04
-            platform: linux/386
-          - arch: armv7
-            runner: ubuntu-24.04
-            platform: linux/arm/v7
-            qemu: true            # no native 32-bit ARM on the runners -> emulate
-          - arch: ppc64le
-            runner: ubuntu-24.04
-            platform: linux/ppc64le
-            qemu: true            # no native ppc64le on the runners -> emulate
-          - arch: s390x
-            runner: ubuntu-24.04
-            platform: linux/s390x
-            qemu: true            # no native s390x on the runners -> emulate
-          - arch: riscv64
-            runner: ubuntu-24.04
-            platform: linux/riscv64
-            qemu: true            # no native riscv64 on the runners -> emulate
-          - arch: armv6
-            runner: ubuntu-24.04
-            platform: linux/arm/v6
-            qemu: true            # no native armv6 on the runners -> emulate
+          # per-libc: base image, artifact suffix, and the package-manager
+          # commands the build script splices in (no quote characters in any
+          # of them; they are injected into a single-quoted sh -c script)
+          - libc: musl
+            image: python:3.14-alpine
+            suffix: -musl
+            toolchain: 'retry 5 apk add --no-cache build-base libffi-dev zlib-dev'
+            nacl_tools: 'retry 3 apk add --no-cache libffi-dev make >/dev/null 2>&1 || true'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apk add --no-cache curl && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          - libc: glibc
+            image: python:3.14-slim
+            suffix: ''
+            toolchain: 'retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev'
+            nacl_tools: 'retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true'
+            rust_setup: '. /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path'
+          # per-arch: docker platform, runner, and whether QEMU is needed
+          # (amd64/arm64/i686 execute natively on the runners)
+          - { arch: amd64, platform: linux/amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { arch: i686, platform: linux/386, runner: ubuntu-24.04 }
+          - { arch: armv7, platform: linux/arm/v7, runner: ubuntu-24.04, qemu: true }
+          - { arch: armv6, platform: linux/arm/v6, runner: ubuntu-24.04, qemu: true }
+          - { arch: ppc64le, platform: linux/ppc64le, runner: ubuntu-24.04, qemu: true }
+          - { arch: s390x, platform: linux/s390x, runner: ubuntu-24.04, qemu: true }
+          - { arch: riscv64, platform: linux/riscv64, runner: ubuntu-24.04, qemu: true }
     runs-on: ${{ matrix.runner }}
     steps:
       # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
@@ -602,22 +627,23 @@ jobs:
       # instead of on every push; install_orjson.sh's plain-pip first attempt
       # then finds the cached wheel and skips the rustup toolchain entirely.
       # Resolution still queries the index every run, so which VERSIONS
-      # install is unchanged, and every verify script still runs against the
+      # install is unchanged, and the verify probes still run against the
       # installed result; the cache only skips re-downloading and re-compiling
-      # artifacts pip validates by hash. Keyed per arch AND libc (glibc gets
-      # its own prefix in the job below): a wheel source-built on glibc and
-      # one built on musl both carry the plain linux_<arch> tag, so a shared
-      # cache could hand one lane the other's ABI-incompatible build. The
-      # key's hashFiles covers pyproject.toml and this workflow, where the dep
-      # floors and the pyinstaller pin live; restore-keys seeds the rebuild
-      # from the previous cache when either file changes.
+      # artifacts pip validates by hash. Keyed per arch AND libc: a wheel
+      # source-built on glibc and one built on musl both carry the plain
+      # linux_<arch> tag, so a shared cache could hand one row the other's
+      # ABI-incompatible build. The key's hashFiles covers pyproject.toml and
+      # this workflow, where the dep floors and the pyinstaller pin live;
+      # restore-keys seeds the rebuild from the previous cache when either
+      # file changes.
       - name: Restore pip cache (QEMU-built wheels)
-        uses: actions/cache@v6.1.0
+        id: pip-cache
+        uses: actions/cache/restore@v6.1.0
         with:
           path: .pip-cache
-          key: pip-musl-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
+          key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
           restore-keys: |
-            pip-musl-${{ matrix.arch }}-
+            pip-${{ matrix.libc }}-${{ matrix.arch }}-
       # Register binfmt/QEMU so `docker run --platform` can execute a foreign-arch
       # container. amd64/arm64/i686 run natively and skip this.
       - if: ${{ matrix.qemu }}
@@ -630,12 +656,12 @@ jobs:
       # pull_base adds registry failover on top of the retries: the
       # 2026-07-25 Hub outage outlived five attempts, so a same-digest
       # mirror (ECR Public, then mirror.gcr.io) now backstops the pull.
-      - name: Pull the Alpine build image
+      - name: Pull the build image
         run: |
           set -euo pipefail
           . .github/scripts/retry.sh
-          pull_base python:3.14-alpine ${{ matrix.platform }}
-      - name: Build binary (Alpine/musl)
+          pull_base ${{ matrix.image }} ${{ matrix.platform }}
+      - name: Build binary (${{ matrix.libc }} container)
         env:
           SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
         run: |
@@ -645,194 +671,99 @@ jobs:
             -e PIP_RETRIES -e PIP_TIMEOUT \
             -e PIP_CACHE_DIR=/src/.pip-cache \
             -v "$PWD:/src" -w /src \
-            python:3.14-alpine sh -euc '
+            ${{ matrix.image }} sh -euc '
               # The checkout is mounted at /src, so the runner-side retry helper
-              # is reachable in here too. apk has no retry flag of its own and a
-              # failed index fetch is a hard job failure, so it gets wrapped.
+              # is reachable in here too. Neither apk nor apt retries hard
+              # enough on its own, and a failed index fetch is a hard job
+              # failure, so the matrix-provided commands wrap themselves in it.
               . /src/.github/scripts/retry.sh
-              # build-base brings the C toolchain + strip (the spec sets
-              # strip=True); libffi/zlib headers cover any dep that lacks a
-              # musllinux wheel and falls back to compiling from sdist (notably
-              # the i686 aiohttp stack, which ships no musllinux_i686 wheels).
-              retry 5 apk add --no-cache build-base libffi-dev zlib-dev
-              pip install --upgrade pip
-              pip install pyinstaller==6.21.0   # pin matches the glibc job (supports 3.14)
-              pip install .                     # bakes the pinned version into cronstable/version.py
-              # Bundle uvloop (the `speedups` extra): a musllinux wheel where one
-              # exists (amd64/arm64), else a source build. verify_uvloop.py proves
-              # the result runs a loop (a source build can miscompile under QEMU)
-              # and uninstalls it otherwise, so a broken uvloop is never frozen
-              # in; the binary then cleanly falls back to asyncio.
-              pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-              python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
-              # Bundle orjson (the `speedups` extra): a musllinux wheel on amd64/
-              # arm64, else a Rust source build. RUST_SETUP installs a CURRENT
-              # Rust via rustup (distro rustc is older than the orjson MSRV) only
-              # when the wheel is missing; the shared script round-trip-verifies
-              # it and drops a broken QEMU build -> stdlib json fallback.
-              # install_orjson.sh runs RUST_SETUP via `sh -c`, a fresh shell, so
-              # it sources the helper itself. rustup is fetched to a file and
-              # then executed rather than piped straight into sh: curl retries
-              # cannot un-feed a truncated script to an interpreter that has
-              # already started running it.
-              RUST_SETUP=". /src/.github/scripts/retry.sh && retry 5 apk add --no-cache curl && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
-              # Bundle pynacl (the `push` extra): musllinux wheels on amd64/
-              # arm64, else a plain-C source build (bundled libsodium; the
-              # libffi-dev/make toolchain is best-effort here). A build that
-              # fails the sealed-box round-trip is uninstalled, so the binary
-              # never ships a miscompiled libsodium (push fails closed).
-              retry 3 apk add --no-cache libffi-dev make >/dev/null 2>&1 || true
-              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
-              python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
-              # Bundle zeroconf (the `discovery` extra): pure Python with
-              # optional speedups, so a HARD install even under QEMU. It
-              # is LGPL-2.1; the in-binary notice, Release source
-              # archive, and public build recipe are the compliance kit
-              # (see LICENSING.md).
-              pip install "zeroconf>=0.132"
-              python -c "import zeroconf, zeroconf.asyncio"
-              pyinstaller pyinstaller/cronstable.spec
-              dist/cronstable --version            # smoke test: a musl binary on a musl host
-              # Whenever the build env kept pynacl, the frozen binary
-              # must reach it (and zeroconf) too: the push-plus-bonjour
-              # config validates only when both import inside the bundle.
-              if python -c "import nacl" 2>/dev/null; then
-                dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
-              fi
-              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}-musl
-            '
-      - uses: actions/upload-artifact@v7.0.1
-        with:
-          name: cronstable-linux-${{ matrix.arch }}-musl
-          path: dist/cronstable-linux-${{ matrix.arch }}-musl
-          if-no-files-found: error
-          retention-days: 7
-
-  # Self-contained glibc binaries for the arches with no native GitHub runner
-  # (i686, armv7, ppc64le, s390x, riscv64). PyInstaller is not a cross-compiler,
-  # so -- like binaries-musl -- these build inside a container via
-  # `docker run --platform`, here on python:3.14-slim (Debian glibc). i686 runs
-  # natively on the amd64 runner; armv7, ppc64le, s390x and riscv64 under QEMU.
-  binaries-glibc-extra:
-    needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: i686
-            runner: ubuntu-24.04
-            platform: linux/386
-          - arch: armv7
-            runner: ubuntu-24.04
-            platform: linux/arm/v7
-            qemu: true
-          - arch: ppc64le
-            runner: ubuntu-24.04
-            platform: linux/ppc64le
-            qemu: true
-          - arch: s390x
-            runner: ubuntu-24.04
-            platform: linux/s390x
-            qemu: true
-          - arch: riscv64
-            runner: ubuntu-24.04
-            platform: linux/riscv64
-            qemu: true
-    runs-on: ${{ matrix.runner }}
-    steps:
-      # Shallow on purpose: SETUPTOOLS_SCM_PRETEND_VERSION pins the version, so
-      # setuptools_scm never walks history here, and its git file-finder (which
-      # the wheel/sdist build does use) only needs the checked-out tree.
-      - uses: actions/checkout@v7.0.1
-      # Same persisted pip cache as binaries-musl (see that job's comment for
-      # the full story), under its own glibc prefix: source-built wheels from
-      # the two libcs share the linux_<arch> tag and must never mix.
-      - name: Restore pip cache (QEMU-built wheels)
-        uses: actions/cache@v6.1.0
-        with:
-          path: .pip-cache
-          key: pip-glibc-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
-          restore-keys: |
-            pip-glibc-${{ matrix.arch }}-
-      - if: ${{ matrix.qemu }}
-        uses: docker/setup-qemu-action@v4.2.0
-      # Same retried, mirror-backstopped pull as binaries-musl: the registry
-      # blip that fails a release is a pull, and the build it precedes is far
-      # too slow to retry.
-      - name: Pull the Debian build image
-        run: |
-          set -euo pipefail
-          . .github/scripts/retry.sh
-          pull_base python:3.14-slim ${{ matrix.platform }}
-      - name: Build binary (Debian/glibc container)
-        env:
-          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.version.outputs.new }}
-        run: |
-          set -euo pipefail
-          docker run --rm --platform ${{ matrix.platform }} \
-            -e SETUPTOOLS_SCM_PRETEND_VERSION \
-            -e PIP_RETRIES -e PIP_TIMEOUT \
-            -e PIP_CACHE_DIR=/src/.pip-cache \
-            -v "$PWD:/src" -w /src \
-            python:3.14-slim sh -euc '
-              # The checkout is mounted at /src, so the runner-side retry helper
-              # is reachable in here too.
-              . /src/.github/scripts/retry.sh
-              # build-essential brings gcc + strip (the spec sets strip=True);
-              # libffi/zlib headers cover the C-extension deps that ship no glibc
-              # wheel and compile from sdist (the i686 aiohttp stack; propcache on
-              # armv7). ppc64le/s390x have full manylinux wheels, so the toolchain
-              # goes unused there.
-              # Acquire::Retries matches the apt calls further down, which had it
-              # from the start while these two (the ones that always run) did not.
-              retry 5 apt-get -o Acquire::Retries=5 update
-              retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends build-essential libffi-dev zlib1g-dev
+              # pip refuses to use a cache directory it does not own: this
+              # container runs as root while the bind-mounted workspace is
+              # the runner user, so without the chown every pip call logs
+              # "The cache has been disabled" and the whole persisted cache
+              # stores nothing. The host-side step after the build hands
+              # ownership back so the cache save can read it.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
+              # Per-libc C toolchain + strip (the spec sets strip=True), plus
+              # libffi/zlib headers for the deps that ship no wheel for this
+              # libc/arch and fall back to compiling from sdist (notably the
+              # i686 aiohttp stack; propcache on armv7). The full-wheel arches
+              # leave the toolchain unused.
+              ${{ matrix.toolchain }}
               pip install --upgrade pip
               pip install pyinstaller==6.21.0   # pin matches the other binary jobs
               pip install .                     # bakes the pinned version into cronstable/version.py
-              # Bundle uvloop (the `speedups` extra): a manylinux wheel where one
-              # exists (amd64/arm64), else a source build. verify_uvloop.py proves
-              # the result runs a loop (a source build can miscompile under QEMU)
-              # and uninstalls it otherwise, so a broken uvloop is never frozen
-              # in; the binary then cleanly falls back to asyncio.
-              pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-              python pyinstaller/verify_uvloop.py || pip uninstall -y uvloop || true
-              # Bundle orjson (the `speedups` extra): a manylinux wheel on amd64/
-              # arm64, else a Rust source build. RUST_SETUP installs a CURRENT
-              # Rust via rustup (distro rustc is older than the orjson MSRV) only
-              # when the wheel is missing; the shared script round-trip-verifies
-              # it and drops a broken QEMU build -> stdlib json fallback.
-              # See the musl job for why rustup is fetched to a file rather than
-              # piped into sh, and why RUST_SETUP sources the helper itself.
-              RUST_SETUP=". /src/.github/scripts/retry.sh && retry 5 apt-get -o Acquire::Retries=5 update && retry 5 apt-get -o Acquire::Retries=5 install -y --no-install-recommends curl ca-certificates && retry 3 curl --proto =https --tlsv1.2 --retry 5 --retry-connrefused --retry-delay 5 -sSfo /tmp/rustup.sh https://sh.rustup.rs && env CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh /tmp/rustup.sh -y --default-toolchain stable --profile minimal --no-modify-path" sh pyinstaller/install_orjson.sh
-              # Bundle pynacl (the `push` extra): manylinux wheels on amd64/
-              # arm64, else a plain-C source build (bundled libsodium, no
-              # Rust; libffi-dev is best-effort). verify_pynacl.py drops a
-              # QEMU-miscompiled build so push fails closed, never garbles.
-              retry 3 apt-get -o Acquire::Retries=5 install -y --no-install-recommends libffi-dev make >/dev/null 2>&1 || true
-              pip install "pynacl>=1.5" || echo "pynacl unavailable; push extra not bundled"
-              python pyinstaller/verify_pynacl.py || pip uninstall -y pynacl || true
+              # Bundle uvloop (the `speedups` extra): a wheel where one exists
+              # (amd64/arm64), else a source build. The shared script has
+              # verify_extra.py prove the result runs a loop (a source build
+              # can miscompile under QEMU) and uninstalls it otherwise, so a
+              # broken uvloop is never frozen in; the binary then cleanly
+              # falls back to asyncio.
+              sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
+              # Bundle orjson (the `speedups` extra): a wheel on amd64/arm64,
+              # else a Rust source build. RUST_SETUP (per-libc, from the
+              # matrix) installs a CURRENT Rust via rustup (distro rustc is
+              # older than the orjson MSRV) only when the wheel is missing;
+              # the shared script round-trip-verifies the result and drops a
+              # broken QEMU build -> stdlib json fallback. install_orjson.sh
+              # runs RUST_SETUP via `sh -c`, a fresh shell, so the command
+              # sources the retry helper itself; rustup is fetched to a file
+              # and then executed rather than piped straight into sh: curl
+              # retries cannot un-feed a truncated script to an interpreter
+              # that has already started running it.
+              RUST_SETUP="${{ matrix.rust_setup }}" sh pyinstaller/install_orjson.sh
+              # Bundle pynacl (the `push` extra): wheels on amd64/arm64, else
+              # a plain-C source build (bundled libsodium, no Rust; the
+              # libffi/make toolchain is best-effort). Soft on this lane
+              # only: a build that fails the sealed-box round-trip is
+              # uninstalled, so the binary never ships a miscompiled
+              # libsodium (push fails closed).
+              ${{ matrix.nacl_tools }}
+              sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" soft "push extra not bundled"
               # Bundle zeroconf (the `discovery` extra): pure Python with
               # optional speedups, so a HARD install even under QEMU. It
               # is LGPL-2.1; the in-binary notice, Release source
               # archive, and public build recipe are the compliance kit
               # (see LICENSING.md).
-              pip install "zeroconf>=0.132"
-              python -c "import zeroconf, zeroconf.asyncio"
+              sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
               pyinstaller pyinstaller/cronstable.spec
-              dist/cronstable --version            # smoke test: native (i686) or emulated (armv7/ppc64le/s390x)
+              dist/cronstable --version            # smoke test, native or emulated on its own libc
               # Whenever the build env kept pynacl, the frozen binary
               # must reach it (and zeroconf) too: the push-plus-bonjour
               # config validates only when both import inside the bundle.
               if python -c "import nacl" 2>/dev/null; then
                 dist/cronstable --validate-config -c pyinstaller/smoke-push.yaml
               fi
-              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}
+              mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
             '
+      # The container runs as root and pip creates its cache files via
+      # tempfile (mode 0600), so without this the runner-user tar in
+      # actions/cache's save step cannot read them: the save fails with a
+      # permissions warning the job ignores, and every push recompiles the
+      # QEMU wheels the cache exists to keep.
+      - name: Make the pip cache readable by the cache save
+        run: |
+          set -euo pipefail
+          if [ -d .pip-cache ]; then
+            sudo chown -R "$(id -u):$(id -g)" .pip-cache
+          fi
+      # Branch-gated like the docker job's buildx export, and for the same
+      # reason: the Actions cache is ONE 10 GB pool per repository, shared
+      # with that exporter's multi-GB layer blobs, and this job alone is 13
+      # matrix rows. Writing from every branch and every fork PR would evict
+      # the layer cache the docker build depends on. Every other branch
+      # still RESTORES through to what develop and main stored, which is
+      # where the QEMU compile savings actually come from.
+      - name: Save pip cache (long-lived branches only)
+        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pip-cache
+          key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: cronstable-linux-${{ matrix.arch }}
-          path: dist/cronstable-linux-${{ matrix.arch }}
+          name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
+          path: dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
           if-no-files-found: error
           retention-days: 7
 
@@ -889,10 +820,11 @@ jobs:
           uv pip install pyinstaller==6.21.0  # pin matches the Linux jobs
           uv pip install .                     # bakes the pinned version into cronstable/version.py
           # Bundle uvloop (the `speedups` extra) for the faster event loop; macOS
-          # ships wheels for both arches. verify_uvloop.py confirms it imports and
-          # runs a loop, else uninstalls it so the binary falls back to asyncio.
-          uv pip install "uvloop>=0.19" || echo "uvloop unavailable; using asyncio"
-          uv run python pyinstaller/verify_uvloop.py || uv pip uninstall uvloop || true
+          # ships wheels for both arches. The shared script has verify_extra.py
+          # confirm it imports and runs a loop, else uninstalls it so the binary
+          # falls back to asyncio.
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh uvloop "uvloop>=0.19" soft "using asyncio"
           # Bundle orjson (the `speedups` extra); macOS ships wheels (no Rust).
           # The shared script round-trip-verifies it and drops a broken build, so
           # the binary falls back to stdlib json (cronstable/_json).
@@ -902,13 +834,13 @@ jobs:
           # wheels, so absence means a broken build. Install and verify
           # are HARD failures on this lane (a soft-fail would silently
           # ship the advertised push channel disabled).
-          uv pip install "pynacl>=1.5"
-          uv run python pyinstaller/verify_pynacl.py
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on both arches, HARD failure. LGPL-2.1; in-binary notice +
           # Release source archive + public build recipe (LICENSING.md).
-          uv pip install "zeroconf>=0.132"
-          uv run python -c "import zeroconf, zeroconf.asyncio"
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           dist/cronstable --version            # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -1035,14 +967,14 @@ jobs:
           # win32/amd64/arm64, so absence means a broken build. Install
           # and verify are HARD failures on this lane (a soft-fail would
           # silently ship the advertised push channel disabled).
-          uv pip install "pynacl>=1.5"
-          uv run python pyinstaller/verify_pynacl.py
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh pynacl "pynacl>=1.5" hard
           # Bundle zeroconf (the `discovery` extra): pure Python, wheels
           # on win32/amd64/arm64, HARD failure. LGPL-2.1; in-binary
           # notice + Release source archive + public build recipe
           # (LICENSING.md).
-          uv pip install "zeroconf>=0.132"
-          uv run python -c "import zeroconf, zeroconf.asyncio"
+          PIP="uv pip" PIPUNINST="uv pip uninstall" PY="uv run python" \
+            sh pyinstaller/install_extra.sh zeroconf "zeroconf>=0.132" hard
           uv run pyinstaller pyinstaller/cronstable.spec
           ./dist/cronstable.exe --version      # smoke test: fails the job if the bundle is broken
           # Prove the FROZEN bundle reaches PyNaCl and zeroconf too (both
@@ -1066,34 +998,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false  # one distro failing must not cancel the others
+      # the canonical rows live in .github/docker-matrix.json (emitted by the
+      # `version` job so `docker-push` consumes the identical list); notes on
+      # per-distro platform coverage (e.g. distroless being amd64/arm64 only:
+      # its base publishes no ppc64le/s390x manifest) live beside the rows.
       matrix:
-        include:
-          - distro: debian
-            dockerfile: Dockerfile
-            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
-          - distro: alpine
-            dockerfile: docker/Dockerfile.alpine
-            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
-          - distro: ubuntu
-            dockerfile: docker/Dockerfile.ubuntu
-            platforms: "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
-          - distro: rhel
-            dockerfile: docker/Dockerfile.rhel
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
-          - distro: fedora
-            dockerfile: docker/Dockerfile.fedora
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
-          - distro: opensuse
-            dockerfile: docker/Dockerfile.opensuse
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
-          - distro: amazonlinux
-            dockerfile: docker/Dockerfile.amazonlinux
-            platforms: "linux/amd64,linux/arm64"
-          # distroless is amd64/arm64 only: gcr.io/distroless/python3-debian12
-          # publishes no ppc64le/s390x manifest, so requesting them aborts.
-          - distro: distroless
-            dockerfile: docker/Dockerfile.distroless
-            platforms: "linux/amd64,linux/arm64"
+        include: ${{ fromJSON(needs.version.outputs.docker-matrix) }}
     steps:
       # Shallow on purpose: CI always passes the VERSION build-arg, so
       # setuptools_scm never walks history inside the build (only a plain
@@ -1425,8 +1335,7 @@ jobs:
       - licenses
       - dist
       - binaries
-      - binaries-musl
-      - binaries-glibc-extra
+      - binaries-container
       - binaries-macos
       - binaries-windows
       - docker
@@ -1645,40 +1554,11 @@ jobs:
       packages: write   # push to GHCR
     strategy:
       fail-fast: false
+      # the same canonical rows the build-only `docker` gate ran, from
+      # .github/docker-matrix.json via the `version` job: what was gated is
+      # exactly what is pushed, suffixes included.
       matrix:
-        include:
-          - distro: debian
-            dockerfile: Dockerfile
-            suffix: ""
-            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
-          - distro: alpine
-            dockerfile: docker/Dockerfile.alpine
-            suffix: "-alpine"
-            platforms: "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
-          - distro: ubuntu
-            dockerfile: docker/Dockerfile.ubuntu
-            suffix: "-ubuntu"
-            platforms: "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
-          - distro: rhel
-            dockerfile: docker/Dockerfile.rhel
-            suffix: "-rhel"
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
-          - distro: fedora
-            dockerfile: docker/Dockerfile.fedora
-            suffix: "-fedora"
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
-          - distro: opensuse
-            dockerfile: docker/Dockerfile.opensuse
-            suffix: "-opensuse"
-            platforms: "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
-          - distro: amazonlinux
-            dockerfile: docker/Dockerfile.amazonlinux
-            suffix: "-amazonlinux"
-            platforms: "linux/amd64,linux/arm64"
-          - distro: distroless
-            dockerfile: docker/Dockerfile.distroless
-            suffix: "-distroless"
-            platforms: "linux/amd64,linux/arm64"
+        include: ${{ fromJSON(needs.version.outputs.docker-matrix) }}
     steps:
       - name: Resolve registries
         id: registries
