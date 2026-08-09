@@ -44,6 +44,7 @@ def _build_demo():
     spec.loader.exec_module(module)
     return module
 
+
 # The logo engine block, from its banner comment to the close of the script
 # tag that holds it.  Both ends are stable by construction: the banner is the
 # first thing inside the tag on all four pages, and the engine always owns a
@@ -132,8 +133,10 @@ def test_no_streamed_log_pane_measures_the_buffer_per_line():
                 "passive scroll listener instead",
             ),
         ):
-            assert banned not in body, (
-                "%s() reintroduced `%s`: %s" % (opener, banned, why)
+            assert banned not in body, "%s() reintroduced `%s`: %s" % (
+                opener,
+                banned,
+                why,
             )
     # and the DAG helper itself still applies the cap and the shared follow
     assert re.search(
@@ -204,7 +207,13 @@ def test_every_secondary_poll_loader_is_single_flight():
         )
     }
     # sanity floor: a broken derivation must fail loudly, not pass vacuously
-    assert {"loadCluster", "loadNode", "loadDags", "loadState", "loadFleet"} <= fetchers, (
+    assert {
+        "loadCluster",
+        "loadNode",
+        "loadDags",
+        "loadState",
+        "loadFleet",
+    } <= fetchers, (
         "derived only %s as fetching poll loaders; the derivation no longer "
         "sees the known ones" % sorted(fetchers)
     )
@@ -283,6 +292,17 @@ def test_logo_engine_extract_matches_the_dashboards_inline_copy():
             "%s regrew an inline logo engine copy; it must consume "
             "docs/logo-engine.js instead" % path
         )
+    # the demo's copy is spliced from the dashboard by build_demo, so it
+    # cannot DRIFT; what it can do is arrive twice, since the injected
+    # fragment lands verbatim right before the engine's own script tag.
+    assert len(_ENGINE.findall(_read(DEMO))) == 1, (
+        "%s carries more than one logo engine copy; the demo gets exactly "
+        "one, spliced from the dashboard" % DEMO
+    )
+    assert not _ENGINE.search(_read(FRAGMENT)), (
+        "%s regrew an inline logo engine copy; the demo inherits the "
+        "dashboard's through the splice" % FRAGMENT
+    )
 
 
 _CSS_RULE = re.compile(r"([^{}]+)\{([^{}]*)\}")

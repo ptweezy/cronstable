@@ -416,9 +416,17 @@ else:
         portable 64-bit window, identically on both backends (see the
         prescan notes above; without the check a stdlib host would hand
         back an exact big int where an orjson host hands back a lossy
-        float).
+        float).  Bytes decode as strict UTF-8 first, matching orjson's
+        bytes contract: the stdlib's own encoding sniff (detect_encoding)
+        would accept a BOM and UTF-16/-32 payloads orjson refuses, and one
+        document must reach one verdict on every host (dagrun's mapped
+        fan-out parses XCom bytes through here).  The prescan runs on the
+        original bytes to keep its translate fast path.
         """
-        if _has_wide_int_run(data):
+        wide = _has_wide_int_run(data)
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8")
+        if wide:
             return _stdlib.loads(data, parse_int=_checked_parse_int)
         return _stdlib.loads(data)
 

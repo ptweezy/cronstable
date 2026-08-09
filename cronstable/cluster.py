@@ -1147,7 +1147,7 @@ class ClusterManager(LeadershipBackend):
         # last-logged oversize count per source: the warning's rate limiter,
         # deliberately distinct from the view cells above (see
         # _note_candidates_truncated).
-        self._candidates_trunc_logged: dict[str, int] = {}
+        self._candidates_trunc_logged: dict[str, bool] = {}
 
     def _derived_state_key(self) -> "tuple":
         """The key every memoized election-derived result is valid under.
@@ -1401,18 +1401,34 @@ class ClusterManager(LeadershipBackend):
                 # UNCOMPRESSED length; the poller's cap applies to the
                 # decompressed stream.
                 oversized = len(body_bytes)
-                payload = dict(payload)
-                payload["job_summaries"] = {}
-                payload["job_summaries_truncated"] = True
-                body_bytes = self._encode_peer_body(payload)
-                logger.warning(
-                    "/peer response was %d bytes, over the %d byte cap peers "
-                    "enforce: dropped job_summaries from the fleet view (now "
-                    "%d bytes)",
-                    oversized,
-                    MAX_PEER_RESPONSE_BYTES,
-                    len(body_bytes),
-                )
+                if payload.get("job_summaries"):
+                    payload = dict(payload)
+                    payload["job_summaries"] = {}
+                    payload["job_summaries_truncated"] = True
+                    body_bytes = self._encode_peer_body(payload)
+                if len(body_bytes) > MAX_PEER_RESPONSE_BYTES:
+                    # Shedding was a no-op (no provider installed) or was
+                    # not enough. Nothing else here is observability-only,
+                    # so say plainly that peers will reject this body and
+                    # drop us rather than log a drop that did not help.
+                    logger.error(
+                        "/peer response is %d bytes, over the %d byte cap "
+                        "peers enforce, and shedding the fleet view left "
+                        "%d: peers will record this node oversized and "
+                        "drop it from their quorum",
+                        oversized,
+                        MAX_PEER_RESPONSE_BYTES,
+                        len(body_bytes),
+                    )
+                else:
+                    logger.warning(
+                        "/peer response was %d bytes, over the %d byte cap "
+                        "peers enforce: dropped job_summaries from the "
+                        "fleet view (now %d bytes)",
+                        oversized,
+                        MAX_PEER_RESPONSE_BYTES,
+                        len(body_bytes),
+                    )
             now_epoch = datetime.datetime.now(
                 datetime.timezone.utc
             ).timestamp()
@@ -1923,16 +1939,21 @@ class ClusterManager(LeadershipBackend):
                     untrusted=False,
                 )
                 return
-            # Bound length and reject control characters: these strings are
-            # reflected verbatim into /cluster JSON and log lines (payload
-            # bloat / log injection). Legitimate identities pass untouched.
+            # Bound length, reject the empty string ("".isprintable() is
+            # True) and control characters: these strings are reflected
+            # verbatim into /cluster JSON and log lines (payload bloat /
+            # log injection), and an empty node_name would count toward
+            # quorum as a peer no election fold can name (the set-shaped
+            # fields drop empties the same way).
             if value is not None and (
-                len(value) > MAX_PEER_FIELD_LEN or not value.isprintable()
+                not value
+                or len(value) > MAX_PEER_FIELD_LEN
+                or not value.isprintable()
             ):
                 self.view.record_failure(
                     host,
-                    "malformed /peer response: {!r} is over {} chars or "
-                    "contains control characters".format(
+                    "malformed /peer response: {!r} is empty, over {} "
+                    "chars or contains control characters".format(
                         key, MAX_PEER_FIELD_LEN
                     ),
                     untrusted=False,
@@ -2341,7 +2362,7 @@ class ClusterManager(LeadershipBackend):
         # clears this source's cell ONLY: the advert build owns its own,
         # so a /cluster read cascading into this derive can no longer
         # blank a truncation the advert side just observed.
-        self._candidates_trunc_seen["bridge"] = 0
+        self._clear_candidates_truncated("bridge")
         return confirmed
 
     def _capped_vouched(self) -> list[str]:
@@ -2356,7 +2377,7 @@ class ClusterManager(LeadershipBackend):
         if len(vouched) > MAX_ADVERTISED_CANDIDATE_NAMES:
             self._note_candidates_truncated("advert", len(vouched))
             return vouched[:MAX_ADVERTISED_CANDIDATE_NAMES]
-        self._candidates_trunc_seen["advert"] = 0
+        self._clear_candidates_truncated("advert")
         return vouched
 
     @property
@@ -2369,29 +2390,51 @@ class ClusterManager(LeadershipBackend):
         blank a truncation the advert build observed on the larger union.
         """
         # The advert cell is only rewritten when a /peer poll rebuilds the
-        # response (_capped_vouched), so on a node nobody polls a latched
-        # overflow would report forever; re-check the advert side here and
-        # zero it once the union fits. The bridge cell cannot go stale that
-        # way (the derive refreshes it).
-        if (
-            self._candidates_trunc_seen.get("advert")
-            and len(self._eligible_candidates())
-            <= MAX_ADVERTISED_CANDIDATE_NAMES
-        ):
-            self._candidates_trunc_seen["advert"] = 0
+        # response (_capped_vouched), so on a node nobody polls it would
+        # otherwise report whatever the last build saw, in BOTH directions:
+        # a latched overflow forever, or a stale 0 while the union has since
+        # outgrown the cap and every future advert would drop a co-owner.
+        # Re-derive it here either way. The bridge cell cannot go stale that
+        # way (its derive refreshes it), and _eligible_candidates is memoized
+        # per view generation, so this read is cheap.
+        union = len(self._eligible_candidates())
+        if union > MAX_ADVERTISED_CANDIDATE_NAMES:
+            # through _note_ so a never-polled node still logs the warning
+            self._note_candidates_truncated("advert", union)
+        else:
+            self._clear_candidates_truncated("advert")
         return max(self._candidates_trunc_seen.values(), default=0)
+
+    def _clear_candidates_truncated(self, source: str) -> None:
+        """``source`` fits the cap again: clear its cell and re-arm its log.
+
+        The twin of :meth:`_note_candidates_truncated`. Re-arming here is
+        what makes the log limiter a per-episode latch rather than a
+        once-per-process one: a fleet that grows back over the cap after
+        shrinking under it is a new episode and warns again.
+        """
+        self._candidates_trunc_seen[source] = 0
+        self._candidates_trunc_logged.pop(source, None)
 
     def _note_candidates_truncated(self, source: str, seen: int) -> None:
         """Record and log a candidate-set truncation (rate-limited).
 
         ``source`` is ``"bridge"`` or ``"advert"``. Both the view cell and
         the log limiter are per source: the two report different counts.
-        Logged once per distinct oversize count per source.
+
+        Logged once per oversize EPISODE per source, not once per distinct
+        count: keying on the exact count meant any membership churn in an
+        over-cap fleet (one node joining or leaving) changed the number and
+        re-fired the warning every poll round, which is the flood the
+        limiter exists to stop. The latch re-arms in
+        :meth:`_clear_candidates_truncated` when the source drops back
+        under the cap, so a genuinely new episode still warns. The current
+        count still rides the message body.
         """
         self._candidates_trunc_seen[source] = seen
-        if self._candidates_trunc_logged.get(source) == seen:
+        if self._candidates_trunc_logged.get(source):
             return
-        self._candidates_trunc_logged[source] = seen
+        self._candidates_trunc_logged[source] = True
         what = (
             "bridge-confirmed candidates"
             if source == "bridge"
@@ -2699,12 +2742,6 @@ class ClusterManager(LeadershipBackend):
             ):
                 return False
         return True
-
-    # the tests exercise the settle hold through the old private name. This
-    # alias is a frozen snapshot for those read-only callers: the gates call
-    # view_settled(), so an override of _view_settled is never consulted
-    # (override or patch view_settled instead).
-    _view_settled = view_settled
 
     @_memoized_derived
     def available_leader_name(self) -> str:

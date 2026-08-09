@@ -67,6 +67,16 @@ fi
 if $PY "$here/verify_extra.py" "$name"; then
     :
 else
+    # exit 2 is verify_extra.py's USAGE code (NAME is not one of its probe
+    # names), not a probe failure. Folding the two together uninstalled a
+    # perfectly healthy package over a typo and still exited 0, so the
+    # binary shipped without the extra and nothing said so. A bad name is
+    # a build bug: fail loudly on both policies.
+    status=$?
+    if [ "$status" -eq 2 ]; then
+        echo "install_extra.sh: \"$name\" is not a verify_extra.py probe name" >&2
+        exit 2
+    fi
     echo "$name: verification failed; uninstalling, $note"
     $PIPUNINST "$name" || true
 fi

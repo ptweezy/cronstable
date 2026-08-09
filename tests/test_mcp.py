@@ -267,6 +267,50 @@ async def test_read_tools_annotations():
         assert t["annotations"]["openWorldHint"] is False
 
 
+async def test_mutating_tool_annotations_are_declared_correctly():
+    # destructiveHint/idempotentHint used to be spelled per tool; _tool()
+    # now DERIVES them from its keywords (idempotent defaults to `not
+    # mutating`), and nothing asserted either one, so a tool declared with
+    # the wrong keyword would advertise the wrong safety hint to an agent
+    # that uses these to decide what it may retry or must confirm. Pin the
+    # whole triple per tool, the way the TUI DAG-state map is pinned.
+    h = _handler({"readOnly": False, "toolsets": ["observe", "act", "dags"]})
+    tools = {
+        t["name"]: t["annotations"]
+        for t in (await _req(h, "tools/list"))["result"]["tools"]
+    }
+    expected = {
+        # (readOnlyHint, destructiveHint, idempotentHint)
+        # launching is not destructive but is not repeatable either: two
+        # calls are two runs
+        "cron_run_job": (False, False, False),
+        # cancelling terminates a run (destructive) but re-cancelling a
+        # stopped job changes nothing
+        "cron_cancel_job": (False, True, True),
+        "cron_pause_job": (False, False, True),
+        "cron_resume_job": (False, False, True),
+        "cron_trigger_dag": (False, False, False),
+        # a backfill and a gate decision both overwrite run state
+        "cron_backfill_dag": (False, True, False),
+        "cron_decide_gate": (False, True, False),
+    }
+    for name, triple in expected.items():
+        assert name in tools, "{} is gone; update this table".format(name)
+        ann = tools[name]
+        got = (
+            ann["readOnlyHint"],
+            ann["destructiveHint"],
+            ann["idempotentHint"],
+        )
+        assert got == triple, (name, got, triple)
+    # every OTHER tool in this fully-enabled handler is read-only, so the
+    # table above is the complete mutating set and a new mutating tool
+    # cannot slip in unannotated
+    for name, ann in tools.items():
+        if name not in expected:
+            assert ann["readOnlyHint"] is True, name
+
+
 async def test_input_schemas_are_object_2020_12_shaped():
     h = _handler({"readOnly": False, "toolsets": ["observe", "act", "dags"]})
     for t in (await _req(h, "tools/list"))["result"]["tools"]:

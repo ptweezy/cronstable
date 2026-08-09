@@ -324,7 +324,7 @@ def _decode_fs_token(token: str) -> Optional[str]:
     Fewer tokens reach the fast path than it looks.  Every managed stream
     prefix ends in ``/`` (``runs/``, ``manifests/``, ``dagrun/``), and a
     scheduled DAG run key is an ISO instant, so the ordinary on-disk token is
-    heavily escaped (``2026-08-07%5412%3A00%3A00_00%3A00``) and goes the slow
+    heavily escaped (``2026-08-07%5412%3A00%3A00%2B00%3A00``) and goes the slow
     way; manual run keys and plain document keys are what hit.  So the branch
     is a trade.  Against carrying no fast path at all, a 50-entry listing of
     escaped names costs 2% to 9% more, and one of unescaped names costs ~75%
@@ -2909,8 +2909,10 @@ class FilesystemStateBackend(StateBackend):
             self._record_name_floor_forget(token)
         # Before the orphan-lock sweep on purpose: an idempotency doc this
         # pass deletes leaves its ``.lock`` behind (same NFS ghost-inode
-        # rationale as DOC_DELETE), and the lock sweep of a LATER pass
-        # reclaims it once idle past grace.
+        # rationale as DOC_DELETE), and running first lets THIS pass's lock
+        # sweep reclaim it. A claim whose expiry lapsed a whole grace ago
+        # was written at least a grace ago, so its lock's mtime already
+        # predates the cutoff and _reclaim_idle_lock_sync takes it below.
         idem_docs_removed = self._gc_idem_docs_sync(cutoff, dry_run)
         leases_removed = self._gc_leases_sync(
             cutoff, dry_run, ephemeral_lease_prefixes
@@ -2975,6 +2977,21 @@ class FilesystemStateBackend(StateBackend):
                 if not name.endswith(".doc"):
                     continue
                 doc_path = os.path.join(ns_dir, name)
+                # mtime pre-gate, the same cheap one _reclaim_idle_lock_sync
+                # takes: a claim's expiry is its write time plus its ttl, so
+                # a doc written at or after the cutoff cannot have lapsed a
+                # whole grace ago and never needs opening. Without it every
+                # pass paid an open + read + parse for every permanent claim
+                # and every live TTL, on the one lane the gc budget shares.
+                # The gate only ever SKIPS, so a doc whose mtime moved out
+                # of band (a restore, an rsync without -t) is swept a later
+                # pass, like a try-lock miss; an OSError leaves it alone,
+                # matching the never-delete-what-cannot-be-classified rule.
+                try:
+                    if os.stat(doc_path).st_mtime >= cutoff:
+                        continue
+                except OSError:
+                    continue
                 body = self._read_doc_file(doc_path)
                 if not self._idem_doc_expired(body, cutoff):
                     continue
@@ -3010,7 +3027,12 @@ class FilesystemStateBackend(StateBackend):
         if body is None:
             return False
         expires = body.get("expiresAt")
-        return isinstance(expires, (int, float)) and expires <= cutoff
+        # bool is an int subclass: a JSON ``true`` would otherwise read as
+        # expiresAt == 1 and delete a doc this build cannot classify. The
+        # same explicit reject the peer-payload numbers use.
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+            return False
+        return expires <= cutoff
 
     def _lease_dead_past_grace(self, lease_path: str, cutoff: float) -> bool:
         """Whether a lease was provably dead for the whole grace window.

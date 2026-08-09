@@ -485,8 +485,11 @@ async def test_query_metrics_walks_the_metric_universe_off_the_loop(
 
     monkeypatch.setattr(cron.metrics, "iter_samples", spy)
 
+    # the gate lives beside the /metrics one it mirrors, in cron.py
+    import cronstable.cron as cron_mod
+
     # a small deployment stays inline: a thread hop costs more than the walk
-    monkeypatch.setattr(mcp_mod, "_METRICS_OFFLOAD_MIN_JOBS", 1000)
+    monkeypatch.setattr(cron_mod, "_METRICS_OFFLOAD_MIN_JOBS", 1000)
     inline = (await _call(h, "cron_query_metrics", {"limit": 500}))[
         "structuredContent"
     ]
@@ -494,7 +497,10 @@ async def test_query_metrics_walks_the_metric_universe_off_the_loop(
     assert seen["walk"] == loop_thread
 
     seen.clear()
-    monkeypatch.setattr(mcp_mod, "_METRICS_OFFLOAD_MIN_JOBS", 1)
+    # the snapshot is memoized across callers within the window, so the
+    # second call would otherwise join the first's and never reach the spy
+    cron._bust_response_memos()
+    monkeypatch.setattr(cron_mod, "_METRICS_OFFLOAD_MIN_JOBS", 1)
     offloaded = (await _call(h, "cron_query_metrics", {"limit": 500}))[
         "structuredContent"
     ]
@@ -513,6 +519,49 @@ async def test_query_metrics_walks_the_metric_universe_off_the_loop(
     assert offloaded["totalMatched"] == inline["totalMatched"]
     assert offloaded["returned"] == inline["returned"] > 0
     assert offloaded["match"] is None
+
+
+async def test_query_metrics_shares_one_walk_across_callers(monkeypatch):
+    # The tool adopted /metrics' offload but not its shared product, so
+    # every call rebuilt the whole universe and enqueued its own
+    # full-universe walk on the shared executor: N polling agents cost N
+    # walks of a body HISTORY sizes at 22 MB for 10,000 jobs. The
+    # snapshot is now memoized like the scrape's, while match/limit stay
+    # per call. A local change must still render at once, not out-wait
+    # the TTL.
+    h = _handler()
+    cron = h._cron
+    walks = []
+    real_iter_samples = cron.metrics.iter_samples
+
+    def counting(target):
+        walks.append(1)
+        return real_iter_samples(target)
+
+    monkeypatch.setattr(cron.metrics, "iter_samples", counting)
+
+    first = (await _call(h, "cron_query_metrics", {"limit": 5}))[
+        "structuredContent"
+    ]
+    second = (await _call(h, "cron_query_metrics", {"limit": 500}))[
+        "structuredContent"
+    ]
+    assert len(walks) == 1, "the second caller rebuilt the universe"
+    # ...and the shared snapshot did NOT flatten the per-call filter
+    assert first["returned"] == 5
+    assert second["returned"] > 5
+    assert first["totalMatched"] == second["totalMatched"]
+    filtered = (
+        await _call(h, "cron_query_metrics", {"match": "cronstable_job"})
+    )["structuredContent"]
+    assert len(walks) == 1
+    assert filtered["totalMatched"] < second["totalMatched"]
+    assert all("cronstable_job" in s["name"] for s in filtered["samples"])
+
+    # a local change busts the snapshot with the rest of the memos
+    cron._bust_response_memos()
+    await _call(h, "cron_query_metrics", {"limit": 5})
+    assert len(walks) == 2
 
 
 async def test_get_version_tool():
@@ -700,13 +749,16 @@ async def test_resume_job_confirm_gate_clears_pause_and_noops():
     assert "not found" in result["content"][0]["text"]
 
 
-_SLA_YAML = _YAML + """\
+_SLA_YAML = (
+    _YAML
+    + """\
   - name: watched
     command: echo hi
     schedule: "0 * * * *"
     sla:
       lateAfterSeconds: 60
 """
+)
 
 
 async def test_observe_payloads_carry_paused_and_sla():

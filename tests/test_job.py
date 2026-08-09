@@ -4023,3 +4023,47 @@ async def test_report_sla_breach_gathers_and_logs_exceptions(
     assert any(
         "Problem reporting job" in rec.getMessage() for rec in caplog.records
     )
+
+
+async def test_reporter_fromfile_secret_resolves_off_the_event_loop():
+    # The reporters run from the completion path, so an ordinary open+read
+    # of a fromFile secret on a hung mount (a Kubernetes secret volume,
+    # NFS) blocked the whole scheduler. Same offload rule the launch path
+    # already applied via jobapi.stage_secrets: only a file source pays
+    # the thread hop.
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen = {}
+    real = cronstable.job._resolve_secret
+
+    def recording(spec, what):
+        seen[what] = threading.get_ident()
+        return real(spec, what)
+
+    original = cronstable.job._resolve_secret
+    cronstable.job._resolve_secret = recording
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".secret", delete=False
+        ) as fobj:
+            fobj.write("https://hooks.example/abc")
+            path = fobj.name
+        try:
+            got = await cronstable.job._resolve_secret_async(
+                {"value": None, "fromFile": path, "fromEnvVar": None},
+                "webhook.url",
+            )
+            assert got == "https://hooks.example/abc"
+            assert seen["webhook.url"] != loop_thread  # a worker thread
+            # a value source is cheaper than the hop, so it stays inline
+            got = await cronstable.job._resolve_secret_async(
+                {"value": "inline", "fromFile": None, "fromEnvVar": None},
+                "sentry.dsn",
+            )
+            assert got == "inline"
+            assert seen["sentry.dsn"] == loop_thread
+        finally:
+            os.unlink(path)
+    finally:
+        cronstable.job._resolve_secret = original

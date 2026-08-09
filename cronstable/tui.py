@@ -132,6 +132,12 @@ WB_STALE_AFTER_MS = 15000
 TAIL_MAX = 4
 TAIL_RETRY_MS = 5000
 
+#: Activity punchcard: max jobs retained and drawn, the same constant as
+#: HEAT_MAX_JOBS in the web page.  Both heat paths apply it, so the
+#: batched feed cannot retain a fleet's worth of rows the card never
+#: draws while the fan-out fallback holds a smaller set.
+HEAT_MAX_JOBS = 80
+
 #: The boot self-test replays after this long, like the web page's.
 BOOT_EVERY_S = 12 * 3600
 
@@ -421,6 +427,11 @@ DAG_STATE_COLOR = {
     "upstream_failed": "fail",
     "expanded": "dim",
     "scheduled": "pending",  # run-level: created, awaiting its slot
+    # TUI-only pseudo-state: _dag_tasks_tab substitutes it for an approval
+    # gate parked on a decision, so it never reaches here from dag.py.
+    # Painted "pending" as the old ladder did: the gate is waiting, not
+    # inert, and it is the one row the operator has to act on.
+    "awaiting": "pending",
     "unknown": "dim",
 }
 
@@ -2928,10 +2939,16 @@ class App:
         if isinstance(jobs, dict):
             # wholesale replacement, so the fan-out path's prune of
             # removed names is implicit here and _heat_parsed's orphan
-            # sweep covers the shrinkage
+            # sweep covers the shrinkage. Capped like the fan-out and the
+            # web card: /activity is uncapped in JOBS, so a fleet-scale
+            # daemon would otherwise hand every refresh a row list per
+            # job, all but HEAT_MAX_JOBS of them never drawn. Selected in
+            # the order render_heat draws, so the retained set is the set
+            # the user can actually reach.
+            names = sorted(str(name) for name in jobs)[:HEAT_MAX_JOBS]
             self.heat_data = {
-                str(name): rows if isinstance(rows, list) else []
-                for name, rows in jobs.items()
+                name: (jobs[name] if isinstance(jobs.get(name), list) else [])
+                for name in names
             }
         return True
 
@@ -2955,8 +2972,10 @@ class App:
                     )
                     self.heat_data[name] = data.get("runs", [])
 
-        # same spirit as the web page's cap
-        await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
+        # the web page's cap, and the same selection the batched path
+        # makes, so the two agree on WHICH jobs the card retains
+        ordered = sorted(self.jobs, key=lambda j: str(j.get("name", "")))
+        await asyncio.gather(*(fetch(j) for j in ordered[:HEAT_MAX_JOBS]))
         # a job removed (or renamed) by a reload never refreshes its
         # entry again; without this prune a long session with name
         # churn accretes one dead run-list payload per old name.

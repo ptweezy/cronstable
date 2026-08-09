@@ -339,9 +339,14 @@ async def test_replace_pursuit_cancels_and_relaunches(fleet_cron):
         await asyncio.sleep(0.05)
     assert rec is not None and rec["kind"] == "cancel"
     assert rec["fence"] == foreign.fence
-    # the holder yields; the pursuit claims the slot and launches
+    # the holder yields; the pursuit claims the slot and launches.  The
+    # pursuit poll is floored at 1.0s, so this waits real seconds: keep
+    # the file's original 0.05s cadence (a 15s budget), not the shared
+    # helper's 0.01s default (3s), which a loaded CI runner can miss.
     await backend.release_lease(foreign)
-    assert await _wait_until(lambda: bool(cron.running_jobs.get("j")))
+    assert await _wait_until(
+        lambda: bool(cron.running_jobs.get("j")), interval=0.05
+    )
     rj = cron.running_jobs["j"][0]
     await rj.wait()
     await cron._handle_finished_job(rj)
@@ -386,8 +391,12 @@ async def test_holder_observes_cancel_and_yields(fleet_cron):
             "at": _iso(_now_utc()),
         },
     )
-    # the renew task notices within ~one renew period and replaces
-    assert await _wait_until(lambda: rj.replaced, tries=300)
+    # the renew task notices within ~one renew period (>= 1.67s at ttl 5:
+    # the period sleep runs BEFORE the first cancel-record read), so this
+    # waits real seconds: keep the file's original 0.05s cadence (a 15s
+    # budget), not the shared helper's 0.01s default (3s), which a loaded
+    # CI runner can miss.
+    assert await _wait_until(lambda: rj.replaced, tries=300, interval=0.05)
     await rj.wait()
     await cron._handle_finished_job(rj)
     await _drain_state_writes(cron)

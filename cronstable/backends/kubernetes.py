@@ -51,7 +51,6 @@ import aiohttp
 
 from cronstable.backends import TRANSPORT_LIBRARY, select_transport
 from cronstable.backends._common import (
-    _SKEW_SECONDS,  # noqa: F401  (re-exported; every backend keeps it)
     _UNKNOWN_HOLDER,
     StoreLeaseBackend,
     # Re-exported; backend tests import it. Rotation detection
@@ -582,9 +581,7 @@ class KubernetesBackend(StoreLeaseBackend):
             self._is_leader = True
             self._holder = self.display_identity
             self._leader_until = self._leader_deadline(now)
-            self._leader_until_mono = fence_deadline(
-                mono, self.lease_duration
-            )
+            self._leader_until_mono = fence_deadline(mono, self.lease_duration)
         else:
             # lost the optimistic-concurrency race (a 409): not leader now.
             # NEVER leave _holder None here: leader_name() None reads in

@@ -143,7 +143,7 @@ DAG_ROLLUP_BULK_THRESHOLD = 8
 #: re-PARSING terminal runs, but the keys listing itself still hit the store
 #: once per dag per request: with the dashboard's /dags poll (and any open
 #: run drawer) that was N_dags listings every ~3s per viewer, forever, on a
-#: quiescent store.  Every LOCAL write funnels through _mutate/_delete_run_doc
+#: quiescent store.  Every LOCAL write funnels through _mutate/_delete_run
 #: and pops the memo, so this-node changes render immediately; the TTL only
 #: bounds how late another node's writes appear in the index rollup, which is
 #: well inside the gossip staleness the fleet view already tolerates.  Sits
@@ -166,7 +166,7 @@ _XCOM_PARSE_OFFLOAD_MIN = 64 * 1024
 def _parse_portable_xcom(data: bytes) -> Any:
     """Parse a mapped-task XCom payload; portability-check a usable list.
 
-    Factored out of :meth:`DagScheduler._mapped_items` so the large-payload
+    Factored out of :meth:`DagScheduler._read_xcom_list` so the large-payload
     branch can run the WHOLE thing on a worker thread.  The bytes go
     straight to ``_json.loads``: the old ``data.decode()`` allocated a full
     second copy and forced the str branch, whose wide-int prescan is a
@@ -276,7 +276,7 @@ class DagScheduler:
         # dag name -> (monotonic stamp, summaries): the short-TTL memo over
         # _run_summaries' RESULT, so the /dags + run-drawer poll traffic of
         # a quiescent dag costs zero store listings between local writes.
-        # Popped by _mutate/_delete_run_doc (local changes must render at
+        # Popped by _mutate/_delete_run (local changes must render at
         # once), swept with the summary cache in forget(), and pruned of
         # removed dags by list_dags.  See DAG_SUMMARY_LIST_TTL.
         self._summaries_memo: dict[
@@ -368,17 +368,24 @@ class DagScheduler:
         backend = self._backend()
         if backend is None:
             return None, None
-        result = await asyncio.wait_for(
-            backend.mutate_document(self._ns(dag_name), key, transform),
-            timeout=STATE_OP_TIMEOUT,
-        )
-        # every local run-doc write funnels through here: pop the summary
-        # memo so this node's own changes (create, advance, finish, adopt)
-        # render on the very next poll instead of aging out by TTL. The bump
-        # is the half the pop cannot cover: it voids a rebuild already in
-        # flight, whose entry is not there to pop yet (see _summaries_gen).
-        self._summaries_memo.pop(dag_name, None)
-        self._summaries_gen += 1
+        try:
+            result = await asyncio.wait_for(
+                backend.mutate_document(self._ns(dag_name), key, transform),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        finally:
+            # every local run-doc write funnels through here: pop the
+            # summary memo so this node's own changes (create, advance,
+            # finish, adopt) render on the very next poll instead of aging
+            # out by TTL. The bump is the half the pop cannot cover: it
+            # voids a rebuild already in flight, whose entry is not there
+            # to pop yet (see _summaries_gen). In a finally because a
+            # timed-out or raised write may still have LANDED: wait_for
+            # abandons the worker thread, it does not undo it (see
+            # state.py _call), so invalidating only on success could serve
+            # a stale summary for the whole TTL.
+            self._summaries_memo.pop(dag_name, None)
+            self._summaries_gen += 1
         return result
 
     async def _read(self, dag_name: str, key: str) -> Optional[dict[str, Any]]:
@@ -833,7 +840,20 @@ class DagScheduler:
         (A backend swap cancels this task outright, see :meth:`forget`.)
         """
         try:
-            await asyncio.sleep(offset)
+            if offset > 0:
+                # interruptible, like the job twin: a bare sleep let a
+                # jitter elapsing during a graceful stop create runs and
+                # fork task subprocesses mid-shutdown. The early return
+                # leaves the checkpoint open, so the next boot resumes the
+                # owed slots.
+                try:
+                    await asyncio.wait_for(
+                        self._cron._stop_event.wait(), timeout=offset
+                    )
+                except asyncio.TimeoutError:
+                    pass  # normal: the jitter elapsed without a shutdown
+            if self._cron._stop_event.is_set():
+                return
             current = self._dags().get(dagcfg.name)
             sched = current.schedule_job if current is not None else None
             if (
@@ -858,6 +878,11 @@ class DagScheduler:
                 )
                 return
             for when in targets:
+                # per-iteration abort, the dag twin of the job backfill's:
+                # a stop landing mid-replay stops here, and the still-owed
+                # slots ride the open checkpoint to the next boot
+                if self._cron._stop_event.is_set():
+                    return
                 await self._create_run(current, when, "catchup")
             await self._checkpoint_catchup(dagcfg.name, "close", watermark)
         except asyncio.CancelledError:
@@ -2767,15 +2792,21 @@ class DagScheduler:
         a doc-less stream the stream GC ages out, never a live run whose
         XCom vanished.
         """
-        await asyncio.wait_for(
-            backend.delete_document(self._ns(name), run_key),
-            timeout=STATE_OP_TIMEOUT,
-        )
-        # the other local write shape (_mutate covers the rest): the memo
-        # must not keep serving a run the GC just deleted, and the bump
-        # voids a rebuild in flight, same as _mutate's.
-        self._summaries_memo.pop(name, None)
-        self._summaries_gen += 1
+        try:
+            await asyncio.wait_for(
+                backend.delete_document(self._ns(name), run_key),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        finally:
+            # the other local write shape (_mutate covers the rest): the
+            # memo must not keep serving a run the GC just deleted, and the
+            # bump voids a rebuild in flight, same as _mutate's. In a
+            # finally for the same reason: an abandoned delete may still
+            # have landed.
+            self._summaries_memo.pop(name, None)
+            self._summaries_gen += 1
+        # the discard stays on the SUCCESS path: _gc_one_dag rebuilds this
+        # cache from truth, so a failed delete must leave the key known.
         known = self._terminal_run_keys.get(name)
         if known is not None:
             # the key may legitimately come back (an operator backfill of the

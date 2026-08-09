@@ -245,10 +245,13 @@ project, on which cronstable is based.
   per cycle against a per-origin connection budget the held log tails
   already draw on. A test now holds every secondary poll to the guard, not
   just this one.
-- The MCP `cron_query_metrics` tool builds and formats the metric universe
-  on the default executor rather than the event loop once the resident job
-  count clears the threshold `GET /metrics` already uses, so an agent
-  polling metrics no longer stalls job dispatch at fleet scale.
+- The MCP `cron_query_metrics` tool formats the metric universe on the
+  default executor rather than the event loop once the resident job count
+  clears the threshold `GET /metrics` already uses (the family build, which
+  reads live scheduler state, stays on the loop), and it shares one built
+  sample snapshot across the callers that arrive within a second, the way
+  `GET /metrics` shares its response. An agent polling metrics no longer
+  stalls job dispatch at fleet scale.
 - The three reporting contexts (a job run, an SLA breach, a `notify:`
   event) name their shared `template_vars` key set once, and a parity test
   holds all three to it. A template written for `onFailure` is meant to
@@ -289,9 +292,13 @@ project, on which cronstable is based.
   quadratic `Seq` validation fixed above shows up at 300 jobs, the size
   `config.parse_yaml_300` measures, as a 38% bulge that a loaded runner can
   argue with; at 3,000 jobs it is 5.3x.
-- The logo engine's four inlined copies (dashboard, demo, logo lab and the
-  comparison page) are pinned identical by a test, where only the
-  dashboard and demo pair had a drift guard before.
+- The logo engine now has one hand-maintained copy instead of four. The
+  dashboard keeps its inline copy (that page must stay a single
+  self-contained file), the demo's is generated from it by
+  `scripts/build_demo.py`, and the logo lab and comparison page share an
+  extracted `docs/logo-engine.js`. A test pins the extract to the
+  dashboard's copy and fails either page for regrowing an inline one,
+  where only the dashboard and demo pair had a drift guard before.
 - A finished run's live-log ring buffer is released once a newer run
   supersedes it. Only the newest run's logs are replayable, but every
   retained history entry kept its full ring in memory anyway, so a

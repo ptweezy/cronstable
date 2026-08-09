@@ -1924,6 +1924,30 @@ def test_dag_state_colors_cover_dag_vocabulary_and_match_web():
     }
     for state, web_var in web_map.items():
         assert tui.DAG_STATE_COLOR[state] == web2tui[web_var], state
+    # ...and the TUI-only pseudo-states. The tabs substitute their own
+    # strings for rows the engine has no state for (an approval gate
+    # parked on a decision), and those never appear in dag.py or on the
+    # web page, so the two checks above cannot see them: a missing key
+    # falls through to "dim" and the row reads inert. Derived from the
+    # source rather than listed, so the next one cannot be forgotten.
+    import inspect
+
+    assigned = set()
+    for method in (
+        tui.AppDrawers._dag_tasks_tab,
+        tui.AppDrawers._dag_runs_tab,
+    ):
+        assigned |= set(
+            re.findall(r'\bstate = "([a-z_]+)"', inspect.getsource(method))
+        )
+    assert "awaiting" in assigned, (
+        "the approval-gate pseudo-state is gone; drop it from the map too"
+    )
+    for state in assigned:
+        assert state in tui.DAG_STATE_COLOR, (
+            "the dag tabs paint {!r}, which the map does not know, so it "
+            "renders in the neutral fallback ink".format(state)
+        )
 
 
 def test_tui_paints_a_pause_held_slot_as_skipped_not_ok():
@@ -2181,6 +2205,8 @@ def test_dispatch_reports_a_bad_ca_path_without_a_traceback(
 
     assert tui.dispatch(Args()) == 2
     assert "absent-ca.pem" in capsys.readouterr().err
+
+
 #  Pure helpers, plumbing, and the CLI entry point
 # ===================================================================
 def _iso_ago(seconds: float) -> str:
@@ -2216,12 +2242,15 @@ def test_more_format_helpers_branches():
     ).isoformat()
     assert fmt_ago(two_d, now) == "2d ago"
     assert ago_short(None) == "?"
-    assert ago_short(
-        datetime.datetime.fromtimestamp(
-            now - 30, tz=datetime.timezone.utc
-        ).isoformat(),
-        now,
-    ) == "30s"
+    assert (
+        ago_short(
+            datetime.datetime.fromtimestamp(
+                now - 30, tz=datetime.timezone.utc
+            ).isoformat(),
+            now,
+        )
+        == "30s"
+    )
     assert ago_short(two_h, now) == "2h"
     assert ago_short(two_d, now) == "2d"
     assert fmt_percent(None) == "—"
@@ -2965,6 +2994,35 @@ async def test_load_heat_falls_back_per_job_on_404(tmp_path):
     assert len(calls) == 13  # the probe plus one /runs per job
     assert app.heat_data["j00"] == [{"outcome": "success"}]
     assert app._heat_busy is False
+
+
+async def test_load_heat_batched_caps_like_the_fanout(tmp_path):
+    # /activity is capped in RUNS per job but not in JOBS, so a
+    # fleet-scale daemon hands the batched path a row list for every
+    # configured job. The card draws HEAT_MAX_JOBS of them, so retaining
+    # the rest is memory the user can never reach, and it left the two
+    # heat paths disagreeing: the fan-out has always capped. Both now
+    # take the same first-N-by-name slice.
+    app = _bare_app(tmp_path)
+    total = tui.HEAT_MAX_JOBS + 25
+    app.jobs = [{"name": "j%03d" % i} for i in range(total)]
+    app.by_name = {j["name"]: j for j in app.jobs}
+    row = {"outcome": "success", "finished_at": _iso_ago(60)}
+
+    class FakeApi:
+        async def get_json(self, path):
+            assert path == "/activity"
+            return {"jobs": {j["name"]: [row] for j in app.jobs}}
+
+    app.api = FakeApi()
+    app._heat_busy = True
+    await app._load_heat()
+    assert len(app.heat_data) == tui.HEAT_MAX_JOBS
+    # the first N by name: the order render_heat draws, so the retained
+    # set is the set the card can actually show
+    assert sorted(app.heat_data) == [
+        "j%03d" % i for i in range(tui.HEAT_MAX_JOBS)
+    ]
 
 
 async def test_load_heat_transient_batch_failure_keeps_stale_data(tmp_path):
