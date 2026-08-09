@@ -1770,6 +1770,115 @@ def bench_dag_mapped_drain():
         raise Skip("dag planning signature changed: %r" % exc) from None
 
 
+def _run_quiescent_advance(
+    dag, spec, build_body, *, variant, now, assert_unchanged
+):
+    """The shared harness of the two dag.advance_quiescent_* metrics.
+
+    Seeds build_body()'s in-flight run document, times 40 wrapped
+    reconcile_and_plan advances through backend.mutate_document, and
+    asserts every pass was quiescent (nothing reconciled, nothing
+    launched): a pass that did work means the fixture or the planner
+    broke and the region timed the wrong shape.  ``variant`` names the
+    run namespace, the tempdir prefix and the failure messages.
+    ``assert_unchanged`` adds the dependency-free variant's keep-path
+    contract: an advance reporting ``changed`` also counts as activity,
+    and the document files must be byte-identical afterwards.  The
+    chain variant deliberately asserts neither (its docstring says why).
+    """
+    import asyncio
+    import hashlib
+
+    try:
+        from cronstable.state import DOC_KEEP
+    except ImportError as exc:
+        raise Skip("state DOC_KEEP sentinel unavailable: %r" % exc) from None
+    ns = dag.DAG_RUN_NS_PREFIX + variant
+    run_key = "r"
+    passes = 40  # 20 measured under the 50ms rule on Linux
+
+    def _wrap_keep(transform):
+        def wrapped(cur):
+            new_body, result = transform(cur)
+            if not isinstance(new_body, dict):
+                return DOC_KEEP, result
+            return new_body, result
+
+        return wrapped
+
+    def _digest(files):
+        digest = hashlib.sha256()
+        for f in sorted(files):
+            with open(f, "rb") as handle:
+                digest.update(handle.read())
+        return digest.hexdigest()
+
+    async def run():
+        path = tempfile.mkdtemp(prefix="dag%s-" % variant, dir=_tmpdir())
+        backend = _state_backend(path)
+        await backend.start()
+        try:
+            body = build_body()
+            await backend.mutate_document(
+                ns, run_key, lambda cur, b=body: (b, None)
+            )
+            before = after = None
+            if assert_unchanged:
+                doc_files = [
+                    os.path.join(root, f)
+                    for root, _dirs, files in os.walk(path)
+                    for f in files
+                ]
+                before = _digest(doc_files)
+            results = []
+            t0 = time.perf_counter()
+            for _ in range(passes):
+                transform = _wrap_keep(
+                    dag.reconcile_and_plan(
+                        spec,
+                        now + 60.0,
+                        "bench-proc",
+                        "bench-host",
+                        lambda pid: True,
+                    )
+                )
+                _, result = await backend.mutate_document(
+                    ns, run_key, transform
+                )
+                results.append(result)
+            dt = time.perf_counter() - t0
+            if assert_unchanged:
+                after = _digest(doc_files)
+        finally:
+            await backend.stop()
+            shutil.rmtree(path, ignore_errors=True)
+        for result in results:
+            reconciled = getattr(result, "reconciled", 0)
+            advance = getattr(result, "advance", None)
+            changed = (
+                assert_unchanged
+                and advance is not None
+                and getattr(advance, "changed", False)
+            )
+            launches = advance is not None and getattr(advance, "launches", [])
+            if reconciled or changed or launches:
+                raise RuntimeError(
+                    "%s advance was not quiescent (%r); the metric would "
+                    "time the wrong shape" % (variant, result)
+                )
+        if assert_unchanged and before != after:
+            raise RuntimeError(
+                "quiescent advances rewrote the document; the keep path "
+                "did not hold"
+            )
+        return dt
+
+    try:
+        return asyncio.run(run())
+    except TypeError as exc:
+        raise Skip("reconcile_and_plan signature changed: %r" % exc) from None
+
+
 @bench(
     "dag.advance_quiescent_1k",
     "dag",
@@ -1791,28 +1900,18 @@ def bench_dag_advance_quiescent():
     quiescence (nothing reconciled, nothing changed) and the document file
     must be byte-unchanged afterwards.
     """
-    import asyncio
-    import hashlib
-
     dag = _dag_module()
     if not hasattr(dag, "reconcile_and_plan"):
         raise Skip("dag.reconcile_and_plan not present")
-    try:
-        from cronstable.state import DOC_KEEP
-    except ImportError as exc:
-        raise Skip("state DOC_KEEP sentinel unavailable: %r" % exc) from None
     n = _n(1000)
     now = 1700000000.0
-    ns = dag.DAG_RUN_NS_PREFIX + "quiet"
-    run_key = "r"
-    passes = 40  # 20 measured under the 50ms rule on Linux
     tasks = [dag.TaskSpec(id="t%d" % i) for i in range(n)]
     spec = dag.DagSpec.build("quiet", tasks)
 
     def _inflight_body():
         body = dag.new_run_body(
             dag="quiet",
-            run_key=run_key,
+            run_key="r",
             run_id="rid",
             logical_date=None,
             kind="scheduled",
@@ -1827,82 +1926,14 @@ def bench_dag_advance_quiescent():
             entry["attempt"] = 0
         return body
 
-    def _wrap_keep(transform):
-        def wrapped(cur):
-            new_body, result = transform(cur)
-            if not isinstance(new_body, dict):
-                return DOC_KEEP, result
-            return new_body, result
-
-        return wrapped
-
-    async def run():
-        path = tempfile.mkdtemp(prefix="dagquiet-", dir=_tmpdir())
-        backend = _state_backend(path)
-        await backend.start()
-        try:
-            body = _inflight_body()
-            await backend.mutate_document(
-                ns, run_key, lambda cur, b=body: (b, None)
-            )
-            doc_files = [
-                os.path.join(root, f)
-                for root, _dirs, files in os.walk(path)
-                for f in files
-            ]
-            before = hashlib.sha256()
-            for f in sorted(doc_files):
-                with open(f, "rb") as handle:
-                    before.update(handle.read())
-            results = []
-            t0 = time.perf_counter()
-            for _ in range(passes):
-                transform = _wrap_keep(
-                    dag.reconcile_and_plan(
-                        spec,
-                        now + 60.0,
-                        "bench-proc",
-                        "bench-host",
-                        lambda pid: True,
-                    )
-                )
-                _, result = await backend.mutate_document(
-                    ns, run_key, transform
-                )
-                results.append(result)
-            dt = time.perf_counter() - t0
-            after = hashlib.sha256()
-            for f in sorted(doc_files):
-                with open(f, "rb") as handle:
-                    after.update(handle.read())
-        finally:
-            await backend.stop()
-            shutil.rmtree(path, ignore_errors=True)
-        for result in results:
-            reconciled = getattr(result, "reconciled", 0)
-            advance = getattr(result, "advance", None)
-            changed = advance is not None and getattr(
-                advance, "changed", False
-            )
-            launches = advance is not None and getattr(
-                advance, "launches", []
-            )
-            if reconciled or changed or launches:
-                raise RuntimeError(
-                    "advance pass was not quiescent (%r); the metric would "
-                    "time the wrong shape" % (result,)
-                )
-        if before.hexdigest() != after.hexdigest():
-            raise RuntimeError(
-                "quiescent advances rewrote the document; the keep path "
-                "did not hold"
-            )
-        return dt
-
-    try:
-        return asyncio.run(run())
-    except TypeError as exc:
-        raise Skip("reconcile_and_plan signature changed: %r" % exc) from None
+    return _run_quiescent_advance(
+        dag,
+        spec,
+        _inflight_body,
+        variant="quiet",
+        now=now,
+        assert_unchanged=True,
+    )
 
 
 @bench(
@@ -1934,32 +1965,21 @@ def bench_dag_advance_quiescent_chain():
     planner's business, and pinning it here would make the metric fail on a
     legitimate change instead of measuring it.
     """
-    import asyncio
-
     dag = _dag_module()
     if not hasattr(dag, "reconcile_and_plan"):
         raise Skip("dag.reconcile_and_plan not present")
-    try:
-        from cronstable.state import DOC_KEEP
-    except ImportError as exc:
-        raise Skip("state DOC_KEEP sentinel unavailable: %r" % exc) from None
     n = _n(1000, floor=4)
     now = 1700000000.0
-    ns = dag.DAG_RUN_NS_PREFIX + "chain"
-    run_key = "r"
-    passes = 40
     tasks = [dag.TaskSpec(id="t0")]
     for i in range(1, n):
-        tasks.append(
-            dag.TaskSpec(id="t%d" % i, depends_on=("t%d" % (i - 1),))
-        )
+        tasks.append(dag.TaskSpec(id="t%d" % i, depends_on=("t%d" % (i - 1),)))
     spec = dag.DagSpec.build("chain", tasks)
     running_at = n // 2
 
     def _inflight_body():
         body = dag.new_run_body(
             dag="chain",
-            run_key=run_key,
+            run_key="r",
             run_id="rid",
             logical_date=None,
             kind="scheduled",
@@ -1982,61 +2002,14 @@ def bench_dag_advance_quiescent_chain():
                 entry["startedAt"] = now
         return body
 
-    def _wrap_keep(transform):
-        def wrapped(cur):
-            new_body, result = transform(cur)
-            if not isinstance(new_body, dict):
-                return DOC_KEEP, result
-            return new_body, result
-
-        return wrapped
-
-    async def run():
-        path = tempfile.mkdtemp(prefix="dagchain-", dir=_tmpdir())
-        backend = _state_backend(path)
-        await backend.start()
-        try:
-            body = _inflight_body()
-            await backend.mutate_document(
-                ns, run_key, lambda cur, b=body: (b, None)
-            )
-            results = []
-            t0 = time.perf_counter()
-            for _ in range(passes):
-                transform = _wrap_keep(
-                    dag.reconcile_and_plan(
-                        spec,
-                        now + 60.0,
-                        "bench-proc",
-                        "bench-host",
-                        lambda pid: True,
-                    )
-                )
-                _, result = await backend.mutate_document(
-                    ns, run_key, transform
-                )
-                results.append(result)
-            dt = time.perf_counter() - t0
-        finally:
-            await backend.stop()
-            shutil.rmtree(path, ignore_errors=True)
-        for result in results:
-            reconciled = getattr(result, "reconciled", 0)
-            advance = getattr(result, "advance", None)
-            launches = advance is not None and getattr(
-                advance, "launches", []
-            )
-            if reconciled or launches:
-                raise RuntimeError(
-                    "chain advance was not quiescent (%r); the metric would "
-                    "time the wrong shape" % (result,)
-                )
-        return dt
-
-    try:
-        return asyncio.run(run())
-    except TypeError as exc:
-        raise Skip("reconcile_and_plan signature changed: %r" % exc) from None
+    return _run_quiescent_advance(
+        dag,
+        spec,
+        _inflight_body,
+        variant="chain",
+        now=now,
+        assert_unchanged=False,
+    )
 
 
 @bench(

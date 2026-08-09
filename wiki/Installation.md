@@ -1,7 +1,7 @@
 # Installation
 
 This page covers every way to install cronstable: the published container image,
-`pip`, `pipx`, and the self-contained PyInstaller binaries. It documents the
+`pip`, `pipx`, Homebrew, winget, and the self-contained PyInstaller binaries. It documents the
 Python and platform requirements, the runtime dependencies, the exact binary
 release assets, and the writable-and-executable temp-directory requirement that
 applies to the standalone binary only. cronstable runs natively on
@@ -46,8 +46,11 @@ minimal/slim images that do not include the system tz data. See
 | pip | PyPI (`cronstable`) | No (uses your interpreter) | No |
 | pipx | PyPI (`cronstable`) | No (uses your interpreter) | No |
 | Standalone binary | GitHub Releases | Yes (embedded) | **Yes** |
+| Homebrew | cronstable tap (release binary) | Yes (embedded) | **Yes** |
+| winget | winget-pkgs (release binary) | Yes (embedded) | **Yes** |
 
-Only the standalone binary self-extracts at startup and therefore needs a
+Only the standalone binary, including the copies Homebrew and winget install,
+self-extracts at startup and therefore needs a
 writable and executable temp directory (see
 [Standalone binary temp-directory requirement](#standalone-binary-temp-directory-requirement)).
 The image and the `pip`/`pipx` installs run cronstable as a normal Python package
@@ -156,6 +159,32 @@ pipx install cronstable
 pipx still requires a supported Python (3.10 or newer) available to build the
 isolated environment.
 
+## Install using Homebrew
+
+On macOS or Linux, install from the cronstable
+[Homebrew tap](https://github.com/ptweezy/homebrew-tap):
+
+```shell
+brew install ptweezy/tap/cronstable
+```
+
+This installs the self-contained release binary for your platform (signed and
+notarized on macOS; glibc `amd64`/`arm64` on Linux via Homebrew on Linux), so no
+Python is required. Upgrade later with `brew upgrade cronstable`.
+
+## Install using winget
+
+On Windows, install the
+[winget package](https://github.com/microsoft/winget-pkgs/tree/master/manifests/p/ptweezy/cronstable):
+
+```shell
+winget install ptweezy.cronstable
+```
+
+This installs the self-contained release binary (`amd64` or `arm64`, matching
+your system), so no Python is required. Upgrade later with
+`winget upgrade ptweezy.cronstable`.
+
 ## Install using a binary
 
 A self-contained binary can be downloaded from
@@ -233,7 +262,7 @@ needed before first run.
 
 ### Standalone binary temp-directory requirement
 
-The standalone binary is a self-extracting executable: on each start it unpacks
+The standalone binary is a self-extracting PyInstaller executable: on each start it unpacks
 its embedded Python runtime into a temporary directory and loads shared
 libraries from there. It therefore needs a temporary directory that is both
 **writable and executable**. On an ordinary system the

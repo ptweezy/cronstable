@@ -234,6 +234,12 @@ paths:
         (304).
       parameters:
         - $ref: "#/components/parameters/IfNoneMatch"
+        - name: limit
+          in: query
+          description: >-
+            Max runs per job, newest kept (clamped to the retained
+            history; default serves the whole retained window).
+          schema: { type: integer }
       responses:
         "200":
           description: Recent run outcomes, per job.
@@ -462,14 +468,21 @@ paths:
       tags: [dags]
       summary: List DAGs
       operationId: listDags
+      description: >-
+        Supports `ETag` / `If-None-Match` (304) and gzip, like `GET /jobs`.
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
       responses:
         "200":
           description: Configured DAGs and their tasks.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Dag" }
+        "304": { description: Not modified (matching `If-None-Match`). }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /dags/{name}/runs:
@@ -665,12 +678,19 @@ paths:
       tags: [cluster]
       summary: Fleet-wide per-node job view
       operationId: getFleet
+      description: >-
+        Supports `ETag` / `If-None-Match` (304) and gzip, like `GET /jobs`.
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
       responses:
         "200":
           description: Each node's per-job run summaries.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+        "304": { description: Not modified (matching `If-None-Match`). }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /node:
@@ -1330,8 +1350,8 @@ components:
       type: object
       description: >-
         The uniform error envelope. Every 4xx/5xx body this API serves is
-        this object (the bodyless 401 aside), so clients parse failures one
-        way across every endpoint.
+        this object, the auth middleware's 401 included, so clients parse
+        failures one way across every endpoint.
       properties:
         error:
           type: string

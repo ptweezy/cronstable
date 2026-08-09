@@ -20,18 +20,21 @@ mutates the working tree it is measuring (and races a parallel test run).  The
 CI ``dist`` job builds and ``twine check``s the real artifact; this module
 covers the input those lists come from.
 
-The last pair of tests fences MANIFEST.in's sdist carve-out instead.  The
-sdist is seeded by setuptools_scm's git file finder, so ``prune docs`` plus
-two explicit add-backs are all that keeps ~116 MB of website screenshots out
-of it (an sdist that once blew past PyPI's 100 MiB per-file limit) while the
-two docs/ files the SHIPPED tests read still arrive.  Rename either of those
-files and the sdist silently loses it; the shipped suite then fails only for
-whoever installed from it.
+The last tests fence MANIFEST.in's sdist carve-out instead.  The sdist is
+seeded by setuptools_scm's git file finder, so ``prune docs`` plus a few
+explicit add-backs are all that keeps ~116 MB of website screenshots out of
+it (an sdist that once blew past PyPI's 100 MiB per-file limit) while the
+docs/ files the SHIPPED tests read still arrive.  Rename or forget one of
+those add-backs and the sdist silently loses the file; the shipped suite
+then fails only for whoever installed from it.  So beyond checking the
+add-backs exist, the suite scrapes its own source for repo docs/ reads and
+diffs that set against the add-back list.
 """
 
 import fnmatch
 import os
 import posixpath
+import re
 
 import pytest
 
@@ -199,10 +202,8 @@ def _manifest_add_backs(text):
 def test_manifest_add_backs_inside_pruned_trees_still_exist():
     with open(os.path.join(ROOT, "MANIFEST.in"), encoding="utf-8") as f:
         add_backs = _manifest_add_backs(f.read())
-    # docs/openapi.yaml and docs/demo/index.html, at the time of writing: the
-    # OpenAPI contract tests/test_openapi.py diffs against cron.WEB_ROUTES,
-    # and the mirror fixture tests/test_web_demo_mirror.py compares to
-    # cronstable/web/index.html. Both live under a pruned docs/.
+    # The add-backs all live under the pruned docs/ tree; the docs-read scan
+    # below keeps the list complete, this only checks the paths still exist.
     assert add_backs, (
         "MANIFEST.in no longer adds anything back inside a pruned tree; if "
         "the prune is still there, the shipped tests lost their fixtures."
@@ -236,3 +237,82 @@ def test_manifest_add_back_scan_only_looks_inside_pruned_trees():
         "docs/openapi.yaml",
         "private/notice.txt",
     ]
+
+
+def _docs_reads_in(source):
+    """Repo-relative ``docs/...`` paths one test module opens, from source.
+
+    Two idioms cover every real read today: ``os.path.join(ROOT, "docs",
+    ...)`` and a pathlib ``... / "docs" / ...`` chain.  Both anchor on the
+    repo root, which is what separates a read of the website tree from the
+    state-store tests that happen to name a namespace directory "docs".  A
+    test that reaches repo docs/ some third way must adopt one of these or
+    teach this scan the new idiom; the self-check in the test below fails
+    loudly if the scrape ever goes blind.
+    """
+    join_style = re.compile(
+        r'os\.path\.join\(\s*ROOT,\s*"docs"((?:,\s*"[^"]+")+)\s*\)'
+    )
+    slash_style = re.compile(r'/\s*"docs"((?:\s*/\s*"[^"]+")+)')
+    found = set()
+    for pattern in (join_style, slash_style):
+        for match in pattern.finditer(source):
+            segments = re.findall(r'"([^"]+)"', match.group(1))
+            found.add("/".join(["docs"] + segments))
+    return found
+
+
+def _docs_paths_read_by_tests():
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    found = set()
+    for name in sorted(os.listdir(tests_dir)):
+        if not name.endswith(".py"):
+            continue
+        with open(os.path.join(tests_dir, name), encoding="utf-8") as fh:
+            found |= _docs_reads_in(fh.read())
+    return found
+
+
+def test_every_docs_file_the_suite_reads_is_added_back_into_the_sdist():
+    # The failure this exists for: a test grows a new read under docs/ (or a
+    # docs file is renamed), MANIFEST.in is not updated, and the shipped
+    # suite starts raising FileNotFoundError, but only from an sdist install,
+    # which no local run or CI lane ever is.
+    with open(os.path.join(ROOT, "MANIFEST.in"), encoding="utf-8") as f:
+        add_backs = set(_manifest_add_backs(f.read()))
+    read_paths = _docs_paths_read_by_tests()
+    # self-check: the two longest-standing reads must be visible to the
+    # scrape, or the reading idiom changed and _docs_reads_in needs updating
+    assert {"docs/openapi.yaml", "docs/demo/index.html"} <= read_paths, (
+        "the docs-read scrape no longer sees the reads it was built on: %r"
+        % (sorted(read_paths),)
+    )
+    missing = sorted(read_paths - add_backs)
+    assert not missing, (
+        "the shipped test suite reads these docs/ paths but MANIFEST.in does "
+        "not add them back inside the pruned docs/ tree, so an sdist install "
+        "ships a test suite that cannot find its fixtures: %r" % (missing,)
+    )
+
+
+def test_docs_read_scan_catches_both_idioms_and_skips_lookalikes():
+    # Fences _docs_reads_in the same way the manifest scan is fenced above.
+    # The positive examples are assembled with join() so the idiom never
+    # appears contiguously in THIS file's source; the scan reads every test
+    # module including this one, and a literal fixture here would leak into
+    # the real scrape (it did, on first writing).
+    source = "\n".join(
+        (
+            ", ".join(('SPEC = os.path.join(ROOT', '"docs"', '"o.yaml")')),
+            " / ".join(('DEMO = P(__file__).parent.parent', '"docs"',
+                        '"demo"', '"index.html"')),
+            # a state-store namespace directory, not the website tree
+            'ns_dir = os.path.join(backend.base, "docs")',
+            # prune lists name the directory without reading anything from it
+            'for name in ("docs", "wiki", "benchmarks"):',
+        )
+    )
+    assert _docs_reads_in(source) == {
+        "docs/o.yaml",
+        "docs/demo/index.html",
+    }

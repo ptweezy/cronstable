@@ -324,42 +324,31 @@ option, or a missing required one such as `backup` without `-o`).
 
 ## Job-facing state commands
 
-Alongside the offline `state` admin actions above, cronstable ships a family of
-**job-facing** state commands -- `state get|set|delete|keys`, `cursor`, `lock`,
-`artifact`, `idempotent`, `secret`, and `xcom` -- that a *running job's* command line
-uses to reach the daemon's durable store. They are thin clients of the
-[loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) the
-daemon injects into every job's environment: each reads the injected
-`CRONSTABLE_STATE_URL` / `CRONSTABLE_STATE_TOKEN` and speaks HTTP over the standard
-library (no aiohttp, no event loop), so it starts instantly and needs no config
-file. Behavior is taken from `cronstable/jobcli.py`.
-
-These are meant to run **inside a job**, not from an operator shell: outside a
-job the injected environment is absent and every command exits `1` with `not
-running inside a cronstable job: CRONSTABLE_STATE_URL is not set`. They require a
-`state:` section with `jobApi.enabled` (the default); see the
-[endpoint reference](HTTP-API#job-facing-state-endpoints-loopback) and
-[Durable State](Durable-State).
-
-> The `state get|set|delete|keys` job actions **coexist** with the offline
-> `state backup|restore|migrate|gc|check|migrate-schema`
-> [admin actions](#the-state-subcommand) under the one `cronstable state` command;
-> the action name selects which handler runs. The admin actions operate offline
-> from `-c`; these job actions act through the running daemon and take no `-c`.
+Alongside the offline `state` admin actions above, a *running job's* command
+line reaches the daemon's durable store through the job-facing commands
+`state get|set|delete|keys`, `cursor`, `lock`, `artifact`, `idempotent`,
+`secret`, and `xcom`: thin clients of the
+[loopback state endpoint](HTTP-API#job-facing-state-endpoints-loopback) that
+read the injected `CRONSTABLE_STATE_URL` / `CRONSTABLE_STATE_TOKEN` and speak
+HTTP over the standard library (no aiohttp, no event loop), so they start
+instantly and need no config file (behavior is from `cronstable/jobcli.py`).
+The `state` job actions share the `cronstable state` name with the
+[admin actions](#the-state-subcommand); the action name selects the handler,
+and the job commands take no `-c`. Outside a job the injected environment is
+absent and every command exits `1` with `not running inside a cronstable job:
+CRONSTABLE_STATE_URL is not set`. This section keeps to each command's
+synopsis, flags, and exit codes; the semantics live in
+[Durable State](Durable-State#job-facing-state), which also covers the
+enabling `state.jobApi` config.
 
 ### Scope and exit codes
 
-Every KV, cursor, artifact, lock, and idempotency command acts in a *scope*: a
-namespace that defaults to the calling job's own name, so one job cannot read
-another's state by accident. Two mutually exclusive flags override it:
-
-| Flag | Meaning |
-| --- | --- |
-| `--scope NAME` | Act in the named scope. |
-| `--global` | Act in the shared `global` scope (deliberate cross-job coordination). |
-
-(`secret` takes neither flag: a run's secrets are always its own. `xcom` takes
-neither flag either: the daemon injects the DAG run's XCom scope.)
+Every KV, cursor, artifact, lock, and idempotency command acts in a *scope*, a
+namespace defaulting to the calling job's own name, and takes two mutually
+exclusive override flags: `--scope NAME` (act in the named scope) and
+`--global` (act in the shared `global` scope, for deliberate cross-job
+coordination). `secret` and `xcom` take neither flag: a run's secrets are
+always its own, and the daemon injects the DAG run's XCom scope.
 
 The commands share one exit-code convention, made for shell branching:
 
@@ -369,8 +358,8 @@ The commands share one exit-code convention, made for shell branching:
 | `1` | An error (a transport or store failure). |
 | `2` | Usage error (argparse; e.g. a command invoked with no action). |
 | `3` | A `lock acquire` / `lock run` did not get the lock. |
-| `4` | The looked-up key, cursor, artifact, or secret does not exist. |
-| `5` | The `idempotent` key was already claimed -- a duplicate. |
+| `4` | The looked-up key, cursor, artifact, secret, or XCom key does not exist (`state delete` of an absent key too). |
+| `5` | The `idempotent` key was already claimed (a duplicate). |
 
 ### `state get|set|delete|keys` (durable key/value)
 
@@ -381,10 +370,7 @@ cronstable state delete KEY [--scope NAME | --global]
 cronstable state keys [--scope NAME | --global]
 ```
 
-Durable, restart-surviving key/value storage. `get` prints the value (exit `4`
-if the key is absent); `set` stores it (as a string by default, or as a parsed
-JSON document with `--json`); `delete` removes it (exit `4` if it did not exist);
-`keys` prints one key per line for the scope.
+`--json` stores `VALUE` as a parsed JSON document rather than a string.
 
 ### `cursor get|advance` (ETL watermark)
 
@@ -393,12 +379,8 @@ cronstable cursor get NAME [--scope NAME | --global]
 cronstable cursor advance NAME VALUE [--force] [--scope NAME | --global]
 ```
 
-A monotonic marker an incremental job advances and never sees regress. `advance`
-moves the cursor to `VALUE` only when it is greater than the stored value (a
-numeric `VALUE` compares numerically, otherwise it compares as a string), so a
-replayed or out-of-order batch cannot walk it backwards; `--force` sets it
-unconditionally (a deliberate rewind). `get` prints the current value (exit `4`
-if the cursor is unset). Both print the resulting value.
+`advance` refuses to move the monotonic cursor backwards; `--force` sets it
+unconditionally (a deliberate rewind).
 
 ### `lock acquire|release|run` (distributed mutex/semaphore)
 
@@ -408,27 +390,16 @@ cronstable lock run NAME [--permits N] [--wait --timeout S] [--ttl S] [--scope N
 cronstable lock release TOKEN
 ```
 
-A fleet-wide mutex (or a semaphore, with `--permits N`) held as a daemon-renewed
-lease. `acquire` takes the lock and prints its hold token (exit `3` if it could
-not, unless `--wait` blocks up to `--timeout` seconds for a free permit);
-`release TOKEN` frees a lock by the token `acquire` printed (it takes no scope
-flags). `run` is the safe form: it holds the lock while running `COMMAND...`
-(everything after `--`), exits with the command's own exit code, and always
-releases the lock afterward -- even if the command fails or is signalled.
-`--ttl` overrides the lease TTL (default `state.jobApi.lockTtlSeconds`). The
-daemon also releases any lock a run still holds when the run ends, so a crash
-never leaks one.
-
-`--timeout` defaults to `0` seconds, so `--wait` alone makes a single pass
-over the permits and gives up immediately; give it a positive `--timeout` to
-actually block. `--permits` accepts `1` (the default -- a mutex) through
-`1024`; the daemon rejects a count outside that range (exit `1`), because
-every permit is a separate lease the acquire pass probes in turn.
-
-The `--` separator belongs to `lock run` alone: cronstable splits the trailing
-command off at the first `--` *before* argument parsing, so a bare `--` in any
-other invocation -- another subcommand, or even a flag-only call such as
-`cronstable --version --` -- is rejected with
+`acquire` prints a hold token, or exits `3` when no permit is free; `--wait`
+first blocks up to `--timeout` seconds (default `0`, so `--wait` alone makes
+one pass and gives up). `release` takes the token, and no scope flags. `run`
+holds the lock while `COMMAND...` (everything after `--`) runs and exits with
+the command's own exit code, or `3` if the lock was not acquired. `--permits`
+accepts `1` (the default, a mutex) through `1024`; a count outside that range
+exits `1`. `--ttl` overrides the lease TTL (default
+`state.jobApi.lockTtlSeconds`). The `--` separator belongs to `lock run`
+alone: cronstable splits the trailing command off at the first `--` before
+argument parsing, so a bare `--` in any other invocation is rejected with
 `` `--` is only valid before a `lock run` command `` and exits `2`.
 
 ### `artifact put|get|list` (named blob store)
@@ -439,11 +410,8 @@ cronstable artifact get NAME [-o FILE] [--scope NAME | --global]
 cronstable artifact list [--scope NAME | --global]
 ```
 
-Small named blobs published by one run and read back by a later run or a peer
-node. `put` publishes from `FILE` (or from stdin when `FILE` is omitted or `-`)
-and prints the payload's `sha256`; `get` writes the newest blob for `NAME` to
-`-o FILE` (or stdout when omitted or `-`, and exits `4` if the name was never
-published); `list` prints one artifact name per line.
+`put` reads `FILE`, or stdin when `FILE` is omitted or `-`; `get` writes to
+`-o FILE`, or stdout when omitted or `-`.
 
 ### `idempotent` (run-once guard)
 
@@ -451,13 +419,8 @@ published); `list` prints one artifact name per line.
 cronstable idempotent KEY [--ttl S] [--release] [--scope NAME | --global]
 ```
 
-A fleet-wide create-if-absent claim: the first caller to claim `KEY` exits `0`
-(fresh -- do the work), every later caller exits `5` (a duplicate -- skip it),
-made for a shell guard around an at-most-once side effect. A transport or
-store error exits `1` instead, distinct from the duplicate code, so an outage
-is detectable rather than reading as "already done". `--ttl S` expires the
-claim after `S` seconds (`0`, the default, is a permanent claim); `--release`
-drops the claim instead of making it, so `KEY` can be claimed fresh again.
+`--ttl S` expires the claim after `S` seconds (`0`, the default, is a
+permanent claim); `--release` drops the claim instead of making it.
 
 ### `secret get|list` (run-scoped secrets)
 
@@ -466,10 +429,7 @@ cronstable secret get NAME
 cronstable secret list
 ```
 
-Read a secret the daemon staged in memory for this run (resolved fresh per run,
-never written to the store, dropped when the run ends). `get` prints the value
-(exit `4` if no secret of that name is staged); `list` prints one staged name
-per line. There are no scope flags: a run sees only its own secrets.
+No flags. `get` exits `4` if no secret of that name is staged for this run.
 
 ### `xcom push|pull|list` (DAG cross-task data)
 
@@ -479,56 +439,12 @@ cronstable xcom pull --task TASK --key KEY [--map-index I] [-o FILE]
 cronstable xcom list
 ```
 
-Pass data between the tasks of a [DAG run](Orchestration-and-DAGs#xcom-passing-data-between-tasks).
-Only meaningful inside a task the DAG scheduler launched (the daemon injects the
-run's XCom scope and this task's id); outside one, the commands print a clean
-error and exit non-zero.
-
-- `push` publishes this task's output under `KEY` (from `FILE`, or stdin).
-- `pull` reads an upstream task's output; `--map-index` selects one instance of
-  a [mapped](Orchestration-and-DAGs#fan-out-dynamic-mapping) upstream. Writes to
-  `-o FILE` or stdout; exit `4` if that key was never published.
-- `list` prints the XCom keys published in this run.
-
-### Job command examples
-
-These run inside a job, where the daemon has injected `CRONSTABLE_STATE_URL` and
-`CRONSTABLE_STATE_TOKEN`.
-
-Advance an ETL watermark from the highest id this run processed, so the next run
-resumes from where it stopped:
-
-```shell
-last=$(cronstable cursor get rows 2>/dev/null || echo 0)
-process-rows --since "$last" --emit-max-id > max_id
-cronstable cursor advance rows "$(cat max_id)"
-```
-
-Hold a fleet-wide mutex while a critical section runs, releasing it
-automatically when the command finishes (or crashes):
-
-```shell
-cronstable lock run db-migrate --wait --timeout 300 -- ./apply-migrations.sh
-```
-
-Guard an at-most-once side effect so a retried or duplicated run sends today's
-invoices only once, fleet-wide:
-
-```shell
-if cronstable idempotent "invoice-$(date +%F)"; then
-    send-invoices
-else
-    echo "invoices already sent for today; skipping"
-fi
-```
-
-Hand a build artifact from one job to a shared scope another job reads:
-
-```shell
-cronstable artifact put report.pdf ./out/report.pdf --global
-# ...then, in a later job:
-cronstable artifact get report.pdf -o ./report.pdf --global
-```
+Pass data between the tasks of a
+[DAG run](Orchestration-and-DAGs#xcom-passing-data-between-tasks); outside a
+task the DAG scheduler launched, the commands print a clean error and exit
+non-zero. `push` reads `FILE` or stdin; `pull` writes to `-o FILE` or stdout,
+`--map-index I` selecting one instance of a
+[mapped](Orchestration-and-DAGs#fan-out-dynamic-mapping) upstream.
 
 ## The `mcp` subcommand
 

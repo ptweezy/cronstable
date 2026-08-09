@@ -40,11 +40,15 @@ from cronstable.backends.kubernetes import (
     resolve_namespace,
 )
 from cronstable.config import ConfigError, parse_config_string
+from tests._helpers import _utc_now_plus
 
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 
 def _backend(extra=""):
+    # Deliberately NOT tests/_helpers._backend (finding B2): that one builds
+    # the FilesystemStateBackend state store, while this builds the
+    # KubernetesBackend leadership backend from cluster YAML.
     yaml = (
         "cluster:\n"
         "  backend: kubernetes\n"
@@ -681,12 +685,6 @@ def test_view_dict_and_lease_detail():
     assert view["lease"]["expiry"] is not None
 
 
-def _utc_now_plus(seconds):
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        seconds=seconds
-    )
-
-
 async def test_renew_once_anchors_steal_at_observe_time(monkeypatch):
     # The steal anchor (_observed_at) must be the MONOTONIC instant we actually
     # read the Lease, not a timestamp captured before observe() returns.
@@ -1182,7 +1180,7 @@ def test_tls_files_changed_false_when_nothing_tracked():
     b = _backend()
     assert b.tls_files_changed() is False  # nothing recorded yet
     b._record_tls_files([None, ""])  # None/empty entries dropped
-    assert b._tls_files == []
+    assert b._tls_signature == {}
     assert b.tls_files_changed() is False
 
 

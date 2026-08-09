@@ -194,8 +194,11 @@ select = [
     "F",
     # Pycodestyle warnings
     "W",
-    # pyupgrade
-    # "UP",
+    # pyupgrade: only the typing-modernization codes (builtin generics, PEP
+    # 604 unions, deprecated typing imports); the full UP set stays off
+    "UP006",
+    "UP007",
+    "UP035",
     "I",  # <= import sorting
 ]
 

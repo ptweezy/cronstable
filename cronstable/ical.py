@@ -31,7 +31,8 @@ Rendering choices, all deliberate:
 import datetime
 import hashlib
 import math
-from typing import List, NamedTuple, Optional, Sequence
+from collections.abc import Sequence
+from typing import NamedTuple, Optional
 
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import _local_tzinfo, describe_cron
@@ -89,7 +90,7 @@ def _fold(line: str) -> str:
     if octets <= 75:
         return line
     data = line.encode("utf-8")
-    chunks: List[str] = []
+    chunks: list[str] = []
     limit = 75
     while data:
         cut = min(limit, len(data))
@@ -179,7 +180,7 @@ def render_calendar(
         duration = _duration_text(block)
         description = "Schedule: {}\n{}\nTimezone: {}".format(
             str(entry.tab),
-            describe_cron(str(entry.tab), hash_key=entry.name),
+            describe_cron(str(entry.tab), hash_key=entry.name, tab=entry.tab),
             str(entry.timezone) if entry.timezone is not None else "local",
         )
         if entry.avg_duration is not None and entry.avg_duration > 0:

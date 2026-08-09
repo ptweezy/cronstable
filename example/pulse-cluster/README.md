@@ -43,9 +43,15 @@ docker compose -f example/pulse-cluster/docker-compose.yml up --build
 - cronstable-c → <http://localhost:8082/> (also the upstream under test — a follower)
 
 A one-shot `certgen` service mints a throwaway cluster CA and one cert per node
-before the nodes start (`gen-certs.sh`; **local-experimentation certs only** —
-see the script's header). Scroll to the **cluster** panel on any dashboard to
-see the peer table, quorum, and elected leader.
+before the nodes start ([`../_shared/gen-certs.sh`](../_shared/gen-certs.sh);
+**local-experimentation certs only** — see the script's header). Each node's
+`cluster:` section (nodeName, peers, TLS identity) is generated at start from
+environment variables by the shared
+[`../_shared/node-entrypoint.sh`](../_shared/node-entrypoint.sh); the annotated
+hand-written version of that section lives in
+[`example/cluster`](../cluster)'s `node-*.yaml` files. Scroll to the
+**cluster** panel on any dashboard to see the peer table, quorum, and elected
+leader.
 
 Stop and wipe (including the throwaway certs):
 
@@ -73,9 +79,12 @@ name, so never the leader). That keeps these two demos from interfering:
 
 ## Spread the leader work (optional)
 
-By default one leader runs every `Leader` job. Uncomment `distribution: spread`
-in **all three** `node-*.yaml` files and recreate
-(`docker compose -f example/pulse-cluster/docker-compose.yml up -d`):
+By default one leader runs every `Leader` job. Recreate with `DISTRIBUTION=spread`:
+
+```console
+DISTRIBUTION=spread docker compose -f example/pulse-cluster/docker-compose.yml up -d
+```
+
 `latency-slo` and `sla-rollup` then get per-job owners via rendezvous hashing,
 so they can land on different nodes instead of both on the leader — same quorum
 gate, same guarantee, just spread out.

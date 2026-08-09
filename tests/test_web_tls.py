@@ -16,8 +16,6 @@ Style follows tests/test_state_job_api.py: bare ``async def``, the server in
 a ``try`` with ``cleanup()`` in ``finally``.
 """
 
-import datetime
-import socket
 import ssl
 
 import aiohttp
@@ -30,166 +28,17 @@ from cronstable.config import (
     parse_config_string,
 )
 from cronstable.cron import Cron, web_site_from_url
+from tests._helpers import _backend, _free_port, _state_cfg, _write_tls
 
-NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+# The TLS cert cluster (_gen_ca/_gen_leaf/_write_tls/_free_port) lives in
+# tests/_helpers.py; this file uses its defaults (cn="web-ca", a localhost
+# leaf with loopback IP SANs, files <cn>-leaf.pem / <cn>-leaf.key), which
+# reproduce the copy that used to live here.
 
 # A syntactically-PEM-looking file that no TLS stack can parse: the shape a
 # half-written rotation leaves behind, and what the loadability probes must
 # treat as "not yet".
 GARBAGE_PEM = b"-----BEGIN CERTIFICATE-----\nnot-valid-base64\n"
-
-
-def _free_port():
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
-
-
-def _gen_ca(cn):
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(NOW - datetime.timedelta(days=1))
-        .not_valid_after(NOW + datetime.timedelta(days=3650))
-        .add_extension(
-            x509.BasicConstraints(ca=True, path_length=None), critical=True
-        )
-        .add_extension(
-            # OpenSSL 3.x rejects a CA with no key-usage extension ("CA cert
-            # does not include key usage extension"), so keyCertSign has to be
-            # spelled out.
-            x509.KeyUsage(
-                digital_signature=False,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    return key, cert
-
-
-def _gen_leaf(ca_key, ca_cert, cn):
-    """A leaf covering localhost AND the loopback literals.
-
-    tests/test_cluster.py's leaf carries only a ``DNSName`` SAN, which is
-    enough for a peer dialled by name. A listener test dials
-    ``https://127.0.0.1:PORT``, and hostname verification (on by default, and
-    what an operator actually gets) needs an IP SAN to match that, so this
-    one carries both forms.
-    """
-    import ipaddress
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-
-    key = ec.generate_private_key(ec.SECP256R1())
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(
-            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-        )
-        .issuer_name(ca_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(NOW - datetime.timedelta(days=1))
-        .not_valid_after(NOW + datetime.timedelta(days=3650))
-        .add_extension(
-            x509.SubjectAlternativeName(
-                [
-                    x509.DNSName("localhost"),
-                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
-                    x509.IPAddress(ipaddress.ip_address("::1")),
-                ]
-            ),
-            critical=False,
-        )
-        .add_extension(
-            # OpenSSL 3.x refuses a chain whose leaf carries no authority key
-            # identifier ("Missing Authority Key Identifier"), so this is not
-            # decoration.
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                ca_key.public_key()
-            ),
-            critical=False,
-        )
-        .add_extension(
-            x509.ExtendedKeyUsage(
-                [
-                    ExtendedKeyUsageOID.SERVER_AUTH,
-                    ExtendedKeyUsageOID.CLIENT_AUTH,
-                ]
-            ),
-            critical=False,
-        )
-        .sign(ca_key, hashes.SHA256())
-    )
-    return key, cert
-
-
-def _write_tls(dirpath, cn="web-ca"):
-    """Mint a CA plus one leaf under ``dirpath``; return the three paths.
-
-    A plain function taking ``tmp_path`` rather than a fixture, matching
-    tests/test_cluster.py (this repo has no conftest.py and defines no
-    fixtures of its own). The ``importorskip`` lives here so every caller
-    self-skips: cryptography has no win-arm64 wheel and cannot build from
-    source on that runner, so it is not installed there.
-
-    ``cn`` prefixes the filenames, so a second, untrusted CA can be minted
-    into the same ``tmp_path`` for the rejection tests.
-    """
-    pytest.importorskip(
-        "cryptography",
-        reason="cryptography unavailable on this platform (e.g. win-arm64)",
-    )
-    from cryptography.hazmat.primitives import serialization
-
-    ca_key, ca_cert = _gen_ca(cn)
-    leaf_key, leaf_cert = _gen_leaf(ca_key, ca_cert, "localhost")
-    ca_path = dirpath / (cn + "-ca.pem")
-    cert_path = dirpath / (cn + "-leaf.pem")
-    key_path = dirpath / (cn + "-leaf.key")
-    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-    cert_path.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        leaf_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    return {
-        "ca": str(ca_path),
-        "cert": str(cert_path),
-        "key": str(key_path),
-    }
 
 
 class _StubRunner:
@@ -421,45 +270,47 @@ def _web_yaml(listen, tls=""):
     return body + tls
 
 
-def test_web_tls_cert_without_key_is_refused():
-    with pytest.raises(ConfigError, match="must be set together"):
-        _cfg(
-            _web_yaml(["https://0.0.0.0:8443"], "  tls:\n    cert: /c\n")
-        )
-
-
-def test_web_tls_client_ca_without_cert_is_refused():
-    with pytest.raises(
-        ConfigError, match="cannot require client certificates"
-    ):
-        _cfg(
-            _web_yaml(["https://0.0.0.0:8443"], "  tls:\n    clientCa: /ca\n")
-        )
-
-
-def test_web_tls_without_an_https_listener_is_refused():
-    with pytest.raises(ConfigError, match="no web.listen address uses https"):
-        _cfg(
-            _web_yaml(
-                ["http://0.0.0.0:8080"],
-                "  tls:\n    cert: /c\n    key: /k\n",
-            )
-        )
-
-
-def test_web_https_listener_without_tls_is_refused():
-    with pytest.raises(ConfigError, match="no web.tls.cert"):
-        _cfg(_web_yaml(["https://0.0.0.0:8443"]))
-
-
-def test_web_tls_is_validated_without_a_metrics_block():
-    # guards the early returns in _validate_web_config: a TLS check appended
-    # after them would be dead code for every config with no metrics section,
-    # which is the common case.
-    with pytest.raises(ConfigError, match="must be set together"):
-        _cfg(
-            _web_yaml(["https://0.0.0.0:8443"], "  tls:\n    key: /k\n")
-        )
+@pytest.mark.parametrize(
+    ("listen", "tls", "match"),
+    [
+        pytest.param(
+            ["https://0.0.0.0:8443"],
+            "  tls:\n    cert: /c\n",
+            "must be set together",
+            id="cert-without-key",
+        ),
+        pytest.param(
+            ["https://0.0.0.0:8443"],
+            "  tls:\n    clientCa: /ca\n",
+            "cannot require client certificates",
+            id="client-ca-without-cert",
+        ),
+        pytest.param(
+            ["http://0.0.0.0:8080"],
+            "  tls:\n    cert: /c\n    key: /k\n",
+            "no web.listen address uses https",
+            id="tls-without-an-https-listener",
+        ),
+        pytest.param(
+            ["https://0.0.0.0:8443"],
+            "",
+            "no web.tls.cert",
+            id="https-listener-without-tls",
+        ),
+        # guards the early returns in _validate_web_config: a TLS check
+        # appended after them would be dead code for every config with no
+        # metrics section, which is the common case.
+        pytest.param(
+            ["https://0.0.0.0:8443"],
+            "  tls:\n    key: /k\n",
+            "must be set together",
+            id="validated-without-a-metrics-block",
+        ),
+    ],
+)
+def test_web_tls_misconfiguration_is_refused(listen, tls, match):
+    with pytest.raises(ConfigError, match=match):
+        _cfg(_web_yaml(listen, tls))
 
 
 def test_web_tls_accepted_with_an_https_listener():
@@ -516,23 +367,38 @@ def test_jobapi_https_listen_is_accepted():
     assert cfg["jobApi"]["tls"]["ca"] == "/ca"
 
 
-def test_jobapi_tls_without_an_https_listen_is_refused():
-    with pytest.raises(ConfigError, match="would be ignored"):
-        _cfg(
-            _state_yaml(
-                "127.0.0.1:9000", "    tls:\n      cert: /c\n      key: /k\n"
-            )
-        )
-
-
-def test_jobapi_https_without_tls_is_refused():
-    with pytest.raises(ConfigError, match="no certificate to serve"):
-        _cfg(
-            _state_yaml(
-                "https://10.0.0.5:9000",
-                extra="    allowNonLoopbackBind: true\n",
-            )
-        )
+@pytest.mark.parametrize(
+    ("listen", "tls", "extra", "match"),
+    [
+        pytest.param(
+            "127.0.0.1:9000",
+            "    tls:\n      cert: /c\n      key: /k\n",
+            "",
+            "would be ignored",
+            id="tls-without-an-https-listen",
+        ),
+        pytest.param(
+            "https://10.0.0.5:9000",
+            "",
+            "    allowNonLoopbackBind: true\n",
+            "no certificate to serve",
+            id="https-without-tls",
+        ),
+        # `ca` is injected into every job as CRONSTABLE_STATE_CACERT, so left
+        # set against a plaintext endpoint it is inert and misleading, and a
+        # bad path in it fails the job CLI on a channel it was never used on.
+        pytest.param(
+            "127.0.0.1:9000",
+            "    tls:\n      ca: /ca\n",
+            "",
+            "would be ignored",
+            id="ca-alone-against-a-plaintext-listen",
+        ),
+    ],
+)
+def test_jobapi_tls_misconfiguration_is_refused(listen, tls, extra, match):
+    with pytest.raises(ConfigError, match=match):
+        _cfg(_state_yaml(listen, tls, extra))
 
 
 @pytest.mark.parametrize(
@@ -567,14 +433,6 @@ def test_jobapi_https_named_host_is_not_treated_as_a_wildcard():
         )
     ).state_config
     assert cfg["jobApi"]["listen"] == "https://jobs.internal:9000"
-
-
-def test_jobapi_tls_ca_alone_against_a_plaintext_listen_is_refused():
-    # `ca` is injected into every job as CRONSTABLE_STATE_CACERT, so left set
-    # against a plaintext endpoint it is inert and misleading, and a bad path
-    # in it fails the job CLI on a channel it was never used on.
-    with pytest.raises(ConfigError, match="would be ignored"):
-        _cfg(_state_yaml("127.0.0.1:9000", "    tls:\n      ca: /ca\n"))
 
 
 def test_jobapi_tls_defaults_are_filled():
@@ -775,8 +633,6 @@ async def test_in_place_rotation_restarts_the_listener(tmp_path):
 
         # rotate IN PLACE: mint fresh material elsewhere, then overwrite the
         # configured paths with it, which is what a secret refresh does.
-        # rotate IN PLACE: mint fresh material elsewhere, then overwrite the
-        # configured paths with it, which is what a secret refresh does.
         rotated = _write_tls(tmp_path, cn="rotated")
         for field in ("cert", "key"):
             _copy_bytes(rotated[field], config["tls"][field])
@@ -827,8 +683,6 @@ async def test_job_state_api_serves_over_tls(tmp_path):
     # to jobs, and a real request completing over it.
     from cronstable.jobapi import JobStateAPI
 
-    from tests.test_state import _backend
-
     tls = _write_tls(tmp_path)
     port = _free_port()
     backend = _backend(tmp_path)
@@ -870,8 +724,6 @@ async def test_job_state_api_plaintext_base_url_is_unchanged(tmp_path):
     # the ephemeral loopback default keeps the http scheme and the BOUND
     # address, which is the only thing that knows the OS-assigned port
     from cronstable.jobapi import JobStateAPI
-
-    from tests.test_state import _backend
 
     backend = _backend(tmp_path)
     await backend.start()
@@ -952,8 +804,6 @@ async def test_plaintext_job_api_has_no_tls_signature(tmp_path):
     # The loopback plaintext default (crypto-free, so this runs everywhere)
     # watches no files: its signature is None, so the rotation check
     # short-circuits and a no-op reload never disturbs the endpoint.
-    from tests.test_state import _state_cfg
-
     cfg = _state_cfg("state:\n  path: " + str(tmp_path))
     cron = Cron(None)
     try:
@@ -974,8 +824,6 @@ async def test_job_api_in_place_rotation_restarts_only_the_listener(tmp_path):
     # byte-identical across a rotation, so only the file signature notices it.
     # The restart rebuilds ONLY the listener: the store backend, and the
     # object identity that proves it, are untouched.
-    from tests.test_state import _state_cfg
-
     tls = _write_tls(tmp_path)
     port = _free_port()
     cfg = _state_cfg(_job_api_state_yaml(tmp_path / "store", port, tls))
@@ -1021,8 +869,6 @@ async def test_job_api_half_written_rotation_keeps_the_old_listener(
     # A half-written rotation (cert-manager / Vault / a Kubernetes secret
     # refresh is not atomic across the files) must keep the working endpoint up
     # and retry, not tear it down and then fail to rebuild.
-    from tests.test_state import _state_cfg
-
     tls = _write_tls(tmp_path)
     port = _free_port()
     cfg = _state_cfg(_job_api_state_yaml(tmp_path / "store", port, tls))

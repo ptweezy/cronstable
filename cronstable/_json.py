@@ -25,7 +25,8 @@ stays stable and backend-independent whether or not a given host has orjson.
 import json as _stdlib
 import math
 import re
-from typing import Any, Iterable, Union, cast
+from collections.abc import Iterable
+from typing import Any, cast
 
 try:
     import orjson
@@ -130,7 +131,7 @@ def _checked_parse_int(text: str) -> int:
 
 
 def _has_wide_int_run(
-    data: Union[bytes, bytearray, memoryview, str],
+    data: bytes | bytearray | memoryview | str,
 ) -> bool:
     # Wider than :func:`loads`' own ``Union[bytes, str]`` on purpose: the
     # translate path below needs a real ``bytes``/``bytearray``, so the
@@ -351,7 +352,7 @@ if orjson is not None:
             ensure_portable(obj)
             raise
 
-    def loads(data: Union[bytes, str]) -> Any:
+    def loads(data: bytes | str) -> Any:
         """Parse JSON from ``bytes`` or ``str``.
 
         Raises :class:`UnsupportedValue` for an integer literal outside the
@@ -408,16 +409,24 @@ else:
         )
         return text.encode("utf-8")
 
-    def loads(data: Union[bytes, str]) -> Any:
+    def loads(data: bytes | str) -> Any:
         """Parse JSON from ``bytes`` or ``str``.
 
         Raises :class:`UnsupportedValue` for an integer literal outside the
         portable 64-bit window, identically on both backends (see the
         prescan notes above; without the check a stdlib host would hand
         back an exact big int where an orjson host hands back a lossy
-        float).
+        float).  Bytes decode as strict UTF-8 first, matching orjson's
+        bytes contract: the stdlib's own encoding sniff (detect_encoding)
+        would accept a BOM and UTF-16/-32 payloads orjson refuses, and one
+        document must reach one verdict on every host (dagrun's mapped
+        fan-out parses XCom bytes through here).  The prescan runs on the
+        original bytes to keep its translate fast path.
         """
-        if _has_wide_int_run(data):
+        wide = _has_wide_int_run(data)
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8")
+        if wide:
             return _stdlib.loads(data, parse_int=_checked_parse_int)
         return _stdlib.loads(data)
 
