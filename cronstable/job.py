@@ -512,13 +512,21 @@ class StreamReader:
     @staticmethod
     def _emit(out_stream, out_line: str) -> None:
         # Write bytes so we control the encoding, and use the STREAM'S OWN
-        # encoding, not a hardcoded UTF-8: on POSIX and on a real Windows
-        # console that is UTF-8 anyway, while a Windows daemon whose output
-        # is redirected to a pipe or log file declares the ANSI code page,
-        # and UTF-8 bytes in that file read back as mojibake. Replacement
-        # (not raising) for what the target encoding cannot carry; ASCII
-        # with replacement remains the last-ditch fallback for a stream
-        # with a broken or unknown encoding.
+        # encoding, not a hardcoded UTF-8: a Windows daemon whose output is
+        # redirected to a pipe or log file declares the ANSI code page, and
+        # UTF-8 bytes in that file read back as mojibake. Replacement (not
+        # raising) for what the target encoding cannot carry; ASCII with
+        # replacement remains the last-ditch fallback for a stream with a
+        # broken or unknown encoding.
+        #
+        # A real console and almost every POSIX process declare UTF-8 (PEP
+        # 538 coerces the C locale, PEP 540 turns UTF-8 mode on by default
+        # from 3.15), so those streams get the same bytes either way. Under
+        # an explicit non-UTF-8 locale they do not: non-ASCII job output
+        # reaches the mirror as `?` rather than as UTF-8 the stream never
+        # claimed it could carry. That side of the trade is deliberate,
+        # since the mirror is read by whatever the operator pointed the
+        # daemon's stdout at.
         try:
             encoding = getattr(out_stream, "encoding", None) or "utf-8"
             payload = out_line.encode(encoding, errors="replace")

@@ -1610,6 +1610,96 @@ async def test_web_app_enforces_auth_when_token_configured(start_web_app):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_route_is_gated_by_the_real_app(start_web_app):
+    """POST /shutdown through the real router and middleware stack.
+
+    The handler's own refusal is unit-tested in test_cron_lifecycle.py,
+    but that test drives the coroutine directly and so proves nothing
+    about the wiring the refusal depends on: that the route is registered
+    at all, that it never lands in WEB_PUBLIC_PATHS, and that its scope
+    resolves to `control` rather than the `view` every read endpoint
+    takes.  Each of those is a one-line edit elsewhere, and any of them
+    would turn the stop switch loose without failing a single test.
+    """
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await start_web_app(
+        cron,
+        {
+            "listen": ["http://127.0.0.1:0"],
+            # `view` alone must not carry it, so the scoped table is what
+            # exercises the gate; `admin` is the full-scope control token.
+            "authTokens": [
+                {"label": "readonly", "scopes": ["view"], "value": "ro-tok"},
+                {
+                    "label": "admin",
+                    "scopes": ["view", "control"],
+                    "value": "rw-tok",
+                },
+            ],
+            # the UI page is the one public path; /shutdown must not join it
+            "ui": True,
+        },
+    )
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+    async with aiohttp.ClientSession() as session:
+        # public UI, to prove the listener really is the ui-enabled shape
+        # that widens WEB_PUBLIC_PATHS
+        async with session.get(base + "/") as resp:
+            assert resp.status == 200
+        # no credentials: the auth middleware refuses before the handler
+        async with session.post(base + "/shutdown") as resp:
+            assert resp.status == 401
+        assert not cron._stop_event.is_set()
+        # authenticated but read-only: 403 from the SCOPE check, which is
+        # the assertion that pins /shutdown to `control`
+        async with session.post(
+            base + "/shutdown", headers={"Authorization": "Bearer ro-tok"}
+        ) as resp:
+            assert resp.status == 403
+            assert "control" in (await resp.json())["error"]
+        assert not cron._stop_event.is_set()
+        # the control token drives the same drain Ctrl-C/SIGTERM trigger
+        async with session.post(
+            base + "/shutdown", headers={"Authorization": "Bearer rw-tok"}
+        ) as resp:
+            assert resp.status == 200
+            assert await resp.json() == {"shuttingDown": True}
+    assert cron._stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_route_refuses_on_a_listener_with_no_tokens():
+    """The open-listener case, end to end.
+
+    With no token configured there is no auth middleware, so every other
+    route is reachable by anyone who can connect.  /shutdown is the one
+    that must still refuse: reachable (not a 404, so the route really is
+    registered on this shape too) and refused with the remedy named.
+    """
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    try:
+        await cron.start_stop_web_app({"listen": ["http://127.0.0.1:0"]})
+        port = cron.web_runner.addresses[0][1]
+        base = "http://127.0.0.1:{}".format(port)
+        async with aiohttp.ClientSession() as session:
+            # the neighbouring control route is wide open on this listener
+            async with session.get(base + "/jobs") as resp:
+                assert resp.status == 200
+            async with session.post(base + "/shutdown") as resp:
+                assert resp.status == 403
+                assert "web.authToken" in (await resp.json())["error"]
+        assert not cron._stop_event.is_set()
+    finally:
+        await cron.start_stop_web_app(None)
+        await asyncio.sleep(0.25)
+
+
+@pytest.mark.asyncio
 async def test_web_app_ui_path_public_but_data_paths_require_auth(
     start_web_app,
 ):
