@@ -465,11 +465,15 @@ Reduction of code. Fixing of bugs and optimizations throughout.
 
 Windows fixes and additions from a gap review against Task Scheduler.
 
-- `shell: cmd` actually runs the command. cronstable now passes cmd.exe its
-  `/c` flag (every other shell keeps `-c`); before, cmd.exe was handed the
-  POSIX `-c`, started an interactive shell, printed its banner, read EOF
-  and exited 0, so the job recorded a clean success forever without ever
-  running anything. The shell reporter had the same flaw and the same fix.
+- `shell: cmd` actually runs the command. cronstable now spawns it the way
+  the Windows default shell has always been spawned: the command string
+  goes to `%ComSpec% /c` untouched, while every other shell keeps its argv
+  and `-c`. Before, cmd.exe was handed the POSIX `-c`, started an interactive
+  shell, printed its banner, read EOF and exited 0, so the job recorded a
+  clean success forever without ever running anything. Going through the
+  command processor rather than an argv also keeps embedded double quotes
+  intact, which cmd.exe's own quoting rules would otherwise mangle. The
+  shell reporter had the same flaw and the same fix.
 - Jobs are spawned in their own Windows process group. Ctrl-C in the
   daemon's console no longer kills every in-flight job with 0xC000013A
   and then reports each one failed through every configured reporter;
@@ -482,21 +486,27 @@ Windows fixes and additions from a gap review against Task Scheduler.
   `killTimeout` means on Windows what it means on POSIX. Where no
   console is shared (a service context) the graceful step degrades to
   the immediate tree kill, as before.
-- Closing the daemon's console window, logging off, and OS shutdown now
-  trigger the graceful drain (a native console-control handler; Python's
-  signal module never surfaces those events), bounded by the few seconds
-  of grace Windows grants.
+- Closing the daemon's console window and OS shutdown now trigger the
+  graceful drain (a native console-control handler; Python's signal module
+  never surfaces those events), bounded by the few seconds of grace
+  Windows grants. Logoff is deliberately not one of them: only session-0
+  processes receive that event, it fires for every user's sign-out, and
+  draining on it would stop an unattended daemon whenever anyone closed
+  an RDP session.
 - `POST /shutdown` runs the same graceful drain as Ctrl-C/SIGTERM, for
   supervised and console-less deployments. It is refused unless the
   request carries a configured bearer token, even where the rest of the
   API is open.
 - The Windows default config path prefers the machine-wide
-  `%ProgramData%\cronstable` whenever that directory exists, falling back
-  to the per-user `%APPDATA%\cronstable` as before, so a service account
-  and an interactive administrator resolve the same configuration.
+  `%ProgramData%\cronstable` whenever that directory holds configuration,
+  falling back to the per-user `%APPDATA%\cronstable` as before, so a
+  service account and an interactive administrator resolve the same
+  configuration. An empty machine-wide directory does not take over: it
+  would load zero jobs and suppress the config-not-found error with it.
 - `cronstable init` writes a commented starter configuration into the
-  default config directory (or a directory of your choosing), and the
-  config-not-found error now names the path it looked in and suggests it.
+  default config directory, a directory of your choosing, or the one named
+  by `-c`, and the config-not-found error now names the path it looked in
+  and suggests it.
 - Captured job output decodes as strict UTF-8 with an OEM-code-page retry
   on Windows, so `dir` output and localized OS messages keep their
   accents instead of collapsing to replacement characters; the

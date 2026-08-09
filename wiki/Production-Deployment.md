@@ -382,8 +382,9 @@ on the Installation page for the error messages and the Docker `--tmpfs`
   and shuts down gracefully, so the default pod termination path works without
   extra configuration. On Windows (where the Proactor loop has no
   `add_signal_handler`) it instead handles `SIGINT`/`SIGBREAK` via
-  `signal.signal` plus a heartbeat timer, and console close / logoff / OS
-  shutdown via a native console-control handler; either way it finishes the
+  `signal.signal` plus a heartbeat timer, and console close / OS shutdown via
+  a native console-control handler (logoff deliberately excluded, since a
+  service receives it for every user's sign-out); either way it finishes the
   currently-running jobs first. Supervised deployments can also stop it over
   HTTP with the authenticated `POST /shutdown` route. See
   [Running on Windows](Running-on-Windows) and the
@@ -393,8 +394,8 @@ on the Installation page for the error messages and the Docker `--tmpfs`
   Reference](CLI-Reference).
 * **Config not found**: the default config path is platform-specific:
   `/etc/cronstable.d` on POSIX; on Windows `%ProgramData%\cronstable` when that
-  directory exists, else `%APPDATA%\cronstable` (falling back to the user
-  profile `~` if `APPDATA` is unset). When `-c` is left at whichever is the
+  directory holds configuration, else `%APPDATA%\cronstable` (falling back to
+  the user profile `~` if `APPDATA` is unset). When `-c` is left at whichever is the
   platform default and that path does not exist, cronstable prints an error and exits
   non-zero. In the container, ensure the config volume is mounted at
   `/etc/cronstable.d`.

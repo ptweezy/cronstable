@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -293,6 +294,66 @@ def test_init_defaults_to_the_platform_config_directory(
     # the default location needs no -c to start
     out = capsys.readouterr().out
     assert "start the scheduler with: cronstable\n" in out
+
+
+def test_init_writes_to_the_root_config_flag(monkeypatch, tmp_path, capsys):
+    # The not-found error that sends people to `init` names -c/--config, so
+    # `cronstable -c DIR init` is a natural reading of it. It used to write
+    # the starter to the default location and report success.
+    fake_default = str(tmp_path / "default-confdir")
+    target = tmp_path / "chosen"
+    monkeypatch.setattr(main, "CONFIG_DEFAULT", fake_default)
+    monkeypatch.setattr(sys, "argv", ["cronstable", "-c", str(target), "init"])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    assert (target / "cronstable.yaml").is_file()
+    assert not os.path.exists(fake_default)  # the default is untouched
+    out = capsys.readouterr().out
+    assert "cronstable -c {}".format(target) in out
+
+
+def test_init_directory_wins_over_a_disagreeing_config_flag(
+    monkeypatch, tmp_path, capsys
+):
+    # Both given and pointing elsewhere: the positional wins (it is the
+    # more specific of the two), but silently writing to one of two named
+    # directories is how a starter ends up somewhere nobody looks.
+    positional = tmp_path / "positional"
+    flagged = tmp_path / "flagged"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cronstable", "-c", str(flagged), "init", str(positional)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 0
+    assert (positional / "cronstable.yaml").is_file()
+    assert not flagged.exists()
+    assert "disagree" in capsys.readouterr().err
+
+
+def test_init_reports_an_unreadable_target(monkeypatch, tmp_path, capsys):
+    # The existing-config scan must fail like every other init failure. It
+    # used to sit outside the OSError guard and traceback instead.
+    target = tmp_path / "confdir"
+    target.mkdir()
+    real_listdir = os.listdir
+
+    def deny(path, *args, **kwargs):
+        if os.path.abspath(path) == os.path.abspath(str(target)):
+            raise PermissionError(13, "Permission denied")
+        return real_listdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "listdir", deny)
+    monkeypatch.setattr(sys, "argv", ["cronstable", "init", str(target)])
+    with pytest.raises(SystemExit) as exc:
+        main.main_loop(_loop())
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "cronstable init: could not read" in err
+    assert "Permission denied" in err
 
 
 def test_config_error_exits_1(monkeypatch):

@@ -9,7 +9,7 @@ settings inherit from defaults. All behavior here is implemented in
 ## Config loading entry points
 
 cronstable resolves the `-c`/`--config` argument (default `/etc/cronstable.d` on
-POSIX; on Windows `%ProgramData%\cronstable` when it exists, else
+POSIX; on Windows `%ProgramData%\cronstable` when it holds configuration, else
 `%APPDATA%\cronstable`, falling back to `~` if APPDATA is unset; see
 [CLI Reference](CLI-Reference) and [Running on Windows](Running-on-Windows))
 through `parse_config(config_arg)`:

@@ -65,8 +65,8 @@ configured entirely in YAML, not on the command line; see the
 
 [^cfgdefault]: The default config path is platform-specific (`DEFAULT_CONFIG_PATH`
     in `cronstable/platform.py`): `/etc/cronstable.d` on POSIX; on Windows the
-    machine-wide `%ProgramData%\cronstable` when that directory exists,
-    otherwise the per-user `%APPDATA%\cronstable`
+    machine-wide `%ProgramData%\cronstable` when that directory holds
+    configuration, otherwise the per-user `%APPDATA%\cronstable`
     (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`, falling back to the user
     profile `~` if `APPDATA` is unset). See
     [Running on Windows](Running-on-Windows).
@@ -111,12 +111,16 @@ instead get the generic configuration-error path (a logged
 `cronstable init [DIRECTORY]` writes a commented starter configuration
 (`cronstable.yaml`, one working job plus the most commonly wanted next steps
 left commented out) into `DIRECTORY`, creating the directory when needed.
-With no argument it targets the platform default config path, so
-`cronstable init` followed by `cronstable` is a working first run. It never
-touches an existing setup: a target that is a file, already holds
-`*.yaml`/`*.yml`/crontab config files, or already has a `cronstable.yaml` is
-refused with the reason and exit `1`; success prints the written path and the
-command to start the scheduler, and exits `0`.
+With no argument it targets a root-level `-c`/`--config` if you gave one, so
+`cronstable -c D:\jobs init` writes to `D:\jobs`, the same flag the not-found
+error above points you at. Otherwise it targets the platform default config
+path, which makes `cronstable init` followed by `cronstable` a working first
+run. Naming both a `DIRECTORY` and a different `-c` writes to `DIRECTORY` and
+says so on stderr. It never touches an existing setup: a target that is a
+file, already holds `*.yaml`/`*.yml`/crontab config files, already has a
+`cronstable.yaml`, or cannot be read or written is refused with the reason
+and exit `1`; success prints the written path and the command to start the
+scheduler, and exits `0`.
 
 ### `-l` / `--log-level`
 
@@ -485,8 +489,10 @@ When started normally (no `--version`, no `--validate-config`, no
    `SIGTERM` on the event loop; on Windows cronstable instead uses `signal.signal`
    for `SIGINT` (Ctrl-C) and `SIGBREAK` (Ctrl-Break) plus a heartbeat timer,
    because the Proactor loop has no `add_signal_handler`, and a native
-   console-control handler that turns console close, logoff, and OS shutdown
-   into the same graceful drain (bounded by the OS's own grace period).
+   console-control handler that turns console close and OS shutdown into the
+   same graceful drain (bounded by the OS's own grace period). Logoff is
+   deliberately not one of them; see
+   [Running on Windows](Running-on-Windows#graceful-shutdown).
 4. Runs the asyncio scheduler loop in the foreground until shutdown.
 
 The scheduler re-reads the configuration on every loop iteration, so editing the
@@ -522,9 +528,11 @@ finishes the currently-running jobs first, exactly as `SIGTERM` does on
 POSIX, and jobs run in their own console process groups so the keystroke
 never reaches them directly. Ctrl-Break (`SIGBREAK`) drains the daemon the
 same way, but a console-generated break also reaches the jobs sharing the
-console, so prefer Ctrl-C. Closing the console window, logging off, and OS
-shutdown trigger the drain too, on the few seconds of grace Windows grants.
-See [Running on Windows](Running-on-Windows).
+console, so prefer Ctrl-C. Closing the console window and OS shutdown trigger
+the drain too, on the few seconds of grace Windows grants. Logging off does
+not: an unattended daemon receives that event for every user on the machine
+and would stop on the first RDP sign-out. See
+[Running on Windows](Running-on-Windows).
 
 ### Exit codes
 
@@ -550,7 +558,7 @@ cronstable -c /etc/cronstable.d
 
 On Windows the config path uses Windows paths, and the machine-wide default
 directory is `%ProgramData%\cronstable` (falling back to `%APPDATA%\cronstable`
-until it exists):
+until it holds a config file):
 
 ```bat
 cronstable.exe -c C:\ProgramData\cronstable

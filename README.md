@@ -302,8 +302,8 @@ POSIX. A few platform details differ:
 
 * **Default config location.** When `-c` is omitted, cronstable looks in the
   machine-wide `%ProgramData%\cronstable` (the Windows analog of
-  `/etc/cronstable.d`) whenever that directory exists, and otherwise in the
-  per-user `%APPDATA%\cronstable`
+  `/etc/cronstable.d`) whenever that directory holds configuration, and
+  otherwise in the per-user `%APPDATA%\cronstable`
   (e.g. `C:\Users\you\AppData\Roaming\cronstable`). `cronstable init` writes a
   commented starter configuration into the default location, and `-c` points
   anywhere:
@@ -315,8 +315,9 @@ POSIX. A few platform details differ:
 * **Default shell.** A string `command` with no explicit `shell` runs through
   the native command processor (`%ComSpec%`, i.e. `cmd.exe`), mirroring the
   `/bin/sh` default on POSIX. `shell: cmd` and `shell: powershell` both work
-  as written (cronstable passes cmd.exe its `/c` flag and every other shell
-  `-c`). For PowerShell, or any other interpreter, set `shell:` or pass
+  as written (cronstable gives cmd.exe the `/c` invocation and quoting it
+  expects, and every other shell `-c`). For PowerShell, or any other
+  interpreter, set `shell:` or pass
   `command` as a list (which bypasses the shell entirely):
 
   ```yaml
@@ -333,9 +334,10 @@ POSIX. A few platform details differ:
 * **Graceful shutdown.** Press `Ctrl-C` to stop cronstable; it shuts down after
   the currently running jobs finish, just as `SIGTERM` does on POSIX (each
   job runs in its own console process group, so the keystroke never reaches
-  the jobs themselves). Closing the console window, logging off, and OS
-  shutdown trigger the same drain on the OS's few seconds of grace, and the
-  authenticated `POST /shutdown` route stops a console-less daemon.
+  the jobs themselves). Closing the console window and OS shutdown trigger the
+  same drain on the OS's few seconds of grace, and the authenticated
+  `POST /shutdown` route stops a console-less daemon. Logging off does not stop
+  it: an unattended daemon sees that event for every user on the machine.
 
 * **Running unattended.** Register cronstable as a boot-time Task Scheduler task
   (or under a service wrapper) with the machine-wide config; the wiki's

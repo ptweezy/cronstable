@@ -53,50 +53,124 @@ jobs:
 
 
 # ---------------------------------------------------------------------------
-# shell_invocation_flag: the per-shell command-string flag
+# is_cmd_shell / shell_spawn: how an explicit `shell:` is invoked
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "shell, flag",
+    "shell, is_cmd",
     [
-        # cmd.exe takes /c; handed -c it starts an interactive shell,
-        # prints its banner, reads EOF and exits 0 -- the silent-green
-        # failure mode a `shell: cmd` job used to record forever.
-        ("cmd", "/c"),
-        ("cmd.exe", "/c"),
-        ("CMD.EXE", "/c"),
-        (r"C:\Windows\System32\cmd.exe", "/c"),
-        # everything else takes -c (PowerShell reads it as -Command)
-        ("powershell", "-c"),
-        ("pwsh", "-c"),
-        ("/bin/sh", "-c"),
-        ("/bin/bash", "-c"),
-        ("bash", "-c"),
+        ("cmd", True),
+        ("cmd.exe", True),
+        ("CMD.EXE", True),
+        (r"C:\Windows\System32\cmd.exe", True),
+        ("powershell", False),
+        ("pwsh", False),
+        ("/bin/sh", False),
+        ("/bin/bash", False),
+        ("bash", False),
+        # a shell that merely CONTAINS the name is not the shell
+        ("cmdish", False),
+        ("/usr/bin/cmd-wrapper", False),
     ],
 )
-def test_shell_invocation_flag(shell, flag):
-    assert cronstable.job.shell_invocation_flag(shell) == flag
+def test_is_cmd_shell(shell, is_cmd):
+    assert cronstable.job.is_cmd_shell(shell) is is_cmd
+
+
+@pytest.mark.parametrize("windows", [True, False])
+@pytest.mark.parametrize("shell", ["powershell", "pwsh", "/bin/sh", "bash"])
+def test_shell_spawn_runs_other_shells_with_dash_c(shell, windows):
+    # -c for everything but cmd.exe (PowerShell reads it as -Command).
+    # These shells parse their own command line by CommandLineToArgvW
+    # rules, which is exactly what Windows' argv rendering reverses, so
+    # the argv form is safe for them on either OS.
+    create, cmd, kwargs = cronstable.job.shell_spawn(
+        shell, 'echo "a b"', windows=windows
+    )
+    assert create is asyncio.create_subprocess_exec
+    assert cmd == [shell, "-c", 'echo "a b"']
+    assert kwargs == {}
+
+
+@pytest.mark.parametrize("shell", ["cmd", "cmd.exe", "CMD.EXE"])
+def test_shell_spawn_hands_cmd_the_raw_command_line(shell):
+    # cmd.exe is spawned through create_subprocess_shell, NOT as an argv.
+    # Two reasons, both fatal the other way: it needs /c (handed -c it
+    # opens an interactive shell, prints its banner, reads EOF and exits
+    # 0, recording a silent success), and it does not follow the
+    # CommandLineToArgvW quoting rules, so the \" that argv rendering
+    # emits for an embedded double quote reaches the command verbatim and
+    # `echo "hello world"` prints \"hello world\". The shell path wraps
+    # the string in `%ComSpec% /c` untouched, which is both the flag and
+    # the quoting cmd's own /c rules are written for.
+    create, cmd, kwargs = cronstable.job.shell_spawn(
+        shell, 'echo "hello world"', windows=True
+    )
+    assert create is asyncio.create_subprocess_shell
+    assert cmd == ['echo "hello world"']
+    # bare name: let ComSpec resolve it rather than searching the CWD
+    assert kwargs == {}
+
+
+def test_shell_spawn_honors_an_absolute_cmd_path():
+    # a deliberately chosen cmd.exe still beats %ComSpec%; Popen uses
+    # `executable` as the comspec when the shell path is spelled out.
+    absolute = r"C:\Windows\SysWOW64\cmd.exe"
+    create, cmd, kwargs = cronstable.job.shell_spawn(
+        absolute, "echo hi", windows=True
+    )
+    assert create is asyncio.create_subprocess_shell
+    assert cmd == ["echo hi"]
+    assert kwargs == {"executable": absolute}
+
+
+@pytest.mark.parametrize("shell", ["cmd", r"C:\Windows\System32\cmd.exe"])
+def test_shell_spawn_leaves_cmd_alone_on_posix(shell):
+    # cmd.exe is a Windows concept. On POSIX a shell named `cmd` is just a
+    # program, and a `shell: cmd` typo must still fail to spawn rather
+    # than quietly running the command under /bin/sh.
+    create, cmd, kwargs = cronstable.job.shell_spawn(
+        shell, "echo hi", windows=False
+    )
+    assert create is asyncio.create_subprocess_exec
+    assert cmd == [shell, "-c", "echo hi"]
+    assert kwargs == {}
 
 
 @pytest.mark.asyncio
-async def test_string_command_with_cmd_shell_spawns_slash_c(monkeypatch):
-    # the flag actually reaches the spawn: a `shell: cmd` job builds
-    # [cmd, /c, command], never the POSIX [-c] cmd.exe cannot parse.
+async def test_string_command_with_cmd_shell_spawns_through_the_shell(
+    monkeypatch,
+):
+    # the choice actually reaches the spawn: a `shell: cmd` job hands the
+    # command string to create_subprocess_shell, and never renders it into
+    # an argv cmd.exe would mis-parse.
     seen = {}
 
-    async def fake_exec(*args, **kwargs):
-        seen["args"] = args
-        raise OSError("stop here: the argv is what is under test")
+    async def fake_exec(*args, **kwargs):  # pragma: no cover - must not run
+        seen["exec"] = args
+        raise OSError("shell: cmd must not take the exec path")
 
+    async def fake_shell(*args, **kwargs):
+        seen["shell"] = (args, kwargs)
+        raise OSError("stop here: the spawn call is what is under test")
+
+    monkeypatch.setattr(cronstable.job.platform, "IS_WINDOWS", True)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_shell)
     job = _running_job(
-        "jobs:\n  - name: t\n    command: echo hi\n"
+        'jobs:\n  - name: t\n    command: echo "hello world"\n'
         '    schedule: "* * * * *"\n    shell: cmd\n'
     )
     await job.start()
     assert job.start_failed is True  # from the deliberate OSError above
-    assert seen["args"] == _argv("cmd", "/c", "echo hi")
+    assert "exec" not in seen
+    args, kwargs = seen["shell"]
+    # the quotes survive: one command string, passed through untouched.
+    # str, not bytes: IS_WINDOWS is patched above, so encode_argv takes its
+    # CreateProcessW branch on either host OS.
+    assert args == ('echo "hello world"',)
+    assert "executable" not in kwargs  # bare `cmd` resolves via ComSpec
 
 
 # ---------------------------------------------------------------------------

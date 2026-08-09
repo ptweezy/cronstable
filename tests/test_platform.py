@@ -53,18 +53,62 @@ def test_windows_config_home_is_per_user_until_machine_wide_exists(tmp_path):
     )
 
 
-def test_windows_config_home_prefers_machine_wide(tmp_path):
+@pytest.mark.parametrize(
+    "filename", ["jobs.yaml", "jobs.yml", "nightly.crontab", "crontab"]
+)
+def test_windows_config_home_prefers_machine_wide(tmp_path, filename):
     # %ProgramData%\cronstable is the real analog of /etc/cronstable.d:
-    # once an administrator creates it, every account (interactive or
+    # once an administrator populates it, every account (interactive or
     # service, whose APPDATA points into systemprofile) resolves to the
-    # same machine-wide config.
+    # same machine-wide config. Every name the loader reads hands over.
     machine_wide = tmp_path / "ProgramData" / "cronstable"
     machine_wide.mkdir(parents=True)
+    (machine_wide / filename).write_text("jobs: []\n")
     env = {
         "PROGRAMDATA": str(tmp_path / "ProgramData"),
         "APPDATA": str(tmp_path / "Roaming"),
     }
     assert platform._windows_config_home(env) == str(machine_wide)
+
+
+@pytest.mark.parametrize(
+    "leftover", [None, "README.md", "_disabled.yaml", ".hidden.yaml"]
+)
+def test_windows_config_home_ignores_machine_wide_without_config(
+    tmp_path, leftover
+):
+    # Existing is not enough: an empty (or config-free) machine-wide
+    # directory parses to zero jobs, and since the path DOES exist the
+    # daemon's configuration-not-found guard stays quiet, so handing over
+    # to it would silently stop a working per-user install from running
+    # anything. An interrupted `init` or an uninstall that took the files
+    # but not the folder is enough to leave one behind.
+    machine_wide = tmp_path / "ProgramData" / "cronstable"
+    machine_wide.mkdir(parents=True)
+    if leftover is not None:
+        # names the loader itself skips: not config, so not a handover
+        (machine_wide / leftover).write_text("jobs: []\n")
+    env = {
+        "PROGRAMDATA": str(tmp_path / "ProgramData"),
+        "APPDATA": str(tmp_path / "Roaming"),
+    }
+    assert platform._windows_config_home(env) == os.path.join(
+        str(tmp_path / "Roaming"), "cronstable"
+    )
+
+
+def test_machine_wide_config_names_match_the_loader():
+    # platform.py duplicates the config-directory filter rather than
+    # importing config/crontabs (it resolves the default at import time and
+    # has to stay cheap for thin clients). Pin the copies together: a new
+    # extension on either side alone would either hand over to a directory
+    # the loader ignores, or refuse one it would happily read.
+    from cronstable import crontabs
+
+    assert platform._CONFIG_BASENAME == crontabs.CRONTAB_BASENAME
+    assert platform._CONFIG_EXTENSIONS == (
+        crontabs.CRONTAB_EXTENSIONS | cronstable.config._YAML_EXTENSIONS
+    )
 
 
 def test_windows_config_home_survives_bare_environments(tmp_path):
@@ -373,16 +417,27 @@ def test_windows_sigint_delivery_reaches_the_callback():
     assert called == [1]
 
 
-def test_console_events_route_close_logoff_shutdown_to_the_drain():
-    # CTRL_CLOSE / CTRL_LOGOFF / CTRL_SHUTDOWN are the daemon's to drain
-    # on (Python's signal module never surfaces them); CTRL_C (0) and
-    # CTRL_BREAK (1) must pass down the chain to the interpreter's own
-    # handler, which turns them into the Python signals handled above.
+def test_console_events_route_close_and_shutdown_to_the_drain():
+    # CTRL_CLOSE / CTRL_SHUTDOWN are the daemon's to drain on (Python's
+    # signal module never surfaces them); CTRL_C (0) and CTRL_BREAK (1)
+    # must pass down the chain to the interpreter's own handler, which
+    # turns them into the Python signals handled above.
     assert platform._console_event_requests_shutdown(2)  # close
-    assert platform._console_event_requests_shutdown(5)  # logoff
     assert platform._console_event_requests_shutdown(6)  # shutdown
     assert not platform._console_event_requests_shutdown(0)  # Ctrl-C
     assert not platform._console_event_requests_shutdown(1)  # Ctrl-Break
+
+
+def test_console_logoff_does_not_stop_the_daemon():
+    # Only session-0 processes (services, the unattended install this is
+    # for) receive CTRL_LOGOFF_EVENT, and it fires for ANY user's logoff
+    # with no way to tell whose. Draining on it would stop the scheduler
+    # the first time anyone signed out of the machine, so it must pass
+    # through like Ctrl-C does.
+    assert platform._CTRL_LOGOFF_EVENT == 5
+    assert not platform._console_event_requests_shutdown(
+        platform._CTRL_LOGOFF_EVENT
+    )
 
 
 @pytest.mark.skipif(

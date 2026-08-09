@@ -70,24 +70,60 @@ DEFAULT_SHELL = "" if IS_WINDOWS else "/bin/sh"
 
 
 # --- Default config location (the ``-c`` default) -------------------------
+#: File names a configuration directory can be loaded from, kept in step
+#: with the filter in :func:`cronstable.config._parse_config_dir` (YAML by
+#: extension, classic crontabs by the markers in
+#: :func:`cronstable.crontabs.is_crontab_path`).  Duplicated rather than
+#: imported because this module resolves the default at import time and has
+#: to stay cheap for every thin-client invocation; a test pins the two
+#: definitions together.
+_CONFIG_EXTENSIONS = frozenset({".yml", ".yaml", ".crontab", ".cron"})
+_CONFIG_BASENAME = "crontab"
+
+
+def _holds_config(directory: str) -> bool:
+    """Whether ``directory`` contains a file the config loader would read."""
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return False
+    for name in names:
+        lowered = name.lower()
+        base, ext = os.path.splitext(lowered)
+        # leading _ or . is the loader's own "skip this file" convention
+        if not base or base[0] in {"_", "."}:
+            continue
+        if ext in _CONFIG_EXTENSIONS or lowered == _CONFIG_BASENAME:
+            return True
+    return False
+
+
 def _windows_config_home(environ: Mapping[str, str]) -> str:
     """The Windows ``-c`` default, resolved against ``environ``.
 
     Machine-wide first: ``%ProgramData%\\cronstable`` is the actual Windows
     analog of ``/etc/cronstable.d`` (machine-scoped, shared by every
-    account), so when that directory exists it wins.  It is never created
+    account), so when it holds configuration it wins.  It is never created
     implicitly; ``cronstable init`` or an administrator creates it, and from
     then on the same command resolves to the same config for an interactive
     admin and for a service account, whose ``%APPDATA%`` points into an
-    invisible ``systemprofile`` directory nobody edits.  Without it the
+    invisible ``systemprofile`` directory nobody edits.  Otherwise the
     default stays the historical per-user location: roaming AppData, falling
     back to the user profile if APPDATA is somehow unset (rare; e.g. a bare
     service account with no roaming profile).
+
+    The directory has to hold configuration, not merely exist.  An empty
+    ``%ProgramData%\\cronstable`` parses to zero jobs, and because the
+    directory does exist the daemon's configuration-not-found guard stays
+    quiet, so a machine with a working per-user config would come up
+    healthy and silently scheduling nothing.  An interrupted ``init`` or
+    an uninstall that took the files but not the folder is enough to leave
+    that directory behind.
     """
     program_data = environ.get("PROGRAMDATA")
     if program_data:
         machine_wide = os.path.join(program_data, "cronstable")
-        if os.path.isdir(machine_wide):
+        if _holds_config(machine_wide):
             return machine_wide
     base = environ.get("APPDATA") or os.path.expanduser("~")
     return os.path.join(base, "cronstable")
@@ -357,7 +393,7 @@ def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
     for sig in win_sigs:
         previous[sig] = signal.signal(sig, handler)
 
-    # Console close, logoff and OS shutdown never reach signal.signal (the
+    # Console close and OS shutdown never reach signal.signal (the
     # interpreter only maps Ctrl-C and Ctrl-Break onto Python signals), so
     # they get a native console-control handler of their own.
     remove_console_handler = _install_windows_console_handler(loop, callback)
@@ -386,32 +422,41 @@ def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
 
 # Windows console-control events beyond the two the interpreter maps onto
 # Python signals (CTRL_C_EVENT -> SIGINT, CTRL_BREAK_EVENT -> SIGBREAK).
-# Closing the console window, logging the user off and an OS shutdown or
-# restart arrive as these; a process without a handler for them is simply
-# terminated, which for a scheduler means jobs truncated mid-write and a
-# reporter storm of "failed" runs on every patch-day restart.
+# Closing the console window and an OS shutdown or restart arrive as these;
+# a process without a handler for them is simply terminated, which for a
+# scheduler means jobs truncated mid-write and a reporter storm of "failed"
+# runs on every patch-day restart.
 _CTRL_CLOSE_EVENT = 2
-_CTRL_LOGOFF_EVENT = 5
 _CTRL_SHUTDOWN_EVENT = 6
+
+# Deliberately absent from the pair above.  CTRL_LOGOFF_EVENT (5) reaches
+# only session-0 processes (services, i.e. exactly the unattended install
+# the scheduler is meant to be), and it carries no indication of WHICH user
+# logged off, so a service cannot tell "my console is going away" from "some
+# administrator closed an RDP session".  Draining on it would stop the
+# daemon the first time anyone signed out of the box, which is the opposite
+# of surviving logoff.  An interactive run is unaffected either way: those
+# processes are terminated at logoff before the event is ever sent.
+_CTRL_LOGOFF_EVENT = 5
 
 #: How long the native console-control handler parks its (system-created)
 #: thread after scheduling the graceful shutdown.  The process is terminated
 #: the moment the handler returns, while a parked handler lets the loop keep
 #: draining until Windows' own patience (about five seconds for a closed
-#: window or a logoff, registry-configurable) expires and it terminates the
-#: process regardless; the park only has to outlast every grace period the
-#: OS might grant.
+#: window, registry-configurable) expires and it terminates the process
+#: regardless; the park only has to outlast every grace period the OS might
+#: grant.
 _CONSOLE_EVENT_HANDLER_PARK = 60.0
 
 
 def _console_event_requests_shutdown(event: int) -> bool:
     """Whether console-control ``event`` is one the daemon must treat as a
-    shutdown request itself (console close / logoff / OS shutdown), rather
-    than leave to the interpreter's own handler chain, which turns Ctrl-C
-    and Ctrl-Break into the Python-level signals handled above."""
+    shutdown request itself (console close / OS shutdown), rather than
+    leave to the interpreter's own handler chain, which turns Ctrl-C and
+    Ctrl-Break into the Python-level signals handled above.  Logoff is not
+    one of them; see :data:`_CTRL_LOGOFF_EVENT`."""
     return event in (
         _CTRL_CLOSE_EVENT,
-        _CTRL_LOGOFF_EVENT,
         _CTRL_SHUTDOWN_EVENT,
     )
 
@@ -419,7 +464,7 @@ def _console_event_requests_shutdown(event: int) -> bool:
 def _install_windows_console_handler(  # pragma: no cover - Windows-only
     loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
 ) -> Callable[[], None]:
-    """Catch console close / logoff / OS shutdown and drain gracefully.
+    """Catch console close and OS shutdown and drain gracefully.
 
     Without this handler those events are a hard kill: in-flight jobs die
     mid-write and nothing is recorded.  The handler schedules the same
