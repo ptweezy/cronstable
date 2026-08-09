@@ -243,8 +243,7 @@ and their results are merged into the including file as follows:
 
 The intended use is to put common definitions (reporting defaults, shell,
 environment, etc.) in a fragment named so directory mode skips it (e.g. with a
-leading underscore), and `include` it from each real config file. This mirrors
-`example/adhoc.cronstable.d`:
+leading underscore), and `include` it from each real config file. For example:
 
 `_inc.yaml` (skipped by directory mode; provides shared `defaults`, `web`, and
 `logging`):

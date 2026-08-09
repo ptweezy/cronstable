@@ -86,7 +86,9 @@ x-cronstable-node: &cronstable-node
 
 services:
   # One-shot: generate the cluster CA + per-node certs into the shared volume,
-  # then exit. The nodes wait for this to finish successfully.
+  # then exit. The nodes wait for this to finish successfully. The script is
+  # shared by all the cluster demos (example/_shared/gen-certs.sh); the env
+  # below names this demo's nodes.
   #
   # The nodes mount this same `cluster-certs` volume read-only, so the CA signing
   # key (ca.key) that certgen leaves here is technically visible to them. That is
@@ -97,9 +99,12 @@ services:
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]
+    environment:
+      NODES: "cronstable-a cronstable-b cronstable-c"
+      PROJECT: example/cluster
     volumes:
       - cluster-certs:/certs
-      - ./gen-certs.sh:/gen-certs.sh:ro
+      - ../_shared/gen-certs.sh:/gen-certs.sh:ro
 
   cronstable-a:
     <<: *cronstable-node

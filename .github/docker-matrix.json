@@ -1,0 +1,50 @@
+[
+  {
+    "distro": "debian",
+    "dockerfile": "Dockerfile",
+    "suffix": "",
+    "platforms": "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+  },
+  {
+    "distro": "alpine",
+    "dockerfile": "docker/Dockerfile.alpine",
+    "suffix": "-alpine",
+    "platforms": "linux/amd64,linux/arm64,linux/386,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+  },
+  {
+    "distro": "ubuntu",
+    "dockerfile": "docker/Dockerfile.ubuntu",
+    "suffix": "-ubuntu",
+    "platforms": "linux/amd64,linux/arm64,linux/arm/v7,linux/ppc64le,linux/s390x,linux/riscv64"
+  },
+  {
+    "distro": "rhel",
+    "dockerfile": "docker/Dockerfile.rhel",
+    "suffix": "-rhel",
+    "platforms": "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+  },
+  {
+    "distro": "fedora",
+    "dockerfile": "docker/Dockerfile.fedora",
+    "suffix": "-fedora",
+    "platforms": "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+  },
+  {
+    "distro": "opensuse",
+    "dockerfile": "docker/Dockerfile.opensuse",
+    "suffix": "-opensuse",
+    "platforms": "linux/amd64,linux/arm64,linux/ppc64le,linux/s390x"
+  },
+  {
+    "distro": "amazonlinux",
+    "dockerfile": "docker/Dockerfile.amazonlinux",
+    "suffix": "-amazonlinux",
+    "platforms": "linux/amd64,linux/arm64"
+  },
+  {
+    "distro": "distroless",
+    "dockerfile": "docker/Dockerfile.distroless",
+    "suffix": "-distroless",
+    "platforms": "linux/amd64,linux/arm64"
+  }
+]

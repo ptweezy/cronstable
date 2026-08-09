@@ -303,6 +303,13 @@ jobs:
     concurrencyPolicy: Forbid
     concurrencyScope: cluster
 
+  - name: payments-reconcile
+    command: |
+      echo "payments-reconcile matched settlements on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 2
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+
   # =====================================================================
   #  2. Transform / ETL  (statsd metrics; output-based failure)
   # =====================================================================
@@ -364,6 +371,13 @@ jobs:
     failsWhen:
       producesStdout: true
 
+  - name: etl-dim-refresh
+    command: |
+      echo "etl-dim-refresh rebuilding dimensions on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 4
+    schedule: "*/5 * * * *"
+    clusterPolicy: Leader
+
   # =====================================================================
   #  3. Load / warehouse  (concurrency policies; mutex + semaphore)
   # =====================================================================
@@ -411,6 +425,13 @@ jobs:
       -- sh -c 'echo "rendering thumbnails (1 of <=2 fleet permits) on $HOSTNAME"; sleep 8'
     schedule: "*/2 * * * *"
     clusterPolicy: EveryNode
+
+  - name: warehouse-vacuum
+    command: |
+      echo "warehouse-vacuum compacting tables on $HOSTNAME at $(date -u +%H:%M:%S)"
+      sleep 5
+    schedule: "*/10 * * * *"
+    clusterPolicy: Leader
 
   # =====================================================================
   #  3b. Resource-heavy workloads  (per-job + per-node monitoring)
@@ -797,6 +818,11 @@ jobs:
             {{ stderr }}
             (exit code: {{ exit_code }})
 
+  - name: nightly-report-batch
+    command: echo "nightly-report-batch generated daily reports on $HOSTNAME"
+    schedule: "@daily"                     # [feature: @daily macro]
+    clusterPolicy: Leader
+
   # =====================================================================
   #  6. Monitoring / health  (EveryNode incident cockpit; all reporters)
   # =====================================================================
@@ -1105,6 +1131,16 @@ jobs:
     schedule: "*/3 * * * *"
     clusterPolicy: Leader
 
+  - name: session-gc
+    command: echo "session-gc reaped idle sessions on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/10 * * * *"
+    clusterPolicy: Leader
+
+  - name: tmp-cleanup
+    command: echo "tmp-cleanup swept scratch space on $HOSTNAME at $(date -u +%H:%M)"
+    schedule: "*/30 * * * *"
+    clusterPolicy: Leader
+
   # =====================================================================
   #  9. Manual / on-demand  (scheduled ~never; run from the UI or API)
   # =====================================================================
@@ -1123,6 +1159,13 @@ jobs:
       sleep 5
     schedule: "0 0 1 1 *"
     clusterPolicy: Leader
+
+  - name: reindex-search
+    command: |
+      echo "reindex-search rebuilding the search index on $HOSTNAME"
+      sleep 4
+    schedule: "0 0 1 1 *"
+    clusterPolicy: PreferLeader
 
   # =====================================================================
   #  10. Disabled  (present in config, never scheduled)

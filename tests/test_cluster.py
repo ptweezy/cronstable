@@ -3,7 +3,6 @@ import dataclasses
 import datetime
 import json
 import logging
-import socket
 import threading
 
 import aiohttp
@@ -11,6 +10,7 @@ import pytest
 
 from cronstable.cluster import (
     MAX_ADVERTISED_REBOOT_JOBS,
+    MAX_PEER_RESPONSE_BYTES,
     MIN_COMPRESS_BYTES,
     NODE_STATS_HEADER,
     STATUS_AGREED,
@@ -38,6 +38,8 @@ from cronstable.cluster import (
 )
 from cronstable.config import DEFAULT_CLUSTER, ConfigError, parse_config_string
 from cronstable.fingerprint import SCHEME_VERSION
+from tests._helpers import _free_port, _wait_until
+from tests._helpers import _write_tls as _mint_tls
 
 NOW = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
 
@@ -457,142 +459,14 @@ def test_self_name_without_instance_stays_self():
 # --------------------------------------------------------------------------
 
 
-def _gen_ca(cn):
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
-
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(NOW - datetime.timedelta(days=1))
-        .not_valid_after(NOW + datetime.timedelta(days=3650))
-        .add_extension(
-            x509.BasicConstraints(ca=True, path_length=None), critical=True
-        )
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=False,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=True,
-                crl_sign=True,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-        .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
-            critical=False,
-        )
-        .sign(key, hashes.SHA256())
-    )
-    return key, cert
-
-
-def _gen_leaf(ca_key, ca_cert, hostname):
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-
-    key = ec.generate_private_key(ec.SECP256R1())
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(
-            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
-        )
-        .issuer_name(ca_cert.subject)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(NOW - datetime.timedelta(days=1))
-        .not_valid_after(NOW + datetime.timedelta(days=3650))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName(hostname)]),
-            critical=False,
-        )
-        .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                ca_key.public_key()
-            ),
-            critical=False,
-        )
-        .add_extension(
-            x509.KeyUsage(
-                digital_signature=True,
-                content_commitment=False,
-                key_encipherment=False,
-                data_encipherment=False,
-                key_agreement=False,
-                key_cert_sign=False,
-                crl_sign=False,
-                encipher_only=False,
-                decipher_only=False,
-            ),
-            critical=True,
-        )
-        .add_extension(
-            x509.ExtendedKeyUsage(
-                [
-                    ExtendedKeyUsageOID.SERVER_AUTH,
-                    ExtendedKeyUsageOID.CLIENT_AUTH,
-                ]
-            ),
-            critical=False,
-        )
-        .sign(ca_key, hashes.SHA256())
-    )
-    return key, cert
-
-
 def _write_tls(dirpath, cn="cluster-ca"):
-    # cryptography has no win-arm64 wheel and can't build from source on that
-    # CI runner, so it isn't installed there; skip the cert-minting mTLS tests
-    # rather than error. The cluster logic itself is covered by the pure tests
-    # above and the mTLS round-trips run on every other platform.
-    pytest.importorskip(
-        "cryptography",
-        reason="cryptography unavailable on this platform (e.g. win-arm64)",
-    )
-    from cryptography.hazmat.primitives import serialization
-
-    ca_key, ca_cert = _gen_ca(cn)
-    leaf_key, leaf_cert = _gen_leaf(ca_key, ca_cert, "localhost")
-    ca_path = dirpath / (cn + "-ca.pem")
-    cert_path = dirpath / (cn + "-node.pem")
-    key_path = dirpath / (cn + "-node.key")
-    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-    cert_path.write_bytes(leaf_cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(
-        leaf_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-    )
-    return {
-        "ca": str(ca_path),
-        "cert": str(cert_path),
-        "key": str(key_path),
-    }
-
-
-def _free_port():
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-    finally:
-        s.close()
+    # the shared cert mint (tests/_helpers.py, finding B7) in this file's
+    # flavor: <cn>-node.pem/.key and a DNS-only leaf SAN (peers are dialled
+    # by name).  The helper importorskips cryptography, so the cert-minting
+    # mTLS tests still self-skip where it has no wheel (e.g. win-arm64); the
+    # cluster logic itself is covered by the pure tests above and the mTLS
+    # round-trips run on every other platform.
+    return _mint_tls(dirpath, cn=cn, suffix="node", ip_sans=False)
 
 
 def _cfg(tls, listen, peers, node, drift_after=3):
@@ -611,6 +485,25 @@ def _cfg(tls, listen, peers, node, drift_after=3):
     return cfg
 
 
+def _mgr(peers=(), node="node-a", job_set="v1:mine", **over):
+    """One-call ClusterManager build (finding B3, 106 sites before).
+
+    ``peers`` are the configured peer hosts, ``node`` this node's name and
+    ``job_set`` the job-set id: a string for the fixed-id tests, or a
+    callable for the live-reload ones.  ``tls``, ``listen`` and
+    ``drift_after`` override the no-cert defaults (the mTLS round-trip
+    tests pass real cert paths and a real port); any other keyword lands in
+    the config dict (distribution, electLeader).
+    """
+    tls = over.pop("tls", _DUMMY_TLS)
+    listen = over.pop("listen", "127.0.0.1:1")
+    drift_after = over.pop("drift_after", 3)
+    cfg = _cfg(tls, listen, list(peers), node, drift_after=drift_after)
+    cfg.update(over)
+    get_id = job_set if callable(job_set) else (lambda: job_set)
+    return ClusterManager(cfg, get_id)
+
+
 @pytest.mark.asyncio
 async def test_tls_files_changed_detects_in_place_rotation(tmp_path):
     # the SSL contexts load the cert+key once at construction, so an in-place
@@ -619,9 +512,11 @@ async def test_tls_files_changed_detects_in_place_rotation(tmp_path):
     # until it expires, then loses quorum fleet-wide. tls_files_changed is the
     # signal Cron.start_stop_cluster uses to restart and rebuild the contexts.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:18443", ["localhost:18444"], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        ["localhost:18444"],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:18443",
     )
     assert mgr.tls_files_changed() is False
     # simulate the rotation by changing the cert file's bytes in place (size
@@ -641,9 +536,11 @@ async def test_tls_files_loadable_true_then_false_on_corruption(tmp_path):
     import ssl
 
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:18443", ["localhost:18444"], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        ["localhost:18444"],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:18443",
     )
     # valid material loads
     assert mgr.tls_files_loadable() is True
@@ -665,13 +562,18 @@ async def test_tls_files_loadable_true_then_false_on_corruption(tmp_path):
 async def test_mtls_round_trip_agreed(tmp_path):
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     await b.start()
     await a.start()
@@ -690,19 +592,19 @@ async def test_mtls_round_trip_agreed(tmp_path):
 async def test_mtls_round_trip_drift(tmp_path):
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(
-            tls,
-            f"127.0.0.1:{pa}",
-            [f"localhost:{pb}"],
-            "node-a",
-            drift_after=1,
-        ),
-        lambda: "v1:aaa",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:aaa",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
+        drift_after=1,
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
-        lambda: "v1:bbb",  # different id
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:bbb",  # different id
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     await b.start()
     await a.start()
@@ -720,13 +622,18 @@ async def test_mtls_untrusted_peer(tmp_path):
     mine = _write_tls(tmp_path, cn="mine")
     rogue = _write_tls(tmp_path, cn="rogue")
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(mine, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=mine,
+        listen=f"127.0.0.1:{pa}",
     )
-    rogue_b = ClusterManager(
-        _cfg(rogue, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "rogue-b"),
-        lambda: "v1:same",
+    rogue_b = _mgr(
+        [f"localhost:{pa}"],
+        node="rogue-b",
+        job_set="v1:same",
+        tls=rogue,
+        listen=f"127.0.0.1:{pb}",
     )
     await rogue_b.start()
     await a.start()
@@ -746,9 +653,7 @@ async def test_server_mtls_rejects_client_without_cert(tmp_path):
 
     mine = _write_tls(tmp_path, cn="mine")
     pa = _free_port()
-    a = ClusterManager(
-        _cfg(mine, f"127.0.0.1:{pa}", [], "node-a"), lambda: "v1:same"
-    )
+    a = _mgr([], job_set="v1:same", tls=mine, listen=f"127.0.0.1:{pa}")
     await a.start()
     try:
         # trust the server's CA (so its cert verifies) but present NO client
@@ -774,9 +679,7 @@ async def test_server_mtls_rejects_wrong_ca_client_cert(tmp_path):
     mine = _write_tls(tmp_path, cn="mine")
     rogue = _write_tls(tmp_path, cn="rogue")
     pa = _free_port()
-    a = ClusterManager(
-        _cfg(mine, f"127.0.0.1:{pa}", [], "node-a"), lambda: "v1:same"
-    )
+    a = _mgr([], job_set="v1:same", tls=mine, listen=f"127.0.0.1:{pa}")
     await a.start()
     try:
         cctx = _ssl.create_default_context(cafile=mine["ca"])
@@ -800,9 +703,11 @@ async def test_peer_client_disables_redirects(tmp_path):
     # (SSRF) or a plaintext http:// downgrade where the mTLS client context no
     # longer applies. Both client call sites must pass allow_redirects=False.
     tls = _write_tls(tmp_path)
-    a = ClusterManager(
-        _cfg(tls, "127.0.0.1:18200", ["peer-b:8200"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        ["peer-b:8200"],
+        job_set="v1:same",
+        tls=tls,
+        listen="127.0.0.1:18200",
     )
     get_kwargs: dict = {}
     post_kwargs: dict = {}
@@ -1046,17 +951,6 @@ async def test_web_fleet_endpoint_is_conditional_gzipped_and_memoized(
     cron._bust_response_memos()
     await cron._web_get_fleet(_Req())
     assert len(builds) == 2
-
-
-async def _wait_until(pred, tries=300, interval=0.01):
-    # Poll a predicate instead of sleeping a fixed time, so the tests stay fast
-    # and do not flake under CI load. Bounded so a never-true predicate fails
-    # cleanly instead of hanging.
-    for _ in range(tries):
-        if pred():
-            return
-        await asyncio.sleep(interval)
-    raise AssertionError("condition not met within {} tries".format(tries))
 
 
 def _fat_fleet_view(builds=None):
@@ -1349,13 +1243,18 @@ async def test_mtls_round_trip_elects_single_leader(tmp_path):
     # other, exactly one of them (the lowest name) is leader.
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     await a.start()
     await b.start()
@@ -1384,14 +1283,11 @@ async def test_is_leader_false_without_quorum(tmp_path):
     # itself (1 < quorum 2) and must not lead.
     tls = _write_tls(tmp_path)
     pa = _free_port()
-    a = ClusterManager(
-        _cfg(
-            tls,
-            f"127.0.0.1:{pa}",
-            ["localhost:1", "localhost:2"],  # nothing listening
-            "node-a",
-        ),
-        lambda: "v1:same",
+    a = _mgr(
+        ["localhost:1", "localhost:2"],  # nothing listening
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
     await a.start()
     try:
@@ -1569,12 +1465,21 @@ async def test_mtls_spread_assigns_distinct_owners(tmp_path):
     # them, and both compute the same owner for the same job.
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    cfg_a = _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a")
-    cfg_a["distribution"] = "spread"
-    cfg_b = _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b")
-    cfg_b["distribution"] = "spread"
-    a = ClusterManager(cfg_a, lambda: "v1:same")
-    b = ClusterManager(cfg_b, lambda: "v1:same")
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
+        distribution="spread",
+    )
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
+        distribution="spread",
+    )
     await a.start()
     await b.start()
     try:
@@ -1603,13 +1508,18 @@ async def test_mtls_reboot_ran_push_propagates(tmp_path):
     # node-b over real mTLS, so node-b learns it ran without waiting to poll.
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     await a.start()
     await b.start()
@@ -1637,9 +1547,12 @@ async def test_mtls_cold_boot_runs_deferred_reboot_exactly_once(tmp_path):
 
     def _mk(name):
         peers = [f"localhost:{p}" for n, p in ports.items() if n != name]
-        return ClusterManager(
-            _cfg(tls, f"127.0.0.1:{ports[name]}", peers, name),
-            lambda: "v1:same",
+        return _mgr(
+            peers,
+            node=name,
+            job_set="v1:same",
+            tls=tls,
+            listen=f"127.0.0.1:{ports[name]}",
         )
 
     nodes = {n: _mk(n) for n in ports}
@@ -1694,14 +1607,12 @@ async def test_mtls_restarted_node_reads_reboot_gossip_in_start(tmp_path):
     pa, pb, pc = _free_port(), _free_port(), _free_port()
 
     def _mk(name, port, peer_ports):
-        return ClusterManager(
-            _cfg(
-                tls,
-                f"127.0.0.1:{port}",
-                [f"localhost:{p}" for p in peer_ports],
-                name,
-            ),
-            lambda: "v1:same",
+        return _mgr(
+            [f"localhost:{p}" for p in peer_ports],
+            node=name,
+            job_set="v1:same",
+            tls=tls,
+            listen=f"127.0.0.1:{port}",
         )
 
     a = _mk("node-a", pa, (pb, pc))
@@ -1783,9 +1694,7 @@ def test_split_host_port_rejects_bad_input():
 async def test_handle_peer_payload(no_tls):
     import json
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     resp = await mgr._handle_peer(_Req())
     payload = json.loads(resp.text)
     assert payload["node_name"] == "node-a"
@@ -1833,10 +1742,7 @@ def test_advertised_ran_jobs_drops_stale_agreed_peer_on_reload(no_tls):
     # a redefined @reboot one-shot, else the deferred one-shot is silently
     # skipped.
     live = {"id": "v1:mine"}
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
-        lambda: live["id"],
-    )
+    mgr = _mgr(["b:1"], job_set=lambda: live["id"])
     _seed_agree(mgr, "b:1", "node-b")  # records peer.job_set_id = "v1:mine"
     mgr.view.peers["b:1"].ran_reboot_jobs = {"boot"}
     # same live id: the agreed peer's ran-set is trusted
@@ -1858,10 +1764,7 @@ def test_advertised_ran_jobs_drops_own_stale_set_on_reload(no_tls):
     # ran_reboot_jobs: [boot]} -- a toxic pairing an agreed peer trusts,
     # retiring its redefined @reboot one-shot without running it.
     live = {"id": "v1:mine"}
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
-        lambda: live["id"],
-    )
+    mgr = _mgr(["b:1"], job_set=lambda: live["id"])
     # this node ran "boot" as owner, recorded under v1 (like mark_reboot_ran)
     mgr._reconcile_job_set_id("v1:mine")
     mgr._ran_reboot_jobs.add("boot")
@@ -1873,10 +1776,7 @@ def test_advertised_ran_jobs_drops_own_stale_set_on_reload(no_tls):
 
 
 def test_manager_accessors_single_leader_quorate(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     assert mgr.cluster_size() == 3
@@ -1896,10 +1796,7 @@ def test_manager_accessors_single_leader_quorate(no_tls):
 
 
 def test_manager_accessors_minority_stands_down(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     # both peers were polled and are down: real information (a view with
     # never-polled peers would instead hold the available_* gates closed; see
     # test_blank_view_does_not_claim_available_ownership).
@@ -1922,10 +1819,7 @@ def test_blank_view_does_not_claim_available_ownership(no_tls):
     # with never-polled peers must claim NO never-skip availability; cron's
     # deferral machinery then re-checks every iteration until real
     # information arrives.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1"], "node-c"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["a:1", "b:1"], node="node-c")
     assert mgr.is_available_leader() is False
     assert mgr.is_available_job_owner("boot") is False
     # real information (both peers polled and down) settles the view: the
@@ -1945,10 +1839,7 @@ def test_rebuilt_manager_holds_available_gates_until_reattested(no_tls):
     # due in the ~1-2 interval window ALONGSIDE the true owner: a
     # healthy-cluster double-run. The converging hold keeps the never-skip
     # gates closed until a peer attests THIS instance.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1"], "node-c"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["a:1", "b:1"], node="node-c")
     for host, name in (("a:1", "node-a"), ("b:1", "node-b")):
         peer = mgr.view.peers[host]
         peer.status = STATUS_AGREED
@@ -1960,7 +1851,7 @@ def test_rebuilt_manager_holds_available_gates_until_reattested(no_tls):
             (name, "inst-" + name, True),
             ("node-c", "inst-old-c", True),
         ]
-    assert mgr._view_settled() is False
+    assert mgr.view_settled() is False
     assert mgr.is_available_leader() is False
     assert mgr.is_available_job_owner("job-x") is False
     # a peer re-polls this incarnation and attests it: the view settles and
@@ -1968,7 +1859,7 @@ def test_rebuilt_manager_holds_available_gates_until_reattested(no_tls):
     # min-name owner instead of double-running.
     for host in ("a:1", "b:1"):
         mgr.view.peers[host].members.append(("node-c", mgr.instance_id, True))
-    assert mgr._view_settled() is True
+    assert mgr.view_settled() is True
     assert mgr.available_leader_name() == "node-a"
     assert mgr.is_available_leader() is False
 
@@ -1983,10 +1874,7 @@ def test_quorate_but_unsettled_view_reads_as_transient_hold(no_tls):
     # (view_settled) so cron._cluster_owner_moved reads the gates' False as a
     # transient fail-closed denial, never as another node positively owning
     # the job (which would abandon the rightful owner's pending retry).
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     # peer b re-polled us and attests THIS incarnation...
     b = mgr.view.peers["b:1"]
     b.status = STATUS_AGREED
@@ -2021,10 +1909,7 @@ def test_convergence_hold_is_bounded_for_one_way_peers(no_tls):
     # stand-down.
     from cronstable.cluster import _SETTLE_ROUNDS
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1"], "node-b"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["a:1"], node="node-b")
     peer = mgr.view.peers["a:1"]
     peer.status = STATUS_AGREED
     peer.node_name = "node-a"
@@ -2033,7 +1918,7 @@ def test_convergence_hold_is_bounded_for_one_way_peers(no_tls):
     peer.members = [("node-a", "inst-a", True)]  # never lists node-b
     assert mgr.is_available_leader() is False  # still converging
     mgr._poll_rounds = _SETTLE_ROUNDS  # ~2 real intervals later
-    assert mgr._view_settled() is True
+    assert mgr.view_settled() is True
     assert mgr.is_available_leader() is True  # one-way peer: lean to running
     assert mgr.is_available_job_owner("job-x") is True
 
@@ -2044,10 +1929,7 @@ def test_legacy_peer_does_not_hold_available_gates(no_tls):
     # would hold its PreferLeader jobs for _SETTLE_ROUNDS on every boot. The
     # reports_members=False flag exempts it, mirroring _agreeing_peers'
     # one-directional fallback.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1"])
     peer = mgr.view.peers["b:1"]
     peer.status = STATUS_AGREED
     peer.node_name = "node-b"
@@ -2055,7 +1937,7 @@ def test_legacy_peer_does_not_hold_available_gates(no_tls):
     peer.job_set_id = "v1:mine"
     peer.members = []
     peer.reports_members = False  # a legacy build
-    assert mgr._view_settled() is True
+    assert mgr.view_settled() is True
     assert mgr.is_available_leader() is True  # min name, counted one-way
 
 
@@ -2067,10 +1949,7 @@ def test_available_leader_folds_witness_contenders(no_tls):
     # mutual_agreeing in makes node-m elect the global-min name (node-a) and
     # defer, while node-a self-elects -- exactly one runner. Without the fold
     # node-m elected itself and both ran the job on a converged cluster.
-    mgr_m = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["z:1"], "node-m"),
-        lambda: "v1:mine",
-    )
+    mgr_m = _mgr(["z:1"], node="node-m")
     _seed_agree(mgr_m, "z:1", "node-z", mutual={"node-m", "node-a"})
     assert "node-a" in mgr_m._available_contenders()
     assert mgr_m.available_leader_name() == "node-a"  # folds the contender
@@ -2078,19 +1957,14 @@ def test_available_leader_folds_witness_contenders(no_tls):
 
     # the symmetric node-a self-elects (it is the global min), so the job runs
     # on exactly one of the two blind nodes rather than both.
-    mgr_a = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["z:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr_a = _mgr(["z:1"])
     _seed_agree(mgr_a, "z:1", "node-z", mutual={"node-m", "node-a"})
     assert mgr_a.available_leader_name() == "node-a"
     assert mgr_a.is_available_leader() is True
 
 
 def test_manager_accessors_spread(no_tls):
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
-    cfg["distribution"] = "spread"
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1"], distribution="spread")
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     members = {"node-a", "node-b", "node-c"}
@@ -2106,9 +1980,7 @@ def test_manager_accessors_spread(no_tls):
 
 
 def test_manager_spread_job_owner_none_without_quorum(no_tls):
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
-    cfg["distribution"] = "spread"
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1"], distribution="spread")
     assert mgr.job_owner("job-x") is None
     assert mgr.is_job_owner("job-x") is False
 
@@ -2119,8 +1991,7 @@ def test_bridge_discovery_makes_larger_node_defer(no_tls):
     # b). N=4, quorum=3. b would naively elect itself (min of {b,c,d}); via the
     # bridge it confirms a is quorate (two witnessed mutual edges c<->a, d<->a)
     # and defers to it, closing the asymmetric double-run.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1"], "node-b")
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["a:1", "c:1", "d:1"], node="node-b")
     # c and d each mutually agree with node-b and node-a (quorate; witness a)
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-a", "node-b"})
     _seed_agree(mgr, "d:1", "node-d", mutual={"node-a", "node-b"})
@@ -2137,8 +2008,7 @@ def test_thin_bridge_is_not_confirmed_so_node_leads(no_tls):
     # mutually agree with a (c + a) < quorum 3: it cannot confirm a is quorate,
     # does NOT defer (the liveness choice -- it may double-run rather than risk
     # standing down behind a node it cannot confirm), and leads itself.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1"], "node-b")
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["a:1", "c:1", "d:1"], node="node-b")
     _seed_agree(
         mgr, "c:1", "node-c", mutual={"node-a", "node-b"}
     )  # witnesses a
@@ -2154,10 +2024,7 @@ def test_no_standdown_when_min_neighbor_is_sub_quorum(no_tls):
     # sub-quorum (mutual only with node-1). The base min-of-live would defer
     # node-1 to the non-runnable node-0 and stand the whole healthy majority
     # down; v2 excludes node-0 (confirmed sub-quorum) so node-1 leads.
-    cfg = _cfg(
-        _DUMMY_TLS, "127.0.0.1:1", ["n0:1", "n2:1", "n3:1", "n4:1"], "node-1"
-    )
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["n0:1", "n2:1", "n3:1", "n4:1"], node="node-1")
     _seed_agree(mgr, "n0:1", "node-0", mutual={"node-1"})  # sub-quorum (2 < 3)
     _seed_agree(mgr, "n3:1", "node-3", mutual={"node-1", "node-2"})  # quorate
     _seed_agree(mgr, "n4:1", "node-4", mutual={"node-1", "node-2"})  # quorate
@@ -2176,8 +2043,7 @@ def test_unconfirmed_peer_is_not_electable(no_tls):
     # confirmed, so node-b does not defer to the smaller node-a; it leans to
     # leading itself (the liveness choice -- never defer to a node that might
     # stand down). The price is a possible double-run during a rolling upgrade.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1"], "node-b")
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["a:1", "c:1"], node="node-b")
     _seed_agree(mgr, "a:1", "node-a")  # mutual=None -> unconfirmed
     _seed_agree(mgr, "c:1", "node-c")
     assert "node-a" not in mgr._eligible_candidates()
@@ -2190,8 +2056,7 @@ def test_bridged_pair_exactly_one_leads(no_tls):
     # and d but NOT each other. Build both managers and confirm exactly ONE
     # leads (safety) and it is the global-min name.
     def _bridged(name, peers):
-        cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", peers, name)
-        mgr = ClusterManager(cfg, lambda: "v1:mine")
+        mgr = _mgr(peers, node=name)
         # c and d each mutually agree with both a and b (the shared bridge)
         _seed_agree(
             mgr, "c:1", "node-c", mutual={"node-a", "node-b", "node-d"}
@@ -2212,9 +2077,7 @@ def test_bridge_discovery_spread_owner_consistent(no_tls):
     # spread mode: the bridged node joins the rendezvous candidate set, so b
     # computes each job's owner over the same {a,b,c,d} that a quorate a would,
     # converging on one owner per job instead of double-running.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1"], "node-b")
-    cfg["distribution"] = "spread"
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["a:1", "c:1", "d:1"], node="node-b", distribution="spread")
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-a", "node-b"})
     _seed_agree(mgr, "d:1", "node-d", mutual={"node-a", "node-b"})
     full = ["node-a", "node-b", "node-c", "node-d"]
@@ -2233,9 +2096,7 @@ def test_thin_bridge_spread_no_double_run(no_tls):
     # the other. The fix folds the unconfirmed possible co-owner into the
     # rendezvous set, so the two agree on a single owner per job.
     def _node(name, peers, seeds):
-        cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", peers, name)
-        cfg["distribution"] = "spread"
-        mgr = ClusterManager(cfg, lambda: "v1:mine")
+        mgr = _mgr(peers, node=name, distribution="spread")
         for host, nm, mutual, vouched in seeds:
             _seed_agree(mgr, host, nm, mutual=mutual, vouched=vouched)
         return mgr
@@ -2300,12 +2161,12 @@ def _spread_mesh(mgr_graph, distribution, electLeader=True):
     names = sorted(mgr_graph)
     mgrs = {}
     for n in names:
-        cfg = _cfg(
-            _DUMMY_TLS, "127.0.0.1:1", [m + ":1" for m in names if m != n], n
+        mgrs[n] = _mgr(
+            [m + ":1" for m in names if m != n],
+            node=n,
+            distribution=distribution,
+            electLeader=electLeader,
         )
-        cfg["distribution"] = distribution
-        cfg["electLeader"] = electLeader
-        mgrs[n] = ClusterManager(cfg, lambda: "v1:mine")
     for n in names:
         for other in names:
             if other == n:
@@ -2321,7 +2182,7 @@ def _spread_mesh(mgr_graph, distribution, electLeader=True):
             else:
                 # a CONVERGED view of a node this one cannot reach: polled and
                 # failed. Leaving it never-polled (unknown) would instead hold
-                # the never-skip available_* gates closed (see _view_settled),
+                # the never-skip available_* gates closed (see view_settled),
                 # which is the startup state, not the converged mesh these
                 # tests model.
                 mgrs[n].view.record_failure(
@@ -2395,11 +2256,7 @@ def test_unconfirmed_contenders_folds_only_quorate_vouched(no_tls):
     # a node it does NOT vouch quorate must NOT be folded -- only the peer's
     # quorate_vouched set is. node-b (agreeing) has an edge to BOTH node-x (it
     # vouches quorate) and node-s (sub-quorum, not vouched); only node-x folds.
-    cfg = _cfg(
-        _DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "x:1", "s:1"], "node-a"
-    )
-    cfg["distribution"] = "spread"
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1", "x:1", "s:1"], distribution="spread")
     _seed_agree(
         mgr,
         "b:1",
@@ -2414,8 +2271,7 @@ def test_unconfirmed_contenders_folds_only_quorate_vouched(no_tls):
 def test_bridge_discovery_ignores_direct_and_underwitnessed(no_tls):
     # a name we already count directly, or one witnessed by fewer than quorum-1
     # mutual edges, is never a bridge candidate.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1"], "node-b")
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["a:1", "c:1", "d:1"], node="node-b")
     # c witnesses node-a (only 1 witness -> underwitnessed); d does not.
     # Both peers stay quorate/electable; no node is confirmed via the bridge.
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-a", "node-b"})
@@ -2434,10 +2290,7 @@ def _seed_conflict(mgr, host, name, instance):
 
 
 def test_manager_no_conflict_when_names_distinct(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     assert mgr.has_conflict() is False
@@ -2450,10 +2303,7 @@ def test_conflict_detection_unaffected_by_bridge_data(no_tls):
     # conflict detection are independent, and conflict wins (checked first in
     # cron._cluster_allows). c and d agree and both witness node-a; d also
     # announces OUR nodeName from a different instance (the duplicate).
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1"], "node-b"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["a:1", "c:1", "d:1"], node="node-b")
     # c and d mutually agree with node-b and node-a -> both witness node-a
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-a", "node-b"})
     _seed_agree(mgr, "d:1", "node-d", mutual={"node-a", "node-b"})
@@ -2474,10 +2324,7 @@ def test_conflict_detection_unaffected_by_bridge_data(no_tls):
 
 def test_manager_detects_duplicate_of_own_name(no_tls):
     # a peer announces OUR nodeName from a different instance -> conflict
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     p = mgr.view.peers["b:1"]
     p.status = STATUS_CONFLICT
     p.node_name = "node-a"
@@ -2489,10 +2336,7 @@ def test_manager_detects_duplicate_of_own_name(no_tls):
 def test_manager_detects_cross_peer_duplicate(no_tls):
     # two DIFFERENT peers report the same name (neither is ours) -> still a
     # duplicate: a third node can spot the collision its peers cannot.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_conflict(mgr, "b:1", "dup", "inst-b")
     _seed_conflict(mgr, "c:1", "dup", "inst-c")
     assert mgr.conflict_names() == ["dup"]
@@ -2501,10 +2345,7 @@ def test_manager_detects_cross_peer_duplicate(no_tls):
 
 def test_manager_self_listing_is_not_conflict(no_tls):
     # the 'self' peer carries our name AND our own instance id -> benign
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "self:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "self:1"])
     _seed_agree(mgr, "b:1", "node-b")
     selfp = mgr.view.peers["self:1"]
     selfp.status = STATUS_SELF
@@ -2523,9 +2364,7 @@ def test_self_listing_without_instance_id_is_not_conflict(no_tls):
     # the self seed, fabricating a phantom duplicate-nodeName conflict that
     # would fail every
     # Leader job closed cluster-wide for the whole upgrade window.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "self:1"], "node-a")
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "self:1"], electLeader=True)
     _seed_agree(mgr, "b:1", "node-b")
     selfp = mgr.view.peers["self:1"]
     selfp.status = STATUS_SELF
@@ -2536,9 +2375,7 @@ def test_self_listing_without_instance_id_is_not_conflict(no_tls):
 
 
 def test_view_dict_reports_conflict(no_tls):
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1"], electLeader=True)
     p = mgr.view.peers["b:1"]
     p.status = STATUS_CONFLICT
     p.node_name = "node-a"
@@ -2556,10 +2393,7 @@ def test_manager_detects_cluster_size_divergence(no_tls):
     # size N. Two nodes quorate under different Ns would each elect themselves
     # (two majorities of *different* Ns can be disjoint), so a size mismatch is
     # a first-class conflict, exactly like a duplicate nodeName.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     assert mgr.cluster_size() == 3
@@ -2573,10 +2407,7 @@ def test_manager_detects_cluster_size_divergence(no_tls):
 
 def test_manager_no_size_conflict_when_sizes_match(no_tls):
     # agreeing peers reporting our own N (the healthy case) is no conflict.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     mgr.view.peers["b:1"].declared_size = 3
@@ -2591,15 +2422,7 @@ def test_self_listing_does_not_inflate_size_or_conflict(no_tls):
     # runtime as STATUS_SELF and excluded from N -- so it neither raises this
     # node's quorum nor makes agreeing peers see a divergent size (the cluster-
     # wide false conflict a naive len(peers)+1 size would cause).
-    mgr = ClusterManager(
-        _cfg(
-            _DUMMY_TLS,
-            "0.0.0.0:8443",
-            ["b:1", "c:1", "myhost:8443"],
-            "node-a",
-        ),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1", "myhost:8443"], listen="0.0.0.0:8443")
     # before this node has polled itself, the self entry is still counted (N=4)
     assert mgr.cluster_size() == 4
     # once it polls its own self-listed address it is marked SELF...
@@ -2622,10 +2445,7 @@ def test_manager_size_divergence_ignores_non_agreed_and_unknown(no_tls):
     # joins our quorum (and a real resize keeps the job set unchanged), and a
     # peer too old to report a size (None) is simply skipped -- neither is a
     # false conflict.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     pb = mgr.view.peers["b:1"]
     pb.status = STATUS_DRIFTED
     pb.node_name = "node-b"
@@ -2637,9 +2457,7 @@ def test_manager_size_divergence_ignores_non_agreed_and_unknown(no_tls):
 
 
 def test_view_dict_reports_size_conflict(no_tls):
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1"], electLeader=True)
     _seed_agree(mgr, "b:1", "node-b")
     mgr.view.peers["b:1"].declared_size = 5
     view = mgr.view_dict()
@@ -2658,10 +2476,7 @@ def test_manager_detects_distribution_divergence(no_tls):
     # DIFFERENT owners for a Leader job (single-leader elects min(live);
     # spread rendezvous-hashes per job), so one would double-run and the other
     # drop it. A divergence among agreeing peers is a first-class conflict.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     assert mgr.distribution == "single-leader"
@@ -2682,9 +2497,7 @@ def test_manager_detects_distribution_divergence(no_tls):
 def test_manager_detects_elect_leader_divergence(no_tls):
     # a peer with electLeader off runs EVERY job ungated; mixing it with an
     # electing node double-runs Leader jobs. Surface it as a conflict too.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1"], electLeader=True)
     _seed_agree(mgr, "b:1", "node-b")
     mgr.view.peers["b:1"].declared_distribution = "single-leader"
     mgr.view.peers["b:1"].declared_elect_leader = False
@@ -2695,10 +2508,7 @@ def test_manager_detects_elect_leader_divergence(no_tls):
 def test_policy_divergence_ignores_non_agreed_and_unknown(no_tls):
     # only AGREED peers that actually reported a value are compared: a drifted
     # peer, or one too old to declare the fields, contributes no conflict.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     pb = mgr.view.peers["b:1"]
     pb.status = STATUS_DRIFTED  # different policy, but drifted -> ignored
@@ -2709,9 +2519,7 @@ def test_policy_divergence_ignores_non_agreed_and_unknown(no_tls):
 
 
 def test_view_dict_reports_policy_conflict(no_tls):
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a")
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
+    mgr = _mgr(["b:1", "c:1"], electLeader=True)
     _seed_agree(mgr, "b:1", "node-b")
     mgr.view.peers["b:1"].declared_distribution = "spread"
     view = mgr.view_dict()
@@ -2752,8 +2560,7 @@ def test_size_divergent_peer_dropped_from_mutual_set(no_tls):
     # node -- one that cannot see the divergent N -- from bridge-confirming the
     # stale-N node as quorate and deferring to a node that is itself failing
     # closed (the resize-while-bridging stand-down).
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
-    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=4, quorum 3
+    mgr = _mgr(["b:1", "c:1", "d:1"])  # N=4, quorum 3
     _seed_agree(mgr, "b:1", "node-b")  # the stale-N node (mid-resize)
     _seed_agree(mgr, "c:1", "node-c")
     _seed_agree(mgr, "d:1", "node-d")
@@ -2777,10 +2584,7 @@ def test_size_divergent_node_not_bridge_confirmed(no_tls):
     # Since the witnesses drop the size-divergent node-a from the
     # mutual_agreeing they gossip (see test above), node-z never witnesses a
     # two-way edge into node-a, cannot confirm it quorate, and won't defer.
-    cfg = _cfg(
-        _DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1", "e:1"], "node-z"
-    )
-    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=5, quorum 3
+    mgr = _mgr(["a:1", "c:1", "d:1", "e:1"], node="node-z")  # N=5, quorum 3
     # witnesses gossip the post-fix set: node-a (stale) is absent from it.
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-z", "node-d", "node-e"})
     _seed_agree(mgr, "d:1", "node-d", mutual={"node-z", "node-c", "node-e"})
@@ -2808,8 +2612,7 @@ def test_policy_divergent_peer_dropped_from_mutual_set(no_tls):
     # a bridge (blind to the policy conflict, which conflicting_policies only
     # sees for DIRECT peers) would bridge-confirm it and elect/defer across a
     # node coordinating by other rules -- a Leader double-run or silent skip.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
-    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=4, quorum 3
+    mgr = _mgr(["b:1", "c:1", "d:1"])  # N=4, quorum 3
     my_elect = bool(mgr.config.get("electLeader"))
     for h in ("b:1", "c:1", "d:1"):
         name = {"b:1": "node-b", "c:1": "node-c", "d:1": "node-d"}[h]
@@ -2839,10 +2642,7 @@ def test_policy_divergent_node_not_bridge_confirmed(no_tls):
     # node-a from the mutual_agreeing they gossip, node-z never sees a two-way
     # edge into node-a, cannot bridge-confirm it quorate, and won't defer to it
     # -- closing the cross-policy elect/defer at source.
-    cfg = _cfg(
-        _DUMMY_TLS, "127.0.0.1:1", ["a:1", "c:1", "d:1", "e:1"], "node-z"
-    )
-    mgr = ClusterManager(cfg, lambda: "v1:mine")  # N=5, quorum 3
+    mgr = _mgr(["a:1", "c:1", "d:1", "e:1"], node="node-z")  # N=5, quorum 3
     # witnesses gossip the post-fix set: node-a (divergent) is absent from it.
     _seed_agree(mgr, "c:1", "node-c", mutual={"node-z", "node-d", "node-e"})
     _seed_agree(mgr, "d:1", "node-d", mutual={"node-z", "node-c", "node-e"})
@@ -2909,15 +2709,14 @@ def test_declared_fields_gate_both_agreement_and_conflict(no_tls):
     }
     cases = _DIVERGENCE_FIELD_CASES
     assert gated == set(cases)
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a")
     # the exclude set _agreeing_peers iterates must be exactly those fields
-    probe = ClusterManager(cfg, lambda: "v1:mine")
+    probe = _mgr(["b:1", "c:1", "d:1"])
     assert set(probe._our_declarations()) == gated
     hosts = {"b:1": "node-b", "c:1": "node-c", "d:1": "node-d"}
     for field, (_aligned, diverging, detector) in cases.items():
         # a fresh manager per field: N=4, quorum 3, every peer agreed and
         # declaring exactly what we declare.
-        mgr = ClusterManager(cfg, lambda: "v1:mine")
+        mgr = _mgr(["b:1", "c:1", "d:1"])
         for host, name in hosts.items():
             _seed_agree(mgr, host, name)
             for other, (aligned, _d, _det) in cases.items():
@@ -2948,23 +2747,18 @@ async def test_mtls_cluster_size_divergence_detected(tmp_path):
     # only pad each node's declared N.
     tls = _write_tls(tmp_path)
     pa, pc = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(
-            tls,
-            f"127.0.0.1:{pa}",
-            [f"localhost:{pc}", "127.0.0.1:2"],
-            "node-a",  # N = 3
-        ),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pc}", "127.0.0.1:2"],  # N = 3
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    c = ClusterManager(
-        _cfg(
-            tls,
-            f"127.0.0.1:{pc}",
-            [f"localhost:{pa}", "127.0.0.1:2", "127.0.0.1:3", "127.0.0.1:4"],
-            "node-c",  # N = 5
-        ),
-        lambda: "v1:same",
+    c = _mgr(
+        [f"localhost:{pa}", "127.0.0.1:2", "127.0.0.1:3", "127.0.0.1:4"],
+        node="node-c",  # N = 5
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pc}",
     )
     await a.start()
     await c.start()
@@ -2987,13 +2781,19 @@ async def test_mtls_duplicate_nodename_detected(tmp_path):
     # that name from a different instance id -> conflict on both sides.
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "dup"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        node="dup",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "dup"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="dup",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     await a.start()
     await b.start()
@@ -3090,128 +2890,344 @@ class _FakeSSLError(aiohttp.ClientSSLError):
         return "fake ssl handshake failure"
 
 
-@pytest.mark.asyncio
-async def test_poll_peer_success_records_agreement(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
+def _peer_body(**extra):
+    # the well-formed /peer body the fake polls build on (node-b agreeing on
+    # our job set at the current scheme; repeated 13x before finding B3)
+    body = {
+        "node_name": "node-b",
+        "job_set_id": "v1:mine",
+        "scheme_version": SCHEME_VERSION,
+    }
+    body.update(extra)
+    return body
+
+
+def _me(mgr):
+    # the members[] entry through which a peer attests THIS node (the mutual
+    # agreement gate needs it before the peer counts toward anything)
+    return {
+        "node_name": "node-a",
+        "instance_id": mgr.instance_id,
+        "agreed": True,
+    }
+
+
+def _peer_session(
+    payload=None, *, body=None, exc=None, headers=None, status=200
+):
+    # one canned /peer result behind a recording session (finding B3):
+    # ``payload`` is JSON-encoded, ``body`` sends raw bytes instead, ``exc``
+    # raises from the request context, ``headers`` and ``status`` ride the
+    # response.
+    if exc is not None:
+        return _FakeSession(_FakeGet(exc=exc))
+    return _FakeSession(
         _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                }
-            )
+            resp=_FakeResp(payload, body=body, headers=headers, status=status)
         )
     )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
+
+
+# _poll_peer failure classification (finding B3): each row is one hostile or
+# broken observation and the failure class it must be filed under, never an
+# escaped exception.  Fields: the _peer_session(**kwargs) input, the expected
+# peer status, an optional last_error fragment, and whether the row also
+# proves the election survives the junk (the value was never stored, so
+# leader_name() computes instead of crashing).
+_POLL_PEER_FAILURE_CASES = [
+    pytest.param(
+        {"exc": _FakeSSLError()},
+        STATUS_UNTRUSTED,
+        None,
+        False,
+        id="ssl-error-is-untrusted",
+    ),
+    pytest.param(
+        {"exc": aiohttp.ClientError("boom")},
+        STATUS_UNREACHABLE,
+        None,
+        False,
+        id="client-error-is-unreachable",
+    ),
+    # #3: a CA-trusted-but-misbehaving peer returning a non-string node_name
+    # is rejected (not stored), so it can never reach min()/sorted() and
+    # crash the scheduler.  Election keeps working.
+    pytest.param(
+        {"payload": _peer_body(node_name=12345)},
+        STATUS_UNREACHABLE,
+        None,
+        True,
+        id="non-string-node-name",
+    ),
+    # an EMPTY node_name passes the length/printability checks ("" is
+    # printable) yet sorts below every real name; stored, it would count
+    # toward quorum as a peer no election fold can name.  Rejected at the
+    # same parse seam that drops the set-shaped fields' empties.
+    pytest.param(
+        {"payload": _peer_body(node_name="")},
+        STATUS_UNREACHABLE,
+        "empty",
+        True,
+        id="empty-node-name",
+    ),
+    # #4: an over-cap body is refused rather than buffered (OOM guard).
+    pytest.param(
+        {"body": b"x" * (MAX_PEER_RESPONSE_BYTES + 1)},
+        STATUS_UNREACHABLE,
+        "oversized",
+        False,
+        id="oversized-body",
+    ),
+    # #5: valid-but-non-object JSON and unparseable bodies are classified as
+    # failed observations instead of raising AttributeError/ValueError.
+    pytest.param(
+        {"body": b"[1, 2, 3]"},
+        STATUS_UNREACHABLE,
+        None,
+        False,
+        id="json-array-body",
+    ),
+    pytest.param(
+        {"body": b'"a string"'},
+        STATUS_UNREACHABLE,
+        None,
+        False,
+        id="json-string-body",
+    ),
+    pytest.param(
+        {"body": b"not json{"},
+        STATUS_UNREACHABLE,
+        None,
+        False,
+        id="unparseable-body",
+    ),
+]
+# a non-int, non-positive, or bool cluster_size from a CA-trusted but buggy
+# peer is a malformed observation (bool is an int subclass -> rejected too)
+_POLL_PEER_FAILURE_CASES += [
+    pytest.param(
+        {"payload": _peer_body(cluster_size=bad)},
+        STATUS_UNREACHABLE,
+        "cluster_size",
+        False,
+        id="malformed-size-" + label,
+    )
+    for bad, label in (
+        ("five", "not-a-number"),
+        (0, "zero"),
+        (-1, "negative"),
+        (True, "bool"),
+        (1.5, "float"),
+    )
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observation", "want_status", "err_substr", "election_still_works"),
+    _POLL_PEER_FAILURE_CASES,
+)
+async def test_poll_peer_failure_classified(
+    no_tls, observation, want_status, err_substr, election_still_works
+):
+    mgr = _mgr(["b:1"])
+    await mgr._poll_peer(_peer_session(**observation), "b:1", "v1:mine")
     peer = mgr.view.peers["b:1"]
+    assert peer.status == want_status
+    if err_substr is not None:
+        assert err_substr in (peer.last_error or "")
+    if election_still_works:
+        assert peer.node_name is None
+        assert mgr.leader_name() is None  # election does not crash
+
+
+# _poll_peer absorb family (finding B3): one successful poll, one declared
+# field parsed and stored.  The rows collect the absorb-shaped tests that
+# used to sit in this file's themed sections; each carries the peer hosts
+# (plus config overrides), the polled host, a payload builder (given the
+# manager, so a members[] block can attest OUR instance id), and the row's
+# original assertions as a check function over (mgr, peer, session).
+
+
+def _check_agreement(mgr, peer, session):
     assert peer.status == STATUS_AGREED
     assert peer.node_name == "node-b"
     assert session.calls[0][0] == "https://b:1/peer"
 
 
-@pytest.mark.asyncio
-async def test_poll_peer_ssl_error_is_untrusted(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(_FakeGet(exc=_FakeSSLError()))
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    assert mgr.view.peers["b:1"].status == STATUS_UNTRUSTED
+def _check_declared_size(mgr, peer, session):
+    assert peer.declared_size == 5
 
 
-@pytest.mark.asyncio
-async def test_poll_peer_client_error_is_unreachable(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_records_declared_size(no_tls):
-    # a successful poll stores the peer's declared cluster size for the
-    # size-divergence gate.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "cluster_size": 5,
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    assert mgr.view.peers["b:1"].declared_size == 5
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_omitted_size_is_none(no_tls):
-    # a peer too old to report cluster_size leaves declared_size None (the size
-    # check is then skipped for it), not a failed observation.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    peer = mgr.view.peers["b:1"]
+def _check_omitted_size(mgr, peer, session):
     assert peer.status == STATUS_AGREED
     assert peer.declared_size is None
 
 
+def _check_mutual_unconfirmed(mgr, peer, session):
+    assert peer.mutual_agreeing == set()  # omitted -> empty
+    assert "node-b" not in mgr._eligible_candidates()  # unconfirmed: excluded
+
+
+def _check_mutual_neutralized(mgr, peer, session):
+    # only the valid string survives; no crash
+    assert peer.mutual_agreeing == {"node-a"}
+
+
+def _check_ran_reboot(mgr, peer, session):
+    assert peer.ran_reboot_jobs == {"boot"}
+    # b is agreed (mutual), so its run is trusted transitively
+    assert mgr.reboot_ran("boot") is True
+
+
+def _check_vouched_empty(mgr, peer, session):
+    assert peer.quorate_vouched == set()  # omitted -> empty
+    assert mgr._unconfirmed_contenders() == []  # nothing folded
+
+
+def _check_job_summaries(mgr, peer, session):
+    assert peer.job_summaries == {
+        "alpha": {
+            "running": True,
+            "enabled": True,
+            "scheduled_in": None,
+            "last": None,
+        }
+    }
+    assert peer.job_summaries_truncated is False
+
+
+_POLL_PEER_ABSORB_CASES = [
+    pytest.param(
+        ["b:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(),
+        _check_agreement,
+        id="success-records-agreement",
+    ),
+    # a successful poll stores the peer's declared cluster size for the
+    # size-divergence gate.
+    pytest.param(
+        ["b:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(cluster_size=5),
+        _check_declared_size,
+        id="records-declared-size",
+    ),
+    # a peer too old to report cluster_size leaves declared_size None (the
+    # size check is then skipped for it), not a failed observation.
+    pytest.param(
+        ["b:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(),
+        _check_omitted_size,
+        id="omitted-size-is-none",
+    ),
+    # mixed-version: a peer on an older build omits mutual_agreeing -> parses
+    # to an empty set, so it is NOT confirmed quorate and not electable.  The
+    # node leans to leading rather than deferring to an unconfirmed peer.
+    pytest.param(
+        ["b:1", "c:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(
+            instance_id="ib",
+            members=[
+                _me(mgr),
+                {"node_name": "node-b", "instance_id": "ib", "agreed": True},
+            ],
+            # NO mutual_agreeing key (older peer)
+        ),
+        _check_mutual_unconfirmed,
+        id="omitted-mutual-agreeing-is-unconfirmed",
+    ),
+    # a malformed/hostile mutual_agreeing (non-list, or non-string items) is
+    # neutralized by _parse_str_list, never reaching min()/sorted().
+    pytest.param(
+        ["b:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(
+            instance_id="ib",
+            members=[
+                _me(mgr),
+                {"node_name": "node-b", "instance_id": "ib", "agreed": True},
+            ],
+            mutual_agreeing=["node-a", 123, None, {"x": 1}],
+        ),
+        _check_mutual_neutralized,
+        id="neutralizes-hostile-mutual-agreeing",
+    ),
+    pytest.param(
+        ["b:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(
+            instance_id="inst-b",
+            members=[_me(mgr)],
+            ran_reboot_jobs=["boot"],
+        ),
+        _check_ran_reboot,
+        id="records-ran-reboot-jobs",
+    ),
+    # mixed-version: an older peer omits quorate_vouched -> parses to an
+    # empty set, so it vouches no transitive contender.  The node then folds
+    # nothing from it (leans toward running, never a zero-run) -- the safe
+    # direction.
+    pytest.param(
+        ["c:1", "d:1", "e:1"],
+        {"distribution": "spread"},
+        "c:1",
+        lambda mgr: _peer_body(
+            node_name="node-c",
+            instance_id="ic",
+            members=[
+                _me(mgr),
+                {"node_name": "node-c", "instance_id": "ic", "agreed": True},
+            ],
+            mutual_agreeing=["node-a", "node-e"],
+            # NO quorate_vouched key (older peer)
+        ),
+        _check_vouched_empty,
+        id="omitted-quorate-vouched-is-empty",
+    ),
+    pytest.param(
+        ["b:1"],
+        {},
+        "b:1",
+        lambda mgr: _peer_body(
+            instance_id="inst-b",
+            members=[_me(mgr)],
+            job_summaries={"alpha": {"running": True}},
+            job_summaries_truncated=False,
+        ),
+        _check_job_summaries,
+        id="absorbs-job-summaries",
+    ),
+]
+
+
 @pytest.mark.asyncio
-async def test_poll_peer_rejects_malformed_size(no_tls):
-    # a non-int, non-positive, or bool cluster_size from a CA-trusted but buggy
-    # peer is a malformed observation (bool is an int subclass -> rejected too)
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    for bad in ("five", 0, -1, True, 1.5):
-        session = _FakeSession(
-            _FakeGet(
-                resp=_FakeResp(
-                    {
-                        "node_name": "node-b",
-                        "job_set_id": "v1:mine",
-                        "scheme_version": SCHEME_VERSION,
-                        "cluster_size": bad,
-                    }
-                )
-            )
-        )
-        await mgr._poll_peer(session, "b:1", "v1:mine")
-        peer = mgr.view.peers["b:1"]
-        assert peer.status == STATUS_UNREACHABLE, bad
-        assert "cluster_size" in peer.last_error
+@pytest.mark.parametrize(
+    ("peers", "over", "host", "make_body", "check"),
+    _POLL_PEER_ABSORB_CASES,
+)
+async def test_poll_peer_absorbs_declared_field(
+    no_tls, peers, over, host, make_body, check
+):
+    mgr = _mgr(peers, **over)
+    session = _peer_session(make_body(mgr))
+    await mgr._poll_peer(session, host, "v1:mine")
+    check(mgr, mgr.view.peers[host], session)
 
 
 @pytest.mark.asyncio
 async def test_poll_all_with_no_peers_is_noop(no_tls):
     # exercises _poll_all's session setup + empty gather with no network
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     await mgr._poll_all()  # must not raise
 
 
@@ -3220,10 +3236,7 @@ async def test_start_stop_lifecycle_plaintext(no_tls):
     # no peers -> the poll loop's _poll_all is a no-op (no peer sockets), so
     # this drives start()/_poll_loop/stop() over a plaintext listener with no
     # certs. stop() is called twice to cover the already-stopped path.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, f"127.0.0.1:{_free_port()}", [], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr([], listen=f"127.0.0.1:{_free_port()}")
     await mgr.start()
     try:
         await asyncio.sleep(0)  # let the poll loop reach its first wait
@@ -3242,15 +3255,7 @@ async def test_start_completes_one_poll_round_inline(no_tls):
     # information), not UNKNOWN, and the never-skip gates behave as for a
     # genuinely isolated node.
     dead = _free_port()  # bound to nothing
-    mgr = ClusterManager(
-        _cfg(
-            _DUMMY_TLS,
-            f"127.0.0.1:{_free_port()}",
-            [f"127.0.0.1:{dead}"],
-            "node-a",
-        ),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr([f"127.0.0.1:{dead}"], listen=f"127.0.0.1:{_free_port()}")
     assert mgr.is_available_leader() is False  # never-polled view: held
     await mgr.start()
     try:
@@ -3274,10 +3279,7 @@ def test_quorum_requires_mutual_agreement(no_tls):
     # #1: seeing a peer AGREED is not enough -- it must also report seeing US
     # agreed (by our instance_id), else a one-way link would let both ends
     # self-elect. The guard: an un-attesting peer does not count toward quorum.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     peer = mgr.view.peers["b:1"]
     peer.status = STATUS_AGREED
     peer.node_name = "node-b"
@@ -3304,10 +3306,7 @@ def test_legacy_peer_without_members_counts_one_directional(no_tls):
     # reports_members=False instead falls back to one-directional agreement (we
     # count it if WE see it AGREED), so the new node stays quorate and elects
     # itself: the documented "lean toward running" behaviour, not a halt.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     for host, name in (("b:1", "node-b"), ("c:1", "node-c")):
         peer = mgr.view.peers[host]
         peer.status = STATUS_AGREED
@@ -3404,12 +3403,8 @@ def test_asymmetric_reachability_never_double_leads(no_tls):
     # the split-brain repro from review finding #1: a<b<c, quorum 2, with
     # a->b reachable, b->a NOT, a<->c down, b->c up + back. Pre-fix BOTH a and
     # b self-elected; mutual attestation must leave at most one leader.
-    a = ClusterManager(
-        _cfg(_DUMMY_TLS, "a:1", ["b:1", "c:1"], "node-a"), lambda: "v1:x"
-    )
-    b = ClusterManager(
-        _cfg(_DUMMY_TLS, "b:1", ["a:1", "c:1"], "node-b"), lambda: "v1:x"
-    )
+    a = _mgr(["b:1", "c:1"], job_set="v1:x", listen="a:1")
+    b = _mgr(["a:1", "c:1"], node="node-b", job_set="v1:x", listen="b:1")
     # a polled b OK, but b never reached a -> b's members omit node-a
     pa_b = a.view.peers["b:1"]
     pa_b.status = STATUS_AGREED
@@ -3437,10 +3432,7 @@ def test_transitive_conflict_via_gossip(no_tls):
     # (so one bad peer cannot fabricate a conflict; see the F05 hardening in
     # conflict_names). With two corroborating reporters the duplicate is still
     # detected and the Leader gate then fails closed.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "d:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1", "d:1"])
     # we directly see one "dup" (instance i1) -- first-party evidence
     p = mgr.view.peers["b:1"]
     p.status = STATUS_AGREED
@@ -3469,10 +3461,7 @@ def test_single_peer_cannot_fabricate_conflict(no_tls):
     # the same name twice with different instances, nor a peer with a foreign
     # instance of OUR OWN name, is enough on its own -- a transitive instance
     # needs two distinct corroborating reporters.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     # b:1 is a normal agreeing peer that also injects a fabricated conflict:
     # two instances of "victim", plus a foreign instance of our own name.
     p = mgr.view.peers["b:1"]
@@ -3495,15 +3484,7 @@ def test_duplicate_nodename_preferleader_tiebreak(no_tls):
     # PreferLeader). The per-process instance_id breaks the tie so exactly one
     # runs -- the lowest instance.
     def mk(instance):
-        m = ClusterManager(
-            _cfg(
-                _DUMMY_TLS,
-                "127.0.0.1:1",
-                ["peer-a:1", "node-z:1"],
-                "node-a",
-            ),
-            lambda: "v1:mine",
-        )
+        m = _mgr(["peer-a:1", "node-z:1"])
         m.instance_id = instance
         return m
 
@@ -3537,9 +3518,7 @@ def test_duplicate_name_tiebreak_does_not_zero_run(no_tls):
     # and the job ran nowhere (a never-skip zero-run). Now we cede only when we
     # can see the twin self-own it; otherwise we run (a PreferLeader-accepted
     # double-run, never a zero-run).
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["y:1", "dup:1"], "node-a")
-    cfg["distribution"] = "spread"
-    a = ClusterManager(cfg, lambda: "v1:mine")
+    a = _mgr(["y:1", "dup:1"], distribution="spread")
     a.instance_id = "i999"  # the HIGHER instance -> loses a blunt tiebreak
     # an agreeing peer that does not out-rank us and vouches no contender, so
     # our own available owner for the chosen job stays "node-a".
@@ -3578,10 +3557,7 @@ def test_duplicate_address_does_not_inflate_quorum(no_tls):
     # and the quorum threshold inflate and fault tolerance erodes below the
     # declared size (silently re-enabling the degenerate 2-real-node mode the
     # electLeader 2-node refusal forbids).
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b1:1", "b2:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b1:1", "b2:1", "c:1"])
     # both b addresses answer as the SAME node B (same instance_id)
     _seed_agree(mgr, "b1:1", "node-b", instance="inst-b")
     _seed_agree(mgr, "b2:1", "node-b", instance="inst-b")
@@ -3601,15 +3577,7 @@ def test_multihomed_peer_outage_does_not_inflate_quorum(no_tls):
     # {a, b} then stood down every Leader job for the whole outage, exactly
     # when the declared fault tolerance was being exercised.
     def _node(name, other_host, other_name):
-        mgr = ClusterManager(
-            _cfg(
-                _DUMMY_TLS,
-                "127.0.0.1:1",
-                [other_host, "x1:1", "x2:1"],
-                name,
-            ),
-            lambda: "v1:mine",
-        )
+        mgr = _mgr([other_host, "x1:1", "x2:1"], node=name)
         # the surviving peer mutually agrees with everyone (and is quorate,
         # so it stays electable after x dies)
         _seed_agree(
@@ -3649,31 +3617,18 @@ def test_multihomed_peer_outage_does_not_inflate_quorum(no_tls):
 async def test_poll_peer_records_peer_members(no_tls):
     # a successful poll stores the peer's reported members, and an attesting
     # peer is counted toward quorum (the mutual-agreement happy path).
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
+    mgr = _mgr(["b:1"])
+    session = _peer_session(
+        _peer_body(
+            instance_id="inst-b",
+            members=[
+                _me(mgr),
                 {
                     "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
                     "instance_id": "inst-b",
-                    "members": [
-                        {
-                            "node_name": "node-a",
-                            "instance_id": mgr.instance_id,
-                            "agreed": True,
-                        },
-                        {
-                            "node_name": "node-b",
-                            "instance_id": "inst-b",
-                            "agreed": True,
-                        },
-                    ],
-                }
-            )
+                    "agreed": True,
+                },
+            ],
         )
     )
     await mgr._poll_peer(session, "b:1", "v1:mine")
@@ -3685,9 +3640,7 @@ async def test_poll_peer_records_peer_members(no_tls):
 
 @pytest.mark.asyncio
 async def test_handle_peer_includes_members(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     _seed_agree(mgr, "b:1", "node-b")
     resp = await mgr._handle_peer(_Req())
     payload = json.loads(resp.text)
@@ -3701,10 +3654,7 @@ async def test_handle_peer_includes_members(no_tls):
 async def test_handle_peer_includes_mutual_agreeing(no_tls):
     # the /peer response must publish our mutual_agreeing set (the confirmed
     # two-way agreers) so pollers can drive bridge confirmation off it.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     _seed_agree(mgr, "c:1", "node-c")
     resp = await mgr._handle_peer(_Req())
@@ -3718,36 +3668,18 @@ async def test_poll_peer_round_trips_mutual_agreeing(no_tls):
     # bridge decision. node-a polls node-b (N=4, quorum 3); b reports it
     # mutually agrees with node-a and node-x. After also learning node-c
     # mutually agrees with node-x, node-a confirms node-x as a bridge node.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1", "x:1"], "node-a"),
-        lambda: "v1:mine",
-    )
-    me = {
-        "node_name": "node-a",
-        "instance_id": mgr.instance_id,
-        "agreed": True,
-    }
+    mgr = _mgr(["b:1", "c:1", "x:1"])
     for host, nm, inst in (("b:1", "node-b", "ib"), ("c:1", "node-c", "ic")):
-        session = _FakeSession(
-            _FakeGet(
-                resp=_FakeResp(
-                    {
-                        "node_name": nm,
-                        "job_set_id": "v1:mine",
-                        "scheme_version": SCHEME_VERSION,
-                        "instance_id": inst,
-                        "members": [
-                            me,
-                            {
-                                "node_name": nm,
-                                "instance_id": inst,
-                                "agreed": True,
-                            },
-                        ],
-                        # b and c each mutually agree with node-a and node-x
-                        "mutual_agreeing": ["node-a", "node-x"],
-                    }
-                )
+        session = _peer_session(
+            _peer_body(
+                node_name=nm,
+                instance_id=inst,
+                members=[
+                    _me(mgr),
+                    {"node_name": nm, "instance_id": inst, "agreed": True},
+                ],
+                # b and c each mutually agree with node-a and node-x
+                mutual_agreeing=["node-a", "node-x"],
             )
         )
         await mgr._poll_peer(session, host, "v1:mine")
@@ -3756,52 +3688,10 @@ async def test_poll_peer_round_trips_mutual_agreeing(no_tls):
     assert mgr._bridge_candidates() == ["node-x"]
 
 
-@pytest.mark.asyncio
-async def test_poll_peer_omitted_mutual_agreeing_is_unconfirmed(no_tls):
-    # mixed-version: a peer on an older build omits mutual_agreeing -> parses
-    # to an empty set, so it is NOT confirmed quorate and not electable. The
-    # node leans to leading rather than deferring to an unconfirmed peer.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
-    me = {
-        "node_name": "node-a",
-        "instance_id": mgr.instance_id,
-        "agreed": True,
-    }
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "ib",
-                    "members": [
-                        me,
-                        {
-                            "node_name": "node-b",
-                            "instance_id": "ib",
-                            "agreed": True,
-                        },
-                    ],
-                    # NO mutual_agreeing key (older peer)
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    assert mgr.view.peers["b:1"].mutual_agreeing == set()  # omitted -> empty
-    assert "node-b" not in mgr._eligible_candidates()  # unconfirmed: excluded
-
-
 def test_poll_failure_resets_mutual_agreeing(no_tls):
     # a failed poll drops the now-stale gossip, including mutual_agreeing, so a
     # witness gone unreachable can no longer vouch for a bridge candidate.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-x"})
     assert mgr.view.peers["b:1"].mutual_agreeing == {"node-a", "node-x"}
     mgr.view.record_failure("b:1", "boom", untrusted=False)
@@ -3813,10 +3703,7 @@ async def test_handle_peer_includes_quorate_vouched(no_tls):
     # the /peer response must publish our quorate_vouched set (our
     # _eligible_candidates -- the nodes we confirm quorate) so a poller folds
     # only confirmed-runnable owners into its spread Leader rendezvous set.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     # N=3, quorum 2: a peer mutually agreeing with >= quorum-1 = 1 name is
     # confirmed quorate, so node-a vouches both node-b and node-c.
     _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"})
@@ -3840,9 +3727,7 @@ async def test_handle_peer_caps_quorate_vouched(no_tls):
         MAX_PEER_RESPONSE_BYTES,
     )
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # what a peer parsed at MAX_MEMBER_ENTRIES x MAX_PEER_FIELD_LEN can hand
     # us: far more names, each far longer, than any real fleet has.
     flood = {"n{:04d}".format(i) + "x" * 200 for i in range(4096)}
@@ -3871,9 +3756,7 @@ async def test_candidate_truncation_is_reported_not_silent(no_tls, caplog):
     # truncation logs and rides /cluster as `candidates_truncated`.
     from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     flood = {
         "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
     }
@@ -3904,9 +3787,7 @@ async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
     # oversized: the exact flood the limiter's docstring says it prevents.
     from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     flood = {
         "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
     }
@@ -3927,6 +3808,50 @@ async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
 
 
 @pytest.mark.asyncio
+async def test_candidate_truncation_warning_survives_membership_churn(
+    no_tls, caplog
+):
+    # The limiter used to key on the exact oversize COUNT, so it only held
+    # while that number stood still. One node joining or leaving an
+    # over-cap fleet changed it and re-fired both lines every poll round,
+    # which is the flood the limiter exists to stop (the test above cannot
+    # see it: it re-seeds the identical set every round). It is a
+    # per-episode latch now.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = _mgr(["b:1"])
+    base = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
+    }
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        for extra in range(6):
+            # every round the fleet is a DIFFERENT size, and every round
+            # it is still over the cap
+            churned = base | {"churn{:02d}".format(i) for i in range(extra)}
+            _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | churned)
+            mgr._bridge_candidates()
+            mgr._capped_vouched()
+    warned = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    assert len(warned) == 2, [r.getMessage() for r in warned]
+
+    # dropping under the cap and growing back over it IS a new episode
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
+        mgr._bridge_candidates()
+        mgr._capped_vouched()
+        _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | base)
+        mgr._bridge_candidates()
+        mgr._capped_vouched()
+    again = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    assert len(again) == 2, [r.getMessage() for r in again]
+
+
+@pytest.mark.asyncio
 async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
     # The /cluster view flag rode the same scalar the bridge derive zeroes
     # when ITS half fits, and view_dict cascades into that derive, so the
@@ -3934,9 +3859,7 @@ async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
     # had just observed on the strictly larger union.
     from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     flood = {
         "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
     }
@@ -3958,9 +3881,7 @@ async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
 
 @pytest.mark.asyncio
 async def test_candidates_truncated_is_zero_for_an_ordinary_fleet(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
     mgr._bridge_candidates()
     assert mgr._candidates_truncated == 0
@@ -3976,9 +3897,7 @@ async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
     # against the cap instead of trusting the last advert build.
     from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     flood = {
         "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
     }
@@ -4004,6 +3923,34 @@ async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
 
 
 @pytest.mark.asyncio
+async def test_candidates_truncated_reports_growth_before_any_peer_poll(
+    no_tls,
+):
+    # The mirror of the shrink case, and the more dangerous direction: the
+    # advert cell is written only by a /peer response build, so a node
+    # nobody polls yet reported 0 while its union had ALREADY outgrown the
+    # cap and every future advert would drop a co-owner. The read must
+    # re-derive the advert side in both directions, not only clear it.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = _mgr(["b:1", "c:1"])
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
+    }
+    # the bridge half fits the cap exactly, so its own cell stays 0 ...
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-a"})
+    assert mgr._bridge_candidates() == sorted(flood)
+    assert mgr._candidates_trunc_seen.get("bridge", 0) == 0
+    # ... while the union (the bridge set plus the two direct peers) does
+    # not. No /peer poll has ever rebuilt the body here.
+    union = len(mgr._eligible_candidates())
+    assert union > MAX_ADVERTISED_CANDIDATE_NAMES
+    assert mgr._candidates_truncated == union
+    assert mgr.view_dict()["candidates_truncated"] == union
+
+
+@pytest.mark.asyncio
 async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
     no_tls, monkeypatch
 ):
@@ -4017,9 +3964,7 @@ async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
     import cronstable.cluster as cluster_mod
 
     monkeypatch.setattr(cluster_mod, "MAX_PEER_RESPONSE_BYTES", 4096)
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     mgr.set_job_summaries_provider(
         lambda: {
             "job-{:03d}".format(i): {
@@ -4051,39 +3996,54 @@ async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
 
 
 @pytest.mark.asyncio
+async def test_handle_peer_says_so_when_shedding_cannot_fit_the_body(
+    no_tls, monkeypatch, caplog
+):
+    # The shed is the only lever here, so it can fail two ways: no
+    # provider is installed (job_summaries is already {}, so dropping it
+    # removes nothing) or the rest of the body is over on its own. Either
+    # way the old code logged "dropped job_summaries ... " as if that had
+    # worked and shipped a body every honest poller rejects. Say what is
+    # actually happening instead, and do not claim a drop that was a
+    # no-op.
+    import logging
+
+    import cronstable.cluster as cluster_mod
+
+    monkeypatch.setattr(cluster_mod, "MAX_PEER_RESPONSE_BYTES", 64)
+    mgr = _mgr([])  # no job-summaries provider: the shed removes nothing
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(resp.body) > 64  # still over: nothing left to shed
+    # the no-op shed did not flip the marker: nothing was truncated, and a
+    # poller must not be told the fleet view was cut when it never existed
+    assert payload["job_summaries"] == {}
+    assert payload["job_summaries_truncated"] is False
+    records = [r for r in caplog.records if "/peer response" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert "drop it from their quorum" in records[0].getMessage()
+    assert "dropped job_summaries" not in records[0].getMessage()
+
+
+@pytest.mark.asyncio
 async def test_poll_peer_round_trips_quorate_vouched(no_tls):
     # end to end: a polled quorate_vouched is parsed, stored, and drives the
     # spread Leader owner fold. node-a (spread) polls node-c, which vouches a
     # transitive node-e quorate; node-a then folds node-e as an unconfirmed
     # contender it cannot itself confirm.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["c:1", "d:1", "e:1"], "node-a")
-    cfg["distribution"] = "spread"
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
-    me = {
-        "node_name": "node-a",
-        "instance_id": mgr.instance_id,
-        "agreed": True,
-    }
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-c",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "ic",
-                    "members": [
-                        me,
-                        {
-                            "node_name": "node-c",
-                            "instance_id": "ic",
-                            "agreed": True,
-                        },
-                    ],
-                    "mutual_agreeing": ["node-a", "node-e"],
-                    "quorate_vouched": ["node-a", "node-e"],
-                }
-            )
+    mgr = _mgr(["c:1", "d:1", "e:1"], distribution="spread")
+    session = _peer_session(
+        _peer_body(
+            node_name="node-c",
+            instance_id="ic",
+            members=[
+                _me(mgr),
+                {"node_name": "node-c", "instance_id": "ic", "agreed": True},
+            ],
+            mutual_agreeing=["node-a", "node-e"],
+            quorate_vouched=["node-a", "node-e"],
         )
     )
     await mgr._poll_peer(session, "c:1", "v1:mine")
@@ -4091,149 +4051,14 @@ async def test_poll_peer_round_trips_quorate_vouched(no_tls):
     assert mgr._unconfirmed_contenders() == ["node-e"]
 
 
-@pytest.mark.asyncio
-async def test_poll_peer_omitted_quorate_vouched_is_empty(no_tls):
-    # mixed-version: an older peer omits quorate_vouched -> parses to an empty
-    # set, so it vouches no transitive contender. The node then folds nothing
-    # from it (leans toward running, never a zero-run) -- the safe direction.
-    cfg = _cfg(_DUMMY_TLS, "127.0.0.1:1", ["c:1", "d:1", "e:1"], "node-a")
-    cfg["distribution"] = "spread"
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
-    me = {
-        "node_name": "node-a",
-        "instance_id": mgr.instance_id,
-        "agreed": True,
-    }
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-c",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "ic",
-                    "members": [
-                        me,
-                        {
-                            "node_name": "node-c",
-                            "instance_id": "ic",
-                            "agreed": True,
-                        },
-                    ],
-                    "mutual_agreeing": ["node-a", "node-e"],
-                    # NO quorate_vouched key (older peer)
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "c:1", "v1:mine")
-    assert mgr.view.peers["c:1"].quorate_vouched == set()  # omitted -> empty
-    assert mgr._unconfirmed_contenders() == []  # nothing folded
-
-
 def test_poll_failure_resets_quorate_vouched(no_tls):
     # a failed poll drops the now-stale gossip, including quorate_vouched, so a
     # witness gone unreachable can no longer vouch a transitive owner.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"}, vouched={"node-x"})
     assert mgr.view.peers["b:1"].quorate_vouched == {"node-x"}
     mgr.view.record_failure("b:1", "boom", untrusted=False)
     assert mgr.view.peers["b:1"].quorate_vouched is None
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_neutralizes_hostile_mutual_agreeing(no_tls):
-    # a malformed/hostile mutual_agreeing (non-list, or non-string items) is
-    # neutralized by _parse_str_list, never reaching min()/sorted().
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    me = {
-        "node_name": "node-a",
-        "instance_id": mgr.instance_id,
-        "agreed": True,
-    }
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "ib",
-                    "members": [
-                        me,
-                        {
-                            "node_name": "node-b",
-                            "instance_id": "ib",
-                            "agreed": True,
-                        },
-                    ],
-                    "mutual_agreeing": ["node-a", 123, None, {"x": 1}],
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    # only the valid string survives; no crash
-    assert mgr.view.peers["b:1"].mutual_agreeing == {"node-a"}
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_rejects_non_string_node_name(no_tls):
-    # #3: a CA-trusted-but-misbehaving peer returning a non-string node_name is
-    # rejected (not stored), so it can never reach min()/sorted() and crash the
-    # scheduler. Election keeps working.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": 12345,  # not a string
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    peer = mgr.view.peers["b:1"]
-    assert peer.status == STATUS_UNREACHABLE
-    assert peer.node_name is None
-    assert mgr.leader_name() is None  # election does not crash
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_rejects_oversized_body(no_tls):
-    # #4: an over-cap body is refused rather than buffered (OOM guard).
-    from cronstable.cluster import MAX_PEER_RESPONSE_BYTES
-
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    big = b"x" * (MAX_PEER_RESPONSE_BYTES + 1)
-    session = _FakeSession(_FakeGet(resp=_FakeResp(body=big)))
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    peer = mgr.view.peers["b:1"]
-    assert peer.status == STATUS_UNREACHABLE
-    assert "oversized" in (peer.last_error or "")
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_rejects_non_dict_and_invalid_json(no_tls):
-    # #5: valid-but-non-object JSON and unparseable bodies are classified as
-    # failed observations instead of raising AttributeError/ValueError.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    for body in (b"[1, 2, 3]", b'"a string"', b"not json{"):
-        session = _FakeSession(_FakeGet(resp=_FakeResp(body=body)))
-        await mgr._poll_peer(session, "b:1", "v1:mine")
-        assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
 
 
 @pytest.mark.asyncio
@@ -4253,9 +4078,7 @@ async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
     def _raise_recursion(_raw):
         raise RecursionError("maximum recursion depth exceeded")
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # seed a prior healthy observation so we can prove it is overwritten, not
     # frozen, by the malformed round.
     _seed_agree(mgr, "b:1", "node-b")
@@ -4264,7 +4087,7 @@ async def test_poll_peer_rejects_deeply_nested_json(no_tls, monkeypatch):
     # what _poll_peer now calls. Injecting RecursionError keeps this test
     # independent of the active parser's real overflow depth.
     monkeypatch.setattr(cluster_mod._json, "loads", _raise_recursion)
-    session = _FakeSession(_FakeGet(resp=_FakeResp(body=b"[[[]]]")))
+    session = _peer_session(body=b"[[[]]]")
     await mgr._poll_peer(session, "b:1", "v1:mine")
     peer = mgr.view.peers["b:1"]
     assert peer.status == STATUS_UNREACHABLE  # demoted, not frozen at AGREED
@@ -4277,13 +4100,14 @@ async def test_start_cleans_up_runner_on_bind_failure(no_tls):
     # leak the runner; start() cleans up after itself and leaves the manager
     # un-started so the caller's "log and keep running" handler is clean.
     port = _free_port()
-    blocker = ClusterManager(
-        _cfg(_DUMMY_TLS, f"127.0.0.1:{port}", [], "node-a"), lambda: "v1:x"
-    )
+    blocker = _mgr([], job_set="v1:x", listen=f"127.0.0.1:{port}")
     await blocker.start()
     try:
-        clash = ClusterManager(
-            _cfg(_DUMMY_TLS, f"127.0.0.1:{port}", [], "node-b"), lambda: "v1:x"
+        clash = _mgr(
+            [],
+            node="node-b",
+            job_set="v1:x",
+            listen=f"127.0.0.1:{port}",
         )
         with pytest.raises(OSError):
             await clash.start()
@@ -4299,9 +4123,7 @@ async def test_start_cleans_up_runner_on_bind_failure(no_tls):
 
 
 def test_reboot_ran_self_is_advertised(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     assert mgr.reboot_ran("boot") is False
     mgr._ran_reboot_jobs.add("boot")
     assert mgr.reboot_ran("boot") is True
@@ -4311,10 +4133,7 @@ def test_reboot_ran_self_is_advertised(no_tls):
 def test_reboot_ran_transitive_from_agreed_peer_only(no_tls):
     # a job an AGREED peer reports as run counts (transitive), but the same
     # report from a non-agreed peer (different job set) is ignored -- scoping.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     _seed_agree(mgr, "b:1", "node-b")
     mgr.view.peers["b:1"].ran_reboot_jobs = {"boot"}
     assert mgr.reboot_ran("boot") is True
@@ -4327,41 +4146,8 @@ def test_reboot_ran_transitive_from_agreed_peer_only(no_tls):
 
 
 @pytest.mark.asyncio
-async def test_poll_peer_records_ran_reboot_jobs(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "inst-b",
-                    "members": [
-                        {
-                            "node_name": "node-a",
-                            "instance_id": mgr.instance_id,
-                            "agreed": True,
-                        }
-                    ],
-                    "ran_reboot_jobs": ["boot"],
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    assert mgr.view.peers["b:1"].ran_reboot_jobs == {"boot"}
-    # b is agreed (mutual), so its run is trusted transitively
-    assert mgr.reboot_ran("boot") is True
-
-
-@pytest.mark.asyncio
 async def test_handle_reboot_ran_absorbs_only_matching_job_set(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # a push for a DIFFERENT job set is ignored (stale config)
     resp = await mgr._handle_reboot_ran(
         _PushReq({"job_set_id": "v1:other", "names": ["boot"]})
@@ -4377,10 +4163,7 @@ async def test_handle_reboot_ran_absorbs_only_matching_job_set(no_tls):
 
 @pytest.mark.asyncio
 async def test_push_reboot_ran_fans_out_to_peers(no_tls, monkeypatch):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     mgr._ran_reboot_jobs.add("boot")
     # the push reuses the manager's lifetime session (created in start()); this
     # test drives _push_reboot_ran directly without start(), so stand in a
@@ -4405,9 +4188,7 @@ async def test_ran_jobs_cleared_on_job_set_change(no_tls):
     # a config reload (job_set_id change) forgets prior runs: a still-deferred
     # job may then re-run (safe), never silently skip a job whose def changed.
     job_set = {"id": "v1:a"}
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: job_set["id"]
-    )
+    mgr = _mgr([], job_set=lambda: job_set["id"])
     mgr._ran_reboot_jobs.add("boot")
     await mgr._poll_all()  # same id -> kept
     assert mgr.reboot_ran("boot") is True
@@ -4428,10 +4209,8 @@ async def test_peer_status_change_logs_untrusted_with_error(no_tls, caplog):
     # the host and the underlying error (botched rotations must stay visible).
     import logging
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(_FakeGet(exc=_FakeSSLError()))
+    mgr = _mgr(["b:1"])
+    session = _peer_session(exc=_FakeSSLError())
     with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
         await mgr._poll_peer(session, "b:1", "v1:mine")
     assert mgr.view.peers["b:1"].status == STATUS_UNTRUSTED
@@ -4447,10 +4226,8 @@ async def test_peer_status_change_unreachable_quiet_at_startup(no_tls, caplog):
     # coming up does not emit a burst while peers are still binding.
     import logging
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    down = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
+    mgr = _mgr(["b:1"])
+    down = _peer_session(exc=aiohttp.ClientError("boom"))
     with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         await mgr._poll_peer(down, "b:1", "v1:mine")
     assert mgr.view.peers["b:1"].status == STATUS_UNREACHABLE
@@ -4463,21 +4240,9 @@ async def test_peer_status_change_warns_only_on_real_drop(no_tls, caplog):
     # WARNING (with the error) only when a *previously reached* peer drops.
     import logging
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    agreed = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                }
-            )
-        )
-    )
-    down = _FakeSession(_FakeGet(exc=aiohttp.ClientError("boom")))
+    mgr = _mgr(["b:1"])
+    agreed = _peer_session(_peer_body())
+    down = _peer_session(exc=aiohttp.ClientError("boom"))
     with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         await mgr._poll_peer(agreed, "b:1", "v1:mine")  # unknown -> agreed
         await mgr._poll_peer(agreed, "b:1", "v1:mine")  # agreed again: quiet
@@ -4491,17 +4256,8 @@ def _self_poll_session(mgr):
     # a /peer response from OUR OWN listener: our name AND our instance id --
     # what polling a self-listed entry (e.g. our own IP under a wildcard
     # listen) returns.
-    return _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": mgr.node_name,
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": mgr.instance_id,
-                }
-            )
-        )
+    return _peer_session(
+        _peer_body(node_name=mgr.node_name, instance_id=mgr.instance_id)
     )
 
 
@@ -4516,14 +4272,11 @@ async def test_self_poll_warns_on_degenerate_two_node_election(no_tls, caplog):
     # to forbid (any single failure stops all Leader jobs cluster-wide).
     import logging
 
-    cfg = _cfg(
-        _DUMMY_TLS,
-        "0.0.0.0:8443",
+    mgr = _mgr(
         ["10.0.0.1:8443", "10.0.0.2:8443"],  # 10.0.0.1 is OUR OWN address
-        "node-a",
+        listen="0.0.0.0:8443",
+        electLeader=True,
     )
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
     session = _self_poll_session(mgr)
     with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
         await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
@@ -4558,14 +4311,11 @@ async def test_self_poll_benign_self_listing_logs_info_only(no_tls, caplog):
     # is benign: identified once at INFO, no degenerate-quorum warning.
     import logging
 
-    cfg = _cfg(
-        _DUMMY_TLS,
-        "0.0.0.0:8443",
+    mgr = _mgr(
         ["10.0.0.1:8443", "10.0.0.2:8443", "10.0.0.3:8443"],
-        "node-a",
+        listen="0.0.0.0:8443",
+        electLeader=True,
     )
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
     session = _self_poll_session(mgr)
     with caplog.at_level(logging.INFO, logger="cronstable.cluster"):
         await mgr._poll_peer(session, "10.0.0.1:8443", "v1:mine")
@@ -4593,15 +4343,12 @@ async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
     # poll round with the fully-deduped size -- and still emit exactly once.
     import logging
 
-    cfg = _cfg(
-        _DUMMY_TLS,
-        "0.0.0.0:8443",
+    mgr = _mgr(
         # 10.0.0.1 is OUR OWN address; .2/.3 are ONE multi-homed peer
         ["10.0.0.1:8443", "10.0.0.2:8443", "10.0.0.3:8443"],
-        "node-a",
+        listen="0.0.0.0:8443",
+        electLeader=True,
     )
-    cfg["electLeader"] = True
-    mgr = ClusterManager(cfg, lambda: "v1:mine")
 
     def _self_get():
         return _self_poll_session(mgr)._get_result
@@ -4661,9 +4408,7 @@ async def test_degenerate_self_warning_survives_multihomed_dedup_lag(
 async def test_handle_reboot_ran_times_out_on_slow_body(no_tls):
     # A5: a hung body read is bounded by connectTimeout -> 408, rather than
     # pinning a handler coroutine indefinitely.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     mgr.config["connectTimeout"] = 0.01
 
     class _HangingContent:
@@ -4683,9 +4428,7 @@ async def test_handle_reboot_ran_rejects_oversized_body(no_tls):
     # A5/DoS: an over-cap body is refused (413) before any JSON parse.
     from cronstable.cluster import MAX_PEER_RESPONSE_BYTES
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
 
     class _RawReq:
         content = _FakeContent(b"x" * (MAX_PEER_RESPONSE_BYTES + 1))
@@ -4710,9 +4453,7 @@ async def test_handle_reboot_ran_rejects_deeply_nested_json(
     def _raise_recursion(_raw):
         raise RecursionError("maximum recursion depth exceeded")
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # Patch the _json shim (orjson when installed, else stdlib json): that is
     # what the handler now calls.
     monkeypatch.setattr(cluster_mod._json, "loads", _raise_recursion)
@@ -4729,9 +4470,7 @@ async def test_mark_reboot_ran_survives_concurrent_reload_clear(no_tls):
     # A2: mark_reboot_ran reconciles to the live id BEFORE adding, so a poll
     # under the (now-current) id does not discard the just-recorded run.
     job_set = {"id": "v1:old"}
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: job_set["id"]
-    )
+    mgr = _mgr([], job_set=lambda: job_set["id"])
     await mgr._poll_all()  # establishes v1:old
     job_set["id"] = "v1:new"  # config reload changes the job set
     await mgr.mark_reboot_ran("boot")  # reconciles to v1:new, then adds boot
@@ -4747,9 +4486,7 @@ async def test_handle_reboot_ran_survives_lagged_job_set_id(no_tls):
     # poll loop advanced _ran_jobs_job_set_id) is recorded under the live id
     # and survives the next poll, instead of being seeded stale and wiped.
     job_set = {"id": "v1:old"}
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: job_set["id"]
-    )
+    mgr = _mgr([], job_set=lambda: job_set["id"])
     await mgr._poll_all()  # establishes v1:old
     job_set["id"] = "v1:new"  # reload; _ran_jobs_job_set_id still lags behind
     await mgr._handle_reboot_ran(
@@ -4824,9 +4561,7 @@ def test_bridge_candidates_reject_an_empty_name(no_tls):
     # _unconfirmed_contenders, _available_contenders) read identically and a
     # future parser change cannot single this one out. Seeded directly, i.e.
     # past the parse boundary.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # N=2, quorum 2: one witness plus the node itself is enough to confirm a
     # bridge candidate, so an unguarded '' would be elected here.
     _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", ""})
@@ -4841,34 +4576,16 @@ async def test_poll_peer_empty_name_never_stands_the_cluster_down(no_tls):
     # end to end: a peer gossiping "" in mutual_agreeing must not elect '' as
     # leader (no node matches it, so every Leader job stops firing while
     # /cluster still reports quorate and conflict-free).
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    me = {
-        "node_name": "node-a",
-        "instance_id": mgr.instance_id,
-        "agreed": True,
-    }
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "ib",
-                    "members": [
-                        me,
-                        {
-                            "node_name": "node-b",
-                            "instance_id": "ib",
-                            "agreed": True,
-                        },
-                    ],
-                    "mutual_agreeing": ["node-a", ""],
-                    "quorate_vouched": ["node-a", ""],
-                }
-            )
+    mgr = _mgr(["b:1"])
+    session = _peer_session(
+        _peer_body(
+            instance_id="ib",
+            members=[
+                _me(mgr),
+                {"node_name": "node-b", "instance_id": "ib", "agreed": True},
+            ],
+            mutual_agreeing=["node-a", ""],
+            quorate_vouched=["node-a", ""],
         )
     )
     await mgr._poll_peer(session, "b:1", "v1:mine")
@@ -5049,9 +4766,7 @@ def test_parse_job_summaries_caps_cardinality():
 
 @pytest.mark.asyncio
 async def test_handle_peer_advertises_job_summaries(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     # no provider installed yet (the scheduler installs it before start()):
     # an empty block, never a crash
     payload = json.loads((await mgr._handle_peer(_Req())).text)
@@ -5083,9 +4798,7 @@ async def test_handle_peer_advertises_job_summaries(no_tls):
 async def test_handle_peer_advertises_node_stats_header_only_when_shared(
     no_tls,
 ):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     # no node-stats provider: no header (absence is the signal)
     resp = await mgr._handle_peer(_Req())
     assert NODE_STATS_HEADER not in resp.headers
@@ -5118,9 +4831,7 @@ async def test_handle_peer_advertises_node_stats_header_only_when_shared(
 def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
     # the /cluster peer panel: per-peer node_stats (populated when shared) and
     # the local readout independent of sharing.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # a provider installed WITHOUT sharing still drives the LOCAL readout
     mgr.set_node_stats_provider(
         lambda: {"cpu_percent": 5.0, "mem_percent": 6.0}, share=False
@@ -5143,37 +4854,19 @@ def test_view_dict_carries_peer_node_stats_and_local_readout(no_tls):
 async def test_poll_peer_absorbs_node_stats_header(no_tls):
     # the reading arrives via the response HEADER (never the body -- see
     # _handle_peer), hardened through _parse_node_stats like any peer input
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
+    mgr = _mgr(["b:1"])
+    session = _peer_session(
+        _peer_body(instance_id="inst-b", members=[_me(mgr)]),
+        headers={
+            NODE_STATS_HEADER: json.dumps(
                 {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "inst-b",
-                    "members": [
-                        {
-                            "node_name": "node-a",
-                            "instance_id": mgr.instance_id,
-                            "agreed": True,
-                        }
-                    ],
+                    "cpu_percent": 55.5,
+                    "mem_percent": 40.0,
+                    "cpu_count": 4,
                 },
-                headers={
-                    NODE_STATS_HEADER: json.dumps(
-                        {
-                            "cpu_percent": 55.5,
-                            "mem_percent": 40.0,
-                            "cpu_count": 4,
-                        },
-                        separators=(",", ":"),
-                    )
-                },
+                separators=(",", ":"),
             )
-        )
+        },
     )
     await mgr._poll_peer(session, "b:1", "v1:mine")
     assert mgr.view.peers["b:1"].node_stats == {
@@ -5192,18 +4885,14 @@ async def test_poll_peer_ignores_malformed_node_stats_header(no_tls):
     # itself (agreement, last_seen, every gate) still succeeds
     from cronstable.cluster import MAX_NODE_STATS_HEADER_LEN
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     # valid JSON padded past the cap: rejected on length, not parsed
     oversized = json.dumps({"cpu_percent": 1.0}) + " " * (
         MAX_NODE_STATS_HEADER_LEN + 1
     )
     for bad in ("{not json", '["not", "a", "dict"]', oversized):
-        session = _FakeSession(
-            _FakeGet(
-                resp=_FakeResp(_PEER_B_BODY, headers={NODE_STATS_HEADER: bad})
-            )
+        session = _peer_session(
+            _PEER_B_BODY, headers={NODE_STATS_HEADER: bad}
         )
         await mgr._poll_peer(session, "b:1", "v1:mine")
         peer = mgr.view.peers["b:1"]
@@ -5222,9 +4911,7 @@ def test_view_expires_node_stats_without_fresh_reading(no_tls):
     # header absent that round).
     from cronstable.cluster import NODE_STATS_STALE_ROUNDS
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     window = NODE_STATS_STALE_ROUNDS * mgr.config["interval"]
     now = datetime.datetime.now(datetime.timezone.utc)
     stats = {"cpu_percent": 70.0, "mem_percent": 20.0}
@@ -5271,9 +4958,7 @@ def test_advertised_job_summaries_caps_deterministically(no_tls):
         MAX_JOB_SUMMARY_NAME_LEN,
     )
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     names = ["job-%05d" % i for i in range(MAX_ADVERTISED_JOB_SUMMARIES + 5)]
     overlong = "x" * (MAX_JOB_SUMMARY_NAME_LEN + 1)
     mgr.set_job_summaries_provider(
@@ -5285,45 +4970,6 @@ def test_advertised_job_summaries_caps_deterministically(no_tls):
     # the sorted-name prefix: a stable subset across rounds, not a flapping one
     assert sorted(block) == names[:MAX_ADVERTISED_JOB_SUMMARIES]
     assert overlong not in block
-
-
-@pytest.mark.asyncio
-async def test_poll_peer_absorbs_job_summaries(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(
-        _FakeGet(
-            resp=_FakeResp(
-                {
-                    "node_name": "node-b",
-                    "job_set_id": "v1:mine",
-                    "scheme_version": SCHEME_VERSION,
-                    "instance_id": "inst-b",
-                    "members": [
-                        {
-                            "node_name": "node-a",
-                            "instance_id": mgr.instance_id,
-                            "agreed": True,
-                        }
-                    ],
-                    "job_summaries": {"alpha": {"running": True}},
-                    "job_summaries_truncated": False,
-                }
-            )
-        )
-    )
-    await mgr._poll_peer(session, "b:1", "v1:mine")
-    peer = mgr.view.peers["b:1"]
-    assert peer.job_summaries == {
-        "alpha": {
-            "running": True,
-            "enabled": True,
-            "scheduled_in": None,
-            "last": None,
-        }
-    }
-    assert peer.job_summaries_truncated is False
 
 
 def test_job_summaries_survive_failed_poll_and_old_build():
@@ -5376,10 +5022,7 @@ def test_job_summaries_survive_failed_poll_and_old_build():
 
 
 def test_fleet_view_merges_self_and_peers(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     mgr.set_job_summaries_provider(
         lambda: {
             "alpha": {
@@ -5424,10 +5067,7 @@ def test_fleet_view_merges_self_and_peers(no_tls):
 
 
 def test_fleet_view_includes_node_stats(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     mgr.set_node_stats_provider(
         lambda: {"cpu_percent": 20.0, "mem_percent": 30.0}
     )
@@ -5454,18 +5094,13 @@ def test_fleet_view_includes_node_stats(no_tls):
 
 def test_fleet_view_node_stats_none_when_not_sharing(no_tls):
     # no provider installed: self node_stats is null, unchanged fleet otherwise
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", [], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr([])
     fleet = mgr.fleet_view()
     assert fleet["nodes"][0]["node_stats"] is None
 
 
 def test_fleet_view_skips_self_listing_and_dedupes_instances(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["a:1", "b:1", "b2:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["a:1", "b:1", "b2:1"])
     # a:1 answered as THIS node (the operator listed our own address)
     peer_a = mgr.view.peers["a:1"]
     peer_a.status = STATUS_SELF
@@ -5489,13 +5124,18 @@ async def test_mtls_round_trip_job_summaries(tmp_path):
     # failing job -- the single-pane-of-glass path.
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     b.set_job_summaries_provider(
         lambda: {
@@ -5536,13 +5176,18 @@ async def test_mtls_round_trip_node_stats(tmp_path):
     # show every node's live load.
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{pa}"], "node-b"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{pa}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     b.set_node_stats_provider(
         lambda: {
@@ -5609,9 +5254,7 @@ _PEER_B_BODY = {
 
 @pytest.mark.asyncio
 async def test_handle_peer_carries_etag_and_answers_304(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
-    )
+    mgr = _mgr(["b:1"], job_set="v1:x")
     resp = await mgr._handle_peer(_Req())
     etag = resp.headers["ETag"]
     # a strong (quoted) tag, well under the client-side echo bound
@@ -5651,9 +5294,7 @@ async def test_handle_peer_304_survives_live_countdown_ticks(no_tls):
     import math
     import time
 
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
-    )
+    mgr = _mgr(["b:1"], job_set="v1:x")
     # a fire ~2 minutes out on a whole-second boundary: the provider's
     # now() and the handler's now() are microseconds apart, so the
     # reconstructed instant sits ~0.5s from either rounding edge
@@ -5687,9 +5328,7 @@ def test_peer_etag_ignores_countdown_ticks_but_rolls_on_fire(no_tls):
     # dropping it entirely would let a fire on a non-owner pass unnoticed and
     # freeze pollers' derived countdowns at zero. The tag therefore hashes
     # the ABSOLUTE next-fire time (now_epoch + countdown).
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
-    )
+    mgr = _mgr(["b:1"], job_set="v1:x")
 
     def payload(scheduled_in, running=False):
         p = mgr._peer_payload()
@@ -5723,9 +5362,7 @@ def test_peer_etag_ignores_countdown_ticks_but_rolls_on_fire(no_tls):
 
 @pytest.mark.asyncio
 async def test_observe_peer_conditional_replay_on_304(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     session = _FakeSeqSession(
         _FakeGet(resp=_FakeResp(_PEER_B_BODY, headers={"ETag": '"tag-1"'})),
         _FakeGet(resp=_FakeResp(body=b"", status=304)),
@@ -5759,9 +5396,7 @@ async def test_handle_peer_etag_stable_while_node_stats_change(no_tls):
     # THE point of the header sidecar: live load values never touch the
     # body's ETag, so a sharing cluster keeps the idle-304 optimisation --
     # and the 304 itself carries the FRESH reading.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
-    )
+    mgr = _mgr(["b:1"], job_set="v1:x")
     stats = {"cpu_percent": 10.0, "mem_percent": 30.0}
     mgr.set_node_stats_provider(lambda: dict(stats), share=True)
     resp = await mgr._handle_peer(_Req())
@@ -5786,9 +5421,7 @@ async def test_observe_peer_absorbs_fresh_node_stats_on_304(no_tls):
     # the poller half of the sidecar: a conditional 304 round replays the
     # cached body observation but absorbs THIS response's header reading --
     # never a stale one from the cache
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     session = _FakeSeqSession(
         _FakeGet(
             resp=_FakeResp(
@@ -5834,10 +5467,8 @@ async def test_observe_peer_unsolicited_304_is_failure(no_tls):
     # a 304 answers a conditional request; with nothing cached we sent none,
     # so a peer volunteering one is buggy or hostile -> a failed observation,
     # never an invented body
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
-    session = _FakeSession(_FakeGet(resp=_FakeResp(body=b"", status=304)))
+    mgr = _mgr(["b:1"])
+    session = _peer_session(body=b"", status=304)
     await mgr._observe_peer(session, "b:1", "v1:mine")
     peer = mgr.view.peers["b:1"]
     assert peer.status == STATUS_UNREACHABLE
@@ -5849,9 +5480,7 @@ async def test_observe_peer_replay_recomputes_against_live_id(no_tls):
     # a 304 proves the PEER'S payload is unchanged; OUR job set may have
     # reloaded meanwhile, so the replay must re-derive agreement against the
     # live my_id rather than resurrect the cached AGREED verdict
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     session = _FakeSeqSession(
         _FakeGet(resp=_FakeResp(_PEER_B_BODY, headers={"ETag": '"tag-1"'})),
         _FakeGet(resp=_FakeResp(body=b"", status=304)),
@@ -5870,9 +5499,7 @@ async def test_observe_peer_bounds_and_drops_unusable_etags(no_tls):
     # hostile peer must not be able to park an oversized or control-character
     # value there; and a tagless response (an older build) clears the cache
     # so we stop sending If-None-Match it cannot honour
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:mine"
-    )
+    mgr = _mgr(["b:1"])
     session = _FakeSeqSession(
         _FakeGet(
             resp=_FakeResp(
@@ -5958,9 +5585,7 @@ def test_record_success_stamps_and_preserves_summaries_taken_at():
 
 
 def test_fleet_view_ages_peer_countdowns(no_tls):
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"), lambda: "v1:x"
-    )
+    mgr = _mgr(["b:1"], job_set="v1:x")
     peer = mgr.view.peers["b:1"]
     peer.status = STATUS_AGREED
     peer.node_name = "node-b"
@@ -6013,16 +5638,21 @@ async def test_mtls_conditional_304_and_gzip(tmp_path):
 
     tls = _write_tls(tmp_path)
     pa, pb = _free_port(), _free_port()
-    a = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pa}", [f"localhost:{pb}"], "node-a"),
-        lambda: "v1:same",
+    a = _mgr(
+        [f"localhost:{pb}"],
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pa}",
     )
     # b's peer entry points at a dead port so its own background poll cannot
     # change its /peer payload (a failed poll adds no members entry) -- the
     # payload must stay byte-stable across a's two rounds for the 304
-    b = ClusterManager(
-        _cfg(tls, f"127.0.0.1:{pb}", [f"localhost:{_free_port()}"], "node-b"),
-        lambda: "v1:same",
+    b = _mgr(
+        [f"localhost:{_free_port()}"],
+        node="node-b",
+        job_set="v1:same",
+        tls=tls,
+        listen=f"127.0.0.1:{pb}",
     )
     # a fat, stable summaries block: enough entries to clear the gzip floor,
     # scheduled_in=None so the payload is clock-independent
@@ -6098,10 +5728,7 @@ def test_derived_sets_memoized_match_fresh_computation(no_tls):
     # produce. Each method's pre-memoization body is reachable as
     # fn.__wrapped__ (functools.wraps), which this test uses as the oracle
     # before and after view mutations through record_success/record_failure.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1", "c:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1", "c:1"])
     # node-b vouches a bridge target (node-x, witnessed once, enough at
     # quorum 2) and an unconfirmable contender (node-e), so the bridge and
     # contender derivations all return non-trivial values.
@@ -6170,10 +5797,7 @@ async def test_handle_peer_serves_cached_pair_until_view_mutates(no_tls):
     # (the payload cascade and the hash run once, not per request), but a
     # view mutation invalidates the pair immediately: the generation in the
     # cache key changes, so election-relevant staleness is zero.
-    mgr = ClusterManager(
-        _cfg(_DUMMY_TLS, "127.0.0.1:1", ["b:1"], "node-a"),
-        lambda: "v1:mine",
-    )
+    mgr = _mgr(["b:1"])
     calls = {"n": 0}
 
     def provider():
@@ -6360,9 +5984,11 @@ async def test_observe_peer_rejects_overlong_field(tmp_path):
     # stored (branch: len(value) > MAX_PEER_FIELD_LEN).
     tls = _write_tls(tmp_path)
     host = "peer-x:9000"
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [host], "node-a"),
-        lambda: "v1:same",
+    mgr = _mgr(
+        [host],
+        job_set="v1:same",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     body = _observe_body(node_name="x" * 300)
     resp = _CovFakeResp(200, body, {"ETag": '"e"'})
@@ -6375,9 +6001,11 @@ async def test_observe_peer_rejects_overlong_field(tmp_path):
 async def test_observe_peer_rejects_bad_cluster_size(tmp_path):
     tls = _write_tls(tmp_path)
     host = "peer-x:9000"
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [host], "node-a"),
-        lambda: "v1:same",
+    mgr = _mgr(
+        [host],
+        job_set="v1:same",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     body = _observe_body(cluster_size=0)  # not a positive integer
     resp = _CovFakeResp(200, body, {"ETag": '"e"'})
@@ -6390,9 +6018,11 @@ async def test_observe_peer_rejects_bad_cluster_size(tmp_path):
 async def test_observe_peer_rejects_non_bool_elect_leader(tmp_path):
     tls = _write_tls(tmp_path)
     host = "peer-x:9000"
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [host], "node-a"),
-        lambda: "v1:same",
+    mgr = _mgr(
+        [host],
+        job_set="v1:same",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     body = _observe_body(cluster_size=2, elect_leader="yes")
     resp = _CovFakeResp(200, body, {"ETag": '"e"'})
@@ -6407,9 +6037,11 @@ async def test_handle_peer_compresses_without_gzip(tmp_path, monkeypatch):
     # gzip still gets compressed via aiohttp's default negotiation (the else
     # branch of the gzip pick). Exercised by calling the handler directly.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
-        lambda: "v1:same",
+    mgr = _mgr(
+        [],
+        job_set="v1:same",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     # a fat summaries block guarantees the body clears the compress floor.
     mgr.set_job_summaries_provider(
@@ -6441,7 +6073,9 @@ async def test_handle_peer_compresses_without_gzip(tmp_path, monkeypatch):
     req = _FakeReq(b"", {"Accept-Encoding": "identity"})
     resp = await mgr._handle_peer(req)
     assert resp.status == 200
-    assert isinstance(resp.body, bytes) and len(resp.body) >= MIN_COMPRESS_BYTES
+    assert (
+        isinstance(resp.body, bytes) and len(resp.body) >= MIN_COMPRESS_BYTES
+    )
     assert codings == [None]  # bare call: aiohttp negotiates
     # and the gzip-advertised path picks gzip EXPLICITLY (the sibling branch)
     req_gzip = _FakeReq(b"", {"Accept-Encoding": "gzip, deflate"})
@@ -6454,9 +6088,11 @@ async def test_handle_reboot_ran_truncates_persistent_set(tmp_path):
     # the persistent ran-set is bounded: a push that would grow it past
     # MAX_ADVERTISED_REBOOT_JOBS is truncated to a stable sorted prefix.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        [],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     # pre-seed with names that sort AFTER the pushed ones so the truncation
     # deterministically drops them.
@@ -6475,9 +6111,11 @@ async def test_poll_all_logs_unexpected_peer_error(tmp_path, caplog):
     # an *unexpected* exception from one peer coroutine (a bug, not a network
     # failure) is logged and does not abort the round.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), ["p:1"], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        ["p:1"],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     mgr._session = object()  # non-None so _poll_all does real work
 
@@ -6497,9 +6135,11 @@ async def test_poll_all_reraises_cancellation(tmp_path):
     # a CancelledError surfacing from a peer coroutine must propagate out of the
     # round, not be swallowed as a logged error.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), ["p:1"], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        ["p:1"],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     mgr._session = object()
 
@@ -6515,9 +6155,11 @@ async def test_poll_loop_sleeps_between_rounds(tmp_path):
     # the loop polls, then waits interval; when the wait times out (no stop yet)
     # it loops again -- so a short interval yields repeated poll rounds.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        [],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
     mgr.config["interval"] = 0.01
     calls = []
@@ -6543,9 +6185,11 @@ async def test_start_cleans_up_on_initial_poll_cancellation(tmp_path):
     # if the up-front poll round is cancelled after the session/runner are up,
     # start() must tear them back down (no leaked session/runner) and re-raise.
     tls = _write_tls(tmp_path)
-    mgr = ClusterManager(
-        _cfg(tls, "127.0.0.1:{}".format(_free_port()), [], "node-a"),
-        lambda: "v1:x",
+    mgr = _mgr(
+        [],
+        job_set="v1:x",
+        tls=tls,
+        listen="127.0.0.1:{}".format(_free_port()),
     )
 
     async def cancel():

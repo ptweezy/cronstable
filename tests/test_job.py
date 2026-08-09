@@ -34,6 +34,24 @@ def _argv(*parts):
     return tuple(parts) if IS_WINDOWS else tuple(p.encode() for p in parts)
 
 
+def _running_job(config_yaml: str, **kw) -> "cronstable.job.RunningJob":
+    """A RunningJob (no retry state) for a config's first job: the
+    parse + jobs[0] + RunningJob prologue this file repeated verbatim
+    (finding B15).  ``kw`` passes through, e.g. ``run_id=``."""
+    conf = cronstable.config.parse_config_string(config_yaml, "")
+    return cronstable.job.RunningJob(conf.jobs[0], None, **kw)
+
+
+# the one-job config both StreamReader-through-RunningJob tests parse
+_CAPTURE_STDERR_JOB = """
+jobs:
+  - name: test
+    command: foo
+    schedule: "* * * * *"
+    captureStderr: true
+"""
+
+
 @pytest.mark.asyncio
 async def test_stream_reader_join_timeout_keeps_partial_output():
     # The read loop only ends at EOF, i.e. once EVERY write-end of the pipe is
@@ -82,18 +100,7 @@ async def test_stream_reader(
         "cronjob-1", "stderr", fake_stream, "", save_limit
     )
 
-    conf = cronstable.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: foo
-    schedule: "* * * * *"
-    captureStderr: true
-""",
-        "",
-    )
-    job_config = conf.jobs[0]
-    job = cronstable.job.RunningJob(job_config, None)
+    job = _running_job(_CAPTURE_STDERR_JOB)
 
     async def producer(fake_stream):
         fake_stream.feed_data(input_lines)
@@ -116,18 +123,7 @@ async def test_stream_reader_long_line():
         "cronjob-1", "stderr", fake_stream, "", 500
     )
 
-    conf = cronstable.config.parse_config_string(
-        """
-jobs:
-  - name: test
-    command: foo
-    schedule: "* * * * *"
-    captureStderr: true
-""",
-        "",
-    )
-    job_config = conf.jobs[0]
-    job = cronstable.job.RunningJob(job_config, None)
+    job = _running_job(_CAPTURE_STDERR_JOB)
 
     async def producer(fake_stream):
         fake_stream.feed_data(b"one line\n")
@@ -759,6 +755,23 @@ def _webhook_job(job_config, success=False, stdout="out", stderr="err"):
     )
 
 
+def _url_value(url: str) -> str:
+    """The pre-indented ``value: <url>`` source line for _webhook_setup."""
+    return f"            value: {url}"
+
+
+def _webhook_setup(url_yaml: str, extra: str = "", **job_over):
+    """The webhook-test prologue (finding B15): parse _webhook_job_config's
+    YAML, take its one job, and build the matching mock run.  Returns
+    ``(job_config, job)``; ``job_over`` passes through to _webhook_job
+    (e.g. ``success=``)."""
+    conf = cronstable.config.parse_config_string(
+        _webhook_job_config(url_yaml, extra), ""
+    )
+    job_config = conf.jobs[0]
+    return job_config, _webhook_job(job_config, **job_over)
+
+
 class _WebhookServer:
     """A local aiohttp server capturing every request the reporter makes."""
 
@@ -811,15 +824,11 @@ async def test_report_webhook(success, expected_subject):
 
     server = _WebhookServer()
     async with server as url:
-        conf = cronstable.config.parse_config_string(
-            _webhook_job_config(
-                f"            value: {url}",
-                extra=("          headers:\n            X-Custom: yes-hello"),
-            ),
-            "",
+        job_config, job = _webhook_setup(
+            _url_value(url),
+            extra="          headers:\n            X-Custom: yes-hello",
+            success=success,
         )
-        job_config = conf.jobs[0]
-        job = _webhook_job(job_config, success=success)
 
         reporter = cronstable.job.WebhookReporter()
         await reporter.report(success, job, job_config.onFailure["report"])
@@ -851,11 +860,7 @@ async def test_report_webhook_url_sources(url_source, monkeypatch, tmp_path):
         else:
             monkeypatch.setenv("TEST_WEBHOOK_URL", url)
             url_yaml = "            fromEnvVar: TEST_WEBHOOK_URL"
-        conf = cronstable.config.parse_config_string(
-            _webhook_job_config(url_yaml), ""
-        )
-        job_config = conf.jobs[0]
-        job = _webhook_job(job_config)
+        job_config, job = _webhook_setup(url_yaml)
 
         await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
@@ -874,11 +879,7 @@ async def test_report_webhook_bad_url_keeps_the_secret_out_of_the_log(caplog):
     # the message and once in the traceback, so the reporter catches it
     # here and reports the failure kind alone.
     url = "https://hooks.slack.example:443x/services/T0/B0/s3cr3tTOKEN"
-    conf = cronstable.config.parse_config_string(
-        _webhook_job_config(f"            value: {url}"), ""
-    )
-    job_config = conf.jobs[0]
-    job = _webhook_job(job_config)
+    job_config, job = _webhook_setup(_url_value(url))
     with caplog.at_level(logging.ERROR, logger="cronstable"):
         await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
@@ -940,11 +941,7 @@ async def test_report_webhook_error_body_cannot_echo_the_secret_url(caplog):
     await server.start_server()
     try:
         url = str(server.make_url(secret_path))
-        conf = cronstable.config.parse_config_string(
-            _webhook_job_config(f"            value: {url}"), ""
-        )
-        job_config = conf.jobs[0]
-        job = _webhook_job(job_config)
+        job_config, job = _webhook_setup(_url_value(url))
         with caplog.at_level(logging.ERROR, logger="cronstable"):
             await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
@@ -985,11 +982,7 @@ async def test_report_webhook_undecodable_error_body_keeps_the_status(caplog):
     await server.start_server()
     try:
         url = str(server.make_url(secret_path))
-        conf = cronstable.config.parse_config_string(
-            _webhook_job_config(f"            value: {url}"), ""
-        )
-        job_config = conf.jobs[0]
-        job = _webhook_job(job_config)
+        job_config, job = _webhook_setup(_url_value(url))
         with caplog.at_level(logging.ERROR, logger="cronstable"):
             await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
@@ -1017,11 +1010,7 @@ async def test_report_webhook_unencodable_body_is_not_a_request_failure(
     # operator to check webhook.url and the network for a request that
     # was never attempted.
     url = "https://hooks.example/services/T0/B0/s3cr3tTOKEN"
-    conf = cronstable.config.parse_config_string(
-        _webhook_job_config(f"            value: {url}"), ""
-    )
-    job_config = conf.jobs[0]
-    job = _webhook_job(job_config)
+    job_config, job = _webhook_setup(_url_value(url))
 
     class _Surrogate:
         def render(self, *args, **kwargs):
@@ -1046,11 +1035,7 @@ async def test_report_webhook_idna_host_is_contained(caplog):
     # so without it in the catch tuple it would reach _report_common's
     # catch-all and be logged with a traceback.
     url = "https://hooks..slack.example/services/T0/B0/s3cr3tTOKEN"
-    conf = cronstable.config.parse_config_string(
-        _webhook_job_config(f"            value: {url}"), ""
-    )
-    job_config = conf.jobs[0]
-    job = _webhook_job(job_config)
+    job_config, job = _webhook_setup(_url_value(url))
     with caplog.at_level(logging.ERROR, logger="cronstable"):
         await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
@@ -1090,11 +1075,9 @@ jobs:
 @pytest.mark.asyncio
 async def test_report_webhook_env_var_not_set(monkeypatch, caplog):
     monkeypatch.delenv("TEST_WEBHOOK_URL", raising=False)
-    conf = cronstable.config.parse_config_string(
-        _webhook_job_config("            fromEnvVar: TEST_WEBHOOK_URL"), ""
+    job_config, job = _webhook_setup(
+        "            fromEnvVar: TEST_WEBHOOK_URL"
     )
-    job_config = conf.jobs[0]
-    job = _webhook_job(job_config)
 
     def no_session(*args, **kwargs):
         raise AssertionError("ClientSession must not be created")
@@ -1119,14 +1102,9 @@ async def test_report_webhook_from_file_unreadable_skips_cleanly(
     # an unreadable fromFile is a clean logged skip through the shared
     # secret resolver, never an OSError traceback out of the reporter
     missing = tmp_path / "nope" / "hook-url"
-    conf = cronstable.config.parse_config_string(
-        _webhook_job_config(
-            "            fromFile: '{}'".format(missing.as_posix())
-        ),
-        "",
+    job_config, job = _webhook_setup(
+        "            fromFile: '{}'".format(missing.as_posix())
     )
-    job_config = conf.jobs[0]
-    job = _webhook_job(job_config)
 
     def no_session(*args, **kwargs):
         raise AssertionError("ClientSession must not be created")
@@ -1148,11 +1126,7 @@ async def test_report_webhook_http_error(caplog):
     # not raise out of the reporter
     server = _WebhookServer(status=500)
     async with server as url:
-        conf = cronstable.config.parse_config_string(
-            _webhook_job_config(f"            value: {url}"), ""
-        )
-        job_config = conf.jobs[0]
-        job = _webhook_job(job_config)
+        job_config, job = _webhook_setup(_url_value(url))
 
         with caplog.at_level(logging.ERROR, logger="cronstable"):
             await cronstable.job.WebhookReporter().report(
@@ -1171,19 +1145,14 @@ async def test_report_webhook_http_error(caplog):
 async def test_report_webhook_custom_method_and_body():
     server = _WebhookServer()
     async with server as url:
-        conf = cronstable.config.parse_config_string(
-            _webhook_job_config(
-                f"            value: {url}",
-                extra=(
-                    "          method: PUT\n"
-                    "          contentType: text/plain\n"
-                    '          body: "job {{ name }}: rc={{ exit_code }}"'
-                ),
+        job_config, job = _webhook_setup(
+            _url_value(url),
+            extra=(
+                "          method: PUT\n"
+                "          contentType: text/plain\n"
+                '          body: "job {{ name }}: rc={{ exit_code }}"'
             ),
-            "",
         )
-        job_config = conf.jobs[0]
-        job = _webhook_job(job_config)
 
         await cronstable.job.WebhookReporter().report(
             False, job, job_config.onFailure["report"]
@@ -1207,11 +1176,7 @@ async def test_webhook_reports_share_one_pooled_connection():
     server = _WebhookServer()
     try:
         async with server as url:
-            conf = cronstable.config.parse_config_string(
-                _webhook_job_config(f"            value: {url}"), ""
-            )
-            job_config = conf.jobs[0]
-            job = _webhook_job(job_config)
+            job_config, job = _webhook_setup(_url_value(url))
             for _ in range(2):
                 await cronstable.job.WebhookReporter().report(
                     False, job, job_config.onFailure["report"]
@@ -1262,11 +1227,7 @@ async def test_webhook_pool_does_not_cap_reports_in_flight():
     server = _WebhookServer()
     try:
         async with server as url:
-            conf = cronstable.config.parse_config_string(
-                _webhook_job_config(f"            value: {url}"), ""
-            )
-            job_config = conf.jobs[0]
-            job = _webhook_job(job_config)
+            job_config, job = _webhook_setup(_url_value(url))
             await cronstable.job.WebhookReporter().report(
                 False, job, job_config.onFailure["report"]
             )
@@ -1288,11 +1249,7 @@ async def test_close_webhook_pool_releases_the_connections():
     server = _WebhookServer()
     try:
         async with server as url:
-            conf = cronstable.config.parse_config_string(
-                _webhook_job_config(f"            value: {url}"), ""
-            )
-            job_config = conf.jobs[0]
-            job = _webhook_job(job_config)
+            job_config, job = _webhook_setup(_url_value(url))
             reporter = cronstable.job.WebhookReporter()
             await reporter.report(False, job, job_config.onFailure["report"])
             pooled = cronstable.job._WEBHOOK_CONNECTORS[loop]
@@ -1403,7 +1360,7 @@ async def test_job_run(
     else:
         command_snippet = "    command: " + command
 
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         """
 jobs:
   - name: test
@@ -1415,12 +1372,8 @@ jobs:
     environment:
       - key: FOO
         value: bar
-""".format(command=command_snippet, shell=shell),
-        "",
+""".format(command=command_snippet, shell=shell)
     )
-    job_config = conf.jobs[0]
-
-    job = cronstable.job.RunningJob(job_config, None)
 
     await job.start()
     await job.wait()
@@ -1451,7 +1404,7 @@ async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
     # was letting a chatty job park up to 32 MiB per stream in the daemon's
     # RSS. It is pinned to the read chunk now, and the cap rides on the
     # readers, which is where it is applied.
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print(out="hi"))
         + """
@@ -1459,10 +1412,8 @@ async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
     captureStdout: true
     captureStderr: true
     maxLineLength: 4194304
-""",
-        "",
+"""
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     await job.start()
     try:
         assert job.proc.stdout._limit == cronstable.job._READ_CHUNK
@@ -1478,16 +1429,14 @@ async def test_capture_pipes_do_not_buffer_a_whole_maxlinelength():
 async def test_monitor_resources_populates_usage():
     # a monitored job records CPU time + peak RSS on the RunningJob, which the
     # reaper then folds into the run record / metrics.
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(0.4))
         + """
     monitorResources: true
     schedule: "* * * * *"
-""",
-        "",
+"""
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     # the monitor takes an immediate first sample when its task first runs
     # (during the wait below), so even this sub-second run is measured once.
     await job.start()
@@ -1503,15 +1452,11 @@ async def test_monitor_resources_populates_usage():
 
 @pytest.mark.asyncio
 async def test_monitor_resources_off_by_default():
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print(out="hi"))
-        + """
-    schedule: "* * * * *"
-""",
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     assert job.config.monitorResources is False
     await job.start()
     await job.wait()
@@ -1523,15 +1468,12 @@ async def test_monitor_resources_off_by_default():
 async def test_template_vars_carry_run_context(monkeypatch):
     # a report payload should identify the run: host, schedule, start instant,
     # and the durable-ledger run id (all new alongside the run's outcome).
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print(out="hi"))
-        + """
-    schedule: "*/5 * * * *"
-""",
-        "",
+        + '\n    schedule: "*/5 * * * *"\n',
+        run_id="run-xyz",
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None, run_id="run-xyz")
     # a sentinel host, so the assertion pins WHERE the value comes from
     # (comparing against report_hostname()'s own expression proves nothing).
     monkeypatch.setenv("HOSTNAME", "host-sentinel-1")
@@ -1556,21 +1498,19 @@ async def test_template_vars_schedule_renders_object_form():
     # schedule_unparsed is Union[str, dict]; an object schedule must render to
     # its crontab line here just as it does for the shell reporter's
     # CRONSTABLE_JOB_SCHEDULE, so every report payload agrees.
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n"
         "  - name: objsched\n"
         "    command: echo hi\n"
         "    schedule:\n"
-        '      minute: "*/5"\n',
-        "",
+        '      minute: "*/5"\n'
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     assert job.template_vars["schedule"] == "*/5 * * * *"
 
 
 @pytest.mark.asyncio
 async def test_execution_timeout():
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print_sleep_print("hello", 1, "world"))
         + """
@@ -1578,11 +1518,8 @@ async def test_execution_timeout():
     schedule: "* * * * *"
     captureStderr: false
     captureStdout: true
-""",
-        "",
+"""
     )
-    job_config = conf.jobs[0]
-    job = cronstable.job.RunningJob(job_config, None)
     await job.start()
     await job.wait()
     assert job.stdout == "hello\n"
@@ -1624,8 +1561,7 @@ async def test_execution_timeout_kills_the_whole_process_group():
     # is stranded in running_jobs forever, and under concurrencyPolicy: Forbid
     # the job never runs again. Killing the whole process group reaps the
     # helper too, so the pipe closes and the run completes.
-    conf = cronstable.config.parse_config_string(_spawner_yaml(), "")
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _running_job(_spawner_yaml())
     await job.start()
     # before the fix this hangs forever, not for `timeout` seconds.
     await asyncio.wait_for(job.wait(), 20)
@@ -1654,8 +1590,7 @@ async def test_killed_job_with_an_escaped_descendant_still_finishes(
         cronstable.platform, "kill_process_group", never_reaches_the_group
     )
     monkeypatch.setattr(cronstable.job, "KILLED_STREAM_DRAIN_TIMEOUT", 1.0)
-    conf = cronstable.config.parse_config_string(_spawner_yaml(), "")
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _running_job(_spawner_yaml())
     await job.start()
     # without the bound this hangs on the surviving helper's pipe forever.
     await asyncio.wait_for(job.wait(), 20)
@@ -1671,13 +1606,11 @@ async def test_untouched_job_drain_is_not_bounded(monkeypatch):
     # The bound is only for a run we killed: a job left to exit on its own owns
     # its lifetime, and its output is not ours to cut short. Assert the gate,
     # not the timeout -- an unbounded join is the absence of a deadline.
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_print(out="hi"))
-        + '\n    schedule: "* * * * *"\n',
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     joined = []
     real_join = cronstable.job.StreamReader.join
 
@@ -1694,14 +1627,11 @@ async def test_untouched_job_drain_is_not_bounded(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_error1():
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
-        + '\n    schedule: "* * * * *"\n',
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job_config = conf.jobs[0]
-    job = cronstable.job.RunningJob(job_config, None)
 
     await job.start()
     with pytest.raises(RuntimeError):
@@ -1711,14 +1641,11 @@ async def test_error1():
 
 @pytest.mark.asyncio
 async def test_error2():
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
-        + '\n    schedule: "* * * * *"\n',
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job_config = conf.jobs[0]
-    job = cronstable.job.RunningJob(job_config, None)
 
     with pytest.raises(RuntimeError):
         await job.wait()
@@ -1731,17 +1658,31 @@ async def test_error3():
     # and several of those paths run outside run()'s try/except -- a raise
     # here used to take the whole scheduler down (see
     # test_cancel_with_no_process_is_noop for the spawn-failed variant).
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(5))
-        + '\n    schedule: "* * * * *"\n',
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job_config = conf.jobs[0]
-    job = cronstable.job.RunningJob(job_config, None)
 
     await job.cancel()  # never started: must not raise
     assert job.proc is None
+
+
+def _statsd_job(port=9999, command=None, extra=""):
+    """A RunningJob whose config carries the statsd block these tests
+    repeated verbatim (finding B15).  ``extra`` is appended pre-indented
+    (whole job fields) between the schedule line and the statsd block."""
+    return _running_job(
+        "jobs:\n  - name: test\n"
+        + yaml_command(cmd_print() if command is None else command)
+        + """
+    schedule: "* * * * *"
+{extra}    statsd:
+      host: 127.0.0.1
+      port: {port}
+      prefix: the.prefix
+""".format(port=port, extra=extra)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1773,21 +1714,7 @@ async def test_statsd(command):
         host, port = transport.get_extra_info("sockname")
         print("Listening UDP on %s:%s" % (host, port))
 
-        conf = cronstable.config.parse_config_string(
-            "jobs:\n  - name: test\n"
-            + yaml_command(command)
-            + """
-    schedule: "* * * * *"
-    statsd:
-      host: 127.0.0.1
-      port: {port}
-      prefix: the.prefix
-""".format(port=port),
-            "",
-        )
-        job_config = conf.jobs[0]
-
-        job = cronstable.job.RunningJob(job_config, None)
+        job = _statsd_job(port=port, command=command)
 
         await job.start()
         await job.wait()
@@ -1827,20 +1754,11 @@ async def test_statsd_resource_metrics():
         UDPServerProtocol, local_addr=("127.0.0.1", 0)
     )
     _host, port = transport.get_extra_info("sockname")
-    conf = cronstable.config.parse_config_string(
-        "jobs:\n  - name: test\n"
-        + yaml_command(cmd_sleep(0.3))
-        + """
-    schedule: "* * * * *"
-    monitorResources: true
-    statsd:
-      host: 127.0.0.1
-      port: {port}
-      prefix: the.prefix
-""".format(port=port),
-        "",
+    job = _statsd_job(
+        port=port,
+        command=cmd_sleep(0.3),
+        extra="    monitorResources: true\n",
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     await job.start()
     await job.wait()
     await asyncio.sleep(0.05)
@@ -1857,17 +1775,15 @@ async def test_start_failure_reported_not_raised():
     # A command that cannot be launched (e.g. it does not exist) must be
     # treated as a normal job failure with exit code 127, not raise
     # RuntimeError (which the reaper logs as "please report this as a bug").
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         """
 jobs:
   - name: test
     command:
       - /this/command/definitely/does/not/exist
     schedule: "* * * * *"
-""",
-        "",
+"""
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
 
     await job.start()
     assert job.proc is None
@@ -1887,22 +1803,19 @@ async def test_start_failure_bare_oserror_reported_not_raised(monkeypatch):
     # broadened it propagated out of the unguarded spawn_jobs /
     # _process_pending_reboots path and killed the whole scheduler. It must now
     # be treated as a normal start failure (start_failed set), not raised.
-    conf = cronstable.config.parse_config_string(
+    async def boom(*args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    job = _running_job(
         """
 jobs:
   - name: test
     command:
       - /bin/true
     schedule: "* * * * *"
-""",
-        "",
+"""
     )
-
-    async def boom(*args, **kwargs):
-        raise OSError(24, "Too many open files")
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
 
     await job.start()  # must NOT raise
     assert job.proc is None
@@ -1921,7 +1834,13 @@ async def test_start_failure_log_does_not_leak_the_child_environment(
     # loopback credentials, and the spawn-failure handler formats kwargs into
     # an ERROR record. Logging it verbatim published every environment secret
     # the daemon holds to journald/syslog and anything shipping from them.
-    conf = cronstable.config.parse_config_string(
+    monkeypatch.setenv("SPAWN_LEAK_CANARY", "canary-from-os-environ")
+
+    async def boom(*args, **kwargs):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
+    job = _running_job(
         """
 jobs:
   - name: test
@@ -1931,16 +1850,8 @@ jobs:
     environment:
       - key: JOB_VAR
         value: job-value
-""",
-        "",
+"""
     )
-    monkeypatch.setenv("SPAWN_LEAK_CANARY", "canary-from-os-environ")
-
-    async def boom(*args, **kwargs):
-        raise OSError(24, "Too many open files")
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", boom)
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     job.extra_env = {"CRONSTABLE_STATE_TOKEN": "tok-canary-deadbeef"}
 
     with caplog.at_level(logging.DEBUG, logger="cronstable"):
@@ -1983,19 +1894,7 @@ async def test_statsd_failure_does_not_crash(monkeypatch):
 
     monkeypatch.setattr(cronstable.statsd, "send_to_statsd", boom)
 
-    conf = cronstable.config.parse_config_string(
-        "jobs:\n  - name: test\n"
-        + yaml_command(cmd_print())
-        + """
-    schedule: "* * * * *"
-    statsd:
-      host: 127.0.0.1
-      port: 9999
-      prefix: the.prefix
-""",
-        "",
-    )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _statsd_job()
 
     await job.start()  # _on_start must swallow the OSError
     await job.wait()  # _on_stop must swallow the OSError
@@ -2020,19 +1919,7 @@ async def test_stalled_statsd_does_not_block_job_launch(monkeypatch):
 
     monkeypatch.setattr(cronstable.statsd, "send_to_statsd", stalled)
 
-    conf = cronstable.config.parse_config_string(
-        "jobs:\n  - name: test\n"
-        + yaml_command(cmd_print())
-        + """
-    schedule: "* * * * *"
-    statsd:
-      host: 127.0.0.1
-      port: 9999
-      prefix: the.prefix
-""",
-        "",
-    )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _statsd_job()
     # generous bound for loaded runners; the pre-fix behavior hangs forever
     await asyncio.wait_for(job.start(), 30.0)
     release.set()
@@ -2057,19 +1944,7 @@ async def test_finished_telemetry_task_exception_is_retrieved(
 
     monkeypatch.setattr(cronstable.statsd, "send_to_statsd", boom)
 
-    conf = cronstable.config.parse_config_string(
-        "jobs:\n  - name: test\n"
-        + yaml_command(cmd_print())
-        + """
-    schedule: "* * * * *"
-    statsd:
-      host: 127.0.0.1
-      port: 9999
-      prefix: the.prefix
-""",
-        "",
-    )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _statsd_job()
 
     loop = asyncio.get_running_loop()
     unhandled = []
@@ -2122,19 +1997,7 @@ async def test_stop_telemetry_runtime_error_does_not_propagate(
 
     monkeypatch.setattr(cronstable.statsd, "send_to_statsd", boom)
 
-    conf = cronstable.config.parse_config_string(
-        "jobs:\n  - name: test\n"
-        + yaml_command(cmd_print())
-        + """
-    schedule: "* * * * *"
-    statsd:
-      host: 127.0.0.1
-      port: 9999
-      prefix: the.prefix
-""",
-        "",
-    )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _statsd_job()
 
     with caplog.at_level(logging.WARNING, logger="cronstable"):
         await job.start()
@@ -2212,8 +2075,7 @@ jobs:
 
 
 def _make_job_with_ids(uid=None, gid=None, username=None):
-    conf = cronstable.config.parse_config_string(_SIMPLE_JOB, "")
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
+    job = _running_job(_SIMPLE_JOB)
     job.config.uid = uid
     job.config.gid = gid
     job.config.username = username
@@ -2535,15 +2397,11 @@ async def test_cancel_with_no_process_is_noop():
     # RuntimeError("process is not running") here used to take down the whole
     # scheduler. It must be a no-op, and the reaper's wait() must still
     # complete the run afterwards.
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(["cronstable-no-such-binary-xyz"])
-        + """
-    schedule: "* * * * *"
-""",
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     await job.start()
     assert job.proc is None
     assert job.start_failed is True
@@ -2674,8 +2532,7 @@ jobs:
 
 
 def _fresh_job():
-    conf = cronstable.config.parse_config_string(_SIMPLE_JOB_TEST, "")
-    return cronstable.job.RunningJob(conf.jobs[0], None)
+    return _running_job(_SIMPLE_JOB_TEST)
 
 
 def _mail_report_config():
@@ -3469,13 +3326,11 @@ async def test_shell_report_timeout_direct_kill_fallback(monkeypatch, caplog):
 
 
 async def test_cancel_terminates_a_running_job():
-    conf = cronstable.config.parse_config_string(
+    job = _running_job(
         "jobs:\n  - name: test\n"
         + yaml_command(cmd_sleep(30))
-        + '\n    schedule: "* * * * *"\n',
-        "",
+        + '\n    schedule: "* * * * *"\n'
     )
-    job = cronstable.job.RunningJob(conf.jobs[0], None)
     await job.start()
     assert job.proc is not None
     assert job.proc.returncode is None  # still running
@@ -4168,3 +4023,47 @@ async def test_report_sla_breach_gathers_and_logs_exceptions(
     assert any(
         "Problem reporting job" in rec.getMessage() for rec in caplog.records
     )
+
+
+async def test_reporter_fromfile_secret_resolves_off_the_event_loop():
+    # The reporters run from the completion path, so an ordinary open+read
+    # of a fromFile secret on a hung mount (a Kubernetes secret volume,
+    # NFS) blocked the whole scheduler. Same offload rule the launch path
+    # already applied via jobapi.stage_secrets: only a file source pays
+    # the thread hop.
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen = {}
+    real = cronstable.job._resolve_secret
+
+    def recording(spec, what):
+        seen[what] = threading.get_ident()
+        return real(spec, what)
+
+    original = cronstable.job._resolve_secret
+    cronstable.job._resolve_secret = recording
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".secret", delete=False
+        ) as fobj:
+            fobj.write("https://hooks.example/abc")
+            path = fobj.name
+        try:
+            got = await cronstable.job._resolve_secret_async(
+                {"value": None, "fromFile": path, "fromEnvVar": None},
+                "webhook.url",
+            )
+            assert got == "https://hooks.example/abc"
+            assert seen["webhook.url"] != loop_thread  # a worker thread
+            # a value source is cheaper than the hop, so it stays inline
+            got = await cronstable.job._resolve_secret_async(
+                {"value": "inline", "fromFile": None, "fromEnvVar": None},
+                "sentry.dsn",
+            )
+            assert got == "inline"
+            assert seen["sentry.dsn"] == loop_thread
+        finally:
+            os.unlink(path)
+    finally:
+        cronstable.job._resolve_secret = original

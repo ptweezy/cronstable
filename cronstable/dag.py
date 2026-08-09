@@ -29,7 +29,7 @@ than re-deriving it from a possibly-changed upstream output.
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from cronstable import _json
 
@@ -150,7 +150,7 @@ class TaskSpec:
 
     id: str
     type: str = TASK
-    depends_on: Tuple[str, ...] = ()
+    depends_on: tuple[str, ...] = ()
     trigger_rule: str = ALL_SUCCESS
     max_attempts: int = 1
     retry_delay: float = 0.0
@@ -174,12 +174,12 @@ class DagSpec:
     """
 
     name: str
-    tasks: Tuple[TaskSpec, ...]
-    by_id: Dict[str, TaskSpec] = field(default_factory=dict)
-    mapped_tasks: Tuple[TaskSpec, ...] = ()
+    tasks: tuple[TaskSpec, ...]
+    by_id: dict[str, TaskSpec] = field(default_factory=dict)
+    mapped_tasks: tuple[TaskSpec, ...] = ()
 
     @staticmethod
-    def build(name: str, tasks: List[TaskSpec]) -> "DagSpec":
+    def build(name: str, tasks: list[TaskSpec]) -> "DagSpec":
         return DagSpec(
             name=name,
             tasks=tuple(tasks),
@@ -202,7 +202,7 @@ def validate_graph(spec: DagSpec) -> None:
     bad DAG is a :class:`~cronstable.config.ConfigError` at load, not a runtime
     hang.
     """
-    seen: Dict[str, TaskSpec] = {}
+    seen: dict[str, TaskSpec] = {}
     for task in spec.tasks:
         if not task.id:
             raise DagValidationError("a task id must be non-empty")
@@ -244,7 +244,7 @@ def validate_graph(spec: DagSpec) -> None:
     _check_acyclic(spec)
 
 
-def _validate_expand(task: TaskSpec, seen: Dict[str, TaskSpec]) -> None:
+def _validate_expand(task: TaskSpec, seen: dict[str, TaskSpec]) -> None:
     exp = task.expand
     assert exp is not None
     if task.type != TASK:
@@ -281,7 +281,7 @@ def _check_acyclic(spec: DagSpec) -> None:
     # chain took seconds of the config load).  validate_graph has already
     # rejected unknown deps, self-deps and duplicate ids above, so every dep
     # here names a real node and the edge set is identical either way.
-    dependents: Dict[str, List[str]] = {}
+    dependents: dict[str, list[str]] = {}
     for tid, d in deps.items():
         for dep in d:
             dependents.setdefault(dep, []).append(tid)
@@ -354,14 +354,14 @@ def new_run_body(
     kind: str,
     now: float,
     spec: DagSpec,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The initial ``dag_run`` document: every task pending, run running.
 
     Mapped tasks start as a single ``pending`` placeholder carrying
     ``mapped: true``; they materialise into ``<id>#<i>`` instances once their
     upstream produces the item list (see :func:`plan_and_claim`).
     """
-    tasks: Dict[str, Dict[str, Any]] = {}
+    tasks: dict[str, dict[str, Any]] = {}
     for task in spec.tasks:
         tasks[task.id] = _new_task_entry(task, now)
     return {
@@ -378,8 +378,8 @@ def new_run_body(
     }
 
 
-def _new_task_entry(task: TaskSpec, now: float) -> Dict[str, Any]:
-    entry: Dict[str, Any] = {
+def _new_task_entry(task: TaskSpec, now: float) -> dict[str, Any]:
+    entry: dict[str, Any] = {
         "id": task.id,
         "mapIndex": None,
         "state": PENDING,
@@ -406,7 +406,7 @@ def _new_task_entry(task: TaskSpec, now: float) -> Dict[str, Any]:
     return entry
 
 
-def is_terminal_run(body: Dict[str, Any]) -> bool:
+def is_terminal_run(body: dict[str, Any]) -> bool:
     return body.get("state") in (SUCCESS, FAILED)
 
 
@@ -432,7 +432,7 @@ class LaunchIntent:
 class AdvanceResult:
     """What the claim transform decided (its ``mutate_document`` result)."""
 
-    launches: List[LaunchIntent] = field(default_factory=list)
+    launches: list[LaunchIntent] = field(default_factory=list)
     changed: bool = False
     run_terminal: bool = False
     # claims hit MAX_CLAIMS_PER_PASS: more instances are claimable right now,
@@ -465,7 +465,7 @@ class ReconcileAdvanceResult:
 
 
 def _mapped_instance_state(
-    tasks: Dict[str, Any], prefix: str, index: int
+    tasks: dict[str, Any], prefix: str, index: int
 ) -> str:
     """The state of one ``<id>#<i>`` instance of an expanded task.
 
@@ -477,14 +477,18 @@ def _mapped_instance_state(
     reads as ``pending`` (non-terminal) in BOTH consumers.  The two once
     disagreed (barrier held, terminaliser skipped), so the same document
     could complete as a run while its group still read ``running`` to every
-    downstream; under the shared rule a hole holds the run open instead,
-    where the reconcile/GC paths can see it.
+    downstream; under the shared rule a hole holds the run open instead.
+    Holding it open is safe because the claim pass repairs it: the same
+    advance transform runs :func:`_propagate_and_claim` first, which
+    materialises a run-recorded index it finds missing and fails it (see
+    :func:`_resolve_missing_instance`), so the run terminalises on that
+    very pass rather than wedging.
     """
     entry = tasks.get(prefix + str(index))
     return PENDING if entry is None else str(entry.get("state", PENDING))
 
 
-def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
+def _mapped_group_state(body: dict[str, Any], task_id: str) -> str:
     """The aggregate state of a mapped task, for downstream dep checks.
 
     Un-expanded -> the placeholder's own state (``pending`` normally, or a
@@ -526,7 +530,7 @@ def _mapped_group_state(body: Dict[str, Any], task_id: str) -> str:
     return SUCCESS
 
 
-def effective_state(spec: DagSpec, body: Dict[str, Any], task_id: str) -> str:
+def effective_state(spec: DagSpec, body: dict[str, Any], task_id: str) -> str:
     """The state a dependency check should see for ``task_id``.
 
     Keyed on the RUN's recorded expansion as well as the spec: a run whose
@@ -541,7 +545,7 @@ def effective_state(spec: DagSpec, body: Dict[str, Any], task_id: str) -> str:
     return str(body["tasks"].get(task_id, {}).get("state", PENDING))
 
 
-def _deps_verdict(spec: DagSpec, body: Dict[str, Any], task: TaskSpec) -> str:
+def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
     """Resolve a task's upstreams into one of: ready / wait / fail / skip.
 
     ``ready`` -- launch it; ``wait`` -- upstreams still running; ``fail`` --
@@ -590,8 +594,8 @@ def _deps_verdict(spec: DagSpec, body: Dict[str, Any], task: TaskSpec) -> str:
 
 
 def tasks_awaiting_expansion(
-    spec: DagSpec, body: Dict[str, Any]
-) -> List[Tuple[str, str, str]]:
+    spec: DagSpec, body: dict[str, Any]
+) -> list[tuple[str, str, str]]:
     """Mapped tasks whose upstream is done but that are not yet expanded.
 
     Returns ``(task_id, from_task, key)`` triples so the driver can pre-read
@@ -600,7 +604,7 @@ def tasks_awaiting_expansion(
     applying, so a stale snapshot only costs a wasted read, never a wrong
     expansion.
     """
-    out: List[Tuple[str, str, str]] = []
+    out: list[tuple[str, str, str]] = []
     if not spec.mapped_tasks:
         return out  # nothing in this DAG can expand: no candidates to walk
     if is_terminal_run(body):
@@ -625,7 +629,7 @@ def plan_and_claim(
     now: float,
     proc: str,
     host: str,
-    expansions: Dict[str, Optional[List[Any]]],
+    expansions: dict[str, Optional[list[Any]]],
 ):
     """Build the ``mutate_document`` transform that advances one run.
 
@@ -650,8 +654,8 @@ def plan_and_claim(
     """
 
     def transform(
-        body: Optional[Dict[str, Any]],
-    ) -> Tuple[Any, AdvanceResult]:
+        body: Optional[dict[str, Any]],
+    ) -> tuple[Any, AdvanceResult]:
         result = AdvanceResult()
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
@@ -695,8 +699,8 @@ def is_keep(value: Any) -> bool:
 
 def _apply_expansions(
     spec: DagSpec,
-    body: Dict[str, Any],
-    expansions: Dict[str, Optional[List[Any]]],
+    body: dict[str, Any],
+    expansions: dict[str, Optional[list[Any]]],
     now: float,
     result: AdvanceResult,
 ) -> None:
@@ -746,8 +750,8 @@ def _apply_expansions(
 
 
 def _instances_of(
-    spec: DagSpec, body: Dict[str, Any], task: TaskSpec
-) -> List[Tuple[str, Optional[int], Any]]:
+    spec: DagSpec, body: dict[str, Any], task: TaskSpec
+) -> list[tuple[str, Optional[int], Any]]:
     """The concrete (taskkey, map_index, item) instances of ``task``.
 
     A plain task is one instance keyed by its id; a mapped task is its
@@ -770,7 +774,7 @@ def _instances_of(
 
 def _propagate_and_claim(
     spec: DagSpec,
-    body: Dict[str, Any],
+    body: dict[str, Any],
     now: float,
     proc: str,
     host: str,
@@ -796,6 +800,20 @@ def _propagate_and_claim(
         for taskkey, map_index, item in _instances_of(spec, body, task):
             entry = body["tasks"].get(taskkey)
             if entry is None:
+                if map_index is not None:
+                    # A HOLE: the run's own mapped item list records this
+                    # index, so the entry should exist. Materialise it as
+                    # failed rather than skipping, or the terminaliser's
+                    # absent-instance rule (which reads a hole as pending,
+                    # holding the run open) would wedge the run forever:
+                    # nothing else can create an entry that is not there.
+                    _resolve_missing_instance(
+                        task, taskkey, map_index, item, body, now, result
+                    )
+                    continue
+                # a plain task with no entry is the deliberate
+                # "added by a reload after the run was created" case,
+                # skipped here and by the terminaliser alike
                 continue
             if verdict is None and entry.get("state") == PENDING:
                 verdict = _deps_verdict(spec, body, task)
@@ -896,6 +914,40 @@ def _resolve_unmaterialised_source(task, entry, now, result) -> None:
         "expands normally)".format(task.expand.from_task)
     )
     _terminalise_task(entry, FAILED, now, result)
+
+
+def _resolve_missing_instance(
+    task, taskkey, map_index, item, body, now, result
+) -> None:
+    """Materialise and fail a mapped instance the run records but lacks.
+
+    The run document's own ``mapped[<task>].items`` records this index, so
+    :func:`_apply_expansions` wrote an entry for it and something later
+    removed it: a partial backup restore, a hand edit, or a peer on a
+    different build.  The entry cannot be recovered, and leaving the hole is
+    worse than failing it: :func:`_mapped_instance_state` reads an absent
+    entry as PENDING (the fan-in barrier's rule), so the terminaliser would
+    hold the run open forever, renewing its advance lease for the life of the
+    daemon and never becoming eligible for retention.
+
+    Failed with a reason, like :func:`_resolve_unmaterialised_source` and
+    :func:`_resolve_stale_placeholder`: the instance genuinely cannot run,
+    an operator wants to see why, and terminalising lets the run finish,
+    release its lease and be pruned.
+    """
+    entry = _new_task_entry(task, now)
+    entry["mapIndex"] = map_index
+    entry.pop("mapped", None)
+    entry["mapItem"] = item
+    body["tasks"][taskkey] = entry
+    entry["failReason"] = (
+        "this run records mapped index {} for task {!r} but holds no entry "
+        "for it: the run document was restored from a partial backup, hand "
+        "edited, or written by a foreign build. Failed so the run can "
+        "finish (the next run expands normally)".format(map_index, task.id)
+    )
+    _terminalise_task(entry, FAILED, now, result)
+    result.changed = True
 
 
 def _resolve_stale_placeholder(task, entry, now, result) -> None:
@@ -1155,6 +1207,9 @@ def _maybe_terminalise(spec, body, now, result) -> None:
             # entry missing for a run-recorded index reads as pending, so a
             # damaged document holds the run open (matching the fan-in
             # barrier's verdict) instead of completing around the hole.
+            # _propagate_and_claim, earlier in this same transform, has
+            # already materialised and failed any such hole, so holding
+            # open here costs at most the rest of this pass.
             st = _mapped_instance_state(tasks, prefix, i)
             if st not in TERMINAL_STATES:
                 return
@@ -1186,10 +1241,10 @@ _Q_INERT = "inert"
 
 def _is_quiescent(
     spec: DagSpec,
-    body: Dict[str, Any],
+    body: dict[str, Any],
     now: float,
     proc: str,
-    expansions: Optional[Dict[str, Optional[List[Any]]]],
+    expansions: Optional[dict[str, Optional[list[Any]]]],
 ) -> bool:
     """Whether an advance pass over ``body`` provably cannot change it.
 
@@ -1242,9 +1297,9 @@ def _is_quiescent(
 
 def _entry_quiescence(
     spec: DagSpec,
-    body: Dict[str, Any],
+    body: dict[str, Any],
     taskkey: str,
-    entry: Dict[str, Any],
+    entry: dict[str, Any],
     now: float,
     proc: str,
 ) -> str:
@@ -1330,10 +1385,10 @@ def _entry_quiescence(
 
 
 def _q_blocked(
-    body: Dict[str, Any],
+    body: dict[str, Any],
     task: TaskSpec,
     taskkey: str,
-    entry: Dict[str, Any],
+    entry: dict[str, Any],
 ) -> str:
     """``_Q_BLOCKED`` when :func:`_maybe_terminalise` provably consults this
     inert entry, else ``_Q_ACT``.
@@ -1411,7 +1466,7 @@ def set_task_pid(
 
 
 def set_task_pids(
-    entries: List[Tuple[str, str, Optional[int], Optional[int]]],
+    entries: list[tuple[str, str, Optional[int], Optional[int]]],
     now: float,
 ):
     """Transform recording a whole launch batch's OS pids in ONE RMW.
@@ -1481,7 +1536,7 @@ def mark_task_finished(
     expected_proc: Optional[str] = None,
     expected_attempt: Optional[int] = None,
     expected_poke: Optional[int] = None,
-    resources: Optional[Dict[str, Any]] = None,
+    resources: Optional[dict[str, Any]] = None,
 ):
     """Transform moving a finished instance to its terminal (or retry) state.
 
@@ -1558,7 +1613,7 @@ def mark_task_finished(
     return transform
 
 
-def mark_tasks_finished(marks: List[Dict[str, Any]], now: float):
+def mark_tasks_finished(marks: list[dict[str, Any]], now: float):
     """Terminalise (or park-for-retry) a whole batch of finished instances in
     ONE RMW.  The batched form of :func:`mark_task_finished`.
 
@@ -1586,7 +1641,7 @@ def mark_tasks_finished(marks: List[Dict[str, Any]], now: float):
         if body is None:
             return _DOC_KEEP, []
         tasks = body.get("tasks", {})
-        applied: List[str] = []
+        applied: list[str] = []
         for mark in marks:
             taskkey = mark["taskkey"]
             entry = tasks.get(taskkey)
@@ -1764,7 +1819,7 @@ def reconcile_crashed(
 
 def _reconcile_entries(
     spec: DagSpec,
-    body: Dict[str, Any],
+    body: dict[str, Any],
     now: float,
     proc: str,
     host: str,
@@ -1828,8 +1883,8 @@ def reconcile_and_plan(
     """
 
     def transform(
-        body: Optional[Dict[str, Any]],
-    ) -> Tuple[Any, ReconcileAdvanceResult]:
+        body: Optional[dict[str, Any]],
+    ) -> tuple[Any, ReconcileAdvanceResult]:
         advance = AdvanceResult()
         result = ReconcileAdvanceResult(advance=advance)
         if body is None or is_terminal_run(body):

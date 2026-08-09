@@ -37,8 +37,9 @@ import json
 import logging
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from aiohttp import web
@@ -168,8 +169,8 @@ class RunContext:
     scheduled_at: Optional[str]
     host: str
     default_scope: str
-    allowed_scopes: Set[str] = field(default_factory=set)
-    secrets: Dict[str, str] = field(default_factory=dict)
+    allowed_scopes: set[str] = field(default_factory=set)
+    secrets: dict[str, str] = field(default_factory=dict)
     token_bytes: bytes = field(init=False, repr=False, default=b"")
 
     def __post_init__(self) -> None:
@@ -198,7 +199,7 @@ class _LockHold:
 
 def run_environment(
     ctx: RunContext, base_url: str, cacert: Optional[str] = None
-) -> Dict[str, str]:
+) -> dict[str, str]:
     """The ``CRONSTABLE_*`` env the daemon injects for one run.
 
     All values are ``str`` (Windows and POSIX both reject non-str env values);
@@ -224,8 +225,8 @@ def run_environment(
 
 
 def _stage_secrets_sync(
-    specs: List[Dict[str, Any]], owner: str
-) -> Dict[str, str]:
+    specs: list[dict[str, Any]], owner: str
+) -> dict[str, str]:
     """Resolve ``secrets`` blocks into a fresh in-memory map, synchronously.
 
     The ONE staging implementation shared by job launches and DAG task
@@ -239,7 +240,7 @@ def _stage_secrets_sync(
     # never fatal: the run sees a 404 for it and fails as it sees fit.
     # _resolve_secret wraps every plausible resolution error in
     # ConfigError, so ConfigError is the whole expected surface.
-    secrets: Dict[str, str] = {}
+    secrets: dict[str, str] = {}
     for spec in specs:
         name = spec.get("name")
         try:
@@ -255,8 +256,8 @@ def _stage_secrets_sync(
 
 
 async def stage_secrets(
-    specs: List[Dict[str, Any]], owner: str
-) -> Dict[str, str]:
+    specs: list[dict[str, Any]], owner: str
+) -> dict[str, str]:
     """Stage a run's secrets, off the event loop when files are involved.
 
     The offload rule both callers used: any ``fromFile`` secret stages on
@@ -308,8 +309,8 @@ class JobLockManager:
         # recorded, with no await between the check and the record so the run
         # cannot end in the gap.
         self._is_run_live = is_run_live
-        self._holds: Dict[str, _LockHold] = {}
-        self._run_holds: Dict[str, Set[str]] = {}
+        self._holds: dict[str, _LockHold] = {}
+        self._run_holds: dict[str, set[str]] = {}
 
     @staticmethod
     def _slot_lease_name(scope: str, name: str, slot: int) -> str:
@@ -325,7 +326,7 @@ class JobLockManager:
         ttl: Optional[float] = None,
         wait: bool = False,
         block_seconds: float = 0.0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Acquire one of ``permits`` slots of lock ``name``.
 
         Returns ``{"acquired": bool, ...}``; on success also ``token`` (the
@@ -417,7 +418,7 @@ class JobLockManager:
         name: str,
         slot: int,
         ttl: float,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         hold = _LockHold(
             hold_token=hold_token,
             run_token=run_token,
@@ -532,11 +533,11 @@ class JobStateAPI:
         backend_getter: Callable[[], Optional[StateBackend]],
         *,
         base_holder: str,
-        config: Dict[str, Any],
+        config: dict[str, Any],
     ) -> None:
         self._backend_getter = backend_getter
         self._config = config
-        self._runs: Dict[str, RunContext] = {}
+        self._runs: dict[str, RunContext] = {}
         self._runner: Optional[web.AppRunner] = None
         self._base_url: Optional[str] = None
         self._max_value_bytes = int(config.get("maxValueBytes") or 0)
@@ -669,7 +670,7 @@ class JobStateAPI:
 
     # --- middlewares -----------------------------------------------------
 
-    def _middlewares(self) -> List[Any]:
+    def _middlewares(self) -> list[Any]:
         @web.middleware
         async def error_mw(request: web.Request, handler: Any) -> Any:
             try:
@@ -743,7 +744,7 @@ class JobStateAPI:
                 return ctx
         raise web.HTTPUnauthorized()
 
-    def _routes(self) -> List[Any]:
+    def _routes(self) -> list[Any]:
         return [
             web.get("/v1/run", self._h_run),
             web.get("/v1/kv/get", self._h_kv_get),
@@ -766,7 +767,7 @@ class JobStateAPI:
     # --- request helpers -------------------------------------------------
 
     @staticmethod
-    async def _json_body(request: web.Request) -> Dict[str, Any]:
+    async def _json_body(request: web.Request) -> dict[str, Any]:
         if not request.can_read_body:
             return {}
         try:

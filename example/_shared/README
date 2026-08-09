@@ -1,0 +1,21 @@
+Shared helpers for the cluster demos
+====================================
+
+  gen-certs.sh         Mints a throwaway cluster CA + one leaf cert per node
+                       into the demo's certs volume. Parameterized by env
+                       (NODES, CA_CN, PROJECT; see the script header). Used by
+                       the one-shot `certgen` service in example/cluster,
+                       example/cluster-large, example/pulse-cluster and
+                       example/grand-tour.
+  node-entrypoint.sh   Generates a node's `cluster:` section from environment
+                       variables at container start, then execs cronstable.
+                       Used by example/cluster-large and example/pulse-cluster.
+                       example/grand-tour has its own entrypoint (it also
+                       switches election backends and assembles a multi-file
+                       config directory), and example/cluster keeps
+                       hand-written, annotated node-*.yaml files as the
+                       readable reference for the `cluster:` section.
+
+Each demo's docker-compose.yml bind-mounts these scripts with relative paths
+(../_shared/...), the same way the demos already reference the repo root as
+their build context; the env contracts are documented in the script headers.
