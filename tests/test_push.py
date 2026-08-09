@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import pytest
 from aiohttp import web
@@ -43,6 +43,7 @@ from cronstable.job import (
     RunningJob,
     report_config_enabled,
 )
+from tests.conftest import _cron as _shared_cron
 
 try:
     from nacl import public as nacl_public
@@ -64,7 +65,7 @@ def _device_keypair():
     return private, public_b64
 
 
-def _open_sealed(private, ciphertext_b64: str) -> Dict[str, Any]:
+def _open_sealed(private, ciphertext_b64: str) -> dict[str, Any]:
     sealed = base64.b64decode(ciphertext_b64)
     plaintext = nacl_public.SealedBox(private).decrypt(sealed)
     return json.loads(plaintext.decode("utf-8"))
@@ -95,7 +96,7 @@ class _RelayServer:
 
     def __init__(self, status: int = 200) -> None:
         self.status = status
-        self.requests: List[Dict[str, Any]] = []
+        self.requests: list[dict[str, Any]] = []
         self.url = ""
         self._runner: Optional[web.AppRunner] = None
 
@@ -326,8 +327,12 @@ def test_validate_pairing_rejects_unusable_key():
     zero_key = base64.b64encode(b"\x00" * 32).decode()
     with pytest.raises(push.PushError):
         push.validate_pairing(
-            {"name": "p", "platform": "ios", "pushToken": "t",
-             "publicKey": zero_key}
+            {
+                "name": "p",
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": zero_key,
+            }
         )
 
 
@@ -360,13 +365,21 @@ def test_validate_pairing_normalizes_and_rejects():
         push.validate_pairing("not a dict")
     with pytest.raises(push.PushError):
         push.validate_pairing(
-            {"name": "p", "platform": "ios", "pushToken": "t",
-             "publicKey": base64.b64encode(b"short").decode()}
+            {
+                "name": "p",
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": base64.b64encode(b"short").decode(),
+            }
         )
     with pytest.raises(push.PushError):
         push.validate_pairing(
-            {"name": "x" * 65, "platform": "ios", "pushToken": "t",
-             "publicKey": public_b64}
+            {
+                "name": "x" * 65,
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": public_b64,
+            }
         )
 
 
@@ -428,8 +441,8 @@ async def test_file_store_write_failure_is_push_error(tmp_path):
 
 async def test_file_store_runs_on_a_private_daemon_thread(tmp_path):
     # Registry I/O used to ride loop.run_in_executor(None, ...): the same
-    # regression tests/test_state_lifecycle_hardening.py guards state
-    # against. The default pool is shared with the once-a-minute config
+    # regression the lifecycle-hardening tests in tests/test_state.py guard
+    # state against. The default pool is shared with the once-a-minute config
     # reload and its workers are non-daemonic, so an op abandoned on a
     # wedged mount retired one worker per attempt until the reload had no
     # thread to run on, and interpreter exit hung joining them.
@@ -615,7 +628,7 @@ class _FakeStateBackend:
     """
 
     def __init__(self) -> None:
-        self.docs: Dict[Any, Dict[str, Any]] = {}
+        self.docs: dict[Any, dict[str, Any]] = {}
 
     async def list_documents(self, namespace):
         assert namespace == push.PUSH_DOC_NAMESPACE
@@ -654,7 +667,7 @@ class _BrokenStateBackend:
 
 
 async def test_state_store_round_trip_and_backend_loss():
-    backend: List[Any] = [_FakeStateBackend()]
+    backend: list[Any] = [_FakeStateBackend()]
     store = push.StateDeviceStore(lambda: backend[0])
     await store.upsert({"id": "d1", "name": "phone"})
     assert [d["id"] for d in await store.load()] == ["d1"]
@@ -857,7 +870,9 @@ async def test_send_report_survives_unreachable_relay(tmp_path):
     _, public_b64 = _device_keypair()
     service, _ = await _paired_service(
         # nothing listens on port 9; must log, never raise
-        tmp_path, "http://127.0.0.1:9/v1/notify", public_b64
+        tmp_path,
+        "http://127.0.0.1:9/v1/notify",
+        public_b64,
     )
     await service.send_report(_FakeJobCtx(), False, {"enabled": True})
 
@@ -882,10 +897,20 @@ async def test_one_bad_registry_key_does_not_break_the_fanout(tmp_path):
                 "devices": [
                     # the bad device first, so the loop must survive it
                     # to ever reach the good one
-                    {"id": "bad", "name": "evil", "platform": "ios",
-                     "publicKey": zero_b64, "pushToken": "tok-bad"},
-                    {"id": "good", "name": "phone", "platform": "ios",
-                     "publicKey": good_b64, "pushToken": "tok-good"},
+                    {
+                        "id": "bad",
+                        "name": "evil",
+                        "platform": "ios",
+                        "publicKey": zero_b64,
+                        "pushToken": "tok-bad",
+                    },
+                    {
+                        "id": "good",
+                        "name": "phone",
+                        "platform": "ios",
+                        "publicKey": good_b64,
+                        "pushToken": "tok-good",
+                    },
                 ],
             }
         ),
@@ -1105,8 +1130,9 @@ async def test_unexpected_error_stays_one_device_s_problem(tmp_path, caplog):
         await service.send_report(_FakeJobCtx(), False, {"enabled": True})
         assert len(relay.requests) == 2  # neither device was cancelled
     failures = [
-        r.getMessage() for r in caplog.records if "delivery to device" in
         r.getMessage()
+        for r in caplog.records
+        if "delivery to device" in r.getMessage()
     ]
     assert len(failures) == 2
     assert all("unexpected UnicodeDecodeError" in m for m in failures)
@@ -1132,7 +1158,7 @@ async def test_send_test_collapse_ids_are_unique(tmp_path):
 
 class _StubService:
     def __init__(self) -> None:
-        self.calls: List[Any] = []
+        self.calls: list[Any] = []
 
     async def send_report(self, ctx, success, push_config):
         self.calls.append((ctx, success, push_config))
@@ -1177,8 +1203,7 @@ def test_push_is_a_registered_reporter_and_gates_fanout():
         isinstance(r, PushReporter) for r in RunningJob.REPORTERS
     )
     defaults = parse_config_string(
-        "jobs:\n  - name: j\n    command: \"true\"\n"
-        "    schedule: \"* * * * *\"\n",
+        'jobs:\n  - name: j\n    command: "true"\n    schedule: "* * * * *"\n',
         "",
     ).jobs[0]
     report = defaults.onFailure["report"]
@@ -1439,8 +1464,9 @@ push:
 )
 def test_push_relay_url_must_be_http(url):
     yaml = (
-        "push:\n  relay:\n    url: \"{}\"\n"
-        "  devicesFile: /tmp/d.json\n".format(url)
+        'push:\n  relay:\n    url: "{}"\n  devicesFile: /tmp/d.json\n'.format(
+            url
+        )
     )
     with pytest.raises(ConfigError):
         _parse_validated(yaml)
@@ -1461,8 +1487,9 @@ def test_push_relay_url_error_redacts_credentials(url):
     # every reparse until the config is fixed; like every other URL a
     # ConfigError echoes, it must never carry the secret.
     yaml = (
-        "push:\n  relay:\n    url: \"{}\"\n"
-        "  devicesFile: /tmp/d.json\n".format(url)
+        'push:\n  relay:\n    url: "{}"\n  devicesFile: /tmp/d.json\n'.format(
+            url
+        )
     )
     with pytest.raises(ConfigError) as err:
         _parse_validated(yaml)
@@ -1620,12 +1647,18 @@ def test_bonjour_off_forms_need_no_library(monkeypatch):
 
 
 class _Req:
-    """The slice of aiohttp's Request the push/whoami handlers read."""
+    """The slice of aiohttp's Request the push/whoami handlers read.
+
+    ``can_read_body`` arms the shared ``_web_json_body`` reader the
+    pairing handler goes through; an Exception body still raises from
+    ``json()`` so the malformed-body arms stay reachable.
+    """
 
     def __init__(self, match=None, body=None, token=None):
         self.match_info = match or {}
         self._body = body
-        self._store: Dict[str, Any] = {}
+        self.can_read_body = body is not None
+        self._store: dict[str, Any] = {}
         if token is not None:
             self._store[WEB_TOKEN_REQUEST_KEY] = token
 
@@ -1648,12 +1681,10 @@ jobs:
 
 
 def _cron() -> Cron:
-    cron = Cron(None, config_yaml=_SEED_JOB)
-    cron.web_config = {}
-    return cron
+    return _shared_cron(_SEED_JOB)
 
 
-def _pair_body(public_b64: str) -> Dict[str, str]:
+def _pair_body(public_b64: str) -> dict[str, str]:
     return {
         "name": "phone",
         "platform": "ios",
@@ -1715,6 +1746,14 @@ async def test_pair_rejects_bad_bodies(tmp_path):
         await cron._web_push_pair(_Req(body=ValueError("bad json")))
     with pytest.raises(web.HTTPBadRequest):
         await cron._web_push_pair(_Req(body={"name": "x"}))
+    # the non-ValueError decode failures too: a bogus `charset=` makes
+    # aiohttp's json() raise LookupError, which a bare `except ValueError`
+    # let escape the JSON error envelope as a plain-text 500.  The shared
+    # _web_json_body reader catches the full decode surface.
+    with pytest.raises(web.HTTPBadRequest):
+        await cron._web_push_pair(
+            _Req(body=LookupError("unknown encoding: x-bogus"))
+        )
 
 
 @requires_pynacl
@@ -1950,11 +1989,11 @@ class _ScopeReq:
         self.path = path
         self.method = method
         self.headers = headers
-        self.query: Dict[str, str] = {}
+        self.query: dict[str, str] = {}
         resource = SimpleNamespace(canonical=canonical)
         route = SimpleNamespace(resource=resource)
         self.match_info = SimpleNamespace(route=route)
-        self._store: Dict[str, Any] = {}
+        self._store: dict[str, Any] = {}
 
     def __setitem__(self, key, value):
         self._store[key] = value
@@ -2124,11 +2163,11 @@ async def test_start_stop_push_state_store_tracks_backend(tmp_path):
 
 
 class _FakeAsyncZeroconf:
-    instances: List["_FakeAsyncZeroconf"] = []
+    instances: list["_FakeAsyncZeroconf"] = []
 
     def __init__(self) -> None:
-        self.registered: List[Any] = []
-        self.unregistered: List[Any] = []
+        self.registered: list[Any] = []
+        self.unregistered: list[Any] = []
         self.closed = False
         _FakeAsyncZeroconf.instances.append(self)
 

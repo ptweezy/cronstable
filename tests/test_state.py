@@ -7,6 +7,7 @@ drive them deterministically.
 """
 
 import asyncio
+import contextlib
 import datetime
 import json
 import logging
@@ -22,6 +23,7 @@ from cronstable.config import ConfigError, parse_config_string
 from cronstable.cron import Cron, JobRunInfo, _job_run_info_from_dict
 from cronstable.dag import DAG_LEASE_PREFIX
 from cronstable.job import JobOutputStream
+from cronstable.platform import exclusive_file_lock
 from cronstable.state import (
     DOCS_DIR,
     RECORDS_DIR,
@@ -33,8 +35,15 @@ from cronstable.state import (
     detect_topology,
     make_state_backend,
 )
-
-_UTC = datetime.timezone.utc
+from tests._configs import _DEP_JOB, _ONE_JOB
+from tests._helpers import (
+    _UTC,
+    _backend,
+    _drain_state_writes,
+    _state_cfg,
+    _wait_until,
+    _write_raw_record,
+)
 
 
 def _info(second=0, outcome="success", exit_code=0, fail_reason=None):
@@ -49,19 +58,7 @@ def _info(second=0, outcome="success", exit_code=0, fail_reason=None):
     )
 
 
-_ONE_JOB = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
-)
-
-
-async def _drain_state_writes(cron):
-    await asyncio.gather(*list(cron._pending_state_writes))
-
 # --- config parsing -------------------------------------------------------
-
-
-def _state_cfg(yaml):
-    return parse_config_string(yaml, "").state_config
 
 
 def test_no_state_section_is_none():
@@ -141,16 +138,6 @@ def test_multiple_state_sections_in_dir_rejected(tmp_path):
 # --- backend construction / factory --------------------------------------
 
 
-def _backend(tmp_path, **over):
-    cfg = {
-        "path": str(tmp_path),
-        "topology": "single-node",
-        "deploymentId": None,
-    }
-    cfg.update(over)
-    return FilesystemStateBackend(cfg, lambda: "jobset-abc")  # type: ignore[arg-type]
-
-
 def test_factory_builds_filesystem(tmp_path):
     cfg = _state_cfg("state:\n  path: " + str(tmp_path) + "\n")
     backend = make_state_backend(cfg, lambda: "js")
@@ -163,9 +150,8 @@ def test_factory_unknown_backend_raises(tmp_path):
         make_state_backend(cfg, lambda: "js")  # type: ignore[arg-type]
 
 
-async def test_start_creates_layout(tmp_path):
-    backend = _backend(tmp_path, deploymentId="app1")
-    await backend.start()
+async def test_start_creates_layout(fs_backend_factory, tmp_path):
+    await fs_backend_factory(deploymentId="app1")
     base = os.path.join(str(tmp_path), "app1")
     for sub in ("records", "leases", "quarantine", "tmp"):
         assert os.path.isdir(os.path.join(base, sub))
@@ -174,12 +160,10 @@ async def test_start_creates_layout(tmp_path):
         n.endswith(".probe")
         for n in os.listdir(os.path.join(base, "tmp"))
     )
-    await backend.stop()
 
 
-async def test_default_namespace(tmp_path):
-    backend = _backend(tmp_path)  # deploymentId None
-    await backend.start()
+async def test_default_namespace(fs_backend, tmp_path):
+    backend = fs_backend  # deploymentId None
     assert backend.namespace == "default"
     assert os.path.isdir(os.path.join(str(tmp_path), "default", "records"))
 
@@ -196,9 +180,8 @@ async def test_start_failure_on_unwritable_path(tmp_path):
 # --- records + derived cursor --------------------------------------------
 
 
-async def test_append_and_list_roundtrip(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_append_and_list_roundtrip(fs_backend):
+    backend = fs_backend
     rid = await backend.append_record("runs", {"outcome": "success", "n": 1})
     assert isinstance(rid, str) and rid
     await backend.append_record("runs", {"outcome": "failure", "n": 2})
@@ -207,15 +190,13 @@ async def test_append_and_list_roundtrip(tmp_path):
     assert got[0]["outcome"] == "success"
 
 
-async def test_list_missing_stream_is_empty(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_missing_stream_is_empty(fs_backend):
+    backend = fs_backend
     assert await backend.list_records("never-written") == []
 
 
-async def test_list_newest_first_and_limit(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_newest_first_and_limit(fs_backend):
+    backend = fs_backend
     for i in range(5):
         await backend.append_record("s", {"i": i})
     newest = await backend.list_records("s", newest_first=True, limit=2)
@@ -224,9 +205,8 @@ async def test_list_newest_first_and_limit(tmp_path):
     assert [r["i"] for r in oldest] == [0, 1, 2]
 
 
-async def test_list_records_predicate_and_max_matches(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_records_predicate_and_max_matches(fs_backend):
+    backend = fs_backend
     for i in range(10):
         await backend.append_record(
             "s", {"i": i, "kind": "even" if i % 2 == 0 else "odd"}
@@ -256,14 +236,15 @@ async def test_list_records_predicate_and_max_matches(tmp_path):
     )
     assert [r["i"] for r in limited] == [8]
     # no predicate/max_matches => unchanged behaviour.
-    assert [
-        r["i"] for r in await backend.list_records("s", limit=3)
-    ] == [0, 1, 2]
+    assert [r["i"] for r in await backend.list_records("s", limit=3)] == [
+        0,
+        1,
+        2,
+    ]
 
 
-async def test_records_are_immutable_and_versioned(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_records_are_immutable_and_versioned(fs_backend):
+    backend = fs_backend
     await backend.append_record("s", {"k": "v"})
     stream_dir = backend._stream_dir("s")
     files = [n for n in os.listdir(stream_dir) if n.endswith(".json")]
@@ -280,38 +261,34 @@ def test_the_old_scheme_version_spelling_still_resolves():
     assert state.SCHEME_VERSION == state.SCHEMA_VERSION
 
 
-async def test_derive_max_is_order_independent(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_derive_max_is_order_independent(fs_backend):
+    backend = fs_backend
     for ts in (5, 3, 8, 1, 4):
         await backend.append_record("s", {"ts": ts})
     assert await backend.derive_max("s", "ts") == 8
 
 
-async def test_derive_max_empty_and_missing_field(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_derive_max_empty_and_missing_field(fs_backend):
+    backend = fs_backend
     assert await backend.derive_max("s", "ts") is None
     await backend.append_record("s", {"other": 1})
     assert await backend.derive_max("s", "ts") is None
 
 
-async def test_derive_max_ignores_incomparable(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_derive_max_ignores_incomparable(fs_backend):
+    backend = fs_backend
     await backend.append_record("s", {"v": "abc"})
     await backend.append_record("s", {"v": 5})  # int vs str: incomparable
     # does not raise; keeps the first-seen value.
     assert await backend.derive_max("s", "v") == "abc"
 
 
-async def test_derive_max_fails_closed_on_read_error(tmp_path):
+async def test_derive_max_fails_closed_on_read_error(fs_backend):
     # H1: an ENVIRONMENTAL read error (NFS blip, AV hold, cross-user EACCES)
     # on one record must fail the whole derive (raise), never silently return
     # the max over the SURVIVORS -- a value below the true max, which regresses
     # the "last fired" watermark and makes catch-up replay an already-run slot.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for ts in (1, 2, 3):
         await backend.append_record("s", {"ts": ts})
     stream_dir = backend._stream_dir("s")
@@ -330,12 +307,11 @@ async def test_derive_max_fails_closed_on_read_error(tmp_path):
     assert {r["ts"] for r in survived} == {1, 2}
 
 
-async def test_derive_max_still_skips_poison_record(tmp_path):
+async def test_derive_max_still_skips_poison_record(fs_backend):
     # the strict path fails closed only for ENVIRONMENTAL errors; a genuinely
     # corrupt (content-bad) record is unrecoverable and is still quarantined
     # and skipped, so one poison object can never wedge the watermark forever.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 5})
     stream_dir = backend._stream_dir("s")
     with open(os.path.join(stream_dir, "00000-bad.json"), "w") as fobj:
@@ -356,14 +332,13 @@ def _spy_reads(backend):
     return read
 
 
-async def test_derive_max_incremental_fold_reads_only_new_records(tmp_path):
+async def test_derive_max_incremental_fold_reads_only_new_records(fs_backend):
     # the watermark memo: a repeat derive over an unchanged stream is one
     # listdir and ZERO record parses, and after appends it parses only the
     # records that landed since the previous call (the performance fix: the
     # catch-up path derives per job per service pass over a ledger of up to
     # ~1000 multi-KB records, which used to be fully re-parsed every time).
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for ts in (1, 2, 3):
         await backend.append_record("s", {"ts": ts})
     assert await backend.derive_max("s", "ts") == 3  # full scan primes memo
@@ -378,12 +353,11 @@ async def test_derive_max_incremental_fold_reads_only_new_records(tmp_path):
     assert len(read) == 2  # only the two new records, never the old three
 
 
-async def test_derive_max_survives_prune_of_the_max_record(tmp_path):
+async def test_derive_max_survives_prune_of_the_max_record(fs_backend):
     # derived cursors are MONOTONIC maxima (see StateBackend.append_record):
     # a bounded prune deletes only old records, and deleting a record whose
     # value is already folded into the memo must never lower the cursor.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for ts in (9, 1, 2, 3):
         await backend.append_record("s", {"ts": ts})
     assert await backend.derive_max("s", "ts") == 9
@@ -392,13 +366,12 @@ async def test_derive_max_survives_prune_of_the_max_record(tmp_path):
 
 
 async def test_derive_max_watermark_record_pruned_after_newer_appends(
-    tmp_path,
+    fs_backend,
 ):
     # a later prune may delete the memo's watermark record itself once newer
     # records exist (prune keeps the newest ``keep``): that must read as a
     # prune (fold only the newer names), not as a stream wipe.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 5})
     assert await backend.derive_max("s", "ts") == 5  # watermark = the 5
     await backend.append_record("s", {"ts": 1})
@@ -407,12 +380,11 @@ async def test_derive_max_watermark_record_pruned_after_newer_appends(
     assert await backend.derive_max("s", "ts") == 5
 
 
-async def test_derive_max_wiped_stream_resets_to_none(tmp_path):
+async def test_derive_max_wiped_stream_resets_to_none(fs_backend):
     # prune keep<=0 deletes the WHOLE stream: the cursor must read as empty
     # again (and then track only the recreated records), never echo the
     # pre-wipe max out of the memo.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for ts in (5, 8):
         await backend.append_record("s", {"ts": ts})
     assert await backend.derive_max("s", "ts") == 8
@@ -422,13 +394,12 @@ async def test_derive_max_wiped_stream_resets_to_none(tmp_path):
     assert await backend.derive_max("s", "ts") == 3
 
 
-async def test_derive_max_wipe_then_append_before_next_derive(tmp_path):
+async def test_derive_max_wipe_then_append_before_next_derive(fs_backend):
     # a keep<=0 wipe followed by appends BEFORE the next derive looks exactly
     # like a prune from the listing alone (the new filenames sort above the
     # old watermark): only the explicit memo invalidation on the wipe path
     # keeps the deleted records' values out of the recreated stream's cursor.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 8})
     assert await backend.derive_max("s", "ts") == 8
     await backend.prune_records("s", keep=0)
@@ -437,14 +408,13 @@ async def test_derive_max_wipe_then_append_before_next_derive(tmp_path):
 
 
 async def test_derive_max_invalidated_by_gc_stream_removal(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # collect_garbage removes whole streams without going through
     # prune_records: it must invalidate the memo the same way, or a stream
     # recreated after gc (again: new filenames above the old watermark)
     # would inherit the collected records' max.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     old = state._now() - 7200.0
     monkeypatch.setattr(state, "_now", lambda: old)
     await backend.append_record("runs/gone", {"ts": 8})
@@ -456,13 +426,12 @@ async def test_derive_max_invalidated_by_gc_stream_removal(
     assert await backend.derive_max("runs/gone", "ts") == 3
 
 
-async def test_derive_max_externally_wiped_stream_yields_none(tmp_path):
+async def test_derive_max_externally_wiped_stream_yields_none(fs_backend):
     # an out-of-band wipe (an operator's rm) never crosses the backend's own
     # delete paths, so it is detected structurally: the watermark filename is
     # gone AND nothing newer exists, a shape a bounded prune can never
     # produce.  The memo is discarded and the empty stream reads None.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for ts in (5, 8):
         await backend.append_record("s", {"ts": ts})
     assert await backend.derive_max("s", "ts") == 8
@@ -472,12 +441,13 @@ async def test_derive_max_externally_wiped_stream_yields_none(tmp_path):
     assert await backend.derive_max("s", "ts") is None
 
 
-async def test_derive_max_newest_record_deleted_out_of_band_rescans(tmp_path):
+async def test_derive_max_newest_record_deleted_out_of_band_rescans(
+    fs_backend,
+):
     # deleting just the NEWEST record out of band drops the watermark with
     # survivors below it: the memo is discarded and a full rescan recomputes
     # the max from what actually remains.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for ts in (2, 9):
         await backend.append_record("s", {"ts": ts})
     assert await backend.derive_max("s", "ts") == 9
@@ -487,15 +457,14 @@ async def test_derive_max_newest_record_deleted_out_of_band_rescans(tmp_path):
     assert await backend.derive_max("s", "ts") == 2
 
 
-async def test_derive_max_strict_error_on_new_record_after_memo(tmp_path):
+async def test_derive_max_strict_error_on_new_record_after_memo(fs_backend):
     # the incremental path parses only new records but with the SAME strict
     # semantics: an environmental error on a new record fails the whole
     # derive AND leaves the memo unadvanced, so the next derive retries the
     # same record instead of skipping past it (a skipped record would let
     # the cursor settle below the true max, the exact bug strict=True is
     # there to prevent).
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 1})
     assert await backend.derive_max("s", "ts") == 1
     await backend.append_record("s", {"ts": 9})
@@ -512,12 +481,11 @@ async def test_derive_max_strict_error_on_new_record_after_memo(tmp_path):
         await backend.derive_max("s", "ts")
 
 
-async def test_derive_max_new_poison_record_skipped_incrementally(tmp_path):
+async def test_derive_max_new_poison_record_skipped_incrementally(fs_backend):
     # a content-bad NEW record keeps the first-scan behaviour on the
     # incremental path too: quarantined and skipped, never wedging or
     # regressing the cursor.  (The name sorts above any real record id.)
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 5})
     assert await backend.derive_max("s", "ts") == 5
     stream_dir = backend._stream_dir("s")
@@ -527,13 +495,12 @@ async def test_derive_max_new_poison_record_skipped_incrementally(tmp_path):
     assert "99999-bad.json" not in os.listdir(stream_dir)  # quarantined
 
 
-async def test_derive_max_wipe_racing_a_scan_is_not_cached(tmp_path):
+async def test_derive_max_wipe_racing_a_scan_is_not_cached(fs_backend):
     # a keep<=0 wipe that lands while a derive is mid-scan on another worker
     # thread must fence that scan's memo write-back (the wipe-generation
     # gate), or the finished scan would resurrect a fold of records that no
     # longer exist and the recreated stream would inherit it.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 8})
     real = FilesystemStateBackend._read_record
 
@@ -556,24 +523,14 @@ async def test_derive_max_wipe_racing_a_scan_is_not_cached(tmp_path):
 # --- worker lanes: lease isolation + wedge observability -----------------
 
 
-async def _wait_until(predicate, timeout=3.0):
-    """Poll ``predicate`` (generous window; never tightens on slow CI)."""
-    for _ in range(int(timeout / 0.01)):
-        if predicate():
-            return True
-        await asyncio.sleep(0.01)
-    return predicate()
-
-
-async def test_lease_lane_isolated_from_saturated_bulk_pool(tmp_path):
+async def test_lease_lane_isolated_from_saturated_bulk_pool(fs_backend):
     # H2/M27: lease/coordination ops run in a DEDICATED worker lane, so a bulk
     # pool fully saturated by slow or wedged record writes cannot starve a
     # lease renew below its TTL -- which would expire a live holder's lease and
     # hand its fenced work to a standby (split-brain / double-fire).  Saturate
     # every bulk slot with a wedged op and prove a lease op still gets through
     # while a further bulk op does not.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     gate = threading.Event()
 
     def _wedge():
@@ -586,8 +543,11 @@ async def test_lease_lane_isolated_from_saturated_bulk_pool(tmp_path):
     try:
         # every wedged op acquires its bulk slot: the bulk lane is now full.
         assert await _wait_until(
-            lambda: backend.stats()["workers"]["bulk_inflight"]
-            == state.BULK_CALL_SLOTS
+            lambda: (
+                backend.stats()["workers"]["bulk_inflight"]
+                == state.BULK_CALL_SLOTS
+            ),
+            raise_on_timeout=False,
         )
         assert backend.stats()["workers"]["lease_inflight"] == 0
         # a LEASE op still completes promptly on its own lane...
@@ -603,15 +563,13 @@ async def test_lease_lane_isolated_from_saturated_bulk_pool(tmp_path):
     finally:
         gate.set()
         await asyncio.gather(*bulk)
-    await backend.stop()
 
 
-async def test_stats_reports_worker_lane_occupancy(tmp_path):
+async def test_stats_reports_worker_lane_occupancy(fs_backend):
     # M27: a wedged store must be VISIBLE.  The op counters only tick when an
     # op FINISHES, so a hung mount reads as idle; the worker gauge shows the
     # live occupancy, so a lane pinned at capacity is the "wedged" signal.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     w = backend.stats()["workers"]
     assert w["bulk_capacity"] == state.BULK_CALL_SLOTS
     assert w["lease_capacity"] == state.LEASE_CALL_SLOTS
@@ -625,23 +583,24 @@ async def test_stats_reports_worker_lane_occupancy(tmp_path):
     try:
         # the wedged op is observable as one in-flight bulk worker.
         assert await _wait_until(
-            lambda: backend.stats()["workers"]["bulk_inflight"] == 1
+            lambda: backend.stats()["workers"]["bulk_inflight"] == 1,
+            raise_on_timeout=False,
         )
     finally:
         gate.set()
         await task
     # and it returns to zero once the op drains.
     assert await _wait_until(
-        lambda: backend.stats()["workers"]["bulk_inflight"] == 0
+        lambda: backend.stats()["workers"]["bulk_inflight"] == 0,
+        raise_on_timeout=False,
     )
-    await backend.stop()
 
 
 # --- directory-entry durability -------------------------------------------
 
 
 async def test_append_to_fresh_stream_fsyncs_new_directory_chain(
-    tmp_path, monkeypatch
+    fs_backend_factory, monkeypatch
 ):
     # the very first append into a stream that never existed before must
     # makedirs it durably: without flushing each newly-created level's
@@ -651,8 +610,7 @@ async def test_append_to_fresh_stream_fsyncs_new_directory_chain(
     monkeypatch.setattr(
         state, "fsync_directory", lambda p: flushed.append(p)
     )
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = await fs_backend_factory()
     flushed.clear()
     await backend.append_record("brand-new-stream", {"x": 1})
     stream_dir = backend._stream_dir("brand-new-stream")
@@ -667,13 +625,12 @@ async def test_append_to_fresh_stream_fsyncs_new_directory_chain(
 
 
 async def test_document_delete_fsyncs_namespace_directory(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # without this, an unlinked idempotency/KV document can RESURRECT after
     # a power loss (the unlink itself was never made durable), silently
     # undoing the delete and letting guarded once-only work run again.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.mutate_document("ns", "k", lambda c: ({"v": 1}, None))
     flushed = []
     monkeypatch.setattr(
@@ -690,9 +647,8 @@ async def test_document_delete_fsyncs_namespace_directory(
 # --- corrupt-record quarantine -------------------------------------------
 
 
-async def test_corrupt_json_is_quarantined(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_corrupt_json_is_quarantined(fs_backend):
+    backend = fs_backend
     await backend.append_record("s", {"good": True})
     stream_dir = backend._stream_dir("s")
     # a truncated/garbage record (as a crash mid-write on a non-atomic store
@@ -707,13 +663,12 @@ async def test_corrupt_json_is_quarantined(tmp_path):
     assert any(n.startswith("00000-bad.json") for n in os.listdir(quarantine))
 
 
-async def test_unrecognised_schema_version_is_left_in_place(tmp_path):
+async def test_unrecognised_schema_version_is_left_in_place(fs_backend):
     # A well-formed record with a schemaVersion this build doesn't recognise
     # is most likely written by a newer peer mid rolling-upgrade: it must be
     # skipped, never destructively quarantined (deleting it would erase that
     # peer's record fleet-wide the moment an old node reads the shared store).
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     stream_dir = backend._stream_dir("s")
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-new.json"), "w") as fobj:
@@ -724,11 +679,12 @@ async def test_unrecognised_schema_version_is_left_in_place(tmp_path):
     assert not os.path.isdir(quarantine) or os.listdir(quarantine) == []
 
 
-async def test_unrecognised_schema_version_fails_closed_when_strict(tmp_path):
+async def test_unrecognised_schema_version_fails_closed_when_strict(
+    fs_backend,
+):
     from cronstable.state import _DocumentUnreadable
 
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     stream_dir = backend._stream_dir("s")
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-new.json"), "w") as fobj:
@@ -737,12 +693,11 @@ async def test_unrecognised_schema_version_fails_closed_when_strict(tmp_path):
         await backend.derive_max("s", "finished_at")
 
 
-async def test_malformed_record_shape_is_still_quarantined(tmp_path):
+async def test_malformed_record_shape_is_still_quarantined(fs_backend):
     # Distinct from an unrecognised-but-well-formed schemaVersion: a record
     # whose "data" isn't even a dict is genuinely unreadable content, not a
     # forward-compat gap, so destructive quarantine is still correct here.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     stream_dir = backend._stream_dir("s")
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-bad.json"), "w") as fobj:
@@ -759,14 +714,13 @@ async def test_malformed_record_shape_is_still_quarantined(tmp_path):
 
 
 async def test_record_content_cache_serves_repeat_reads(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # A record file is immutable and its name unique forever, so a second
     # read of the same record must not open the file again.  Each read still
     # hands back its OWN parsed body: callers mutate what they get back, and
     # a shared dict would let one caller's edit rewrite history for the next.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"i": 1})
     first = await backend.list_records("s")
     assert first == [{"i": 1}]
@@ -789,14 +743,15 @@ async def test_record_content_cache_serves_repeat_reads(
     assert (await backend.list_records("s")) == [{"i": 1}]
 
 
-async def test_record_content_cache_is_bounded(tmp_path, monkeypatch):
+async def test_record_content_cache_is_bounded(
+    fs_backend_factory, monkeypatch
+):
     # Both bounds hold: an oversized body is never cached at all (one
     # archived-output record must not evict a thousand useful small ones),
     # and the cache evicts least-recently-read once it is full.
     monkeypatch.setattr(state, "_RECORD_CACHE_MAX_ITEM_BYTES", 200)
     monkeypatch.setattr(state, "_RECORD_CACHE_MAX_ENTRIES", 3)
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = await fs_backend_factory()
     await backend.append_record("big", {"blob": "x" * 400})
     await backend.list_records("big")
     assert backend._record_cache == {}
@@ -815,14 +770,13 @@ async def test_record_content_cache_is_bounded(tmp_path, monkeypatch):
 
 
 async def test_record_content_cache_is_bypassed_by_strict_reads(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # strict is the fail-closed reader (derived watermarks, the mapped
     # fan-out): a record it cannot read RIGHT NOW must fail the caller
     # closed, never be resolved from a body this process happens to
     # remember, so it reads the store in both directions.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("s", {"ts": 5})
     assert await backend.derive_max("s", "ts") == 5
     assert backend._record_cache == {}  # a strict read caches nothing
@@ -839,14 +793,13 @@ async def test_record_content_cache_is_bypassed_by_strict_reads(
         await backend.list_records("s", strict=True)
 
 
-async def test_record_content_cache_never_holds_an_invalid_record(tmp_path):
+async def test_record_content_cache_never_holds_an_invalid_record(fs_backend):
     # Only a body that read back VALID is cached, so a record this build
     # cannot interpret keeps failing closed on every later read instead of
     # being remembered as readable.
     from cronstable.state import _DocumentUnreadable
 
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     stream_dir = backend._stream_dir("s")
     os.makedirs(stream_dir, exist_ok=True)
     with open(os.path.join(stream_dir, "00001-new.json"), "w") as fobj:
@@ -860,9 +813,8 @@ async def test_record_content_cache_never_holds_an_invalid_record(tmp_path):
 # --- lease primitive ------------------------------------------------------
 
 
-async def test_lease_acquire_read_release(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_lease_acquire_read_release(fs_backend):
+    backend = fs_backend
     lease = await backend.acquire_lease("job-x", "node-a", ttl=30)
     assert lease is not None
     assert lease.holder == "node-a"
@@ -873,27 +825,26 @@ async def test_lease_acquire_read_release(tmp_path):
     assert await backend.read_lease("job-x") is None
 
 
-async def test_lease_denies_second_holder_while_valid(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_lease_denies_second_holder_while_valid(fs_backend):
+    backend = fs_backend
     a = await backend.acquire_lease("L", "A", ttl=30)
     assert a is not None
     # B cannot take a validly-held lease.
     assert await backend.acquire_lease("L", "B", ttl=30) is None
 
 
-async def test_lease_same_holder_renews_keeps_fence(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_lease_same_holder_renews_keeps_fence(fs_backend):
+    backend = fs_backend
     a1 = await backend.acquire_lease("L", "A", ttl=30)
     a2 = await backend.acquire_lease("L", "A", ttl=30)
     assert a1 is not None and a2 is not None
     assert a2.fence == a1.fence == 1
 
 
-async def test_lease_takeover_after_expiry_bumps_fence(tmp_path, monkeypatch):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_lease_takeover_after_expiry_bumps_fence(
+    fs_backend, monkeypatch
+):
+    backend = fs_backend
     clock = {"t": 1000.0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
 
@@ -912,9 +863,8 @@ async def test_lease_takeover_after_expiry_bumps_fence(tmp_path, monkeypatch):
     assert b2 is not None and b2.fence == 2
 
 
-async def test_lease_release_only_by_current_holder(tmp_path, monkeypatch):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_lease_release_only_by_current_holder(fs_backend, monkeypatch):
+    backend = fs_backend
     clock = {"t": 1000.0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
     a = await backend.acquire_lease("L", "A", ttl=10)
@@ -928,23 +878,20 @@ async def test_lease_release_only_by_current_holder(tmp_path, monkeypatch):
     assert still is not None and still.holder == "B"
 
 
-async def test_renew_missing_lease_returns_none(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_renew_missing_lease_returns_none(fs_backend):
+    backend = fs_backend
     ghost = Lease(name="L", holder="A", fence=1, expires_at=0.0)
     assert await backend.renew_lease(ghost, ttl=10) is None
 
 
-async def test_release_missing_lease_is_noop(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_release_missing_lease_is_noop(fs_backend):
+    backend = fs_backend
     ghost = Lease(name="L", holder="A", fence=1, expires_at=0.0)
     await backend.release_lease(ghost)  # must not raise
 
 
-async def test_read_corrupt_lease_is_none(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_read_corrupt_lease_is_none(fs_backend):
+    backend = fs_backend
     lock, lease_path = backend._lease_paths("L")
     os.makedirs(os.path.dirname(lease_path), exist_ok=True)
     with open(lease_path, "w") as fobj:
@@ -955,44 +902,43 @@ async def test_read_corrupt_lease_is_none(tmp_path):
 # --- topology probe -------------------------------------------------------
 
 
-async def test_topology_explicit_shared(tmp_path, monkeypatch):
+async def test_topology_explicit_shared(fs_backend_factory, monkeypatch):
     # explicit shared overrides even when the probe disagrees (and warns).
     monkeypatch.setattr(state, "IS_WINDOWS", False)
     monkeypatch.setattr(state, "_mount_fstype", lambda p: "ext4")
-    backend = _backend(tmp_path, topology="shared")
-    await backend.start()
+    backend = await fs_backend_factory(topology="shared")
     assert backend.topology == "shared"
     assert backend.supports_shared_locking() is True
 
 
-async def test_topology_explicit_single_node(tmp_path):
-    backend = _backend(tmp_path, topology="single-node")
-    await backend.start()
+async def test_topology_explicit_single_node(fs_backend_factory):
+    backend = await fs_backend_factory(topology="single-node")
     assert backend.topology == "single-node"
     assert backend.supports_shared_locking() is False
 
 
-async def test_topology_auto_detects_shared(tmp_path, monkeypatch):
+async def test_topology_auto_detects_shared(fs_backend_factory, monkeypatch):
     monkeypatch.setattr(state, "IS_WINDOWS", False)
     monkeypatch.setattr(state, "_mount_fstype", lambda p: "nfs4")
-    backend = _backend(tmp_path, topology="auto")
-    await backend.start()
+    backend = await fs_backend_factory(topology="auto")
     assert backend.topology == "shared"
 
 
-async def test_topology_auto_detects_single_node(tmp_path, monkeypatch):
+async def test_topology_auto_detects_single_node(
+    fs_backend_factory, monkeypatch
+):
     monkeypatch.setattr(state, "IS_WINDOWS", False)
     monkeypatch.setattr(state, "_mount_fstype", lambda p: "xfs")
-    backend = _backend(tmp_path, topology="auto")
-    await backend.start()
+    backend = await fs_backend_factory(topology="auto")
     assert backend.topology == "single-node"
 
 
-async def test_topology_auto_unknown_falls_back(tmp_path, monkeypatch):
+async def test_topology_auto_unknown_falls_back(
+    fs_backend_factory, monkeypatch
+):
     monkeypatch.setattr(state, "IS_WINDOWS", False)
     monkeypatch.setattr(state, "_mount_fstype", lambda p: None)
-    backend = _backend(tmp_path, topology="auto")
-    await backend.start()
+    backend = await fs_backend_factory(topology="auto")
     assert backend.topology == "single-node"
 
 
@@ -1203,9 +1149,8 @@ async def test_cron_state_start_failure_is_swallowed(tmp_path, caplog):
 # --- retention / pruning ----------------------------------------
 
 
-async def test_prune_keeps_newest(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_keeps_newest(fs_backend):
+    backend = fs_backend
     for i in range(5):
         await backend.append_record("s", {"i": i})
     removed = await backend.prune_records("s", keep=2)
@@ -1213,26 +1158,23 @@ async def test_prune_keeps_newest(tmp_path):
     assert [r["i"] for r in await backend.list_records("s")] == [3, 4]
 
 
-async def test_prune_keep_zero_deletes_all(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_keep_zero_deletes_all(fs_backend):
+    backend = fs_backend
     for i in range(3):
         await backend.append_record("s", {"i": i})
     assert await backend.prune_records("s", keep=0) == 3
     assert await backend.list_records("s") == []
 
 
-async def test_prune_fewer_than_keep_is_noop(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_fewer_than_keep_is_noop(fs_backend):
+    backend = fs_backend
     await backend.append_record("s", {"i": 0})
     assert await backend.prune_records("s", keep=10) == 0
     assert len(await backend.list_records("s")) == 1
 
 
-async def test_prune_missing_stream(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_missing_stream(fs_backend):
+    backend = fs_backend
     assert await backend.prune_records("nope", keep=5) == 0
 
 
@@ -1354,9 +1296,10 @@ async def test_persist_error_is_swallowed(tmp_path, caplog):
 # --- warm-dashboard rehydration + watermark ---------------------
 
 
-async def _prepopulate_ledger(tmp_path, finished_isos):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def _prepopulate_ledger(backend, finished_isos):
+    # seed a run ledger through a caller-provided started backend (the
+    # fs_backend fixture); the Cron under test then opens its own backend
+    # over the same store.
     for iso in finished_isos:
         await backend.append_record(
             "runs/j",
@@ -1371,9 +1314,9 @@ async def _prepopulate_ledger(tmp_path, finished_isos):
         )
 
 
-async def test_cron_rehydrates_history_on_restart(tmp_path):
+async def test_cron_rehydrates_history_on_restart(fs_backend, tmp_path):
     await _prepopulate_ledger(
-        tmp_path,
+        fs_backend,
         [
             "2026-07-01T00:00:00+00:00",
             "2026-07-02T00:00:00+00:00",
@@ -1391,8 +1334,8 @@ async def test_cron_rehydrates_history_on_restart(tmp_path):
     )
 
 
-async def test_rehydration_runs_once(tmp_path):
-    await _prepopulate_ledger(tmp_path, ["2026-07-01T00:00:00+00:00"])
+async def test_rehydration_runs_once(fs_backend, tmp_path):
+    await _prepopulate_ledger(fs_backend, ["2026-07-01T00:00:00+00:00"])
     cron = Cron(None, config_yaml=_ONE_JOB)
     cfg = _state_cfg("state:\n  path: " + str(tmp_path))
     await cron.start_stop_state(cfg)
@@ -1404,9 +1347,9 @@ async def test_rehydration_runs_once(tmp_path):
     assert len(cron.run_history["j"]) == before
 
 
-async def test_durable_last_run_at_watermark(tmp_path):
+async def test_durable_last_run_at_watermark(fs_backend, tmp_path):
     await _prepopulate_ledger(
-        tmp_path,
+        fs_backend,
         ["2026-07-01T00:00:00+00:00", "2026-07-03T00:00:00+00:00"],
     )
     cron = Cron(None, config_yaml=_ONE_JOB)
@@ -1699,11 +1642,6 @@ async def test_run_catch_up_revalidates_after_jitter(tmp_path):
 
 # --- depends_on_past (onlyIfLastSucceeded) -----------------------
 
-_DEP_JOB = (
-    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
-    "    onlyIfLastSucceeded: true\n"
-)
-
 
 async def _dep_cron(tmp_path):
     cron = Cron(None, config_yaml=_DEP_JOB)
@@ -1894,9 +1832,8 @@ def test_record_epoch_unclassifiable_names_are_infinite():
 # --- stream-name sidecar + truncated-token enumeration --------------------
 
 
-async def test_truncated_stream_roundtrips_via_sidecar(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_truncated_stream_roundtrips_via_sidecar(fs_backend):
+    backend = fs_backend
     # the first append into a truncated-token stream lands the name sidecar
     # (_ensure_stream_name_sidecar), and a second append early-returns because
     # the sidecar already records the exact logical name.
@@ -1908,12 +1845,10 @@ async def test_truncated_stream_roundtrips_via_sidecar(tmp_path):
     names, complete = await backend.list_stream_names_audit("")
     assert _LONG in names
     assert complete is True
-    await backend.stop()
 
 
-async def test_stream_sidecar_rejects_non_roundtripping_name(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_stream_sidecar_rejects_non_roundtripping_name(fs_backend):
+    backend = fs_backend
     await backend.append_record(_LONG, {"n": 1})
     stream_dir = backend._stream_dir(_LONG)
     token = os.path.basename(stream_dir)
@@ -1929,12 +1864,10 @@ async def test_stream_sidecar_rejects_non_roundtripping_name(tmp_path):
     # hidden rather than returned garbled).
     _names, complete = backend._list_stream_names_audit_sync("")
     assert complete is False
-    await backend.stop()
 
 
-async def test_list_stream_names_skips_prefix_and_stray_files(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_stream_names_skips_prefix_and_stray_files(fs_backend):
+    backend = fs_backend
     await backend.append_record("runs/job-a", {"n": 1})
     await backend.append_record("logs/job-b", {"n": 2})
     records_root = os.path.join(backend.base, RECORDS_DIR)
@@ -1950,14 +1883,12 @@ async def test_list_stream_names_skips_prefix_and_stray_files(tmp_path):
     assert {"logs/job-b", "runs/job-a"} <= set(names_all)
     assert "stray-file" not in names_all  # the non-directory entry was skipped
     assert complete_all is True
-    await backend.stop()
 
 
 async def test_list_stream_names_missing_root_is_empty_not_unreadable(
-    tmp_path,
+    fs_backend,
 ):
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     records_root = os.path.join(backend.base, RECORDS_DIR)
     shutil.rmtree(records_root)
     # no records root at all: exhaustively empty and COMPLETE (a never-written
@@ -1965,12 +1896,12 @@ async def test_list_stream_names_missing_root_is_empty_not_unreadable(
     names, complete = backend._list_stream_names_audit_sync("")
     assert names == []
     assert complete is True
-    await backend.stop()
 
 
-async def test_list_stream_names_unreadable_root_reports_incomplete(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_stream_names_unreadable_root_reports_incomplete(
+    fs_backend,
+):
+    backend = fs_backend
     records_root = os.path.join(backend.base, RECORDS_DIR)
     shutil.rmtree(records_root)
     # replace the records dir with a plain file: listdir raises a non-
@@ -1980,15 +1911,13 @@ async def test_list_stream_names_unreadable_root_reports_incomplete(tmp_path):
     names, complete = backend._list_stream_names_audit_sync("")
     assert names == []
     assert complete is False
-    await backend.stop()
 
 
 # --- prune-latest-by (name-keyed supersession) ----------------------------
 
 
-async def test_prune_latest_by_keeps_newest_per_value(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_latest_by_keeps_newest_per_value(fs_backend):
+    backend = fs_backend
     await backend.append_record("s", {"name": "a", "v": 1})
     await backend.append_record("s", {"name": "a", "v": 2})
     await backend.append_record("s", {"name": "b", "v": 3})
@@ -2008,19 +1937,15 @@ async def test_prune_latest_by_keeps_newest_per_value(tmp_path):
     for rec in survivors:
         by_name[rec["name"]] = rec["v"]
     assert by_name == {"a": 5, "b": 3, 999: 4}  # newest "a" and non-str kept
-    await backend.stop()
 
 
-async def test_prune_latest_by_missing_stream_is_zero(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_latest_by_missing_stream_is_zero(fs_backend):
+    backend = fs_backend
     assert backend._prune_latest_by_sync("never-written", "name") == 0
-    await backend.stop()
 
 
-async def test_prune_latest_by_swallows_unlink_race(tmp_path, monkeypatch):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_prune_latest_by_swallows_unlink_race(fs_backend, monkeypatch):
+    backend = fs_backend
     await backend.append_record("s", {"name": "a", "v": 1})
     await backend.append_record("s", {"name": "a", "v": 2})
 
@@ -2035,15 +1960,13 @@ async def test_prune_latest_by_swallows_unlink_race(tmp_path, monkeypatch):
     # pass/node deleted it) must not raise: it just is not counted.
     monkeypatch.setattr(state.os, "unlink", _raced_unlink)
     assert backend._prune_latest_by_sync("s", "name") == 0
-    await backend.stop()
 
 
 # --- append-side prune failure is swallowed -------------------------------
 
 
-async def test_append_swallows_prune_failure(tmp_path, caplog):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_append_swallows_prune_failure(fs_backend, caplog):
+    backend = fs_backend
 
     def _boom(stream, keep):
         raise OSError("prune blew up")
@@ -2058,15 +1981,13 @@ async def test_append_swallows_prune_failure(tmp_path, caplog):
     assert any(
         "could not prune stream" in r.getMessage() for r in caplog.records
     )
-    await backend.stop()
 
 
 # --- quarantine helper ----------------------------------------------------
 
 
-async def test_quarantine_moves_corrupt_record_out_of_stream(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_quarantine_moves_corrupt_record_out_of_stream(fs_backend):
+    backend = fs_backend
     await backend.append_record("s", {"good": True})
     stream_dir = backend._stream_dir("s")
     with open(os.path.join(stream_dir, "00000-bad.json"), "w") as fobj:
@@ -2076,24 +1997,20 @@ async def test_quarantine_moves_corrupt_record_out_of_stream(tmp_path):
     assert "00000-bad.json" not in os.listdir(stream_dir)
     quarantine = os.path.join(backend.base, "quarantine")
     assert any(n.startswith("00000-bad.json") for n in os.listdir(quarantine))
-    await backend.stop()
 
 
-async def test_quarantine_of_absent_path_is_swallowed(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_quarantine_of_absent_path_is_swallowed(fs_backend):
+    backend = fs_backend
     ghost = os.path.join(backend._stream_dir("s"), "does-not-exist.json")
     # relocating a record that already raced away must never raise into a read.
     backend._quarantine(ghost, "does-not-exist.json", "gone")
-    await backend.stop()
 
 
 # --- meta stamp: unreadable stamp is skipped ------------------------------
 
 
-async def test_stamp_meta_skips_unreadable_stamp(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()  # writes the real meta stamp
+async def test_stamp_meta_skips_unreadable_stamp(fs_backend):
+    backend = fs_backend  # its start() wrote the real meta stamp
     meta_dir = backend._stream_dir("meta")
     # a garbage stamp that sorts newest: _stamp_meta_sync reads it first, fails
     # to parse it, and keeps looking (never raises) -- the real stamp behind it
@@ -2101,25 +2018,21 @@ async def test_stamp_meta_skips_unreadable_stamp(tmp_path):
     with open(os.path.join(meta_dir, "99999-bad.json"), "w") as fobj:
         fobj.write("{not json")
     backend._stamp_meta_sync()  # must not raise
-    await backend.stop()
 
 
 # --- mutable documents ----------------------------------------------------
 
 
-async def test_mutate_document_rejects_non_dict_body(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_mutate_document_rejects_non_dict_body(fs_backend):
+    backend = fs_backend
     # a transform returning something that is neither a dict body nor a
     # DOC_KEEP/DOC_DELETE sentinel is a programming error, refused loudly.
     with pytest.raises(TypeError, match="must return a dict body"):
         await backend.mutate_document("ns", "k", lambda c: (12345, None))
-    await backend.stop()
 
 
-async def test_read_doc_strict_raises_on_unknown_schema(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_read_doc_strict_raises_on_unknown_schema(fs_backend):
+    backend = fs_backend
     _lock, doc_path = backend._doc_paths("ns", "k")
     os.makedirs(os.path.dirname(doc_path), exist_ok=True)
     # a well-formed JSON object with a foreign schemaVersion: best-effort read
@@ -2129,12 +2042,10 @@ async def test_read_doc_strict_raises_on_unknown_schema(tmp_path):
     assert backend._read_doc_file(doc_path) is None  # non-strict
     with pytest.raises(state._DocumentUnreadable):
         backend._read_doc_file(doc_path, strict=True)
-    await backend.stop()
 
 
-async def test_list_document_keys_returns_sorted_keys(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_keys_returns_sorted_keys(fs_backend):
+    backend = fs_backend
     for key in ("charlie", "alpha", "bravo"):
         await backend.mutate_document(
             "ns", key, lambda c, k=key: ({"key": k}, None)
@@ -2146,12 +2057,10 @@ async def test_list_document_keys_returns_sorted_keys(tmp_path):
     ]
     # a namespace with no document ever written is exhaustively empty.
     assert await backend.list_document_keys("empty-ns") == []
-    await backend.stop()
 
 
-async def test_list_document_keys_unreadable_namespace_dir(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_keys_unreadable_namespace_dir(fs_backend):
+    backend = fs_backend
     ns_dir = backend._doc_dir("ns")
     os.makedirs(os.path.dirname(ns_dir), exist_ok=True)
     # the namespace path is a file, not a directory: listdir raises a non-
@@ -2159,12 +2068,10 @@ async def test_list_document_keys_unreadable_namespace_dir(tmp_path):
     with open(ns_dir, "wb") as fobj:
         fobj.write(b"not a directory")
     assert await backend.list_document_keys("ns") is None
-    await backend.stop()
 
 
-async def test_list_document_keys_truncated_key_reports_unable(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_keys_truncated_key_reports_unable(fs_backend):
+    backend = fs_backend
     # a key long enough to truncate has no name sidecar to decode it back, so
     # the WHOLE listing reports unable (None) rather than hiding this key.
     await backend.mutate_document(_LONG, "k", lambda c: ({"v": 1}, None))
@@ -2172,12 +2079,10 @@ async def test_list_document_keys_truncated_key_reports_unable(tmp_path):
         "docns", _LONG, lambda c: ({"v": 1}, None)
     )
     assert await backend.list_document_keys("docns") is None
-    await backend.stop()
 
 
-async def test_list_document_keys_foreign_filename_reports_unable(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_keys_foreign_filename_reports_unable(fs_backend):
+    backend = fs_backend
     ns_dir = backend._doc_dir("ns")
     os.makedirs(ns_dir, exist_ok=True)
     # a .doc filename our encoder could never emit (an invalid percent-escape
@@ -2186,12 +2091,10 @@ async def test_list_document_keys_foreign_filename_reports_unable(tmp_path):
     with open(os.path.join(ns_dir, "%FF.doc"), "wb") as fobj:
         fobj.write(b"{}")
     assert await backend.list_document_keys("ns") is None
-    await backend.stop()
 
 
-async def test_list_document_keys_round_trip_guard(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_keys_round_trip_guard(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("ns", "real", lambda c: ({"v": 1}, None))
     ns_dir = backend._doc_dir("ns")
     # tokens that DECODE cleanly but that the encoder can never have
@@ -2206,12 +2109,10 @@ async def test_list_document_keys_round_trip_guard(tmp_path):
         assert await backend.list_document_keys("ns") is None
         os.unlink(os.path.join(ns_dir, foreign))
     assert await backend.list_document_keys("ns") == ["real"]
-    await backend.stop()
 
 
-async def test_list_document_keys_surrogate_key_round_trips(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_keys_surrogate_key_round_trips(fs_backend):
+    backend = fs_backend
     # a key carrying a lone surrogate (names come from os.fsdecode'd
     # sources elsewhere in the store) encodes via surrogatepass; the
     # listing must hand back the SAME key, not report unable (the old
@@ -2222,12 +2123,10 @@ async def test_list_document_keys_surrogate_key_round_trips(tmp_path):
         "ns", key, lambda c: ({"v": 1}, None)
     )
     assert await backend.list_document_keys("ns") == [key]
-    await backend.stop()
 
 
-async def test_list_document_namespaces_lists_and_filters(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_namespaces_lists_and_filters(fs_backend):
+    backend = fs_backend
     await backend.mutate_document("runs/a", "k", lambda c: ({"v": 1}, None))
     await backend.mutate_document("runs/b", "k", lambda c: ({"v": 2}, None))
     await backend.mutate_document("other/c", "k", lambda c: ({"v": 3}, None))
@@ -2243,24 +2142,20 @@ async def test_list_document_namespaces_lists_and_filters(tmp_path):
     names_all, complete_all = await backend.list_document_namespaces("")
     assert sorted(names_all) == ["other/c", "runs/a", "runs/b"]
     assert complete_all is True
-    await backend.stop()
 
 
-async def test_list_document_namespaces_missing_root_is_empty(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_namespaces_missing_root_is_empty(fs_backend):
+    backend = fs_backend
     # remove the docs root entirely (a never-written store): the listing is
     # exhaustively empty and complete.
     shutil.rmtree(os.path.join(backend.base, DOCS_DIR))
     names, complete = await backend.list_document_namespaces("")
     assert names == []
     assert complete is True
-    await backend.stop()
 
 
-async def test_list_document_namespaces_unreadable_root_incomplete(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_list_document_namespaces_unreadable_root_incomplete(fs_backend):
+    backend = fs_backend
     docs_root = os.path.join(backend.base, DOCS_DIR)
     shutil.rmtree(docs_root)
     # a file where the docs root should be: listdir raises a non-FileNotFound
@@ -2270,15 +2165,13 @@ async def test_list_document_namespaces_unreadable_root_incomplete(tmp_path):
     names, complete = await backend.list_document_namespaces("")
     assert names == []
     assert complete is False
-    await backend.stop()
 
 
 # --- content-addressed blobs ----------------------------------------------
 
 
-async def test_get_blob_transient_read_error_is_raised(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_get_blob_transient_read_error_is_raised(fs_backend):
+    backend = fs_backend
     digest = await backend.put_blob(b"payload")
     blob_path = backend._blob_path(digest)
     # swap the blob file for a directory of the same name: open() on a dir
@@ -2289,15 +2182,13 @@ async def test_get_blob_transient_read_error_is_raised(tmp_path):
     os.mkdir(blob_path)
     with pytest.raises(OSError):
         await backend.get_blob(digest)
-    await backend.stop()
 
 
 # --- lease lifecycle: unreadable lease fails closed -----------------------
 
 
-async def test_renew_denied_when_lease_file_unreadable(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_renew_denied_when_lease_file_unreadable(fs_backend):
+    backend = fs_backend
     lease = await backend.acquire_lease("L", "A", ttl=30)
     assert lease is not None
     _lock, lease_path = backend._lease_paths("L")
@@ -2306,12 +2197,10 @@ async def test_renew_denied_when_lease_file_unreadable(tmp_path):
     with open(lease_path, "wb") as fobj:
         fobj.write(b"garbage-not-json")
     assert await backend.renew_lease(lease, ttl=30) is None
-    await backend.stop()
 
 
-async def test_release_of_unreadable_lease_is_noop(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_release_of_unreadable_lease_is_noop(fs_backend):
+    backend = fs_backend
     lease = await backend.acquire_lease("L", "A", ttl=30)
     assert lease is not None
     _lock, lease_path = backend._lease_paths("L")
@@ -2320,24 +2209,22 @@ async def test_release_of_unreadable_lease_is_noop(tmp_path):
     # cannot prove ownership: release leaves the file to expire by TTL and
     # must not raise.
     await backend.release_lease(lease)
-    await backend.stop()
 
 
 # --- lock-fidelity probe --------------------------------------------------
 
 
-async def test_verify_locking_passes_on_a_real_lock(tmp_path):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_verify_locking_passes_on_a_real_lock(fs_backend):
+    backend = fs_backend
     # a real filesystem's advisory locks genuinely exclude, so the probe
     # returns None (no reason to distrust them).
     assert await backend.verify_locking() is None
-    await backend.stop()
 
 
-async def test_verify_locking_inconclusive_on_io_error(tmp_path, monkeypatch):
-    backend = _backend(tmp_path)
-    await backend.start()
+async def test_verify_locking_inconclusive_on_io_error(
+    fs_backend, monkeypatch
+):
+    backend = fs_backend
 
     def _boom(*a, **k):
         raise OSError("probe I/O error")
@@ -2346,7 +2233,6 @@ async def test_verify_locking_inconclusive_on_io_error(tmp_path, monkeypatch):
     # failure: it reports None rather than condemning a healthy store on a blip.
     monkeypatch.setattr(state, "exclusive_file_lock", _boom)
     assert backend._verify_locking_sync() is None
-    await backend.stop()
 
 
 # --- rename/unlink retry helpers ------------------------------------------
@@ -2427,25 +2313,15 @@ def test_makedirs_durable_walk_stops_at_self_referential_root(tmp_path):
 # source) plus os.utime on the seeded files.
 
 
-def _write_raw_record(backend, stream, name, payload):
-    # drop a record wrapper straight onto disk so the migrate walk sees a
-    # chosen schemaVersion verbatim.
-    stream_dir = backend._stream_dir(stream)
-    os.makedirs(stream_dir, exist_ok=True)
-    with open(os.path.join(stream_dir, name), "wb") as fobj:
-        fobj.write(json.dumps(payload).encode())
-
-
 # --- empty-store fast paths: every root missing -> the OSError branches -----
 
 
-async def test_maintenance_tolerates_missing_roots(tmp_path, monkeypatch):
+async def test_maintenance_tolerates_missing_roots(fs_backend, monkeypatch):
     # ``start()`` pre-creates the directory skeleton, so to exercise the
     # "root absent" os.listdir(...) -> OSError branches (an operator-wiped or
     # not-yet-populated store) we remove the roots and drive the sync halves
     # directly.  Each op must return its empty-result shape, not raise.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     # No clock patch here on purpose. Every op under test returns from its
     # root-missing OSError branch before any aging arithmetic runs, so
     # patching state._now cannot influence a single assertion below; the
@@ -2494,13 +2370,12 @@ async def test_maintenance_tolerates_missing_roots(tmp_path, monkeypatch):
 
 
 async def test_gc_removes_aged_stream_and_keeps_unmatched(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # A managed, unreferenced, aged stream is deleted (records unlinked, dir
     # rmdir'd); a stream whose prefix nothing in `keep` names is unclassified
     # and kept; a stray non-dir entry under records/ is skipped.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     clock = {"t": time.time()}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
 
@@ -2548,13 +2423,12 @@ async def test_gc_removes_aged_stream_and_keeps_unmatched(
 
 
 async def test_gc_keeps_referenced_and_empty_dir_ages_against_grace(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # A stream whose suffix IS in the keep set survives however old; an empty
     # managed dir (a writer's half-born stream) is aged against the grace via
     # its own mtime and reclaimed only once idle past it.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     clock = {"t": time.time()}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
 
@@ -2579,13 +2453,12 @@ async def test_gc_keeps_referenced_and_empty_dir_ages_against_grace(
 
 
 async def test_gc_keeps_truncated_stream_without_name_sidecar(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # A length-truncated stream directory with no verifiable name sidecar was
     # invisible to the keep-set builder, so its absence from `keep` proves
     # nothing: it must be KEPT no matter how aged/unreferenced.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     clock = {"t": time.time()}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
 
@@ -2609,13 +2482,12 @@ async def test_gc_keeps_truncated_stream_without_name_sidecar(
 
 
 async def test_gc_reclaims_ephemeral_lease_dead_past_grace(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # The happy path of _gc_leases_sync / _lease_dead_past_grace: an ephemeral
     # dagadvance lease provably dead for the whole grace window is reclaimed
     # (dry-run counts but keeps; the real pass unlinks the .lease).
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     t0 = time.time()
     clock = {"t": t0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
@@ -2660,12 +2532,11 @@ async def test_gc_reclaims_ephemeral_lease_dead_past_grace(
 
 
 async def test_gc_empty_ephemeral_prefixes_reclaims_nothing(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # ephemeral_lease_prefixes that collapse to nothing after the blank-string
     # filter (`("",)`) short-circuit to a no-op, as does the default `()`.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     t0 = time.time()
     clock = {"t": t0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
@@ -2687,13 +2558,12 @@ async def test_gc_empty_ephemeral_prefixes_reclaims_nothing(
 
 
 async def test_gc_never_reclaims_unreadable_ephemeral_lease(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # An unreadable/corrupt lease under an ephemeral prefix must fail the
     # dead-past-grace judge (strict read raises _LeaseUnreadable) and survive:
     # never delete what cannot be classified.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     t0 = time.time()
     clock = {"t": t0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
@@ -2725,14 +2595,11 @@ async def test_gc_never_reclaims_unreadable_ephemeral_lease(
 # --- orphan .lock sweeps ---------------------------------------------------
 
 
-async def test_gc_sweeps_orphan_document_lock_only_when_doc_absent(
-    tmp_path,
-):
+async def test_gc_sweeps_orphan_document_lock_only_when_doc_absent(fs_backend):
     # A document .lock is reclaimed only when BOTH the .doc is absent AND the
     # lock sat idle past the grace; a present doc keeps its lock forever, and
     # a young orphan lock survives.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     grace = 3600.0
     old = time.time() - grace - 300.0
 
@@ -2768,7 +2635,7 @@ async def test_gc_sweeps_orphan_document_lock_only_when_doc_absent(
     assert not os.path.exists(dead_lock)
 
 
-async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
+async def test_gc_sweeps_expired_idempotency_docs(fs_backend, monkeypatch):
     # A ttl>0 idempotency claim used to leave its .doc behind forever after
     # expiry (the documented per-event key pattern mints one per event, so
     # a busy dedupe scope grew its flat namespace without bound). The GC
@@ -2777,8 +2644,7 @@ async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
     # docs/ namespace stay untouched.
     from cronstable import jobstate
 
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         await jobstate.idempotency_claim(backend, "scope", "permanent")
         await jobstate.idempotency_claim(backend, "scope", "lapsed", ttl=5.0)
@@ -2823,7 +2689,75 @@ async def test_gc_sweeps_expired_idempotency_docs(tmp_path, monkeypatch):
         await backend.stop()
 
 
-async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(tmp_path):
+async def test_gc_idem_sweep_does_not_read_young_docs(fs_backend, monkeypatch):
+    # The sweep used to open, read and JSON-parse EVERY idempotency doc on
+    # every pass before testing its age, so a namespace of permanent
+    # claims and live TTLs (the shapes it can never delete) cost a full
+    # read each, on the same lane and budget the rest of the gc shares.
+    # A claim's expiry is its write time plus its ttl, so an mtime at or
+    # after the cutoff is proof it cannot have lapsed a whole grace ago.
+    from cronstable import jobstate
+
+    backend = fs_backend
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "permanent")
+        await jobstate.idempotency_claim(
+            backend, "scope", "alive", ttl=999999.0
+        )
+        reads = []
+        real_read = backend._read_doc_file
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(backend, "_read_doc_file", counting_read)
+        # cutoff is in the past, so every doc's mtime is at or after it
+        grace = 3600.0
+        monkeypatch.setattr(state, "_now", lambda: time.time() - 10.0)
+        assert (
+            backend._gc_sync({"runs/": set()}, grace, (), False)[
+                "idem_docs_removed"
+            ]
+            == 0
+        )
+        idem_reads = [p for p in reads if "idem" in p]
+        assert idem_reads == [], (
+            "the sweep still opens docs it cannot possibly delete: {}".format(
+                idem_reads
+            )
+        )
+    finally:
+        await backend.stop()
+
+
+def test_idem_doc_expired_boundary_and_unclassifiable(fs_backend):
+    # The sweep rests on "expiry lapsed a WHOLE grace ago", so the
+    # boundary belongs to the survivor: expiresAt == cutoff is expired
+    # (dead for exactly the window), one tick later is not. And a doc this
+    # build cannot classify is never expired: bool is an int subclass, so
+    # a JSON `true` would otherwise compare as expiresAt == 1 and read as
+    # long dead.
+    backend = fs_backend
+    cutoff = 1_000_000.0
+    assert backend._idem_doc_expired({"expiresAt": cutoff - 1}, cutoff)
+    assert backend._idem_doc_expired({"expiresAt": cutoff}, cutoff)
+    assert not backend._idem_doc_expired({"expiresAt": cutoff + 1}, cutoff)
+    for unclassifiable in (
+        {},  # a permanent claim carries no expiresAt
+        {"expiresAt": None},
+        {"expiresAt": True},  # not 1
+        {"expiresAt": False},  # not 0
+        {"expiresAt": "1"},
+        {"expiresAt": [1]},
+    ):
+        assert not backend._idem_doc_expired(unclassifiable, cutoff), (
+            unclassifiable
+        )
+    assert not backend._idem_doc_expired(None, cutoff)
+
+
+async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(fs_backend):
     # REGRESSION: the idem-doc sweep used to take each candidate's flock
     # with the blocking _locked, so on a shared store one peer wedged
     # mid-claim stalled the entire gc() call (and its worker slot) behind
@@ -2838,8 +2772,7 @@ async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(tmp_path):
     from cronstable import jobstate
     from cronstable.platform import exclusive_file_lock
 
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     try:
         await jobstate.idempotency_claim(backend, "scope", "held", ttl=5.0)
         await jobstate.idempotency_claim(backend, "scope", "free", ttl=5.0)
@@ -2888,12 +2821,11 @@ def test_idem_prefix_mirror_stays_in_sync():
     assert state._IDEM_DOC_NS_PREFIX == jobstate.IDEM_NS_PREFIX
 
 
-async def test_gc_sweeps_bare_lease_lock_idle_past_grace(tmp_path):
+async def test_gc_sweeps_bare_lease_lock_idle_past_grace(fs_backend):
     # A bare lease .lock with no .lease sibling (a lost post-release unlink)
     # is reclaimed once idle past the grace; a fresh bare lock and a lock with
     # a live .lease sibling both survive.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     grace = 3600.0
     old = time.time() - grace - 300.0
     lease_root = os.path.join(backend.base, state.LEASES_DIR)
@@ -2922,12 +2854,11 @@ async def test_gc_sweeps_bare_lease_lock_idle_past_grace(tmp_path):
 # --- tmp / quarantine crash-debris sweeps ----------------------------------
 
 
-async def test_gc_sweeps_tmp_and_quarantine_debris(tmp_path, monkeypatch):
+async def test_gc_sweeps_tmp_and_quarantine_debris(fs_backend, monkeypatch):
     # _sweep_dir_sync: aged write-temp files (> TMP_MAX_AGE) and aged
     # quarantined records (> grace) are unlinked; a young file, and a
     # sub-directory (not a plain file), are left alone.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     clock = {"t": now}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
@@ -2976,13 +2907,12 @@ async def test_gc_sweeps_tmp_and_quarantine_debris(tmp_path, monkeypatch):
 # --- migrate_schema converter walk -----------------------------------------
 
 
-async def test_migrate_schema_counts_every_class(tmp_path, monkeypatch):
+async def test_migrate_schema_counts_every_class(fs_backend, monkeypatch):
     # Drive _migrate_sync through all its record classes: current, converted,
     # unknown (no converter / converter returns None / non-dict data),
     # unreadable (corrupt bytes), failed (converter raises), plus non-.json
     # and non-dir entries under records/ that the walk must skip.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("runs/j", {"outcome": "ok"})  # current v1
 
     monkeypatch.setitem(
@@ -3054,13 +2984,12 @@ async def test_migrate_schema_counts_every_class(tmp_path, monkeypatch):
 
 
 async def test_migrate_schema_rolls_back_a_failed_atomic_write(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # If the in-place re-encode write itself fails (a disk error, a
     # sharing hold), the record is NOT counted as converted: the tentative
     # ``converted`` is rolled back and the record is booked as failed.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     monkeypatch.setitem(
         state.RECORD_MIGRATIONS, "v0", lambda data: {"outcome": "x"}
     )
@@ -3086,13 +3015,12 @@ async def test_migrate_schema_rolls_back_a_failed_atomic_write(
 
 
 async def test_sweep_orphan_blobs_removes_aged_unreferenced(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # _sweep_orphan_blobs_sync: an aged, unreferenced blob is unlinked (and
     # its now-empty shard rmdir'd); a referenced blob and a young blob both
     # survive; a stray file directly under blobs/ is skipped.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     monkeypatch.setattr(state, "_now", lambda: now)
 
@@ -3136,13 +3064,12 @@ async def test_sweep_orphan_blobs_removes_aged_unreferenced(
 
 
 async def test_inventory_reports_counts_leases_and_quarantine(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # _inventory_sync walks records + documents into per-prefix groups, lists
     # live leases (skipping released/absent and corrupt ones), and counts the
     # quarantine dir.  A non-dir entry under records/ is skipped by the walk.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     t0 = time.time()
     monkeypatch.setattr(state, "_now", lambda: t0)
 
@@ -3365,14 +3292,13 @@ def test_mount_entry_skips_malformed_short_lines(monkeypatch):
     assert state._mount_entry("/anything") == ("rootfs", "rw")
 
 
-async def test_call_never_reuses_a_worker_still_stuck_in_an_op(tmp_path):
+async def test_call_never_reuses_a_worker_still_stuck_in_an_op(fs_backend):
     # What thread-per-call used to buy, the pool must keep: a worker wedged
     # in an uninterruptible syscall on a dead mount is never handed another
     # op.  A worker rejoins the idle pool only once its op RETURNS, so the
     # next op runs on a different thread instead of queueing behind the
     # wedged one forever.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     gate = threading.Event()
     idents = []
 
@@ -3382,7 +3308,9 @@ async def test_call_never_reuses_a_worker_still_stuck_in_an_op(tmp_path):
 
     wedged = asyncio.create_task(backend._call("wedge", wedge))
     try:
-        assert await _wait_until(lambda: len(idents) == 1)
+        assert await _wait_until(
+            lambda: len(idents) == 1, raise_on_timeout=False
+        )
         got = await asyncio.wait_for(
             backend._call("after", threading.get_ident), timeout=5.0
         )
@@ -3390,14 +3318,12 @@ async def test_call_never_reuses_a_worker_still_stuck_in_an_op(tmp_path):
     finally:
         gate.set()
         await wedged
-    await backend.stop()
 
 
-async def test_call_releases_slot_when_thread_spawn_fails(tmp_path):
+async def test_call_releases_slot_when_thread_spawn_fails(fs_backend):
     # If the per-call worker thread cannot even be started, the worker slot
     # it reserved is released (never leaked) and the failure propagates.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
 
     class _BoomThread:
         def __init__(self, *a, **k):
@@ -3427,7 +3353,6 @@ async def test_call_releases_slot_when_thread_spawn_fails(tmp_path):
 
     # the slot was returned: a normal op still completes afterwards.
     assert await backend.derive_max("runs/j", "ts") is None
-    await backend.stop()
 
 
 def test_replace_windows_retry_loop_forced(tmp_path, monkeypatch):
@@ -3525,11 +3450,10 @@ def test_makedirs_durable_walk_breaks_at_self_referential_root(
         backend._makedirs_durable(target)
 
 
-async def test_prune_tolerates_unlink_oserror(tmp_path, monkeypatch):
+async def test_prune_tolerates_unlink_oserror(fs_backend, monkeypatch):
     # A prune whose individual unlink races another node (or a Windows
     # sharing hold) swallows the OSError and simply reports fewer deletes.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     for i in range(3):
         await backend.append_record("runs/p", {"n": i})
     stream_dir = backend._stream_dir("runs/p")
@@ -3541,39 +3465,34 @@ async def test_prune_tolerates_unlink_oserror(tmp_path, monkeypatch):
     _os_raiser(monkeypatch, "unlink", names)
     # keep=1 would delete two records, but every unlink raises: none counted.
     assert await backend.prune_records("runs/p", keep=1) == 0
-    await backend.stop()
 
 
-async def test_locked_reopens_on_ghost_inode(tmp_path, monkeypatch):
+async def test_locked_reopens_on_ghost_inode(fs_backend, monkeypatch):
     # After winning the flock, _locked re-verifies the path still names the
     # locked inode; when the identity stat cannot be taken (a ghost inode
     # reclaimed underneath a waiter) it re-opens and contends afresh.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "ghost.lock")
     _os_one_shot(monkeypatch, "stat", lock_path)
     # the first samestat's os.stat raises -> loop retries and then acquires.
     with backend._locked(lock_path):
         pass
     assert os.path.exists(lock_path)
-    await backend.stop()
 
 
-async def test_locked_touch_without_fd_utime_support(tmp_path, monkeypatch):
+async def test_locked_touch_without_fd_utime_support(fs_backend, monkeypatch):
     # On a platform whose os.utime cannot take a file descriptor, the
     # touch=True path refreshes the lock's mtime by PATH instead.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "touch.lock")
     monkeypatch.setattr(os, "supports_fd", set())
     with backend._locked(lock_path, touch=True):
         pass
     assert os.path.exists(lock_path)
-    await backend.stop()
 
 
 async def test_locked_bootstrap_write_loss_is_not_an_error(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # Two contenders can both open a FRESH lock file and observe size 0;
     # the first writes the bootstrap byte and takes the byte-range lock,
@@ -3584,8 +3503,7 @@ async def test_locked_bootstrap_write_loss_is_not_an_error(
     # and killed a whole retry-claim pass).  Simulated on every platform:
     # the fake write installs the rival's byte and raises what the
     # Windows kernel would.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "race.lock")
     real_write = os.write
 
@@ -3604,11 +3522,10 @@ async def test_locked_bootstrap_write_loss_is_not_an_error(
     with backend._locked(lock_path):
         entered = True
     assert entered
-    await backend.stop()
 
 
 async def test_locked_bootstrap_write_race_real_byte_lock(
-    tmp_path, monkeypatch
+    fs_backend_factory, monkeypatch
 ):
     if not state.IS_WINDOWS:
         pytest.skip("msvcrt byte-range lock semantics are Windows-only")
@@ -3619,8 +3536,7 @@ async def test_locked_bootstrap_write_race_real_byte_lock(
     # the loser saw before the rival won (the stale observation that
     # makes it attempt the write).  The write fails with the genuine
     # EACCES; _locked must wait the rival out and acquire, not raise.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = await fs_backend_factory()
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "kernel.lock")
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     rival = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
@@ -3661,14 +3577,12 @@ async def test_locked_bootstrap_write_race_real_byte_lock(
     finally:
         releaser.join()
     assert entered
-    await backend.stop()
 
 
-async def test_gc_keeps_stream_when_listdir_fails(tmp_path, monkeypatch):
+async def test_gc_keeps_stream_when_listdir_fails(fs_backend, monkeypatch):
     # A managed candidate stream whose directory cannot be listed (a
     # transient I/O error mid-sweep) is kept, never partially collected.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     monkeypatch.setattr(state, "_now", lambda: now + 30 * 86400.0)
     await backend.append_record("runs/unreadable", {"x": 1})
@@ -3679,17 +3593,15 @@ async def test_gc_keeps_stream_when_listdir_fails(tmp_path, monkeypatch):
     )
     assert result["streams_removed"] == 0
     assert os.path.isdir(stream_dir)
-    await backend.stop()
 
 
 async def test_gc_empty_stream_dir_vanishing_mid_scan_is_kept(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # An empty managed dir whose stat fails (it was rmdir'd between the
     # listing and the age check) is treated as brand new (newest == +inf)
     # and kept, not deleted on sight.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     monkeypatch.setattr(state, "_now", lambda: now + 30 * 86400.0)
     stream_dir = backend._stream_dir("runs/ghost")
@@ -3713,31 +3625,29 @@ async def test_gc_empty_stream_dir_vanishing_mid_scan_is_kept(
         keep={"runs/": set()}, grace=7 * 86400.0
     )
     assert result["streams_removed"] == 0
-    await backend.stop()
 
 
 async def test_lease_dead_past_grace_false_when_read_returns_none(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # The dead-past-grace judge returns False (never reclaim) when the lease
     # stats fine but reads back positively absent -- an ambiguous state that
     # must not be classified as safely dead.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     lease_path = os.path.join(backend.base, state.LEASES_DIR, "x.lease")
     with open(lease_path, "wb") as fobj:
         fobj.write(b"{}")
     monkeypatch.setattr(backend, "_read_lease_file", lambda *a, **k: None)
-    assert backend._lease_dead_past_grace(lease_path, time.time() + 100) is False
-    await backend.stop()
+    assert (
+        backend._lease_dead_past_grace(lease_path, time.time() + 100) is False
+    )
 
 
-async def test_gc_leases_rejudge_keeps_revived_lease(tmp_path, monkeypatch):
+async def test_gc_leases_rejudge_keeps_revived_lease(fs_backend, monkeypatch):
     # An ephemeral lease that passes the cheap pre-check but is re-judged
     # NOT-dead under the lock (a concurrent re-acquire revived it) is left
     # untouched.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     lease = await backend.acquire_lease("dagadvance/d/r", "A", ttl=10.0)
     assert lease is not None
     _lock, lease_path = backend._lease_paths("dagadvance/d/r")
@@ -3753,14 +3663,12 @@ async def test_gc_leases_rejudge_keeps_revived_lease(tmp_path, monkeypatch):
     )
     assert r["leases_removed"] == 0
     assert os.path.exists(lease_path)
-    await backend.stop()
 
 
-async def test_gc_leases_windows_post_release_unlink(tmp_path, monkeypatch):
+async def test_gc_leases_windows_post_release_unlink(fs_backend, monkeypatch):
     # On Windows the dead ephemeral lease's .lock sibling is unlinked AFTER
     # releasing the flock (own handle closed), best-effort.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     t0 = time.time()
     clock = {"t": t0}
     monkeypatch.setattr(state, "_now", lambda: clock["t"])
@@ -3776,30 +3684,26 @@ async def test_gc_leases_windows_post_release_unlink(tmp_path, monkeypatch):
     assert r["leases_removed"] == 1
     assert not os.path.exists(lease_path)
     assert not os.path.exists(lock_path)
-    await backend.stop()
 
 
 async def test_gc_orphan_locks_skips_unreadable_namespace(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # The orphan-lock sweep skips a document namespace directory it cannot
     # list rather than crashing the whole pass.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.mutate_document("kv/ns", "k", lambda _c: ({"v": 1}, None))
     ns_dir = os.path.dirname(backend._doc_paths("kv/ns", "k")[0])
     _os_raiser(monkeypatch, "listdir", [ns_dir])
     # must not raise; the (unlistable) namespace simply contributes nothing.
     r = await backend.collect_garbage(keep={}, grace=3600.0)
     assert r["locks_removed"] == 0
-    await backend.stop()
 
 
-async def test_reclaim_idle_lock_absent_lock_is_noop(tmp_path):
+async def test_reclaim_idle_lock_absent_lock_is_noop(fs_backend):
     # A .lock whose stat fails (already gone / unreadable) cannot be
     # classified, so it is not reclaimed.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     missing = os.path.join(backend.base, state.LEASES_DIR, "vanished.lock")
     sibling = os.path.join(backend.base, state.LEASES_DIR, "vanished.lease")
     assert (
@@ -3808,16 +3712,14 @@ async def test_reclaim_idle_lock_absent_lock_is_noop(tmp_path):
         )
         is False
     )
-    await backend.stop()
 
 
 async def test_reclaim_idle_lock_rejudge_touched_under_lock(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # Under the flock the lock's mtime is re-read; a concurrent acquire that
     # just touched it (mtime now past the cutoff) aborts the reclaim.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "touched.lock")
     sibling = os.path.join(backend.base, state.LEASES_DIR, "touched.lease")
@@ -3836,13 +3738,11 @@ async def test_reclaim_idle_lock_rejudge_touched_under_lock(
         is False
     )
     assert os.path.exists(lock_path)
-    await backend.stop()
 
 
-async def test_reclaim_idle_lock_vanishes_under_lock(tmp_path, monkeypatch):
+async def test_reclaim_idle_lock_vanishes_under_lock(fs_backend, monkeypatch):
     # Under the flock the lock's re-stat can fail (it vanished): abort.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "gone.lock")
     sibling = os.path.join(backend.base, state.LEASES_DIR, "gone.lease")
@@ -3860,16 +3760,14 @@ async def test_reclaim_idle_lock_vanishes_under_lock(tmp_path, monkeypatch):
         backend._reclaim_idle_lock_sync(lock_path, sibling, now, False)
         is False
     )
-    await backend.stop()
 
 
 async def test_reclaim_idle_lock_sibling_reappears_under_lock(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # Under the flock the sibling data file is re-checked; if a concurrent
     # actor re-created it, the lock is no longer orphaned: abort.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "resurrect.lock")
     sibling = os.path.join(backend.base, state.LEASES_DIR, "resurrect.lease")
@@ -3889,16 +3787,14 @@ async def test_reclaim_idle_lock_sibling_reappears_under_lock(
         is False
     )
     assert os.path.exists(lock_path)
-    await backend.stop()
 
 
 async def test_reclaim_idle_lock_windows_post_release_unlink(
-    tmp_path, monkeypatch
+    fs_backend, monkeypatch
 ):
     # On Windows the reclaim's unlink happens AFTER the flock is released,
     # best-effort, and still reports the lock reclaimed.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     now = time.time()
     lock_path = os.path.join(backend.base, state.LEASES_DIR, "winlock.lock")
     sibling = os.path.join(backend.base, state.LEASES_DIR, "winlock.lease")
@@ -3911,14 +3807,12 @@ async def test_reclaim_idle_lock_windows_post_release_unlink(
         is True
     )
     assert not os.path.exists(lock_path)
-    await backend.stop()
 
 
-async def test_sweep_dir_tolerates_unlink_oserror(tmp_path, monkeypatch):
+async def test_sweep_dir_tolerates_unlink_oserror(fs_backend, monkeypatch):
     # _sweep_dir_sync swallows a per-file OSError (a racing delete / hold)
     # and moves on rather than aborting the whole sweep.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     sweep_dir = os.path.join(backend.base, state.TMP_DIR)
     os.makedirs(sweep_dir, exist_ok=True)
     aged = os.path.join(sweep_dir, "aged.tmp")
@@ -3930,16 +3824,14 @@ async def test_sweep_dir_tolerates_unlink_oserror(tmp_path, monkeypatch):
     # the unlink raises and is swallowed: nothing counted, file survives.
     assert backend._sweep_dir_sync(sweep_dir, time.time(), False) == 0
     assert os.path.exists(aged)
-    await backend.stop()
 
 
-async def test_migrate_skips_unreadable_stream_dir(tmp_path, monkeypatch):
+async def test_migrate_skips_unreadable_stream_dir(fs_backend, monkeypatch):
     # migrate_schema skips a stream directory it cannot list rather than
     # failing the whole migration pass.  A convertible legacy record sits in
     # the unlistable stream: because the stream is skipped it is never read,
     # so nothing is converted (proving the skip, not a silent read).
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     monkeypatch.setitem(
         state.RECORD_MIGRATIONS, "v0", lambda data: {"outcome": "x"}
     )
@@ -3955,14 +3847,12 @@ async def test_migrate_skips_unreadable_stream_dir(tmp_path, monkeypatch):
     # the unlistable stream is skipped: its convertible record is untouched.
     assert result["converted"] == 0
     assert result["unreadable"] == 0
-    await backend.stop()
 
 
-async def test_blob_sweep_tolerates_unlink_oserror(tmp_path, monkeypatch):
+async def test_blob_sweep_tolerates_unlink_oserror(fs_backend, monkeypatch):
     # An aged, unreferenced blob whose unlink raises is left in place and
     # not counted; the sweep does not abort.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     digest = await backend.put_blob(b"orphaned-artifact")
     blob_path = backend._blob_path(digest)
     old = time.time() - 10000.0
@@ -3970,14 +3860,12 @@ async def test_blob_sweep_tolerates_unlink_oserror(tmp_path, monkeypatch):
     _os_raiser(monkeypatch, "unlink", [blob_path])
     assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
     assert await backend.get_blob(digest) == b"orphaned-artifact"
-    await backend.stop()
 
 
-async def test_inventory_skips_unreadable_stream_node(tmp_path, monkeypatch):
+async def test_inventory_skips_unreadable_stream_node(fs_backend, monkeypatch):
     # The inventory walk skips a stream directory it cannot list rather than
     # failing the whole snapshot.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     await backend.append_record("runs/inv", {"x": 1})
     stream_dir = backend._stream_dir("runs/inv")
     _os_raiser(monkeypatch, "listdir", [stream_dir])
@@ -3985,14 +3873,14 @@ async def test_inventory_skips_unreadable_stream_node(tmp_path, monkeypatch):
     # the unreadable node drops out of the grouping; the snapshot returns.
     assert inv["enumerable"] is True
     assert "runs" not in inv["records"]
-    await backend.stop()
 
 
-async def test_inventory_tolerates_lease_read_exception(tmp_path, monkeypatch):
+async def test_inventory_tolerates_lease_read_exception(
+    fs_backend, monkeypatch
+):
     # A lease file that raises on read during the inventory walk is observed
     # best-effort (None) and skipped, never crashing the snapshot.
-    backend = _backend(tmp_path)
-    await backend.start()
+    backend = fs_backend
     lease = await backend.acquire_lease("leader", "node-a", ttl=30.0)
     assert lease is not None
 
@@ -4002,4 +3890,1315 @@ async def test_inventory_tolerates_lease_read_exception(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "_read_lease_file", _boom)
     inv = await backend.inventory()
     assert inv["leases"] == []
-    await backend.stop()
+
+
+# =====================================================================
+# Adversarial-review hardening of cronstable.state
+# (formerly tests/test_state_hardening.py; merged per finding B18,
+# rationale below kept verbatim from that module's docstring)
+# =====================================================================
+# Regression tests for the adversarial-review hardening of cronstable.state.
+#
+# Each test pins a CONFIRMED bug fixed in the hardening pass; if a fix
+# regresses, the matching test fails.  Covered invariants:
+#
+# * record ids stay unique when several worker threads append at once (the
+#   ``_seq`` counter is now behind a lock);
+# * lease fences are monotonic for the life of the store, across release and
+#   expiry (release marks the lease expired in place, never deletes it);
+# * an unreadable lease file fails CLOSED on the locked paths and stays
+#   best-effort on the unlocked observer;
+# * poison record CONTENT is quarantined while transient I/O errors are not;
+# * a failed atomic write never leaks its temp file;
+# * two backend instances over one mount (the shared-mount deployment) keep a
+#   coherent, non-colliding ledger;
+# * ``~`` in ``state.path`` means the home directory, not a literal ``~``
+#   directory under the daemon's CWD;
+# * length-truncated stream tokens round-trip through ``list_stream_names``
+#   via the logical-name sidecar, and a legacy truncated dir without one is
+#   skipped/kept -- never returned garbled or collected;
+# * garbage collection reclaims ONLY the ephemeral per-run lease classes
+#   (``dagadvance/``) once provably dead past the whole grace window --
+#   never slot/retry-claim/election leases, whose fences persist in durable
+#   slot cancel records -- and sweeps orphaned ``.lock`` side-files (a
+#   deleted document's, a bare lease lock's) only once idle past the grace,
+#   while ``delete_document`` itself never unlinks the ``.lock`` (an eager
+#   unlink split the document mutex across nodes on NFS);
+# * stream/document-namespace enumeration reports hidden (unnameable)
+#   entries, the orphan-blob sweep's age guard keeps young payloads, and a
+#   dedupe re-put re-arms that guard -- the KEEP biases the blob sweep
+#   builds on;
+# * the document delete path rides out Windows sharing violations like the
+#   replace-write path does;
+# * stream/document-namespace enumeration decodes a lone-surrogate name
+#   exactly (the surrogatepass inverse of ``_fs_safe``), and a token that
+#   cannot round-trip is reported through ``complete``, never returned
+#   garbled;
+# * record filenames stay monotonic per stream across a backward wall-clock
+#   step, so the amortised prune never deletes the just-written record and
+#   the derive_max watermark never hides it.
+#
+# No tight wall-clock timing anywhere: lease expiry is driven by
+# monkeypatching ``cronstable.state._now`` (the one time source), so
+# nothing here depends on the coarse Windows clock.
+
+
+# --- 1: record-id uniqueness under thread concurrency ----------------------
+
+
+async def test_append_sync_ids_unique_under_thread_contention(
+    fs_backend, monkeypatch
+):
+    # The sync halves run on daemon worker threads, several of which can be
+    # in flight at once (two jobs finishing together each schedule an
+    # append).  Before the fix `self._seq += 1` was an unlocked read-modify-
+    # write; two threads could interleave it, and a duplicated seq plus the
+    # coarse Windows clock meant a duplicated record id -- one record
+    # silently clobbering another via the atomic rename.
+    backend = fs_backend
+    # Freeze the clock: the record id is "<epoch>-<instance>-<seq>", so with
+    # a frozen epoch (and a single instance) uniqueness rests ENTIRELY on
+    # the locked counter, making a seq race a deterministic id collision
+    # instead of a needs-the-right-millisecond one.
+    monkeypatch.setattr(state, "_now", lambda: 1000.0)
+    n_threads, per_thread = 8, 50
+    buckets = [[] for _ in range(n_threads)]
+    errors = []
+
+    def worker(bucket):
+        try:
+            for i in range(per_thread):
+                bucket.append(backend._append_sync("s", {"i": i}))
+        except BaseException as ex:  # noqa: BLE001 - relayed to the test
+            errors.append(ex)
+
+    threads = [
+        threading.Thread(target=worker, args=(buckets[t],))
+        for t in range(n_threads)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    ids = [rid for bucket in buckets for rid in bucket]
+    assert len(ids) == n_threads * per_thread
+    # every id unique: a duplicate means one record overwrote another.
+    assert len(set(ids)) == n_threads * per_thread
+    got = await backend.list_records("s")
+    assert len(got) == n_threads * per_thread
+
+
+# --- 2: lease fence monotonicity ------------------------------------------
+
+
+async def test_fence_monotonic_across_release(fs_backend):
+    # Release used to unlink the lease file -- the fence counter's only home
+    # -- so the next acquire restarted at fence=1, re-issuing a fence value
+    # already handed out and defeating stale-writer detection.  Release now
+    # marks the lease expired IN PLACE, so the counter survives.
+    backend = fs_backend
+    a = await backend.acquire_lease("L", "A", ttl=30)
+    assert a is not None and a.fence == 1
+    await backend.release_lease(a)
+    b = await backend.acquire_lease("L", "B", ttl=30)
+    assert b is not None and b.holder == "B"
+    assert b.fence > a.fence  # regression: reset to 1 after release
+    assert b.fence == 2
+
+
+async def test_fence_bumps_on_expiry_and_stale_renew_denied(
+    fs_backend, monkeypatch
+):
+    backend = fs_backend
+    # drive expiry through the module's one time source instead of real
+    # sleeps: deterministic on the coarse Windows clock.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    a = await backend.acquire_lease("L", "A", ttl=5)  # expires at 1005
+    assert a is not None and a.fence == 1
+    clock["t"] = 1010.0  # past expiry
+    b = await backend.acquire_lease("L", "B", ttl=5)
+    assert b is not None and b.holder == "B"
+    assert b.fence == a.fence + 1  # takeover must bump the fence
+    # A's renew with its stale lease is fenced off, not honoured.
+    assert await backend.renew_lease(a, ttl=5) is None
+
+
+# --- 3: unreadable lease fails closed --------------------------------------
+
+
+async def test_corrupt_lease_fails_closed_on_acquire(fs_backend):
+    # An unreadable lease is not a FREE lease.  Before the fix a corrupt (or
+    # transiently unreadable) lease file read as "no lease", letting an
+    # acquirer steal a possibly-valid lease from its live holder with a
+    # reset fence=1.  The locked paths must deny instead.
+    backend = fs_backend
+    _lock_path, lease_path = backend._lease_paths("L")
+    os.makedirs(os.path.dirname(lease_path), exist_ok=True)
+    with open(lease_path, "w") as fobj:
+        fobj.write("{definitely not json")
+    assert await backend.acquire_lease("L", "H", ttl=30) is None
+    # the unlocked observer stays best-effort: None, never an exception.
+    assert await backend.read_lease("L") is None
+
+
+# --- 4: release keeps the file, observers see it as free -------------------
+
+
+async def test_release_marks_expired_in_place_keeps_file(fs_backend):
+    backend = fs_backend
+    lease = await backend.acquire_lease("L", "A", ttl=30)
+    assert lease is not None
+    await backend.release_lease(lease)
+    # observers must see "nobody holds it" after a release...
+    assert await backend.read_lease("L") is None
+    # ...but the file must still exist: it is what preserves the fence
+    # counter across release/re-acquire cycles (see the monotonicity test).
+    _lock_path, lease_path = backend._lease_paths("L")
+    assert os.path.exists(lease_path)
+    with open(lease_path, "rb") as fobj:
+        on_disk = json.loads(fobj.read())
+    assert on_disk["expiresAt"] == 0.0
+
+
+# --- 5: _read_record error taxonomy ----------------------------------------
+
+
+async def test_invalid_json_record_is_quarantined(fs_backend):
+    # Bad CONTENT (truncated JSON from a crash mid-write on a store without
+    # atomic rename) is the record's fault: quarantine it so one poison
+    # object can never brick every later read of the stream.
+    backend = fs_backend
+    await backend.append_record("s", {"good": True})
+    stream_dir = backend._stream_dir("s")
+    with open(os.path.join(stream_dir, "00000-bad.json"), "w") as fobj:
+        fobj.write("{not json")
+    assert await backend.list_records("s") == [{"good": True}]
+    assert "00000-bad.json" not in os.listdir(stream_dir)
+    quarantine = os.path.join(backend.base, "quarantine")
+    assert any(n.startswith("00000-bad.json") for n in os.listdir(quarantine))
+
+
+async def test_deeply_nested_json_record_is_quarantined(fs_backend):
+    # A hostile >1000-deep nesting makes json.loads raise RecursionError,
+    # which is NOT an OSError or ValueError: before the fix it escaped the
+    # except clauses and crashed whichever caller was reading the stream.
+    # Content poison must be caught and quarantined like any bad record.
+    backend = fs_backend
+    await backend.append_record("s", {"ok": 1})
+    stream_dir = backend._stream_dir("s")
+    bomb = "[" * 1300 + "]" * 1300
+    with open(os.path.join(stream_dir, "00000-deep.json"), "w") as fobj:
+        fobj.write(bomb)
+    got = await backend.list_records("s")  # must not raise
+    assert got == [{"ok": 1}]
+    assert "00000-deep.json" not in os.listdir(stream_dir)
+    quarantine = os.path.join(backend.base, "quarantine")
+    assert any(n.startswith("00000-deep.json") for n in os.listdir(quarantine))
+
+
+async def test_transient_read_error_skips_but_never_quarantines(
+    fs_backend, monkeypatch
+):
+    # A transient I/O error (an NFS blip, an AV scanner's momentary hold) is
+    # the ENVIRONMENT's fault, not the record's.  Quarantining on it would
+    # eject perfectly valid history -- and regress the derived watermark --
+    # on every store hiccup.  The read must skip the record for this pass
+    # and leave the file in place.
+    backend = fs_backend
+    await backend.append_record("s", {"i": 0})
+    await backend.append_record("s", {"i": 1})
+    stream_dir = backend._stream_dir("s")
+    names = sorted(n for n in os.listdir(stream_dir) if n.endswith(".json"))
+    victim = os.path.normpath(os.path.join(stream_dir, names[0]))
+    real_open = open
+    failing = {"on": True}
+
+    def flaky_open(path, *args, **kwargs):
+        if failing["on"] and os.path.normpath(str(path)) == victim:
+            raise PermissionError(13, "transient hold", str(path))
+        return real_open(path, *args, **kwargs)
+
+    # shadow the module's open, the same seam tests/test_state.py patches.
+    monkeypatch.setattr(state, "open", flaky_open, raising=False)
+    got = await backend.list_records("s")
+    assert [r["i"] for r in got] == [1]  # unreadable one skipped
+    # still in the stream (NOT quarantined), and quarantine stays empty.
+    assert names[0] in os.listdir(stream_dir)
+    assert os.listdir(os.path.join(backend.base, "quarantine")) == []
+    # once the blip clears the record is readable again, proving the file
+    # was left fully intact.
+    failing["on"] = False
+    assert [r["i"] for r in await backend.list_records("s")] == [0, 1]
+
+
+# --- 6: atomic-write temp-file hygiene --------------------------------------
+
+
+async def test_failed_replace_leaves_no_tmp_files(fs_backend, monkeypatch):
+    # A failed rename must not strand its temp file: on a long-lived store
+    # leaked w-*.tmp files accumulate forever (and on a shared mount every
+    # node's leaks pile into the same directory).
+    backend = fs_backend
+
+    def boom(*args):
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(
+        state.FilesystemStateBackend, "_replace", staticmethod(boom)
+    )
+    with pytest.raises(OSError, match="simulated rename failure"):
+        await backend.append_record("s", {"i": 0})
+    tmp_dir = os.path.join(backend.base, "tmp")
+    assert [n for n in os.listdir(tmp_dir) if n.endswith(".tmp")] == []
+    # and the half-written record never became visible either.
+    monkeypatch.undo()
+    assert await backend.list_records("s") == []
+
+
+# --- 7: two instances over one mount (shared-mount simulation) --------------
+
+
+async def test_two_instances_share_one_ledger(fs_backend_factory):
+    # The shared-mount deployment: two processes (here: two backend
+    # instances) over the SAME store and namespace.  Ids must never collide
+    # (each instance mixes its own random `_instance` token into every
+    # filename), reads must see the union, and the derived cursor must be
+    # the true max regardless of which node wrote it.
+    b1 = await fs_backend_factory()
+    b2 = await fs_backend_factory()
+    assert b1._instance != b2._instance
+    stream = "runs/shared-job"
+    ids = []
+    for i in range(5):  # interleaved appends, as two live nodes produce
+        ids.append(
+            await b1.append_record(stream, {"finished_at": 2 * i, "n": 1})
+        )
+        ids.append(
+            await b2.append_record(stream, {"finished_at": 2 * i + 1, "n": 2})
+        )
+    assert len(set(ids)) == 10  # no cross-instance id collision
+    seen1 = await b1.list_records(stream)
+    seen2 = await b2.list_records(stream)
+    assert len(seen1) == len(seen2) == 10
+    union = {(r["n"], r["finished_at"]) for r in seen1}
+    assert union == {(r["n"], r["finished_at"]) for r in seen2}
+    assert {r["n"] for r in seen1} == {1, 2}  # both writers visible
+    # the max (9) was written by node 2 but must be derived identically
+    # from either node -- order-independent, never last-writer-wins.
+    assert await b1.derive_max(stream, "finished_at") == 9
+    assert await b2.derive_max(stream, "finished_at") == 9
+    # one node prunes while the other lists: neither may raise.  The racing
+    # list may observe any prefix of the deletes; only convergence matters.
+    removed, racing = await asyncio.gather(
+        b1.prune_records(stream, keep=3),
+        b2.list_records(stream),
+    )
+    assert 3 <= len(racing) <= 10
+    # a Windows lister can transiently hold a record open, making prune's
+    # unlink of that one file fail (silently skipped by design); a second
+    # pass after the reader finished sweeps any such straggler.
+    swept = await b1.prune_records(stream, keep=3)
+    assert removed + swept == 7
+    assert len(await b1.list_records(stream)) == 3
+    assert len(await b2.list_records(stream)) == 3
+
+
+# --- 8: ~ expansion ----------------------------------------------------------
+
+
+def test_tilde_path_expands_to_home():
+    # `path: ~/state` must mean the home directory: before the fix the raw
+    # "~" went through abspath, creating a literal "~" directory under
+    # whatever CWD the daemon started in.  Construction only -- no start(),
+    # so nothing is created under the real home.
+    backend = _backend("~/some-cronstable-test-path")
+    home = os.path.expanduser("~")
+    expected = os.path.abspath(os.path.join(home, "some-cronstable-test-path"))
+    assert backend.root == expected
+    assert backend.root.startswith(home)
+
+
+# --- 9: renew cannot resurrect a released lease -----------------------------
+
+
+async def test_renew_after_release_is_denied(fs_backend):
+    # Release marks the lease expired in place with the SAME holder+fence
+    # (that is what keeps the fence monotonic), so a renew that checks only
+    # holder+fence would still match and silently un-release it -- an
+    # in-flight renew loop racing shutdown would resurrect the lease and
+    # block other nodes for a full TTL after a clean release.
+    backend = fs_backend
+    lease = await backend.acquire_lease("leader", "node-a", 30.0)
+    assert lease is not None
+    await backend.release_lease(lease)
+    assert await backend.read_lease("leader") is None
+    assert await backend.renew_lease(lease, 30.0) is None
+    # ...and the lease is genuinely still free for the next holder, with a
+    # bumped fence.
+    lease2 = await backend.acquire_lease("leader", "node-b", 30.0)
+    assert lease2 is not None
+    assert lease2.fence > lease.fence
+
+
+# --- 10: a failed lease write denies instead of raising ----------------------
+
+
+async def test_lease_write_failure_denies_instead_of_raising(
+    fs_backend, monkeypatch
+):
+    # On Windows a reader/AV holding the .lease file open past the replace
+    # retries surfaces PermissionError from the write; the lease API must
+    # translate that into a clean denial (fail closed), never an exception
+    # escaping acquire/renew to its caller.
+    backend = fs_backend
+    lease = await backend.acquire_lease("leader", "node-a", 30.0)
+    assert lease is not None
+
+    def boom(path, obj, *, durable=True):
+        raise PermissionError(5, "sharing violation", path)
+
+    monkeypatch.setattr(backend, "_write_lease_file", boom)
+    assert await backend.renew_lease(lease, 30.0) is None
+    monkeypatch.setattr(
+        state, "_now", lambda: lease.expires_at + 1.0
+    )  # expire it
+    assert await backend.acquire_lease("leader", "node-b", 30.0) is None
+
+
+# --- 11: truncated stream tokens round-trip through list_stream_names -------
+
+
+async def test_list_stream_names_roundtrips_truncated_tokens(fs_backend):
+    # _fs_safe truncates a >_FS_SAFE_MAX token to head + "%." + digest, and
+    # unquote()ing that token back produced a GARBLED name that re-encoded
+    # to a DIFFERENT token: a host with a long (or multibyte -- 9 encoded
+    # chars per CJK char) hostname had its manifest stream invisible to
+    # every GC keep-set builder, and its jobs' durable state was collected
+    # as garbage.  The name sidecar written on append must make every
+    # returned name round-trip exactly to its on-disk token.
+    backend = fs_backend
+    long_ascii = "manifests/" + "H" * 140  # uppercase: 3 encoded chars each
+    multibyte = "manifests/" + "主机" * 20  # a CJK hostname
+    plain = "manifests/plain-host"
+    for stream in (long_ascii, multibyte, plain):
+        await backend.append_record(stream, {"x": 1})
+    names = await backend.list_stream_names("manifests/")
+    assert set(names) == {long_ascii, multibyte, plain}
+    # the property under test: _fs_safe over every returned name reproduces
+    # exactly the set of on-disk stream tokens (nothing garbled, nothing
+    # skipped), so keep-sets built from these names protect the real dirs.
+    records_root = os.path.join(backend.base, "records")
+    prefix_token = state._fs_safe_fragment("manifests/")
+    on_disk = {
+        t for t in os.listdir(records_root) if t.startswith(prefix_token)
+    }
+    assert {state._fs_safe(n) for n in names} == on_disk
+    # and each name feeds straight back into a record read, the exact call
+    # the GC keep-set builders make.
+    for name in names:
+        assert await backend.list_records(name) == [{"x": 1}]
+
+
+async def test_gc_keeps_legacy_truncated_stream_and_skips_its_name(
+    fs_backend, monkeypatch
+):
+    # A store written BEFORE the sidecar existed: a truncated dir's logical
+    # name is unrecoverable, so enumeration must SKIP it (never return a
+    # garbled, non-round-tripping name) and GC must treat it as
+    # unclassifiable (keep) -- until an append lands the sidecar and makes
+    # it classifiable again.
+    backend = fs_backend
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    long_job = "runs/" + "J" * 200
+    await backend.append_record(long_job, {"x": 1})
+    stream_dir = backend._stream_dir(long_job)
+    # simulate the legacy dir by removing the sidecar the append wrote.
+    os.unlink(os.path.join(stream_dir, state._STREAM_NAME_SIDECAR))
+    assert await backend.list_stream_names("runs/") == []
+    # aged far past the grace and unreferenced: still KEPT, because its
+    # absence from the keep map proves nothing (the builder never saw it).
+    clock["t"] = 1000.0 + 8 * 86400.0
+    result = await backend.collect_garbage(
+        keep={"runs/": set()}, grace=7 * 86400.0
+    )
+    assert result["streams_removed"] == 0
+    assert await backend.list_records(long_job) == [{"x": 1}]
+    # the next append self-heals the sidecar: enumerable again...
+    await backend.append_record(long_job, {"x": 2})
+    assert await backend.list_stream_names("runs/") == [long_job]
+    # ...and therefore classifiable: aged and unreferenced now really goes.
+    clock["t"] = 1000.0 + 16 * 86400.0
+    result = await backend.collect_garbage(
+        keep={"runs/": set()}, grace=7 * 86400.0
+    )
+    assert result["streams_removed"] == 1
+    assert not os.path.isdir(stream_dir)
+
+
+async def test_list_stream_names_audit_reports_hidden_streams(fs_backend):
+    # The orphan-blob sweep builds its referenced-digest set from the stream
+    # listing, so it must be able to tell "these are ALL the artifact
+    # streams" from "a legacy truncated dir is hiding one": a hidden
+    # stream's records still reference blobs, and a sweep that could not
+    # see them would delete live payloads.
+    backend = fs_backend
+    long_scope = "artifacts/" + "S" * 200
+    await backend.append_record("artifacts/plain", {"sha256": "a" * 64})
+    await backend.append_record(long_scope, {"sha256": "b" * 64})
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is True
+    assert set(names) == {"artifacts/plain", long_scope}
+    # a legacy dir (pre-sidecar store): the stream becomes unnameable and
+    # the audit must say so instead of silently shrinking the listing.
+    stream_dir = backend._stream_dir(long_scope)
+    os.unlink(os.path.join(stream_dir, state._STREAM_NAME_SIDECAR))
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is False
+    assert names == ["artifacts/plain"]
+    # the plain (non-audit) listing keeps its established best-effort shape.
+    assert await backend.list_stream_names("artifacts/") == [
+        "artifacts/plain"
+    ]
+    # a prefix with nothing hidden under it stays complete.
+    names, complete = await backend.list_stream_names_audit("manifests/")
+    assert (names, complete) == ([], True)
+
+
+async def test_list_document_namespaces_skips_truncated_namespace(fs_backend):
+    # The GC discovers dag-run namespaces (dagrun/<dag>) through this
+    # listing; a length-truncated namespace has no name sidecar to recover
+    # its logical name from, so it must be reported as an INCOMPLETE
+    # listing -- never returned garbled (a garbled name would be treated as
+    # a removed dag and its runs' XCom scopes left unprotected).
+    backend = fs_backend
+
+    def put(body):
+        return lambda _cur: (body, None)
+
+    await backend.mutate_document("dagrun/a", "r1", put({"runId": "1"}))
+    await backend.mutate_document("dagrun/b", "r1", put({"runId": "2"}))
+    await backend.mutate_document("kv/x", "k", put({"value": 1}))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert (names, complete) == (["dagrun/a", "dagrun/b"], True)
+    await backend.mutate_document(
+        "dagrun/" + "D" * 200, "r1", put({"runId": "3"})
+    )
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert names == ["dagrun/a", "dagrun/b"]
+    assert complete is False
+    # unrelated prefixes are unaffected by the truncated dagrun namespace.
+    assert await backend.list_document_namespaces("kv/") == (["kv/x"], True)
+
+
+async def test_sweep_orphan_blobs_keeps_young_unreferenced_blobs(fs_backend):
+    # The put-blob-then-append-record window: a payload that has just
+    # landed has no record yet, so an unreferenced-but-young blob must
+    # survive the sweep (the grace is the age guard) and only a blob both
+    # unreferenced AND older than the grace may go.
+    backend = fs_backend
+    digest = await backend.put_blob(b"just-landed")
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) is not None
+    old = time.time() - 7200.0
+    os.utime(backend._blob_path(digest), (old, old))
+    # dry run counts it but must not delete...
+    assert await backend.sweep_orphan_blobs(set(), 3600.0, dry_run=True) == 1
+    assert await backend.get_blob(digest) is not None
+    # ...the real pass reclaims it.
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 1
+    assert await backend.get_blob(digest) is None
+
+
+async def test_put_blob_dedupe_rearms_the_sweep_age_guard(fs_backend):
+    # a re-put of identical content dedupes to the EXISTING blob file; if
+    # that file kept its old mtime, a sweep racing the re-putter's
+    # record append would read the blob as an aged orphan (its previous
+    # references may be mid-deletion) and delete a payload about to be
+    # referenced again.  The dedupe hit must refresh the mtime, re-arming
+    # the age guard.
+    backend = fs_backend
+    digest = await backend.put_blob(b"republished-content")
+    old = time.time() - 7200.0
+    os.utime(backend._blob_path(digest), (old, old))
+    assert await backend.put_blob(b"republished-content") == digest
+    assert await backend.sweep_orphan_blobs(set(), 3600.0) == 0
+    assert await backend.get_blob(digest) == b"republished-content"
+
+
+def test_blob_path_rejects_a_non_sha256_digest(tmp_path):
+    # A digest is a content-addressed lowercase sha256 hex string.  A crafted
+    # value (e.g. a "sha256" field from a malicious restore archive) must be
+    # rejected before it builds a path, so it can never traverse out of the
+    # blob directory via ".." or a path separator.
+    backend = _backend(tmp_path)
+    for bad in ("../../etc/passwd", "0" * 63, "0" * 65, "g" * 64, "AB" * 32):
+        with pytest.raises(ValueError, match="invalid blob digest"):
+            backend._blob_path(bad)
+    # a well-formed digest still yields a normal sharded path.
+    good = "a" * 64
+    assert backend._blob_path(good).endswith(good + ".blob")
+
+
+# --- 12: GC reclaims ONLY ephemeral leases, only once dead past grace -------
+
+
+async def test_gc_reclaims_ephemeral_leases_dead_past_grace_only(
+    fs_backend, monkeypatch
+):
+    # dagrun takes one uniquely-named advance lease per DAG run, and nothing
+    # ever deleted the files: ~210k permanent files/year for a 5-minute DAG.
+    # GC must reclaim a lease (and its .lock sibling) matching an EPHEMERAL
+    # prefix once dead past the whole grace window -- and never sooner.
+    backend = fs_backend
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    lease = await backend.acquire_lease("dagadvance/d/r1", "A", ttl=10.0)
+    assert lease is not None
+    lock_path, lease_path = backend._lease_paths("dagadvance/d/r1")
+    grace = 3600.0
+    # expired, but within the grace window: never touched (the fence home).
+    clock["t"] = t0 + 60.0
+    result = await backend.collect_garbage(
+        keep={}, grace=grace, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
+    assert result["leases_removed"] == 0
+    assert os.path.exists(lease_path)
+    # dead past the whole window: dry run counts it but deletes nothing...
+    clock["t"] = t0 + grace + 60.0
+    dry = await backend.collect_garbage(
+        keep={},
+        grace=grace,
+        ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,),
+        dry_run=True,
+    )
+    assert dry["leases_removed"] == 1
+    assert os.path.exists(lease_path) and os.path.exists(lock_path)
+    # ...and the real pass reclaims BOTH files.
+    result = await backend.collect_garbage(
+        keep={}, grace=grace, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
+    assert result["leases_removed"] == 1
+    assert not os.path.exists(lease_path)
+    assert not os.path.exists(lock_path)
+    # without the prefix (a caller that names no ephemeral classes) the
+    # same dead-past-grace lease would never have been touched.
+    revived = await backend.acquire_lease("dagadvance/d/r2", "A", ttl=10.0)
+    assert revived is not None
+    clock["t"] = t0 + 2 * (grace + 60.0)
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["leases_removed"] == 0
+    assert os.path.exists(backend._lease_paths("dagadvance/d/r2")[1])
+
+
+async def test_gc_never_reclaims_non_ephemeral_leases(fs_backend, monkeypatch):
+    # REGRESSION of the previous fix round: reclaiming ANY dead lease reset
+    # slot fences that persisted Replace-cancel records still reference
+    # ({kind: cancel, fence: N} in slots/<job> stays newest until the next
+    # cancel), so a reborn fence could re-collide and a healthy future run
+    # be silently cancelled.  A slot lease dead past ANY grace window must
+    # survive GC and the next acquire must CONTINUE its fence line.
+    backend = fs_backend
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    first = await backend.acquire_lease("slots/j", "A", ttl=10.0)
+    assert first is not None and first.fence == 1
+    # the durable cancel record a Replace takeover leaves behind: it names
+    # fence 1 and nothing will ever prune it until another cancel lands.
+    await backend.append_record("slots/j", {"kind": "cancel", "fence": 1})
+    await backend.release_lease(first)
+    grace = 3600.0
+    clock["t"] = t0 + grace + 60.0  # dead past the whole grace window
+    result = await backend.collect_garbage(
+        keep={"slots/": {"j"}},
+        grace=grace,
+        ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,),
+    )
+    assert result["leases_removed"] == 0
+    lock_path, lease_path = backend._lease_paths("slots/j")
+    assert os.path.exists(lease_path)  # the fence counter's only home
+    assert os.path.exists(lock_path)
+    # the fence line CONTINUES: the reborn holder is at fence 2, so the
+    # stale fence-1 cancel record can never match it again.
+    nxt = await backend.acquire_lease("slots/j", "B", ttl=10.0)
+    assert nxt is not None and nxt.fence == first.fence + 1
+    records = await backend.list_records("slots/j")
+    assert records == [{"kind": "cancel", "fence": 1}]
+    assert all(rec["fence"] != nxt.fence for rec in records)
+
+
+async def test_gc_dates_released_lease_by_mtime_not_expiry(
+    fs_backend, monkeypatch
+):
+    # release marks expiresAt 0.0 IN PLACE -- ancient by expiry alone.  An
+    # ephemeral lease released moments ago must survive the full grace
+    # window (a stale fence from just before the release could still be
+    # live), so the sweep dates a release by the file's mtime and the
+    # fence counter survives.
+    backend = fs_backend
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    lease = await backend.acquire_lease("dagadvance/d/r1", "A", ttl=30.0)
+    assert lease is not None
+    await backend.release_lease(lease)
+    clock["t"] = t0 + 120.0  # well within the grace window
+    result = await backend.collect_garbage(
+        keep={}, grace=3600.0, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
+    assert result["leases_removed"] == 0
+    _lock_path, lease_path = backend._lease_paths("dagadvance/d/r1")
+    assert os.path.exists(lease_path)  # the fence counter's only home
+    nxt = await backend.acquire_lease("dagadvance/d/r1", "B", ttl=30.0)
+    assert nxt is not None and nxt.fence == lease.fence + 1
+
+
+async def test_lease_gc_fence_reset_cannot_enable_stale_ops(
+    fs_backend, monkeypatch
+):
+    # The safety argument for deleting an ephemeral lease file at all, as a
+    # test: a lease GC reclaims has every fence it ever issued expired >=
+    # grace ago, so the post-reclaim fence reset to 1 must be unobservable
+    # -- a stale Lease from before the reclaim (same holder, higher fence)
+    # can neither renew nor release the reborn lease.
+    backend = fs_backend
+    t0 = time.time()
+    clock = {"t": t0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    name = "dagadvance/d/rX"
+    first = await backend.acquire_lease(name, "A", ttl=10.0)
+    assert first is not None and first.fence == 1
+    clock["t"] = t0 + 60.0
+    stale = await backend.acquire_lease(name, "A", ttl=10.0)  # takeover
+    assert stale is not None and stale.fence == 2
+    grace = 3600.0
+    clock["t"] = t0 + 60.0 + grace + 60.0  # both fences dead past grace
+    result = await backend.collect_garbage(
+        keep={}, grace=grace, ephemeral_lease_prefixes=(DAG_LEASE_PREFIX,)
+    )
+    assert result["leases_removed"] == 1
+    lock_path, lease_path = backend._lease_paths(name)
+    assert not os.path.exists(lease_path)
+    assert not os.path.exists(lock_path)
+    reborn = await backend.acquire_lease(name, "A", ttl=30.0)
+    assert reborn is not None and reborn.fence == 1
+    # fence EQUALITY (never >=) is what keeps the reset safe: the stale
+    # renew and the stale release must both miss the reborn lease.
+    assert await backend.renew_lease(stale, ttl=30.0) is None
+    await backend.release_lease(stale)
+    current = await backend.read_lease(name)
+    assert current is not None
+    assert current.holder == "A" and current.fence == 1  # untouched
+
+
+# --- 13: delete_document leaves the .lock for the GC orphan sweep -----------
+
+
+async def test_delete_document_leaves_lock_sibling_alone(fs_backend):
+    # REGRESSION of the previous fix round: delete_document unlinked the
+    # .lock side-file eagerly, which splits the document mutex across nodes
+    # on a shared NFS/EFS store (a waiter that wins the flock on the ghost
+    # inode can pass the post-acquire stat re-verify through a stale
+    # dentry/attribute cache while another node locks a fresh file).  The
+    # hot path must never unlink a doc .lock; reclamation belongs to the
+    # GC orphan sweep, gated on idle-past-grace.
+    backend = fs_backend
+
+    def put(value):
+        def transform(_current):
+            return {"v": value}, None
+
+        return transform
+
+    await backend.mutate_document("dagrun/d", "r1", put(1))
+    lock_path, doc_path = backend._doc_paths("dagrun/d", "r1")
+    assert os.path.exists(doc_path) and os.path.exists(lock_path)
+    assert await backend.delete_document("dagrun/d", "r1") is True
+    assert not os.path.exists(doc_path)
+    assert os.path.exists(lock_path)  # left for the GC sweep, never eager
+    # the key stays fully usable: a fresh mutation recreates the doc under
+    # the SAME lock file and reads back.
+    body, _ = await backend.mutate_document("dagrun/d", "r1", put(2))
+    assert body == {"v": 2}
+    assert await backend.read_document("dagrun/d", "r1") == {"v": 2}
+    assert os.path.exists(lock_path)
+
+
+# --- 13b: the GC orphan-lock sweep ------------------------------------------
+
+
+async def test_gc_sweeps_orphaned_doc_lock_only_when_doc_absent_and_idle(
+    fs_backend,
+):
+    # a doc .lock is swept only when BOTH hold: the document is absent AND
+    # the lock sat idle (mtime) past the whole grace window.  A present
+    # document keeps its lock whatever the mtime says.
+    backend = fs_backend
+    grace = 3600.0
+    old = time.time() - grace - 120.0
+
+    await backend.mutate_document("kv/a", "k", lambda _c: ({"v": 1}, None))
+    kept_lock, kept_doc = backend._doc_paths("kv/a", "k")
+    os.utime(kept_lock, (old, old))  # ancient, but the doc is PRESENT
+
+    await backend.mutate_document("kv/b", "k", lambda _c: ({"v": 1}, None))
+    await backend.delete_document("kv/b", "k")
+    young_lock, _young_doc = backend._doc_paths("kv/b", "k")
+    # doc absent but the lock was just touched: still within the grace.
+
+    await backend.mutate_document("kv/c", "k", lambda _c: ({"v": 1}, None))
+    await backend.delete_document("kv/c", "k")
+    dead_lock, dead_doc = backend._doc_paths("kv/c", "k")
+    os.utime(dead_lock, (old, old))  # doc absent AND idle past grace
+
+    dry = await backend.collect_garbage(keep={}, grace=grace, dry_run=True)
+    assert dry["locks_removed"] == 1
+    assert os.path.exists(dead_lock)  # dry run deletes nothing
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["locks_removed"] == 1
+    assert os.path.exists(kept_lock)  # doc present: never swept
+    assert os.path.exists(young_lock)  # idle clock not yet past grace
+    assert not os.path.exists(dead_lock)
+    assert not os.path.exists(dead_doc)
+
+
+async def test_mutate_touch_refreshes_the_doc_lock_idle_clock(fs_backend):
+    # a flock never updates mtime, so every mutate must utime the lock:
+    # a doc-absent .lock that was CONTENDED recently (an idempotency key
+    # between claims) must read as active and survive the sweep.
+    backend = fs_backend
+    grace = 3600.0
+    old = time.time() - grace - 120.0
+    await backend.mutate_document("kv/t", "k", lambda _c: ({"v": 1}, None))
+    await backend.delete_document("kv/t", "k")
+    lock_path, _doc_path = backend._doc_paths("kv/t", "k")
+    os.utime(lock_path, (old, old))
+    # a doc-keeping probe of the absent key: acquires (and touches) the
+    # lock without recreating the document.
+    body, _ = await backend.mutate_document(
+        "kv/t", "k", lambda _c: (state.DOC_KEEP, None)
+    )
+    assert body is None
+    assert os.stat(lock_path).st_mtime > old  # the touch really landed
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["locks_removed"] == 0
+    assert os.path.exists(lock_path)
+
+
+async def test_gc_sweeps_bare_lease_lock_only_once_idle_past_grace(fs_backend):
+    # REGRESSION of the previous fix round: _gc_leases_sync keys off .lease
+    # names, so a .lock orphaned by a lost post-release unlink (Windows AV
+    # scanner handle) was never revisited -- it leaked forever.  The orphan
+    # sweep must reclaim a BARE .lock (no .lease sibling) once idle past
+    # the grace, and keep both a fresh bare lock and a lock whose .lease
+    # still exists.
+    backend = fs_backend
+    grace = 3600.0
+    old = time.time() - grace - 120.0
+    lease_root = os.path.join(backend.base, state.LEASES_DIR)
+
+    # a live lease: .lock has its .lease sibling, whatever the mtime.
+    lease = await backend.acquire_lease("slots/j", "A", ttl=30.0)
+    assert lease is not None
+    live_lock, live_lease = backend._lease_paths("slots/j")
+    os.utime(live_lock, (old, old))
+
+    # the orphan: a bare .lock aged past the grace window.
+    dead_lock = os.path.join(lease_root, "dagadvance%2Fd%2Fgone.lock")
+    with open(dead_lock, "wb") as fobj:
+        fobj.write(b"\0")
+    os.utime(dead_lock, (old, old))
+
+    # a fresh bare .lock (an acquire between open and lease write).
+    young_lock = os.path.join(lease_root, "dagadvance%2Fd%2Fnew.lock")
+    with open(young_lock, "wb") as fobj:
+        fobj.write(b"\0")
+
+    dry = await backend.collect_garbage(keep={}, grace=grace, dry_run=True)
+    assert dry["locks_removed"] == 1
+    assert os.path.exists(dead_lock)
+    result = await backend.collect_garbage(keep={}, grace=grace)
+    assert result["locks_removed"] == 1
+    assert not os.path.exists(dead_lock)
+    assert os.path.exists(live_lock) and os.path.exists(live_lease)
+    assert os.path.exists(young_lock)
+
+
+# --- 14: document delete rides out Windows sharing violations ---------------
+
+
+async def test_document_delete_retries_sharing_violation(
+    fs_backend, monkeypatch
+):
+    # On Windows a concurrent reader/AV scan holding a .doc open makes
+    # os.unlink raise PermissionError; the write path always retried this
+    # (see _replace) but the delete path surfaced it as a spurious error
+    # from a healthy store.  The unlink must retry the transient hold away.
+    backend = fs_backend
+    await backend.mutate_document("ns", "k", lambda _c: ({"v": 1}, None))
+    _lock_path, doc_path = backend._doc_paths("ns", "k")
+    monkeypatch.setattr(state, "IS_WINDOWS", True)  # force the retry path
+    calls = {"n": 0}
+    real_unlink = os.unlink
+
+    def flaky_unlink(path, *args, **kwargs):
+        if (
+            os.path.normpath(str(path)) == os.path.normpath(doc_path)
+            and calls["n"] < 2
+        ):
+            calls["n"] += 1
+            raise PermissionError(5, "sharing violation", str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(state.os, "unlink", flaky_unlink)
+    assert await backend.delete_document("ns", "k") is True
+    assert calls["n"] == 2  # the transient hold really was retried away
+    assert not os.path.exists(doc_path)
+    assert await backend.read_document("ns", "k") is None
+
+
+# --- 15: lone-surrogate names round-trip through enumeration -----------------
+
+
+async def test_stream_audit_roundtrips_lone_surrogate_names(fs_backend):
+    # Job names come from os.fsdecode'd crontab filenames, so a stream name
+    # can carry a lone surrogate; _fs_safe encodes it via surrogatepass.
+    # Decoding the token back with errors="replace" returned a DIFFERENT
+    # name (U+FFFD in place of the surrogate) while still reporting the
+    # listing complete: the orphan-blob sweep re-encoded the garbled name,
+    # read a stream that does not exist (silently empty), dropped the real
+    # stream's digests from its referenced set, and deleted still-referenced
+    # payload blobs.
+    backend = fs_backend
+    surrogate = "artifacts/caf\udce9"
+    plain = "artifacts/plain"
+    for stream in (surrogate, plain):
+        await backend.append_record(stream, {"sha256": "a" * 64})
+    names, complete = await backend.list_stream_names_audit("artifacts/")
+    assert complete is True
+    assert set(names) == {surrogate, plain}
+    # _fs_safe over every returned name reproduces exactly the on-disk
+    # tokens, so keep-sets built from these names protect the real dirs.
+    records_root = os.path.join(backend.base, "records")
+    prefix_token = state._fs_safe_fragment("artifacts/")
+    on_disk = {
+        t for t in os.listdir(records_root) if t.startswith(prefix_token)
+    }
+    assert {state._fs_safe(n) for n in names} == on_disk
+    # each returned name feeds straight back into a record read, the exact
+    # call the sweep's referenced-digest builder makes.
+    for name in names:
+        assert await backend.list_records(name) == [{"sha256": "a" * 64}]
+
+
+async def test_stream_audit_never_returns_foreign_tokens_garbled(fs_backend):
+    # A records-root entry _fs_safe cannot have produced (undecodable bytes,
+    # or an alias that decodes but re-encodes to a DIFFERENT token) must be
+    # reported through ``complete``, never returned as a mangled name a
+    # destructive caller could act on.
+    backend = fs_backend
+    await backend.append_record("artifacts/plain", {"n": 1})
+    records_root = os.path.join(backend.base, "records")
+    os.mkdir(os.path.join(records_root, "artifacts%2Fbad%FF"))
+    os.mkdir(os.path.join(records_root, "artifacts%2fx"))
+    names, complete = await backend.list_stream_names_audit("")
+    assert complete is False
+    assert "artifacts/plain" in names
+    assert "artifacts/bad\ufffd" not in names
+    assert "artifacts/x" not in names  # the %2f alias must not decode
+    # every returned name still round-trips to a real on-disk token.
+    for name in names:
+        assert os.path.isdir(
+            os.path.join(records_root, state._fs_safe(name))
+        )
+
+
+async def test_document_namespaces_roundtrip_lone_surrogate_names(fs_backend):
+    # The docs-side twin: a dag-run namespace named after an os.fsdecode'd
+    # dag name can carry a lone surrogate.  A replace-decoded (garbled)
+    # namespace reads as a REMOVED dag to the GC, whose runs' XCom scopes
+    # then lose their keep-set protection.
+    backend = fs_backend
+
+    def put(body):
+        return lambda _cur: (body, None)
+
+    surrogate_ns = "dagrun/caf\udce9"
+    await backend.mutate_document(surrogate_ns, "r1", put({"runId": "1"}))
+    await backend.mutate_document("dagrun/plain", "r1", put({"runId": "2"}))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert complete is True
+    assert set(names) == {surrogate_ns, "dagrun/plain"}
+    # the returned namespace addresses the real documents.
+    assert await backend.list_documents(surrogate_ns) == [{"runId": "1"}]
+    # a foreign token that cannot round-trip is reported, never garbled.
+    docs_root = os.path.join(backend.base, "docs")
+    os.mkdir(os.path.join(docs_root, "dagrun%2Fbad%FF"))
+    names, complete = await backend.list_document_namespaces("dagrun/")
+    assert complete is False
+    assert "dagrun/bad\ufffd" not in names
+
+
+# --- 16: record names stay monotonic across a backward clock step ------------
+
+
+async def test_backward_clock_step_never_prunes_the_fresh_record(
+    fs_backend, monkeypatch
+):
+    # Record filenames embed the wall clock, and both the amortised prune
+    # (keep the lexicographic tail) and the derive_max memo (scan only names
+    # above the watermark) assume they only ever grow.  A backward step (NTP
+    # correcting a fast host clock) minted names BELOW retained history: at
+    # the prune cap, the very next amortised prune deleted the just-written,
+    # acknowledged record while keeping stale future-dated ones, and
+    # derive_max kept answering from the pre-step fold.
+    backend = fs_backend
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    keep = 3
+    total = state._PRUNE_EVERY_APPENDS
+    ids = []
+    for i in range(total):
+        clock["t"] += 1.0
+        ids.append(
+            await backend.append_record(
+                "runs/j", {"seq": i}, prune_keep=keep
+            )
+        )
+    # arm the derive_max memo: its watermark is the newest pre-step name.
+    assert await backend.derive_max("runs/j", "seq") == total - 1
+    clock["t"] = 1000.0  # the wall clock steps backwards
+    # append number _PRUNE_EVERY_APPENDS + 1 carries the due prune itself.
+    ids.append(
+        await backend.append_record("runs/j", {"seq": total}, prune_keep=keep)
+    )
+    recs = await backend.list_records("runs/j")
+    assert {"seq": total} in recs  # survived the prune it carried
+    assert len(recs) == keep  # and the prune still bounded the stream
+    assert recs[-1] == {"seq": total}  # newest by name, like by ack order
+    assert await backend.derive_max("runs/j", "seq") == total
+    # ids stay strictly increasing and parseable by the epoch reader.
+    assert ids == sorted(ids)
+    assert len(set(ids)) == len(ids)
+    assert state._record_epoch(ids[-1]) != float("inf")
+
+
+async def test_backward_clock_step_survives_a_process_restart(
+    fs_backend, fs_backend_factory, monkeypatch
+):
+    # The name floor is in-process state, so a restart must re-learn it from
+    # the stream directory itself: the first append of a fresh backend
+    # (which always carries an immediately-due prune) must land above the
+    # retained future-dated history, not below it.
+    backend = fs_backend
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(state, "_now", lambda: clock["t"])
+    keep = 3
+    for i in range(keep):
+        clock["t"] += 1.0
+        await backend.append_record("runs/j", {"seq": i}, prune_keep=keep)
+    clock["t"] = 1000.0  # steps back, and then the daemon restarts
+    backend2 = await fs_backend_factory()
+    await backend2.append_record("runs/j", {"seq": keep}, prune_keep=keep)
+    recs = await backend2.list_records("runs/j")
+    assert {"seq": keep} in recs
+    assert recs[-1] == {"seq": keep}
+    assert len(recs) == keep
+    assert await backend2.derive_max("runs/j", "seq") == keep
+
+
+# =====================================================================
+# Lifecycle hardening of the durable state layer
+# (formerly tests/test_state_lifecycle_hardening.py; merged per finding
+# B18, rationale below kept verbatim from that module's docstring; its
+# local _info helper collapsed onto this module's _info, which has the
+# same body with a wider signature)
+# =====================================================================
+# Lifecycle hardening of the durable state layer.
+#
+# Adversarial-review follow-ups not covered elsewhere: the platform file
+# lock must BLOCK (never raise) under contention, the backend's
+# daemon-thread ``_call`` helper must keep a hung store abandonable, and
+# the shutdown flush in :meth:`cronstable.cron.Cron.run` must persist
+# in-flight run records without ever letting a wedged store hang exit.
+#
+# Timing discipline (Windows CI has coarse ~15.6ms timers and slow
+# spawns): every wait here is an event or a generous bound, and nothing
+# asserts a duration or a tight window -- only ordering and completion.
+
+
+# --- exclusive_file_lock: block-then-succeed under contention -------------
+
+
+def test_exclusive_lock_blocks_then_succeeds_under_contention(tmp_path):
+    # The semantic guarantee both platforms must give: a second locker
+    # BLOCKS while the first holds, then SUCCEEDS once it releases --
+    # it never raises.  (msvcrt's LK_LOCK raised OSError after ~10
+    # one-second retries; the Windows path is now a non-blocking retry
+    # loop, and this is its contract test.  On POSIX flock blocks
+    # natively.)  Ordering is asserted with events only, never times.
+    lock_file = tmp_path / "contended.lock"
+    lock_file.write_bytes(b"\0")  # msvcrt needs a byte present to lock
+
+    a_holding = threading.Event()  # A is inside the locked section
+    a_release = threading.Event()  # main tells A to let go
+    b_attempting = threading.Event()  # B is about to block on the lock
+    b_acquired = threading.Event()  # B made it inside
+    b_saw_release_order = []  # was A told to release before B got in?
+    errors = []
+
+    def hold_a():
+        fd = os.open(str(lock_file), os.O_RDWR)
+        try:
+            with exclusive_file_lock(fd):
+                a_holding.set()
+                a_release.wait(timeout=30)
+        except OSError as ex:  # pragma: no cover - the failure under test
+            errors.append(ex)
+        finally:
+            os.close(fd)
+
+    def contend_b():
+        fd = os.open(str(lock_file), os.O_RDWR)
+        try:
+            b_attempting.set()
+            with exclusive_file_lock(fd):
+                # a_release is set by the main thread strictly before A
+                # can exit its locked section, so if mutual exclusion
+                # holds B can only ever observe it already set.
+                b_saw_release_order.append(a_release.is_set())
+                b_acquired.set()
+        except OSError as ex:  # pragma: no cover - the failure under test
+            errors.append(ex)
+        finally:
+            os.close(fd)
+
+    thread_a = threading.Thread(target=hold_a, daemon=True)
+    thread_a.start()
+    assert a_holding.wait(timeout=10)
+    thread_b = threading.Thread(target=contend_b, daemon=True)
+    thread_b.start()
+    assert b_attempting.wait(timeout=10)
+    # hold the lock a while with B contending.  B staying out is a
+    # mutual-exclusion check, not a timing one: b_acquired can only be
+    # set by actually acquiring, impossible while A holds the lock.
+    time.sleep(0.5)
+    assert not b_acquired.is_set()
+    assert errors == []  # above all, B must not have RAISED while blocked
+    a_release.set()
+    assert b_acquired.wait(timeout=10)  # B succeeds once A releases
+    thread_a.join(timeout=10)
+    thread_b.join(timeout=10)
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert errors == []
+    assert b_saw_release_order == [True]
+
+
+# --- FilesystemStateBackend._call: the daemon-thread seam -----------------
+
+
+async def test_call_runs_sync_half_on_daemon_thread(fs_backend):
+    # _call must run the blocking half on a DAEMON thread named
+    # "cronstable-state", never the default executor: non-daemonic workers
+    # are joined at interpreter exit, so one wedged in a dead NFS hard
+    # mount would hang process shutdown forever.
+    backend = fs_backend
+    seen = {}
+    real_append = backend._append_sync
+
+    def spy(stream, data, prune_keep=None, prune_latest_by=None):
+        thread = threading.current_thread()
+        seen["daemon"] = thread.daemon
+        seen["name"] = thread.name
+        return real_append(stream, data, prune_keep)
+
+    backend._append_sync = spy  # type: ignore[method-assign]
+    rec_id = await backend.append_record("s", {"i": 1})
+    assert rec_id
+    assert seen["daemon"] is True
+    assert seen["name"].startswith("cronstable-state")
+
+
+class _StoreBoom(Exception):
+    pass
+
+
+async def test_call_propagates_sync_half_exception(fs_backend):
+    # an exception raised on the worker thread must surface, as itself,
+    # to the awaiter -- not vanish and not wedge the await.
+    backend = fs_backend
+
+    def boom(stream, data, prune_keep=None, prune_latest_by=None):
+        raise _StoreBoom("sync half exploded")
+
+    backend._append_sync = boom  # type: ignore[method-assign]
+    with pytest.raises(_StoreBoom, match="sync half exploded"):
+        await backend.append_record("s", {"i": 1})
+
+
+async def test_call_survives_abandoned_await(fs_backend):
+    # An awaiter that times out (asyncio.wait_for) abandons _call's
+    # future; when the daemon thread later finishes, _resolve must see
+    # the cancelled future and drop the result silently -- no
+    # InvalidStateError thrown into the loop, no unhandled-exception
+    # noise.  This is the "hung store, caller moved on" path shutdown
+    # relies on.
+    backend = fs_backend
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(stream, data, prune_keep=None, prune_latest_by=None):
+        entered.set()
+        release.wait(timeout=30)  # released below; bound is a safety net
+        return "late-result"
+
+    backend._append_sync = blocked  # type: ignore[method-assign]
+
+    loop = asyncio.get_running_loop()
+    captured = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda lp, ctx: captured.append(ctx))
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                backend.append_record("s", {"i": 1}), timeout=0.1
+            )
+        # the worker really is in-flight (tries=1000 keeps this file's
+        # original ~10s bound for slow CI)
+        await _wait_until(entered.is_set, tries=1000)
+        release.set()  # let the daemon thread finish into the dead future
+        await asyncio.sleep(0.3)  # a generous beat for _resolve to run
+    finally:
+        loop.set_exception_handler(previous)
+    assert captured == []
+
+
+async def test_inventory_runs_via_call_daemon_thread(fs_backend):
+    # inventory() used to submit its full listdir walk to the DEFAULT
+    # executor (loop.run_in_executor(None, ...)), bypassing _call's
+    # abandonable daemon threads, lane cap and throttle: a dashboard
+    # polling GET /state against a hung mount wedged the non-daemon
+    # default workers one by one, after which config reload -- and the
+    # interpreter-exit join of those workers -- hung behind them.  The
+    # walk must ride the same "cronstable-state" daemon lane as every other
+    # op, and be accounted in the per-op stats like one.
+    backend = fs_backend
+    seen = {}
+    real_inventory = backend._inventory_sync
+
+    def spy():
+        thread = threading.current_thread()
+        seen["daemon"] = thread.daemon
+        seen["name"] = thread.name
+        return real_inventory()
+
+    backend._inventory_sync = spy  # type: ignore[method-assign]
+    inv = await backend.inventory()
+    assert inv["enumerable"] is True
+    assert seen["daemon"] is True
+    assert seen["name"].startswith("cronstable-state")
+    assert "inventory" in backend.stats()["ops"]
+
+
+# --- Cron.run(): the shutdown flush ----------------------------------------
+
+
+_FLUSH_CFG = """\
+jobs:
+  - name: j
+    command: echo hi
+    schedule: "0 0 29 2 *"
+state:
+  path: {path}
+"""
+
+
+async def test_shutdown_flushes_pending_run_record(tmp_path):
+    # The exact data loss the flush exists to prevent: a run record
+    # scheduled fire-and-forget moments before shutdown must still be
+    # durable after run() returns.  Drives the REAL run() loop (the
+    # test_cron.py pattern): start -> backend up -> record ->
+    # signal_shutdown -> clean exit -> read the store back cold.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(_FLUSH_CFG.format(path=state_dir))
+
+    cron = Cron(str(cfg))
+    task = asyncio.create_task(cron.run())
+    try:
+        await _wait_until(
+            lambda: cron.state_backend is not None, tries=1000
+        )
+        # schedule the persist and shut down in the SAME loop step: the
+        # write task has not run even once yet, so without the shutdown
+        # flush it would be abandoned mid-air.
+        cron._record_run("j", _info(second=1))
+        # at least the run-record write is pending and un-run (the backend
+        # start may also have queued chore writes, e.g. the manifest)
+        assert len(cron._pending_state_writes) >= 1
+    finally:
+        cron.signal_shutdown()
+        await asyncio.wait_for(task, timeout=30)
+
+    assert cron.state_backend is None  # run() tore the backend down
+    reader = _backend(state_dir)
+    recs = await reader.list_records("runs/j")
+    assert any(
+        r["finished_at"] == "2026-07-01T00:00:01+00:00"
+        and r["outcome"] == "success"
+        for r in recs
+    )
+
+
+async def test_shutdown_completes_despite_hung_state_write(
+    tmp_path, monkeypatch
+):
+    # A wedged store (the classic dead-NFS-server hard mount) must not
+    # hang exit: the flush is BOUNDED, the hung write is abandoned, and
+    # run() still returns.  Never asserts how fast -- only that it
+    # completes at all, within a x10-generous outer bound.
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg("state:\n  path: " + str(tmp_path)))
+    assert cron.state_backend is not None
+
+    hang = asyncio.get_running_loop().create_future()
+
+    async def hung_append(stream, data, *, prune_keep=None):
+        await hang  # never resolves
+
+    monkeypatch.setattr(cron.state_backend, "append_record", hung_append)
+
+    # Shrink run()'s hardcoded flush bound (asyncio.wait(..., timeout=5))
+    # so the test proves "bounded" without idling out the real 5s; every
+    # other asyncio.wait call in flight passes through untouched.
+    real_wait = asyncio.wait
+
+    async def fast_wait(fs, timeout=None, **kwargs):
+        if timeout == 5:
+            timeout = 0.2
+        return await real_wait(fs, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", fast_wait)
+
+    cron._record_run("j", _info())
+    assert len(cron._pending_state_writes) == 1
+    pending = next(iter(cron._pending_state_writes))
+
+    # Straight to the shutdown sequence (the pattern of test_cron.py's
+    # test_shutdown_stops_cluster_manager_before_job_drain): the loop
+    # body never runs, so housekeeping cannot replace the rigged
+    # backend, and run() goes directly to the flush block.
+    cron.signal_shutdown()
+    await asyncio.wait_for(cron.run(), timeout=30)
+
+    assert cron.state_backend is None  # shutdown ran to completion
+    assert not pending.done()  # the hung write was abandoned, not awaited
+    pending.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending

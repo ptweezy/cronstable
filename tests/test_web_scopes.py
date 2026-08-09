@@ -30,6 +30,7 @@ from cronstable.cron import (
     _required_web_scope,
     _WebToken,
 )
+from tests._configs import DISABLED_JOB as _DISABLED_JOB
 
 # --------------------------------------------------------------------------
 # fake request plumbing for the middleware unit tests
@@ -106,16 +107,24 @@ def _table(*entries):
 # --------------------------------------------------------------------------
 
 
-def test_effective_scopes_view_only():
-    assert _effective_web_scopes(["view"]) == frozenset({"view"})
-
-
-def test_effective_scopes_control_implies_view():
-    assert _effective_web_scopes(["control"]) == frozenset({"control", "view"})
-
-
-def test_effective_scopes_approve_implies_view():
-    assert _effective_web_scopes(["approve"]) == frozenset({"approve", "view"})
+@pytest.mark.parametrize(
+    ("scopes", "expected"),
+    [
+        pytest.param(["view"], frozenset({"view"}), id="view-only"),
+        pytest.param(
+            ["control"],
+            frozenset({"control", "view"}),
+            id="control-implies-view",
+        ),
+        pytest.param(
+            ["approve"],
+            frozenset({"approve", "view"}),
+            id="approve-implies-view",
+        ),
+    ],
+)
+def test_effective_scopes(scopes, expected):
+    assert _effective_web_scopes(scopes) == expected
 
 
 def test_effective_scopes_approve_does_not_imply_control():
@@ -126,25 +135,27 @@ def test_required_scope_get_is_view():
     assert _required_web_scope(_ScopedReq("/status")) == "view"
 
 
-def test_required_scope_post_is_control():
-    req = _ScopedReq(
-        "/jobs/x/start", method="POST", canonical="/jobs/{name}/start"
-    )
-    assert _required_web_scope(req) == "control"
-
-
-def test_required_scope_decision_is_approve():
-    req = _ScopedReq(
-        "/dags/d/runs/r/tasks/t/decision",
-        method="POST",
-        canonical="/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
-    )
-    assert _required_web_scope(req) == "approve"
-
-
-def test_required_scope_mcp_is_control():
-    req = _ScopedReq("/mcp", method="POST", canonical="/mcp")
-    assert _required_web_scope(req) == "control"
+@pytest.mark.parametrize(
+    ("path", "canonical", "expected"),
+    [
+        pytest.param(
+            "/jobs/x/start",
+            "/jobs/{name}/start",
+            "control",
+            id="start-post-is-control",
+        ),
+        pytest.param(
+            "/dags/d/runs/r/tasks/t/decision",
+            "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+            "approve",
+            id="decision-post-is-approve",
+        ),
+        pytest.param("/mcp", "/mcp", "control", id="mcp-post-is-control"),
+    ],
+)
+def test_required_scope_post_routes(path, canonical, expected):
+    req = _ScopedReq(path, method="POST", canonical=canonical)
+    assert _required_web_scope(req) == expected
 
 
 def test_required_scope_unmatched_route_falls_back_to_method():
@@ -171,29 +182,6 @@ async def test_view_token_allowed_on_get():
     )
 
 
-async def test_view_token_forbidden_on_control_post():
-    mw = Cron._make_auth_middleware(_table(("viewtok", ["view"], "phone")))
-    req = _ScopedReq(
-        "/jobs/x/start",
-        method="POST",
-        canonical="/jobs/{name}/start",
-        headers=_bearer("viewtok"),
-    )
-    with pytest.raises(web.HTTPForbidden):
-        await _run(mw, req)
-
-
-async def test_control_token_allowed_on_control_post():
-    mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ci")))
-    req = _ScopedReq(
-        "/jobs/x/start",
-        method="POST",
-        canonical="/jobs/{name}/start",
-        headers=_bearer("ctl"),
-    )
-    assert await _run(mw, req) == "ok"
-
-
 async def test_control_token_allowed_on_get_via_implied_view():
     mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ci")))
     assert (
@@ -201,55 +189,85 @@ async def test_control_token_allowed_on_get_via_implied_view():
     )
 
 
-async def test_control_token_forbidden_on_approve_route():
-    mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ci")))
+@pytest.mark.parametrize(
+    ("token", "scopes", "label", "path", "canonical"),
+    [
+        pytest.param(
+            "viewtok",
+            ["view"],
+            "phone",
+            "/jobs/x/start",
+            "/jobs/{name}/start",
+            id="view-token-on-control-post",
+        ),
+        pytest.param(
+            "ctl",
+            ["control"],
+            "ci",
+            "/dags/d/runs/r/tasks/t/decision",
+            "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+            id="control-token-on-approve-route",
+        ),
+        # approve implies view but NOT control.
+        pytest.param(
+            "apr",
+            ["approve"],
+            "oncall",
+            "/jobs/x/start",
+            "/jobs/{name}/start",
+            id="approve-token-on-control-post",
+        ),
+        pytest.param(
+            "viewtok",
+            ["view"],
+            "phone",
+            "/mcp",
+            "/mcp",
+            id="view-token-on-mcp",
+        ),
+    ],
+)
+async def test_insufficient_scope_post_is_403(
+    token, scopes, label, path, canonical
+):
+    mw = Cron._make_auth_middleware(_table((token, scopes, label)))
     req = _ScopedReq(
-        "/dags/d/runs/r/tasks/t/decision",
-        method="POST",
-        canonical="/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
-        headers=_bearer("ctl"),
+        path, method="POST", canonical=canonical, headers=_bearer(token)
     )
     with pytest.raises(web.HTTPForbidden):
         await _run(mw, req)
 
 
-async def test_approve_token_allowed_on_approve_route():
-    mw = Cron._make_auth_middleware(_table(("apr", ["approve"], "oncall")))
+@pytest.mark.parametrize(
+    ("token", "scopes", "label", "path", "canonical"),
+    [
+        pytest.param(
+            "ctl",
+            ["control"],
+            "ci",
+            "/jobs/x/start",
+            "/jobs/{name}/start",
+            id="control-token-on-control-post",
+        ),
+        pytest.param(
+            "apr",
+            ["approve"],
+            "oncall",
+            "/dags/d/runs/r/tasks/t/decision",
+            "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
+            id="approve-token-on-approve-route",
+        ),
+        pytest.param(
+            "ctl", ["control"], "ci", "/mcp", "/mcp", id="control-token-on-mcp"
+        ),
+    ],
+)
+async def test_matching_scope_post_reaches_the_handler(
+    token, scopes, label, path, canonical
+):
+    mw = Cron._make_auth_middleware(_table((token, scopes, label)))
     req = _ScopedReq(
-        "/dags/d/runs/r/tasks/t/decision",
-        method="POST",
-        canonical="/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision",
-        headers=_bearer("apr"),
-    )
-    assert await _run(mw, req) == "ok"
-
-
-async def test_approve_token_forbidden_on_control_post():
-    # approve implies view but NOT control.
-    mw = Cron._make_auth_middleware(_table(("apr", ["approve"], "oncall")))
-    req = _ScopedReq(
-        "/jobs/x/start",
-        method="POST",
-        canonical="/jobs/{name}/start",
-        headers=_bearer("apr"),
-    )
-    with pytest.raises(web.HTTPForbidden):
-        await _run(mw, req)
-
-
-async def test_view_token_forbidden_on_mcp():
-    mw = Cron._make_auth_middleware(_table(("viewtok", ["view"], "phone")))
-    req = _ScopedReq(
-        "/mcp", method="POST", canonical="/mcp", headers=_bearer("viewtok")
-    )
-    with pytest.raises(web.HTTPForbidden):
-        await _run(mw, req)
-
-
-async def test_control_token_allowed_on_mcp():
-    mw = Cron._make_auth_middleware(_table(("ctl", ["control"], "ci")))
-    req = _ScopedReq(
-        "/mcp", method="POST", canonical="/mcp", headers=_bearer("ctl")
+        path, method="POST", canonical=canonical, headers=_bearer(token)
     )
     assert await _run(mw, req) == "ok"
 
@@ -406,14 +424,6 @@ def test_resolve_tokens_two_scoped_duplicates_refused():
 # --------------------------------------------------------------------------
 # end-to-end over a real aiohttp app
 # --------------------------------------------------------------------------
-
-_DISABLED_JOB = """
-jobs:
-  - name: test
-    command: echo hi
-    schedule: "* * * * *"
-    enabled: false
-"""
 
 
 @pytest.mark.asyncio

@@ -29,7 +29,8 @@ The HTML document is returned with defense-in-depth security headers, including 
 strict `Content-Security-Policy` (`default-src 'self'`, `connect-src 'self'`,
 `frame-ancestors 'none'`, anti-clickjacking `X-Frame-Options: DENY`, and
 `X-Content-Type-Options: nosniff`). Any header you set under `web.headers` is
-merged on top of these defaults, so you can relax or extend them deliberately.
+merged on top of these defaults, so you can relax or extend them deliberately
+(`Content-Type` excepted: the page is always `text/html`).
 
 To expose only the REST API and **not** the dashboard, set `ui: false`:
 

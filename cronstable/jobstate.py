@@ -32,7 +32,7 @@ as the backend's own exception.
 """
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from cronstable import _json
 from cronstable.state import DOC_KEEP, StateBackend
@@ -171,7 +171,7 @@ def _check_size(kind: str, value: Any, max_bytes: int) -> None:
 
 async def kv_get(
     backend: StateBackend, scope: str, key: str
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """The stored body of ``key`` (``{key, value, updatedAt}``), or ``None``.
 
     ``None`` means the key is absent; a present key whose value is ``null`` is
@@ -190,12 +190,12 @@ async def kv_set(
     value: Any,
     *,
     max_bytes: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Set ``key`` to ``value`` (last write wins under the per-key lock)."""
     _check_size("value", value, max_bytes)
     body = {"key": key, "value": value, "updatedAt": _now()}
 
-    def _put(_current: Optional[Dict[str, Any]]) -> Tuple[Any, None]:
+    def _put(_current: Optional[dict[str, Any]]) -> tuple[Any, None]:
         return body, None
 
     await backend.mutate_document(
@@ -211,7 +211,7 @@ async def kv_delete(backend: StateBackend, scope: str, key: str) -> bool:
     )
 
 
-async def kv_list(backend: StateBackend, scope: str) -> List[Dict[str, Any]]:
+async def kv_list(backend: StateBackend, scope: str) -> list[dict[str, Any]]:
     """Every key/value body in ``scope`` (order-independent)."""
     bodies = await backend.list_documents(KV_NS_PREFIX + _require_scope(scope))
     return sorted(bodies, key=lambda b: str(b.get("key", "")))
@@ -224,7 +224,7 @@ async def kv_list(backend: StateBackend, scope: str) -> List[Dict[str, Any]]:
 
 async def cursor_get(
     backend: StateBackend, scope: str, name: str
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """The cursor body (``{name, value, updatedAt}``), or ``None`` if unset."""
     return await backend.read_document(
         CURSOR_NS_PREFIX + _require_scope(scope), name
@@ -239,7 +239,7 @@ async def cursor_advance(
     *,
     force: bool = False,
     max_bytes: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Advance cursor ``name`` toward ``value`` and return its new state.
 
     By default the advance is **monotonic**: the stored value only ever moves
@@ -258,8 +258,8 @@ async def cursor_advance(
     now = _now()
 
     def _advance(
-        current: Optional[Dict[str, Any]],
-    ) -> Tuple[Any, Dict[str, Any]]:
+        current: Optional[dict[str, Any]],
+    ) -> tuple[Any, dict[str, Any]]:
         cur = current.get("value") if current else None
         if force or cur is None:
             new = value
@@ -301,7 +301,7 @@ async def idempotency_claim(
     key: str,
     *,
     ttl: float = 0.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Claim ``key`` once, fleet-wide; return ``{"fresh": bool}``.
 
     The first caller to claim a key gets ``fresh: True`` and should do the
@@ -320,8 +320,8 @@ async def idempotency_claim(
     now = _now()
 
     def _claim(
-        current: Optional[Dict[str, Any]],
-    ) -> Tuple[Any, Dict[str, Any]]:
+        current: Optional[dict[str, Any]],
+    ) -> tuple[Any, dict[str, Any]]:
         if current is not None:
             expires = current.get("expiresAt")
             if expires is None or expires > now:
@@ -330,7 +330,7 @@ async def idempotency_claim(
                     "claimedAt": current.get("claimedAt"),
                 }
             # else: the previous claim's TTL lapsed -- fall through and re-win.
-        body: Dict[str, Any] = {"key": key, "claimedAt": now}
+        body: dict[str, Any] = {"key": key, "claimedAt": now}
         if ttl and ttl > 0:
             body["expiresAt"] = now + ttl
         return body, {"fresh": True, "claimedAt": now}
@@ -362,8 +362,8 @@ async def artifact_put(
     data: bytes,
     *,
     max_bytes: int = 0,
-    meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    meta: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Publish ``data`` under ``name``; return the artifact record.
 
     The payload is written to the content-addressed blob store (identical
@@ -385,7 +385,7 @@ async def artifact_put(
         )
     scope = _require_scope(scope)
     digest = await backend.put_blob(data)
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "name": name,
         "sha256": digest,
         "size": len(data),
@@ -401,7 +401,7 @@ async def artifact_put(
 
 async def artifact_get_record(
     backend: StateBackend, scope: str, name: str, *, strict: bool = False
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """The newest artifact record published under ``name``, or ``None``.
 
     The scan is best-effort by default: a record that cannot be read *right
@@ -453,7 +453,7 @@ async def artifact_get(
     *,
     strict: bool = False,
     max_bytes: Optional[int] = None,
-) -> Optional[Tuple[Dict[str, Any], bytes]]:
+) -> Optional[tuple[dict[str, Any], bytes]]:
     """The newest ``(record, payload)`` published under ``name``, or ``None``.
 
     ``None`` if the name was never published.  A record whose blob has since
@@ -494,13 +494,13 @@ async def artifact_get(
 
 async def artifact_list(
     backend: StateBackend, scope: str
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """The newest record for each distinct artifact name in ``scope``."""
     scope = _require_scope(scope)
     records = await backend.list_records(
         ARTIFACT_STREAM_PREFIX + scope, newest_first=True
     )
-    seen: Dict[str, Dict[str, Any]] = {}
+    seen: dict[str, dict[str, Any]] = {}
     for record in records:
         name = record.get("name")
         if isinstance(name, str) and name not in seen:
@@ -509,7 +509,7 @@ async def artifact_list(
 
 
 async def referenced_blob_digests(
-    backend: StateBackend, scopes: List[str], *, strict: bool = False
+    backend: StateBackend, scopes: list[str], *, strict: bool = False
 ) -> "set[str]":
     """Every blob digest the surviving artifact records of ``scopes`` name.
 

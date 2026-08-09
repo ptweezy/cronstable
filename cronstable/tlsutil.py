@@ -25,14 +25,10 @@ each other.
 
 import os
 import ssl
+from collections.abc import Callable, Mapping, Sequence
 from typing import (
     Any,
-    Callable,
-    Dict,
-    Mapping,
     Optional,
-    Sequence,
-    Tuple,
 )
 
 # The keys of a listener `tls:` block, in the order the rotation check stats
@@ -183,7 +179,7 @@ def build_verifying_client_ssl_context(
 # --------------------------------------------------------------------------
 
 
-def file_signature(path: str) -> Optional[Tuple[int, int]]:
+def file_signature(path: str) -> Optional[tuple[int, int]]:
     """``(st_mtime_ns, st_size)`` for ``path``, or ``None`` if it cannot be
     stat'ed.
 
@@ -202,7 +198,7 @@ def file_signature(path: str) -> Optional[Tuple[int, int]]:
 
 def tls_file_signature(
     tls: Mapping[str, Any], keys: Sequence[str]
-) -> Dict[str, Optional[Tuple[int, int]]]:
+) -> dict[str, Optional[tuple[int, int]]]:
     """A cheap on-disk fingerprint of the ``keys`` named in ``tls``.
 
     An SSL context is built once and loads the certificate and key into
@@ -215,7 +211,7 @@ def tls_file_signature(
     An absent or ``None`` entry (an optional ``clientCa``) records ``None``
     rather than raising, so an optional-material block is safe to pass whole.
     """
-    out: Dict[str, Optional[Tuple[int, int]]] = {}
+    out: dict[str, Optional[tuple[int, int]]] = {}
     for key in keys:
         path = tls.get(key)
         out[key] = file_signature(path) if path else None

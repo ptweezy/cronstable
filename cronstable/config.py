@@ -10,17 +10,13 @@ import socket
 import sys
 import types
 from collections import Counter, OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import (
     Any,
-    Dict,
-    FrozenSet,
-    List,
-    Mapping,
     NamedTuple,
     NewType,
     Optional,
-    Tuple,
     Union,  # noqa
 )
 from urllib.parse import ParseResult, urlparse
@@ -114,12 +110,12 @@ def _patch_strictyaml_seq_deepcopy() -> None:
 _patch_strictyaml_seq_deepcopy()
 
 logger = logging.getLogger("cronstable.config")
-WebConfig = NewType("WebConfig", Dict[str, Any])
-ClusterConfig = NewType("ClusterConfig", Dict[str, Any])
-StateConfig = NewType("StateConfig", Dict[str, Any])
-MCPConfig = NewType("MCPConfig", Dict[str, Any])
-JobDefaults = NewType("JobDefaults", Dict[str, Any])
-LoggingConfig = NewType("LoggingConfig", Dict[str, Any])
+WebConfig = NewType("WebConfig", dict[str, Any])
+ClusterConfig = NewType("ClusterConfig", dict[str, Any])
+StateConfig = NewType("StateConfig", dict[str, Any])
+MCPConfig = NewType("MCPConfig", dict[str, Any])
+JobDefaults = NewType("JobDefaults", dict[str, Any])
+LoggingConfig = NewType("LoggingConfig", dict[str, Any])
 
 # Defaults for an (optional) cluster block. Only applied when a `cluster`
 # section is present; see _build_cluster_config.
@@ -131,9 +127,6 @@ DEFAULT_CLUSTER = {
     #   "etcd"             - a lease-backed etcd key/election (fenced);
     #   "filesystem"       - a flock-guarded TTL lease on a shared POSIX
     #                        mount (fenced under NTP-bounded clock skew).
-    # The kubernetes/etcd backends talk to their store over plain HTTP (the
-    # core aiohttp dependency) and the filesystem backend needs only a
-    # mount, so none of them adds a runtime dependency.
     "backend": "gossip",
     "interval": 30,  # seconds between peer-attestation rounds
     "driftAfter": 3,  # reachable-but-mismatched rounds before "drifted"
@@ -144,11 +137,9 @@ DEFAULT_CLUSTER = {
     # cronstable.cluster.elect_leader.
     # Off by default so a cluster section is observe-only until opted in.
     "electLeader": False,
-    # How leader-gated jobs are distributed across the quorate cluster:
-    #   "single-leader" (default) - one elected leader runs every Leader job;
-    #   "spread"                  - per-job ownership via rendezvous hashing,
-    #                               so the work fans out across the quorate
-    #                               nodes (same quorum gate, same guarantee).
+    # How leader-gated jobs spread across the quorate cluster: "single-leader"
+    # (default, one leader runs every Leader job) or "spread" (per-job
+    # ownership via rendezvous hashing, same quorum gate and guarantee).
     # Inert unless electLeader is on; see cronstable.cluster.elect_job_owner.
     "distribution": "single-leader",
 }
@@ -156,7 +147,7 @@ DEFAULT_CLUSTER = {
 # Defaults merged over a `cluster.kubernetes` block (backend: kubernetes). The
 # values mirror client-go's leaderelection defaults; see
 # cronstable.backends.kubernetes.
-DEFAULT_K8S: Dict[str, Any] = {
+DEFAULT_K8S: dict[str, Any] = {
     "leaseName": "cronstable-leader",
     # None -> the in-cluster service-account namespace file at runtime.
     "leaseNamespace": None,
@@ -165,11 +156,9 @@ DEFAULT_K8S: Dict[str, Any] = {
     "retryPeriodSeconds": 2,
     "identity": None,  # None -> nodeName
     "kubeconfig": None,  # for out-of-cluster / local (Docker) testing
-    # override the apiserver URL (e.g. point at a kube-rbac-proxy sidecar);
-    # must be https. Wins on BOTH credential paths and both transports:
-    # in-cluster it keeps the ServiceAccount token/CA, and with kubeconfig set
-    # it overrides the kubeconfig's cluster.server while keeping its
-    # credentials (see backends.kubernetes._setup_sync/_load_kubeconfig).
+    # override the apiserver URL (e.g. a kube-rbac-proxy sidecar); must be
+    # https. Wins on both credential paths while keeping their credentials
+    # (see backends.kubernetes._setup_sync/_load_kubeconfig).
     "apiServer": None,
     # auto (native `kubernetes` client if importable, else hand-rolled HTTP) |
     # library (require the native client) | http (force hand-rolled).
@@ -178,7 +167,7 @@ DEFAULT_K8S: Dict[str, Any] = {
 
 # Defaults merged over a `cluster.etcd` block (backend: etcd). See
 # cronstable.backends.etcd.
-DEFAULT_ETCD: Dict[str, Any] = {
+DEFAULT_ETCD: dict[str, Any] = {
     "endpoints": ["http://127.0.0.1:2379"],
     "electionName": "cronstable/leader",
     "ttl": 15,  # lease time-to-live, seconds
@@ -190,10 +179,9 @@ DEFAULT_ETCD: Dict[str, Any] = {
 }
 
 # Defaults merged over a `cluster.filesystem` block (backend: filesystem):
-# leader election over a shared POSIX mount (Amazon S3 Files / EFS / NFS),
-# using the same flock-guarded TTL lease the durable state store uses -- no
-# coordination service at all. See cronstable.backends.filesystem.
-DEFAULT_FILESYSTEM: Dict[str, Any] = {
+# leader election via a flock-guarded TTL lease on a shared POSIX mount.
+# See cronstable.backends.filesystem.
+DEFAULT_FILESYSTEM: dict[str, Any] = {
     # required: the directory the election lease lives in. Point it at the
     # same mount (and deploymentId) as the `state` section to keep one
     # coordination surface per deployment.
@@ -213,96 +201,71 @@ DEFAULT_FILESYSTEM: Dict[str, Any] = {
 # Defaults for an (optional) state block. Only applied when a `state` section
 # is present; see _build_state_config. cronstable is stateless by default, so
 # the whole section is absent unless the user opts in.
-DEFAULT_STATE: Dict[str, Any] = {
-    # required: the directory the durable store lives in. A local path gives
-    # single-node durability; an Amazon S3 Files / EFS mount gives durability
-    # plus fleet-wide coordination -- the same POSIX backend either way, the
-    # mount decides the reach. Enforced non-empty in _build_state_config.
+DEFAULT_STATE: dict[str, Any] = {
+    # required: the directory the durable store lives in; a shared mount adds
+    # fleet-wide coordination. Enforced non-empty in _build_state_config.
     "path": None,
     # auto (probe the mount) | single-node | shared. Gates whether cross-node
-    # coordination may be offered; auto detects a shared network mount
-    # (NFS/EFS/S3 Files) and otherwise assumes single-node.
-    # See cronstable.state.
+    # coordination may be offered; see cronstable.state.
     "topology": "auto",
     # optional stable prefix so several deployments can share one store/bucket
     # without colliding or cross-reading; None -> the "default" namespace.
     "deploymentId": None,
-    # how many finished runs to retain durably per job (the durable analogue of
-    # the in-memory history ring); the ledger is pruned to this after each
-    # append. <= 0 disables pruning (unbounded; rely on an external lifecycle
-    # rule). Durable retention is larger than the in-memory window on purpose.
+    # finished runs retained durably per job; the ledger is pruned to this
+    # after each append. <= 0 disables pruning (unbounded).
     "maxRunsPerJob": 1000,
-    # what the STATEFUL features do while the store is configured but
-    # unavailable (down, unreadable, hung). "degrade" (default) falls back to
-    # the in-memory behaviour: durable-truth gates fail open and writes are
-    # dropped with a warning (and counted). "fail-closed" prefers not running
-    # over possibly running wrong: the onlyIfLastSucceeded gate blocks, a
-    # due durable retry defers until the store answers, and an unverifiable
-    # @reboot boot marker skips the boot run. Plain scheduled fires are never
-    # gated on the store under either policy.
+    # what the STATEFUL features do while the store is unavailable: "degrade"
+    # (default) fails durable-truth gates open and drops writes with a
+    # warning; "fail-closed" blocks the onlyIfLastSucceeded gate, defers due
+    # durable retries and skips an unverifiable @reboot run. Plain scheduled
+    # fires are never gated on the store under either policy.
     "onStoreUnavailable": "degrade",
-    # age (seconds) past which durable state belonging to a job that no
-    # recent manifest references (no node's loaded config under this
-    # deploymentId has mentioned it for this long) is garbage collected.
-    # <= 0 disables automatic GC. Defaults to 7 days -- long enough that a
-    # briefly-removed job, or a fleet node down for a long weekend, keeps
-    # its history.
+    # age (seconds) past which durable state no recent manifest references is
+    # garbage collected; <= 0 disables GC. Defaults to 7 days so a briefly
+    # removed job (or a node down for a long weekend) keeps its history.
     "gcGraceSeconds": 604800,
-    # upper bound on store operations per second (a token bucket over every
-    # backend call), for request-rate/cost control on mounts that bill per
-    # request. 0 disables (no throttling). Lease operations (coordination)
-    # bypass the bucket: a renew queued behind bulk writes could overshoot
-    # its TTL and double-run the job the lease fences.
+    # token-bucket cap on store operations per second (0 disables). Lease
+    # operations bypass the bucket: a renew queued behind bulk writes could
+    # overshoot its TTL and double-run the job the lease fences.
     "maxOpsPerSecond": 0,
-    # TTL (seconds) of the per-job concurrency slot lease taken for
-    # concurrencyScope: cluster jobs. Renewed at a third of this while the
-    # job runs; on a crash the slot frees itself after at most this long.
-    # Floor 5 (enforced): a tiny TTL leaves no room for renew latency on a
-    # network mount and would expire live holders.
+    # TTL (seconds) of the concurrencyScope: cluster slot lease, renewed at a
+    # third of this while the job runs. Floor 5 (enforced): a tiny TTL leaves
+    # no room for renew latency and would expire live holders.
     "slotTtlSeconds": 30,
-    # the job-facing state API: the loopback HTTP endpoint + the
-    # `cronstable state|cursor|lock|artifact|idempotent|secret` job commands.
-    # Merged (not replaced) over DEFAULT_JOB_API in _build_state_config, so a
-    # partial `jobApi:` block keeps the untouched defaults. See the defaults.
+    # the job-facing state API (loopback endpoint + job commands). Merged
+    # (not replaced) over DEFAULT_JOB_API in _build_state_config, so a
+    # partial `jobApi:` block keeps the untouched defaults.
     "jobApi": None,
 }
 
 # Defaults for the state.jobApi sub-section. Present only when a `state`
 # section is (the loopback endpoint has no store to talk to otherwise). See
 # cronstable.jobapi / cronstable.jobstate.
-DEFAULT_JOB_API: Dict[str, Any] = {
+DEFAULT_JOB_API: dict[str, Any] = {
     # run the loopback endpoint and inject its address/token into every job's
     # environment. On by default when `state` is configured; set false to keep
     # the durable store's scheduler features but expose nothing to jobs.
     "enabled": True,
-    # override the loopback bind, as an `http://host:port` URL. None (default)
-    # binds an OS-assigned ephemeral port on 127.0.0.1 -- reachable only from
-    # this host's job processes, which is what the per-run token then scopes.
-    # A unix:// path is not accepted here: the job CLI reaches the endpoint
-    # over stdlib urllib, which speaks TCP only.
+    # override the loopback bind (`http://host:port`); None binds an
+    # OS-assigned ephemeral port on 127.0.0.1. A unix:// path is not accepted:
+    # the job CLI reaches the endpoint over stdlib urllib, TCP only.
     "listen": None,
     # upper bound (bytes) on a single KV / cursor value; a larger set is
-    # refused (HTTP 413). Keeps a runaway job from filling the store one
-    # oversized document at a time.
+    # refused (HTTP 413).
     "maxValueBytes": 1024 * 1024,
     # upper bound (bytes) on a single artifact payload; a larger put is
     # refused (HTTP 413).
     "maxArtifactBytes": 64 * 1024 * 1024,
-    # TTL (seconds) of a job mutex/semaphore lease. The daemon holds the lease
-    # on the run's behalf and renews it at a third of this; if the job (or the
-    # daemon) dies the lock frees itself after at most this long. Floor 5, like
-    # slotTtlSeconds, for the same renew-latency reason.
+    # TTL (seconds) of a job mutex/semaphore lease, renewed at a third of
+    # this on the run's behalf. Floor 5, like slotTtlSeconds.
     "lockTtlSeconds": 30,
-    # explicit opt-in required for a `listen` host that is not loopback. The
-    # endpoint serves per-run bearer tokens and staged job secrets, so binding
-    # it to a routable interface without this set would serve them to anything
-    # that can reach the port. Pair it with `tls` below to encrypt them.
+    # explicit opt-in required for a non-loopback `listen` host: the endpoint
+    # serves per-run bearer tokens and staged job secrets. Pair it with `tls`
+    # below to encrypt them.
     "allowNonLoopbackBind": False,
-    # native TLS for an `https://` listen. `cert` + `key` are all-or-nothing.
-    # `ca` is the trust anchor path handed to jobs as CRONSTABLE_STATE_CACERT,
-    # so the job CLI can verify a certificate no public root signed (the
-    # normal case for an internally-issued one). Empty by default: the
-    # endpoint is loopback and plaintext unless the operator asks otherwise.
+    # native TLS for an `https://` listen. `cert` + `key` are all-or-nothing;
+    # `ca` is the trust anchor handed to jobs as CRONSTABLE_STATE_CACERT so
+    # the job CLI can verify an internally-issued certificate.
     "tls": {"cert": None, "key": None, "ca": None},
 }
 
@@ -315,35 +278,26 @@ MCP_TOOLSETS = ("observe", "act", "dags", "state")
 # listeners (it reuses their auth + lifecycle), so it is inert without a `web`
 # section; `enabled` defaults false so a plain install pays nothing. See
 # cronstable.mcp.
-DEFAULT_MCP: Dict[str, Any] = {
+DEFAULT_MCP: dict[str, Any] = {
     # serve the Model Context Protocol endpoint (POST /mcp) on the web
     # listeners, and expose the `cronstable mcp` stdio bridge. Off by default.
     "enabled": False,
-    # strip every mutating tool (run/cancel a job, trigger/backfill a DAG,
-    # decide an approval gate). On by default: an agent gets read-only access
-    # unless the operator deliberately opts into control. Takes precedence over
-    # `toolsets` -- `act` is suppressed while this is true.
+    # strip every mutating tool. On by default; takes precedence over
+    # `toolsets` (`act` is suppressed while this is true).
     "readOnly": True,
-    # which tool groups to expose. `observe` (read-only job/cluster/metrics
-    # views) is the safe default; add `dags`, `state`, and -- with
-    # readOnly:false -- `act`.
+    # which tool groups to expose; `observe` (read-only) is the safe default.
     "toolsets": ["observe"],
-    # exact-match browser Origins allowed to call /mcp. Empty (default) serves
-    # non-browser clients only: a present Origin not on this list is refused
-    # (403, a DNS-rebinding defense); a non-empty list additionally answers
-    # CORS preflight with a scoped Access-Control-Allow-Origin.
+    # exact-match browser Origins allowed to call /mcp; a present Origin not
+    # on the list is refused (403, a DNS-rebinding defense). A non-empty list
+    # additionally answers CORS preflight.
     "allowedOrigins": [],
     # serve /mcp on a routable listener even when no web.authToken is set.
-    # Fail-closed default (false): with no token the app has no auth middleware
-    # at all, so an enabled /mcp on a non-loopback address would be wide open.
-    # Set true only when the endpoint is protected by other means (an
-    # mTLS-terminating reverse proxy, a network policy).
+    # Fail-closed default: with no token the app has no auth middleware at
+    # all. Set true only when the endpoint is protected by other means.
     "allowUnauthenticated": False,
-    # expose MCP resources (URI-addressable read-only context, e.g.
-    # cronstable://status) and prompts (canned triage playbooks). Both are
-    # read-only and safe; turn either off for a tools-only profile or a client
-    # that mishandles them. Their scope follows `toolsets` (a dag resource is
-    # served only when the `dags` toolset is on, etc).
+    # expose MCP resources (read-only context, e.g. cronstable://status) and
+    # prompts (canned triage playbooks); both read-only, scope follows
+    # `toolsets`.
     "resources": True,
     "prompts": True,
     # optional free-text `instructions` surfaced to the client at initialize
@@ -493,11 +447,9 @@ _REPORT_DEFAULTS = {
     "shell": {
         "shell": platform.DEFAULT_SHELL,
         "command": None,
-        # hard bound (seconds) on the reporter command. Reports run INLINE on
-        # the reaper -- the daemon's single job-completion loop -- so a notify
-        # script that never exits (curl with no --max-time, a read from stdin)
-        # would otherwise freeze completion handling for every job in the
-        # daemon. On expiry the reporter's whole process group is killed.
+        # hard bound (seconds) on the reporter command: reports run INLINE on
+        # the reaper, so a script that never exits would freeze completion
+        # handling for every job. On expiry the process group is killed.
         "timeout": DEFAULT_REPORT_SHELL_TIMEOUT,
     },
     "webhook": {
@@ -517,24 +469,20 @@ _REPORT_DEFAULTS = {
 }
 
 
-DEFAULT_CONFIG: Dict[str, Any] = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "shell": platform.DEFAULT_SHELL,
     "concurrencyPolicy": "Allow",
-    # how far concurrencyPolicy reaches: "node" (default, classic behaviour:
-    # only this process's running instances are considered) or "cluster"
-    # (Forbid/Replace also exclude instances on OTHER nodes sharing the
-    # `state` store, via a TTL slot lease on the shared mount). Requires a
-    # `state` section; Allow+cluster is refused as inert. See
-    # cronstable.cron.maybe_launch_job.
+    # how far concurrencyPolicy reaches: "node" (default) or "cluster"
+    # (Forbid/Replace also exclude instances on other nodes via a TTL slot
+    # lease on the shared `state` store). Requires a `state` section;
+    # Allow+cluster is refused as inert. See cronstable.cron.maybe_launch_job.
     "concurrencyScope": "node",
     # where this job runs under cluster leader election (inert unless
     # cluster.electLeader is set); see cronstable.cron._cluster_allows.
     "clusterPolicy": "Leader",
-    # missed-run catch-up on restart (requires a `state` backend for the
-    # durable last-run watermark; inert without one). skip (default, classic
-    # behaviour: occurrences missed while down are not run) | run-once (fire
-    # once to catch up, coalescing all missed slots) | run-all (replay each
-    # missed occurrence). See cronstable.cron._catch_up.
+    # missed-run catch-up on restart (inert without a `state` backend):
+    # skip (default) | run-once (coalesce all missed slots into one fire) |
+    # run-all (replay each missed occurrence). See cronstable.cron._catch_up.
     "onMissed": "skip",
     # only occurrences missed within this many seconds are caught up; None (the
     # default) means no deadline. Bounds run-all to a recent window so a long
@@ -544,24 +492,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # seconds (deterministic per job name) so a fleet of jobs does not all fire
     # at once on restart. 0 (default) fires them together.
     "catchupJitterSeconds": 0,
-    # depends-on-past guard: skip a scheduled fire when the job's previous
-    # durable run did not succeed (Airflow depends_on_past). Requires a `state`
-    # backend for the durable outcome; inert without one. See
-    # cronstable.cron._depends_on_past_ok.
+    # depends-on-past guard: skip a scheduled fire when the previous durable
+    # run did not succeed (Airflow depends_on_past; inert without a `state`
+    # backend). See cronstable.cron._depends_on_past_ok.
     "onlyIfLastSucceeded": False,
-    # archive each finished run's captured output to the `state` store (opt-in;
-    # requires a state backend). Encryption-at-rest is the mount's job (EFS/S3
-    # SSE, an encrypted volume); this writes the captured lines, redacted.
+    # archive each finished run's captured output to the `state` store
+    # (opt-in; encryption-at-rest is the mount's job).
     "archiveOutput": False,
-    # scrub common secrets (tokens, passwords, keys, auth URLs) from archived
-    # output before it is written. On by default; captured stdout/stderr
-    # routinely carries credentials. Only applies when archiveOutput is set.
+    # scrub common secrets from archived output before it is written. On by
+    # default; only applies when archiveOutput is set.
     "redactArchivedSecrets": True,
-    # sample each run's CPU time and peak resident memory (opt-in; needs the
-    # psutil-backed sampler, see cronstable.resources). Observability only: the
-    # numbers ride the run record into the web UI, /metrics and statsd but
-    # never change a run's success/failure verdict. Off by default -- it spawns
-    # a lightweight sampling task per running instance.
+    # sample each run's CPU time and peak resident memory (opt-in; see
+    # cronstable.resources). Observability only: never changes a run's
+    # success/failure verdict.
     "monitorResources": False,
     "captureStderr": True,
     "captureStdout": False,
@@ -603,11 +546,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # {name, value|fromFile|fromEnvVar}. Resolved fresh per run, never durably
     # stored. Inert without a `state` section with jobApi enabled.
     "secrets": [],
-    # extra scope names (besides this job's own name and the conventional
-    # `global` namespace) this job's loopback state calls may explicitly
-    # name. Without an entry here, a `--scope OTHER` naming any other job's
-    # own name is refused (403) rather than reaching that job's private
-    # state. See cronstable.jobapi.JobStateAPI._scope.
+    # extra scope names this job's loopback state calls may explicitly name;
+    # without an entry, a `--scope` naming another job's own name is refused
+    # (403). See cronstable.jobapi.JobStateAPI._scope.
     "stateAllowedScopes": [],
     "env_file": None,
     "executionTimeout": None,
@@ -630,7 +571,7 @@ _late_report["sentry"]["fingerprint"] = ["cronstable", "sla", "{{ name }}"]
 del _late_report
 
 
-def _onlate_names_a_destination(on_late: Dict[str, Any]) -> bool:
+def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
     """Whether an ``onLate`` block would actually report anything.
 
     A reporter left at its all-None defaults is not "configured": only an
@@ -673,7 +614,7 @@ if _onlate_names_a_destination(  # pragma: no cover - dev invariant
 # _REPORT_DEFAULTS (a deepcopy) so a daemon event's wording never leaks into a
 # job's report block or its fingerprint, and give events their own sentry
 # grouping keyed on the event name.
-_NOTIFY_REPORT_DEFAULTS: Dict[str, Any] = copy.deepcopy(_REPORT_DEFAULTS)
+_NOTIFY_REPORT_DEFAULTS: dict[str, Any] = copy.deepcopy(_REPORT_DEFAULTS)
 _NOTIFY_REPORT_DEFAULTS["mail"]["subject"] = DEFAULT_NOTIFY_SUBJECT_TEMPLATE
 _NOTIFY_REPORT_DEFAULTS["mail"]["body"] = DEFAULT_NOTIFY_BODY_TEMPLATE
 _NOTIFY_REPORT_DEFAULTS["webhook"]["body"] = (
@@ -772,6 +713,22 @@ _report_schema = Map(
     }
 )
 
+# A schedule is a crontab string or the map form below.  An explicit second
+# opts into second-level scheduling (see schedule_object_to_crontab /
+# cronstable.cron).  One shared fragment: jobs (where schedule is required)
+# and DAGs (where it is optional) accept exactly the same shapes.
+_schedule_schema = Str() | Map(
+    {
+        Opt("second"): Str(),
+        Opt("minute"): Str(),
+        Opt("hour"): Str(),
+        Opt("dayOfMonth"): Str(),
+        Opt("month"): Str(),
+        Opt("year"): Str(),
+        Opt("dayOfWeek"): Str(),
+    }
+)
+
 _job_defaults_common = {
     Opt("shell"): Str(),
     Opt("concurrencyPolicy"): Enum(["Allow", "Forbid", "Replace"]),
@@ -832,12 +789,9 @@ _job_defaults_common = {
     ),
     Opt("onLate"): Map({Opt("report"): _report_schema}),
     Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
-    # run-scoped secrets: each is resolved fresh per run and served
-    # to the job over the loopback endpoint (`cronstable
-    # secret get NAME`) rather
-    # than placed in the environment, so it never shows in /proc/<pid>/environ
-    # or a `ps -E`. The same value/fromFile/fromEnvVar source triple every
-    # other secret uses. Needs a `state` section with jobApi enabled.
+    # run-scoped secrets, resolved fresh per run and served over the loopback
+    # endpoint rather than the environment (never shows in
+    # /proc/<pid>/environ). Needs a `state` section with jobApi enabled.
     Opt("secrets"): Seq(
         Map(
             {
@@ -872,21 +826,7 @@ _job_schema_dict.update(
     {
         "name": Str(),
         "command": Str() | Seq(Str()),
-        "schedule": Str()
-        | Map(
-            {
-                # An explicit second opts the job into second-level scheduling
-                # (see schedule_object_to_crontab / cronstable.cron). Omit it
-                # and the schedule stays minute-granular, exactly as before.
-                Opt("second"): Str(),
-                Opt("minute"): Str(),
-                Opt("hour"): Str(),
-                Opt("dayOfMonth"): Str(),
-                Opt("month"): Str(),
-                Opt("year"): Str(),
-                Opt("dayOfWeek"): Str(),
-            }
-        ),
+        "schedule": _schedule_schema,
     }
 )
 
@@ -895,55 +835,46 @@ _job_schema_dict.update(
 # the DAG-node fields (id, dependsOn edges, node type, per-task retries,
 # dynamic mapping, sensor poke schedule, approval reject policy).  ``command``
 # is optional only for an approval gate (which runs no subprocess).
+# The launch fields are taken from _job_defaults_common by name so the two
+# schemas cannot drift; the job fields NOT named here (scheduling, concurrency,
+# the onFailure retry ladder) stay job-only because a task's cadence and
+# attempts are graph-driven.
+_DAG_TASK_LAUNCH_KEYS = frozenset(
+    {
+        "shell",
+        "environment",
+        "captureStderr",
+        "captureStdout",
+        "monitorResources",
+        "saveLimit",
+        "maxLineLength",
+        "streamPrefix",
+        "failsWhen",
+        "executionTimeout",
+        "killTimeout",
+        "statsd",
+        "user",
+        "group",
+        "env_file",
+        "secrets",
+        "stateAllowedScopes",
+        "onSuccess",
+    }
+)
 _dag_task_launch_fields = {
-    Opt("shell"): Str(),
-    Opt("environment"): Seq(Map({"key": Str(), "value": Str()})),
-    Opt("captureStderr"): Bool(),
-    Opt("captureStdout"): Bool(),
-    Opt("monitorResources"): Bool()
-    | Map(
-        {
-            Opt("enabled"): Bool(),
-            Opt("interval"): Float(),
-            Opt("history"): Int(),
-        }
-    ),
-    Opt("saveLimit"): Int(),
-    Opt("maxLineLength"): Int(),
-    Opt("streamPrefix"): Str(),
-    Opt("failsWhen"): Map(
-        {
-            "producesStdout": Bool(),
-            Opt("producesStderr"): Bool(),
-            Opt("nonzeroReturn"): Bool(),
-            Opt("always"): Bool(),
-        }
-    ),
-    Opt("executionTimeout"): Float(),
-    Opt("killTimeout"): Float(),
-    Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
-    Opt("user"): Int() | Str(),
-    Opt("group"): Int() | Str(),
-    Opt("env_file"): Str(),
-    Opt("secrets"): Seq(
-        Map(
-            {
-                "name": Str(),
-                Opt("value"): EmptyNone() | Str(),
-                Opt("fromFile"): EmptyNone() | Str(),
-                Opt("fromEnvVar"): EmptyNone() | Str(),
-            }
-        )
-    ),
-    Opt("stateAllowedScopes"): Seq(Str()),
-    # Per-task run reporting: report-only (no `retry` key, unlike a job's
-    # onFailure): a task's attempts are graph-driven (the DAG node's
-    # `retries`), so a job-level retry ladder here would be dead config
-    # presented as live. An inherited `defaults:` onFailure.retry is likewise
-    # inert for tasks. Fired by Cron._handle_finished_dag_task per task run.
-    Opt("onFailure"): Map({Opt("report"): _report_schema}),
-    Opt("onSuccess"): Map({Opt("report"): _report_schema}),
+    key: validator
+    for key, validator in _job_defaults_common.items()
+    if key.key in _DAG_TASK_LAUNCH_KEYS
 }
+_missing_launch_keys = _DAG_TASK_LAUNCH_KEYS.difference(
+    key.key for key in _dag_task_launch_fields
+)
+if _missing_launch_keys:  # pragma: no cover - dev invariant
+    raise RuntimeError(
+        "config: _DAG_TASK_LAUNCH_KEYS names fields _job_defaults_common "
+        "no longer defines, so the DAG-task schema would silently drop "
+        "them: {}".format(", ".join(sorted(_missing_launch_keys)))
+    )
 
 _dag_task_schema_dict = dict(_dag_task_launch_fields)
 _dag_task_schema_dict.update(
@@ -960,23 +891,16 @@ _dag_task_schema_dict.update(
         Opt("pokeTimeoutSeconds"): Int() | Float(),
         Opt("pokeJitterSeconds"): Int() | Float(),
         Opt("onReject"): Enum(["fail", "skip"]),
+        # Report-only, unlike the job-level onFailure (no `retry` key): a
+        # task's attempts are graph-driven, so a retry ladder here would be
+        # dead config. Fired by Cron._handle_finished_dag_task per task run.
+        Opt("onFailure"): Map({Opt("report"): _report_schema}),
     }
 )
 
 _dag_schema_dict = {
     "name": Str(),
-    Opt("schedule"): Str()
-    | Map(
-        {
-            Opt("second"): Str(),
-            Opt("minute"): Str(),
-            Opt("hour"): Str(),
-            Opt("dayOfMonth"): Str(),
-            Opt("month"): Str(),
-            Opt("year"): Str(),
-            Opt("dayOfWeek"): Str(),
-        }
-    ),
+    Opt("schedule"): _schedule_schema,
     Opt("timezone"): Str(),
     Opt("utc"): Bool(),
     Opt("onMissed"): Enum(["skip", "run-once", "run-all"]),
@@ -988,12 +912,10 @@ _dag_schema_dict = {
     "tasks": Seq(Map(_dag_task_schema_dict)),
 }
 
-# Bearer-token scopes for the web control API (web.authTokens[].scopes).
-# `view` = every read-only GET; `control` = the mutating POST endpoints
-# (start/cancel/pause/resume/trigger/backfill); `approve` = the DAG
-# approval-gate decision only. Holding `control` or `approve` implies `view`
-# (an action UI must read state first). The scalar web.authToken is an
-# all-scopes ("god") token. Enforcement lives in
+# Bearer-token scopes for the web control API (web.authTokens[].scopes):
+# `view` = read-only GETs; `control` = mutating POSTs; `approve` = the DAG
+# approval decision only. `control`/`approve` imply `view`; the scalar
+# web.authToken is all-scopes. Enforcement lives in
 # cronstable.cron.Cron._make_auth_middleware / _required_web_scope.
 WEB_TOKEN_SCOPES = ("view", "control", "approve")
 
@@ -1007,11 +929,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 "listen": Seq(Str()),
                 Opt("headers"): MapPattern(Str(), Str()),
                 # extra exact-match browser Origins allowed to call the
-                # MUTATING web endpoints (start/cancel/trigger/...). Same-
-                # origin requests (the served dashboard) and clients that
-                # send no Origin (curl, monitoring) always pass; a foreign
-                # Origin is refused (403) as a CSRF/DNS-rebinding defense,
-                # mirroring mcp.allowedOrigins. See
+                # MUTATING web endpoints. Same-origin and no-Origin clients
+                # always pass; a foreign Origin is refused (403) as a
+                # CSRF/DNS-rebinding defense. See
                 # cronstable.cron.Cron._make_origin_middleware.
                 Opt("allowedOrigins"): Seq(Str()),
                 # optional opt-in bearer-token auth for the web API
@@ -1022,14 +942,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("fromEnvVar"): EmptyNone() | Str(),
                     }
                 ),
-                # additional per-device *scoped* bearer tokens, so a phone or
-                # a wallboard need not carry the all-scopes `authToken` above.
-                # Each entry resolves its secret from the same
-                # value/fromFile/fromEnvVar sources, carries a `scopes` list
-                # (view / control / approve; control and approve imply view)
-                # and an optional `label` used to identify and revoke it (drop
-                # the entry and reload). Written block-style (strictyaml
-                # rejects flow lists). See
+                # additional per-device *scoped* bearer tokens (same
+                # value/fromFile/fromEnvVar sources, a `scopes` list, an
+                # optional `label` for revocation). Written block-style
+                # (strictyaml rejects flow lists). See
                 # cronstable.cron.Cron._resolve_web_tokens.
                 Opt("authTokens"): Seq(
                     Map(
@@ -1044,14 +960,12 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 ),
                 # octal permissions to apply to a unix:// listen socket
                 Opt("socketMode"): Str(),
-                # native TLS for the `https://` entries in `listen`.
-                # `cert`/`key` are required together and serve every https://
-                # address; http:// and unix:// entries stay plaintext on the
-                # same runner. `clientCa` additionally REQUIRES a client
-                # certificate signed by that CA (mutual TLS), so the CA file
-                # is the caller allowlist: point it at a dedicated CA, never
-                # a shared organisational one. An in-place rotation of these
-                # files is noticed and restarts the listener; see
+                # native TLS for the `https://` entries in `listen`;
+                # `cert`/`key` required together. `clientCa` additionally
+                # REQUIRES a client certificate signed by that CA (mutual
+                # TLS): the CA file is the caller allowlist, so point it at
+                # a dedicated CA, never a shared organisational one. In-place
+                # rotation restarts the listener; see
                 # cronstable.cron.Cron._web_tls_files_changed.
                 Opt("tls"): Map(
                     {
@@ -1062,11 +976,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 ),
                 # serve the browser dashboard at "/" (default true)
                 Opt("ui"): Bool(),
-                # native Prometheus exposition at GET /metrics (default on
-                # whenever the web API is on). `metrics: false` disables it;
-                # the map form additionally exempts /metrics from authToken
-                # (public) and overrides the duration-histogram buckets.
-                # See cronstable/prometheus.py.
+                # Prometheus exposition at GET /metrics (default on). The map
+                # form can make /metrics public (no authToken) and override
+                # the histogram buckets. See cronstable/prometheus.py.
                 Opt("metrics"): Bool()
                 | Map(
                     {
@@ -1075,10 +987,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("durationBuckets"): Seq(Float()),
                     }
                 ),
-                # background node CPU/memory history ring for the dashboard's
-                # node chart (GET /node/history). On by default whenever the
-                # web API is on; `nodeHistory: false` disables the sampling
-                # task, the map form tunes cadence and window size.
+                # node CPU/memory history ring for the dashboard's node chart
+                # (GET /node/history). On by default; the map form tunes
+                # cadence and window size.
                 Opt("nodeHistory"): Bool()
                 | Map(
                     {
@@ -1087,13 +998,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("points"): Int(),
                     }
                 ),
-                # opt-in zero-config LAN discovery: advertise the web API as
-                # a `_cronstable._tcp` mDNS/Bonjour service so a companion
-                # app on the same network finds the daemon without a typed
-                # URL. Off by default; needs the `discovery` extra
-                # (python-zeroconf) and at least one TCP listen address.
-                # The map form overrides the advertised instance name.
-                # See cronstable.discovery.
+                # opt-in mDNS/Bonjour advert of the web API
+                # (`_cronstable._tcp`). Needs the `discovery` extra and a
+                # TCP listen address; the map form overrides the instance
+                # name. See cronstable.discovery.
                 Opt("bonjour"): Bool()
                 | Map(
                     {
@@ -1103,11 +1011,9 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 ),
             }
         ),
-        # Optional MCP (Model Context Protocol) server: expose jobs, DAGs,
-        # cluster/fleet, metrics and durable state to AI agents as MCP tools,
-        # served on the web listeners (POST /mcp) and over a stdio bridge.
-        # Every field is optional; defaults live in DEFAULT_MCP. Off unless
-        # `enabled: true`. See cronstable.mcp.
+        # Optional MCP server: expose jobs/DAGs/cluster/state as MCP tools on
+        # the web listeners (POST /mcp) and a stdio bridge. Defaults live in
+        # DEFAULT_MCP; off unless `enabled: true`. See cronstable.mcp.
         Opt("mcp"): EmptyDict()
         | Map(
             {
@@ -1124,12 +1030,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
             }
         ),
         # Optional cluster section: gate scheduled jobs on a leadership
-        # backend. The gossip backend (default) attests the job set against a
-        # static peer list over mutual TLS (see cronstable.cluster); the
-        # kubernetes/etcd backends use a lease store (see cronstable.backends).
-        # listen/tls/peers are required for gossip only -- enforced in
-        # _build_cluster_config, not the schema, so a lease backend need not
-        # carry them.
+        # backend (gossip mesh or a lease store; see cronstable.cluster /
+        # .backends). listen/tls/peers are required for gossip only, enforced
+        # in _build_cluster_config rather than the schema so a lease backend
+        # need not carry them.
         Opt("cluster"): Map(
             {
                 # gossip (default) | kubernetes | etcd | filesystem
@@ -1209,18 +1113,13 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                     }
                 ),
                 # --- observability overlay: gossip as a secondary data plane -
-                # Share per-node CPU/memory (and job summaries) across the
-                # cluster for the dashboard's fleet view, independent of which
-                # backend owns election. With backend: gossip the election mesh
-                # already carries it, so this is an empty marker that just opts
-                # into node-stats sharing (listen/tls/peers are rejected as
-                # redundant, and the overlay tuning keys nodeName/interval/
-                # driftAfter/connectTimeout as lease-backend-only).
-                # With a lease backend (kubernetes/etcd/filesystem)
-                # it stands up a dedicated, election-inert gossip mesh, so it
-                # requires listen/tls/peers just like backend: gossip does. See
-                # cronstable.cron.start_stop_observability and the overlay
-                # build in _build_cluster_config.
+                # Share per-node CPU/memory across the cluster for the fleet
+                # view. Under backend: gossip the election mesh already
+                # carries it (transport and tuning keys are rejected); under
+                # a lease backend this stands up a dedicated election-inert
+                # gossip mesh, so listen/tls/peers are required. See
+                # cronstable.cron.start_stop_observability and
+                # _attach_observability.
                 Opt("observability"): Map(
                     {
                         Opt("shareNodeStats"): Bool(),
@@ -1241,12 +1140,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 ),
             }
         ),
-        # Optional state section: an opt-in durable store (a local filesystem
-        # path or an Amazon S3 Files / EFS mount -- the same POSIX backend
-        # either way) enabling restart-durable history, missed-run catch-up
-        # and, on a shared mount, HA coordination. Stateless by default: absent
-        # this section cronstable keeps everything in memory exactly as before.
-        # See cronstable.state.
+        # Optional state section: an opt-in durable store (local path or
+        # shared POSIX mount) enabling durable history, missed-run catch-up
+        # and, on a shared mount, HA coordination. Absent, everything stays
+        # in memory. See cronstable.state.
         Opt("state"): Map(
             {
                 "path": Str(),
@@ -1268,12 +1165,10 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                         Opt("maxArtifactBytes"): Int(),
                         Opt("lockTtlSeconds"): Int() | Float(),
                         Opt("allowNonLoopbackBind"): Bool(),
-                        # native TLS for an `https://` listen. Only meaningful
-                        # alongside allowNonLoopbackBind: a loopback endpoint
-                        # is already unreachable off-host. Note `ca` here is
-                        # the CLIENT-side trust anchor handed to jobs as
-                        # CRONSTABLE_STATE_CACERT, the opposite direction from
-                        # web.tls.clientCa (which authenticates callers).
+                        # native TLS for an `https://` listen. Note `ca` here
+                        # is the CLIENT-side trust anchor handed to jobs as
+                        # CRONSTABLE_STATE_CACERT, the opposite direction
+                        # from web.tls.clientCa (which authenticates callers).
                         Opt("tls"): Map(
                             {
                                 Opt("cert"): EmptyNone() | Str(),
@@ -1298,22 +1193,17 @@ CONFIG_SCHEMA = EmptyDict() | Map(
                 Opt("root"): YamlAny(),
             }
         ),
-        # Optional daemon-level event notifications: fan DAG failures, approval
-        # gates awaiting a decision, and leadership/quorum changes out to the
-        # same reporters a job uses.  `report` reuses the job report schema;
-        # `events` is an optional allow-list (default = every event).  See
-        # cronstable.cron.Cron._dispatch_notify.
+        # Optional daemon-level event notifications: fan NOTIFY_EVENTS out to
+        # the same reporters a job uses.  `events` is an optional allow-list
+        # (default = every event).  See cronstable.cron.Cron._dispatch_notify.
         Opt("notify"): Map(
             {
                 Opt("events"): Seq(Enum(list(NOTIFY_EVENTS))),
                 Opt("report"): _report_schema,
             }
         ),
-        # Optional end-to-end encrypted push alerts (cronstable.push): the
-        # daemon-global relay endpoint and paired-device registry the `push`
-        # reporter needs. Turning the reporter on stays per-job/per-event
-        # (`report: push: enabled: true` / `notify.report.push`); this
-        # section only says where alerts go and where pairings are stored.
+        # Optional E2E encrypted push alerts (cronstable.push): the relay
+        # endpoint and paired-device registry the `push` reporter needs.
         # The relay URL is explicit and required: the daemon never posts
         # alert ciphertext anywhere the operator did not spell out.
         Opt("push"): Map(
@@ -1339,19 +1229,16 @@ CONFIG_SCHEMA = EmptyDict() | Map(
 )
 
 
-_MONITOR_SAMPLING_DEFAULTS: Optional[Tuple[float, int]] = None
+_MONITOR_SAMPLING_DEFAULTS: Optional[tuple[float, int]] = None
 
 
-def _monitor_sampling_defaults() -> Tuple[float, int]:
+def _monitor_sampling_defaults() -> tuple[float, int]:
     """``(interval, history)`` defaults for the monitorResources block.
 
-    ``cronstable.resources`` owns those two literals, and reading them at
-    import time was the only reason this module depended on it -- which drags
-    asyncio and psutil (~35 ms, ~2 MB) into every process that merely imports
-    the config module: cronstable.state, .leadership, .cluster, and the tui
-    and mcp clients.  Resource monitoring is opt-in per job, so the cost is
-    deferred to the first job actually built, and the constants keep their
-    single definition rather than being copied here.
+    Imported lazily: ``cronstable.resources`` owns the two literals but
+    drags asyncio and psutil into every importer of this module, so the cost
+    is deferred to the first job actually built and the constants keep their
+    single definition.
     """
     global _MONITOR_SAMPLING_DEFAULTS
     if _MONITOR_SAMPLING_DEFAULTS is None:
@@ -1364,15 +1251,13 @@ def _monitor_sampling_defaults() -> Tuple[float, int]:
     return _MONITOR_SAMPLING_DEFAULTS
 
 
-def __getattr__(name: str) -> Union[float, int]:
+def __getattr__(name: str) -> float | int:
     """Serve the two resources constants without importing them eagerly.
 
-    The removed ``from cronstable.resources import ...`` also re-exported
-    ``SAMPLE_INTERVAL`` and ``MONITOR_HISTORY_DEFAULT`` as attributes of this
-    module, and callers read them that way.  PEP 562 keeps that spelling
-    working while the import itself stays deferred.  The return annotation is
-    deliberately narrow rather than ``Any``, so a typo'd attribute on this
-    module still fails to type-check where its value is used.
+    Callers read ``SAMPLE_INTERVAL`` / ``MONITOR_HISTORY_DEFAULT`` as module
+    attributes; PEP 562 keeps that spelling while the import stays deferred.
+    The return annotation is deliberately narrow rather than ``Any``, so a
+    typo'd attribute still fails to type-check where its value is used.
     """
     if name == "SAMPLE_INTERVAL":
         return _monitor_sampling_defaults()[0]
@@ -1383,7 +1268,7 @@ def __getattr__(name: str) -> Union[float, int]:
     )
 
 
-def _normalize_monitor_resources(raw: Any) -> Tuple[bool, float, int]:
+def _normalize_monitor_resources(raw: Any) -> tuple[bool, float, int]:
     """Collapse ``monitorResources``'s bool-or-map forms to one shape.
 
     Returns ``(enabled, interval, history)``: the map form reads its three
@@ -1433,7 +1318,7 @@ def _merge_lists(key: str, base: list, override: list) -> list:
     return base + override
 
 
-def mergedicts(dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
+def mergedicts(dict1: dict[str, Any], dict2: dict[str, Any]) -> dict[str, Any]:
     """Merge config mapping ``dict2`` over ``dict1`` (the defaults).
 
     The override side wins for a plain value; two dicts merge recursively;
@@ -1442,7 +1327,7 @@ def mergedicts(dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
     must not wipe out a populated default section).  Keys are emitted in
     ``dict1`` order, then ``dict2``-only keys in their own order.
     """
-    merged: Dict[str, Any] = dict(dict1)
+    merged: dict[str, Any] = dict(dict1)
     for key, override in dict2.items():
         if key not in merged:
             merged[key] = override
@@ -1462,33 +1347,24 @@ def mergedicts(dict1: Dict[str, Any], dict2: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
+def schedule_object_to_crontab(spec: dict[str, Any]) -> str:
     """Render the object form of a ``schedule`` to a crontab string.
 
-    The cron engine's field layout is ``[second] minute hour dayOfMonth month
-    dayOfWeek [year]``: a bare 5-field line has an implicit second of 0 and any
-    year, a 6-field line adds a trailing ``year`` column, and a 7-field line
-    adds a leading ``second`` column.  We emit only the columns actually
-    specified, so a schedule that uses neither ``second`` nor ``year`` still
-    renders as the exact 5-field line it always did -- keeping its job-set
-    fingerprint stable, and equal to the equivalent crontab-string spelling.
+    Field layout: ``[second] minute hour dayOfMonth month dayOfWeek [year]``.
+    Only the columns actually specified are emitted, so a schedule using
+    neither ``second`` nor ``year`` renders as the classic 5-field line,
+    keeping its job-set fingerprint stable.
 
-    Note this is the single source of truth for the object->crontab mapping,
-    shared by parsing (:meth:`JobConfig._parse_schedule`), the web UI's
-    schedule label (:func:`cronstable.cron.schedule_str`) and the fingerprint
-    (:func:`cronstable.fingerprint._schedule_repr`), so those cannot drift.
+    The single source of truth for the object->crontab mapping, shared by
+    :meth:`JobConfig._parse_schedule`, :func:`cronstable.cron.schedule_str`
+    and :func:`cronstable.fingerprint._schedule_repr`, so those cannot drift.
 
-    Every provided value must render as exactly ONE non-empty,
-    whitespace-free token (the object form's whole point is one field per
-    key); anything else raises :class:`ConfigError` naming the key.  The
-    rendered line is re-read by the cron engine under a whitespace split, so
-    a BLANK value would silently delete its column and shift every later
-    field one position left (``second: "0"`` plus an empty ``year:`` turns
-    "fire every second at :00" into "fire every hour at minute 0" -- a 60x
-    rate change with no error), and an embedded space would inject an extra
-    column and shift fields right (``minute: "0 12"`` pins the HOUR to 12).
-    ``str.split()`` is the exact predicate the engine splits with, so every
-    exotic Unicode whitespace it honours is refused here too.
+    Every value must render as exactly ONE non-empty, whitespace-free token;
+    anything else raises :class:`ConfigError` naming the key.  The rendered
+    line is re-read under a whitespace split, so a BLANK value would
+    silently delete its column and an embedded space would inject one,
+    shifting every later field.  ``str.split()`` is the exact predicate the
+    engine splits with, so exotic Unicode whitespace is refused here too.
     """
     minute = _schedule_field(spec, "minute")
     hour = _schedule_field(spec, "hour")
@@ -1515,7 +1391,7 @@ def schedule_object_to_crontab(spec: Dict[str, Any]) -> str:
 
 
 def _schedule_field(
-    spec: Dict[str, Any], key: str, default: Optional[str] = "*"
+    spec: dict[str, Any], key: str, default: Optional[str] = "*"
 ) -> Optional[str]:
     """One validated cron column of an object-form ``schedule:``.
 
@@ -1542,7 +1418,7 @@ def _schedule_field(
 
 
 def schedule_has_seconds(
-    schedule_unparsed: Union[str, Dict[str, Any]],
+    schedule_unparsed: str | dict[str, Any],
 ) -> bool:
     """Whether a schedule pins specific seconds (fires at second granularity).
 
@@ -1553,14 +1429,10 @@ def schedule_has_seconds(
     string, ``@reboot`` and the ``@daily``/``@hourly``/... nicknames never do.
     """
     if isinstance(schedule_unparsed, dict):
-        # Derive from the ACTUAL rendered field count, not mere key presence:
-        # ``second: null`` (a key with no value) renders no seconds column at
-        # all, and keying off presence alone would then force the whole
-        # scheduler to tick per-second for a job that only ever fires once a
-        # minute.  (A blank or whitespace-bearing value no longer gets this
-        # far: schedule_object_to_crontab rejects it, because a vanishing or
-        # split column silently shifts every later field into the wrong
-        # position.)
+        # Derive from the ACTUAL rendered field count, not key presence:
+        # ``second: null`` renders no seconds column at all, and keying off
+        # presence alone would force per-second ticking for a job that only
+        # ever fires once a minute.
         return len(schedule_object_to_crontab(schedule_unparsed).split()) == 7
     if isinstance(schedule_unparsed, str):
         stripped = schedule_unparsed.strip()
@@ -1575,27 +1447,20 @@ def schedule_has_seconds(
 #: Per-parse memo for :meth:`JobConfig._lint_schedule`, keyed by
 #: ``(source text, H-resolved text, resolved zone)``.  Created by
 #: :func:`_config_from_doc` and dropped when that parse returns.
-LintCache = Dict[Tuple[str, str, Optional[datetime.tzinfo]], List[Finding]]
+LintCache = dict[tuple[str, str, Optional[datetime.tzinfo]], list[Finding]]
 
-#: Shared empty threshold mapping for every job that configures no SLA check,
-#: which is the overwhelming majority.  A fresh per-job dict would add one
-#: object per job to steady-state memory for a value that is always empty and
-#: never written; a read-only proxy makes the sharing safe by construction, so
-#: a consumer that tried to edit its "own" thresholds fails loudly here rather
-#: than silently corrupting every other job's.
+#: Shared empty threshold mapping for every job with no SLA check (the vast
+#: majority): saves one dict per job, and the read-only proxy makes the
+#: sharing safe by construction (an accidental edit fails loudly).
 _NO_SLA_THRESHOLDS: Mapping[str, Any] = types.MappingProxyType({})
 
 
 class JobConfig:
-    # One JobConfig exists per configured job for the life of the process (and
-    # is rebuilt on every reload), so trimming its per-instance __dict__ with
-    # __slots__ cuts steady-state memory and speeds attribute access on the
-    # scheduler's hot path.  Every attribute the class ever sets -- including
-    # the host-resolved uid/gid/username and the configured user/group kept for
-    # the fingerprint -- must be listed here, or assigning it raises
-    # AttributeError.  Nothing outside this class assigns attributes to a
-    # JobConfig instance (the prometheus per-job accumulators live on their own
-    # slotted _JobMetrics), so the set is closed.
+    # __slots__ cuts steady-state memory (one JobConfig per job, rebuilt on
+    # every reload) and speeds attribute access on the scheduler's hot path.
+    # Every attribute the class ever sets must be listed here.  Nothing
+    # outside this class assigns attributes to a JobConfig instance, so the
+    # set is closed.
     __slots__ = (
         "name",
         "command",
@@ -1657,19 +1522,18 @@ class JobConfig:
     def __init__(
         self,
         config: dict,
-        env_cache: Optional[Dict[str, Dict[str, str]]] = None,
+        env_cache: Optional[dict[str, dict[str, str]]] = None,
         lint_cache: Optional["LintCache"] = None,
     ) -> None:
-        self.name = config["name"]  # type: str
-        self.command = config["command"]  # type: Union[str, List[str]]
+        self.name: str = config["name"]
+        self.command: str | list[str] = config["command"]
         self.schedule_unparsed = config.pop("schedule")
-        self.schedule: Union[CronTab, str] = self._parse_schedule(
+        self.schedule: CronTab | str = self._parse_schedule(
             self.schedule_unparsed,
             config.pop(crontabs.PARSED_SCHEDULE_KEY, None),
         )
         # True when the schedule pins specific seconds; the scheduler then
-        # ticks per-second for this job instead of per-minute
-        # (cronstable.cron).
+        # ticks per-second for this job instead of per-minute.
         self.has_seconds: bool = schedule_has_seconds(self.schedule_unparsed)
         self.shell = config.pop("shell")
         self.concurrencyPolicy = config.pop("concurrencyPolicy")
@@ -1679,15 +1543,11 @@ class JobConfig:
         self.concurrencyScope = config.pop("concurrencyScope")
         self.clusterPolicy = config.pop("clusterPolicy")
         # Catch-up config is deliberately NOT part of the job-set fingerprint
-        # (cronstable.fingerprint): it is a restart-time, node-local behaviour
-        # depends on a durable state backend, not a property of "which jobs run
-        # on which schedule", so it does not gate leader-election drift and
-        # needs no SCHEME_VERSION bump.  The same goes for the archival pair
-        # (observability, not behaviour) and for sla/onLate (alerting-only:
-        # thresholds and late reports never change what runs or when).
-        # onlyIfLastSucceeded is different:
-        # it gates EVERY scheduled fire, so it IS fingerprinted, like
-        # `enabled` -- replicas disagreeing on it must show as drift.
+        # (cronstable.fingerprint): restart-time, node-local behaviour, so no
+        # SCHEME_VERSION bump.  Same for the archival pair and for sla/onLate
+        # (alerting-only).  onlyIfLastSucceeded IS fingerprinted, like
+        # `enabled`: it gates every scheduled fire, so replicas disagreeing
+        # on it must show as drift.
         self.onMissed = config.pop("onMissed")
         self.startingDeadlineSeconds = config.pop("startingDeadlineSeconds")
         self.catchupJitterSeconds = config.pop("catchupJitterSeconds")
@@ -1695,8 +1555,7 @@ class JobConfig:
         self.archiveOutput = config.pop("archiveOutput")
         self.redactArchivedSecrets = config.pop("redactArchivedSecrets")
         # normalized from the bool-or-map config forms: a plain bool switch
-        # (every consumer tests truthiness, exactly as before) plus the
-        # sampling cadence and per-run series retention beside it.
+        # plus the sampling cadence and per-run series retention beside it.
         (
             self.monitorResources,
             self.monitorResourcesInterval,
@@ -1713,15 +1572,12 @@ class JobConfig:
         self.timezone: Optional[datetime.tzinfo] = self._resolve_timezone(
             config.pop("timezone")
         )
-        # Advisory schedule lint (never-fires, AND day semantics, uneven
-        # steps, skipped months, DST notes), computed once per parse in the
-        # job's resolved frame.  Logged here so the load or reload that
-        # introduces a footgun says so immediately, and kept on the job so
-        # the status payloads can carry the findings to the dashboards.  A
-        # dead schedule stays a WARNING rather than an error: a fixed past
-        # year is also the working idiom for parking a job, and failing the
-        # whole config load over it would turn an upgrade into an outage.
-        self.schedule_findings: List[Finding] = self._lint_schedule(lint_cache)
+        # Advisory schedule lint, logged so the load that introduces a
+        # footgun says so immediately, and kept on the job for the status
+        # payloads.  A dead schedule stays a WARNING, not an error: a fixed
+        # past year is the working idiom for parking a job, and failing the
+        # load over it would turn an upgrade into an outage.
+        self.schedule_findings: list[Finding] = self._lint_schedule(lint_cache)
         for finding in self.schedule_findings:
             logger.log(
                 logging.WARNING
@@ -1740,8 +1596,7 @@ class JobConfig:
         self.onSuccess = config.pop("onSuccess")
         self.sla = config.pop("sla")
         # True iff any sla threshold is set: lets the per-minute monitor skip
-        # the whole evaluation for a job with no check, without re-deriving it
-        # from the sla dict each pass (see cronstable.cron.Cron._sla_periodic).
+        # jobs with no check (see cronstable.cron.Cron._sla_periodic).
         self.has_sla = any(v is not None for v in self.sla.values())
         self.onLate = config.pop("onLate")
 
@@ -1757,8 +1612,8 @@ class JobConfig:
         self.killTimeout = config.pop("killTimeout")
         self.statsd = config.pop("statsd")
 
-        self.uid = None  # type: Optional[int]
-        self.gid = None  # type: Optional[int]
+        self.uid: int | None = None
+        self.gid: int | None = None
         # Resolved login name of the target user, used by the child process'
         # privilege-drop (os.initgroups) so it gets the user's supplementary
         # groups instead of inheriting root's. None when unknown.
@@ -1767,13 +1622,10 @@ class JobConfig:
 
         self._validate_numeric_ranges()
 
-        # Empty slot for the memoized job digest, filled at most once per
-        # instance by cronstable.fingerprint.job_digest_cached and never read
-        # here. A reload rebuilds every JobConfig, so the memo cannot outlive
-        # the definition it describes: the ``jobDigest`` stored beside a retry
-        # ladder or an @reboot marker keeps meaning "the job as it was when
-        # this record was written", and job_digest() itself stays a live
-        # function of the attributes (tests/test_fingerprint.py pins that).
+        # Memoized job digest slot, filled at most once per instance by
+        # cronstable.fingerprint.job_digest_cached. A reload rebuilds every
+        # JobConfig, so the memo cannot outlive the definition it describes
+        # (tests/test_fingerprint.py pins that).
         self._digest: Optional[str] = None
 
         self._precompute_payload_views()
@@ -1781,17 +1633,11 @@ class JobConfig:
     def _precompute_payload_views(self) -> None:
         """Derive the per-job fragments the /jobs payload rebuilds each poll.
 
-        Every value here is a pure function of attributes already set on this
-        instance and none of them is mutated afterwards, so they are computed
-        once at build time instead of once per job per poll.  JobConfigs are
-        rebuilt wholesale on reload (``_apply_reload`` reassigns cron_jobs
-        rather than editing the objects in it), so there is no invalidation
-        hook to keep in step.
-
-        The shared values are READ-ONLY to consumers:
-        ``schedule_findings_json`` and ``sla_thresholds`` are handed straight
-        into the response payload, which is serialized and discarded, never
-        edited.
+        Pure functions of already-set attributes, computed once at build
+        time; JobConfigs are rebuilt wholesale on reload, so there is no
+        invalidation hook to keep in step.  The shared values
+        (``schedule_findings_json``, ``sla_thresholds``) are READ-ONLY to
+        consumers: serialized into the payload, never edited.
         """
         unparsed = self.schedule_unparsed
         self.schedule_display: str = (
@@ -1803,21 +1649,18 @@ class JobConfig:
         self.command_display: str = (
             command if isinstance(command, str) else " ".join(command)
         )
-        self.schedule_findings_json: List[Dict[str, Any]] = [
+        self.schedule_findings_json: list[dict[str, Any]] = [
             finding._asdict() for finding in self.schedule_findings
         ]
-        # The plain-dialect spelling an ``H`` schedule resolved to, or None for
-        # every other schedule (which is the overwhelming majority, so the
-        # payload builder just tests for None).
+        # The plain-dialect spelling an ``H`` schedule resolved to, else None
+        # (the common case; the payload builder just tests for None).
         schedule = self.schedule
         resolved: Optional[str] = None
         if isinstance(schedule, CronTab) and schedule.resolved_differs:
             resolved = schedule.resolved_source
         self.schedule_resolved_or_none = resolved
-        # The non-None sla thresholds. A job with no check at all (the vast
-        # majority) shares one empty mapping rather than allocating its own
-        # dict: at fleet scale a fresh per-job dict here is ~100k dicts of
-        # pure overhead. It is empty and never written, so sharing is safe.
+        # The non-None sla thresholds; jobs with no check share one empty
+        # read-only mapping (never written, so sharing is safe).
         self.sla_thresholds: Mapping[str, Any] = (
             {k: v for k, v in self.sla.items() if v is not None}
             if self.has_sla
@@ -1826,20 +1669,15 @@ class JobConfig:
 
     def _lint_schedule(
         self, lint_cache: Optional["LintCache"]
-    ) -> List[Finding]:
+    ) -> list[Finding]:
         """Advisory findings for this job's schedule.
 
-        ``lint_cache`` is a per-parse memo: a fleet has far fewer distinct
-        schedule shapes than jobs, and the lint is the single largest term in
-        building a JobConfig (a full ``next()`` probe, a step analysis and,
-        for a zoned job, a year of DST transitions).
-
-        The key is the source text AND the H-resolved text: those two differ
-        only for an ``H`` schedule, and keying on the resolved text alone
-        would let ``H * * * *`` hashed to ``22 * * * *`` collide with a
-        literal ``22 * * * *`` and hand the literal job a hashed-slot note it
-        must not have.  The cache is per parse, never process-lifetime,
-        because never-fires and the DST findings are answers about *now*.
+        ``lint_cache`` is a per-parse memo: fleets repeat schedule shapes,
+        and the lint is the largest term in building a JobConfig.  The key
+        includes BOTH the source and the H-resolved text so a literal
+        schedule cannot collide with an ``H`` schedule that resolved to it.
+        The cache must stay per parse, never process-lifetime: never-fires
+        and the DST findings are answers about *now*.
         """
         tab = self.schedule
         if not isinstance(tab, CronTab):
@@ -1851,12 +1689,12 @@ class JobConfig:
         if findings is None:
             findings = lint_schedule(timezone=self.timezone, tab=tab)
             lint_cache[key] = findings
-        # a copy, so every job keeps owning its own list exactly as before
+        # a copy, so every job owns its own list
         return list(findings)
 
     def _parse_schedule(
         self, schedule_unparsed, prebuilt: Optional[CronTab] = None
-    ) -> Union[CronTab, str]:
+    ) -> CronTab | str:
         """Resolve the ``schedule:`` value to a CronTab (or ``@reboot``).
 
         ``prebuilt`` is the CronTab the classic-crontab front end already
@@ -1877,13 +1715,10 @@ class JobConfig:
         raise ConfigError("invalid schedule: {!r}".format(schedule_unparsed))
 
     def _crontab(self, tab: str) -> CronTab:
-        # CronTab raises ValueError on a malformed field (a bad range, an
-        # out-of-range second, the wrong field count). Surface it as a
-        # ConfigError naming the offending expression, so a bad schedule fails
-        # the config load with a clear message the reload loop can log, rather
-        # than as an anonymous traceback.  The job's name seeds the H hash
-        # form (self.name is assigned before the schedule parses), so an
-        # H slot is stable across restarts, reloads and replicas.
+        # Surface CronTab's ValueError as a ConfigError naming the offending
+        # expression.  The job's name seeds the H hash form (self.name is
+        # assigned before the schedule parses), so an H slot is stable across
+        # restarts, reloads and replicas.
         try:
             return CronTab(tab, hash_key=self.name)
         except ValueError as err:
@@ -1897,13 +1732,10 @@ class JobConfig:
         if timezone is not None:
             try:
                 return ZoneInfo(timezone)
-            # ZoneInfo maps the key onto a tzdata path: an unknown zone raises
-            # ZoneInfoNotFoundError, an embedded NUL raises ValueError, and an
-            # over-long or OS-invalid component raises OSError (ENAMETOOLONG /
-            # EINVAL).  Catch all three so a bad timezone (now reachable from
-            # ${ENV} interpolation, not only a literal) fails the load as a
-            # ConfigError, not a raw traceback that crashes startup and
-            # mislabels an operator typo as a cronstable bug.
+            # ZoneInfo raises ZoneInfoNotFoundError (unknown zone), ValueError
+            # (embedded NUL) or OSError (over-long/OS-invalid component).
+            # Catch all three so a bad timezone fails the load as a
+            # ConfigError, not a raw traceback.
             except (ZoneInfoNotFoundError, ValueError, OSError) as err:
                 raise ConfigError(
                     "unknown timezone: {}".format(timezone)
@@ -1915,13 +1747,10 @@ class JobConfig:
     def _validate_secrets(self) -> None:
         """Reject secret blocks that name no source.
 
-        A secret with no source (value/fromFile/fromEnvVar) could only ever
-        stage empty, which is a config mistake worth catching at load rather
-        than at run time.  (The ``name`` is schema-required, and same-named
-        secrets merge to last-wins exactly as ``environment`` variables do.)
+        A sourceless secret could only ever stage empty: catch it at load.
         Whether a *configured* source resolves non-empty is checked when the
-        run stages it (cronstable.jobapi), the same fail-closed contract every
-        other secret uses.
+        run stages it (cronstable.jobapi), fail-closed like every other
+        secret.
         """
         for entry in self.secrets:
             if not (
@@ -1935,7 +1764,7 @@ class JobConfig:
                 )
 
     def _merge_env_file(
-        self, env_cache: Optional[Dict[str, Dict[str, str]]] = None
+        self, env_cache: Optional[dict[str, dict[str, str]]] = None
     ) -> None:
         # Within one parse many jobs commonly share an env_file; read+parse
         # it once and reuse the result.  The cached dict is treated as
@@ -1971,8 +1800,8 @@ class JobConfig:
         # None) for the job-set fingerprint.  The resolved uid/gid below are
         # host-specific (the same name can map to different ids on different
         # hosts), so fingerprinting must use the configured value, not them.
-        self.user: Optional[Union[str, int]] = user
-        self.group: Optional[Union[str, int]] = group
+        self.user: Optional[str | int] = user
+        self.group: Optional[str | int] = group
         if user is None and group is None:
             return  # nothing to switch to: nothing POSIX-only to resolve
 
@@ -2046,11 +1875,9 @@ class JobConfig:
         return ConfigError("Job {}: {}".format(self.name, message))
 
     def _validate_numeric_ranges(self) -> None:
-        # strictyaml only enforces the type (Int/Float); fail fast on values
-        # that would otherwise produce obscure runtime behavior instead of a
-        # clear configuration error.  Written as plain `if ... raise` rather
-        # than through a helper: this runs once per job on every load and
-        # reload, and a closure plus ~16 calls is most of its cost.
+        # strictyaml only enforces the type; fail fast on values that would
+        # otherwise produce obscure runtime behavior.  Plain `if ... raise`
+        # on purpose: this runs once per job on every load and reload.
         # The Float-typed checks stay in the negated `if not value >= bound`
         # form on purpose: NaN fails every comparison, so the tempting
         # inversion (`if value < bound`) waves NaN through (strictyaml's
@@ -2072,10 +1899,9 @@ class JobConfig:
             raise self._reject(
                 "monitorResources.history must be between 0 and 2000 (points)"
             )
-        # Allow places no bound on concurrent instances, so widening its
-        # scope to the cluster gates nothing -- a safety option that
-        # silently does nothing is worse than an error the operator sees
-        # once at load time.
+        # Allow places no bound on concurrent instances, so cluster scope
+        # would gate nothing; an option that silently does nothing is worse
+        # than a load-time error.
         if (
             self.concurrencyScope == "cluster"
             and self.concurrencyPolicy == "Allow"
@@ -2132,7 +1958,7 @@ class JobConfig:
 # stay absent).  The launch fields are filled from the assembled job-defaults
 # base (DEFAULT_CONFIG plus any `defaults:` block) when the per-task JobConfig
 # template is built (see DagTaskConfig).
-_DAG_TASK_DEFAULTS: Dict[str, Any] = {
+_DAG_TASK_DEFAULTS: dict[str, Any] = {
     "type": "task",
     "dependsOn": [],
     "triggerRule": "all_success",
@@ -2167,12 +1993,9 @@ class DagTaskConfig:
     """One DAG node: its state-machine :class:`cronstable.dag.TaskSpec` plus
     the :class:`JobConfig` launch template the scheduler runs it from.
 
-    A task *is* a job invocation (the mandate), so the launch fields reuse the
-    exact job machinery -- the template carries the command, shell, env,
-    capture, timeouts and run-scoped secrets, and the daemon launches it
-    through the same :class:`~cronstable.job.RunningJob` path a scheduled job
-    uses.  The DAG-node fields (deps, type, retries, mapping) drive the pure
-    state machine.
+    A task *is* a job invocation: the launch fields reuse the exact job
+    machinery (the same :class:`~cronstable.job.RunningJob` path a scheduled
+    job uses); the DAG-node fields drive the pure state machine.
     """
 
     __slots__ = ("id", "type", "job_template", "spec")
@@ -2181,16 +2004,13 @@ class DagTaskConfig:
         self,
         dag_name: str,
         raw_task: dict,
-        defaults: Optional[Dict[str, Any]] = None,
+        defaults: Optional[dict[str, Any]] = None,
     ) -> None:
-        # `defaults` is the assembled job-defaults base (DEFAULT_CONFIG plus
-        # any included-file and top-level `defaults:` block), the same base a
-        # regular job is merged over.  A task's launch fields therefore inherit
-        # global reporters, environment, shell, capture, secrets,
-        # monitorResources and timeouts just as a job does.  It falls back to
-        # DEFAULT_CONFIG when a DagConfig is built directly (e.g. in a test)
-        # without a defaults base.  The DAG-node fields are popped out below
-        # before this merge, so a `defaults:` block never perturbs graph shape.
+        # `defaults` is the assembled job-defaults base, the same base a
+        # regular job is merged over (falls back to DEFAULT_CONFIG when a
+        # DagConfig is built directly, e.g. in a test).  The DAG-node fields
+        # are popped out below before this merge, so a `defaults:` block
+        # never perturbs graph shape.
         base = defaults if defaults is not None else DEFAULT_CONFIG
         merged = mergedicts(_DAG_TASK_DEFAULTS, raw_task)
         self.id: str = merged["id"]
@@ -2273,7 +2093,7 @@ class DagConfig:
     )
 
     def __init__(
-        self, raw_dag: dict, defaults: Optional[Dict[str, Any]] = None
+        self, raw_dag: dict, defaults: Optional[dict[str, Any]] = None
     ) -> None:
         raw = dict(raw_dag)
         self.name: str = raw.pop("name")
@@ -2289,7 +2109,7 @@ class DagConfig:
                 "dag {!r}: needs at least one task".format(self.name)
             )
         self.tasks = [DagTaskConfig(self.name, t, defaults) for t in tasks_raw]
-        self.task_templates: Dict[str, JobConfig] = {
+        self.task_templates: dict[str, JobConfig] = {
             t.id: t.job_template for t in self.tasks
         }
         self.spec = dag.DagSpec.build(self.name, [t.spec for t in self.tasks])
@@ -2305,7 +2125,7 @@ class DagConfig:
         )
 
     def _build_schedule_job(self, raw: dict, schedule: Any) -> JobConfig:
-        overrides: Dict[str, Any] = {
+        overrides: dict[str, Any] = {
             "name": "dag:" + self.name,
             "command": "true",
             "schedule": schedule,
@@ -2331,13 +2151,11 @@ class DagConfig:
             job = JobConfig(job_dict)
         except ConfigError as ex:
             raise ConfigError("dag {!r}: {}".format(self.name, ex)) from ex
-        # every DAG scheduling path (seeding, catch-up, backfill) computes
-        # next-fire instants from a CronTab; a schedule _parse_schedule leaves
-        # as a plain string ("@reboot", the boot marker) has none and would
-        # crash the scheduler at runtime instead of failing the load here.
-        # Structural on purpose: whatever parses into a CronTab (including
-        # the @daily/@hourly-style aliases the crontab library expands) is
-        # fine, anything that stays a string is not.
+        # Every DAG scheduling path computes next-fire instants from a
+        # CronTab; a schedule left as a plain string ("@reboot") would crash
+        # the scheduler at runtime instead of failing the load here.
+        # Structural on purpose: whatever parses into a CronTab is fine,
+        # anything that stays a string is not.
         if not isinstance(job.schedule, CronTab):
             raise ConfigError(
                 "dag {!r}: schedule {!r} is not a cron expression; DAG "
@@ -2347,27 +2165,18 @@ class DagConfig:
         return job
 
 
-def parse_environment_file(path: str) -> Dict[str, str]:
-    """
-    Parse environment variables from file.
+def parse_environment_file(path: str) -> dict[str, str]:
+    """Parse a ``VARIABLE_NAME=CONTENT`` environment file to a dict.
 
-    Handles comments (lines starting with ``#``) and blank lines.
-    Variables must be specified in ``VARIABLE_NAME=CONTENT`` format.
-
-    :param path: Path to the environment file.
-    :raise ConfigError: If a line in the file is not parsable (the ``=``
-        key-value separation character is missing), if the file is not
-        valid UTF-8, or if ``path`` is not a usable path.
-    :raise OSError: If an error occurred while opening the file at ``path``.
-    :return: key-value map of environment variables.
+    Skips comments and blank lines.  Raises ConfigError for an unparsable
+    line, non-UTF-8 content or an unusable path; OSError if the file cannot
+    be opened.
     """
-    environ: Dict[str, str] = {}
+    environ: dict[str, str] = {}
 
     # open()/readlines() raise ValueError for a NUL in the path and
-    # UnicodeDecodeError (a ValueError, NOT an OSError) for a latin-1/cp1252
-    # file or a stray high byte -- neither is caught by the caller's
-    # `except OSError`, so both would escape parse_config_string entirely.
-    # Config parsing must only ever raise ConfigError.
+    # UnicodeDecodeError (a ValueError, NOT an OSError) for non-UTF-8 bytes;
+    # config parsing must only ever raise ConfigError.
     try:
         with open(path, "r", encoding="utf-8") as env_file:
             lines = env_file.readlines()
@@ -2376,8 +2185,6 @@ def parse_environment_file(path: str) -> Dict[str, str]:
             "Could not load env_file {!r}: {}".format(path, err)
         ) from err
 
-    # file parsing
-    # you may want to use the `dotenv` library to do the job
     for line in lines:
         line = line.strip(" ").rstrip("\n")
         if line.startswith("#") or not line:
@@ -2425,43 +2232,32 @@ def _is_self_listed(peer_host: str, listen: str, node_name: str) -> bool:
     """Whether a configured peer entry *unambiguously* points back at us.
 
     A self entry must be dropped from `peers`: it never counts toward
-    agreement, yet it inflates `cluster_size()` -- and so the quorum threshold,
-    the size-divergence gate, and the 2-node refusal -- by one. We only drop an
-    entry here when it can be *only* this node, never another member:
+    agreement, yet it inflates `cluster_size()` (and so the quorum threshold,
+    the size-divergence gate, and the 2-node refusal) by one.  An entry is
+    dropped only when it can be *only* this node, never another member:
 
     * an exact match of our own `listen` address; or
-    * the common wildcard case -- a `listen` bound to all interfaces
-      (`0.0.0.0` / `::`) self-listed by `nodeName` -- recognised structurally
-      when the entry's host equals our `nodeName` *exactly* (which defaults to
-      the system hostname, the name the cert SAN and peer address use by
-      convention), on the same port; or
-    * a *literal loopback* entry (`127.0.0.1` / `[::1]`) on the same port,
-      under a wildcard `listen` of the matching family: loopback traffic
-      never leaves this host and the wildcard bind holds the port on every
-      interface of that family, so connecting to the entry can only land on
-      our own listener.  Matched by :func:`_loopback_ip_version` (literal
-      parsing only); `localhost` is deliberately NOT matched here (resolving
-      it would be the DNS guessing this function refuses -- it gets an
-      advisory instead, see :func:`_likely_self_loopback`).
+    * a wildcard `listen` self-listed by a host equal to our `nodeName`
+      *exactly*, on the same port; or
+    * a *literal loopback* entry on the same port, under a wildcard `listen`
+      of the matching family (loopback never leaves this host, and the
+      wildcard bind holds the port on every interface of that family).
+      `localhost` is deliberately NOT matched: resolving it would be the DNS
+      guessing this function refuses; it gets an advisory instead
+      (:func:`_likely_self_loopback`).
 
     The match is deliberately *exact*: never drop a peer on a fuzzy match of
-    the host FQDN's *first label* against a bare `nodeName` (e.g. dropping
-    `node-a.internal` when `nodeName` is `node-a`). A peer host's DNS labels
-    have no required relationship to any `nodeName`, so such an over-match can
-    silently drop a genuinely distinct member that merely shares a first label
-    (`web.dc1.internal` vs our short hostname `web`), shrinking *our* `N` below
-    everyone else's -- which either pins `Leader` jobs closed cluster-wide on a
-    permanent size-divergence conflict (with no warning emitted), or, if it
-    lowers our quorum threshold, opens a split-brain. No runtime backstop
-    re-adds a config-dropped peer, so the damage would be permanent.
-
-    A genuine self-listing the exact match does not catch -- e.g. a self listed
-    by its FQDN while `nodeName` is the short label -- is simply not dropped
-    here; it falls back to the runtime `STATUS_SELF` recognition in
-    `ClusterManager.cluster_size` once its self-poll succeeds. The brief `N`
-    inflation before that first poll is the *safe* direction (a higher quorum,
-    never a split-brain). No DNS resolution is done at config time (it would
-    block the per-reload parse).
+    the host FQDN's *first label* against a bare `nodeName`.  Such an
+    over-match can silently drop a genuinely distinct member that merely
+    shares a first label, shrinking *our* `N` below everyone else's, which
+    either pins `Leader` jobs closed cluster-wide on a permanent
+    size-divergence conflict or opens a split-brain; no runtime backstop
+    re-adds a config-dropped peer.  A genuine self-listing the exact match
+    misses (e.g. FQDN vs short `nodeName`) falls back to the runtime
+    `STATUS_SELF` recognition in `ClusterManager.cluster_size`; the brief
+    `N` inflation before that first poll errs in the safe direction (a
+    higher quorum, never a split-brain).  No DNS resolution is done at
+    config time.
     """
     if peer_host == listen:
         return True
@@ -2509,14 +2305,10 @@ def _likely_self_loopback(peer_host: str, listen: str) -> bool:
 
     A diagnostics-only heuristic like :func:`_likely_self_fqdn` (never used
     to drop a peer).  True for a loopback-ish entry on our listen port that
-    :func:`_is_self_listed` could not drop as unambiguous: ``localhost`` (a
-    name, whose family is unknowable without the DNS resolution config time
-    refuses), or a loopback literal under a non-wildcard or other-family
-    ``listen``.  Loopback traffic never leaves this host, so such an entry
-    can never be another cluster member: at best it is this node itself --
-    hiding a degenerate effective size behind an inflated declared one -- and
-    at worst dead weight that raises the quorum threshold.  Used to warn when
-    the remainder would leave the real cluster at <= 2 nodes.
+    :func:`_is_self_listed` could not drop as unambiguous (``localhost``, or
+    a loopback literal under a non-wildcard or other-family ``listen``).
+    Such an entry can never be another cluster member; used to warn when the
+    remainder would leave the real cluster at <= 2 nodes.
     """
     _, _, listen_port = listen.rpartition(":")
     peer_h, _, peer_port = peer_host.rpartition(":")
@@ -2528,14 +2320,14 @@ def _likely_self_loopback(peer_host: str, listen: str) -> bool:
     return peer_h == "localhost" or _loopback_ip_version(peer_h) is not None
 
 
-def _cluster_base(raw: dict) -> "Dict[str, Any]":
+def _cluster_base(raw: dict) -> "dict[str, Any]":
     """Fill the shared cluster defaults over a raw (schema-validated) block.
 
     Covers the keys every backend uses (backend, nodeName, connectTimeout,
     electLeader, distribution, and the inert gossip cadence fields). Each
     backend's builder then layers on its own block.
     """
-    cfg: Dict[str, Any] = dict(DEFAULT_CLUSTER)
+    cfg: dict[str, Any] = dict(DEFAULT_CLUSTER)
     cfg.update(raw)
     if not cfg.get("nodeName"):
         # a stable, human-readable identity for this node, used as the lease
@@ -2573,13 +2365,13 @@ def _build_cluster_config(raw: dict) -> ClusterConfig:
 
 
 def _attach_observability(
-    cfg: "Dict[str, Any]", raw: dict, backend: str
+    cfg: "dict[str, Any]", raw: dict, backend: str
 ) -> None:
     """Resolve a ``cluster.observability`` block onto a built cluster config.
 
     Sets ``cfg["shareNodeStats"]`` and ``cfg["observabilityMesh"]`` (see
-    :func:`_build_cluster_config`). No-op when the block is absent, so a config
-    without it is byte-identical to before (and gossips the same bytes).
+    :func:`_build_cluster_config`). No-op when the block is absent, so a
+    config without it gossips the same bytes as one that never had it.
     """
     cfg["shareNodeStats"] = False
     cfg["observabilityMesh"] = None
@@ -2602,11 +2394,9 @@ def _attach_observability(
                 "data); drop them -- an empty `observability:` block, or just "
                 "`shareNodeStats`, is enough to share node CPU/memory"
             )
-        # the overlay tuning keys only configure the SEPARATE mesh a lease
-        # backend stands up; under gossip the stats ride the election mesh,
-        # whose cadence/identity the cluster-level keys already set -- so
-        # reject them rather than silently ignoring a value the operator
-        # believes is in effect.
+        # the overlay tuning keys only configure the separate mesh a lease
+        # backend stands up; reject them under gossip rather than silently
+        # ignoring a value the operator believes is in effect.
         for key in ("nodeName", "interval", "driftAfter", "connectTimeout"):
             if obs.get(key) is not None:
                 raise ConfigError(
@@ -2648,7 +2438,7 @@ def _build_state_config(raw: dict) -> StateConfig:
     otherwise resolve to a surprising directory).  ``topology`` is already
     constrained to the enum by the schema, and ``deploymentId`` is free-form.
     """
-    cfg: Dict[str, Any] = dict(DEFAULT_STATE)
+    cfg: dict[str, Any] = dict(DEFAULT_STATE)
     cfg.update(raw)
     if not cfg.get("path") or not str(cfg["path"]).strip():
         raise ConfigError("state.path is required and must be non-empty")
@@ -2679,10 +2469,8 @@ def _build_state_config(raw: dict) -> StateConfig:
     # DEFAULT_JOB_API keys of a partially-specified `jobApi:` block).
     job_api = dict(DEFAULT_JOB_API)
     job_api.update(cfg.get("jobApi") or {})
-    # jobApi.tls is a third nesting level, so it needs its own explicit merge
-    # for the same reason: the update above is shallow and would drop the
-    # untouched DEFAULT_JOB_API["tls"] keys of a partially-specified `tls:`
-    # block (mirrors _build_etcd_cluster_config).
+    # jobApi.tls is a third nesting level: same shallow-merge reason
+    # (mirrors _build_etcd_cluster_config).
     job_api["tls"] = {
         **DEFAULT_JOB_API["tls"],
         **(job_api.get("tls") or {}),
@@ -2708,13 +2496,10 @@ def _build_state_config(raw: dict) -> StateConfig:
             "bare host:port (the job CLI reaches the endpoint over TCP only)"
         )
     if listen:
-        # validate the port the same way the runtime bind parses it
-        # (urlparse().port raises on a non-numeric or out-of-range port);
-        # left unchecked, the ValueError would escape the API startup and
-        # permanently disable the loopback endpoint instead of failing the
-        # config load. An explicit :0 is fine -- jobapi._bind_target maps
-        # a missing port to 0 anyway, and the bind treats both as the
-        # OS-assigned ephemeral default -- but anything else must be usable.
+        # validate the port the way the runtime bind parses it: an unchecked
+        # ValueError would escape API startup and permanently disable the
+        # loopback endpoint instead of failing the config load.  An explicit
+        # :0 is fine (OS-assigned ephemeral, same as a missing port).
         text = str(listen)
         parsed = _safe_urlparse(
             text if "://" in text else "http://" + text,
@@ -2756,16 +2541,11 @@ def _build_state_config(raw: dict) -> StateConfig:
 def _is_wildcard_host(host: str) -> bool:
     """True for a bind address meaning "every interface".
 
-    Spelled several ways: ``0.0.0.0``, ``::``, ``[::]``, the long form
-    ``0:0:0:0:0:0:0:0``, ``::0``, and an empty host. ``ipaddress`` normalises
-    all of the IP forms to the one unspecified address per family, so this
-    compares parsed values rather than the handful of strings someone
-    happened to think of.
-
-    Shared with :mod:`cronstable.jobapi`, which imports it to decide what
-    address to advertise to jobs (a wildcard is not one a job can dial);
-    here it also gates a wildcard bind over ``https://`` (no certificate SAN
-    can cover an unspecified address).
+    Compares parsed ``ipaddress`` values rather than a string list, so every
+    spelling (``0.0.0.0``, ``::``, ``[::]``, ``::0``, empty) matches.
+    Shared with :mod:`cronstable.jobapi` (a wildcard is not an address a job
+    can dial); here it also gates a wildcard bind over ``https://`` (no
+    certificate SAN can cover an unspecified address).
     """
     text = host.strip().strip("[]")
     if not text:
@@ -2778,16 +2558,14 @@ def _is_wildcard_host(host: str) -> bool:
         return False
 
 
-def _validate_job_api_tls(job_api: Dict[str, Any], listen: Any) -> None:
+def _validate_job_api_tls(job_api: dict[str, Any], listen: Any) -> None:
     """Cross-checks between ``state.jobApi.listen``'s scheme and its `tls`.
 
-    Same shape as the etcd client-TLS checks in
-    :func:`_build_etcd_cluster_config`: material with no transport that
-    uses it, and a transport with no material, are silent-downgrade
-    misconfigurations rather than typos to shrug at. Here
-    the downgrade is specific: this endpoint hands every job a per-run bearer
-    token and stages its secrets, so a `tls` block that turns out to be inert
-    puts exactly those bytes on the wire in the clear.
+    Same shape as the etcd client-TLS checks: material with no transport, or
+    a transport with no material, is a silent-downgrade misconfiguration.
+    The stakes: this endpoint hands every job a per-run bearer token and
+    stages its secrets, so an inert `tls` block puts exactly those bytes on
+    the wire in the clear.
     """
     tls = job_api.get("tls") or {}
     cert, key, ca = tls.get("cert"), tls.get("key"), tls.get("ca")
@@ -2800,10 +2578,9 @@ def _validate_job_api_tls(job_api: Dict[str, Any], listen: Any) -> None:
             "cert={!r}, key={!r}".format(bool(cert), bool(key))
         )
     if (cert or ca) and not is_https:
-        # `ca` is caught by the same check as `cert`: it is injected into
-        # every job as CRONSTABLE_STATE_CACERT, so left set against a
-        # plaintext endpoint it is both inert and actively misleading, and a
-        # bad path in it fails the job CLI on a channel it was never used on.
+        # `ca` too: it is injected into every job as CRONSTABLE_STATE_CACERT,
+        # so left set against a plaintext endpoint it is both inert and
+        # actively misleading.
         raise ConfigError(
             "state.jobApi.tls is configured but state.jobApi.listen is not "
             "an https:// URL, so the TLS material would be ignored and "
@@ -2829,10 +2606,8 @@ def _validate_job_api_tls(job_api: Dict[str, Any], listen: Any) -> None:
             "explicitly, e.g. https://10.0.0.5:9000"
         )
     if listen and job_api.get("allowNonLoopbackBind") and not is_https:
-        # Warn, not fail: the opt-in predates native TLS and the documented
-        # pairing was a reverse proxy, which is still a valid answer. But the
-        # combination is worth naming every boot, because the flag's own
-        # rationale is that these bytes are worth protecting.
+        # Warn, not fail: a TLS-terminating reverse proxy in front is still a
+        # valid answer, but the combination is worth naming every boot.
         parsed = _safe_urlparse(
             text if "://" in text else "http://" + text,
             "state.jobApi.listen",
@@ -2871,12 +2646,10 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     # connection error. Mirrors cronstable.cluster._split_host_port, plus a
     # port range check; anything this accepts also parses at runtime.
     def _is_port(port: str) -> bool:
-        # NOT a bare port.isdigit(): str.isdigit() is True for the whole Nd+No
-        # category, so superscript and circled digits ('2', '(1)') pass it and
-        # then raise a bare ValueError inside int() on the same expression;
-        # and an all-ASCII run past CPython's 4300-digit int-conversion limit
-        # raises there too. Both must be a clean ConfigError, so bound the
-        # text before converting it.
+        # NOT a bare port.isdigit(): non-ASCII digits pass isdigit() and then
+        # raise a bare ValueError inside int(), and an over-long run trips
+        # CPython's int-conversion limit. Both must be a clean ConfigError,
+        # so bound the text before converting it.
         if not (port.isascii() and port.isdigit() and len(port) <= 5):
             return False
         return 0 < int(port) <= 65535
@@ -2913,19 +2686,14 @@ def _build_gossip_cluster_config(raw: dict) -> ClusterConfig:
     for peer in cfg["peers"]:
         _require_host_port(peer["host"], "peers[].host")
 
-    # De-duplicate peers and drop any entry pointing at our own listen address.
-    # ClusterView keys peers by host (so duplicates collapse) and a self-listed
-    # peer never counts toward agreement -- but cluster_size() (and thus the
-    # quorum threshold) is derived from this list, so a duplicate or self entry
-    # would otherwise inflate the quorum and cost fault tolerance. Keep the
-    # first occurrence to preserve configured order. _is_self_listed also
-    # catches the common wildcard case (a `0.0.0.0` listen self-listed by
-    # hostname), so config-time N matches the runtime N every correctly-
-    # configured peer declares. (An exotic self-listing that escapes it -- e.g.
-    # an FQDN vs the short nodeName -- still degrades to the runtime
-    # STATUS_SELF exclusion in ClusterManager.cluster_size.)
+    # De-duplicate peers and drop any entry pointing at our own listen
+    # address: cluster_size() (and thus the quorum threshold) is derived
+    # from this list, so a duplicate or self entry would inflate the quorum
+    # and cost fault tolerance.  First occurrence wins to preserve order.
+    # (An exotic self-listing _is_self_listed misses still degrades to the
+    # runtime STATUS_SELF exclusion in ClusterManager.cluster_size.)
     seen: "set[str]" = set()
-    deduped: List[Dict[str, Any]] = []
+    deduped: list[dict[str, Any]] = []
     for peer in cfg["peers"]:
         host = peer["host"]
         if (
@@ -2985,15 +2753,10 @@ _RFC1123_SUBDOMAIN = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
 def _reject_foreign_store_blocks(cfg: dict, backend: str) -> None:
     """Reject a lease store sub-block that does not match the chosen backend.
 
-    Both store blocks are schema-optional and can be present at once, and each
-    builder consumes ONLY its own -- so a block carried under the wrong
-    ``backend:`` (a copy-paste that changed only ``backend:``, an ``etcd:``
-    block under ``backend: kubernetes``, or a stray store block under
-    ``backend: gossip``) would be silently ignored, discarding the operator's
-    intended endpoints / TLS / credentials and arbitrating leadership against
-    an unintended (default) store -- landing on either failure the subsystem
-    exists to prevent (a job that never runs, or one that double-runs). Fail
-    loudly.
+    Each builder consumes ONLY its own block, so a block carried under the
+    wrong ``backend:`` would be silently ignored, discarding the operator's
+    intended endpoints/TLS/credentials and arbitrating leadership against an
+    unintended (default) store.  Fail loudly.
     """
     for key in _LEASE_STORE_KEYS:
         if key == backend:
@@ -3008,13 +2771,11 @@ def _reject_foreign_store_blocks(cfg: dict, backend: str) -> None:
             )
 
 
-# Cluster keys only the gossip transport consumes. A lease backend silently
-# ignores them, so a lease config that carries them (e.g. copied from a gossip
-# example and re-pointed with `backend:`) does not do what it looks like --
-# most dangerously a `tls` block, which the operator may believe secures
-# peer/store traffic when it does nothing. interval/driftAfter live in
-# DEFAULT_CLUSTER so are always present in the built cfg; detect them from the
-# *raw* block instead, where they appear only if the operator wrote them.
+# Cluster keys only the gossip transport consumes; a lease backend silently
+# ignores them (most dangerously a `tls` block the operator may believe
+# secures store traffic). interval/driftAfter are always present in the
+# built cfg via DEFAULT_CLUSTER, so detect them from the *raw* block, where
+# they appear only if the operator wrote them.
 _GOSSIP_ONLY_CLUSTER_KEYS = (
     "listen",
     "tls",
@@ -3024,14 +2785,14 @@ _GOSSIP_ONLY_CLUSTER_KEYS = (
 )
 
 
-def _lease_advisories(raw: dict, backend: str) -> List[str]:
+def _lease_advisories(raw: dict, backend: str) -> list[str]:
     """Non-fatal advisories for a lease (kubernetes/etcd) cluster block.
 
     Surfaced (once, via :func:`cluster_config_warnings`) rather than raised so
     an upgrade does not fail a previously-accepted config; promote to a hard
     ConfigError behind a deprecation window if stricter validation is wanted.
     """
-    advisories: List[str] = []
+    advisories: list[str] = []
     present = [k for k in _GOSSIP_ONLY_CLUSTER_KEYS if raw.get(k) is not None]
     if present:
         msg = (
@@ -3083,15 +2844,12 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
             # the handler below already fails closed on.
             with open(spec["fromFile"], "rt", encoding="utf-8") as secret_file:
                 secret = secret_file.read().strip()
-        # Broad on purpose: callers only handle ConfigError -- on the
-        # job-secret staging path (cron._prepare_job_api_run) anything else
-        # escapes the scheduler loop and crash-loops the daemon at every
-        # fire of that job.  Beyond OSError, open()/read() raise ValueError
-        # for a NUL in the path, UnicodeDecodeError (a ValueError subclass)
-        # for binary data (a .p12 bundle, a gzip, a stray high byte), and
-        # UnicodeEncodeError (likewise) for a lone surrogate in the path --
-        # reachable from a pure-ASCII config via YAML \u escapes -- plus
-        # TypeError for a non-string path.
+        # Broad on purpose: callers only handle ConfigError, and on the
+        # job-secret staging path anything else escapes the scheduler loop
+        # and crash-loops the daemon at every fire of that job.  Beyond
+        # OSError, open()/read() can raise ValueError (NUL in path),
+        # UnicodeDecodeError/UnicodeEncodeError (ValueError subclasses) and
+        # TypeError.
         except (OSError, ValueError, TypeError) as ex:
             raise ConfigError(
                 "{}.fromFile could not be read: {}".format(what, ex)
@@ -3099,10 +2857,8 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
     elif spec.get("fromEnvVar"):
         try:
             secret = os.environ.get(spec["fromEnvVar"], "")
-        # same stakes as fromFile above: os.environ.get raises
-        # UnicodeEncodeError (a ValueError) for a lone-surrogate name and
-        # TypeError for a non-string one, neither of which the callers on
-        # the per-fire staging path survive.
+        # same stakes as fromFile above: os.environ.get can raise
+        # UnicodeEncodeError (a ValueError) and TypeError.
         except (ValueError, TypeError) as ex:
             raise ConfigError(
                 "{}.fromEnvVar could not be read: {}".format(what, ex)
@@ -3128,10 +2884,8 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         # the (already-defaulted) nodeName.
         k8s["identity"] = cfg["nodeName"]
     # leaseName/leaseNamespace are spliced into the apiserver URL path (see
-    # _K8sHttpTransport._lease_url) and passed to the native client; constrain
-    # them to the Kubernetes RFC1123 charset so a stray '/', '?', '#' or space
-    # cannot retarget the request (silently never acquiring the lease, or
-    # the HTTP and native transports resolve different resources).
+    # _K8sHttpTransport._lease_url); constrain them to the RFC1123 charset
+    # so a stray '/', '?', '#' or space cannot retarget the request.
     lease_name = k8s["leaseName"]
     if not isinstance(lease_name, str) or (
         len(lease_name) > 253 or not _RFC1123_SUBDOMAIN.match(lease_name)
@@ -3153,12 +2907,9 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
                 lease_ns
             )
         )
-    # The apiserver override carries the in-cluster ServiceAccount bearer token
-    # on every request; a plaintext http:// target would send that high-value
-    # credential in cleartext (aiohttp ignores the SSL context for an http URL)
-    # and expose the lease store to MITM. Require https, mirroring the etcd
-    # backend's auth-over-https guard. (A local kube-rbac-proxy that genuinely
-    # needs http should front it with https or use a kubeconfig.)
+    # The apiserver override carries the ServiceAccount bearer token on
+    # every request; require https so that high-value credential is never
+    # sent in cleartext (mirrors the etcd auth-over-https guard).
     api_server = k8s.get("apiServer")
     if api_server and not str(api_server).lower().startswith("https://"):
         raise ConfigError(
@@ -3187,16 +2938,11 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
         raise ConfigError("cluster.kubernetes.retryPeriodSeconds must be > 0")
     if retry >= renew:
         # client-go's third leaderelection invariant (RenewDeadline must
-        # exceed the RetryPeriod). The renew loop sleeps retryPeriodSeconds
-        # *between* rounds, unbounded by the lease window: with
-        # retry >= renew (and so, with duration > renew already enforced
-        # above, retry can also exceed the whole lease duration) a holder
-        # cannot complete a renewal before the next attempt is due, so it
-        # lapses out of the lease for most of every cycle -- is_leader and
-        # is_quorate flap False, no Leader job ever runs stably (a single
-        # holder, so no peer leads either) and never-skip PreferLeader jobs
-        # double-run on every replica. Reject it rather than silently defeat
-        # the at-most-once guarantee a lease backend exists to provide.
+        # exceed the RetryPeriod): with retry >= renew a holder cannot
+        # complete a renewal before the next attempt is due, so it lapses
+        # out of the lease every cycle, is_leader flaps and no Leader job
+        # runs stably. Reject rather than silently defeat the at-most-once
+        # guarantee a lease backend exists to provide.
         raise ConfigError(
             "cluster.kubernetes.retryPeriodSeconds ({}) must be less than "
             "renewDeadlineSeconds ({}): a holder must be able to renew "
@@ -3205,18 +2951,12 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
             "stably".format(retry, renew)
         )
     if renew + retry >= duration:
-        # The renew loop runs one round (bounded by renewDeadlineSeconds) and
-        # THEN sleeps retryPeriodSeconds, so the worst-case interval between
-        # two successive lease refreshes is renewDeadline + retryPeriod -- but
-        # the holder's self-demotion deadline is only leaseDuration ahead of a
-        # round's START. The three pairwise invariants above (retry<renew,
-        # renew<duration) do NOT bound their SUM, so a config like
-        # duration=12/renew=11/retry=10 passes them yet has a ~21s refresh
-        # interval against a ~12s deadline: under a slow-but-not-timed-out
-        # apiserver the sole healthy holder self-demotes between rounds every
-        # cycle (is_leader flaps False), Leader jobs collapse toward
-        # at-most-zero and PreferLeader double-runs. Require the sum to fit
-        # inside the lease window.
+        # The worst-case interval between two lease refreshes is
+        # renewDeadline + retryPeriod, but the self-demotion deadline is
+        # only leaseDuration ahead of a round's START.  The pairwise
+        # invariants above do NOT bound the SUM (duration=12/renew=11/
+        # retry=10 passes them yet flaps every cycle under a slow apiserver).
+        # Require the sum to fit inside the lease window.
         raise ConfigError(
             "cluster.kubernetes: renewDeadlineSeconds ({}) + "
             "retryPeriodSeconds ({}) must be less than leaseDurationSeconds "
@@ -3240,20 +2980,16 @@ def _build_kubernetes_cluster_config(raw: dict) -> ClusterConfig:
 _URL_SCHEME_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*:(?=//)")
 
 
-def _url_authority_span(url: str) -> Tuple[int, int]:
+def _url_authority_span(url: str) -> tuple[int, int]:
     """The ``[start, end)`` span of ``url`` that can carry userinfo.
 
     The ONE authority locator shared by :func:`_url_has_userinfo` and
     :func:`_redact_userinfo`, so the detector and the redactor can never
-    disagree about where a credential may live (two subtly different ad-hoc
-    ``"://"`` splits previously let a protocol-relative ``//user:pass@host``
-    slip past both, and a malformed trailing ``://`` past the redactor only --
-    leaking the password into the very ConfigError written to prevent that).
-    Per RFC 3986 the authority follows ``scheme://`` (or a protocol-relative
-    ``//``) and ends at the first ``/``, ``?`` or ``#``; for a scheme-less
-    ``user:pass@host`` -- which urlparse misreads as scheme ``user`` -- the
-    whole leading run up to those delimiters is treated as the authority, so
-    a credentialed endpoint is caught whether or not a scheme is present.
+    disagree about where a credential may live.  Per RFC 3986 the authority
+    follows ``scheme://`` (or a protocol-relative ``//``) and ends at the
+    first ``/``, ``?`` or ``#``; a scheme-less ``user:pass@host`` (which
+    urlparse misreads as scheme ``user``) is treated as all-authority, so a
+    credentialed endpoint is caught whether or not a scheme is present.
     """
     match = _URL_SCHEME_RE.match(url)
     if match is not None:
@@ -3273,11 +3009,9 @@ def _url_authority_span(url: str) -> Tuple[int, int]:
 def _url_has_userinfo(url: str) -> bool:
     """Whether ``url``'s authority carries ``user[:pass]@`` userinfo.
 
-    Robust to a scheme-less ``user:pass@host:port`` (which urlparse misreads as
-    scheme ``user`` with no username/password), so a credentialed endpoint is
-    detected -- and rejected/redacted -- regardless of whether a scheme is
-    present.  Shares :func:`_url_authority_span` with :func:`_redact_userinfo`
-    so anything detected here is by construction redactable there.
+    Robust to a scheme-less ``user:pass@host:port``.  Shares
+    :func:`_url_authority_span` with :func:`_redact_userinfo` so anything
+    detected here is by construction redactable there.
     """
     start, end = _url_authority_span(url)
     return "@" in url[start:end]
@@ -3287,12 +3021,10 @@ def _redact_userinfo(url: str) -> str:
     """Replace ``user:pass@`` userinfo in ``url`` with ``***@`` for logs.
 
     Deliberately does NOT rely on ``urlparse(...).username``: a scheme-less
-    ``user:pass@host`` parses as scheme ``user`` with username/password both
-    ``None``, so trusting that would echo the secret verbatim (the leak this
-    helper exists to prevent).  Instead the authority is located via the same
-    :func:`_url_authority_span` the detector uses and any userinfo it carries
-    is redacted, so the credential never reaches a log whether or not a scheme
-    is present.
+    ``user:pass@host`` parses as scheme ``user`` with no username/password,
+    so trusting that would echo the secret verbatim (the leak this helper
+    exists to prevent).  The authority is located via the same
+    :func:`_url_authority_span` the detector uses.
     """
     start, end = _url_authority_span(url)
     authority = url[start:end]
@@ -3308,13 +3040,10 @@ def _redact_userinfo(url: str) -> str:
 def _safe_urlparse(text: str, what: str) -> "ParseResult":
     """``urlparse(text)``, with a malformed URL as a ConfigError.
 
-    urlsplit raises ``ValueError('Invalid IPv6 URL')`` on an unterminated
-    ``[`` bracket -- a one-character typo in an IPv6 endpoint.  Config
-    parsing must only ever raise ConfigError (``__main__`` catches only that,
-    and the reload loop logs anything else as 'please report this as a bug'),
-    so every urlparse of operator-supplied text goes through here.  ``what``
-    names the offending key; the value is redacted, since these keys may
-    carry credentials.
+    urlsplit raises ValueError on an unterminated ``[`` bracket, and config
+    parsing must only ever raise ConfigError, so every urlparse of
+    operator-supplied text goes through here.  ``what`` names the offending
+    key; the value is redacted, since these keys may carry credentials.
     """
     try:
         return urlparse(text)
@@ -3322,6 +3051,30 @@ def _safe_urlparse(text: str, what: str) -> "ParseResult":
         raise ConfigError(
             "{} is not a valid URL: {!r}".format(what, _redact_userinfo(text))
         ) from err
+
+
+def _require_lease_ttl_floor(ttl: float, what: str) -> None:
+    """Reject a lease ttl below 3 seconds, or a non-finite one.
+
+    Below a 3s ttl the leader window (ttl minus a 1s clock-skew margin,
+    renewed every max(1s, ttl/3)) collapses to <= the keepalive period: a
+    node that wins the election immediately treats its own lease as expired
+    and NO Leader job ever runs cluster-wide.  NaN-rejecting on purpose,
+    like the state TTL floors: strictyaml's Float() accepts 'nan' (for which
+    'x < 3' is False) and overflow literals like '1e309' (== inf), and
+    either silently breaks the lease expiry arithmetic (multiple leaders /
+    a crashed leader's lease never expiring).  Shared by the etcd and
+    filesystem backends; kubernetes is protected by its own duration>renew
+    invariants instead.
+    """
+    if not math.isfinite(float(ttl)) or ttl < 3:
+        raise ConfigError(
+            "{} must be >= 3 seconds and finite (the leader holds the "
+            "lease only until ttl minus a clock-skew margin and renews "
+            "every max(1s, ttl/3); a smaller ttl makes a node that wins "
+            "the election immediately treat its own lease as expired, so "
+            "no Leader job ever runs); got {}".format(what, ttl)
+        )
 
 
 def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
@@ -3339,56 +3092,33 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
     }
     etcd["tls"] = {**DEFAULT_ETCD["tls"], **(raw_etcd.get("tls") or {})}
     cfg["etcd"] = etcd
-    # A winning node holds the election key only until (ttl - 1s clock-skew
-    # margin) and re-keepalives every max(1s, ttl/3); below 3s that leader
-    # window collapses to <= the keepalive period, so a node that wins the
-    # campaign immediately considers its own lease expired and NO Leader job
-    # ever runs cluster-wide -- a silent at-most-once -> at-most-zero.
-    # (kubernetes is protected by its duration>renew invariant; etcd is not,
-    # so floor ttl here.)
-    if etcd["ttl"] < 3:
-        raise ConfigError(
-            "cluster.etcd.ttl must be >= 3 seconds (the leader holds the "
-            "key only until ttl minus a 1s clock-skew margin and renews "
-            "every max(1s, ttl/3); a smaller ttl makes a node that wins "
-            "the election immediately treat its own lease as expired, so "
-            "no Leader job ever runs); got {}".format(etcd["ttl"])
-        )
+    _require_lease_ttl_floor(etcd["ttl"], "cluster.etcd.ttl")
     if not etcd["endpoints"]:
         raise ConfigError("cluster.etcd.endpoints must list at least one URL")
     for endpoint in etcd["endpoints"]:
         parsed = _safe_urlparse(endpoint, "cluster.etcd.endpoints")
-        # Reject credentials embedded in the URL (user:pass@host) FIRST,
-        # before the scheme/port check below: they would be logged in cleartext
-        # at start() and sent as HTTP Basic auth, bypassing the
-        # username/password block's https-only guard. Checking this first
-        # matters because an endpoint with BOTH embedded credentials AND a bad
-        # scheme/port would otherwise fall into the scheme/port branch and
-        # the raw password; here it is always redacted. Use the structured
-        # cluster.etcd.username/password fields instead.
+        # Reject credentials embedded in the URL FIRST, before the
+        # scheme/port check below: an endpoint with BOTH embedded
+        # credentials AND a bad scheme/port must land here (always
+        # redacted), never in the scheme/port branch.
         if _url_has_userinfo(endpoint):
             # _url_has_userinfo (not parsed.username) so a scheme-less
-            # user:pass@host -- which urlparse misreads as scheme 'user' with
-            # no userinfo -- is still caught here and redacted, instead of
-            # falling through to the scheme/port branch carrying cleartext.
+            # user:pass@host is still caught here and redacted.
             raise ConfigError(
                 "cluster.etcd.endpoints must not embed credentials in the URL "
                 "(userinfo@host); use cluster.etcd.username/password instead, "
                 "got {!r}".format(_redact_userinfo(endpoint))
             )
-        # urlparse's .port *raises* ValueError on a non-numeric or out-of-range
-        # port; guard it so a typo surfaces as a clean ConfigError (config
-        # parsing must only ever raise ConfigError) instead of an opaque
-        # ValueError that __main__ / the reload loop mistake for a
-        # cronstable bug.
+        # urlparse's .port *raises* ValueError on a non-numeric or
+        # out-of-range port; guard it so a typo surfaces as a clean
+        # ConfigError.
         try:
             port = parsed.port
         except ValueError:
             bad_port = True
         else:
-            # a missing port is fine -- it defaults to the scheme's port at
-            # connection time (e.g. https://etcd.svc behind 443 ingress); only
-            # an explicitly-present out-of-range port is rejected.
+            # a missing port defaults to the scheme's port at connection
+            # time; only an explicitly-present out-of-range port is rejected.
             bad_port = port is not None and not 0 < port <= 65535
         if (
             parsed.scheme not in ("http", "https")
@@ -3402,9 +3132,7 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
                 "got {!r}".format(_redact_userinfo(endpoint))
             )
     # mTLS to etcd needs BOTH the client cert and key; one without the other
-    # silently degrades to one-way TLS (the cert is never loaded -- see
-    # EtcdBackend._build_ssl), which either fails auth opaquely or drops the
-    # intended posture. Require them together.
+    # silently degrades to one-way TLS. Require them together.
     tls = etcd["tls"]
     if bool(tls.get("cert")) != bool(tls.get("key")):
         raise ConfigError(
@@ -3433,24 +3161,17 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
         etcd["password"], "cluster.etcd.password"
     )
     if etcd["username"] and not etcd["resolved_password"]:
-        # etcd's /v3/auth/authenticate needs a password for the username; a
-        # username with no resolvable password would fail auth opaquely every
-        # round (a recurring 401, no token, Leader jobs never run) instead of a
-        # clean config error.
+        # etcd auth needs a password for the username; without one, auth
+        # fails opaquely every round instead of as a clean config error.
         raise ConfigError(
             "cluster.etcd.username is set but no password is configured; set "
             "cluster.etcd.password (value/fromFile/fromEnvVar)"
         )
     if etcd["username"] or etcd["resolved_password"]:
-        # Authentication credentials (the cleartext username/password POSTed
-        # to /v3/auth/authenticate, and the bearer token attached to every
-        # request thereafter) must never travel unencrypted. _build_ssl only
-        # builds a TLS context when an endpoint is https, and the _post
-        # failover loop would otherwise POST those credentials over any
-        # plaintext member -- including a single http:// endpoint, or the
-        # plaintext one in a mixed http/https list. Refuse the combination at
-        # load time so credentials cannot be sniffed; the default loopback
-        # endpoint is plaintext but needs no auth, so it is unaffected.
+        # Auth credentials (and the bearer token attached to every request
+        # thereafter) must never travel unencrypted: the _post failover loop
+        # would POST them over any plaintext member, including the plaintext
+        # one in a mixed http/https list. Refuse at load time.
         insecure = [
             endpoint
             for endpoint in etcd["endpoints"]
@@ -3467,15 +3188,11 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
             )
     cfg["electLeader"] = True
     advisories = _lease_advisories(raw, "etcd")
-    # A small ttl shrinks the renew round's per-request timeout budget
-    # (EtcdBackend.request_timeout ~= round_deadline / 5, where round_deadline
-    # ~= ttl - max(1, ttl/3) renew - 1s clock skew). Below ~1s that budget can
-    # fall under a real cross-AZ/region round-trip to etcd, so every renew POST
-    # times out and the node treats a reachable etcd as unreachable (Leader
-    # jobs fail closed, and at boot they never recover). It is the operator's
-    # explicit ttl choice and a local/low-latency etcd is fine, so warn rather
-    # than reject. (Mirrors the backend's cadence constants: 1s skew, ttl/3
-    # renew period, 5 POSTs per renew cycle.)
+    # A small ttl shrinks the per-request renew timeout budget below a real
+    # cross-AZ round-trip, making a reachable etcd look unreachable (Leader
+    # jobs fail closed). Warn rather than reject: a local etcd is fine.
+    # (Mirrors EtcdBackend's cadence constants: 1s skew, ttl/3 renew period,
+    # 5 POSTs per renew cycle.)
     renew_period = max(1.0, etcd["ttl"] / 3)
     round_deadline = max(1.0, etcd["ttl"] - renew_period - 1.0)
     per_post_budget = round_deadline / 5
@@ -3498,11 +3215,9 @@ def _build_etcd_cluster_config(raw: dict) -> ClusterConfig:
 def _build_filesystem_cluster_config(raw: dict) -> ClusterConfig:
     """Build the cluster config for the shared-mount (filesystem) backend.
 
-    The store is a directory, so validation is far smaller than etcd's: a
-    non-empty path, a ttl floor (same rationale as etcd's -- below 3s the
-    leader window collapses under the renew cadence and the clock-skew
-    margin), and the shared lease-backend rules (no spread, no foreign store
-    blocks, electLeader implied).
+    Validation: a non-empty path, a ttl floor (same rationale as etcd's) and
+    the shared lease-backend rules (no spread, no foreign store blocks,
+    electLeader implied).
     """
     cfg = _cluster_base(raw)
     _reject_lease_spread(cfg, "filesystem")
@@ -3519,18 +3234,7 @@ def _build_filesystem_cluster_config(raw: dict) -> ClusterConfig:
         )
     if not str(fsb.get("electionName") or "").strip():
         raise ConfigError("cluster.filesystem.electionName must be non-empty")
-    # NaN-rejecting on purpose, like the state TTL floors: 'nan < 3' is False
-    # and '1e309' parses as inf, and either silently breaks the lease expiry
-    # arithmetic (multiple leaders / a crashed leader's lease never expiring).
-    if not math.isfinite(float(fsb["ttl"])) or fsb["ttl"] < 3:
-        raise ConfigError(
-            "cluster.filesystem.ttl must be >= 3 seconds and finite (the "
-            "leader holds the lease only until ttl minus a clock-skew "
-            "margin and "
-            "renews every max(1s, ttl/3); a smaller ttl makes a node that "
-            "wins the election immediately treat its own lease as "
-            "expired, so no Leader job ever runs); got {}".format(fsb["ttl"])
-        )
+    _require_lease_ttl_floor(fsb["ttl"], "cluster.filesystem.ttl")
     cfg["electLeader"] = True
     advisories = _lease_advisories(raw, "filesystem")
     if advisories:
@@ -3538,19 +3242,17 @@ def _build_filesystem_cluster_config(raw: dict) -> ClusterConfig:
     return ClusterConfig(cfg)
 
 
-def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
+def cluster_config_warnings(cfg: ClusterConfig) -> list[str]:
     """Non-fatal advisories for a cluster config, returned as messages.
 
-    Returned (not logged) so the caller can emit them *once* — e.g. when the
-    cluster manager (re)starts — instead of on every config reload. The daemon
-    re-parses its config every wakeup, so logging here would spam the same
-    warning every minute for the life of the process.
+    Returned (not logged) so the caller can emit them *once* when the
+    cluster manager (re)starts: the daemon re-parses its config every
+    wakeup, so logging here would spam the same warning every minute.
     """
-    # Lease-backend advisories (gossip-only keys / a swallowed
-    # electLeader:false) are computed at build time, where the raw block is
-    # available, and stashed on the cfg; surface them here so they ride the
-    # same emit-once channel.
-    warnings: List[str] = list(cfg.get("_advisories", ()))
+    # Lease-backend advisories are computed at build time (where the raw
+    # block is available) and stashed on the cfg; surfaced here so they ride
+    # the same emit-once channel.
+    warnings: list[str] = list(cfg.get("_advisories", ()))
     if cfg.get("backend", "gossip") != "gossip":
         # The lease backends have no static peer set or even/odd-size
         # trade-off, and always imply electLeader, so the gossip-only
@@ -3571,13 +3273,10 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
                 "node, or grow to {} to tolerate one more failure; prefer an "
                 "odd size.".format(size, size - 1, size - 1, size + 1)
             )
-        # A self-listing by FQDN (vs the short nodeName) is not dropped at
-        # config time, so the declared size can be one larger than the real
-        # cluster -- which, at the boundary, hides the degenerate 2-node case
-        # the size==2 refusal exists to catch (the runtime STATUS_SELF
-        # exclusion later drops it, leaving a real quorum of 2). Warn so the
-        # operator can fix the listing rather than discover it as flapping
-        # leadership.
+        # A self-listing by FQDN is not dropped at config time, so the
+        # declared size can hide the degenerate 2-node case the size==2
+        # refusal exists to catch. Warn so the operator fixes the listing
+        # rather than discovering it as flapping leadership.
         listen = cfg.get("listen") or ""
         node_name = cfg["nodeName"]
         self_hosts = [
@@ -3598,15 +3297,11 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
                     size - len(self_hosts),
                 )
             )
-        # The loopback analogue: a loopback entry can only reach this node
-        # (or nothing), so like a self-listing-by-FQDN it hides a smaller --
-        # at the boundary, degenerate -- real cluster behind the declared
-        # size. Unambiguous forms are dropped at load (_is_self_listed); this
-        # advisory covers what remains (localhost, or a family/listen
-        # mismatch). A self-listing by a routable IP under a wildcard listen
-        # is undetectable without resolving addresses; that case is caught at
-        # runtime instead, when the self-poll marks the entry STATUS_SELF
-        # (see cronstable.cluster.ClusterManager._log_peer_status_change).
+        # The loopback analogue: unambiguous forms are dropped at load
+        # (_is_self_listed); this advisory covers what remains (localhost,
+        # or a family/listen mismatch). A self-listing by a routable IP is
+        # undetectable without resolving addresses and is caught at runtime
+        # as STATUS_SELF instead.
         loopback_hosts = [
             peer["host"]
             for peer in cfg["peers"]
@@ -3640,19 +3335,15 @@ def cluster_config_warnings(cfg: ClusterConfig) -> List[str]:
 def _validate_web_tls(webconf: WebConfig) -> None:
     """Cross-checks between the `web.listen` schemes and the `web.tls` block.
 
-    Mirrors the etcd client-TLS checks: material with no transport that uses
-    it, and a transport with no material, are both silent-downgrade
-    misconfigurations rather than typos to shrug at. Fails at parse time so
-    ``--validate-config`` catches them, because the runtime bind loop is
-    designed to skip a bad listener with a warning; an unvalidated
-    certificate problem would otherwise degrade to "the dashboard is just
-    gone" with the reason buried in the log.
+    Mirrors the etcd client-TLS checks: material with no transport, or a
+    transport with no material, is a silent-downgrade misconfiguration.
+    Fails at parse time because the runtime bind loop skips a bad listener
+    with only a warning ("the dashboard is just gone").
 
-    Whether the files exist or load is deliberately NOT checked here. Nothing
-    in this module touches the filesystem (not even for ``cluster.tls``),
-    ``--validate-config`` may run somewhere that is not the deployment
-    target, and a Kubernetes-mounted secret need not exist yet at first boot.
-    That gate lives at the listener, in
+    Whether the files exist or load is deliberately NOT checked here:
+    nothing in this module touches the filesystem, ``--validate-config`` may
+    run off the deployment target, and a Kubernetes-mounted secret need not
+    exist yet at first boot.  That gate lives at the listener, in
     :meth:`cronstable.cron.Cron.start_stop_web_app`.
     """
     tls = webconf.get("tls") or {}
@@ -3692,8 +3383,7 @@ def _validate_web_config(webconf: WebConfig) -> None:
     """Range checks the schema cannot express, mirroring the cluster
     builders: fail at parse time (so ``--validate-config`` catches it)
     rather than when the first scrape arrives."""
-    # First, before the early returns below (no nodeHistory map, no metrics
-    # map) skip everything appended after them.
+    # First: the early returns below would skip it.
     _validate_web_tls(webconf)
     if resolve_bonjour_config(webconf) is not None:
         # Imported here so a config without the advert never pays for
@@ -3756,10 +3446,10 @@ def _build_mcp_config(raw: Optional[dict]) -> MCPConfig:
     web section (the fail-closed no-auth check) live in
     :func:`_validate_mcp_config`, run once on the fully assembled config.
     """
-    merged: Dict[str, Any] = {**DEFAULT_MCP, **(raw or {})}
+    merged: dict[str, Any] = {**DEFAULT_MCP, **(raw or {})}
     # dedupe toolsets while preserving order, so `[observe, observe]` is one.
     seen: set = set()
-    toolsets: List[str] = []
+    toolsets: list[str] = []
     for name in merged["toolsets"]:
         if name not in seen:
             seen.add(name)
@@ -3797,28 +3487,22 @@ def _web_has_any_token(web: dict) -> bool:
 
     True when either the scalar ``web.authToken`` or one or more scoped
     ``web.authTokens`` entries are present. A bare presence test (like the
-    fail-closed MCP gate needs): it does not resolve the sources, matching
-    the historical ``web.get("authToken")`` truthiness check.
+    fail-closed MCP gate needs): it does not resolve the sources.
     """
     return bool(web.get("authToken") or web.get("authTokens"))
 
 
-def _open_routable_listeners(web: dict) -> List[str]:
+def _open_routable_listeners(web: dict) -> list[str]:
     """Web listeners a stranger could reach with no credential at all.
 
-    Shared by the ``mcp`` and ``push`` fail-closed gates, which guard
-    different endpoints against the same hazard: cronstable installs its
-    auth middleware only when a token resolves, so with no
-    ``web.authToken``/``web.authTokens`` there is no middleware and every
-    route on every listener answers whoever can connect.  Empty when any
-    token is configured, and empty when every listener is loopback or a
-    unix socket (nothing off-host can reach those).
+    Shared by the ``mcp`` and ``push`` fail-closed gates: cronstable
+    installs its auth middleware only when a token resolves, so with no
+    token every route answers whoever can connect.  Empty when any token is
+    configured, or when every listener is loopback or a unix socket.
 
-    An ``https`` listener with ``web.tls.clientCa`` set authenticates its
-    callers at the transport (CERT_REQUIRED against that CA), the same
-    guarantee these gates already accept from an mTLS-terminating proxy,
-    so it does not count as open.  Plain ``https`` does: transport
-    encryption is not caller authentication.
+    An ``https`` listener with ``web.tls.clientCa`` authenticates callers
+    at the transport, so it does not count as open.  Plain ``https`` does:
+    transport encryption is not caller authentication.
     """
     if _web_has_any_token(web):
         return []
@@ -3875,7 +3559,7 @@ def _validate_mcp_config(config: "CronstableConfig") -> None:
         )
 
 
-def _push_report_users(config: "CronstableConfig") -> List[str]:
+def _push_report_users(config: "CronstableConfig") -> list[str]:
     """Every place the assembled config enables the push reporter.
 
     Human-readable names ("job backup", "dag etl task load", "notify"),
@@ -3915,15 +3599,11 @@ def _push_report_users(config: "CronstableConfig") -> List[str]:
 def _validate_push_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for push that need the fully assembled config.
 
-    Runs at the top-level parse (from :func:`_validate_cross_sections`):
-    the ``push:`` section, the ``state:`` section and the jobs enabling
-    the reporter may legitimately live in different config-dir files.
-
-    Everything here refuses to start rather than degrade: push is an
-    alerting channel, and a channel that silently self-disables (a
-    missing library, a registry with nowhere to live, a reporter with
-    no relay) is a missed page at 2 a.m., the one failure mode this
-    feature exists to prevent.
+    Runs at the top-level parse (from :func:`_validate_cross_sections`): the
+    sections involved may live in different config-dir files.  Everything
+    here refuses to start rather than degrade: an alerting channel that
+    silently self-disables is a missed page at 2 a.m., the one failure mode
+    this feature exists to prevent.
     """
     users = _push_report_users(config)
     push_conf = config.push_config
@@ -3936,10 +3616,8 @@ def _validate_push_config(config: "CronstableConfig") -> None:
                 "reporter".format(", ".join(sorted(users)))
             )
         return
-    # Imported here, not at module top: cronstable.push pulls in aiohttp
-    # and the optional PyNaCl probe, which a bare config parse (e.g.
-    # `--validate-config` in scripts) should not pay for unless a push
-    # section actually exists.
+    # Imported here, not at module top: cronstable.push pulls in aiohttp,
+    # which a bare config parse should not pay for.
     from cronstable.push import HAVE_PYNACL
 
     if not HAVE_PYNACL:
@@ -3955,18 +3633,12 @@ def _validate_push_config(config: "CronstableConfig") -> None:
             "configure a `state:` section (shared store, cluster-visible "
             "pairings) or set push.devicesFile (single node)"
         )
-    # The same gate the mcp section gets, on the same evidence and for the
-    # same reason: /push/devices is the other mutating surface the web API
-    # exposes, and without a token there is no auth middleware to gate it.
-    # An open pairing endpoint is worse than an open read endpoint, because
-    # the damage outlives the exposure: a stranger who pairs once keeps
-    # receiving every alert from anywhere, forever, and the only trace is an
-    # extra row in a listing nobody re-reads.
-    #
-    # No web section (or no listener) means no pairing endpoint exists at
-    # all, which is a legitimate shape: on a cluster, one node serves the
-    # dashboard and pairs devices while the others only send to the
-    # registry they share. So gate on the listeners, never on push itself.
+    # The same gate the mcp section gets: without a token there is no auth
+    # middleware to gate /push/devices, and an open pairing endpoint's
+    # damage outlives the exposure (a stranger who pairs once keeps
+    # receiving every alert, forever).  No web section means no pairing
+    # endpoint at all, a legitimate cluster shape (other nodes only send to
+    # the shared registry), so gate on the listeners, never on push itself.
     web = config.web_config
     if web is not None and not push_conf.get("allowUnauthenticated"):
         routable = _open_routable_listeners(web)
@@ -3991,81 +3663,55 @@ def _validate_push_config(config: "CronstableConfig") -> None:
 
 @dataclass(slots=True)
 class CronstableConfig:
-    jobs: List[JobConfig]
+    jobs: list[JobConfig]
     web_config: Optional[WebConfig]
     job_defaults: JobDefaults
     logging_config: Optional[LoggingConfig]
-    # Optional; None default so existing constructors (e.g. the empty config in
-    # Cron.update_config) need no change.
+    # The optional sections default to None (feature off, classic behaviour)
+    # so existing constructors (e.g. the empty config in Cron.update_config)
+    # need no change.
     cluster_config: Optional[ClusterConfig] = None
-    # Optional durable state backend (cronstable.state); None keeps the classic
-    # stateless, in-memory behaviour. Defaulted for the same reason as above.
     state_config: Optional[StateConfig] = None
-    # Orchestration DAGs; empty keeps the classic no-DAG behaviour.
     # A mutable default needs field(default_factory), never a shared [].
-    dags: List["DagConfig"] = field(default_factory=list)
-    # Optional MCP server section; None keeps the server off. Defaulted so the
-    # empty config in Cron.update_config and other constructors need no change.
+    dags: list["DagConfig"] = field(default_factory=list)
     mcp_config: Optional[MCPConfig] = None
-    # Optional daemon-level event notifications (`notify:`): a report block
-    # that fires on DAG failures, approval gates, and leadership/quorum
-    # changes. None keeps the classic job-runs-only reporting.
-    notify_config: Optional[Dict[str, Any]] = None
-    # Optional end-to-end encrypted push alerts (`push:`): the relay
-    # endpoint + device-registry storage the push reporter needs. None
-    # keeps push off (and refuses report.push.enabled anywhere).
-    push_config: Optional[Dict[str, Any]] = None
+    notify_config: Optional[dict[str, Any]] = None
+    push_config: Optional[dict[str, Any]] = None
 
 
 # Environment-variable interpolation over the validated config document.
 #
 # After strictyaml validates a YAML file, every ``${VAR}`` /
 # ``${VAR:-default}`` in a *string* value is replaced with the environment
-# variable VAR.  ``:-default`` supplies a fallback when VAR is unset or empty
-# (exactly like the POSIX shell); ``$$`` is the escape for a literal ``$``.  A
-# reference to an unset variable with no default is a hard ConfigError naming
-# the variable and where it appeared, so a missing deploy-time variable fails
-# fast at load (and under ``--validate-config``) rather than silently expanding
-# to nothing.
+# variable VAR (``:-default`` falls back when unset or empty, like the POSIX
+# shell; ``$$`` escapes a literal ``$``).  An unset variable with no default
+# is a hard ConfigError naming the variable and where it appeared.  Only the
+# braced forms are recognised: a lone ``$``, a bare ``$VAR``, or a malformed
+# ``${...}`` is left verbatim, so a config that never used the syntax is
+# untouched.  Expansion runs post-validation, so only fields strictyaml
+# accepted as strings are eligible (put a variable inside a string, e.g.
+# ``listen: ["0.0.0.0:${PORT}"]``).
 #
-# Expansion runs post-validation over the parsed document, so only fields
-# strictyaml already accepted as strings are eligible; a numeric key such as
-# ``smtpPort`` cannot itself be a bare ``${VAR}`` (put the variable inside a
-# string, e.g. ``listen: ["0.0.0.0:${PORT}"]``).  Only the braced forms are
-# recognised: a lone ``$``, a bare ``$VAR``, or a malformed ``${...}`` is left
-# verbatim, so an existing config that never used the syntax is untouched.
+# Skipped whole, because a ``${...}`` there is another layer's syntax:
+# * a job's or DAG task's ``command`` and ``shell``, and a shell reporter's
+#   ``shell`` block: the runtime shell expands those against the *job's*
+#   environment at execution time, not the daemon's;
+# * the top-level ``logging`` section: handed to ``logging.config``
+#   verbatim, where a ``$``-style formatter legitimately writes
+#   ``${asctime}``.
+# The skip is decided by WHERE a key sits, not by its spelling: a
+# user-chosen key named ``command``/``shell``/``logging`` inside an
+# arbitrary-key map is interpolated like any other value (see
+# _env_child_kind).
 #
-# A few structural locations are skipped whole, because a ``${...}`` there is
-# another layer's expansion syntax rather than ours:
+# Fingerprints hash the post-expansion config, so a job set interpolating
+# env vars gets a different job-set id per environment; intended, the
+# configs really do differ.
 #
-# * A job's or DAG task's ``command`` and ``shell``, and a shell reporter's
-#   ``shell`` block: that ``${VAR}`` belongs to the runtime shell, which
-#   expands it against the *job's* environment (env_file, per-job environment,
-#   staged secrets) at execution time, not the daemon's.
-# * The top-level ``logging`` section: it is handed to Python's
-#   ``logging.config`` verbatim, and a ``$``-style formatter (``style: "$"``)
-#   legitimately writes ``${asctime}`` / ``${message}`` in its ``format``
-#   string, so the whole subtree is left for logging.config.
-#
-# The skip is decided by WHERE a key sits in the validated document, not by
-# its spelling: a user-chosen key that happens to be named ``command`` /
-# ``shell`` / ``logging`` inside an arbitrary-key map (``web.headers``, a
-# ``webhook.headers`` entry, ``sentry.extra``) is interpolated like any other
-# value. The walk tags each map it descends into with a small "kind"; only the
-# job, task and defaults kinds own shell-territory ``command`` / ``shell``, a
-# report kind owns the shell reporter, and the root kind owns ``logging``.
-#
-# Because fingerprints hash the post-expansion config, a job set that
-# interpolates env vars gets a different job-set id per environment; that is
-# intended (the configs really do differ).
-# ASCII-only variable-name character sets (a name is
-# ``[A-Za-z_][A-Za-z0-9_]*``), matched by hand so the expansion is a single
-# linear pass instead of ``re.sub``.  ``re.sub`` retries the pattern at every
-# position, and its ``:-([^}]*)`` default lets the engine scan to
-# end-of-string at each retry, so a value carrying many unterminated
-# ``${x:-`` fragments cost O(n^2) to expand: a config-load, ``--validate-
-# config`` and hot-reload stall.  The scanner below is O(n); it never re-scans
-# a span, and stops looking for a closing ``}`` once none can remain ahead.
+# The scanner is hand-rolled and single-pass: ``re.sub`` with a
+# ``:-([^}]*)`` default is O(n^2) on a value carrying many unterminated
+# ``${x:-`` fragments, which would stall config load and hot-reload.  Names
+# are ASCII ``[A-Za-z_][A-Za-z0-9_]*``.
 _ENV_NAME_START = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
 )
@@ -4106,9 +3752,8 @@ def _interpolate_env_value(raw: str, path: str, location: str) -> str:
 
     A single linear left-to-right pass equivalent to the grammar
     ``$$ | ${NAME} | ${NAME:-DEFAULT}`` (NAME is ``[A-Za-z_][A-Za-z0-9_]*``,
-    DEFAULT is any run of non-``}`` characters, the same as the old
-    ``re.sub``); every other ``$`` (a lone ``$``, a bare ``$VAR``, a malformed
-    ``${...``) is copied verbatim.
+    DEFAULT is any run of non-``}`` characters); every other ``$`` (a lone
+    ``$``, a bare ``$VAR``, a malformed ``${...``) is copied verbatim.
     """
     if "$" not in raw:  # the overwhelmingly common case
         return raw
@@ -4245,17 +3890,11 @@ def parse_config_string(
     except YAMLError as ex:
         raise ConfigError(str(ex)) from ex
     except (ValueError, AttributeError) as ex:
-        # strictyaml's own scalar validators raise BARE ValueError for
-        # values their is_decimal/is_integer prefilters accept but
-        # float()/int() reject ('' -- a key left with no value -- '.',
-        # '-', '_', ...), reaching every Float()/Int() config key; and its
-        # reader raises AttributeError (a ReaderError missing context_mark)
-        # for a control character or lone surrogate anywhere in the file.
-        # Config parsing must only ever raise ConfigError: without this,
-        # startup dies with a raw traceback instead of 'Configuration
-        # error: ...', the reload loop logs the operator's typo as a
-        # cronstable bug, and one bad file aborts a whole config-directory
-        # load.
+        # strictyaml's scalar validators raise BARE ValueError for values
+        # like '' or '.' on any Float()/Int() key, and its reader raises
+        # AttributeError for a control character or lone surrogate.  Config
+        # parsing must only ever raise ConfigError: without this, one bad
+        # file aborts a whole config-directory load with a raw traceback.
         raise ConfigError("{}: {}".format(path, ex)) from ex
     # Expand ${VAR} references over the validated doc before building the
     # config (an unset-variable ConfigError propagates as-is). Runs per file,
@@ -4268,12 +3907,10 @@ def parse_crontab_string(data: str, path: str) -> CronstableConfig:
     """Parse classic (Vixie-style) crontab text into a CronstableConfig.
 
     The crontab is lowered to ordinary job dictionaries
-    (:func:`cronstable.crontabs.parse_crontab`) and then built exactly like a
+    (:func:`cronstable.crontabs.parse_crontab`) and built exactly like a
     YAML ``jobs:`` section, so every entry gets cronstable's standard
-    defaults -- UTC schedules unless the crontab sets ``CRON_TZ``, stderr
-    and exit-status failure detection, and so on -- rather than an
-    emulation of cron's environment.  A crontab can only define jobs;
-    web / cluster / logging / defaults customization stays YAML-only.
+    defaults rather than an emulation of cron's environment.  A crontab can
+    only define jobs; every other section stays YAML-only.
     """
     try:
         job_docs = crontabs.parse_crontab(data, path)
@@ -4282,7 +3919,7 @@ def parse_crontab_string(data: str, path: str) -> CronstableConfig:
     return _config_from_doc({"jobs": job_docs}, path, None)
 
 
-def _build_notify_config(raw: dict) -> Dict[str, Any]:
+def _build_notify_config(raw: dict) -> dict[str, Any]:
     """Assemble the ``notify:`` block: an event allow-list + a report block.
 
     ``report`` merges over the event-shaped :data:`_NOTIFY_REPORT_DEFAULTS`
@@ -4300,7 +3937,7 @@ def _build_notify_config(raw: dict) -> Dict[str, Any]:
     }
 
 
-def _build_push_config(raw: dict) -> Dict[str, Any]:
+def _build_push_config(raw: dict) -> dict[str, Any]:
     """Assemble the ``push:`` block: relay endpoint + registry storage.
 
     Only shape/range checks live here; the cross-section requirements
@@ -4338,7 +3975,7 @@ def _build_push_config(raw: dict) -> Dict[str, Any]:
 
 def resolve_bonjour_config(
     web_config: Optional[WebConfig],
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Collapse ``web.bonjour``'s bool-or-map forms to one shape.
 
     Returns ``None`` when the advert is off (absent, ``false``, or the
@@ -4373,7 +4010,7 @@ def _config_from_doc(
     """
     inc_defaults_merged: dict = {}
     jobs = []
-    dags: List[DagConfig] = []
+    dags: list[DagConfig] = []
     webconf = WebConfig(doc["web"]) if "web" in doc else None
     if webconf is not None:
         # (an included file's web section was already validated when that
@@ -4433,7 +4070,7 @@ def _config_from_doc(
     defaults = mergedicts(defaults, doc.get("defaults", {}))
     # One env_file is frequently shared by many jobs in a doc; a per-doc
     # cache reads and parses each such file once instead of once per job.
-    env_cache: Dict[str, Dict[str, str]] = {}
+    env_cache: dict[str, dict[str, str]] = {}
     # Likewise for the advisory schedule lint, which a fleet's jobs repeat far
     # more often than they repeat env_files (see JobConfig._lint_schedule).
     lint_cache: LintCache = {}
@@ -4442,13 +4079,10 @@ def _config_from_doc(
         jobs.append(
             JobConfig(job_dict, env_cache=env_cache, lint_cache=lint_cache)
         )
-    # A DAG task is a job invocation, so its launch fields inherit the same
-    # `defaults:` base a regular job does (global reporters, environment,
-    # shell, capture, secrets, monitorResources, timeouts).  The DAG-node
-    # fields (deps/type/retries/mapping) are graph shape, not launch config,
-    # and are never touched by a `defaults:` block.  The DAG's synthetic
-    # schedule-trigger job stays on DEFAULT_CONFIG (see DagConfig), so a global
-    # onSuccess/onFailure reporter does not fire on every DAG tick.
+    # A DAG task inherits the same `defaults:` base a regular job does; the
+    # DAG-node fields are graph shape and never touched by `defaults:`.  The
+    # synthetic schedule-trigger job stays on DEFAULT_CONFIG (see DagConfig)
+    # so a global reporter does not fire on every DAG tick.
     for config_dag in doc.get("dags", []):
         dags.append(DagConfig(config_dag, defaults))
     return CronstableConfig(
@@ -4466,20 +4100,16 @@ def _config_from_doc(
 
 
 #: Extensions the YAML front end owns.  A file with one of these names is
-#: always YAML -- never content-sniffed -- so every config that worked
-#: before classic-crontab support keeps its exact behavior and errors.
+#: always YAML, never content-sniffed.
 _YAML_EXTENSIONS = frozenset({".yml", ".yaml"})
 
 
 def _is_crontab_config(path: str, data: str) -> bool:
     """Decide which front end parses ``path``: classic crontab or YAML.
 
-    The file NAME decides whenever it can: a crontab marker (``.crontab``
-    / ``.cron`` extension, or a file named ``crontab``) always means
-    crontab, and a YAML extension always means YAML.  Content sniffing is
-    a last resort for an explicitly-passed file with a neutral name (e.g.
-    ``-c /var/spool/cron/crontabs/root``) and is conservative: only a
-    first line no YAML config could open with reads as a crontab
+    The file NAME decides whenever it can; content sniffing is a last
+    resort for a neutral name and is conservative: only a first line no
+    YAML config could open with reads as a crontab
     (see :func:`cronstable.crontabs.looks_like_crontab`).
     """
     if crontabs.is_crontab_path(path):
@@ -4494,16 +4124,14 @@ def parse_config_file(
     _seen: Optional[set] = None,
     _sources: Optional[set] = None,
 ) -> CronstableConfig:
-    # Guard against include cycles (a file that includes itself directly or
-    # transitively) so a misconfiguration raises a clear ConfigError instead
-    # of recursing until RecursionError. _seen is scoped per top-level parse,
-    # so two independent files including a common file is not flagged.
+    # Guard against include cycles with a clear ConfigError instead of
+    # RecursionError. _seen is scoped per top-level parse, so two
+    # independent files including a common file is not flagged.
     abspath = os.path.abspath(path)
-    # _sources, when supplied, accumulates every on-disk file the parse reads
-    # (this file plus any it includes, transitively) so a caller can stat them
-    # and skip an unchanged reparse; it is deliberately NOT _seen (which is
-    # per-file cycle scope) so two dir files including a common file are still
-    # both recorded without being mistaken for a cycle.
+    # _sources accumulates every on-disk file the parse reads so a caller
+    # can stat them and skip an unchanged reparse; deliberately NOT _seen
+    # (per-file cycle scope), so a shared include is recorded without being
+    # mistaken for a cycle.
     if _sources is not None:
         _sources.add(abspath)
     if _seen is None:
@@ -4526,13 +4154,10 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     where an included or config-dir sibling file is parsed standalone and
     the section a job depends on may legitimately live in another file.
     """
-    # The scheduler indexes jobs by name (concurrency gating, pause state,
-    # run history, the durable in-flight record), so of two same-named jobs
-    # only the later definition would ever run, silently. Rejected here, on
-    # the assembled config, for the same reason the dag checks below reject
-    # duplicate dag names: the usual source is the same name in two
-    # config-dir or included files, or two crontab files sharing a basename
-    # (their auto-generated '<basename>:<line>' names then collide).
+    # The scheduler indexes jobs by name, so of two same-named jobs only the
+    # later definition would ever run, silently. The usual source is the
+    # same name in two config-dir/included files, or two crontab files
+    # sharing a basename (their '<basename>:<line>' names then collide).
     dup_jobs = sorted(
         name
         for name, count in Counter(job.name for job in config.jobs).items()
@@ -4601,17 +4226,14 @@ def _validate_dags(config: CronstableConfig) -> None:
     if dups:
         raise ConfigError("duplicate dag name(s): {}".format(", ".join(dups)))
     # Each task's launch template is named '<dag>.<taskId>' and shares the
-    # scheduler's per-name bookkeeping (running_jobs, concurrencyPolicy, the
-    # durable in-flight record) with regular jobs, so a name collision
-    # entangles unrelated runs: a Replace job would cancel an in-flight DAG
-    # task mid-run, a Forbid job silently skips fires while it runs. Task ids
-    # may themselves contain '.', so two dags can also mint the same template
-    # name (dag 'a' task 'b.c' vs dag 'a.b' task 'c'). Reject both at load.
-    # A job named after a bare dag is fine: the dag's synthetic schedule job
-    # carries a 'dag:' prefix and is never launched, and dag run/XCom state
-    # lives under its own 'dagrun/'/'dagxcom/' scopes.
+    # scheduler's per-name bookkeeping with regular jobs, so a name
+    # collision entangles unrelated runs. Task ids may contain '.', so two
+    # dags can also mint the same template name (dag 'a' task 'b.c' vs dag
+    # 'a.b' task 'c'). Reject both at load. A job named after a bare dag is
+    # fine: the synthetic schedule job carries a 'dag:' prefix and is never
+    # launched.
     job_names = {job.name for job in config.jobs}
-    template_owner: Dict[str, Tuple[str, str]] = {}
+    template_owner: dict[str, tuple[str, str]] = {}
     for d in config.dags:
         for task in d.tasks:
             template = task.job_template.name
@@ -4668,19 +4290,14 @@ def parse_config(
 
 def parse_config_with_sources(
     config_arg: str,
-) -> Tuple[CronstableConfig, FrozenSet[str]]:
+) -> tuple[CronstableConfig, frozenset[str]]:
     """Parse ``config_arg`` and report the on-disk files the parse read.
 
-    Returns ``(config, sources)`` where ``sources`` is the absolute path of
-    every YAML/crontab file consulted (the top-level file or directory entries,
-    plus anything they ``include`` transitively) and every job's and DAG
-    task's ``env_file``.
-    The scheduler stats this exact set to detect that nothing changed on disk
-    and skip the (strictyaml-heavy) reparse on an unchanged config; because it
-    covers includes and env_files, an edit to any file that actually feeds the
-    config is still noticed.  ``env_file`` is abspath'd the same way
-    :func:`parse_environment_file` opens it (relative to the process CWD), so
-    the recorded path matches what was read.
+    ``sources`` is the absolute path of every YAML/crontab file consulted
+    (including transitive ``include``s) and every job's and DAG task's
+    ``env_file``.  The scheduler stats this exact set to skip the reparse on
+    an unchanged config; because it covers includes and env_files, an edit
+    to any file that actually feeds the config is still noticed.
     """
     sources: set = set()
     config = parse_config(config_arg, sources)
@@ -4699,56 +4316,41 @@ def parse_config_with_sources(
 class _CachedDirFile(NamedTuple):
     """A remembered per-file parse for the per-file parse cache.
 
-    ``sources`` is every on-disk file the file's parse read (itself, its
-    transitive ``include``s, and the ``env_file`` of each job and DAG task
-    it defines); ``sig`` is the sorted ``(abspath, content_digest)``
-    fingerprint of exactly those, and ``config`` is the parsed result to
-    hand back untouched when they are all still byte-for-byte current.
-
-    ``included`` is the narrower set the include-cycle guard reasons about:
-    the config files the parse actually walked, without the env_files (which
-    are read, never parsed, so they are not part of any cycle).  Serving a
-    cached parse has to leave the caller's cycle scope holding exactly what
-    a real parse would have added to it.
+    ``sources`` is every on-disk file the parse read; ``sig`` the sorted
+    ``(abspath, content_digest)`` fingerprint of exactly those; ``config``
+    the parsed result to reuse while they stay byte-for-byte current.
+    ``included`` is the narrower set the include-cycle guard reasons about
+    (config files only, no env_files): serving a cached parse must leave the
+    caller's cycle scope holding exactly what a real parse would have added.
     """
 
-    sources: FrozenSet[str]
-    included: FrozenSet[str]
-    sig: Tuple[Tuple[str, Optional[str]], ...]
+    sources: frozenset[str]
+    included: frozenset[str]
+    sig: tuple[tuple[str, Optional[str]], ...]
     config: CronstableConfig
 
 
-#: Per-file parse cache.  A one-line edit to one file of a config directory
-#: (or of an ``include:`` tree) reopens the scheduler's whole-config reparse
-#: (cronstable.cron._config_signature), which then rebuilds EVERY file's
-#: JobConfigs even though only one changed.  Keyed by absolute path and
-#: validated by hashing each source's CONTENT, this hands back the
-#: unchanged files' already-parsed configs and re-runs strictyaml only for
-#: the file that actually changed -- so a cache hit is byte-exact with a
-#: full reparse, never merely mtime-close.  Bounded LRU so a process that
-#: parses many distinct configs (tests) does not grow it without limit; a
-#: stale or evicted entry only costs a reparse, never correctness.
+#: Per-file parse cache, keyed by absolute path and validated by hashing
+#: each source's CONTENT: an edit to one file of a config directory or
+#: include tree re-runs strictyaml only for that file.  A cache hit is
+#: byte-exact with a full reparse, never merely mtime-close.  Bounded LRU;
+#: a stale or evicted entry only costs a reparse, never correctness.
 _DIR_FILE_CACHE: "OrderedDict[str, _CachedDirFile]" = OrderedDict()
 _DIR_FILE_CACHE_MAX = 1024
 
 
 def _dir_file_content_sig(
-    sources: FrozenSet[str],
-) -> Tuple[Tuple[str, Optional[str]], ...]:
+    sources: frozenset[str],
+) -> tuple[tuple[str, Optional[str]], ...]:
     """Sorted ``(abspath, content_digest)`` fingerprint of a parse's inputs.
 
-    Hashes each source's bytes -- the file itself, its transitive
-    includes, and its jobs'/tasks' env_files -- rather than trusting a
-    ``(mtime_ns, size)`` stat, so a size-preserving edit that also
-    preserves mtime (coarse-granularity network/container filesystems, or
-    mtime-pinning tooling such as ``rsync -a`` / ``cp --preserve=timestamps``
-    / backup-restore) still invalidates the cache.  Reading the bytes is
-    the cheap part the pre-cache code paid on EVERY reparse anyway; the
-    strictyaml parse and JobConfig build are what the cache skips.  A
-    vanished or unreadable source hashes to ``None`` so a deletion still
-    reads as a change.
+    Hashes each source's bytes rather than trusting a ``(mtime_ns, size)``
+    stat, so a size- and mtime-preserving edit (coarse filesystems,
+    ``rsync -a``) still invalidates the cache; the strictyaml parse is what
+    the cache skips, not the read.  A vanished or unreadable source hashes
+    to ``None`` so a deletion still reads as a change.
     """
-    parts: List[Tuple[str, Optional[str]]] = []
+    parts: list[tuple[str, Optional[str]]] = []
     for src in sorted(sources):
         try:
             with open(src, "rb") as handle:
@@ -4763,21 +4365,17 @@ def _dir_file_content_sig(
 
 def _parse_file_cached(
     path: str, _seen: Optional[set] = None
-) -> Tuple[CronstableConfig, FrozenSet[str], FrozenSet[str]]:
+) -> tuple[CronstableConfig, frozenset[str], frozenset[str]]:
     """Parse one config file, reusing an unchanged prior parse.
 
-    Returns ``(config, sources, included)``: ``sources`` is every file the
-    parse depended on (the file, its includes, and its jobs'/tasks'
-    env_files) so the caller can fold it into the source set the scheduler
-    stat-watches, and ``included`` is the config files alone, for the
-    caller's include-cycle scope.  ConfigError/OSError propagate unchanged
-    (and nothing is cached) so callers record them exactly as before.
+    Returns ``(config, sources, included)``: every file the parse depended
+    on, and the config files alone for the caller's include-cycle scope.
+    ConfigError/OSError propagate unchanged (and nothing is cached).
 
-    ``_seen`` is the caller's cycle scope, when it has one.  It is passed
-    straight into the real parse, so a file that includes its way back to an
-    ancestor still raises there; a cache hit instead folds the remembered
-    ``included`` set into it, and is declined outright when the two overlap,
-    because that overlap IS the cycle and the uncached path words the error.
+    ``_seen`` is the caller's cycle scope: passed into a real parse, folded
+    from the remembered ``included`` set on a cache hit, and a hit is
+    declined outright when the two overlap, because that overlap IS the
+    cycle and the uncached path words the error.
     """
     abspath = os.path.abspath(path)
     cached = _DIR_FILE_CACHE.get(abspath)
@@ -4795,10 +4393,8 @@ def _parse_file_cached(
     before = frozenset(seen)
     config = parse_config_file(path, seen, file_sources)
     file_included = frozenset(seen) - before
-    # env_files are read at parse time (JobConfig._merge_env_file / DAG task
-    # templates), so a change to one must invalidate the cached parse too --
-    # fold them into the fingerprint exactly as parse_config_with_sources
-    # folds them into the scheduler's stat-watch set.
+    # env_files are read at parse time, so a change to one must invalidate
+    # the cached parse too: fold them into the fingerprint.
     for job in config.jobs:
         if job.env_file is not None:
             file_sources.add(os.path.abspath(job.env_file))
@@ -4821,11 +4417,8 @@ def _parse_included_file(
 ) -> CronstableConfig:
     """Parse one ``include:`` target, reusing an unchanged prior parse.
 
-    The include branch used to call :func:`parse_config_file` directly, so
-    editing one file of an include tree re-ran strictyaml over every file the
-    tree reaches, and strictyaml is ~95% of a parse.  Routing it through the
-    same content-hash cache the config-directory loader uses reduces that to
-    reparsing the file that actually changed.
+    Routed through the same content-hash cache the config-directory loader
+    uses, so editing one file of an include tree reparses only that file.
     """
     config, sources, _ = _parse_file_cached(path, _seen)
     if _sources is not None:
@@ -4839,7 +4432,7 @@ def _claim_config_dir_section(
     current: Any,
     current_source: Optional[str],
     path: str,
-) -> Tuple[Any, Optional[str]]:
+) -> tuple[Any, Optional[str]]:
     """Adopt one at-most-once section from a config-dir file.
 
     web/cluster/state/mcp/logging/notify/push may each appear in at most
@@ -4859,9 +4452,9 @@ def _claim_config_dir_section(
 def _parse_config_dir(
     config_arg: str, _sources: Optional[set] = None
 ) -> CronstableConfig:
-    jobs: List[JobConfig] = []
-    dags: List[DagConfig] = []
-    config_errors: Dict[str, str] = {}
+    jobs: list[JobConfig] = []
+    dags: list[DagConfig] = []
+    config_errors: dict[str, str] = {}
     web_config: Optional[WebConfig] = None
     web_config_source_fname: Optional[str] = None
     cluster_config: Optional[ClusterConfig] = None
@@ -4872,9 +4465,9 @@ def _parse_config_dir(
     mcp_config_source_fname: Optional[str] = None
     logging_config: Optional[LoggingConfig] = None
     logging_config_source_fname: Optional[str] = None
-    notify_config: Optional[Dict[str, Any]] = None
+    notify_config: Optional[dict[str, Any]] = None
     notify_config_source_fname: Optional[str] = None
-    push_config: Optional[Dict[str, Any]] = None
+    push_config: Optional[dict[str, Any]] = None
     push_config_source_fname: Optional[str] = None
     job_defaults: JobDefaults = JobDefaults({})
     # Sort by name so job order and the "first config found" error messages

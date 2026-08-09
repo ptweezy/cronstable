@@ -1,0 +1,885 @@
+<script id="cronstable-demo-backend">
+/* Injected before the dashboard app; patches window.fetch to serve a synthetic fleet. */
+try { document.title = "cronstable // live dashboard demo"; } catch (e) {}
+
+/* =====================================================================
+ *  cronstable dashboard — DEMO backend (synthetic, fully client-side)
+ *  ---------------------------------------------------------------------
+ *  Overrides window.fetch so the real dashboard SPA below runs with no
+ *  server. A 9-node "meridian" gossip fleet is derived deterministically
+ *  from the wall clock, so every 3s poll animates: countdowns tick,
+ *  long-runners stay running, a fleet incident flares and self-clears.
+ *  No network ever leaves the page.  See docs/comparison.html.
+ * ===================================================================== */
+(function () {
+  "use strict";
+
+  // ---- fixtures ----------------------------------------------------
+  var VERSION = "1.2.8";
+  var JSID = "5978710a7e1f";
+  var NODES = ["meridian-a", "meridian-b", "meridian-c", "meridian-d", "meridian-e",
+               "meridian-f", "meridian-g", "meridian-h", "meridian-i"];
+  var SELF = "meridian-a";
+  var QUORUM = 5;
+  var BOOT_UPTIME_MS = 3 * 3600 * 1000;          // the fleet "booted" ~3h ago
+  var T0 = Date.now() - BOOT_UPTIME_MS;
+
+  // deterministic hash -> [0,1) for stable jitter keyed on any string
+  function hash(s) { var h = 2166136261; for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return ((h >>> 0) % 100000) / 100000; }
+  function jitter(key, lo, hi) { return lo + (hi - lo) * hash(key); }
+  function iso(ms) { return new Date(ms).toISOString(); }        // "...Z", Date-parseable
+  function nowMs() { return Date.now(); }
+
+  // ---- minimal cron engine (5-field + macros; sub-minute flagged) --
+  var MAC = { "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *", "@monthly": "0 0 1 * *",
+              "@weekly": "0 0 * * 0", "@daily": "0 0 * * *", "@midnight": "0 0 * * *", "@hourly": "0 * * * *" };
+  var DOWMAP = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+  function field(tok, min, max, names) {
+    var out = {};
+    tok.split(",").forEach(function (part) {
+      var step = 1, rng = part;
+      var sl = part.split("/"); if (sl.length === 2) { rng = sl[0]; step = parseInt(sl[1], 10) || 1; }
+      var lo, hi;
+      if (rng === "*") { lo = min; hi = max; }
+      else {
+        var dd = rng.split("-").map(function (x) { var n = names && names[x.toLowerCase()]; return n != null ? n : parseInt(x, 10); });
+        lo = dd[0]; hi = dd.length === 2 ? dd[1] : dd[0];
+      }
+      for (var v = lo; v <= hi; v += step) out[v] = 1;
+    });
+    return out;
+  }
+  // the extension day forms (L / L-n / nW / LW; L<n> / d#n), so the roster's
+  // business-day jobs schedule exactly like the real engine
+  function daySpec(tok, isDow) {
+    var plain = [], s = { offsets: {}, nearest: [], lastW: false, lastDow: {}, nth: {}, special: false };
+    tok.split(",").forEach(function (part) {
+      var low = part.toLowerCase(), m;
+      if (!isDow && low === "l") { s.offsets[0] = 1; s.special = true; }
+      else if (!isDow && low === "lw") { s.lastW = true; s.special = true; }
+      else if (!isDow && (m = low.match(/^l-(\d+)$/))) { s.offsets[+m[1]] = 1; s.special = true; }
+      else if (!isDow && (m = low.match(/^(\d+)w$/))) { s.nearest.push(+m[1]); s.special = true; }
+      else if (isDow && (m = low.match(/^l(\d+)$/))) { s.lastDow[+m[1] % 7] = 1; s.special = true; }
+      else if (isDow && (m = low.match(/^([a-z]+|\d+)#(\d)$/))) {
+        var d = DOWMAP[m[1]] != null ? DOWMAP[m[1]] : (+m[1] % 7);
+        s.nth[d + "#" + m[2]] = 1; s.special = true;
+      }
+      else plain.push(part);
+    });
+    s.plain = plain.join(",");
+    return s;
+  }
+  function parseCron(expr) {
+    if (!expr) return null;
+    if (expr[0] === "@") { if (expr === "@reboot") return { reboot: true }; expr = MAC[expr] || expr; }
+    var p = expr.trim().split(/\s+/);
+    if (p.length === 6) p = p.slice(1);              // drop seconds field for minute stepping
+    if (p.length !== 5) return { sub: true };        // 7-field / exotic -> sub-minute bucket
+    var domS = daySpec(p[2], false), dowS = daySpec(p[4], true);
+    return {
+      mi: field(p[0], 0, 59), ho: field(p[1], 0, 23),
+      dom: domS.plain ? field(domS.plain, 1, 31) : {},
+      mo: field(p[3], 1, 12),
+      dow: dowS.plain ? field(dowS.plain, 0, 6, DOWMAP) : {},
+      domSpec: domS, dowSpec: dowS,
+      domStar: p[2] === "*", dowStar: p[4] === "*",
+    };
+  }
+  function monthEndUTC(d) { return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate(); }
+  function shiftW(y, mo, t, end) {
+    var wd = new Date(Date.UTC(y, mo, t)).getUTCDay();
+    if (wd === 6) return t > 1 ? t - 1 : t + 2;      // Saturday -> Friday (or inward)
+    if (wd === 0) return t < end ? t + 1 : t - 2;    // Sunday -> Monday (or inward)
+    return t;
+  }
+  function domSideOk(c, d) {
+    if (c.dom[d.getUTCDate()]) return true;
+    var s = c.domSpec; if (!s || !s.special) return false;
+    var end = monthEndUTC(d), day = d.getUTCDate();
+    if (s.offsets[end - day]) return true;
+    if (s.lastW && day === shiftW(d.getUTCFullYear(), d.getUTCMonth(), end, end)) return true;
+    for (var i = 0; i < s.nearest.length; i++) {
+      var t = s.nearest[i];
+      if (t <= end && day === shiftW(d.getUTCFullYear(), d.getUTCMonth(), t, end)) return true;
+    }
+    return false;
+  }
+  function dowSideOk(c, d) {
+    if (c.dow[d.getUTCDay()]) return true;
+    var s = c.dowSpec; if (!s || !s.special) return false;
+    var end = monthEndUTC(d), day = d.getUTCDate();
+    if (s.lastDow[d.getUTCDay()] && day > end - 7) return true;
+    return !!s.nth[d.getUTCDay() + "#" + (Math.floor((day - 1) / 7) + 1)];
+  }
+  function matches(c, d) {
+    if (!c.mi[d.getUTCMinutes()] || !c.ho[d.getUTCHours()] || !c.mo[d.getUTCMonth() + 1]) return false;
+    if (c.domStar && c.dowStar) return true;         // engine AND rule (cronexpr._day_matches)
+    if (c.domStar) return dowSideOk(c, d);
+    if (c.dowStar) return domSideOk(c, d);
+    return domSideOk(c, d) && dowSideOk(c, d);
+  }
+  // previous fire times (newest-first), not before `floor` ms, capped
+  function prevFires(expr, from, count, floor) {
+    var c = parseCron(expr); if (!c || c.reboot) return [];
+    if (c.sub) { var out = [], base = Math.floor(from / 5000) * 5000; for (var k = 0; k < count; k++) { var t = base - k * 5000; if (t < floor) break; out.push(t); } return out; }
+    var d = new Date(Math.floor(from / 60000) * 60000), res = [], guard = 0;
+    while (res.length < count && guard++ < 60000) { if (d.getTime() < floor) break; if (matches(c, d)) res.push(d.getTime()); d = new Date(d.getTime() - 60000); }
+    return res;
+  }
+  // memoized per expression: the cached fire is the first one after its
+  // recorded `from`, so for any later probe below it no new fire can have
+  // appeared in between; the monthly business-day schedules then stop
+  // re-walking ~40k minutes on every poll
+  var _nextFireMemo = {};   // expr -> {from, t}
+  function nextFire(expr, from) {
+    var hit = _nextFireMemo[expr];
+    if (hit && from >= hit.from && hit.t > from) return hit.t;
+    var c = parseCron(expr); if (!c || c.reboot) return null;
+    if (c.sub) return Math.ceil((from + 1) / 5000) * 5000;
+    var d = new Date(Math.ceil((from + 1) / 60000) * 60000), guard = 0;
+    while (guard++ < 60000) {
+      if (matches(c, d)) { _nextFireMemo[expr] = { from: from, t: d.getTime() }; return d.getTime(); }
+      d = new Date(d.getTime() + 60000);
+    }
+    return null;
+  }
+
+  // ---- job roster --------------------------------------------------
+  // J(name, schedule, {p:policy, o:owner, run:seconds, mem:MiB, cpu:%, mon,
+  //                     fail:profile, cap0, tz, disabled, sub, manual, cmd})
+  function J(name, schedule, o) { o = o || {}; o.name = name; o.schedule = schedule; return o; }
+  function sched(j) { return j.resolved || j.schedule; }   // H jobs carry their hashed plain form
+  var EN = "EveryNode", LD = "Leader", PL = "PreferLeader";
+  var host = "$HOSTNAME";
+  var ROSTER = [
+    // heartbeat / bootstrap
+    J("welcome", "@reboot", { p: EN, cmd: 'echo "👋 Meridian online on ' + host + '"' }),
+    J("heartbeat", "* * * * *", { p: EN, cmd: 'echo "♥ ' + host + ' at $(date -u +%H:%M:%S) UTC"' }),
+    J("api-canary", "* * * * *", { p: EN, cmd: 'echo "api /healthz 200 OK from ' + host + '"' }),
+    // ingest
+    J("orders-ingest", "*/2 * * * *", { p: LD, o: "meridian-a", cmd: 'echo "pulled orders from orders-db.meridian.internal (region us-east-1)"' }),
+    J("clickstream-collect", "* * * * *", { p: PL, o: "meridian-b", cmd: 'echo "flushed clickstream events on ' + host + '"' }),
+    J("incremental-orders-export", "*/5 * * * *", { p: LD, o: "meridian-c", cmd: 'cronstable cursor advance high_water --scope orders-domain' }),
+    J("inventory-sync", "*/2 * * * *", { p: EN, run: 90, cmd: 'cronstable slot hold inventory --scope cluster; sleep 90' }),
+    J("payments-reconcile", "*/5 * * * *", { p: LD, o: "meridian-d", cmd: 'echo "payments-reconcile matched settlements on ' + host + '"' }),
+    // transform
+    J("etl-build-facts", "* * * * *", { p: EN, run: 4, cmd: 'echo "building fact tables"; sleep 4  # statsd meridian.etl.build_facts' }),
+    J("etl-dim-refresh", "*/5 * * * *", { p: LD, o: "meridian-e", run: 4, cmd: 'echo "dim-refresh rebuilding dimensions on ' + host + '"; sleep 4' }),
+    J("dedup-orders", "*/4 * * * *", { p: LD, o: "meridian-f", cmd: 'cronstable cursor read high_water --scope orders-domain' }),
+    J("config-lint", "*/2 * * * *", { p: EN, fail: "stderrwin", cmd: 'cronstable lint --strict "validating pipeline configs on ' + host + '"' }),
+    J("format-check", "*/2 * * * *", { p: EN, fail: "stdoutwin", cmd: 'echo "format-check scanning fixtures on ' + host + '"' }),
+    // warehouse / concurrency
+    J("warehouse-sync", "* * * * *", { p: EN, run: 75, cmd: 'echo "warehouse-sync streaming batch on ' + host + '" sleep 75' }),
+    J("search-reindex", "* * * * *", { p: EN, run: 80, fail: "cancelled", cmd: 'echo "search-reindex rebuilding index on ' + host + '" sleep 80' }),
+    J("warehouse-vacuum", "*/10 * * * *", { p: LD, o: "meridian-g", run: 5, cmd: 'echo "compacting tables"; sleep 5' }),
+    J("compact-warehouse", "*/10 * * * *", { p: EN, cmd: 'cronstable lock run --global --wait --timeout 30 warehouse-maintenance -- vacuumdb --analyze' }),
+    J("render-thumbnails", "*/2 * * * *", { p: EN, fail: "rt3", cmd: 'cronstable lock run --global --permits 2 --wait --timeout 20 thumbnail-pool -- render' }),
+    // resource-heavy (monitored)
+    J("risk-model-recompute", "* * * * *", { p: EN, run: 30, mon: 1, cpu: 101, cmd: 'echo "risk-model-recompute burning one core ~30s on ' + host + '" timeout 30 sh -c \'while :; do :; done\'' }),
+    J("fraud-graph-scan", "* * * * *", { p: LD, o: "meridian-h", run: 40, mon: 1, cpu: 98, cmd: 'yes | timeout 40 sha256sum' }),
+    J("catalog-build-inmemory", "* * * * *", { p: EN, run: 25, mon: 1, cpu: 22, mem: 256, cmd: 'echo "catalog-build-inmemory allocating ~256MB on ' + host + '" & keep 25s' }),
+    J("report-render-buffer", "*/2 * * * *", { p: LD, o: "meridian-i", run: 20, mon: 1, cpu: 18, mem: 400, cmd: 'echo "report-render-buffer holding ~400MB resident ~20s"' }),
+    // billing
+    J("charge-subscriptions", "0 * * * *", { p: EN, cmd: 'key="charge-$(date -u +%Y-%m-%dT%H)"; if cronstable idempotent "$key"; then echo charged; fi' }),
+    J("webhook-dispatch", "* * * * *", { p: EN, fail: "every5", cmd: 'if [ $(( $(date -u +%M) % 5 )) -eq 0 ]; then echo "upstream 503 from hooks.meridian.io" >&2; exit 7; fi; echo delivered' }),
+    J("outbox-flush", "*/5 * * * *", { p: LD, o: "meridian-a", fail: "selfheal", cmd: 'cronstable kv incr outbox-attempt; echo "flushing transactional outbox"' }),
+    J("nightly-billing-export", "@daily", { p: LD, o: "meridian-b", tz: "local", cmd: 'echo "wrote the invoice feed for the day (local midnight)"' }),
+    // reporting / finance EOD
+    J("hourly-rollup", "0 * * * *", { p: LD, o: "meridian-c", cmd: 'echo "aggregated the last hour of events"' }),
+    J("hourly-kpi-refresh", "0 * * * *", { p: LD, o: "meridian-d", cmd: 'echo "recomputed executive KPIs"' }),
+    J("hourly-exec-dashboard", "0 * * * *", { p: LD, o: "meridian-e", cmd: 'echo "published the exec dashboard snapshot"' }),
+    J("hourly-cache-warm", "0 * * * *", { p: PL, o: "meridian-f", cmd: 'echo "primed report caches for the hour"' }),
+    J("build-daily-report", "0 6 * * *", { p: LD, o: "meridian-h", cmd: 'set -eu; token=$(cronstable secret get REPORT_TOKEN); cronstable artifact put daily-report' }),
+    J("finance-eod-close", "30 2 * * *", { p: LD, o: "meridian-a", tz: "America/New_York", cmd: 'echo "booked end-of-day on ' + host + ' (America/New_York, DST-aware)"' }),
+    J("monthly-close-prep", "30 1 LW * *", { p: LD, o: "meridian-d", cmd: 'echo "staged the books on the last weekday of the month (LW)"' }),
+    J("payroll-file-transmit", "0 7 L-3 * *", { p: LD, o: "meridian-g", cmd: 'echo "sent the payroll file three days before month-end (L-3)"' }),
+    J("board-pack-render", "0 6 * * 5#3", { p: LD, o: "meridian-i", cmd: 'echo "rendered the board pack on the third Friday (5#3)"' }),
+    J("eu-open-report", "0 6 * * mon-fri", { p: LD, o: "meridian-b", tz: "Europe/London", cmd: 'echo "eu-open-report sent the London morning digest on ' + host + '"' }),
+    J("apac-open-report", "0 9 * * *", { p: LD, o: "meridian-c", tz: "Asia/Tokyo", cmd: 'echo "apac-open-report sent the Tokyo morning digest on ' + host + '"' }),
+    J("nightly-report-batch", "@daily", { p: LD, o: "meridian-e", cmd: 'echo "generated the daily report batch"' }),
+    J("slow-report-generator", "5,35 * * * *", { p: EN, run: 10, fail: "timeout", cmd: 'sleep 30  # executionTimeout:10 killTimeout:5 -> SIGKILL' }),
+    J("fraud-model-refresh", "*/10 * * * *", { p: LD, o: "meridian-f", fail: "sentry", cmd: 'echo "refreshing fraud model"  # onFailure: Sentry + mail ml-oncall@meridian.example' }),
+    // monitoring / alerting (the incident cockpit)
+    J("db-health-orders", "* * * * *", { p: EN, fail: "db69", cmd: 'pg_isready -h orders-db.meridian.internal && echo ok || exit 69' }),
+    J("db-health-inventory", "* * * * *", { p: EN, fail: "db69", cmd: 'pg_isready -h inventory-db.meridian.internal && echo ok || exit 69' }),
+    J("db-health-payments", "* * * * *", { p: EN, fail: "db69", cmd: 'pg_isready -h payments-db.meridian.internal && echo ok || exit 69' }),
+    J("db-health-warehouse", "* * * * *", { p: EN, fail: "db69", cmd: 'pg_isready -h warehouse-db.meridian.internal && echo ok || exit 69' }),
+    J("cert-expiry-check", "* * * * *", { p: EN, fail: "cert", cmd: 'if [ "$(date -u +%M)" -ge 45 ] && [ "$(date -u +%M)" -le 47 ]; then echo "cert expires in 6 days" >&2; exit 1; fi; echo ok' }),
+    J("alert-selftest", "20,40 * * * *", { p: LD, o: "meridian-g", fail: "always", cmd: 'echo "alert self-test firing from ' + host + '"; exit 1' }),
+    J("queue-depth-probe", "*/2 * * * *", { p: EN, cmd: 'echo "queue depth 142"  # statsd meridian.queue.depth' }),
+    // second-level SLA
+    J("pulse-liveness", "*/5 * * * * *", { p: EN, sub: 1, cmd: 'python3 -c "..."  # GET /status, Forbid, timeout 4' }),
+    J("spread-probe", "H * * * *", { p: EN, resolved: "9 * * * *", cmd: 'echo "spread-probe checked the metrics pipeline on ' + host + '"' }),
+    J("sla-rollup", "* * * * *", { p: EN, cmd: 'echo "{\\"kind\\":\\"sla-rollup\\",\\"minute\\":\\"$(date -u +%H:%M)\\",\\"node\\":\\"' + host + '\\"}"' }),
+    // housekeeping
+    J("log-rotate", "*/15 * * * *", { p: LD, o: "meridian-h", cmd: 'echo "rotated and gzipped logs"' }),
+    J("cache-evict", "*/6 * * * *", { p: PL, o: "meridian-i", cmd: 'echo "cache-evict expired stale keys on ' + host + '"' }),
+    J("session-gc", "*/10 * * * *", { p: LD, o: "meridian-a", cmd: 'echo "reaped idle sessions"' }),
+    J("tmp-cleanup", "*/30 * * * *", { p: LD, o: "meridian-b", cmd: 'echo "swept scratch space"' }),
+    // runtime pause + per-job SLA showcases
+    J("archive-cold-storage", "*/5 * * * *", { p: LD, o: "meridian-h", paused: 1, cmd: 'echo "archive-cold-storage shipped cold objects to the glacier tier"' }),
+    J("partner-settlement-import", "*/10 * * * *", { p: LD, o: "meridian-i", fail: "feed", late: 1, cmd: 'echo "waiting on settlements drop from sftp.partner.example" >&2; exit 4  # sla.maxTimeSinceSuccessSeconds: 900' }),
+    J("backup-warehouse", "0 3 * * *", { p: LD, o: "meridian-c", cmd: 'echo "backup-warehouse -> ${BACKUP_BUCKET:-<unset>} (retain ${BACKUP_RETENTION_DAYS:-30}d)"' }),
+    J("silent-cleanup", "*/8 * * * *", { p: LD, o: "meridian-d", cap0: 1, cmd: 'echo "silent-cleanup ran, but its output is not captured on ' + host + '"' }),
+    J("audit-log-ship", "*/12 * * * *", { p: LD, o: "meridian-e", cmd: 'echo "audit-log-ship shipped the audit trail on ' + host + '"' }),
+    J("daily-reconcile", "0 4 * * *", { p: LD, o: "meridian-f", cmd: 'echo "daily-reconcile squared the ledgers on ' + host + '"' }),
+    J("platform-pulse-counter", "*/3 * * * *", { p: LD, o: "meridian-g", cmd: 'cronstable kv incr pulse-count --scope global' }),
+    // manual / on-demand (never fire on their own)
+    J("run-schema-migration", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "run-schema-migration (manual only)"' }),
+    J("reindex-search", "0 0 1 1 *", { p: LD, manual: 1, cmd: 'echo "reindex-search (manual only)"' }),
+    // disabled
+    J("legacy-nightly-sync", "0 1 * * *", { p: LD, o: "meridian-a", disabled: 1, cmd: 'echo "legacy-nightly-sync is retired; flip enabled to true to schedule"' }),
+    // legacy crontab file
+    J("legacy-incremental-backup", "*/7 * * * *", { p: EN, cmd: 'echo "[legacy] incremental backup tick at $(date -u +%H:%M)"' }),
+    J("legacy-weekday-report", "30 4 * * mon-fri", { p: EN, cmd: 'echo "[legacy] weekday 04:30 report generated"' }),
+  ];
+  var BYNAME = {}; ROSTER.forEach(function (j) { BYNAME[j.name] = j; });
+
+  // ---- fail profiles: fire-ms -> outcome/exit/reason ---------------
+  function outcomeFor(job, t) {
+    var min = new Date(t).getUTCMinutes(), bucket = Math.floor(t / 60000);
+    switch (job.fail) {
+      case "always": return { outcome: "failure", exit_code: 1, fail_reason: "self-test tripwire (failsWhen.always)" };
+      case "db69": return (bucket % 5 === 0) ? { outcome: "failure", exit_code: 69, fail_reason: "connection refused (EX_UNAVAILABLE)" } : ok();
+      case "every5": return (min % 5 === 0) ? { outcome: "failure", exit_code: 7, fail_reason: "downstream 503 from hooks.meridian.io" } : ok();
+      case "stderrwin": return (min >= 25 && min <= 29) ? { outcome: "failure", exit_code: 1, fail_reason: "wrote to stderr (failsWhen.producesStderr)" } : ok();
+      case "stdoutwin": return (min >= 35 && min <= 39) ? { outcome: "failure", exit_code: 1, fail_reason: "matched failure pattern on stdout" } : ok();
+      case "cert": return (min >= 45 && min <= 47) ? { outcome: "failure", exit_code: 1, fail_reason: "certificate expires in 6 days" } : ok();
+      case "sentry": return (min === 50) ? { outcome: "failure", exit_code: 1, fail_reason: "model drift beyond threshold (reported to Sentry)" } : ok();
+      case "timeout": return { outcome: "failure", exit_code: 137, fail_reason: "execution timeout (10s) exceeded — SIGKILL" };
+      case "selfheal": return (bucket % 4 === 0) ? { outcome: "failure", exit_code: 75, fail_reason: "retryable: broker not ready" } : ok();
+      case "rt3": return (bucket % 13 === 0) ? { outcome: "failure", exit_code: 3, fail_reason: "thumbnail encoder returned 3" } : ok();
+      // the SLA-overdue fixture: failing for the last ~50 minutes, so its last
+      // success sits well past maxTimeSinceSuccessSeconds (jobDict adds d.sla)
+      case "feed": return (nowMs() - t < 3000e3) ? { outcome: "failure", exit_code: 4, fail_reason: "partner feed not delivered (SFTP drop empty)" } : ok();
+      case "cancelled": return (bucket % 6 === 0) ? { outcome: "cancelled", exit_code: null, fail_reason: "superseded (concurrencyPolicy: Replace)" } : ok();
+      default: return ok();
+    }
+    function ok() { return { outcome: "success", exit_code: 0, fail_reason: null }; }
+  }
+  function runDur(job, t) {
+    if (job.run) return +(job.run + jitter(job.name + t, -0.4, 0.6)).toFixed(2);
+    return +jitter(job.name + t, 0.2, 2.4).toFixed(3);
+  }
+
+  // ---- derive one job's public dict at time `now` ------------------
+  function jobDict(job, now) {
+    var d = { name: job.name, enabled: !job.disabled, schedule: job.schedule, command: job.cmd,
+      captureStdout: !job.cap0, captureStderr: !job.cap0, utc: job.tz !== "local", timezone: job.tz && job.tz !== "local" ? job.tz : null,
+      running: false, pids: [], scheduled_in: null, last_run: null, history: [], paused: null };
+    // runtime pause: a user action (OVERLAY, including an explicit resume as
+    // null) wins over the roster fixture's standing maintenance pause. The
+    // fixture anchors on the hour so its record (and the render signatures
+    // derived from it) stays stable between polls.
+    if (Object.prototype.hasOwnProperty.call(OVERLAY.paused, job.name)) d.paused = OVERLAY.paused[job.name];
+    else if (job.paused) { var ph = Math.floor(now / 3600000) * 3600000;
+      d.paused = { since: iso(ph - 1800000), until: iso(ph + 5400000), note: "upstream maintenance window", by: "sre-oncall", channel: "api" }; }
+    // per-job SLA: the "feed" fail profile keeps the job success-free for the
+    // trailing 3000s, so the breach numbers below stay coherent with history
+    if (job.late) d.sla = { thresholds: { maxTimeSinceSuccessSeconds: 900 }, state: "late",
+      breaches: [{ check: "maxTimeSinceSuccess", since: iso(now - 2100000), observed_seconds: 3000, threshold_seconds: 900 }] };
+    if (job.resolved) d.schedule_resolved = job.resolved;
+    if (job.disabled) { d.history = []; return d; }
+    if (job.p && job.p !== EN) d.clusterPolicy = job.p;
+    if (job.o) d.clusterOwner = job.o;
+    if (job.name === "inventory-sync") { d.concurrencyScope = "cluster"; }
+
+    var floor = T0;
+    var fires = prevFires(sched(job), now, 26, floor);      // newest-first
+    var next = nextFire(sched(job), now);
+    if (job.manual) { d.scheduled_in = null; d.last_run = null; return d; }   // pending until triggered
+
+    // currently running?  long-runners occupy the window after their last fire
+    var latest = fires[0];
+    if (job.run && latest != null) {
+      var elapsed = (now - latest) / 1000;
+      var dur = job.run;
+      var stillRunning = job.name === "search-reindex" ? elapsed < dur * 1.05 : elapsed < dur;
+      if (stillRunning) {
+        d.running = true;
+        d.pids = [40000 + Math.floor(hash(job.name) * 20000)];
+        d.scheduled_in = null;
+        if (job.mon) {
+          var cpu = (job.cpu || 30) * (0.85 + 0.3 * hash(job.name + Math.floor(now / 5000)));
+          d.running_resources = { cpu_percent: +cpu.toFixed(1), cpu_seconds: +(elapsed * cpu / 100).toFixed(1),
+            rss_bytes: Math.round((job.mem || 40) * 1048576 * (0.6 + 0.5 * Math.min(1, elapsed / dur))), instances: 1 };
+        }
+        fires = fires.slice(1);                                // last completed run is the fire before
+      }
+    }
+    if (!d.running) d.scheduled_in = job.sub ? (next != null ? (next - now) / 1000 : 5) : (next != null ? (next - now) / 1000 : null);
+
+    // build history (oldest-first) + last_run from completed fires
+    var runs = [];
+    for (var i = Math.min(fires.length, 18) - 1; i >= 0; i--) {
+      var t = fires[i], oc = outcomeFor(job, t), du = runDur(job, t);
+      runs.push({ outcome: oc.outcome, duration: du === null ? null : +du.toFixed(3) });
+    }
+    d.history = runs;
+    if (fires.length) {
+      var lt = fires[0], loc = outcomeFor(job, lt), ldu = runDur(job, lt);
+      var res = null;
+      if (job.mon) res = { cpu_user_seconds: +(ldu * 0.8).toFixed(2), cpu_system_seconds: +(ldu * 0.2).toFixed(2),
+        cpu_total_seconds: +ldu.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: Math.max(2, Math.round(ldu / 2)) };
+      d.last_run = { outcome: loc.outcome, exit_code: loc.exit_code, started_at: iso(lt),
+        finished_at: iso(lt + ldu * 1000), duration: loc.outcome === "cancelled" ? +jitter("c" + lt, 5, 40).toFixed(1) : +ldu.toFixed(3),
+        fail_reason: loc.fail_reason, resources: res };
+    }
+    // an armed retry ladder on a currently-failing frequent job
+    if (d.last_run && d.last_run.outcome === "failure" && (job.fail === "every5" || job.fail === "selfheal")) {
+      var att = 1 + Math.floor(hash(job.name + now) * 3);
+      d.retry = { attempt: att, maxAttempts: job.fail === "selfheal" ? null : 5, nextRetryAt: iso(now + 30000), delaySeconds: 30.0 };
+    }
+    return d;
+  }
+
+  // ---- node stats --------------------------------------------------
+  function nodeStats(node, now) {
+    var base = 0.13 + 0.09 * hash(node), wob = 0.05 * Math.sin(now / 9000 + hash(node) * 6);
+    var cpu = Math.max(3, (base + wob) * 100 * (node === SELF ? 1.2 : 1));
+    var mem = 13 + 8 * hash(node + "m") + 3 * Math.sin(now / 20000 + hash(node));
+    return { cpu_percent: +cpu.toFixed(1), cpu_count: 8, mem_percent: +mem.toFixed(1),
+      mem_used_bytes: Math.round(mem / 100 * 16 * 1e9), mem_total_bytes: 16000000000,
+      proc_rss_bytes: 78000000 + Math.round(hash(node + "r") * 3e7), proc_cpu_percent: +(0.8 + hash(node) * 2).toFixed(1) };
+  }
+
+  // =================================================================
+  //  endpoint builders
+  // =================================================================
+  function buildJobs() { var now = nowMs(); applyOverlay(now); return ROSTER.map(function (j) { return jobDict(j, now); }); }
+
+  function buildCluster() {
+    var now = nowMs();
+    var peers = NODES.filter(function (n) { return n !== SELF; }).map(function (n) {
+      return { host: n + ":8443", status: "agreed", job_set_id: JSID, node_name: n,
+        last_seen: iso(now - Math.round(jitter(n + now, 200, 2600))), last_error: null, mismatch_streak: 0,
+        node_stats: nodeStats(n, now) };
+    });
+    return { enabled: true, backend: "gossip", node_name: SELF, job_set_id: JSID, cluster_size: 9, quorum: QUORUM,
+      elect_leader: true, distribution: "spread", conflict: false, conflict_names: [], size_conflict: false,
+      conflicting_sizes: [], policy_conflict: false, conflicting_policies: [], quorate: true, leader: null,
+      is_leader: false, peers: peers, node_stats: nodeStats(SELF, now) };
+  }
+
+  function buildFleet() {
+    var now = nowMs(), jobs = buildJobs(), byName = {}; jobs.forEach(function (j) { byName[j.name] = j; });
+    var nodes = NODES.map(function (n) {
+      var self = n === SELF, jm = {};
+      ROSTER.forEach(function (spec) {
+        var jd = byName[spec.name]; if (!jd) return;
+        var everywhere = !spec.p || spec.p === EN;
+        var ownerHere = spec.o === n;
+        if (!everywhere && !ownerHere) {                       // owned job: known but idle on non-owners
+          if (!spec.disabled) jm[spec.name] = { running: false, enabled: true, scheduled_in: jd.scheduled_in, last: null };
+          return;
+        }
+        var last = jd.last_run ? { outcome: jd.last_run.outcome, finished_at: jd.last_run.finished_at,
+          duration: jd.last_run.duration, exit_code: jd.last_run.exit_code } : null;
+        // give peers their own recent outcome for EveryNode jobs (independent hosts)
+        if (!self && everywhere && last) { var o2 = outcomeFor(spec, Math.floor(now / 60000) * 60000 + Math.round(hash(n + spec.name) * 4000)); if (spec.fail === "db69") { last = { outcome: o2.outcome, finished_at: last.finished_at, duration: last.duration, exit_code: o2.exit_code }; } }
+        jm[spec.name] = { running: self ? jd.running : false, enabled: jd.enabled,
+          scheduled_in: jd.running ? null : jd.scheduled_in, last: last };
+      });
+      return { node_name: n, host: self ? null : n + ":8443", self: self, status: self ? "self" : "agreed",
+        as_of: iso(now - (self ? 0 : Math.round(jitter(n + now, 300, 2400)))), truncated: false,
+        node_stats: nodeStats(n, now), jobs: jm };
+    });
+    return { enabled: true, backend: "gossip", node_name: SELF, distribution: "spread", elect_leader: true, interval: 10.0, nodes: nodes };
+  }
+
+  function buildNode() { return { node_name: SELF, resources: nodeStats(SELF, nowMs()) }; }
+  function buildNodeHistory() {
+    var now = nowMs(), pts = [], iv = 10;
+    for (var i = 60; i >= 0; i--) { var t = now - i * iv * 1000, s = nodeStats(SELF, t); pts.push([+(t / 1000).toFixed(2), s.cpu_percent, s.mem_percent]); }
+    return { node_name: SELF, enabled: true, interval: iv, points: pts };
+  }
+  function buildStatus() {
+    var now = nowMs(); return buildJobs().map(function (j) {
+      if (j.running) return { job: j.name, status: "running", pid: j.pids };
+      if (!j.enabled) return { job: j.name, status: "disabled" };
+      return { job: j.name, status: "scheduled", scheduled_in: j.scheduled_in == null ? "@reboot" : j.scheduled_in };
+    });
+  }
+
+  function buildJobRuns(name) {
+    var job = BYNAME[name]; if (!job) return null;
+    var now = nowMs(), fires = prevFires(sched(job), now, 40, T0).reverse(), runs = [];
+    fires.forEach(function (t) { var oc = outcomeFor(job, t), du = runDur(job, t);
+      var res = job.mon ? { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: Math.max(2, Math.round(du / 2)) } : null;
+      runs.push({ outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason, resources: res }); });
+    return { name: name, runs: runs, stats: statsOf(runs) };
+  }
+  function buildActivity() { var jobs = {}; ROSTER.forEach(function (j) { var r = buildJobRuns(j.name); if (r) jobs[j.name] = r.runs.map(function (x) { return { started_at: x.started_at, finished_at: x.finished_at, outcome: x.outcome }; }); }); return { jobs: jobs }; }
+  function statsOf(runs) {
+    var s = { total: runs.length, success: 0, failure: 0, cancelled: 0, unknown: 0 }, durs = [], cpus = [], rss = [];
+    runs.forEach(function (r) { s[r.outcome === "success" ? "success" : r.outcome === "failure" ? "failure" : r.outcome === "cancelled" ? "cancelled" : "unknown"]++;
+      if (r.duration != null) durs.push(r.duration); if (r.resources) { cpus.push(r.resources.cpu_total_seconds); rss.push(r.resources.max_rss_bytes); } });
+    function agg(a) { return a.length ? { avg: +(a.reduce(function (x, y) { return x + y; }, 0) / a.length).toFixed(2), min: Math.min.apply(0, a), max: Math.max.apply(0, a), last: a[a.length - 1] } : null; }
+    var d = agg(durs), c = agg(cpus), m = agg(rss);
+    return { total: s.total, success: s.success, failure: s.failure, cancelled: s.cancelled, unknown: s.unknown,
+      success_rate: (s.success + s.failure) ? +(s.success / (s.success + s.failure)).toFixed(3) : null,
+      avg_duration: d && d.avg, min_duration: d && d.min, max_duration: d && d.max, last_duration: d && d.last,
+      avg_cpu_seconds: c && c.avg, max_cpu_seconds: c && c.max, last_cpu_seconds: c && c.last,
+      avg_rss_bytes: m && m.avg, max_rss_bytes: m && m.max, last_rss_bytes: m && m.last };
+  }
+  function buildResources(name) {
+    var job = BYNAME[name]; if (!job) return null;
+    if (!job.mon) return { name: name, monitored: false, interval: null, live: [], runs: [] };
+    var now = nowMs(), jd = jobDict(job, now), live = [];
+    if (jd.running && jd.running_resources) { var rr = jd.running_resources, series = [], st = now - jd.running_resources.cpu_seconds / (rr.cpu_percent / 100) * 1000;
+      for (var k = 0; k <= 8; k++) { var tt = k * 2; series.push([tt, +(rr.cpu_percent * (0.7 + 0.4 * hash(name + k))).toFixed(1), Math.round(rr.rss_bytes * (0.5 + 0.06 * k))]); }
+      live.push({ started_at: iso(now - 10000), pid: jd.pids[0], current: { cpu_seconds: rr.cpu_seconds, cpu_percent: rr.cpu_percent, rss_bytes: rr.rss_bytes }, series: series }); }
+    var fires = prevFires(sched(job), now, 12, T0).reverse(), runs = [];
+    fires.forEach(function (t) { var du = runDur(job, t), oc = outcomeFor(job, t), series = [];
+      for (var k = 0; k * 2 <= du; k++) series.push([k * 2, +((job.cpu || 30) * (0.5 + 0.6 * hash(name + t + k))).toFixed(1), Math.round((job.mem || 60) * 1048576 * (0.4 + 0.5 * Math.min(1, k * 2 / du)))]);
+      runs.push({ outcome: oc.outcome, exit_code: oc.exit_code, started_at: iso(t), finished_at: iso(t + du * 1000), duration: +du.toFixed(3), fail_reason: oc.fail_reason,
+        resources: { cpu_user_seconds: +(du * 0.8).toFixed(2), cpu_system_seconds: +(du * 0.2).toFixed(2), cpu_total_seconds: +du.toFixed(2), max_rss_bytes: Math.round((job.mem || 60) * 1048576), samples: series.length, series: series } }); });
+    return { name: name, monitored: true, interval: 2.0, live: live, runs: runs };
+  }
+  function buildTrends(name) {
+    var r = buildJobRuns(name); if (!r) return null; var now = nowMs();
+    function win(ms) { var cut = ms ? now - ms : 0; return statsOf(r.runs.filter(function (x) { return new Date(x.finished_at).getTime() >= cut; })); }
+    return { name: name, source: "durable", generated_at: iso(now), windows: { "1h": win(3600e3), "24h": win(86400e3), "7d": win(7 * 86400e3), "30d": win(30 * 86400e3), "all": win(0) } };
+  }
+
+  // =================================================================
+  //  DAGs
+  // =================================================================
+  function task(id, type, deps, tr, retries, mapped) { return { id: id, type: type || "task", dependsOn: deps || [], triggerRule: tr || "all_success", retries: retries || 0, mapped: !!mapped }; }
+  var DAGS = {
+    "orders-etl": { enabled: true, schedule: "*/3 * * * *", retainRuns: 20, tasks: [task("discover"), task("load", "task", ["discover"], "all_success", 2, true), task("verify", "task", ["load"])] },
+    "data-quality-gate": { enabled: true, schedule: "*/15 * * * *", retainRuns: 20, policy: "Leader",
+      tasks: [task("snapshot"), task("check-nulls", "task", ["snapshot"]), task("check-freshness", "task", ["snapshot"]), task("check-volume", "task", ["snapshot"]), task("certify", "task", ["check-nulls", "check-freshness", "check-volume"])] },
+    "release-train": { enabled: true, schedule: null, retainRuns: 20,
+      tasks: [task("build"), task("approve", "approval", ["build"]), task("canary", "sensor", ["build"]), task("publish", "task", ["approve", "canary"], "all_done")] },
+    "hotfix-release": { enabled: true, schedule: null, retainRuns: 20,
+      tasks: [task("build-hotfix"), task("approve", "approval", ["build-hotfix"]), task("deploy", "task", ["approve"])] },
+    "nightly-close": { enabled: true, schedule: "0 1 * * *", retainRuns: 20, tz: "America/New_York",
+      tasks: [task("freeze-ledgers"), task("post-journals", "task", ["freeze-ledgers"]), task("close-books", "task", ["post-journals"])] },
+  };
+  var DAG_ORDER = ["orders-etl", "release-train", "nightly-close", "data-quality-gate", "hotfix-release"];
+
+  // deterministic recent scheduled runs for a dag
+  function dagRuns(name) {
+    var def = DAGS[name], now = nowMs(), out = [];
+    if (def.schedule) {
+      var fires = prevFires(def.schedule, now, 40, T0);        // newest-first
+      fires.forEach(function (t, i) {
+        var running = i === 0 && (now - t) < 60000;             // freshest one may still be running
+        var st = runStateFor(name, t, running);
+        out.push({ runKey: iso(t).replace(".000Z", "").replace("Z", ""), runId: "01J" + Math.floor(hash(name + t) * 1e9).toString(36).toUpperCase(),
+          state: st.state, kind: "scheduled", logicalDate: iso(t).replace("Z", ""), createdAt: t / 1000, updatedAt: (t + st.dur) / 1000, taskStates: st.hist });
+      });
+    }
+    OVERLAY.dagRuns.filter(function (r) { return r.dag === name; }).forEach(function (r) { out.unshift(runSummary(r)); });
+    return out;
+  }
+  function runStateFor(name, t, running) {
+    var def = DAGS[name], n = def.tasks.length, bad = (name === "data-quality-gate") && (new Date(t).getUTCHours() % 2 === 1);
+    if (running) return { state: "running", dur: 40000, hist: { success: Math.max(1, n - 2), running: 1, pending: 1 } };
+    if (bad) return { state: "failed", dur: 55000, hist: { success: n - 2, failed: 1, upstream_failed: 1 } };
+    return { state: "success", dur: 30000 + Math.round(hash(name + t) * 60000), hist: mk(n) };
+    function mk(k) { return { success: k }; }
+  }
+  function buildDags() {
+    return DAG_ORDER.map(function (name) {
+      var def = DAGS[name], runs = dagRuns(name), d = { name: name, enabled: def.enabled, scheduled: !!def.schedule, retainRuns: def.retainRuns, tasks: def.tasks };
+      if (def.schedule) d.schedule = def.schedule;
+      if (runs.length) {
+        var lr = runs[0], counts = {}; runs.forEach(function (r) { counts[r.state] = (counts[r.state] || 0) + 1; });
+        d.latestRun = { runKey: lr.runKey, state: lr.state, kind: lr.kind, createdAt: lr.createdAt, updatedAt: lr.updatedAt };
+        d.runCounts = counts; d.totalRuns = runs.length;
+      }
+      return d;
+    });
+  }
+  function buildDagRuns(name, limit) { if (!DAGS[name]) return null; return { dag: name, runs: dagRuns(name).slice(0, limit || 50) }; }
+
+  // full run document with a per-task map (progresses over wall-clock for running runs)
+  function buildDagRun(name, rk) {
+    var def = DAGS[name]; if (!def) return null;
+    var ov = OVERLAY.dagRuns.filter(function (r) { return r.dag === name && r.runKey === rk; })[0];
+    if (ov) return ov.doc();
+    var t = Date.parse(rk.indexOf("Z") < 0 ? rk + "Z" : rk); if (isNaN(t)) { var m = dagRuns(name).filter(function (r) { return r.runKey === rk; })[0]; if (!m) return null; t = m.createdAt * 1000; }
+    var running = (nowMs() - t) < 60000 && new Date().getMinutes() >= 0;
+    var st = runStateFor(name, t, running), now = nowMs();
+    var tasks = {}, order = def.tasks, elapsed = (now - t) / 1000;
+    order.forEach(function (tk, i) {
+      var startOff = i * 8, endOff = startOff + 6, state;
+      var bad = def.tasks && name === "data-quality-gate" && tk.id === "check-volume" && (new Date(t).getUTCHours() % 2 === 1);
+      if (running) { state = elapsed > endOff ? (bad ? "failed" : "success") : elapsed > startOff ? "running" : "pending"; if (tk.dependsOn.some(function (dep) { return bad && dep === "check-volume"; })) state = elapsed > endOff ? "upstream_failed" : "pending"; }
+      else { state = st.state === "failed" && (bad || tk.dependsOn.indexOf("check-volume") >= 0) ? (bad ? "failed" : "upstream_failed") : "success"; }
+      var started = t + startOff * 1000, fin = t + endOff * 1000;
+      tasks[tk.id] = { id: tk.id, mapIndex: null, state: state, attempt: 0, proc: state === "running" ? "tok-" + i : null, pid: state === "running" ? 41000 + i : null,
+        host: NODES[i % 9], startedAt: state === "pending" ? null : started / 1000, finishedAt: (state === "success" || state === "failed" || state === "upstream_failed") ? fin / 1000 : null,
+        exitCode: state === "success" ? 0 : state === "failed" ? 1 : null, failReason: state === "failed" ? "quality gate breached" : null, resources: null, updatedAt: Math.min(now, fin) / 1000 };
+      if (tk.type === "sensor" && state === "running") { tasks[tk.id].pokeCount = Math.floor(elapsed / 10); tasks[tk.id].nextPokeAt = (now + 10000) / 1000; tasks[tk.id].firstPokeAt = started / 1000; }
+    });
+    return { dag: name, runKey: rk, runId: "01J" + Math.floor(hash(name + rk) * 1e9).toString(36).toUpperCase(), logicalDate: rk, kind: "scheduled",
+      state: running ? "running" : (st.state === "failed" ? "failed" : "success"), createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks };
+  }
+  function buildXcom(name, rk) {
+    var entries = [], now = nowMs();
+    if (name === "orders-etl") entries = [
+      { taskkey: "discover", key: "shards", sha256: "9f86d0818" + hash(rk).toString(36), size: 22, at: now / 1000 - 30, value: '["eu","us","apac"]' },
+      { taskkey: "load#0", key: "rows", sha256: "a1b2c3", size: 5, at: now / 1000 - 20, value: "48213" },
+      { taskkey: "load#1", key: "rows", sha256: "d4e5f6", size: 5, at: now / 1000 - 19, value: "51902" },
+      { taskkey: "load#2", key: "rows", sha256: "778899", size: 4, at: now / 1000 - 18, value: "9471" }];
+    else if (name === "release-train") entries = [{ taskkey: "build", key: "tag", sha256: "beef01", size: 20, at: now / 1000 - 40, value: "release-20260709-0142" }];
+    else entries = [{ taskkey: DAGS[name].tasks[0].id, key: "snapshot_id", sha256: "cafe12", size: 12, at: now / 1000 - 25, value: "snap-" + rk }];
+    return { dag: name, runKey: rk, runId: "01J" + Math.floor(hash(name + rk) * 1e9).toString(36).toUpperCase(), truncated: false, entries: entries };
+  }
+
+  // =================================================================
+  //  durable state
+  // =================================================================
+  function buildState() {
+    var now = nowMs();
+    var enabledJobs = ROSTER.filter(function (j) { return !j.disabled && !j.manual; });
+    var runStreams = enabledJobs.length;
+    return { enabled: true, enumerable: true,
+      view: { backend: "filesystem", path: "/var/lib/cronstable/state/meridian-prod", namespace: "meridian-prod", topology: "shared", shared_locking: true, job_set_id: JSID },
+      stats: { ops: { append: { count: 2000 + Math.floor(now / 60000 % 900), errors: 0, seconds: 113.27 }, "blob-put": { count: 1, errors: 0, seconds: 0.02 },
+          "doc-list": { count: 252, errors: 0, seconds: 0.17 }, "doc-mutate": { count: 36, errors: 0, seconds: 0.22 }, "doc-read": { count: 15, errors: 0, seconds: 0.004 },
+          inventory: { count: 10, errors: 0, seconds: 0.12 }, "lease-acquire": { count: 273, errors: 0, seconds: 6.66 } },
+        lock: { acquisitions: 1290, wait_seconds: 0.12 }, throttle: { count: 0, wait_seconds: 0.0 },
+        workers: { bulk_inflight: 0, bulk_peak: 3, bulk_capacity: 8, lease_inflight: 1, lease_peak: 2, lease_capacity: 4 } },
+      records: { artifacts: { count: 36, streams: 40, scopes: [{ scope: "daily-report", count: 12 }, { scope: "build-artifacts", count: 24 }] },
+        counters: { count: 36, streams: 9, scopes: [{ scope: "pulse-count", count: 9 }] },
+        inflight: { count: 415, streams: runStreams, scopes: [{ scope: "warehouse-sync", count: 20 }, { scope: "search-reindex", count: 20 }] },
+        manifests: { count: 126, streams: 9, scopes: [] }, meta: { count: 4, streams: 1, scopes: [] },
+        reboot: { count: 32, streams: 1, scopes: [{ scope: "welcome", count: 32 }] },
+        retries: { count: 16, streams: 2, scopes: [{ scope: "webhook-dispatch", count: 9 }, { scope: "outbox-flush", count: 7 }] },
+        runs: { count: 3607, streams: runStreams, scopes: enabledJobs.slice(0, 6).map(function (j) { return { scope: j.name, count: 200 }; }) } },
+      documents: { cursor: { count: 1, streams: 1, scopes: [{ scope: "orders-domain", count: 1 }] },
+        dag_run: { count: 39, streams: 1, scopes: DAG_ORDER.map(function (n) { return { scope: n, count: 8 }; }) },
+        kv: { count: 2, streams: 1, scopes: [{ scope: "global", count: 2 }] } },
+      leases: [{ name: "warehouse-maintenance", holder: SELF, fence: 12, expiresAt: now / 1000 + 24, expired: false },
+        { name: "thumbnail-pool", holder: "meridian-e", fence: 41, expiresAt: now / 1000 + 12, expired: false }],
+      quarantine: 0,
+      node: { host: SELF, retries: [{ job: "webhook-dispatch", attempt: 2, nextRetryAt: iso(now + 30000), delaySeconds: 30.0 }],
+        slots: [{ slot: "inventory-sync", holder: SELF, fence: 5, expiresAt: now / 1000 + 30, refs: 1 }] } };
+  }
+  function buildStateDocs(ns) {
+    var now = nowMs();
+    if (ns === "kv/global" || ns === "kv") return { namespace: ns, documents: [
+      { key: "pulse-count", updatedAt: now / 1000 - 12, valueSize: 6, valueType: "int" },
+      { key: "outbox-attempt", updatedAt: now / 1000 - 40, valueSize: 2, valueType: "int" },
+      { key: "report-meta", updatedAt: now / 1000 - 3600, valueSize: 28, valueType: "dict" }] };
+    if (ns.indexOf("cursor") === 0) return { namespace: ns, documents: [{ name: "high_water", value: 9284713 + Math.floor(now / 1000 % 1000), updatedAt: now / 1000 - 8 }] };
+    if (ns.indexOf("idem") === 0) return { namespace: ns, documents: [{ key: "charge-" + iso(now).slice(0, 13), claimedAt: now / 1000 - 200, expiresAt: now / 1000 + 3400 }] };
+    return { namespace: ns, documents: [] };
+  }
+  function buildStateRecords(stream) {
+    var m = /^runs\/(.+)$/.exec(stream); if (m && BYNAME[m[1]]) { var r = buildJobRuns(m[1]); return { stream: stream, records: r.runs.slice().reverse().slice(0, 100) }; }
+    return { stream: stream, records: [] };
+  }
+
+  // =================================================================
+  //  user-action overlay (start / trigger / backfill / approve)
+  // =================================================================
+  var OVERLAY = { started: {}, dagRuns: [], created: 0, paused: {} };
+  function applyOverlay(now) {
+    // clear manual "started" runs whose synthetic duration elapsed
+    Object.keys(OVERLAY.started).forEach(function (n) { if (now - OVERLAY.started[n].at > OVERLAY.started[n].dur) delete OVERLAY.started[n]; });
+    // pause records auto-expire, mirroring the daemon's reader-enforced expiry
+    Object.keys(OVERLAY.paused).forEach(function (n) { var p = OVERLAY.paused[n]; if (p && new Date(p.until).getTime() <= now) delete OVERLAY.paused[n]; });
+  }
+  function seedApprovalRun() {
+    // one release-train run parked on its approval gate, ready to interact with
+    var t = nowMs() - 30000, rk = "manual-0ea2f0a42037";
+    OVERLAY.dagRuns.push(makeManualRun("release-train", rk, t, "awaiting"));
+  }
+  function makeManualRun(dag, rk, t, mode) {
+    var def = DAGS[dag];
+    var rec = { dag: dag, runKey: rk, createdAt: t, kind: "manual", _mode: mode, _decision: null };
+    rec.doc = function () {
+      var now = nowMs(), tasks = {}, el = (now - t) / 1000;
+      def.tasks.forEach(function (tk, i) {
+        var state = "pending", started = null, fin = null, extra = {};
+        if (tk.id === "build" || tk.id === "build-hotfix") { state = "success"; started = t / 1000; fin = t / 1000 + 6; }
+        else if (tk.type === "approval") {
+          if (rec._decision === "approve") { state = "success"; started = t / 1000 + 6; fin = now / 1000; extra.approval = { decision: "approved", by: "you", at: now / 1000 }; }
+          else if (rec._decision === "reject") { state = def === DAGS["hotfix-release"] ? "failed" : "skipped"; started = t / 1000 + 6; fin = now / 1000; extra.approval = { decision: "rejected", by: "you", at: now / 1000 }; }
+          else { state = "running"; started = t / 1000 + 6; extra.awaitingApproval = true; extra.approval = null; }
+        } else if (tk.type === "sensor") { state = rec._decision ? "success" : "running"; started = t / 1000 + 6; if (state === "running") { extra.pokeCount = Math.floor(el / 10); extra.nextPokeAt = now / 1000 + 10; extra.firstPokeAt = t / 1000 + 6; } else fin = now / 1000; }
+        else { // publish / deploy — waits on approval
+          if (rec._decision === "approve") { state = el > 20 ? "success" : "running"; started = now / 1000 - 2; if (state === "success") fin = now / 1000; }
+          else if (rec._decision === "reject") { state = "upstream_failed"; }
+          else state = "pending";
+        }
+        tasks[tk.id] = Object.assign({ id: tk.id, mapIndex: null, state: state, attempt: 0, proc: state === "running" ? "tok-" + i : null, pid: null, host: SELF,
+          startedAt: started, finishedAt: fin, exitCode: state === "success" ? 0 : null, failReason: null, resources: null, updatedAt: now / 1000 }, extra);
+      });
+      var over = def.tasks.every(function (tk) { return ["success", "skipped", "failed", "upstream_failed"].indexOf(tasks[tk.id].state) >= 0; });
+      return { dag: dag, runKey: rk, runId: "01JZ" + Math.floor(hash(dag + rk) * 1e6).toString(36).toUpperCase(), logicalDate: null, kind: "manual",
+        state: over ? (rec._decision === "reject" && def === DAGS["hotfix-release"] ? "failed" : "success") : "running", createdAt: t / 1000, updatedAt: now / 1000, mapped: {}, tasks: tasks };
+    };
+    return rec;
+  }
+  function runSummary(rec) { var doc = rec.doc(), hist = {}; Object.keys(doc.tasks).forEach(function (k) { var s = doc.tasks[k].state; hist[s] = (hist[s] || 0) + 1; });
+    return { runKey: rec.runKey, runId: doc.runId, state: doc.state, kind: "manual", logicalDate: null, createdAt: rec.createdAt / 1000, updatedAt: nowMs() / 1000, taskStates: hist }; }
+
+  // =================================================================
+  //  SSE log stream
+  // =================================================================
+  function logLines(name) {
+    var job = BYNAME[name]; if (!job) return [["stdout", "no such job"]];
+    if (job.cap0) return null;                                   // -> end reason:no-output
+    var now = new Date(), ts = function (o) { return new Date(now.getTime() - o * 1000).toISOString().slice(11, 19); };
+    var L = [], out = function (s) { L.push(["stdout", s]); }, err = function (s) { L.push(["stderr", s]); };
+    var jd = jobDict(job, nowMs());
+    out("[90m" + ts(9) + "[0m cronstable: launching [36m" + name + "[0m on [1m" + SELF + "[0m");
+    out("[90m" + ts(9) + "[0m $ " + job.cmd.split("\n")[0]);
+    if (/warehouse-sync/.test(name)) { out("streaming warehouse batch [36mshard 3/8[0m"); out("copied 1.24M rows ([32m18.4 MB/s[0m)"); out("checkpoint committed at lsn 0/3F9A21"); }
+    else if (/search-reindex/.test(name)) { out("rebuilding inverted index"); out("segment [36m14/22[0m merged"); out("[33mnote:[0m prior run superseded (concurrencyPolicy: Replace)"); }
+    else if (/risk-model|fraud-graph|catalog-build|report-render/.test(name)) { out("allocating working set"); out("[36mepoch 1[0m loss=0.4123  [36mepoch 2[0m loss=0.2981"); out("peak RSS " + Math.round((job.mem || 60)) + " MiB, cpu " + (job.cpu || 30) + "%"); }
+    else if (/db-health/.test(name)) { var bad = jd.last_run && jd.last_run.outcome === "failure"; if (bad) { err("[31mconnection refused[0m: " + name.replace("db-health-", "") + "-db.meridian.internal:5432"); err("probe failed after 3 attempts — [31mexit 69[0m"); } else out("[32mok[0m " + name.replace("db-health-", "") + "-db 200 ([32m4ms[0m)"); }
+    else if (/webhook-dispatch/.test(name)) { out("POST https://hooks.meridian.io/events"); if (jd.last_run && jd.last_run.outcome === "failure") { err("[31mHTTP 503[0m upstream unavailable — retry 2/5 in 30s"); } else out("[32m200 OK[0m delivered 42 events"); }
+    else if (/alert-selftest/.test(name)) { err("[31malert self-test tripwire fired[0m (failsWhen.always)"); }
+    else { out(job.cmd.replace(/^echo "?|"?$/g, "").replace(/\$HOSTNAME/g, SELF).slice(0, 120)); out("[32mdone[0m"); }
+    if (jd.running) { out("… still running ([36mtail live[0m)"); }
+    return L;
+  }
+  function sseStream(name, kind, opts) {
+    var lines = kind === "job" ? logLines(name) : [["stdout", "task " + name + " streaming…"], ["stdout", "processing shard 3/8"]];
+    var enc = new TextEncoder(), cancelled = false, timer = null;
+    return new ReadableStream({
+      start: function (ctrl) {
+        function frame(ev, data) { try { ctrl.enqueue(enc.encode("event: " + ev + "\ndata: " + JSON.stringify(data) + "\n\n")); } catch (e) {} }
+        if (lines === null) { frame("end", { reason: "no-output" }); try { ctrl.close(); } catch (e) {} return; }
+        var i = 0;
+        (function pump() {
+          if (cancelled) return;
+          if (i < lines.length) { frame("line", { stream: lines[i][0], line: lines[i][1] }); i++; timer = setTimeout(pump, 90 + Math.random() * 220); }
+          else { frame("end", { reason: null }); try { ctrl.close(); } catch (e) {} }
+        })();
+        if (opts && opts.signal) opts.signal.addEventListener("abort", function () { cancelled = true; if (timer) clearTimeout(timer); try { ctrl.close(); } catch (e) {} });
+      },
+      cancel: function () { cancelled = true; if (timer) clearTimeout(timer); },
+    });
+  }
+
+  // =================================================================
+  //  router
+  // =================================================================
+  function J200(body) { return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }); }
+  function T200(text) { return new Response(String(text), { status: 200, headers: { "Content-Type": "text/plain" } }); }
+  function E(code, msg) { return new Response(msg || "", { status: code }); }
+  function J400(msg) { return new Response(JSON.stringify({ error: msg }), { status: 400, headers: { "Content-Type": "application/json" } }); }
+  function wantsJSON(opts) { var h = (opts && opts.headers) || {}; var acc = (h instanceof Headers) ? h.get("Accept") : (h.Accept || h.accept || ""); return /application\/json/.test(acc || ""); }
+
+
+  // ---- fleet schedule analyzers (mirror /schedule/*) ---------------
+  // Mirror of the daemon's _zone_from_name: a ?tz= query value as an
+  // Intl formatter (null when absent, meaning UTC); throws a flagged
+  // error for an unknown name, which the router turns into the same
+  // 400 {"error": "unknown timezone: <name>"} payload the real daemon
+  // sends for /schedule/pressure and /schedule/suggest.
+  function zoneFmt(tz) {
+    if (!tz) return null;
+    try {
+      return new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit" });
+    } catch (err) {
+      var e = new Error("unknown timezone: " + tz); e.badTz = true; throw e;
+    }
+  }
+  // hour/minute labels of an instant in the requested zone (UTC when fmt
+  // is null); some ICU builds render midnight as "24" under hour12:false,
+  // hence the % 24
+  function hmIn(fmt, d) {
+    if (!fmt) return { h: d.getUTCHours(), m: d.getUTCMinutes() };
+    var h = 0, m = 0;
+    fmt.formatToParts(d).forEach(function (p) {
+      if (p.type === "hour") h = (+p.value) % 24;
+      else if (p.type === "minute") m = +p.value;
+    });
+    return { h: h, m: m };
+  }
+  function pressureGrid(fmt) {
+    var grid = [], mJobs = [], h, m;
+    for (h = 0; h < 24; h++) { var row = []; for (m = 0; m < 60; m++) row.push(0); grid.push(row); }
+    for (m = 0; m < 60; m++) mJobs.push({});
+    var jobs = 0, t0 = (Math.floor(nowMs() / 60000) + 1) * 60000;
+    ROSTER.forEach(function (job) {
+      if (job.disabled || job.schedule === "@reboot") return;
+      var c = parseCron(sched(job)); if (!c || c.reboot) return;
+      jobs++;
+      var weight = c.sub ? 12 : 1, cc = c.sub ? parseCron("* * * * *") : c;
+      for (var i = 0; i < 1440; i++) {
+        var d = new Date(t0 + i * 60000);
+        if (!matches(cc, d)) continue;
+        var hm = hmIn(fmt, d);
+        grid[hm.h][hm.m] += weight;
+        mJobs[hm.m][job.name] = 1;
+      }
+    });
+    return { grid: grid, mJobs: mJobs, jobs: jobs, t0: t0 };
+  }
+  function buildPressure(tz) {
+    var fmt = zoneFmt(tz);
+    var p = pressureGrid(fmt), grid = p.grid, m, h;
+    var bmf = [], bmj = [], byHour = [], total = 0;
+    for (m = 0; m < 60; m++) { var s = 0; for (h = 0; h < 24; h++) s += grid[h][m]; bmf.push(s); bmj.push(Object.keys(p.mJobs[m]).length); total += s; }
+    for (h = 0; h < 24; h++) { var hs = 0; for (m = 0; m < 60; m++) hs += grid[h][m]; byHour.push(hs); }
+    var busiest = 0; for (m = 1; m < 60; m++) if (bmj[m] > bmj[busiest] || (bmj[m] === bmj[busiest] && bmf[m] > bmf[busiest])) busiest = m;
+    var empty = []; for (m = 0; m < 60; m++) if (!bmf[m]) empty.push(m);
+    return { start: iso(p.t0), hours: 24, timezone: tz || "UTC", jobs: p.jobs, total_fires: total,
+             grid: grid, by_minute_fires: bmf, by_minute_jobs: bmj, by_hour: byHour,
+             busiest_minute: { minute: busiest, jobs: bmj[busiest], fires: bmf[busiest] },
+             empty_minutes: empty, top_cells: [],
+             excluded: { disabled: ROSTER.filter(function (j) { return j.disabled; }).length,
+                         reboot: ROSTER.filter(function (j) { return !j.disabled && j.schedule === "@reboot"; }).length } };
+  }
+  function buildDuplicates() {
+    var groups = {}, count = 0;
+    ROSTER.forEach(function (job) {
+      if (job.disabled || job.schedule === "@reboot") return;
+      count++;
+      var norm = (MAC[sched(job)] || sched(job)) + "|" + (job.tz || "UTC");
+      if (!groups[norm]) groups[norm] = { expr: job.schedule, names: [] };
+      groups[norm].names.push(job.name);
+    });
+    var out = [];
+    Object.keys(groups).forEach(function (key) {
+      var g = groups[key];
+      if (g.names.length < 2) return;
+      out.push({ expression: g.expr, description: "", timezone: key.split("|")[1],
+                 count: g.names.length, jobs: g.names.slice().sort() });
+    });
+    out.sort(function (a, b) { return b.count - a.count || (a.expression < b.expression ? -1 : 1); });
+    return { jobs: count, groups: out };
+  }
+  function circDist(a, b, n) { var d = Math.abs(a - b) % n; return Math.min(d, n - d); }
+  function buildSuggest(period, tz) {
+    var fmt = zoneFmt(tz);
+    var p = pressureGrid(fmt), grid = p.grid, m, h;
+    if (period === "daily") {
+      var busiest = { h: 0, m: 0, c: grid[0][0] }, best = null;
+      for (h = 0; h < 24; h++) for (m = 0; m < 60; m++) if (grid[h][m] > busiest.c) busiest = { h: h, m: m, c: grid[h][m] };
+      var bmod = busiest.h * 60 + busiest.m;
+      for (h = 0; h < 24; h++) for (m = 0; m < 60; m++) {
+        var cand = { h: h, m: m, c: grid[h][m], d: circDist(h * 60 + m, bmod, 1440) };
+        if (!best || cand.c < best.c || (cand.c === best.c && cand.d > best.d)) best = cand;
+      }
+      return { period: "daily", timezone: tz || "UTC", hour: best.h, minute: best.m,
+               expression: best.m + " " + best.h + " * * *", fires_in_window: best.c,
+               busiest: { hour: busiest.h, minute: busiest.m, fires_in_window: busiest.c },
+               alternatives: [], hash_hint: "H H * * *" };
+    }
+    var loads = []; for (m = 0; m < 60; m++) { var s = 0; for (h = 0; h < 24; h++) s += grid[h][m]; loads.push(s); }
+    var bus = 0; for (m = 1; m < 60; m++) if (loads[m] > loads[bus]) bus = m;
+    var bm = 0;
+    for (m = 1; m < 60; m++) if (loads[m] < loads[bm] || (loads[m] === loads[bm] && circDist(m, bus, 60) > circDist(bm, bus, 60))) bm = m;
+    return { period: "hourly", timezone: tz || "UTC", minute: bm, expression: bm + " * * * *",
+             fires_in_window: loads[bm], busiest: { minute: bus, fires_in_window: loads[bus] },
+             alternatives: [], hash_hint: "H * * * *" };
+  }
+
+  function route(path, opts) {
+    var method = (opts && opts.method || "GET").toUpperCase();
+    var url = path.split("?")[0], qs = {};
+    (path.split("?")[1] || "").split("&").forEach(function (kv) { var p = kv.split("="); if (p[0]) qs[decodeURIComponent(p[0])] = decodeURIComponent(p[1] || ""); });
+    var m;
+
+    if (url === "/version") return T200(VERSION);
+    if (url === "/job-set-id") return wantsJSON(opts) ? J200({ job_set_id: JSID, jobs: ROSTER.filter(function (j) { return !j.disabled; }).length }) : T200(JSID);
+    if (url === "/cluster") return J200(buildCluster());
+    if (url === "/fleet") return J200(buildFleet());
+    if (url === "/node") return J200(buildNode());
+    if (url === "/node/history") return J200(buildNodeHistory());
+    if (url === "/status") return wantsJSON(opts) ? J200(buildStatus()) : T200(buildStatus().map(function (r) { return r.job + ": " + r.status; }).join("\n"));
+    if (url === "/jobs") return J200(buildJobs());
+    if (url === "/activity") return J200(buildActivity());
+    if (url === "/schedule/pressure") { try { return J200(buildPressure(qs.tz)); } catch (e) { if (e && e.badTz) return J400(e.message); throw e; } }
+    if (url === "/schedule/duplicates") return J200(buildDuplicates());
+    if (url === "/schedule/suggest") { try { return J200(buildSuggest(qs.period || "hourly", qs.tz)); } catch (e) { if (e && e.badTz) return J400(e.message); throw e; } }
+    if (url === "/dags") return J200(buildDags());
+    if (url === "/state") return J200(buildState());
+    if (url === "/state/documents") return qs.ns ? J200(buildStateDocs(qs.ns)) : E(400, "ns required");
+    if (url === "/state/records") return qs.stream ? J200(buildStateRecords(qs.stream)) : E(400, "stream required");
+
+    if ((m = /^\/jobs\/([^/]+)\/logs$/.exec(url))) { var nm = decodeURIComponent(m[1]); if (!BYNAME[nm]) return E(404, "unknown job"); return new Response(sseStream(nm, "job", opts), { status: 200, headers: { "Content-Type": "text/event-stream" } }); }
+    if ((m = /^\/jobs\/([^/]+)\/runs$/.exec(url))) { var r = buildJobRuns(decodeURIComponent(m[1])); return r ? J200(r) : E(404, "unknown job"); }
+    if ((m = /^\/jobs\/([^/]+)\/resources$/.exec(url))) { var rr = buildResources(decodeURIComponent(m[1])); return rr ? J200(rr) : E(404, "unknown job"); }
+    if ((m = /^\/jobs\/([^/]+)\/trends$/.exec(url))) { var tr = buildTrends(decodeURIComponent(m[1])); return tr ? J200(tr) : E(404, "unknown job"); }
+    if ((m = /^\/jobs\/([^/]+)\/start$/.exec(url)) && method === "POST") { var jn = decodeURIComponent(m[1]); var jb = BYNAME[jn]; if (!jb) return E(404); if (jb.disabled) return E(409, "job is disabled"); OVERLAY.started[jn] = { at: nowMs(), dur: (jb.run || 3) * 1000 }; return E(200); }
+    if ((m = /^\/jobs\/([^/]+)\/cancel$/.exec(url)) && method === "POST") { return BYNAME[decodeURIComponent(m[1])] ? E(200) : E(404); }
+    if ((m = /^\/jobs\/([^/]+)\/pause$/.exec(url)) && method === "POST") {
+      var pn = decodeURIComponent(m[1]); if (!BYNAME[pn]) return E(404);
+      var pb; try { pb = JSON.parse(opts && opts.body || "{}"); } catch (e) { pb = {}; }
+      var pdur = Math.min(Math.max(pb.durationSeconds || 3600, 1), 2592000);   // PAUSE_DEFAULT/MAX_SECONDS
+      var prec = { since: iso(nowMs()), until: iso(nowMs() + pdur * 1000), note: pb.note || null, by: pb.by || "demo", channel: "api" };
+      OVERLAY.paused[pn] = prec;
+      return J200({ paused: prec });
+    }
+    if ((m = /^\/jobs\/([^/]+)\/resume$/.exec(url)) && method === "POST") {
+      var rn = decodeURIComponent(m[1]); if (!BYNAME[rn]) return E(404);
+      OVERLAY.paused[rn] = null;      // explicit resume also overrides a roster fixture pause
+      return J200({ paused: null });
+    }
+
+    if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/tasks\/([^/]+)\/logs$/.exec(url))) return new Response(sseStream(decodeURIComponent(m[3]), "task", opts), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/tasks\/([^/]+)\/decision$/.exec(url)) && method === "POST") {
+      var dn = decodeURIComponent(m[1]), rk = decodeURIComponent(m[2]); var rec = OVERLAY.dagRuns.filter(function (x) { return x.dag === dn && x.runKey === rk; })[0];
+      var dec; try { dec = JSON.parse(opts && opts.body || "{}"); } catch (e) { dec = {}; }
+      if (!rec) return E(409, "no such run/task awaiting approval"); if (dec.decision !== "approve" && dec.decision !== "reject") return E(400, "decision must be approve|reject");
+      rec._decision = dec.decision; var stt = dec.decision === "approve" ? "success" : (DAGS[dn] === DAGS["hotfix-release"] ? "failed" : "skipped"); return J200({ ok: true, state: stt });
+    }
+    if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)\/xcom$/.exec(url))) return J200(buildXcom(decodeURIComponent(m[1]), decodeURIComponent(m[2])));
+    if ((m = /^\/dags\/([^/]+)\/runs\/([^/]+)$/.exec(url))) { var doc = buildDagRun(decodeURIComponent(m[1]), decodeURIComponent(m[2])); return doc ? J200(doc) : E(404); }
+    if ((m = /^\/dags\/([^/]+)\/runs$/.exec(url))) { var dr = buildDagRuns(decodeURIComponent(m[1]), qs.limit ? parseInt(qs.limit, 10) : 50); return dr ? J200(dr) : E(404); }
+    if ((m = /^\/dags\/([^/]+)\/trigger$/.exec(url)) && method === "POST") { var dg = decodeURIComponent(m[1]); if (!DAGS[dg]) return E(404); var k = "manual-" + Math.floor(hash(dg + nowMs()) * 0xffffffffff).toString(16).slice(0, 12); OVERLAY.dagRuns.push(makeManualRun(dg, k, nowMs(), DAGS[dg].tasks.some(function (t) { return t.type === "approval"; }) ? "awaiting" : "run")); return J200({ dag: dg, runKey: k }); }
+    if ((m = /^\/dags\/([^/]+)\/backfill$/.exec(url)) && method === "POST") { var db = decodeURIComponent(m[1]); if (!DAGS[db] || !DAGS[db].schedule) return E(400, "unschedulable dag"); var b; try { b = JSON.parse(opts && opts.body || "{}"); } catch (e) { b = {}; } if (typeof b.from !== "string" || typeof b.to !== "string") return E(400, "from/to required"); var created = prevFires(DAGS[db].schedule, Date.parse(b.to), 200, Date.parse(b.from)).length; return J200({ ok: true, created: created }); }
+
+    if (url === "/whoami") return J200({ authenticated: true, label: "authToken", scopes: ["view", "control", "approve"], allScopes: true });
+    if (url === "/push/devices" && method === "GET") return J200({ devices: [{ id: "a1b2c3d4e5f60718", name: "Parker's iPhone", platform: "ios", publicKey: "(demo)", pushToken: "…4Q9zXk", createdAt: "2026-07-20T14:02:11+00:00", createdBy: "authToken" }] });
+    if (url === "/push/devices" && method === "POST") { var dv; try { dv = JSON.parse(opts && opts.body || "{}"); } catch (e) { dv = {}; } return J200({ device: { id: "ffeeddccbbaa9988", name: dv.name || "device", platform: dv.platform || "ios", publicKey: "(demo)", pushToken: "…demo42", createdAt: "2026-07-23T00:00:00+00:00", createdBy: "authToken" }, created: true }); }
+    if ((m = /^\/push\/devices\/([^/]+)\/test$/.exec(url)) && method === "POST") return J200({ device: decodeURIComponent(m[1]), status: 200, error: null });
+    if ((m = /^\/push\/devices\/([^/]+)$/.exec(url)) && method === "DELETE") return J200({ revoked: decodeURIComponent(m[1]) });
+
+    return E(404, "not found (demo)");
+  }
+
+  // =================================================================
+  //  install
+  // =================================================================
+  seedApprovalRun();
+  try { localStorage.removeItem("cronstable.bootShownAt"); } catch (e) {}   // always play the boot self-test
+
+  var realFetch = window.fetch ? window.fetch.bind(window) : null;
+  window.fetch = function (input, opts) {
+    var path = typeof input === "string" ? input : (input && input.url) || "";
+    if (path && path.charAt(0) === "/") { try { return Promise.resolve(route(path, opts || {})); } catch (e) { console.error("[demo mock]", path, e); return Promise.resolve(new Response("mock error", { status: 500 })); } }
+    return realFetch ? realFetch(input, opts) : Promise.reject(new Error("offline demo"));
+  };
+
+  // unobtrusive, honest badge (does not obscure the board)
+  window.addEventListener("DOMContentLoaded", function () {
+    var b = document.createElement("a");
+    b.href = "../comparison.html"; b.textContent = "▚ demo · synthetic data";
+    b.title = "cronstable interactive demo — every view is real, the data is synthetic. Back to the comparison.";
+    b.style.cssText = "position:fixed;left:10px;bottom:10px;z-index:8000;font:600 11px/1 var(--mono,monospace);" +
+      "padding:5px 9px;border:1px solid var(--border2,#2a3b4d);border-radius:3px;background:var(--panel,#0b1620);" +
+      "color:var(--fg-dim,#4b9cd3);text-decoration:none;opacity:.72;box-shadow:0 2px 10px rgba(0,0,0,.4)";
+    b.onmouseenter = function () { b.style.opacity = "1"; }; b.onmouseleave = function () { b.style.opacity = ".72"; };
+    document.body.appendChild(b);
+  });
+
+  // the .ics feed links need a live daemon; this page is synthetic
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest && e.target.closest(".icslink");
+    if (a) {
+      e.preventDefault();
+      alert("demo: the iCal feed is served by a live cronstable daemon (GET /calendar.ics and /jobs/<name>/calendar.ics); this page runs on synthetic data with no backend.");
+    }
+  }, true);
+
+  console.log("%ccronstable demo backend active", "color:#4b9cd3;font-weight:700", "— synthetic 9-node meridian fleet, no network.");
+})();
+</script>
+<!-- logo engine: inlined verbatim from cronstable/web/index.html (the live
+     dashboard header's mark), because the demo mirrors the shipped
+     single-file dashboard byte for byte. GENERATED PAGE: do not edit
+     docs/demo/index.html by hand. Edit cronstable/web/index.html or
+     docs/demo/_backend.html, then run `python scripts/build_demo.py`. -->

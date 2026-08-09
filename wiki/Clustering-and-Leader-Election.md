@@ -500,11 +500,16 @@ can override it with **`clusterPolicy`** to pick its own point on the
 liveness-vs-duplication trade-off. **No option is true exactly-once**: each
 gives up one side. `Leader` may *skip*, `PreferLeader` may *double-run*.
 
-| `clusterPolicy` | Healthy (quorate) | Partitioned / sub-quorum | Use for |
-| --- | --- | --- | --- |
-| `Leader` *(default)* | leader runs once | **nobody** runs (skips) | non-idempotent jobs where a duplicate is harmful and an occasional skip is OK (billing, outbound email) |
-| `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | important **and** idempotent jobs that should never skip |
-| `EveryNode` | every node runs | every reachable node runs | genuinely per-node work (local log rotation), or fully idempotent jobs |
+| `clusterPolicy` | Healthy (quorate) | Partitioned / sub-quorum | Guarantee by backend | Use for |
+| --- | --- | --- | --- | --- |
+| `Leader` *(default)* | leader runs once | **nobody** runs (skips) | may skip on every backend: best-effort on `gossip` (rare dup); fenced on `kubernetes` / `etcd`; fenced under NTP-bounded skew on `filesystem` | non-idempotent jobs where a duplicate is harmful and an occasional skip is OK (billing, outbound email) |
+| `PreferLeader` | lowest node runs once | each side's lowest node runs (**may double-run**) | never-skip on every backend (may dup) | important **and** idempotent jobs that should never skip |
+| `EveryNode` | every node runs | every reachable node runs | every node on every backend | genuinely per-node work (local log rotation), or fully idempotent jobs |
+
+In the guarantee column, "fenced" is the hard, single-holder guarantee,
+"best-effort" admits the narrow gossip windows, and "may skip" / "may dup" name
+the side the policy gives up; the fuller per-backend wording is in
+[Guarantees and trade-offs](#guarantees-and-trade-offs).
 
 ```yaml
 jobs:
@@ -913,16 +918,9 @@ backend.
 
 ## Guarantees and trade-offs
 
-The delivery guarantee each `clusterPolicy` gives depends on the backend. The
-matrix below is the one-word summary (fuller wording follows); "fenced" is the
-hard, single-holder guarantee, "best-effort" admits the narrow gossip windows,
-and "may skip" / "may dup" name the side each policy gives up:
-
-| `clusterPolicy` | `gossip` | `kubernetes` | `etcd` | `filesystem` |
-| --- | --- | --- | --- | --- |
-| `Leader` | best-effort (may skip; rare dup) | fenced (may skip) | fenced (may skip) | fenced under NTP-bounded skew (may skip) |
-| `PreferLeader` | never-skip (may dup) | never-skip (may dup) | never-skip (may dup) | never-skip (may dup) |
-| `EveryNode` | every-node | every-node | every-node | every-node |
+The delivery guarantee each `clusterPolicy` gives depends on the backend; the
+per-policy, per-backend summary is the guarantee column of the
+[Per-job policy table](#per-job-policy), and the fuller wording follows.
 
 On the lease backends "fenced" holds while the store is reachable; a store
 outage is the one window a `Leader` job skips and a `PreferLeader` job may
@@ -1426,9 +1424,9 @@ The compose file's header comments document the full set of things to try
 
 **A full showcase.** For the fullest end-to-end demo (`distribution: spread`,
 all three `clusterPolicy` values, and mTLS together), the repository ships
-[`example/acme-platform/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/acme-platform/docker-compose.yml);
+[`example/grand-tour/docker-compose.yml`](https://github.com/ptweezy/cronstable/blob/develop/example/grand-tour/docker-compose.yml);
 its walkthrough is in
-[`example/acme-platform/README.md`](https://github.com/ptweezy/cronstable/blob/develop/example/acme-platform/README.md).
+[`example/grand-tour/README.md`](https://github.com/ptweezy/cronstable/blob/develop/example/grand-tour/README.md).
 
 ### A larger, CPU-heavy cluster
 

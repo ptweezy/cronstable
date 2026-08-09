@@ -26,11 +26,15 @@ from cronstable.backends.etcd import (
     lease_ttl_from_keepalive,
 )
 from cronstable.config import parse_config_string
+from tests._helpers import _utc_now_plus
 
 NOW = datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 
 def _backend(extra="", endpoint="http://127.0.0.1:2379"):
+    # Deliberately NOT tests/_helpers._backend (finding B2): that one builds
+    # the FilesystemStateBackend state store, while this builds the EtcdBackend
+    # leadership backend from cluster YAML with endpoint/extra knobs.
     yaml = (
         "cluster:\n"
         "  backend: etcd\n"
@@ -44,12 +48,6 @@ def _backend(extra="", endpoint="http://127.0.0.1:2379"):
     )
     cfg = parse_config_string(yaml, "").cluster_config
     return EtcdBackend(cfg, lambda: "v1:job")
-
-
-def _utc_now_plus(seconds):
-    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        seconds=seconds
-    )
 
 
 # --- base64 helpers -------------------------------------------------------
@@ -295,7 +293,8 @@ def test_tls_files_changed_detects_in_place_rotation(tmp_path):
         "      key: " + str(key).replace("\\", "/") + "\n"
     )
     b = _backend(extra=extra, endpoint="https://127.0.0.1:2379")
-    b._record_tls_files()  # snapshot, as start() does after _build_ssl
+    # snapshot, as start() does after _build_ssl
+    b._record_tls_files(b._tls_file_paths())
     assert b.tls_files_changed() is False
     # an in-place rotation: same path, new (longer) bytes -> new size/mtime
     cert.write_text("new-client-cert-material-much-longer")
@@ -307,8 +306,8 @@ def test_tls_files_changed_false_for_plain_http():
     # rotate and tls_files_changed stays False (the inherited lease default),
     # never spuriously rebuilding the backend.
     b = _backend()  # http endpoint, no tls material
-    b._record_tls_files()
-    assert b._tls_files == []
+    b._record_tls_files(b._tls_file_paths())
+    assert b._tls_signature == {}
     assert b.tls_files_changed() is False
 
 
