@@ -21,6 +21,7 @@ from cronstable.config import (
     parse_config_string,
     parse_config_with_sources,
 )
+from tests._configs import _ETCD, _STATE
 
 
 def _cluster(yaml):
@@ -54,18 +55,18 @@ def test_backend_defaults_to_gossip():
     assert cfg["backend"] == "gossip"
 
 
-def test_gossip_requires_transport_keys():
+@pytest.mark.parametrize("missing", ["listen", "tls", "peers"])
+def test_gossip_requires_transport_keys(missing):
     # listen/tls/peers are schema-optional now, but gossip still requires them
-    for missing in ("listen", "tls", "peers"):
-        lines = {
-            "listen": "  listen: '0.0.0.0:8443'\n",
-            "tls": "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n",
-            "peers": "  peers:\n    - host: b:8443\n",
-        }
-        del lines[missing]
-        yaml = "cluster:\n  backend: gossip\n" + "".join(lines.values())
-        with pytest.raises(ConfigError, match=missing):
-            _cluster(yaml)
+    lines = {
+        "listen": "  listen: '0.0.0.0:8443'\n",
+        "tls": "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n",
+        "peers": "  peers:\n    - host: b:8443\n",
+    }
+    del lines[missing]
+    yaml = "cluster:\n  backend: gossip\n" + "".join(lines.values())
+    with pytest.raises(ConfigError, match=missing):
+        _cluster(yaml)
 
 
 # --- observability overlay ------------------------------------------------
@@ -95,37 +96,51 @@ def test_observability_gossip_backend_shares_node_stats():
     assert cfg["observabilityMesh"] is None
 
 
-def test_observability_gossip_backend_rejects_transport():
-    with pytest.raises(ConfigError, match="redundant with backend: gossip"):
-        _gossip(
-            "    - host: b:8443\n",
-            extra=_OBS_TRANSPORT,
-        )
-
-
-def test_observability_gossip_backend_rejects_overlay_tuning():
-    # nodeName/interval/driftAfter/connectTimeout configure the SEPARATE
-    # overlay mesh a lease backend stands up; under gossip the stats ride the
-    # election mesh (tuned by the cluster-level keys), so they must be
-    # rejected like the transport keys rather than silently ignored.
-    for key, value in (
-        ("nodeName", "obs-a"),
-        ("interval", "5"),
-        ("driftAfter", "2"),
-        ("connectTimeout", "3"),
-    ):
-        with pytest.raises(
-            ConfigError,
-            match="observability.{} only applies".format(key),
-        ):
-            _gossip(
-                "    - host: b:8443\n",
-                extra=(
-                    "  observability:\n"
-                    "    shareNodeStats: true\n"
-                    "    " + key + ": " + value + "\n"
-                ),
-            )
+@pytest.mark.parametrize(
+    "extra, match",
+    [
+        pytest.param(
+            _OBS_TRANSPORT,
+            "redundant with backend: gossip",
+            id="transport-block",
+        ),
+        # nodeName/interval/driftAfter/connectTimeout configure the SEPARATE
+        # overlay mesh a lease backend stands up; under gossip the stats ride
+        # the election mesh (tuned by the cluster-level keys), so they must be
+        # rejected like the transport keys rather than silently ignored.
+        pytest.param(
+            "  observability:\n"
+            "    shareNodeStats: true\n"
+            "    nodeName: obs-a\n",
+            "observability.nodeName only applies",
+            id="tuning-nodeName",
+        ),
+        pytest.param(
+            "  observability:\n"
+            "    shareNodeStats: true\n"
+            "    interval: 5\n",
+            "observability.interval only applies",
+            id="tuning-interval",
+        ),
+        pytest.param(
+            "  observability:\n"
+            "    shareNodeStats: true\n"
+            "    driftAfter: 2\n",
+            "observability.driftAfter only applies",
+            id="tuning-driftAfter",
+        ),
+        pytest.param(
+            "  observability:\n"
+            "    shareNodeStats: true\n"
+            "    connectTimeout: 3\n",
+            "observability.connectTimeout only applies",
+            id="tuning-connectTimeout",
+        ),
+    ],
+)
+def test_observability_gossip_backend_rejects_lease_only_keys(extra, match):
+    with pytest.raises(ConfigError, match=match):
+        _gossip("    - host: b:8443\n", extra=extra)
 
 
 def test_observability_lease_requires_transport():
@@ -191,49 +206,69 @@ def test_kubernetes_identity_override():
     assert cfg["kubernetes"]["identity"] == "pod-7"
 
 
-def test_kubernetes_rejects_spread():
-    with pytest.raises(ConfigError, match="spread"):
-        _cluster(_K8S + "  distribution: spread\n")
-
-
-def test_kubernetes_duration_must_exceed_renew():
-    yaml = _K8S + (
-        "  kubernetes:\n"
-        "    leaseDurationSeconds: 10\n"
-        "    renewDeadlineSeconds: 10\n"
-    )
-    with pytest.raises(ConfigError, match="greater than"):
-        _cluster(yaml)
-
-
-def test_kubernetes_renew_must_be_positive():
-    yaml = _K8S + (
-        "  kubernetes:\n"
-        "    leaseDurationSeconds: 5\n"
-        "    renewDeadlineSeconds: 0\n"
-    )
-    with pytest.raises(ConfigError, match="renewDeadlineSeconds"):
-        _cluster(yaml)
-
-
-def test_kubernetes_retry_must_be_positive():
-    yaml = _K8S + "  kubernetes:\n    retryPeriodSeconds: 0\n"
-    with pytest.raises(ConfigError, match="retryPeriodSeconds"):
-        _cluster(yaml)
-
-
-def test_kubernetes_retry_must_be_less_than_renew():
-    # client-go's third leaderelection invariant: with retry >= renew a holder
-    # cannot renew before the next attempt is due, so it lapses out of the
-    # lease every cycle and no Leader job runs stably. retry == renew is the
-    # boundary case and must also be rejected.
-    yaml = _K8S + (
-        "  kubernetes:\n"
-        "    leaseDurationSeconds: 15\n"
-        "    renewDeadlineSeconds: 10\n"
-        "    retryPeriodSeconds: 10\n"
-    )
-    with pytest.raises(ConfigError, match="retryPeriodSeconds"):
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        pytest.param(
+            _K8S + "  kubernetes:\n"
+            "    leaseDurationSeconds: 10\n"
+            "    renewDeadlineSeconds: 10\n",
+            "greater than",
+            id="duration-must-exceed-renew",
+        ),
+        pytest.param(
+            _K8S + "  kubernetes:\n"
+            "    leaseDurationSeconds: 5\n"
+            "    renewDeadlineSeconds: 0\n",
+            "renewDeadlineSeconds",
+            id="renew-must-be-positive",
+        ),
+        pytest.param(
+            _K8S + "  kubernetes:\n    retryPeriodSeconds: 0\n",
+            "retryPeriodSeconds",
+            id="retry-must-be-positive",
+        ),
+        # client-go's third leaderelection invariant: with retry >= renew a
+        # holder cannot renew before the next attempt is due, so it lapses out
+        # of the lease every cycle and no Leader job runs stably. retry ==
+        # renew is the boundary case and must also be rejected.
+        pytest.param(
+            _K8S + "  kubernetes:\n"
+            "    leaseDurationSeconds: 15\n"
+            "    renewDeadlineSeconds: 10\n"
+            "    retryPeriodSeconds: 10\n",
+            "retryPeriodSeconds",
+            id="retry-must-be-less-than-renew",
+        ),
+        # F17: renewDeadline + retryPeriod must fit inside leaseDuration, or
+        # the holder's worst-case refresh gap exceeds the lease lifetime and
+        # it lapses out of the lease every cycle even when sole and healthy
+        # (no stable leader). 11+10=21 >= 12 passes the pairwise checks
+        # (10<11, 11<12) but not the sum.
+        pytest.param(
+            _K8S + "  kubernetes:\n"
+            "    leaseDurationSeconds: 12\n"
+            "    renewDeadlineSeconds: 11\n"
+            "    retryPeriodSeconds: 10\n",
+            "must be less than",
+            id="renew-plus-retry-ge-duration",
+        ),
+        # L2: leaseName is spliced into the apiserver URL path; a '/' (or
+        # other path metacharacter) would retarget the request to a different
+        # resource. Reject non-RFC1123 names at config load, not silently at
+        # runtime.
+        pytest.param(
+            "cluster:\n"
+            "  backend: kubernetes\n"
+            "  kubernetes:\n"
+            "    leaseName: team/leader\n",
+            "leaseName",
+            id="leaseName-path-chars",
+        ),
+    ],
+)
+def test_kubernetes_invalid_lease_config_rejected(yaml, match):
+    with pytest.raises(ConfigError, match=match):
         _cluster(yaml)
 
 
@@ -245,15 +280,7 @@ def test_kubernetes_default_retry_renew_valid():
 
 
 # --- etcd -----------------------------------------------------------------
-
-_ETCD = (
-    "cluster:\n"
-    "  backend: etcd\n"
-    "  nodeName: node-a\n"
-    "  etcd:\n"
-    "    endpoints:\n"
-    "      - http://127.0.0.1:2379\n"
-)
+# the _ETCD base yaml is shared with other files via tests/_configs.py
 
 # auth credentials must never cross a plaintext wire, so a config that sets a
 # username/password is only valid with https endpoints (see
@@ -278,68 +305,71 @@ def test_etcd_defaults_filled():
     assert cfg["electLeader"] is True
 
 
-def test_etcd_rejects_spread():
-    with pytest.raises(ConfigError, match="spread"):
-        _cluster(_ETCD + "  distribution: spread\n")
-
-
-def test_etcd_ttl_must_be_positive():
-    yaml = (
+def _etcd_ttl_yaml(ttl):
+    return (
         "cluster:\n"
         "  backend: etcd\n"
         "  etcd:\n"
         "    endpoints:\n"
         "      - http://127.0.0.1:2379\n"
-        "    ttl: 0\n"
+        "    ttl: {}\n".format(ttl)
     )
-    with pytest.raises(ConfigError, match="ttl"):
+
+
+# A ttl below the floor passes the > 0 check but makes the leader deadline
+# (ttl - 1s skew) collapse to <= the keepalive period, so a node that wins
+# the campaign immediately treats its own lease as expired and is_leader()
+# is permanently False -- at-most-once silently degrades to at-most-zero.
+# ttl 1 and 2 must be rejected; 3 (the floor) must be accepted (the
+# companion test below).
+@pytest.mark.parametrize(
+    "ttl, match",
+    [
+        pytest.param(0, "ttl", id="zero"),
+        pytest.param(1, "ttl must be >= 3", id="one-below-floor"),
+        pytest.param(2, "ttl must be >= 3", id="two-below-floor"),
+    ],
+)
+def test_etcd_ttl_out_of_range_rejected(ttl, match):
+    with pytest.raises(ConfigError, match=match):
+        _cluster(_etcd_ttl_yaml(ttl))
+
+
+def test_etcd_ttl_floor_value_accepted():
+    assert _cluster(_etcd_ttl_yaml(3))["etcd"]["ttl"] == 3
+
+
+# missing host, bad scheme, non-numeric port, out-of-range port, and port 0
+# must all raise a clean ConfigError (never a raw ValueError from
+# urlparse().port). A MISSING port is allowed (defaults to scheme port);
+# see test_etcd_accepts_portless_endpoint.
+@pytest.mark.parametrize(
+    "endpoint, match",
+    [
+        pytest.param("127.0.0.1:2379", "endpoints", id="no-scheme"),
+        pytest.param("ftp://h:2379", "endpoints", id="bad-scheme"),
+        pytest.param("http://h:notaport", "endpoints", id="nonnumeric-port"),
+        pytest.param("http://h:99999", "endpoints", id="port-out-of-range"),
+        pytest.param("http://h:0", "endpoints", id="port-zero"),
+        # credentials in the URL would be logged in cleartext and sent as
+        # Basic auth, bypassing the username/password https-only guard.
+        pytest.param(
+            "https://user:s3cret@etcd:2379",
+            "credentials",
+            id="embedded-credentials",
+        ),
+    ],
+)
+def test_etcd_rejects_malformed_endpoint(endpoint, match):
+    yaml = (
+        "cluster:\n"
+        "  backend: etcd\n"
+        "  etcd:\n"
+        "    endpoints:\n"
+        "      - " + endpoint + "\n"
+    )
+    with pytest.raises(ConfigError, match=match):
         _cluster(yaml)
-
-
-def test_etcd_ttl_floor_rejects_unleadable_small_ttl():
-    # A ttl below the floor passes the > 0 check but makes the leader deadline
-    # (ttl - 1s skew) collapse to <= the keepalive period, so a node that wins
-    # the campaign immediately treats its own lease as expired and is_leader()
-    # is permanently False -- at-most-once silently degrades to at-most-zero.
-    # ttl 1 and 2 must be rejected; 3 (the floor) must be accepted.
-    def _yaml(ttl):
-        return (
-            "cluster:\n"
-            "  backend: etcd\n"
-            "  etcd:\n"
-            "    endpoints:\n"
-            "      - http://127.0.0.1:2379\n"
-            "    ttl: {}\n".format(ttl)
-        )
-
-    for bad in (1, 2):
-        with pytest.raises(ConfigError, match="ttl must be >= 3"):
-            _cluster(_yaml(bad))
-    assert _cluster(_yaml(3))["etcd"]["ttl"] == 3
-
-
-def test_etcd_rejects_malformed_endpoint():
-    # missing host, bad scheme, non-numeric port, out-of-range port, and port 0
-    # must all raise a clean ConfigError (never a raw ValueError from
-    # urlparse().port). A MISSING port is allowed (defaults to scheme port);
-    # see test_etcd_accepts_portless_endpoint.
-    bad_endpoints = (
-        "127.0.0.1:2379",  # no scheme
-        "ftp://h:2379",
-        "http://h:notaport",
-        "http://h:99999",
-        "http://h:0",
-    )
-    for bad in bad_endpoints:
-        yaml = (
-            "cluster:\n"
-            "  backend: etcd\n"
-            "  etcd:\n"
-            "    endpoints:\n"
-            "      - " + bad + "\n"
-        )
-        with pytest.raises(ConfigError, match="endpoints"):
-            _cluster(yaml)
 
 
 def test_etcd_accepts_portless_endpoint():
@@ -355,20 +385,6 @@ def test_etcd_accepts_portless_endpoint():
     )
     cfg = _cluster(yaml)
     assert cfg["etcd"]["endpoints"] == ["https://etcd.svc.cluster.local"]
-
-
-def test_etcd_rejects_url_embedded_credentials():
-    # credentials in the URL would be logged in cleartext and sent as Basic
-    # auth, bypassing the username/password https-only guard.
-    yaml = (
-        "cluster:\n"
-        "  backend: etcd\n"
-        "  etcd:\n"
-        "    endpoints:\n"
-        "      - https://user:s3cret@etcd:2379\n"
-    )
-    with pytest.raises(ConfigError, match="credentials"):
-        _cluster(yaml)
 
 
 def test_etcd_credentialed_bad_port_does_not_leak_password():
@@ -389,47 +405,45 @@ def test_etcd_credentialed_bad_port_does_not_leak_password():
     assert "***" in str(exc.value)
 
 
-def test_kubernetes_rejects_stray_etcd_store_block():
-    # M5: an etcd: store block under backend: kubernetes is silently ignored by
-    # the k8s builder, discarding the operator's intended endpoints/TLS/creds
-    # and arbitrating leadership against the default store. Reject it loudly.
-    yaml = (
-        "cluster:\n"
-        "  backend: kubernetes\n"
-        "  etcd:\n"
-        "    endpoints:\n"
-        "      - https://etcd:2379\n"
-    )
-    with pytest.raises(ConfigError, match="cluster.etcd is configured"):
-        _cluster(yaml)
-
-
-def test_etcd_rejects_stray_kubernetes_store_block():
-    # M5: the symmetric case -- a kubernetes: block under backend: etcd.
-    yaml = (
-        "cluster:\n"
-        "  backend: etcd\n"
-        "  etcd:\n"
-        "    endpoints:\n"
-        "      - https://etcd:2379\n"
-        "  kubernetes:\n"
-        "    leaseName: cronstable-leader\n"
-    )
-    with pytest.raises(ConfigError, match="cluster.kubernetes is configured"):
-        _cluster(yaml)
-
-
-def test_kubernetes_rejects_lease_name_with_path_chars():
-    # L2: leaseName is spliced into the apiserver URL path; a '/' (or other
-    # path metacharacter) would retarget the request to a different resource.
-    # Reject non-RFC1123 names at config load, not silently at runtime.
-    yaml = (
-        "cluster:\n"
-        "  backend: kubernetes\n"
-        "  kubernetes:\n"
-        "    leaseName: team/leader\n"
-    )
-    with pytest.raises(ConfigError, match="leaseName"):
+# M5: a store block for one backend under another backend is silently ignored
+# by that backend's builder, discarding the operator's intended
+# endpoints/TLS/creds and arbitrating leadership against an unintended store.
+# Reject it loudly.
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        pytest.param(
+            "cluster:\n"
+            "  backend: kubernetes\n"
+            "  etcd:\n"
+            "    endpoints:\n"
+            "      - https://etcd:2379\n",
+            "cluster.etcd is configured",
+            id="etcd-under-kubernetes",
+        ),
+        pytest.param(
+            "cluster:\n"
+            "  backend: etcd\n"
+            "  etcd:\n"
+            "    endpoints:\n"
+            "      - https://etcd:2379\n"
+            "  kubernetes:\n"
+            "    leaseName: cronstable-leader\n",
+            "cluster.kubernetes is configured",
+            id="kubernetes-under-etcd",
+        ),
+        pytest.param(
+            "cluster:\n"
+            "  backend: etcd\n"
+            "  filesystem:\n"
+            "    path: /mnt/shared\n",
+            "cluster.filesystem",
+            id="filesystem-under-etcd",
+        ),
+    ],
+)
+def test_stray_store_block_rejected_under_other_backend(yaml, match):
+    with pytest.raises(ConfigError, match=match):
         _cluster(yaml)
 
 
@@ -450,31 +464,50 @@ def test_etcd_password_from_env(monkeypatch):
     assert _cluster(yaml)["etcd"]["resolved_password"] == "from-env"
 
 
-def test_etcd_auth_requires_https():
-    # credentials over a plaintext endpoint would be sniffable: reject the
-    # combination at load time (the default endpoint is http:// but needs no
-    # auth, so it stays valid without credentials).
-    yaml = _ETCD + "    username: root\n    password:\n      value: s3cret\n"
-    with pytest.raises(ConfigError, match="cleartext"):
-        _cluster(yaml)
-
-
-def test_etcd_auth_rejects_mixed_scheme_endpoints():
-    # a mixed http/https list still lets the _post failover loop POST
-    # credentials over the plaintext member, so it is rejected too.
-    yaml = (
-        "cluster:\n"
-        "  backend: etcd\n"
-        "  nodeName: node-a\n"
-        "  etcd:\n"
-        "    endpoints:\n"
-        "      - https://etcd-1:2379\n"
-        "      - http://etcd-2:2379\n"
-        "    username: root\n"
-        "    password:\n"
-        "      value: s3cret\n"
-    )
-    with pytest.raises(ConfigError, match="http://etcd-2:2379"):
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        # credentials over a plaintext endpoint would be sniffable: reject the
+        # combination at load time (the default endpoint is http:// but needs
+        # no auth, so it stays valid without credentials).
+        pytest.param(
+            _ETCD
+            + "    username: root\n    password:\n      value: s3cret\n",
+            "cleartext",
+            id="auth-over-http",
+        ),
+        # a mixed http/https list still lets the _post failover loop POST
+        # credentials over the plaintext member, so it is rejected too.
+        pytest.param(
+            "cluster:\n"
+            "  backend: etcd\n"
+            "  nodeName: node-a\n"
+            "  etcd:\n"
+            "    endpoints:\n"
+            "      - https://etcd-1:2379\n"
+            "      - http://etcd-2:2379\n"
+            "    username: root\n"
+            "    password:\n"
+            "      value: s3cret\n",
+            "http://etcd-2:2379",
+            id="mixed-scheme-endpoints",
+        ),
+        # TLS material set but every endpoint is plaintext -> silently
+        # ignored; refuse rather than send cleartext.
+        pytest.param(
+            _ETCD + "    tls:\n      ca: /ca\n",
+            "no endpoint is https",
+            id="tls-without-https-endpoint",
+        ),
+        pytest.param(
+            _ETCD_TLS + "    username: root\n",
+            "no password is configured",
+            id="username-without-password",
+        ),
+    ],
+)
+def test_etcd_insecure_auth_combinations_rejected(yaml, match):
+    with pytest.raises(ConfigError, match=match):
         _cluster(yaml)
 
 
@@ -512,20 +545,6 @@ def test_etcd_tls_cert_requires_key():
     assert _cluster(both)["etcd"]["tls"]["cert"] == "/c"
 
 
-def test_etcd_tls_without_https_endpoint_rejected():
-    # TLS material set but every endpoint is plaintext -> silently ignored;
-    # refuse rather than send cleartext.
-    yaml = _ETCD + "    tls:\n      ca: /ca\n"
-    with pytest.raises(ConfigError, match="no endpoint is https"):
-        _cluster(yaml)
-
-
-def test_etcd_username_requires_password():
-    yaml = _ETCD_TLS + "    username: root\n"
-    with pytest.raises(ConfigError, match="no password is configured"):
-        _cluster(yaml)
-
-
 def test_kubernetes_apiserver_must_be_https():
     # an http:// apiserver would leak the ServiceAccount bearer token.
     yaml = _K8S + "  kubernetes:\n    apiServer: http://kube-proxy:8080\n"
@@ -536,9 +555,32 @@ def test_kubernetes_apiserver_must_be_https():
     assert _cluster(ok)["kubernetes"]["apiServer"] == "https://api:6443"
 
 
-def test_gossip_fqdn_self_listing_warns_degenerate_size():
-    # a 3-node config where one peer is this node by FQDN (short nodeName) is
-    # really 2 nodes at runtime; warn so it is not discovered as flapping.
+@pytest.mark.parametrize(
+    "self_peer, needle",
+    [
+        # a 3-node config where one peer is this node by FQDN (short
+        # nodeName) is really 2 nodes at runtime; warn so it is not
+        # discovered as flapping.
+        pytest.param(
+            "node-a.internal:8443", "FQDN", id="fqdn-self-listing"
+        ),
+        # SELF-BY-IP hardening (config-time half): a "localhost" peer on our
+        # own port cannot be dropped without DNS resolution, but it can never
+        # be another host either -- a 3-node config carrying it is really 2
+        # nodes at runtime, the degenerate mode the size==2 refusal exists to
+        # catch. Warn, like the FQDN self-listing.
+        pytest.param(
+            "localhost:8443", "loopback", id="localhost-self-listing"
+        ),
+        # a loopback literal that _is_self_listed could not drop as
+        # unambiguous (here: v6 loopback under a v4-only wildcard bind) still
+        # points at this host at best, so it gets the same advisory.
+        pytest.param(
+            "'[::1]:8443'", "loopback", id="family-mismatched-loopback"
+        ),
+    ],
+)
+def test_gossip_self_listing_warns_degenerate_size(self_peer, needle):
     cfg = _cluster(
         "cluster:\n"
         "  listen: '0.0.0.0:8443'\n"
@@ -546,49 +588,11 @@ def test_gossip_fqdn_self_listing_warns_degenerate_size():
         "  electLeader: true\n"
         "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
         "  peers:\n"
-        "    - host: node-a.internal:8443\n"
+        "    - host: " + self_peer + "\n"
         "    - host: node-b:8443\n"
     )
     warnings = cluster_config_warnings(cfg)
-    assert any("FQDN" in w for w in warnings)
-
-
-def test_gossip_localhost_self_listing_warns_degenerate_size():
-    # SELF-BY-IP hardening (config-time half): a "localhost" peer on our own
-    # port cannot be dropped without DNS resolution, but it can never be
-    # another host either -- a 3-node config carrying it is really 2 nodes at
-    # runtime, the degenerate mode the size==2 refusal exists to catch. Warn,
-    # like the FQDN self-listing.
-    cfg = _cluster(
-        "cluster:\n"
-        "  listen: '0.0.0.0:8443'\n"
-        "  nodeName: node-a\n"
-        "  electLeader: true\n"
-        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
-        "  peers:\n"
-        "    - host: localhost:8443\n"
-        "    - host: node-b:8443\n"
-    )
-    warnings = cluster_config_warnings(cfg)
-    assert any("loopback" in w for w in warnings)
-
-
-def test_gossip_family_mismatched_loopback_warns():
-    # a loopback literal that _is_self_listed could not drop as unambiguous
-    # (here: v6 loopback under a v4-only wildcard bind) still points at this
-    # host at best, so it gets the same advisory.
-    cfg = _cluster(
-        "cluster:\n"
-        "  listen: '0.0.0.0:8443'\n"
-        "  nodeName: node-a\n"
-        "  electLeader: true\n"
-        "  tls:\n    ca: /ca\n    cert: /cert\n    key: /key\n"
-        "  peers:\n"
-        "    - host: '[::1]:8443'\n"
-        "    - host: node-b:8443\n"
-    )
-    warnings = cluster_config_warnings(cfg)
-    assert any("loopback" in w for w in warnings)
+    assert any(needle in w for w in warnings)
 
 
 def test_gossip_loopback_advisory_scope():
@@ -720,22 +724,8 @@ def test_unknown_backend_rejected():
 
 
 # --- F17: kubernetes lease-timing sum invariant ---------------------------
-
-
-def test_kubernetes_rejects_renew_plus_retry_ge_duration():
-    # renewDeadline + retryPeriod must fit inside leaseDuration, or the
-    # holder's worst-case refresh gap exceeds the lease lifetime and it lapses
-    # out of the lease every cycle even when sole and healthy (no stable
-    # leader). 11+10=21 >= 12 passes the pairwise checks (10<11, 11<12) but not
-    # the sum.
-    with pytest.raises(ConfigError, match="must be less than"):
-        _cluster(
-            "cluster:\n  backend: kubernetes\n  nodeName: node-a\n"
-            "  kubernetes:\n"
-            "    leaseDurationSeconds: 12\n"
-            "    renewDeadlineSeconds: 11\n"
-            "    retryPeriodSeconds: 10\n"
-        )
+# the rejection case is the renew-plus-retry-ge-duration row of
+# test_kubernetes_invalid_lease_config_rejected
 
 
 def test_kubernetes_defaults_satisfy_sum_invariant():
@@ -747,16 +737,23 @@ def test_kubernetes_defaults_satisfy_sum_invariant():
 # --- F11: IPv6 host:port validation ---------------------------------------
 
 
-def test_gossip_rejects_bare_ipv6_peer():
-    # a bare (unbracketed) IPv6 peer host would be mis-split (host=2001:db8:,
-    # port=1) and silently dropped from quorum; require the bracketed form.
+# a bare (unbracketed) IPv6 peer host would be mis-split (host=2001:db8:,
+# port=1) and silently dropped from quorum; require the bracketed form for
+# the listen address too.
+@pytest.mark.parametrize(
+    "peers_yaml, listen",
+    [
+        pytest.param(
+            "    - host: 2001:db8::5\n", "0.0.0.0:8443", id="bare-ipv6-peer"
+        ),
+        pytest.param(
+            "    - host: node-b:8443\n", "2001:db8::1", id="bare-ipv6-listen"
+        ),
+    ],
+)
+def test_gossip_rejects_bare_ipv6(peers_yaml, listen):
     with pytest.raises(ConfigError, match="IPv6"):
-        _gossip("    - host: 2001:db8::5\n")
-
-
-def test_gossip_rejects_bare_ipv6_listen():
-    with pytest.raises(ConfigError, match="IPv6"):
-        _gossip("    - host: node-b:8443\n", listen="2001:db8::1")
+        _gossip(peers_yaml, listen=listen)
 
 
 def test_gossip_accepts_bracketed_ipv6():
@@ -896,44 +893,59 @@ def test_filesystem_defaults_filled():
     assert cfg["electLeader"] is True  # lease backend implies leadership
 
 
-def test_filesystem_requires_path():
-    with pytest.raises(ConfigError, match="filesystem.path"):
-        _cluster("cluster:\n  backend: filesystem\n")
-    with pytest.raises(ConfigError, match="filesystem.path"):
-        _cluster(
+@pytest.mark.parametrize(
+    "yaml, match",
+    [
+        pytest.param(
+            "cluster:\n  backend: filesystem\n",
+            "filesystem.path",
+            id="path-missing",
+        ),
+        pytest.param(
             "cluster:\n  backend: filesystem\n"
-            "  filesystem:\n    path: '  '\n"
-        )
-
-
-def test_filesystem_ttl_floor():
-    # same rationale as etcd's: below 3s the leader window collapses under
-    # the renew cadence plus the clock-skew margin.
-    with pytest.raises(ConfigError, match="ttl must be >= 3"):
-        _cluster(_FS + "    ttl: 2\n")
-
-
-def test_filesystem_election_name_nonempty():
-    with pytest.raises(ConfigError, match="electionName"):
-        _cluster(_FS + "    electionName: ' '\n")
-
-
-def test_filesystem_rejects_spread():
-    with pytest.raises(ConfigError, match="spread"):
-        _cluster(_FS + "  distribution: spread\n")
-
-
-def test_filesystem_block_rejected_under_other_backends():
-    # a filesystem: block under another backend would be silently ignored,
-    # arbitrating leadership against an unintended store -- refused loudly.
-    yaml = (
-        "cluster:\n"
-        "  backend: etcd\n"
-        "  filesystem:\n"
-        "    path: /mnt/shared\n"
-    )
-    with pytest.raises(ConfigError, match="cluster.filesystem"):
+            "  filesystem:\n    path: '  '\n",
+            "filesystem.path",
+            id="path-blank",
+        ),
+        # same rationale as etcd's ttl floor: below 3s the leader window
+        # collapses under the renew cadence plus the clock-skew margin.
+        pytest.param(
+            _FS + "    ttl: 2\n", "ttl must be >= 3", id="ttl-below-floor"
+        ),
+        # strictyaml's Float() accepts '.nan' and '1e309' (== inf), and
+        # 'nan < floor' is False, so a floor-only check would wave a
+        # non-finite ttl into the lease arithmetic (see the non-finite notes
+        # by the state float tests below).
+        pytest.param(
+            _FS + "    ttl: .nan\n", "ttl must be >= 3", id="ttl-nan"
+        ),
+        pytest.param(
+            _FS + "    ttl: 1e309\n", "ttl must be >= 3", id="ttl-inf"
+        ),
+        pytest.param(
+            _FS + "    electionName: ' '\n",
+            "electionName",
+            id="election-name-blank",
+        ),
+    ],
+)
+def test_filesystem_invalid_config_rejected(yaml, match):
+    with pytest.raises(ConfigError, match=match):
         _cluster(yaml)
+
+
+# spread is a gossip-only distribution; every lease backend refuses it
+@pytest.mark.parametrize(
+    "base",
+    [
+        pytest.param(_K8S, id="kubernetes"),
+        pytest.param(_ETCD, id="etcd"),
+        pytest.param(_FS, id="filesystem"),
+    ],
+)
+def test_lease_backends_reject_spread(base):
+    with pytest.raises(ConfigError, match="spread"):
+        _cluster(base + "  distribution: spread\n")
 
 
 def test_filesystem_gossip_only_keys_are_advisories():
@@ -957,18 +969,20 @@ def test_filesystem_ttl_rejects_non_finite():
             _cluster(_FS + "    ttl: {}\n".format(bad))
 
 
-def test_state_floats_reject_non_finite():
-    cases = (
-        "  slotTtlSeconds: {}\n",
-        "  maxOpsPerSecond: {}\n",
-        "  jobApi:\n    lockTtlSeconds: {}\n",
-    )
-    for extra in cases:
-        for bad in (".nan", "1e309"):
-            with pytest.raises(ConfigError, match="finite"):
-                parse_config_string(
-                    "state:\n  path: /x\n" + extra.format(bad), ""
-                )
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param("  slotTtlSeconds: {}\n", id="slotTtlSeconds"),
+        pytest.param("  maxOpsPerSecond: {}\n", id="maxOpsPerSecond"),
+        pytest.param(
+            "  jobApi:\n    lockTtlSeconds: {}\n", id="jobApi-lockTtlSeconds"
+        ),
+    ],
+)
+@pytest.mark.parametrize("bad", [".nan", "1e309"])
+def test_state_floats_reject_non_finite(extra, bad):
+    with pytest.raises(ConfigError, match="finite"):
+        parse_config_string("state:\n  path: /x\n" + extra.format(bad), "")
 
 
 def test_state_floats_accept_finite_values():
@@ -992,14 +1006,20 @@ def test_state_floats_accept_finite_values():
 # loopback endpoint; the config load must catch it instead.
 
 
-def test_jobapi_listen_bad_port_rejected():
-    for bad in ("127.0.0.1:99999", "127.0.0.1:abc"):
-        with pytest.raises(ConfigError, match="0-65535"):
-            parse_config_string(
-                "state:\n  path: /x\n  jobApi:\n"
-                "    listen: '{}'\n".format(bad),
-                "",
-            )
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param("127.0.0.1:99999", id="port-out-of-range"),
+        pytest.param("127.0.0.1:abc", id="port-non-numeric"),
+    ],
+)
+def test_jobapi_listen_bad_port_rejected(bad):
+    with pytest.raises(ConfigError, match="0-65535"):
+        parse_config_string(
+            "state:\n  path: /x\n  jobApi:\n"
+            "    listen: '{}'\n".format(bad),
+            "",
+        )
 
 
 def test_jobapi_listen_valid_forms_parse():
@@ -1028,8 +1048,7 @@ def test_jobapi_listen_explicit_port_zero_parses():
 
 
 # --- DAG config validation (schedule form, retries, name collisions) --------
-
-_STATE = "state:\n  path: /tmp/x\n"
+# the _STATE base yaml is shared with other files via tests/_configs.py
 
 
 def _xsect(yaml):
@@ -1060,17 +1079,17 @@ def test_dag_alias_schedules_parse():
         assert cfg.dags[0].schedule_job is not None
 
 
-def test_dag_task_negative_retries_rejected():
-    # the job-level maximumRetries documents -1 as retry-forever; on a dag
-    # task a negative value would silently mean ZERO retries, so reject it.
-    for bad in (-1, -5):
-        with pytest.raises(ConfigError, match="not supported for dag tasks"):
-            parse_config_string(
-                "dags:\n  - name: d\n    tasks:\n"
-                "      - id: t\n        command: 'echo'\n"
-                "        retries: {}\n".format(bad),
-                "",
-            )
+# the job-level maximumRetries documents -1 as retry-forever; on a dag
+# task a negative value would silently mean ZERO retries, so reject it.
+@pytest.mark.parametrize("bad", [-1, -5])
+def test_dag_task_negative_retries_rejected(bad):
+    with pytest.raises(ConfigError, match="not supported for dag tasks"):
+        parse_config_string(
+            "dags:\n  - name: d\n    tasks:\n"
+            "      - id: t\n        command: 'echo'\n"
+            "        retries: {}\n".format(bad),
+            "",
+        )
 
 
 def test_dag_task_zero_retries_parses():

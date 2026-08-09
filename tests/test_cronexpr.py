@@ -725,36 +725,47 @@ def test_prev_rolls_back_through_year_column():
     ).total_seconds()
 
 
-def test_prev_month_rollback_crosses_year_boundary():
-    # months set is {6}; from March the current-year scan finds no month
-    # at or before June-that-is-<=-March, so it steps to the prior year.
-    ct = CronTab("0 0 1 6 *")
-    got = ct._prev_civil(datetime.datetime(2026, 3, 1))
-    assert got == datetime.datetime(2025, 6, 1)
-
-
-def test_prev_month_end_clamps_the_rollback_sentinel():
-    # rolling back into February with the day sentinel at 31 must clamp to
-    # the real month end (28) before scanning days.
-    ct = CronTab("0 0 * 2 *")  # every day of February
-    got = ct._prev_civil(datetime.datetime(2026, 3, 15))
-    assert got == datetime.datetime(2026, 2, 28)
-
-
-def test_prev_scans_back_across_months_for_a_dom():
-    # day 15 is absent from the days below March 9, so the walk decrements
-    # the month and finds Feb 15.
-    ct = CronTab("0 0 15 * *")
-    got = ct._prev_civil(datetime.datetime(2026, 3, 10))
-    assert got == datetime.datetime(2026, 2, 15)
-
-
-def test_prev_single_month_wraps_month_below_one():
-    # only January fires; from Jan 10 the same-month scan fails, month
-    # decrements below 1 and wraps to December of the prior year.
-    ct = CronTab("0 0 15 1 *")
-    got = ct._prev_civil(datetime.datetime(2026, 1, 10))
-    assert got == datetime.datetime(2025, 1, 15)
+@pytest.mark.parametrize(
+    ("expr", "probe", "expected"),
+    [
+        # months set is {6}; from March the current-year scan finds no month
+        # at or before June-that-is-<=-March, so it steps to the prior year.
+        pytest.param(
+            "0 0 1 6 *",
+            datetime.datetime(2026, 3, 1),
+            datetime.datetime(2025, 6, 1),
+            id="month-rollback-crosses-year-boundary",
+        ),
+        # rolling back into February (every day of it) with the day sentinel
+        # at 31 must clamp to the real month end (28) before scanning days.
+        pytest.param(
+            "0 0 * 2 *",
+            datetime.datetime(2026, 3, 15),
+            datetime.datetime(2026, 2, 28),
+            id="month-end-clamps-the-rollback-sentinel",
+        ),
+        # day 15 is absent from the days below March 9, so the walk
+        # decrements the month and finds Feb 15.
+        pytest.param(
+            "0 0 15 * *",
+            datetime.datetime(2026, 3, 10),
+            datetime.datetime(2026, 2, 15),
+            id="scans-back-across-months-for-a-dom",
+        ),
+        # only January fires; from Jan 10 the same-month scan fails, month
+        # decrements below 1 and wraps to December of the prior year.
+        pytest.param(
+            "0 0 15 1 *",
+            datetime.datetime(2026, 1, 10),
+            datetime.datetime(2025, 1, 15),
+            id="single-month-wraps-month-below-one",
+        ),
+    ],
+)
+def test_prev_civil_rollback_branches(expr, probe, expected):
+    ct = CronTab(expr)
+    got = ct._prev_civil(probe)
+    assert got == expected
 
 
 # _prev_in

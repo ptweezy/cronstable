@@ -5,7 +5,7 @@ Backend half (FilesystemStateBackend): the self-observability stats
 the store version stamp, collect_garbage's deletion rules, and
 migrate_schema's converter walk.  CLI half (cronstable.state_admin via
 cronstable.__main__): backup/restore/migrate/gc/check/migrate-schema driven
-through main_loop with the test_main.py argv/exit pattern.
+through main_loop via the conftest ``cli_runner`` fixture (finding B12).
 """
 
 import asyncio
@@ -15,33 +15,19 @@ import io
 import json
 import os
 import stat
-import sys
 import tarfile
 import time
 
 import pytest
 
-import cronstable.__main__
 import cronstable.state as state_mod
 from cronstable import state_admin
 from cronstable.config import ConfigError
 from cronstable.platform import IS_WINDOWS
-from cronstable.state import _TokenBucket, RECORDS_DIR
-from tests.test_state import _backend
+from cronstable.state import RECORDS_DIR, _TokenBucket
+from tests._helpers import _backend, _write_raw_record
 
 _UTC = datetime.timezone.utc
-
-
-class ExitError(RuntimeError):
-    pass
-
-
-def _exit(num):
-    raise ExitError(num)
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # --- self-observability stats ---------------------------------------------
@@ -247,13 +233,6 @@ async def test_collect_garbage_sweeps_tmp_and_quarantine(
 # --- migrate_schema ---------------------------------------------------------
 
 
-def _write_raw_record(backend, stream, name, payload):
-    stream_dir = backend._stream_dir(stream)
-    os.makedirs(stream_dir, exist_ok=True)
-    with open(os.path.join(stream_dir, name), "wb") as fobj:
-        fobj.write(json.dumps(payload).encode())
-
-
 async def test_migrate_schema_converts_known_versions(tmp_path, monkeypatch):
     backend = _backend(tmp_path)
     await backend.start()
@@ -350,7 +329,7 @@ def _seed_store(store):
         await backend.append_record("runs/j", {"outcome": "success"})
         await backend.append_record("runs/j", {"outcome": "failure"})
 
-    _run(go())
+    asyncio.run(go())
 
 
 def _read_store(store, stream):
@@ -358,39 +337,35 @@ def _read_store(store, stream):
         backend = _backend(store)
         return await backend.list_records(stream)
 
-    return _run(go())
+    return asyncio.run(go())
 
 
-def _cli(monkeypatch, argv):
-    loop = asyncio.new_event_loop()
-    try:
-        monkeypatch.setattr(sys, "argv", ["cronstable"] + argv)
-        monkeypatch.setattr(sys, "exit", _exit)
-        with pytest.raises(ExitError) as excinfo:
-            cronstable.__main__.main_loop(loop)
-        return excinfo.value.args[0]
-    finally:
-        loop.close()
-
-
-def test_cli_check(tmp_path, monkeypatch, capsys):
+@pytest.fixture
+def seeded_store(tmp_path):
+    """The store/config/_seed_store prologue (finding B12): a store under
+    tmp_path with two runs/j records, plus a cfg.yaml naming it.  Returns
+    the (store, config) pair; tests with bespoke seeding build their own."""
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)
     _seed_store(store)
-    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    return store, config
+
+
+def test_cli_check(seeded_store, cli_runner, capsys):
+    store, config = seeded_store
+    assert cli_runner(["state", "check", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "is writable" in out
     assert "runs: 2 record(s)" in out
 
 
-def test_cli_backup_restore_roundtrip(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_cli_backup_restore_roundtrip(
+    seeded_store, tmp_path, cli_runner, capsys
+):
+    store, config = seeded_store
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "backup", "-c", config, "-o", archive],
         )
         == 0
@@ -400,7 +375,7 @@ def test_cli_backup_restore_roundtrip(tmp_path, monkeypatch, capsys):
     store2 = tmp_path / "restored"
     config2 = _write_config(tmp_path, store2, name="cfg2.yaml")
     assert (
-        _cli(monkeypatch, ["state", "restore", "-c", config2, archive]) == 0
+        cli_runner(["state", "restore", "-c", config2, archive]) == 0
     )
     recs = _read_store(store2, "runs/j")
     assert {"outcome": "success"} in recs
@@ -408,20 +383,19 @@ def test_cli_backup_restore_roundtrip(tmp_path, monkeypatch, capsys):
 
     # a second restore refuses to clobber without --force ...
     assert (
-        _cli(monkeypatch, ["state", "restore", "-c", config2, archive]) == 1
+        cli_runner(["state", "restore", "-c", config2, archive]) == 1
     )
     assert "refusing" in capsys.readouterr().err
     # ... and proceeds with it
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "restore", "-c", config2, "--force", archive],
         )
         == 0
     )
 
 
-def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, monkeypatch):
+def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, cli_runner):
     # docs/ (idempotency keys, KV, cursors, distributed-lock docs) and blobs/
     # (artifact payloads) are committed durable state: backup+restore must
     # carry them, or a restore silently loses idempotency/KV/cursor/lock state
@@ -437,17 +411,17 @@ def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, monkeypatch):
         )
         return await backend.put_blob(b"artifact-payload")
 
-    digest = _run(_seed())
+    digest = asyncio.run(_seed())
 
     archive = str(tmp_path / "backup.tar.gz")
-    assert _cli(
-        monkeypatch, ["state", "backup", "-c", config, "-o", archive]
+    assert cli_runner(
+        ["state", "backup", "-c", config, "-o", archive]
     ) == 0
 
     store2 = tmp_path / "restored"
     config2 = _write_config(tmp_path, store2, name="cfg2.yaml")
-    assert _cli(
-        monkeypatch, ["state", "restore", "-c", config2, archive]
+    assert cli_runner(
+        ["state", "restore", "-c", config2, archive]
     ) == 0
 
     async def _check():
@@ -457,7 +431,7 @@ def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, monkeypatch):
         blob = await backend.get_blob(digest)
         return doc, blob
 
-    doc, blob = _run(_check())
+    doc, blob = asyncio.run(_check())
     assert doc is not None  # the job-state document survived the round-trip
     assert blob == b"artifact-payload"  # the artifact blob survived too
 
@@ -465,20 +439,17 @@ def test_cli_backup_restore_carries_docs_and_blobs(tmp_path, monkeypatch):
 @pytest.mark.skipif(
     IS_WINDOWS, reason="POSIX file modes are not representable on Windows"
 )
-def test_cli_backup_archive_created_0600(tmp_path, monkeypatch):
+def test_cli_backup_archive_created_0600(seeded_store, tmp_path, cli_runner):
     # the archive flattens records/docs/blobs -- captured job output, KV
     # values, artifact payloads, where secrets live -- into one file: it
     # must get the store's own 0o600, not the default 0o644, including
     # when the output path already exists with wider permissions.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     archive = tmp_path / "backup.tar.gz"
     archive.write_bytes(b"stale")
     os.chmod(archive, 0o644)
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "backup", "-c", config, "-o", str(archive)],
         )
         == 0
@@ -487,7 +458,7 @@ def test_cli_backup_archive_created_0600(tmp_path, monkeypatch):
 
 
 def test_cli_restore_force_does_not_regress_lease_fences(
-    tmp_path, monkeypatch, capsys
+    tmp_path, cli_runner, capsys
 ):
     # a backup's lease files are older by definition; restoring them over
     # the store's current ones would regress the fence counters (a lease
@@ -503,12 +474,12 @@ def test_cli_restore_force_does_not_regress_lease_fences(
         await backend.append_record("runs/j", {"outcome": "success"})
         return await backend.acquire_lease("slot", "n1", ttl=30.0)
 
-    lease = _run(_seed())
+    lease = asyncio.run(_seed())
     assert lease is not None and lease.fence == 1
 
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
 
@@ -521,13 +492,12 @@ def test_cli_restore_force_does_not_regress_lease_fences(
         await backend.release_lease(current)
         return await backend.acquire_lease("slot", "n2", ttl=30.0)
 
-    bumped = _run(_bump())
+    bumped = asyncio.run(_bump())
     assert bumped is not None and bumped.fence == 2
 
     capsys.readouterr()
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "restore", "-c", config, "--force", archive],
         )
         == 0
@@ -540,7 +510,7 @@ def test_cli_restore_force_does_not_regress_lease_fences(
         await backend.start()
         return await backend.read_lease("slot")
 
-    after = _run(_after())
+    after = asyncio.run(_after())
     assert after is not None
     assert after.fence == 2  # NOT regressed to the archived fence 1
     assert after.holder == "n2"
@@ -553,7 +523,7 @@ def test_cli_restore_force_does_not_regress_lease_fences(
     store2 = tmp_path / "restored"
     config2 = _write_config(tmp_path, store2, name="cfg2.yaml")
     assert (
-        _cli(monkeypatch, ["state", "restore", "-c", config2, archive]) == 0
+        cli_runner(["state", "restore", "-c", config2, archive]) == 0
     )
 
     async def _fresh():
@@ -561,18 +531,15 @@ def test_cli_restore_force_does_not_regress_lease_fences(
         await backend.start()
         return await backend.read_lease("slot")
 
-    fresh = _run(_fresh())
+    fresh = asyncio.run(_fresh())
     assert fresh is not None and fresh.fence == 1
 
 
-def test_cli_migrate(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_cli_migrate(seeded_store, tmp_path, cli_runner, capsys):
+    store, config = seeded_store
     dest = tmp_path / "mount"
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "migrate", "-c", config, "--dest", str(dest)],
         )
         == 0
@@ -582,8 +549,7 @@ def test_cli_migrate(tmp_path, monkeypatch, capsys):
     assert len(recs) == 2
     # refusing a same-store "migration"
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "migrate", "-c", config, "--dest", str(store)],
         )
         == 1
@@ -591,24 +557,20 @@ def test_cli_migrate(tmp_path, monkeypatch, capsys):
 
 
 def test_cli_gc_defers_on_young_manifest_history(
-    tmp_path, monkeypatch, capsys
+    seeded_store, cli_runner, capsys
 ):
     # a store with no (or young) manifest history cannot prove absence:
     # the pass must defer rather than collect with zero effective grace.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     assert (
-        _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
+        cli_runner(["state", "gc", "--dry-run", "-c", config]) == 0
     )
     out = capsys.readouterr().out
     assert "gc deferred" in out
 
 
-def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_cli_gc_dry_run(seeded_store, cli_runner, capsys):
+    store, config = seeded_store
 
     # seed a manifest OLDER than the grace window so the history-depth
     # guard is satisfied (grace is the default 7 days). Manifests are
@@ -626,13 +588,15 @@ def test_cli_gc_dry_run(tmp_path, monkeypatch, capsys):
             },
         )
 
-    _run(seed_manifest())
-    assert _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
+    asyncio.run(seed_manifest())
+    assert cli_runner(["state", "gc", "--dry-run", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "gc would remove" in out
 
 
-def test_cli_gc_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
+def test_cli_gc_reclaims_only_ephemeral_leases(
+    tmp_path, monkeypatch, cli_runner
+):
     # `cronstable state gc` must pass the ephemeral-lease prefix through like
     # the daemon's pass: a dead-past-grace dagadvance/ per-run lease is
     # reclaimed while a slots/ lease of the same age survives (its fence
@@ -659,9 +623,9 @@ def test_cli_gc_reclaims_only_ephemeral_leases(tmp_path, monkeypatch):
             os.utime(path, (old, old))
         return dag_paths, slot_paths
 
-    (dag_lock, dag_lease), (slot_lock, slot_lease) = _run(seed())
+    (dag_lock, dag_lease), (slot_lock, slot_lease) = asyncio.run(seed())
     _seed_gc_manifests(store)
-    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    assert cli_runner(["state", "gc", "-c", config]) == 0
     assert not os.path.exists(dag_lease)
     assert not os.path.exists(dag_lock)
     assert os.path.exists(slot_lease)  # never touched, whatever its age
@@ -695,10 +659,12 @@ def _seed_gc_manifests(backend_coro_store):
             },
         )
 
-    _run(go())
+    asyncio.run(go())
 
 
-def test_cli_gc_reclaims_artifacts_and_blobs(tmp_path, monkeypatch, capsys):
+def test_cli_gc_reclaims_artifacts_and_blobs(
+    tmp_path, monkeypatch, cli_runner, capsys
+):
     # `cronstable state gc` must reclaim what the daemon pass reclaims: a
     # removed scope's artifact stream ages out and the orphaned payload
     # blob is swept -- with --dry-run reporting both without deleting.
@@ -725,17 +691,17 @@ def test_cli_gc_reclaims_artifacts_and_blobs(tmp_path, monkeypatch, capsys):
             os.utime(backend._blob_path(rec["sha256"]), (old, old))
         return gone, kept
 
-    gone, kept = _run(seed())
+    gone, kept = asyncio.run(seed())
     _seed_gc_manifests(store)
 
     # dry run: the stream and its blob are reported, nothing is deleted.
-    assert _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config]) == 0
+    assert cli_runner(["state", "gc", "--dry-run", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "gc would remove" in out
     assert "would remove 1 orphaned artifact blob(s)" in out
     assert len(_read_store(store, "artifacts/gone")) == 1
 
-    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    assert cli_runner(["state", "gc", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "removed 1 orphaned artifact blob(s)" in out
     assert _read_store(store, "artifacts/gone") == []
@@ -749,13 +715,13 @@ def test_cli_gc_reclaims_artifacts_and_blobs(tmp_path, monkeypatch, capsys):
             await backend.get_blob(kept["sha256"]),
         )
 
-    gone_blob, kept_blob = _run(blobs())
+    gone_blob, kept_blob = asyncio.run(blobs())
     assert gone_blob is None
     assert kept_blob == b"job-payload"
 
 
 def test_cli_gc_sweep_skipped_on_hidden_artifact_stream(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, cli_runner, capsys
 ):
     # the KEEP fail-safe end to end: a legacy truncated artifact stream
     # (no name sidecar) makes the enumeration incomplete, so the CLI must
@@ -782,9 +748,9 @@ def test_cli_gc_sweep_skipped_on_hidden_artifact_stream(
         os.unlink(os.path.join(stream_dir, state_mod._STREAM_NAME_SIDECAR))
         return rec
 
-    rec = _run(seed())
+    rec = asyncio.run(seed())
     _seed_gc_manifests(store)
-    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    assert cli_runner(["state", "gc", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "orphan-blob sweep skipped" in out
 
@@ -792,16 +758,13 @@ def test_cli_gc_sweep_skipped_on_hidden_artifact_stream(
         backend = _backend(store)
         return await backend.get_blob(rec["sha256"])
 
-    assert _run(check()) == b"hidden-payload"
+    assert asyncio.run(check()) == b"hidden-payload"
 
 
-def test_cli_migrate_schema(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_cli_migrate_schema(seeded_store, cli_runner, capsys):
+    store, config = seeded_store
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "migrate-schema", "--dry-run", "-c", config],
         )
         == 0
@@ -809,23 +772,21 @@ def test_cli_migrate_schema(tmp_path, monkeypatch, capsys):
     assert "migrate-schema would convert 0" in capsys.readouterr().out
 
 
-def test_cli_requires_state_section(tmp_path, monkeypatch, capsys):
+def test_cli_requires_state_section(tmp_path, cli_runner, capsys):
     config = _write_config(tmp_path, tmp_path / "store", state=False)
-    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 1
+    assert cli_runner(["state", "check", "-c", config]) == 1
     assert "no `state:` section" in capsys.readouterr().err
 
 
-def test_cli_state_without_action(tmp_path, monkeypatch, capsys):
-    assert _cli(monkeypatch, ["state"]) == 2
+def test_cli_state_without_action(tmp_path, cli_runner, capsys):
+    assert cli_runner(["state"]) == 2
     assert "no action" in capsys.readouterr().err
 
 
-def test_cli_root_config_position_also_works(tmp_path, monkeypatch, capsys):
+def test_cli_root_config_position_also_works(seeded_store, cli_runner, capsys):
     # `cronstable -c X state check` (root -c before the subcommand)
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
-    assert _cli(monkeypatch, ["-c", config, "state", "check"]) == 0
+    store, config = seeded_store
+    assert cli_runner(["-c", config, "state", "check"]) == 0
     assert "is writable" in capsys.readouterr().out
 
 # ===========================================================================
@@ -855,33 +816,30 @@ def _config_text(tmp_path, store, extra="", name="cfg.yaml"):
 
 
 def test_backup_without_store_reports_nothing_to_do(
-    tmp_path, monkeypatch, capsys
+    tmp_path, cli_runner, capsys
 ):
     config = _write_config(tmp_path, tmp_path / "never-created")
     archive = str(tmp_path / "b.tar.gz")
-    code = _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+    code = cli_runner(["state", "backup", "-c", config, "-o", archive])
     assert code == 1
     assert "nothing to back up" in capsys.readouterr().err
 
 
 def test_backup_into_unwritable_output_is_clean_error(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, cli_runner, capsys
 ):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     archive = str(tmp_path / "no-such-dir" / "b.tar.gz")
-    code = _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+    code = cli_runner(["state", "backup", "-c", config, "-o", archive])
     assert code == 1
     assert "cronstable state error" in capsys.readouterr().err
 
 
 def test_migrate_without_store_reports_nothing_to_do(
-    tmp_path, monkeypatch, capsys
+    tmp_path, cli_runner, capsys
 ):
     config = _write_config(tmp_path, tmp_path / "never-created")
-    code = _cli(
-        monkeypatch,
+    code = cli_runner(
         ["state", "migrate", "-c", config, "--dest", str(tmp_path / "d")],
     )
     assert code == 1
@@ -889,27 +847,24 @@ def test_migrate_without_store_reports_nothing_to_do(
 
 
 def test_migrate_refuses_populated_dest_without_force(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, cli_runner, capsys
 ):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     dest = tmp_path / "dest"
     _seed_store(dest)
-    code = _cli(
-        monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
+    code = cli_runner(
+        ["state", "migrate", "-c", config, "--dest", str(dest)]
     )
     assert code == 1
     assert "--force" in capsys.readouterr().err
 
 
-def test_migrate_with_dest_deployment_id(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_migrate_with_dest_deployment_id(
+    seeded_store, tmp_path, cli_runner, capsys
+):
+    store, config = seeded_store
     dest = tmp_path / "dest"
-    code = _cli(
-        monkeypatch,
+    code = cli_runner(
         [
             "state",
             "migrate",
@@ -924,37 +879,37 @@ def test_migrate_with_dest_deployment_id(tmp_path, monkeypatch, capsys):
     assert code == 0
 
 
-def test_migrate_blocked_destination_path(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_migrate_blocked_destination_path(
+    seeded_store, tmp_path, cli_runner, capsys
+):
+    store, config = seeded_store
     dest = tmp_path / "dest"
     dest.mkdir()
     # the deployment subtree cannot be created: a file sits in its place
     (dest / "default").write_text("not a directory")
-    code = _cli(
-        monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
+    code = cli_runner(
+        ["state", "migrate", "-c", config, "--dest", str(dest)]
     )
     assert code == 1
     err = capsys.readouterr().err
     assert "failed to copy" in err or "cronstable state error" in err
 
 
-def test_restore_blocked_destination_path(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_restore_blocked_destination_path(
+    seeded_store, tmp_path, cli_runner, capsys
+):
+    store, config = seeded_store
     archive = str(tmp_path / "b.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
     dest = tmp_path / "dest"
     (dest / "default").mkdir(parents=True)
     (dest / "default" / "records").write_text("not a directory")
     config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
-    code = _cli(
-        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    code = cli_runner(
+        ["state", "restore", "-c", config2, "--force", archive]
     )
     assert code == 1
     err = capsys.readouterr().err
@@ -966,23 +921,23 @@ def test_restore_blocked_destination_path(tmp_path, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_gc_requires_grace_window(tmp_path, monkeypatch, capsys):
+def test_gc_requires_grace_window(tmp_path, cli_runner, capsys):
     store = tmp_path / "store"
     # gcGraceSeconds: 0 disables gc entirely; a manual gc must refuse
     config = _config_text(tmp_path, store, "  gcGraceSeconds: 0\n")
     _seed_store(store)
-    code = _cli(monkeypatch, ["state", "gc", "-c", config])
+    code = cli_runner(["state", "gc", "-c", config])
     assert code == 1
     assert "gcGraceSeconds" in capsys.readouterr().err
 
 
-def test_gc_dry_run_with_dag_config(tmp_path, monkeypatch, capsys):
+def test_gc_dry_run_with_dag_config(tmp_path, cli_runner, capsys):
     store = tmp_path / "store"
     config = _config_text(
         tmp_path, store, "  gcGraceSeconds: 86400\n" + _DAG_BLOCK
     )
     _seed_store(store)
-    code = _cli(monkeypatch, ["state", "gc", "--dry-run", "-c", config])
+    code = cli_runner(["state", "gc", "--dry-run", "-c", config])
     assert code == 0
 
 
@@ -991,23 +946,21 @@ def test_gc_dry_run_with_dag_config(tmp_path, monkeypatch, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_check_empty_store_layout(tmp_path, monkeypatch, capsys):
+def test_check_empty_store_layout(tmp_path, cli_runner, capsys):
     store = tmp_path / "store"
     store.mkdir()  # exists but has no records/quarantine subtrees yet
     config = _write_config(tmp_path, store)
-    code = _cli(monkeypatch, ["state", "check", "-c", config])
+    code = cli_runner(["state", "check", "-c", config])
     assert code == 0
     assert "is writable" in capsys.readouterr().out
 
 
-def test_check_skips_stray_files_in_records(tmp_path, monkeypatch, capsys):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+def test_check_skips_stray_files_in_records(seeded_store, cli_runner, capsys):
+    store, config = seeded_store
     (store / "default" / "records" / "stray.txt").write_text(
         "not a stream dir"
     )
-    code = _cli(monkeypatch, ["state", "check", "-c", config])
+    code = cli_runner(["state", "check", "-c", config])
     assert code == 0
     assert "runs: 2 record(s)" in capsys.readouterr().out
 
@@ -1064,7 +1017,7 @@ def test_lease_fence_parsing():
 # ---------------------------------------------------------------------------
 
 
-def test_restore_over_unreadable_lease(tmp_path, monkeypatch, capsys):
+def test_restore_over_unreadable_lease(tmp_path, cli_runner, capsys):
     store = tmp_path / "store"
     config = _write_config(tmp_path, store)
 
@@ -1075,10 +1028,10 @@ def test_restore_over_unreadable_lease(tmp_path, monkeypatch, capsys):
         lease = await backend.acquire_lease("leader", "n1", ttl=3600.0)
         assert lease is not None
 
-    _run(seed())
+    asyncio.run(seed())
     archive = str(tmp_path / "b.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
     # find the lease member the backup carried and block its restore target
@@ -1093,8 +1046,8 @@ def test_restore_over_unreadable_lease(tmp_path, monkeypatch, capsys):
     config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
     target = dest / "default" / lease_members[0]
     target.mkdir(parents=True)  # a directory where the lease file would go
-    code = _cli(
-        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    code = cli_runner(
+        ["state", "restore", "-c", config2, "--force", archive]
     )
     # the current lease exists but its fence cannot be read: unprovable, so
     # the restore keeps the store's copy rather than risk a fence regression
@@ -1131,13 +1084,13 @@ def test_load_backend_rejects_non_filesystem(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_backup_skips_unreadable_files(tmp_path, monkeypatch, capsys):
+def test_backup_skips_unreadable_files(
+    seeded_store, tmp_path, monkeypatch, cli_runner, capsys
+):
     # a file that cannot be read (a prune, a Windows sharing violation) is
     # skipped by design for a backup taken against a live daemon: the archive
     # is still written, just without that member.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     archive = str(tmp_path / "backup.tar.gz")
 
     blocked = os.path.abspath(str(store))
@@ -1155,8 +1108,8 @@ def test_backup_skips_unreadable_files(tmp_path, monkeypatch, capsys):
         return real_open(file, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", fake_open)
-    code = _cli(
-        monkeypatch, ["state", "backup", "-c", config, "-o", archive]
+    code = cli_runner(
+        ["state", "backup", "-c", config, "-o", archive]
     )
     assert code == 0
     # every carried file's read raised, so all were skipped: 0 members.
@@ -1170,7 +1123,7 @@ def test_backup_skips_unreadable_files(tmp_path, monkeypatch, capsys):
 
 
 def test_restore_keeps_current_lease_when_archived_fence_older(
-    tmp_path, monkeypatch, capsys
+    tmp_path, cli_runner, capsys
 ):
     # restoring an archive's older lease over a store's current one would
     # regress the fence counter (a lease file is its fence's only home): the
@@ -1185,12 +1138,12 @@ def test_restore_keeps_current_lease_when_archived_fence_older(
         await backend.append_record("runs/j", {"outcome": "success"})
         return await backend.acquire_lease("slot", "n1", ttl=30.0)
 
-    lease = _run(seed())
+    lease = asyncio.run(seed())
     assert lease is not None and lease.fence == 1
 
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
 
@@ -1203,13 +1156,12 @@ def test_restore_keeps_current_lease_when_archived_fence_older(
         await backend.release_lease(current)
         return await backend.acquire_lease("slot", "n2", ttl=30.0)
 
-    bumped = _run(bump())
+    bumped = asyncio.run(bump())
     assert bumped is not None and bumped.fence == 2
 
     capsys.readouterr()
     assert (
-        _cli(
-            monkeypatch,
+        cli_runner(
             ["state", "restore", "-c", config, "--force", archive],
         )
         == 0
@@ -1222,24 +1174,22 @@ def test_restore_keeps_current_lease_when_archived_fence_older(
         await backend.start()
         return await backend.read_lease("slot")
 
-    after_lease = _run(after())
+    after_lease = asyncio.run(after())
     assert after_lease is not None
     assert after_lease.fence == 2  # NOT regressed to the archived fence 1
     assert after_lease.holder == "n2"
 
 
 def test_restore_reports_failure_when_target_is_a_directory(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, cli_runner, capsys
 ):
     # a restore lands every member via a temp sibling + atomic replace; if
     # the final path is blocked (a directory sits where the record must go)
     # the replace fails cleanly with a per-member message and a non-zero exit.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
 
@@ -1257,8 +1207,8 @@ def test_restore_reports_failure_when_target_is_a_directory(
     blocker = dest_base / member.name.replace("/", os.sep)
     os.makedirs(blocker)  # a directory where the restored file should land
 
-    code = _cli(
-        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    code = cli_runner(
+        ["state", "restore", "-c", config2, "--force", archive]
     )
     assert code == 1
     err = capsys.readouterr().err
@@ -1268,7 +1218,7 @@ def test_restore_reports_failure_when_target_is_a_directory(
 
 
 def test_restore_keeps_lease_whose_current_fence_is_unreadable(
-    tmp_path, monkeypatch, capsys
+    tmp_path, cli_runner, capsys
 ):
     # when the store's current lease file cannot be read (its fence is
     # unprovable), the restore cannot show the archived fence is not older,
@@ -1283,10 +1233,10 @@ def test_restore_keeps_lease_whose_current_fence_is_unreadable(
         lease = await backend.acquire_lease("leader", "n1", ttl=3600.0)
         assert lease is not None
 
-    _run(seed())
+    asyncio.run(seed())
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
 
@@ -1303,8 +1253,8 @@ def test_restore_keeps_lease_whose_current_fence_is_unreadable(
     target = dest / "default" / lease_member.replace("/", os.sep)
     os.makedirs(target)
 
-    code = _cli(
-        monkeypatch, ["state", "restore", "-c", config2, "--force", archive]
+    code = cli_runner(
+        ["state", "restore", "-c", config2, "--force", archive]
     )
     assert code == 0
     assert "kept 1 current lease file(s)" in capsys.readouterr().out
@@ -1317,14 +1267,12 @@ def test_restore_keeps_lease_whose_current_fence_is_unreadable(
 
 
 def test_migrate_reports_copy_failure_when_target_is_a_directory(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, cli_runner, capsys
 ):
     # each migrated file lands via a temp sibling + atomic rename; a blocked
     # destination path (a directory where a record must go) surfaces as a
     # per-file "failed to copy" and a non-zero exit, not a traceback.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     src_base = os.path.join(str(store), "default")
     _full, arcname = next(state_admin._walk_carried(src_base))
 
@@ -1333,8 +1281,7 @@ def test_migrate_reports_copy_failure_when_target_is_a_directory(
     blocker = dest_base / arcname.replace("/", os.sep)
     os.makedirs(blocker)  # a directory where a copied file must land
 
-    code = _cli(
-        monkeypatch,
+    code = cli_runner(
         ["state", "migrate", "-c", config, "--dest", str(dest), "--force"],
     )
     assert code == 1
@@ -1348,7 +1295,7 @@ def test_migrate_reports_copy_failure_when_target_is_a_directory(
 
 
 def test_gc_keeps_artifacts_referenced_by_live_dag_run(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, cli_runner, capsys
 ):
     # a live dag run's document names its XCom artifact scope; the gc pass
     # must add that scope to the keep set (enumerating dagrun/<dag> docs) so
@@ -1383,10 +1330,10 @@ def test_gc_keeps_artifacts_referenced_by_live_dag_run(
             os.utime(backend._blob_path(rec["sha256"]), (old, old))
         return kept, orphan
 
-    kept, orphan = _run(seed())
+    kept, orphan = asyncio.run(seed())
     _seed_gc_manifests(store)
 
-    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    assert cli_runner(["state", "gc", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "gc removed" in out
     # the dag-run reference kept the XCom scope's stream alive ...
@@ -1396,7 +1343,7 @@ def test_gc_keeps_artifacts_referenced_by_live_dag_run(
 
 
 def test_gc_skips_blob_sweep_when_artifact_record_unreadable(
-    tmp_path, monkeypatch, capsys
+    tmp_path, cli_runner, capsys
 ):
     # the orphan-blob sweep is biased to KEEP: if any artifact record cannot
     # be read (here a record stamped with a newer, unknown schema), the
@@ -1429,10 +1376,10 @@ def test_gc_skips_blob_sweep_when_artifact_record_unreadable(
                 ).encode()
             )
 
-    _run(seed())
+    asyncio.run(seed())
     _seed_gc_manifests(store)
 
-    assert _cli(monkeypatch, ["state", "gc", "-c", config]) == 0
+    assert cli_runner(["state", "gc", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "orphan-blob sweep skipped" in out
     assert "could not be read" in out
@@ -1444,11 +1391,9 @@ def test_gc_skips_blob_sweep_when_artifact_record_unreadable(
 
 
 def test_check_inventory_lists_streams_and_quarantine(
-    tmp_path, monkeypatch, capsys
+    seeded_store, cli_runner, capsys
 ):
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     base = os.path.join(str(store), "default")
     # a stray non-directory in the records root is skipped, not counted ...
     with open(os.path.join(base, RECORDS_DIR, "stray.txt"), "w") as fobj:
@@ -1459,7 +1404,7 @@ def test_check_inventory_lists_streams_and_quarantine(
     with open(os.path.join(quarantine, "poison.rec"), "wb") as fobj:
         fobj.write(b"poison")
 
-    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    assert cli_runner(["state", "check", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "is writable" in out
     assert "runs: 2 record(s)" in out
@@ -1499,24 +1444,22 @@ def test_safe_members_skips_member_when_commonpath_raises(
 
 
 def test_restore_skips_member_with_no_extractable_content(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, monkeypatch, cli_runner, capsys
 ):
     # tar.extractfile returns None for a member that carries no readable
     # stream; the restore skips it rather than crash on the missing payload.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
 
     dest = tmp_path / "restored"
     config2 = _write_config(tmp_path, dest, name="cfg2.yaml")
     monkeypatch.setattr(tarfile.TarFile, "extractfile", lambda self, m: None)
-    code = _cli(
-        monkeypatch, ["state", "restore", "-c", config2, archive]
+    code = cli_runner(
+        ["state", "restore", "-c", config2, archive]
     )
     assert code == 0
     # every member's stream was None, so all were skipped: 0 files restored.
@@ -1533,17 +1476,15 @@ def _raise_replace(src, dst):
 
 
 def test_restore_swallows_temp_cleanup_failure(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, monkeypatch, cli_runner, capsys
 ):
     # when the atomic replace fails AND removing the leftover temp file also
     # fails, the restore still surfaces the original per-member error and a
     # non-zero exit rather than letting the cleanup OSError escape.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     archive = str(tmp_path / "backup.tar.gz")
     assert (
-        _cli(monkeypatch, ["state", "backup", "-c", config, "-o", archive])
+        cli_runner(["state", "backup", "-c", config, "-o", archive])
         == 0
     )
 
@@ -1560,8 +1501,8 @@ def test_restore_swallows_temp_cleanup_failure(
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", _bad_unlink)
-    code = _cli(
-        monkeypatch, ["state", "restore", "-c", config2, archive]
+    code = cli_runner(
+        ["state", "restore", "-c", config2, archive]
     )
     assert code == 1
     assert "failed to restore" in capsys.readouterr().err
@@ -1573,14 +1514,12 @@ def test_restore_swallows_temp_cleanup_failure(
 
 
 def test_migrate_swallows_temp_cleanup_failure(
-    tmp_path, monkeypatch, capsys
+    seeded_store, tmp_path, monkeypatch, cli_runner, capsys
 ):
     # the migrate copy mirrors restore: if the atomic replace fails AND the
     # leftover temp file cannot be removed, the per-file "failed to copy"
     # error and a non-zero exit still stand, with the cleanup OSError eaten.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     dest = tmp_path / "dest"
     monkeypatch.setattr(
         state_admin.FilesystemStateBackend, "_replace", _raise_replace
@@ -1593,8 +1532,8 @@ def test_migrate_swallows_temp_cleanup_failure(
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", _bad_unlink)
-    code = _cli(
-        monkeypatch, ["state", "migrate", "-c", config, "--dest", str(dest)]
+    code = cli_runner(
+        ["state", "migrate", "-c", config, "--dest", str(dest)]
     )
     assert code == 1
     assert "failed to copy" in capsys.readouterr().err
@@ -1620,34 +1559,30 @@ def _listdir_raising_on(target):
 
 
 def test_check_records_root_unreadable_reports_zero_streams(
-    tmp_path, monkeypatch, capsys
+    seeded_store, monkeypatch, cli_runner, capsys
 ):
     # if the records root cannot be listed the inventory reports zero streams
     # rather than aborting the writable-store check.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     base = os.path.join(str(store), "default")
     records_root = os.path.join(base, RECORDS_DIR)
     monkeypatch.setattr(os, "listdir", _listdir_raising_on(records_root))
-    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    assert cli_runner(["state", "check", "-c", config]) == 0
     out = capsys.readouterr().out
     assert "is writable" in out
     assert "streams: 0 (0 record(s))" in out
 
 
 def test_check_unreadable_stream_dir_is_skipped(
-    tmp_path, monkeypatch, capsys
+    seeded_store, monkeypatch, cli_runner, capsys
 ):
     # a single stream directory that cannot be listed is skipped (its records
     # go uncounted) without failing the whole inventory.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     base = os.path.join(str(store), "default")
     stream_dir = os.path.join(base, RECORDS_DIR, "runs%2Fj")
     monkeypatch.setattr(os, "listdir", _listdir_raising_on(stream_dir))
-    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    assert cli_runner(["state", "check", "-c", config]) == 0
     out = capsys.readouterr().out
     # both streams are still enumerated; the unreadable runs stream counts as
     # zero, so only the meta stream's single record is tallied.
@@ -1656,15 +1591,13 @@ def test_check_unreadable_stream_dir_is_skipped(
 
 
 def test_check_unreadable_quarantine_reports_zero(
-    tmp_path, monkeypatch, capsys
+    seeded_store, monkeypatch, cli_runner, capsys
 ):
     # an unreadable quarantine directory tallies as zero quarantined records
     # rather than crashing the check.
-    store = tmp_path / "store"
-    config = _write_config(tmp_path, store)
-    _seed_store(store)
+    store, config = seeded_store
     base = os.path.join(str(store), "default")
     quarantine = os.path.join(base, "quarantine")
     monkeypatch.setattr(os, "listdir", _listdir_raising_on(quarantine))
-    assert _cli(monkeypatch, ["state", "check", "-c", config]) == 0
+    assert cli_runner(["state", "check", "-c", config]) == 0
     assert "quarantined: 0 record(s)" in capsys.readouterr().out

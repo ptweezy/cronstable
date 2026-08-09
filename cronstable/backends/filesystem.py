@@ -75,26 +75,32 @@ import datetime
 import logging
 import time
 import uuid
-from typing import Any, Callable, Dict, Optional, Set
+from collections.abc import Callable
+from typing import Any, Optional
 
+# The skew margin and unknown-holder sentinel are cross-backend contracts
+# shared via _common.  Here the margin is applied TWICE (the module
+# docstring's holder and challenger halves) and must stay under the
+# config-floored ttl (>= 3) so the leader window never collapses at the
+# minimum ttl.  The monotonic helper binds under this module's name, so the
+# tests' per-module monkeypatching keeps working.
+from cronstable.backends._common import (
+    _SKEW_SECONDS,
+    _UNKNOWN_HOLDER,
+    ElectionReadsBase,
+    _monotonic,
+    fence_deadline,
+)
 from cronstable.config import ClusterConfig, ConfigError, StateConfig
 
 # RebootRanUnknownError is re-exported here for compatibility: it was born in
 # this module and is documented/imported as its conservative-gate error; it
 # now lives in cronstable.leadership so the etcd backend can share the gate.
-from cronstable.leadership import LeaseBackend, RebootRanUnknownError
+from cronstable.leadership import RebootRanUnknownError
 from cronstable.platform import IS_WINDOWS
 from cronstable.state import FilesystemStateBackend, Lease
 
 logger = logging.getLogger("cronstable.backends.filesystem")
-
-# The clock budget applied TWICE (see the module docstring): the holder
-# self-demotes this early, and a challenger waits this long past the
-# observed expiry, so leadership only overlaps when inter-host skew
-# exceeds their sum.  Matches etcd's margin, and stays under the
-# config-floored ttl (3s) so the leader window never collapses at the
-# minimum ttl.
-_SKEW_SECONDS = 1.0
 
 # Kept in sync with config.py's cluster.filesystem.ttl floor (>= 3).
 _MIN_USABLE_TTL = 3
@@ -104,13 +110,6 @@ _MIN_USABLE_TTL = 3
 # refresh/append); the per-op timeout is sized off this so a whole round
 # fits its deadline even when every op is slow.
 _OPS_PER_CYCLE = 4
-
-# Reported as the holder's display name when a lease exists but its holder
-# string is empty/unparseable.  Reporting a non-None holder keeps
-# leader_name() non-None so a quorate follower defers its PreferLeader
-# jobs instead of reading "holder unknown" as "run anyway" (see
-# LeadershipBackend.is_available_leader).
-_UNKNOWN_HOLDER = "<unknown holder>"
 
 # Stream (inside the embedded store) holding the @reboot-ran records, and
 # the newest-N bound both the reader and the pruner use.
@@ -132,25 +131,6 @@ _REBOOT_RAN_KEEP = 512
 # store (see _maintain_reboot_ran).  The same period also rate-limits
 # the leader's "deferring one-shots" WARNING.
 _REBOOT_RAN_REFRESH = 60.0
-
-
-def _utcnow() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
-
-
-def _monotonic() -> float:
-    """A monotonic clock for lease/quorum *deadlines*.
-
-    Lease fences must never be judged on the wall clock: a backward NTP/VM
-    step would keep ``is_leader`` true past the lease's real expiry (a
-    second node has by then taken it over); a forward step would expire
-    quorum early.  ``time.monotonic`` cannot jump, so deadlines anchored
-    to it stay correct across any wall-clock correction.  The wall clock
-    is used only for the human-readable expiry in the dashboard and for
-    the challenger-side takeover margin (which is exactly the cross-host
-    comparison the margins exist to bound).
-    """
-    return time.monotonic()
 
 
 def _wallclock() -> float:
@@ -179,7 +159,7 @@ def display_name(holder: Optional[str]) -> Optional[str]:
     return name or _UNKNOWN_HOLDER
 
 
-class FilesystemBackend(LeaseBackend):
+class FilesystemBackend(ElectionReadsBase):
     """Leader election through a TTL lease on a shared POSIX mount."""
 
     backend_name = "filesystem"
@@ -251,7 +231,7 @@ class FilesystemBackend(LeaseBackend):
         # completed _refresh_reboot_ran; cleared synchronously (no await
         # in between) where leadership is gained in _renew_once.
         self._reboot_ran_synced = False
-        self._reboot_persisted: Set[str] = set()
+        self._reboot_persisted: set[str] = set()
         self._reboot_persisted_job_set_id: Optional[str] = None
 
         self._task: Optional[asyncio.Task] = None
@@ -306,17 +286,6 @@ class FilesystemBackend(LeaseBackend):
         # cannot keep us "leader" past the real lease expiry.
         return _monotonic() < self._lease_deadline_mono
 
-    def _is_self_demoted_holder(self) -> bool:
-        # raw win flag still set (we acquired and have not observed another
-        # holder) but the monotonic fence lapsed or a renew was refused --
-        # the brief self-demotion window. See the LeadershipBackend base.
-        return self._is_leader and not self.is_leader()
-
-    def leader_name(self) -> Optional[str]:
-        if not self.is_quorate():
-            return None
-        return self._holder
-
     def is_quorate(self) -> bool:
         if self._quorum_deadline_mono is None:
             return False
@@ -324,7 +293,7 @@ class FilesystemBackend(LeaseBackend):
         # only a successful round may extend it.
         return _monotonic() < self._quorum_deadline_mono
 
-    def lease_detail(self) -> Dict[str, Any]:
+    def lease_detail(self) -> dict[str, Any]:
         return {
             "path": self._store.root,
             "electionName": self.election_name,
@@ -368,7 +337,7 @@ class FilesystemBackend(LeaseBackend):
         self._observed_fence = fence
         if is_leader:
             fence_anchor = lease_mono if lease_mono is not None else mono
-            self._lease_deadline_mono = fence_anchor + self.ttl - _SKEW_SECONDS
+            self._lease_deadline_mono = fence_deadline(fence_anchor, self.ttl)
         else:
             self._lease_deadline_mono = None
             self._lease = None
@@ -796,7 +765,7 @@ class FilesystemBackend(LeaseBackend):
         self._reboot_refresh_next = _monotonic() + _REBOOT_RAN_REFRESH
         self._reboot_warn_next = 0.0
 
-    def _note_persisted(self, job_set_id: str, jobs: Set[str]) -> None:
+    def _note_persisted(self, job_set_id: str, jobs: set[str]) -> None:
         if self._reboot_persisted_job_set_id != job_set_id:
             self._reboot_persisted = set()
             self._reboot_persisted_job_set_id = job_set_id

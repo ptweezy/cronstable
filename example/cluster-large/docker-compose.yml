@@ -8,7 +8,7 @@
 #
 # Ten nodes (cronstable-a .. cronstable-j) are deployed from one identical job set
 # (example/cluster-large/jobs.yaml, 14 jobs, six CPU-heavy). Each node's cluster
-# config is generated at start by example/cluster-large/node-entrypoint.sh from
+# config is generated at start by example/_shared/node-entrypoint.sh from
 # environment variables, so the compose file needs no per-node peer lists: every
 # node shares one CLUSTER_HOSTS list and drops itself by NODE_NAME.
 #
@@ -64,7 +64,7 @@ x-node: &node
       condition: service_completed_successfully
   volumes:
     - ./jobs.yaml:/config/jobs.yaml:ro
-    - ./node-entrypoint.sh:/node-entrypoint.sh:ro
+    - ../_shared/node-entrypoint.sh:/node-entrypoint.sh:ro
     - cluster-large-certs:/certs:ro
 
 services:
@@ -76,9 +76,13 @@ services:
   certgen:
     image: alpine:3.20
     command: ["sh", "/gen-certs.sh"]
+    environment:
+      NODES: "cronstable-a cronstable-b cronstable-c cronstable-d cronstable-e
+        cronstable-f cronstable-g cronstable-h cronstable-i cronstable-j"
+      PROJECT: example/cluster-large
     volumes:
       - cluster-large-certs:/certs
-      - ./gen-certs.sh:/gen-certs.sh:ro
+      - ../_shared/gen-certs.sh:/gen-certs.sh:ro
 
   cronstable-a: { <<: *node, hostname: cronstable-a, ports: ["8080:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-a } }
   cronstable-b: { <<: *node, hostname: cronstable-b, ports: ["8081:8080"], environment: { <<: *node-env, NODE_NAME: cronstable-b } }

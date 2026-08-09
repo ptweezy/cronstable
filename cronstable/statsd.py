@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 import weakref
-from typing import Any, Dict, Tuple
+from typing import Any
 
 logger = logging.getLogger("statsd")
 
@@ -72,7 +72,7 @@ class StatsdClientProtocol(asyncio.DatagramProtocol):
 #: so concurrent emits to a cold target share a single
 #: create_datagram_endpoint instead of racing to open several sockets and
 #: leaking all but the last.
-_ENDPOINTS: "weakref.WeakKeyDictionary[Any, Dict[Tuple[str, int], Any]]" = (
+_ENDPOINTS: "weakref.WeakKeyDictionary[Any, dict[tuple[str, int], Any]]" = (
     weakref.WeakKeyDictionary()
 )
 
@@ -133,9 +133,20 @@ async def _endpoint(host, port, message):
     except BaseException:
         # A failed open (unresolvable host, no route) must not be cached,
         # or every later emit would replay the same failure without ever
-        # retrying.
-        if endpoints.get(key) is task:
-            del endpoints[key]
+        # retrying. A waiter CANCELLED while the open is still in flight
+        # is not a failed open: the shield keeps that task running, so
+        # evicting on its behalf would drop a live transport out of the
+        # pool with nothing left holding it to close. (RunningJob._on_stop
+        # joins the spawned job_started emission on a bound, so a slow
+        # open really does get cancelled here.) Evict only what has
+        # actually finished badly, by the same rule the pool hit above
+        # uses.
+        if (
+            endpoints.get(key) is task
+            and task.done()
+            and _unusable(task, loop.time())
+        ):
+            _discard(endpoints, key, task)
         raise
     return transport, mine
 

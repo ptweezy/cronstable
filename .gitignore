@@ -66,8 +66,17 @@ target/
 /pyoxidizer/venv/
 /cronstable/version.py
 
-# Local-only changelog tooling
+# Local-only changelog tooling (build_demo.py is tracked: the demo mirror
+# test regenerates docs/demo/index.html through it)
 /scripts/*
+!/scripts/build_demo.py
+
+# Local working ledgers for the 2026-08 code-reduction program. Never
+# commit these: MANIFEST.in is opt-out, so a tracked root .md ships in
+# the sdist (they were committed once by accident and history-rewritten
+# back out).
+/reduction-findings.md
+/reduction-handoff.md
 
 # Screenshot-pipeline scratch output: raw captures land here for review before
 # the keepers are copied over docs/img/ (the tracked, published set)
@@ -89,5 +98,5 @@ target/
 !/.claude/settings.json
 
 # CI-only: the QEMU binary jobs persist pip's cache here via actions/cache
-# (see binaries-musl in .github/workflows/release.yml); never tracked.
+# (see binaries-container in .github/workflows/release.yml); never tracked.
 /.pip-cache/

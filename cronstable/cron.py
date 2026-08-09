@@ -1,9 +1,6 @@
-# PEP 563 string annotations, so that the ~100 `web.Request` / `web.Response`
-# signatures below never evaluate at def time. That is what lets aiohttp stay
-# out of this module's import graph (see the _AiohttpDoor block after the
-# imports); without it, importing cronstable.cron would resolve every one of
-# those names and pull the web stack straight back in. Nothing here inspects
-# annotations at runtime, so making them strings costs nothing.
+# PEP 563 string annotations: the many `web.Request` / `web.Response`
+# signatures below must never evaluate at def time, or importing this module
+# would pull in aiohttp (see the _AiohttpDoor block after the imports).
 from __future__ import annotations
 
 import asyncio
@@ -24,7 +21,7 @@ import ssl
 import zlib
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
-from functools import lru_cache, partial
+from functools import lru_cache, partial, wraps
 from typing import (  # noqa
     TYPE_CHECKING,
     Any,
@@ -179,347 +176,177 @@ if not TYPE_CHECKING:
 
 logger = logging.getLogger("cronstable")
 WAKEUP_INTERVAL = datetime.timedelta(minutes=1)
-# Floor applied to a SUBSYSTEM's wake hint before it shortens the main loop's
-# sleep (see Cron._sleep_interval). A near-zero hint is not "wake now" but
-# "there is work whose completion I cannot predict", and without a floor the
-# loop would sleep zero seconds and re-run the entire housekeeping block
-# (config stat fingerprint, cluster/web/state/push upkeep, the SLA walk, a
-# store-read refresh) tens of thousands of times a second for as long as that
-# work takes. This is the generic backstop of last resort for EVERY
-# subsystem, and it is what protects the window between a subsystem deciding
-# to spawn such a pass and that pass actually starting. A subsystem that can
-# name its own settling time parks that instead: DagScheduler no longer parks
-# 0.0 anywhere, it parks now + dagrun.ADVANCE_POLL_FLOOR (0.2 s) and floors
-# in-flight refs to the same value. The two compose: the specific floor
-# where the subsystem knows better, this one everywhere else. Flooring costs
-# at most this much extra latency on a sub-minute DAG poke, and only the fire
-# path (a real due instant, not a hint) may drive the sleep below it.
+# Floor on subsystem wake hints (Cron._sleep_interval); only a real due
+# fire may drive the sleep below this, so near-zero hints cannot busy-spin.
 MIN_TICK_SLEEP = 0.02
-# The furthest back the scheduler will retroactively service a job after a slow
-# pass or a forward clock jump (see Cron._advance): if a job's soonest missed
-# fire is no more than this behind, every missed occurrence in the window is
-# replayed so a frequently-scheduled job is not silently dropped by tick
-# overhead (a long config reload, many simultaneous launches); a larger gap is
-# a stall/suspend/clock jump, which we resume past by firing only the most
-# recent occurrence, matching cron's no-catch-up-after-an-outage behaviour,
-# so a long freeze cannot unleash a burst of backdated launches.
+# Max lateness replayed after a slow pass or clock jump (Cron._advance);
+# past it only the newest occurrence fires, so a freeze cannot burst-launch.
 CATCHUP_LIMIT = datetime.timedelta(seconds=10)
-# Hard cap on how many missed occurrences a single job replays on restart under
-# onMissed: run-all, so a long outage (or a per-second job) cannot stampede
-# or spin the loop enumerating occurrences. The newest bound-fitting window is
-# preferred via startingDeadlineSeconds; this is the backstop when no deadline
-# is set. Coalescing (run-once) is always exactly one launch regardless.
+# Cap on onMissed: run-all replays per job when no startingDeadlineSeconds
+# bounds the window; run-once always launches exactly once.
 MAX_CATCHUP_OCCURRENCES = 100
-# How many finished runs to retain per job for the web UI's history/stats view.
-# In-memory only (like the rest of the run record), and bounded so a frequently
-# scheduled job cannot grow memory without limit.
+# Finished runs retained per job, in memory only (web UI history/stats).
 RUN_HISTORY_LIMIT = 50
 
-#: Concurrent per-job store reads in the boot warm-up
-#: (:meth:`Cron._rehydrate_from_state` and its retry re-arm scan).  The
-#: warm-up used to read every job's streams strictly one at a time, so boot
-#: paid jobs x per-read latency before the first scheduling pass: seconds
-#: on local disk at fleet scale, minutes on a network mount, none of it
-#: needed for scheduling correctness (the dashboard fills in as jobs run).
-#: Matched to the filesystem store's bulk worker lane (16 slots), where
-#: more in-flight reads would only queue; a hung mount now costs about one
-#: STATE_OP_TIMEOUT of boot delay instead of one per job.
+#: Boot warm-up read parallelism; matches the filesystem store's 16-slot
+#: bulk lane and bounds a hung mount to ~one STATE_OP_TIMEOUT of boot delay.
 _REHYDRATE_CONCURRENCY = 16
 
-#: Subprocess spawns allowed to execute at once when a slot launches many
-#: jobs together (see the ``_spawn_gate`` acquire around
-#: ``RunningJob.start()``).  A spawn's fork/exec and pipe-transport setup
-#: are synchronous work ON the event loop; gathering N due jobs queues all
-#: N spawn steps into one ready-queue burst, so at 500 same-slot jobs the
-#: loop ran ~0.25-1s of contiguous spawn syscalls each minute boundary
-#: while web requests, SSE writes and gossip waited (and a loaded box
-#: could trip the CATCHUP_LIMIT resume path).  The gate does not slow the
-#: burst down (the syscalls were always loop-serial); it caps how much of
-#: it runs per loop iteration so other ready callbacks interleave.  Held
-#: only across ``start()`` itself, never across a launch's slot claims or
-#: a Replace teardown, which can legally take seconds.
+#: Cap on same-slot subprocess spawns per loop pass (spawn work is
+#: synchronous on the loop). Held only across RunningJob.start() itself.
 _SPAWN_BURST_LIMIT = 16
-# First page size the onlyIfLastSucceeded gate reads from the durable run
-# ledger (see _depends_on_past_ok). The gate needs only the newest success/
-# failure record, so it probes this many newest records and widens to the
-# full RUN_HISTORY_LIMIT window only when the whole probe page is non-run
-# outcomes (cancelled/skipped): the common path reads a few records
-# instead of 50 and the skip window stays the same.
+# First ledger page _depends_on_past_ok reads; widens to RUN_HISTORY_LIMIT
+# only when the whole probe page is non-run outcomes.
 DEPENDS_GATE_PROBE = 8
-# How many compact run summaries to embed per job in the /jobs payload: enough
-# for the dashboard's inline sparkline without shipping the full detailed
-# history on every poll. The full history is available from /jobs/{name}/runs.
+# Run summaries inlined per job in /jobs; full history at /jobs/{name}/runs.
 JOBS_INLINE_HISTORY = 20
-# Prefix under which a job's finished-run records live in the durable state
-# store (cronstable.state), one stream per job. Scoped by
-# JOB NAME (stable across
-# config edits) rather than job-set id, so restart-durable history survives an
-# ordinary reload instead of being orphaned every time the config changes.
+# Durable finished-run ledger, one stream per job, scoped by JOB NAME so
+# history survives an ordinary config reload.
 RUN_STREAM_PREFIX = "runs/"
-# Prefix for a job's archived captured output (opt-in archiveOutput), one
-# stream per job, pruned to the same maxRunsPerJob bound as the run ledger.
+# Archived captured output (opt-in archiveOutput), pruned to maxRunsPerJob.
 LOG_STREAM_PREFIX = "logs/"
-# Prefix for a job's catch-up checkpoint stream: an "open" intent is recorded
-# before a backfill is scheduled and a "close" after it completes, so a
-# restart mid-backfill (or mid-jitter) resumes from the intent's watermark
-# instead of silently forfeiting the owed runs; the run ledger's derived
-# watermark alone cannot tell a backfilled slot from an ordinary run that
-# advanced it past the still-missing slots.  At-least-once: a crash between
-# the last launch and the close record replays; that is the documented trade.
+# Catch-up checkpoints: "open" intent before a backfill, "close" after, so a
+# restart resumes from the intent's watermark. At-least-once by design.
 CATCHUP_STREAM_PREFIX = "catchup/"
-# How many checkpoint records to retain per job (each cycle writes two).
+# Checkpoint records retained per job (each cycle writes two).
 CATCHUP_STREAM_KEEP = 8
-# Upper bound on any single awaited state-store READ issued from scheduling
-# paths (the depends-on-past gate, the catch-up watermark, rehydration).  A
-# hung mount (dead NFS server) must degrade the stateful features, never
-# stall job scheduling: past the timeout the read is abandoned (its daemon
-# worker thread is left to the OS) and the caller falls back.
+# Cap on awaited state READS from scheduling paths: a hung mount degrades
+# stateful features, never stalls scheduling.
 STATE_OP_TIMEOUT = 10.0
-# Backstop cap on the tracked fire-and-forget durable-write set. Each write is
-# individually bounded by STATE_OP_TIMEOUT (see _track_state_write callers), so
-# a wedged mount already drains the backlog at rate x timeout instead of
-# forever; this cap is the second line of defence for a pathological write rate
-# against a slow store, shedding new best-effort writes rather than letting the
-# set (and its buffered records) grow without bound -> OOM. Sized well above
-# any plausible healthy burst (a whole fleet firing in one slot drains in ms on
-# a live backend), so it only trips when writes are genuinely not completing.
+# Cap on the tracked fire-and-forget write set; sheds new best-effort
+# writes against a wedged store instead of growing without bound.
 MAX_PENDING_STATE_WRITES = 8192
-# How long to wait before re-evaluating catch-up when it could not resolve on
-# a pass: the state backend had not (re)started yet, or the cluster had not
-# converged on an owner.  Keeps the retry off the per-second hot path.
+# Retry cadence when catch-up could not resolve (backend/cluster not ready).
 CATCHUP_RECHECK_INTERVAL = 30.0
-# Longest a backfill launch waits for a non-Forbid job to go idle between
-# its serialized launches.  For Allow/Replace the wait is anti-stampede
-# pacing, not correctness, so it must not starve forever when the job's
-# scheduled instances always overlap; Forbid waits unbounded (launching
-# would be swallowed).
+# Idle wait between serialized backfill launches (pacing, not correctness);
+# Forbid waits unbounded because launching would be swallowed.
 CATCHUP_IDLE_WAIT_LIMIT = 30.0
-# Floor (seconds) for the gate re-check interval of a deferred fail-closed
-# retry: the cluster gate can stay closed for a while, and a job configured
-# with a tiny/zero backoff delay must not hot-loop the scheduler (and spam the
-# log) while it waits. See schedule_retry_job.
+# Gate re-check floor so a tiny backoff cannot hot-loop on a closed cluster
+# gate. See schedule_retry_job.
 RETRY_GATE_RECHECK_FLOOR = 1.0
-# Prefix for a job's durable retry-ladder stream: a "pending" record (with an
-# ABSOLUTE notBefore deadline and the job's per-job config digest) is written
-# when a retry is armed, and a "settled" record when the ladder resolves
-# (launched / succeeded / superseded / exhausted / ...). Newest record wins:
-# a boot that finds a "pending" on top re-arms the retry with only the
-# remaining delay (see _rehydrate_retries). Job-name scoped like the run
-# ledger; the digest inside the record is what invalidates on config change.
+# Durable retry-ladder stream, newest record wins: "pending" (ABSOLUTE
+# notBefore + config digest) re-arms at boot, "settled" resolves it.
 RETRY_STREAM_PREFIX = "retries/"
-# How many retry-ladder records to retain per job (each ladder writes a
-# handful; only the newest is ever read back).
+# Ladder records retained per job (only the newest is ever read back).
 RETRY_STREAM_KEEP = 8
-# Prefix for a job's @reboot boot-marker stream (standalone dedupe): a marker
-# records which HOST ran the job during which OS BOOT (boot_id / derived boot
-# time) for which job definition (digest). A daemon restart within the same
-# boot skips the re-run; a genuine reboot, a redefined job, or an unreadable
-# marker runs it (at-least-once, today's behaviour). Host-scoped inside the
-# records so several standalone daemons may share one store.
+# @reboot dedupe markers (host + boot + job digest); a redefined job or
+# unreadable marker re-runs (at-least-once).
 REBOOT_STREAM_PREFIX = "reboot/"
-# Markers retained per job: bounds the stream while keeping enough history
-# for a modest number of hosts sharing one store standalone.
+# Markers retained per job; several standalone hosts may share one store.
 REBOOT_STREAM_KEEP = 32
-# Wall-clock slack when comparing DERIVED boot times (now - uptime): the
-# derivation rides the current wall clock, so an NTP step shifts it. Two real
-# boots are further apart than this in practice; where an exact boot_id
-# exists (Linux) it is used instead and this never applies.
+# Slack comparing DERIVED boot times (now - uptime) across NTP steps; an
+# exact boot_id (Linux) is used instead where available.
 BOOT_TIME_TOLERANCE = 60.0
-# Prefix for the per-HOST job manifest streams: each node periodically
-# records the job names its loaded config defines to its OWN stream
-# (``manifests/<host>``), mirroring COUNTER_STREAM_PREFIX. The union of
-# RECENT manifests (every host's stream, same deploymentId) is what anchors
-# cross-jobset garbage collection: a job stream is garbage only when nobody
-# has claimed its name for state.gcGraceSeconds. Per-host (rather than one
-# stream shared and count-pruned across the whole fleet) so the retained
-# history a node can prove absence over never shrinks as the fleet grows:
-# a single shared stream's count-based prune was reached by write VOLUME
-# (nodes x writes/day), so past a fleet-size threshold the retained span fell
-# under gcGraceSeconds and GC deferred forever, growing every removed job's
-# streams without bound.
+# Per-HOST job manifests anchoring cross-jobset GC. MUST stay per-host: a
+# shared count-pruned stream's span shrinks as the fleet grows, eventually
+# falling under gcGraceSeconds and deferring GC forever.
 MANIFEST_STREAM_PREFIX = "manifests/"
-# Manifest records retained per HOST (count-pruned; independent of fleet
-# size). At 4 manifests/node/day, 512 records span ~128 days for any single
-# host, comfortably outliving any realistic gcGraceSeconds regardless of how
-# many other nodes share the store. (The GC pass additionally refuses to run
-# until the retained history (across every host's stream) provably
-# covers one full grace window.) A host that stops writing (scaled down,
-# renamed) leaves its manifest stream at whatever size it last reached; that
-# stream is then swept by the normal collect_garbage prefix/keep-set path
-# once it ages past grace, exactly like an abandoned counters/<host> stream.
+# Per-host retention; GC also refuses to run until retained history
+# provably covers one full grace window.
 MANIFEST_STREAM_KEEP = 512
-# Safety cap on distinct per-host manifest streams read in one GC pass (a
-# pathological fleet with churning, never-reused host identities could in
-# principle accumulate more members than is worth reading every pass); a
-# real deployment is nowhere near this. Truncation is logged, never silent.
+# Cap on per-host manifest streams read per GC pass; truncation is logged.
 MANIFEST_HOSTS_CAP = 2000
-# How often each node re-records its manifest (also written on every backend
-# start), and how often the GC pass runs. Loop-clock gated, per process.
+# Manifest re-record and GC cadences. Loop-clock gated, per process.
 STATE_MANIFEST_INTERVAL = 21600.0
 STATE_GC_INTERVAL = 86400.0
-# How often the two per-housekeeping store sweeps (the paused/ stream refresh
-# and the foreign-retry-ladder claim scan) may actually hit the store. Both
-# are single-flight on their task handle, but single-flight alone only stops
-# them OVERLAPPING: each re-spawns the instant the previous one completes, so
-# an extra housekeeping pass (a DAG wake, an early wake) turns them into a
-# store-read storm rather than the once-a-minute cadence their docstrings
-# promise. Loop-clock gated, per process, exactly like the manifest and GC
-# intervals above; a fresh backend generation re-anchors both to zero. Just
-# under a minute so a housekeeping pass landing a hair early still sweeps,
-# instead of deferring to the pass after and halving the cadence.
+# Store-hit cadence for the paused/ refresh and foreign-retry claim scans
+# (single-flight only stops overlap). Just under a minute so a pass landing
+# a hair early still sweeps instead of halving the cadence.
 PAUSE_REFRESH_INTERVAL = 55.0
 RETRY_CLAIM_INTERVAL = 55.0
-# Upper bound on one GC pass. Generous (a huge store sweeps many files on a
-# worker thread), but finite: an unbounded await on a wedged mount would
-# leave the single-flight _gc_task pending forever and silently disable
-# automatic GC for the life of the process.
+# Bound on one GC pass so a wedged mount cannot leave the single-flight
+# _gc_task pending and silently disable GC for the process.
 STATE_GC_TIMEOUT = 600.0
-# Prefix for the per-HOST durable Prometheus counter snapshots (host-scoped:
-# counters are per-process truth, and the host name is the stable identity a
-# restart can reclaim, unlike the backend's per-process instance id).
+# Durable Prometheus counter snapshots, host-scoped (a restart reclaims the
+# host name, unlike the backend's per-process instance id).
 COUNTER_STREAM_PREFIX = "counters/"
 COUNTER_STREAM_KEEP = 4
-# Minimum seconds between durable counter snapshots. Snapshots piggyback on
-# the per-run persist task, so without a floor a per-second job would double
-# every durable write for a low-value gain; the tail is flushed at shutdown.
+# Floor between counter snapshots (they ride the per-run persist task); the
+# tail is flushed at shutdown.
 COUNTER_SNAPSHOT_INTERVAL = 15.0
-# Prefix for a job's in-flight run stream (newest-wins, like retries/): an
-# "open" record lands when a job's FIRST live instance starts and a "closed"
-# record when its LAST one finishes, so a crash leaves "open" on top and the
-# next rehydration (same host) or slot takeover (another node) can make the
-# interrupted run visible instead of it silently vanishing from the ledger.
-# Written only when a state backend is configured.
+# In-flight run stream, newest wins: "open" at first live instance, "closed"
+# at last; a crash leaves "open" so takeover surfaces the interrupted run.
 INFLIGHT_STREAM_PREFIX = "inflight/"
 INFLIGHT_STREAM_KEEP = 8
-# Prefix for a job's concurrency-slot signalling stream (cancel requests for
-# cluster-scoped Replace); the slot LEASE shares the same "slots/<name>"
-# name in the lease namespace. See maybe_launch_job/_claim_cluster_slot.
+# Slot-signalling stream (cluster-scoped Replace cancels); the slot LEASE
+# shares the same "slots/<name>" name in the lease namespace.
 SLOT_STREAM_PREFIX = "slots/"
 SLOT_STREAM_KEEP = 8
-# Lease-name prefix serializing cross-node retry claims (and the claiming
-# side of the consume path) for one job; TTL bounds a crashed claimer.
+# Lease serializing cross-node retry claims; TTL bounds a crashed claimer.
 RETRY_CLAIM_PREFIX = "retry-claim/"
 RETRY_CLAIM_TTL = 30.0
-# How stale (seconds past due) a foreign host's pending retry must be before
-# the claim scan may take it over. This only covers a live owner whose fire
-# is slightly late (slow loop, small clock skew); it CANNOT cover an owner
-# deferring on a closed cluster gate, whose re-check cadence is its own
-# ladder delay; the consume-time newest-record re-check under the claim
-# lease is what prevents a double-fire there, and is load-bearing.
+# Staleness before a foreign pending retry may be claimed; covers a live
+# owner firing late only. The consume-time newest-record re-check under the
+# claim lease is what prevents a double-fire, and is load-bearing.
 RETRY_CLAIM_GRACE = 30.0
-# Runtime pause/resume (POST /jobs/{name}/pause): how long a pause lasts
-# when the caller gives neither a duration nor an explicit until, the hard
-# ceiling on any pause window (30 days; a longer stop is a config edit,
-# not a runtime toggle), and the accepted sizes of the free-text audit
-# fields riding the pause record.
+# Runtime pause defaults, hard ceiling (30 days), and audit-field caps.
 PAUSE_DEFAULT_SECONDS = 3600
 PAUSE_MAX_SECONDS = 2592000
 PAUSE_NOTE_MAX = 500
 PAUSE_BY_MAX = 100
-# Prefix for a job's durable pause stream (newest record wins, like
-# retries/): a "paused" record carries an ABSOLUTE `until` deadline and is
-# superseded by a "resumed" record. Expiry is reader-enforced (nothing in
-# the store expires records; see _pause_active). The record's `host` is
-# audit info ONLY: unlike retry records, a pause is honored by every node
-# sharing the store.
+# Durable pause stream, newest wins; expiry is reader-enforced (see
+# _pause_active) and every node sharing the store honors a pause.
 PAUSE_STREAM_PREFIX = "paused/"
 PAUSE_STREAM_KEEP = 8
-# The per-job SLA check labels: the sla config keys minus their "Seconds"
-# suffix. One vocabulary everywhere a check is named: the (job, check)
-# breach latch, the cronstable_job_late/cronstable_job_sla_breaches metric
-# label, the "sla" payload's "check" field and the onLate {{sla_check}}
-# template variable.
+# SLA check labels (the sla config keys minus "Seconds"): one vocabulary for
+# the breach latch, metric labels, payload "check" field and {{sla_check}}.
 SLA_CHECK_STALE = "maxTimeSinceSuccess"
 SLA_CHECK_LATE = "lateAfter"
 SLA_CHECK_RUNTIME = "maxRuntime"
-# The complete, fixed set of check names any SLA surface can produce (the
-# only second-half values ever keyed into _sla_state).  Because it is a
-# bounded 3-tuple, the per-job latch bookkeeping walks THESE three names
-# rather than scanning the whole (name, check) latch map for a matching
-# name half, so a widespread breach across many jobs stays O(jobs), not
-# O(jobs x total-latches).
+# The only check names ever keyed into _sla_state; latch bookkeeping walks
+# these three, keeping a widespread breach O(jobs).
 SLA_CHECKS = (SLA_CHECK_STALE, SLA_CHECK_LATE, SLA_CHECK_RUNTIME)
-# How deep the boot rehydrate re-reads a job's run ledger when the warmed
-# RUN_HISTORY_LIMIT window holds no success at all. Only jobs configuring
-# maxTimeSinceSuccess pay for it, and only when they are failing more often
-# than the warm window is wide (see _warm_last_success_beyond_history).
+# Boot ledger re-read depth when the warm window holds no success at all
+# (maxTimeSinceSuccess jobs only).
 SLA_SUCCESS_SCAN_LIMIT = 1000
-# How many finished pause windows are kept per job for the maxTimeSinceSuccess
-# pause credit. Windows the staleness reference has already overtaken are
-# dropped first, so reaching this cap needs that many pauses with no success
-# in between; the oldest is then dropped, understating the credit rather than
-# overstating it (see _sla_bank_pause).
+# Pause windows kept per job for the staleness credit; overflow drops the
+# oldest, understating the credit rather than overstating it.
 SLA_PAUSE_SPANS_MAX = 64
-# Aggregation windows served by GET /jobs/{name}/trends over the durable
-# ledger (label, seconds). Bounded by state.maxRunsPerJob retention.
-TREND_WINDOWS: Tuple[Tuple[str, float], ...] = (
+# Aggregation windows for GET /jobs/{name}/trends (label, seconds).
+TREND_WINDOWS: tuple[tuple[str, float], ...] = (
     ("1h", 3600.0),
     ("24h", 86400.0),
     ("7d", 604800.0),
     ("30d", 2592000.0),
 )
-# Newest records the trends endpoint reads per request: with unbounded
-# retention (maxRunsPerJob <= 0) an uncapped listing could hold a backend
-# worker slot for the whole scan on every dashboard poll.
+# Newest ledger records read per trends request (bounds unbounded-retention
+# scans on every dashboard poll).
 TREND_SCAN_LIMIT = 5000
-# How long a built trends payload is served without re-reading the ledger.
-# A trends drawer polls every few seconds and several clients can watch the
-# same job; this collapses those to one TREND_SCAN_LIMIT-record read per
-# job per window.  Kept short so the age-relative windows barely drift, and
-# a locally finished run busts the cache outright (see _record_run), so the
-# TTL only bounds ledger writes this node did not make (other cluster
-# nodes' runs), exactly the (record_count, newest_finished_at) change a
-# poll would otherwise re-read the whole ledger to notice.
+# Trends payload TTL; a locally finished run busts the cache, so this only
+# bounds re-reads of other cluster nodes' ledger writes.
 JOB_TRENDS_CACHE_TTL = 5.0
-# requests served without bearer-token auth even when authToken is configured.
-# Only the UI page itself (which carries no data and no secrets) is public; the
-# browser then authenticates every data request with the token the user enters.
+# Served without bearer auth: only the UI page, which carries no secrets.
 WEB_PUBLIC_PATHS = frozenset({"/"})
 
-# HTTP methods the cross-site Origin gate waves through: none of the web API's
-# reads mutate anything, and the browser's same-origin policy already keeps a
-# foreign page from READING their responses (no CORS headers are set unless
-# the operator adds them). Everything else (the POST control endpoints) is a
-# state change and gets the Origin check. OPTIONS passes so the /mcp CORS
-# preflight handler keeps answering for its own allow-list.
+# Methods the cross-site Origin gate waves through (reads mutate nothing);
+# OPTIONS passes so the /mcp CORS preflight keeps answering.
 WEB_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
-# Paths that enforce their OWN Origin allow-list and are therefore exempt from
-# the app-wide gate: /mcp validates Origin against mcp.allowedOrigins and
-# answers CORS preflight itself (see cronstable.mcp.MCPHandler.handle_http);
-# gating it here too would 403 a browser MCP client the operator explicitly
-# allow-listed there.
+# Paths enforcing their OWN Origin allow-list (/mcp validates against
+# mcp.allowedOrigins); gating here too would 403 an allow-listed client.
 WEB_ORIGIN_EXEMPT_PATHS = frozenset({"/mcp"})
 
-# The full set of web scopes: what the scalar web.authToken (and any scoped
-# token that lists every scope) grants. `control` and `approve` each imply
+# What the scalar web.authToken grants; `control` and `approve` imply
 # `view`, expanded by _effective_web_scopes at token-resolution time.
 _WEB_ALL_SCOPES = frozenset(WEB_TOKEN_SCOPES)
 
-# Routes whose required scope differs from the method default (a safe method ->
-# `view`, everything else -> `control`). Keyed by the matched aiohttp
-# resource's canonical path. Anything not listed uses the method default, so a
-# newly added POST route requires `control` automatically instead of slipping
-# through unguarded; a new GET requires only `view`.
+# Routes whose required scope differs from the method default (safe method
+# -> `view`, else `control`), keyed by canonical path. Unlisted routes use
+# the method default, so new routes cannot slip through unguarded.
 _WEB_SCOPE_OVERRIDES = {
     # the DAG approval-gate decision is the one action gated by `approve`.
     "/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision": "approve",
-    # /mcp is an action-capable surface (its own readOnly/act config narrows
-    # it further); a scoped token needs `control` to drive it.
+    # /mcp is action-capable; a scoped token needs `control` to drive it.
     "/mcp": "control",
 }
 
-# The web control API's complete route table: (method, path, handler, gate).
-# `handler` names a Cron method, except on the "mcp"-gated rows where it names
-# an MCPHandler method (that server is rebuilt per app start). `gate` marks the
-# conditionally registered groups: None (always), "mcp" (mcp.enabled),
-# "metrics" (a metrics section is configured), "ui" (web.ui, the default).
-# This is the single source of truth for the app's surface:
-# start_stop_web_app builds its aiohttp routes from it, and
+# The web API's complete route table: (method, path, handler, gate).
+# `handler` names a Cron method except "mcp"-gated rows (MCPHandler);
+# `gate` marks conditionally registered groups (None, "mcp", "metrics",
+# "ui"). start_stop_web_app builds the aiohttp routes from it and
 # tests/test_openapi.py diffs it (plus _WEB_SCOPE_OVERRIDES' keys) against
-# docs/openapi.yaml, so a route added, removed, or renamed here without a
-# matching spec edit fails the suite instead of drifting silently. Rows keep
-# registration order; append conditional groups at the end.
-WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
+# docs/openapi.yaml. Rows keep registration order; append conditional
+# groups at the end.
+WEB_ROUTES: "tuple[tuple[str, str, str, Optional[str]], ...]" = (
     ("GET", "/version", "_web_get_version", None),
     ("GET", "/job-set-id", "_web_job_set_id", None),
     ("GET", "/cluster", "_web_get_cluster", None),
@@ -535,10 +362,8 @@ WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
     ("GET", "/schedule/why", "_web_schedule_why", None),
     ("GET", "/calendar.ics", "_web_calendar", None),
     ("GET", "/jobs", "_web_list_jobs", None),
-    # the activity heatmap's batched feed: every job's retained run
-    # outcomes in one memoized product (see _web_get_activity). A fixed
-    # top-level path on purpose: /jobs/activity would shadow a job
-    # literally named "activity" under the /jobs/{name} dynamic route.
+    # top-level on purpose: /jobs/activity would shadow a job named
+    # "activity" under the /jobs/{name} dynamic route.
     ("GET", "/activity", "_web_get_activity", None),
     ("GET", "/jobs/{name}", "_web_get_job", None),
     ("GET", "/jobs/{name}/runs", "_web_job_runs", None),
@@ -573,21 +398,16 @@ WEB_ROUTES: "Tuple[Tuple[str, str, str, Optional[str]], ...]" = (
     ("GET", "/state", "_web_state", None),
     ("GET", "/state/documents", "_web_state_documents", None),
     ("GET", "/state/records", "_web_state_records", None),
-    # bearer-token introspection: which token authenticated me, with
-    # which scopes (drives the dashboard's pairing-QR warning and lets
-    # a companion app show what it may do)
+    # bearer-token introspection: which token authenticated me, what scopes
     ("GET", "/whoami", "_web_whoami", None),
-    # E2E-encrypted push alerts: the paired-device registry. Registered
-    # unconditionally (like the state inspector) so a reload that adds
-    # a `push:` section needs no web-app restart; the handlers answer
-    # 404 until one is configured. See cronstable.push.
+    # push pairing registry; registered unconditionally so a reload adding
+    # `push:` needs no web-app restart (handlers 404 until configured).
     ("GET", "/push/devices", "_web_push_devices", None),
     ("POST", "/push/devices", "_web_push_pair", None),
     ("DELETE", "/push/devices/{id}", "_web_push_revoke", None),
     ("POST", "/push/devices/{id}/test", "_web_push_test", None),
-    # The MCP server rides these same listeners and the auth middleware:
-    # /mcp is NEVER in WEB_PUBLIC_PATHS, so it inherits the bearer-token gate
-    # (and the `control` scope override above, on every method).
+    # /mcp is NEVER in WEB_PUBLIC_PATHS: it inherits the bearer-token gate
+    # (and the `control` scope override above) on every method.
     ("POST", "/mcp", "handle_http", "mcp"),
     ("GET", "/mcp", "handle_http_get", "mcp"),
     ("OPTIONS", "/mcp", "handle_options", "mcp"),
@@ -608,11 +428,9 @@ def _effective_web_scopes(scopes: Iterable[str]) -> "frozenset[str]":
 def _required_web_scope(request) -> str:
     """The scope a request must hold, from its matched route and method.
 
-    Safe methods (GET/HEAD/OPTIONS) default to ``view`` and mutating methods
-    to ``control``; a small override table promotes the DAG decision route to
-    ``approve`` and the MCP endpoint to ``control``. An unmatched route (a
-    request that will 404) has no resource, so it falls back to the method
-    default; it is still authenticated, it just 404s afterwards.
+    Safe methods default to ``view``, mutating ones to ``control``, with
+    _WEB_SCOPE_OVERRIDES on top. An unmatched route (about to 404) falls
+    back to the method default but is still authenticated first.
     """
     route = request.match_info.route
     resource = getattr(route, "resource", None)
@@ -643,16 +461,12 @@ class _WebToken(NamedTuple):
 
 
 def _accepts_json(request: "web.Request") -> bool:
-    """Whether the request's ``Accept`` header names ``application/json``.
+    """Whether the ``Accept`` header explicitly names ``application/json``.
 
-    The two dual-format endpoints (``/status``, ``/job-set-id``) default to
-    text and switch to JSON on request. A generated client sends compound
-    headers (``application/json, */*`` or with ``;q=`` parameters), so this
-    parses the media ranges instead of comparing the raw header. Deliberately
-    matches only the EXPLICIT ``application/json`` range: honouring the
-    ``*/*``/``application/*`` wildcards would flip curl's default Accept
-    (``*/*``) from text to JSON and break every existing script that parses
-    the text form.
+    Parses media ranges (generated clients send compound headers) and
+    deliberately ignores ``*/*``/``application/*`` wildcards: honouring
+    them would flip curl's default Accept from text to JSON and break
+    every script parsing the text form of the dual-format endpoints.
     """
     accept = request.headers.get("Accept", "")
     for media_range in accept.split(","):
@@ -664,22 +478,11 @@ def _accepts_json(request: "web.Request") -> bool:
 def _origin_matches_host(origin: str, host: Optional[str]) -> bool:
     """Whether a browser ``Origin`` header names this request's own ``Host``.
 
-    The same-origin test behind the web API's CSRF/DNS-rebinding gate
-    (:meth:`Cron._make_origin_middleware`): a page served by this daemon
-    posts with an Origin whose authority is exactly the URL the operator is
-    browsing (the ``Host`` header) while a foreign page's Origin names
-    the attacker's site.  ``Host`` cannot be chosen by the attacker's page
-    (the browser sets both headers), so equality is a trustworthy
-    same-origin signal.
-
-    Compares authority only (hostname + port, default ports normalized from
-    the Origin's scheme; for a same-origin request both headers come from
-    one URL, so their implicit ports agree).  The scheme is deliberately NOT
-    compared: behind a TLS-terminating reverse proxy the browser's Origin
-    says ``https`` while the daemon speaks plain http, and a strict scheme
-    compare would 403 the operator's own dashboard.  ``Origin: null``
-    (sandboxed iframes, some redirect chains) and anything unparsable never
-    match: fail closed.
+    The same-origin test behind the CSRF/DNS-rebinding gate. Compares
+    authority only (hostname + port, defaults from the Origin scheme); the
+    scheme is deliberately NOT compared, or a TLS-terminating reverse proxy
+    would 403 the operator's own dashboard. ``Origin: null`` and anything
+    unparsable never match: fail closed.
     """
     if not host:
         return False
@@ -718,7 +521,7 @@ class ApiActionError(Exception):
         self.status = status
 
 
-def _strip_headers(headers: Optional[Any], *names: str) -> Dict[str, str]:
+def _strip_headers(headers: Optional[Any], *names: str) -> dict[str, str]:
     """A fresh dict of ``headers`` minus ``names``, case-insensitively.
 
     ``names`` must be given lowercase.  ``None`` or an empty mapping
@@ -733,16 +536,13 @@ def _strip_headers(headers: Optional[Any], *names: str) -> Dict[str, str]:
     }
 
 
-def _strip_content_type(headers: Optional[Any]) -> Dict[str, str]:
+def _strip_content_type(headers: Optional[Any]) -> dict[str, str]:
     """The mapping minus any Content-Type, in any spelling.
 
-    The canonical home of the rule every JSON/data endpoint applies: the
-    endpoint's own Content-Type wins over an operator-configured
-    ``web.headers`` one.  aiohttp refuses ``content_type=`` when the
-    mapping already carries a Content-Type, and header names are
-    case-insensitive on the wire while these dicts are not, so a
-    case-variant leftover would be emitted as a second, conflicting
-    header.
+    An endpoint's own Content-Type wins over an operator-configured
+    ``web.headers`` one: aiohttp refuses ``content_type=`` when the mapping
+    already carries one, and a case-variant leftover would be emitted as a
+    second, conflicting header.
     """
     return _strip_headers(headers, "content-type")
 
@@ -750,39 +550,25 @@ def _strip_content_type(headers: Optional[Any]) -> Dict[str, str]:
 def _error_body(message: str) -> str:
     """The web API's ONE error envelope: a JSON object ``{"error": msg}``.
 
-    Every 4xx/5xx body this origin serves carries it (the raise-style
-    handlers via :func:`_api_error`, the return-style ones via
-    ``_json_response({"error": ...})``, and everything that escapes as a
-    default text/plain body, bare-404 raises and the auth middleware's 401s
-    and the router's own 404/405 included, via
-    :func:`_error_envelope_middleware`), matching the jobapi and MCP
-    surfaces, so a client parses failures one way instead of sniffing
-    text/plain per handler.
+    Every 4xx/5xx body this origin serves carries it (via :func:`_api_error`,
+    ``_json_response({"error": ...})``, or :func:`_error_envelope_middleware`
+    for anything that would escape as text/plain), matching the jobapi and
+    MCP surfaces, so a client parses failures one way.
     """
     return json.dumps({"error": message})
 
 
 def _api_error(
-    factory: "Type[web.HTTPException]",
+    factory: "type[web.HTTPException]",
     message: str,
     headers: Optional[Any] = None,
 ) -> web.HTTPException:
     """An aiohttp error response carrying the uniform JSON envelope.
 
-    The envelope's own Content-Type wins over an operator-configured
-    ``web.headers`` one, in ANY spelling, the same rule ``/metrics`` and the
-    SSE tails apply.  aiohttp refuses ``content_type=`` outright when the
-    headers mapping already carries a Content-Type (``ValueError: passing
-    both Content-Type header and content_type or charset params is
-    forbidden``), so without the strip a deployment that sets one turned the
-    start/cancel 409 into a 500; that is the one error path these headers
-    ride.  Header names are case-insensitive on the wire but the mapping is
-    not, so a case-variant leftover would be emitted as a second,
-    conflicting header even where aiohttp did not refuse.
+    The envelope's own Content-Type wins over any configured ``web.headers``
+    one, in any spelling (see :func:`_strip_content_type`).
     """
     if headers is not None:
-        # the envelope's own Content-Type wins, in any spelling: see
-        # _strip_content_type
         clean = _strip_content_type(headers)
         return factory(
             text=_error_body(message),
@@ -797,9 +583,8 @@ def _http_for_action_error(
 ) -> web.HTTPException:
     """Map an :class:`ApiActionError` to the matching aiohttp response.
 
-    ``headers`` (the operator's ``web.headers``) is applied where the pre-MCP
-    handlers applied it (the ``409`` conflict bodies of the job start/cancel
-    routes) and omitted elsewhere, preserving the documented behavior.
+    ``headers`` (the operator's ``web.headers``) is applied only on the 409
+    conflict bodies of the job start/cancel routes.
     """
     status_map = {
         400: web.HTTPBadRequest,
@@ -811,19 +596,35 @@ def _http_for_action_error(
     return _api_error(factory, ex.message, headers)
 
 
+def _maps_action_errors(
+    handler: Callable[["Cron", web.Request], Awaitable[web.Response]],
+) -> Callable[["Cron", web.Request], Awaitable[web.Response]]:
+    """Translate an escaping :class:`ApiActionError` into its HTTP response.
+
+    The ONE spelling of the ``except ApiActionError`` tail the action and
+    state-inspection handlers used to each repeat.  The status mapping and
+    the headers-on-409 rule live in :meth:`Cron._action_http_error` (the
+    state-inspection payloads never raise 409, so that rule is inert for
+    them).
+    """
+
+    @wraps(handler)
+    async def wrapper(self: "Cron", request: web.Request) -> web.Response:
+        try:
+            return await handler(self, request)
+        except ApiActionError as ex:
+            raise self._action_http_error(ex) from ex
+
+    return wrapper
+
+
 async def _error_envelope_middleware(request, handler):
     """Give every escaping HTTP error the one JSON envelope.
 
-    The raise-style handlers wrap their errors via :func:`_api_error`, but
-    three families used to escape as aiohttp's default text/plain bodies:
-    the handlers' bare ``HTTPNotFound()`` raises, the auth middleware's
-    401s, and the router's own errors (405 on a wrong method, 404 on an
-    unmatched path).  Each falsified the documented "every error body is
-    one JSON envelope" contract, so a client had to sniff text/plain per
-    handler after all.  Installed outermost, so it sees them all.  An error
-    already carrying the envelope passes through untouched, and headers the
-    error legitimately owns (a 405's ``Allow``) are preserved; only the
-    body-describing pair is replaced along with the body.
+    Installed outermost so it catches errors that would escape as aiohttp's
+    text/plain defaults (bare raises, the auth middleware's 401s, the
+    router's 404/405). Errors already carrying the envelope pass through;
+    headers the error legitimately owns (a 405's ``Allow``) are preserved.
 
     Marked new-style below rather than with ``@web.middleware`` here.  The
     decorator reads an attribute off the lazy aiohttp door above while this
@@ -849,11 +650,43 @@ async def _error_envelope_middleware(request, handler):
             headers=headers,
             content_type="application/json",
         )
+    except asyncio.CancelledError:
+        raise  # a disconnected client is not an error to report
+    except asyncio.TimeoutError:
+        # a store call that outran its budget: aiohttp would answer 500,
+        # but the accurate status is a gateway timeout, and either way the
+        # body must be the envelope like every other error.
+        logger.exception("web: timed out serving %s", request.rel_url.path)
+        return web.Response(
+            text=_error_body(
+                "the request timed out; the reason is in the cronstable log"
+            ),
+            status=504,
+            content_type="application/json",
+        )
+    except Exception:  # noqa: BLE001 - the envelope's last arm
+        # An unhandled error used to escape to aiohttp's own handler,
+        # which answers text/plain (or text/html on an Accept), so the ONE
+        # status a client could not parse uniformly was the 500. Message
+        # is fixed: the reason goes to the log, never to the caller (the
+        # rule _push_store_unavailable and the MCP/jobapi surfaces follow).
+        # aiohttp's own log_exception is lost once this arm handles it, so
+        # log here or the traceback disappears.
+        logger.exception(
+            "web: internal error serving %s", request.rel_url.path
+        )
+        return web.Response(
+            text=_error_body(
+                "internal error; the reason is in the cronstable log"
+            ),
+            status=500,
+            content_type="application/json",
+        )
 
 
 # aiohttp's decorator is this assignment plus a return, so this is the same
 # marker without the attribute read that would open the door.  Pinned by
-# tests/test_cron.py, so an aiohttp release that moves the marker cannot
+# tests/test_cron_web.py, so an aiohttp release that moves the marker cannot
 # silently demote the envelope to an old-style factory.
 _error_envelope_middleware.__middleware_version__ = 1  # type: ignore[attr-defined]
 
@@ -907,22 +740,13 @@ class JobRunInfo:
     finished_at: datetime.datetime
     fail_reason: Optional[str]
     output: JobOutputStream
-    # sampled CPU time + peak RSS for the run, when the job opted into
-    # monitorResources; None otherwise (the common case). Defaulted so every
-    # existing JobRunInfo construction site stays valid; the reaper fills it
-    # from the finished RunningJob.
+    # sampled CPU time + peak RSS when the job opted into monitorResources;
+    # None otherwise. The reaper fills it from the finished RunningJob.
     resource_usage: Optional[ResourceUsage] = None
     # why a synthetic "skipped" row exists ("paused"); None for real runs.
-    # Defaulted for the same construction-site reason as resource_usage.
     skip_reason: Optional[str] = None
-    # Elapsed seconds, derived once at construction rather than recomputed per
-    # read. It used to be a property, and the payload builders read it several
-    # times per run per poll: the inline history block alone re-subtracted
-    # two datetimes for twenty runs per job, and _run_stats reads it four more
-    # times per run per trend window. Both operands are set at construction
-    # and nothing reassigns either, so the value cannot go stale. init=False
-    # keeps every existing construction site valid; compare=False keeps
-    # equality over the recorded fields alone.
+    # Elapsed seconds, derived once at construction (both operands are
+    # immutable). compare=False keeps equality over the recorded fields.
     duration: Optional[float] = field(default=None, init=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -931,25 +755,23 @@ class JobRunInfo:
                 self.finished_at - self.started_at
             ).total_seconds()
 
-    def to_dict(self, *, include_series: bool = False) -> Dict[str, Any]:
+    def to_dict(self, *, include_series: bool = False) -> dict[str, Any]:
         """JSON-serializable summary (everything except the output stream).
 
-        ``include_series`` additionally embeds the run's downsampled CPU/RSS
-        chart series: on for the durable ledger record (so charts survive
-        restarts) and the dedicated resources endpoint, off for the polled
-        payloads (/jobs and /jobs/{name}/runs stay summary-sized).
+        ``include_series`` embeds the downsampled CPU/RSS chart series: on
+        for the durable ledger record and the resources endpoint, off for
+        the polled payloads.
 
-        ``ranAt`` mirrors ``finished_at`` on every row that represents an
-        actual run, and is omitted entirely (never nulled: ``derive_max``
-        folds over whatever value a present field holds) on a synthetic
-        ``skipped`` one.  That gives the durable superseded-by-run guard a
-        watermark (:meth:`Cron.durable_last_completed_at`) a pause cannot
+        ``ranAt`` mirrors ``finished_at`` on real runs and is omitted
+        entirely (never nulled: ``derive_max`` folds over present values)
+        on a synthetic ``skipped`` row. That gives
+        :meth:`Cron.durable_last_completed_at` a watermark a pause cannot
         move, while ``finished_at`` stays unfiltered for the catch-up
         watermark, which intentionally advances over pause-skipped slots.
         """
         # one isoformat for the two keys that carry the same instant
         finished = self.finished_at.isoformat()
-        data: Dict[str, Any] = {
+        data: dict[str, Any] = {
             "outcome": self.outcome,
             "exit_code": self.exit_code,
             "started_at": (
@@ -990,7 +812,7 @@ class PauseInfo:
     by: str
     channel: str
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """JSON-safe form (the /jobs "paused" object and pause responses)."""
         return {
             "since": self.since.isoformat(),
@@ -1001,16 +823,14 @@ class PauseInfo:
         }
 
 
-def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
+def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
     """Aggregate stats over a job's retained run history, for the web UI."""
     total = len(runs)
     success = sum(1 for r in runs if r.outcome == "success")
     failure = sum(1 for r in runs if r.outcome == "failure")
     cancelled = sum(1 for r in runs if r.outcome == "cancelled")
-    # crash-reconciled runs: the daemon crashed / lost the store mid-run, so
-    # no completion was ever recorded. Bucketed on its own so it neither
-    # vanishes into `total` alone nor is miscounted as a real failure, and
-    # so the dashboard can call out interrupted runs distinctly.
+    # crash-reconciled runs, bucketed on their own so they are neither
+    # hidden in `total` nor miscounted as real failures.
     unknown = sum(1 for r in runs if r.outcome == "unknown")
     durations = [r.duration for r in runs if r.duration is not None]
     # resource-monitored runs only (monitorResources); an unmonitored history
@@ -1057,6 +877,36 @@ def _run_stats(runs: List[JobRunInfo]) -> Dict[str, Any]:
     }
 
 
+def _activity_jobs(
+    histories: dict[str, list[JobRunInfo]], limit: int
+) -> dict[str, Any]:
+    """The ``/activity`` payload over a snapshot of per-job run histories.
+
+    Each job maps to its newest ``limit`` retained runs, oldest first,
+    each row exactly ``{started_at, finished_at, outcome}``.  Pure over
+    its arguments, and the three fields it reads are frozen at row
+    construction, so the large-fleet branch of the product build runs
+    this on a worker thread beside the serialize/hash/gzip.
+    """
+    return {
+        "jobs": {
+            name: [
+                {
+                    "started_at": (
+                        r.started_at.isoformat()
+                        if r.started_at is not None
+                        else None
+                    ),
+                    "finished_at": r.finished_at.isoformat(),
+                    "outcome": r.outcome,
+                }
+                for r in rows[-limit:]
+            ]
+            for name, rows in histories.items()
+        }
+    }
+
+
 def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
     """Parse an ISO-8601 string to an AWARE datetime, or ``None``.
 
@@ -1081,7 +931,7 @@ def _parse_iso_utc(value: Any) -> Optional[datetime.datetime]:
 
 def _in_pause_window(
     when: datetime.datetime,
-    window: Tuple[Optional[datetime.datetime], datetime.datetime],
+    window: tuple[Optional[datetime.datetime], datetime.datetime],
 ) -> bool:
     """Whether ``when`` falls inside a durable pause window.
 
@@ -1096,11 +946,11 @@ def _in_pause_window(
 
 
 def _fold_manifest(
-    rec: Dict[str, Any],
-    names: Set[str],
-    hosts: Set[str],
-    art_scopes: Set[str],
-    live_dags: Set[str],
+    rec: dict[str, Any],
+    names: set[str],
+    hosts: set[str],
+    art_scopes: set[str],
+    live_dags: set[str],
 ) -> None:
     """Accumulate one recent manifest record into the GC keep sets.
 
@@ -1121,7 +971,7 @@ def _fold_manifest(
         live_dags.update(str(d) for d in rec["dags"])
 
 
-def _manifests_cover_scopes(recent: List[Dict[str, Any]]) -> bool:
+def _manifests_cover_scopes(recent: list[dict[str, Any]]) -> bool:
     """Whether artifact streams / dag-run documents may be managed at all.
 
     Only once EVERY recent manifest advertises its scopes and dags: a
@@ -1138,22 +988,103 @@ def _manifests_cover_scopes(recent: List[Dict[str, Any]]) -> bool:
     )
 
 
+def build_gc_keep_set(
+    manifests: list[dict[str, Any]],
+    now: datetime.datetime,
+    grace: float,
+    names: set[str],
+    hosts: set[str],
+    art_scopes: set[str],
+    live_dags: set[str],
+) -> tuple[dict[str, set[str]], list[dict[str, Any]]]:
+    """Fold recent manifests and build the stream keep-set for one GC pass.
+
+    The ONE spelling of the prefix-to-keep-names map, shared by the
+    daemon's automatic pass and `cronstable state gc` so the two cannot
+    drift (a prefix missing from one pass would let it reclaim live
+    bookkeeping the other protects). The passed sets are mutated in
+    place. Returns ``(keep, recent)``; each caller layers its own extras
+    on ``keep`` (live-pause streams, dag catch-up checkpoints, artifact
+    scopes) since those need I/O or coverage guards the caller owns.
+    Abandoned per-host streams (counters, manifests) age out because only
+    recently-manifesting hosts land in ``hosts``.
+    """
+    recent: list[dict[str, Any]] = []
+    for rec in manifests:
+        at = _parse_iso_utc(rec.get("at"))
+        if at is None or (now - at).total_seconds() > grace:
+            continue
+        recent.append(rec)
+        _fold_manifest(rec, names, hosts, art_scopes, live_dags)
+    # job names keep their default artifact scope too.
+    art_scopes |= names
+    keep: dict[str, set[str]] = {
+        RUN_STREAM_PREFIX: names,
+        LOG_STREAM_PREFIX: names,
+        CATCHUP_STREAM_PREFIX: names,
+        RETRY_STREAM_PREFIX: names,
+        REBOOT_STREAM_PREFIX: names,
+        COUNTER_STREAM_PREFIX: hosts,
+        INFLIGHT_STREAM_PREFIX: names,
+        SLOT_STREAM_PREFIX: names,
+        MANIFEST_STREAM_PREFIX: hosts,
+    }
+    return keep, recent
+
+
+def _parse_retry_record(
+    rec: dict[str, Any],
+) -> tuple[int, datetime.datetime] | None:
+    """Parse ``(attempt, notBefore)`` out of a ladder record.
+
+    ``None`` for unparseable content; the caller decides whether that
+    settles the ladder (rehydration) or merely declines it (the
+    cross-node claim scan). The arm time stays out of the tuple:
+    :func:`_retry_armed_at` parses it on first use, after the caller's
+    cheap decline gates, because the once-a-minute claim scan declines
+    most records (foreign or stale ladders) before ever needing it.
+    """
+    attempt = rec.get("attempt")
+    not_before = _parse_iso_utc(rec.get("notBefore"))
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or not_before is None
+    ):
+        return None
+    return attempt, not_before
+
+
+def _retry_armed_at(
+    rec: dict[str, Any], not_before: datetime.datetime
+) -> datetime.datetime:
+    """The arm time of a ladder record ``_parse_retry_record`` accepted.
+
+    A handoff carries the original arm time in ``armedAt``; a pending's
+    own ``at`` IS its arm time (a handoff's ``at`` is the hand-off
+    instant, which would hide a completed run). Falls back to
+    ``notBefore`` when the record spells neither.
+    """
+    return (
+        _parse_iso_utc(rec.get("armedAt"))
+        or _parse_iso_utc(rec.get("at"))
+        or not_before
+    )
+
+
 def _job_run_info_from_dict(
-    rec: Dict[str, Any], *, output: Optional[JobOutputStream] = None
+    rec: dict[str, Any], *, output: Optional[JobOutputStream] = None
 ) -> Optional["JobRunInfo"]:
     """Rebuild a :class:`JobRunInfo` from a durable ledger record.
 
-    The inverse of :meth:`JobRunInfo.to_dict`, used to warm the in-memory
-    history on restart.  The captured output stream is not persisted, so a
-    rehydrated run gets an empty, already-closed :class:`JobOutputStream`: the
-    dashboard's stats/sparkline never need it, and the log-replay endpoint
-    returns an empty (cleanly-terminating) stream for it.  A record missing or
-    with an unparseable ``finished_at`` is skipped (returns ``None``) rather
-    than crashing the rehydration.
+    Inverse of :meth:`JobRunInfo.to_dict`, used to warm in-memory history
+    on restart. Output is not persisted, so a rehydrated run gets an empty,
+    closed stream; a record with no parseable ``finished_at`` returns None
+    rather than crashing the rehydration.
 
-    ``output`` lets a bulk caller that never reads the stream (the trends
-    aggregation) supply one shared closed placeholder instead of paying an
-    allocation per record; leave it ``None`` for infos that enter
+    ``output`` lets a bulk caller (the trends aggregation) supply one
+    shared closed placeholder; leave it None for infos entering
     ``run_history``, where log replay expects each run's own stream.
     """
     # _parse_iso_utc pins naive timestamps to UTC: a rehydrated JobRunInfo
@@ -1162,9 +1093,8 @@ def _job_run_info_from_dict(
     finished = _parse_iso_utc(rec.get("finished_at"))
     if finished is None:
         # a crash-reconciled record deliberately omits finished_at so the
-        # catch-up watermark stays put (the interrupted slot is still owed
-        # under onMissed run-once/run-all); its interruption instant
-        # stands in for display ordering only.
+        # catch-up watermark stays put; its interruption instant stands in
+        # for display ordering only.
         finished = _parse_iso_utc(rec.get("interruptedAt"))
     if finished is None:
         return None
@@ -1217,15 +1147,13 @@ def load_index_html() -> str:
 
 
 @lru_cache(maxsize=1)
-def _index_document() -> Tuple[bytes, str]:
+def _index_document() -> tuple[bytes, str]:
     """The dashboard as ``(utf-8 bytes, ETag)``, built once.
 
-    ``load_index_html`` caches the DECODE, but aiohttp's ``text=`` argument
-    re-encodes on every response construction, so each page load re-ran
-    ``str.encode`` over 573 KB (0.27 ms and a fresh 573 KB allocation) on the
-    scheduler's loop for bytes that are fixed for the life of the process.
-    The tag is fixed for the same reason: the document is static package
-    data with no per-request or per-viewer content.
+    ``load_index_html`` caches the DECODE; this caches the encode, which
+    aiohttp's ``text=`` argument would otherwise redo per response. The tag
+    is fixed because the document is static package data with no per-request
+    or per-viewer content.
     """
     raw = load_index_html().encode("utf-8")
     return raw, '"' + hashlib.sha256(raw).hexdigest()[:32] + '"'
@@ -1235,18 +1163,10 @@ def _index_document() -> Tuple[bytes, str]:
 def _index_gzip() -> bytes:
     """The dashboard pre-compressed once, for clients that accept gzip.
 
-    The document is static package data, so the compression is done a single
-    time for the life of the process rather than per page load: ~573 KB of
-    HTML becomes ~159 KB on the wire.  Kept separate from
-    :func:`_index_document` so that function's ``(bytes, ETag)`` contract is
-    unchanged and a deployment whose clients never send ``Accept-Encoding:
-    gzip`` never pays the compression at all.
-
-    NOTE the cache chain is three deep: ``load_index_html`` (the decode),
-    ``_index_document`` (the encode plus ETag) and this (the compression).
-    They are independent lru_caches, so a test that swaps the page out must
-    clear ALL THREE to change what GET / actually serves; clearing only
-    ``load_index_html`` leaves both the served bytes and this gzip stale.
+    NOTE the cache chain is three deep: ``load_index_html`` (decode),
+    ``_index_document`` (encode plus ETag) and this (compression). They are
+    independent lru_caches, so a test that swaps the page out must clear
+    ALL THREE to change what GET / actually serves.
     """
     return _gzip_body(_index_document()[0])
 
@@ -1270,32 +1190,11 @@ def _json_response(
 ) -> web.Response:
     """A JSON ``web.Response`` serialized with the orjson-accelerated encoder.
 
-    Drop-in for :func:`aiohttp.web.json_response` on the data endpoints: it
-    serializes with :func:`cronstable._json.dumps_bytes` (orjson when present,
-    several times faster than aiohttp's default ``json.dumps``, and compact
-    separators so the payload ships fewer bytes) instead of the stdlib.  A web
-    response is transient (never a durable, cross-fleet record), so a
-    non-finite float or other non-portable value falls back to the stdlib and
-    never 500s the endpoint, exactly as :func:`cronstable.mcp._dumps` does.
-
-    That same transience is why the encode is ``trusted``: the portability
-    walk it skips exists to keep bytes that are round-tripped through
-    ``loads`` (durable records, leases, documents) comparable across a fleet,
-    and it costs 13x the serialization it guards on a real payload.  What is
-    given up is the walk's ``MAX_DEPTH`` ceiling and, on the orjson flavour, a
-    non-finite float becoming ``null`` instead of taking the fallback, which
-    is if anything an improvement, since the stdlib fallback emits a bare
-    ``NaN`` token that a browser's ``JSON.parse`` rejects.  Everything else
-    (an out-of-window integer, a non-string key) still surfaces from
-    ``orjson.dumps`` itself and still falls back; the stdlib flavour keeps
-    ``allow_nan=False`` and raises a bare ``ValueError``, which is why the
-    except clause is wider than ``UnsupportedValue``.
-
-    The endpoint's own Content-Type wins over an operator-configured
-    ``web.headers`` one, in ANY spelling: the :func:`_api_error` rule.
-    aiohttp refuses ``content_type=`` outright when the headers mapping
-    already carries a Content-Type, so without the strip a deployment that
-    sets one turned every JSON data endpoint into a 500.
+    A web response is transient, never a durable cross-fleet record, so the
+    encode is ``trusted`` and a non-portable value falls back to the stdlib
+    instead of 500ing; the stdlib flavour raises bare ``ValueError`` on
+    non-finite floats, hence the wide except. The endpoint's own
+    Content-Type wins over configured ``web.headers`` (the _api_error rule).
     """
     try:
         body = _json.dumps_bytes(payload, trusted=True)
@@ -1311,85 +1210,41 @@ def _json_response(
     )
 
 
-#: Job count at or above which GET /jobs computes its ETag and serializes
-#: its body on the default executor instead of inline.  Below it the
-#: thread hop costs more than the encode; above it a large fleet's encode
-#: must not stall the scheduling loop.
+#: Job count from which /jobs computes its ETag and body on the executor;
+#: below it the thread hop costs more than the encode.
 _JOBS_SERIALIZE_OFFLOAD_MIN = 200
 
-#: How long one built /jobs response (payload, ETag, body, gzip) is shared
-#: across pollers before it is rebuilt.  Every viewer used to pay the full
-#: per-request build even when nothing changed: a wallboard plus N tabs on
-#: one daemon is N identical builds per poll cycle.  The memo makes that
-#: at most ceil(pollMs / this) builds per cycle however many viewers watch.
-#: Local changes (a run recorded, a launch, a pause, a reload) bust the
-#: memo so they render on the very next poll; the TTL bounds the staleness
-#: of everything else (live resource samples, a fire advancing with no
-#: local bust) to under a second, inside the jitter of the 3s default poll
-#: cadence.  A single viewer polling slower than this never hits the memo,
-#: so the one-tab case behaves exactly as before.
+#: How long one built /jobs response is shared across pollers. Local
+#: changes bust the memo; the TTL only bounds foreign staleness.
 _JOBS_RESPONSE_TTL = 1.0
 
-#: Config-source count at or above which the once-a-minute stat fingerprint
-#: (:meth:`Cron._config_signature`) is taken on the default executor instead
-#: of inline.  One ``os.stat`` is ~14 us on local disk but 1-2 ms on the
-#: NFS/EFS/S3-Files mounts the state backend documents as targets, and a
-#: config DIRECTORY plus its ``include:`` tree and ``env_file`` targets is
-#: exactly the layout that grows the count, so the probe that guards the
-#: carefully-offloaded reparse is itself the unoffloaded part.  Below the
-#: threshold (the single-file default) the thread hop costs more than the
-#: stats, so it stays inline.
+#: Config-source count from which the stat fingerprint runs on the
+#: executor (os.stat on a network mount is milliseconds).
 _CONFIG_SIGNATURE_OFFLOAD_MIN = 16
 
 #: Resident job count at or above which a reload pauses the garbage collector
 #: for the reparse.  See :meth:`Cron._quiet_gc_for_reparse`.
 _GC_QUIET_RELOAD_MIN = 5000
 
-#: Resident job count at or above which ``GET /metrics`` renders the
-#: exposition text on the default executor instead of inline.  The family
-#: build must stay on the loop (it reads live scheduler state), but the
-#: render over that immutable snapshot is pure CPU: ~6.7 ms at 500 jobs and
-#: ~31 ms at 2000, all of it blocking every other handler and the tick.
-#: Below the threshold the render is far cheaper than a thread hop, so a
-#: small deployment's scrape stays inline.
+#: Job count from which /metrics renders on the executor; the family build
+#: stays on the loop (it reads live scheduler state), the render is pure
+#: CPU over that snapshot.
 _METRICS_OFFLOAD_MIN_JOBS = 250
 
-#: How long one rendered ``GET /metrics`` product (body plus gzip, per
-#: exposition format) is shared across scrapers before it is rebuilt.  This
-#: is the largest payload the daemon serves, and its build is the whole
-#: metric universe: without the memo, N scrapers (a Prometheus pair plus an
-#: agent, a federation puller, a human with curl) each pay a full family
-#: build on the event loop.  The memo makes that at most one build per this
-#: window however many scrapers land together.  A sub-second-stale body is
-#: safe because Prometheus timestamps a sample at SCRAPE time, so re-serving
-#: a body built up to a second earlier is indistinguishable from the scrape
-#: having arrived a second earlier, the same argument the /jobs and /peer
-#: memos make.  A scraper on a normal 15s interval never hits the memo at
-#: all; it is the simultaneous-scrapers case this exists for.
+#: How long one rendered /metrics product is shared across scrapers. Safe:
+#: Prometheus timestamps samples at SCRAPE time.
 _METRICS_RESPONSE_TTL = 1.0
 
-#: How long one built ``GET /fleet`` product is shared across pollers.  The
-#: build is O(nodes x jobs) with a dict copy per entry and every dashboard
-#: tab polls it on the same cadence as /jobs, which is memoized for exactly
-#: this reason.  The payload is peer gossip already up to a poll interval
-#: old by the time it reaches us, so a further second of sharing changes
-#: nothing a viewer can observe.
+#: How long one built /fleet product is shared; the payload is peer gossip
+#: already up to a poll interval old, so a further second is invisible.
 _FLEET_RESPONSE_TTL = 1.0
 
-#: Per-node job-summary entry count at or above which the /fleet
-#: serialize, hash and gzip run on the default executor instead of
-#: inline.  The merge itself stays on the loop (it reads live gossip
-#: state), but the product over the merged dict is pure CPU, the same
-#: split /jobs makes at _JOBS_SERIALIZE_OFFLOAD_MIN.
+#: Per-node entry count from which the /fleet serialize/hash/gzip run on
+#: the executor; the merge stays on the loop (live gossip state).
 _FLEET_SERIALIZE_OFFLOAD_MIN = 200
 
-#: How long one built ``GET /activity`` product is shared across viewers.
-#: The payload is a pure projection of the run histories, which change
-#: only on events that already bust the memo (a run recorded, a reload),
-#: so the TTL is a safety net; 1s keeps it uniform with the /jobs and
-#: /fleet windows.  A heat overlay refreshes at most once a minute per
-#: viewer, so the memo pays off exactly when several viewers land
-#: together.
+#: How long one built /activity product is shared; changes already bust
+#: the memo, so the TTL is a safety net kept uniform with /jobs.
 _ACTIVITY_RESPONSE_TTL = 1.0
 
 
@@ -1408,7 +1263,7 @@ class _ResponseMemo(Generic[_ProductT]):
 
     def __init__(self) -> None:
         # (loop.time stamp, product) of the newest stored build, or None
-        self.cached: Optional[Tuple[float, _ProductT]] = None
+        self.cached: Optional[tuple[float, _ProductT]] = None
         # the in-flight build's future, for followers to join
         self.inflight: Optional["asyncio.Future[Optional[_ProductT]]"] = None
         # the _memo_gen the in-flight build registered under; a joiner
@@ -1485,58 +1340,30 @@ _GZIP_MIN_BYTES = 1024
 def _gzip_body(body: bytes) -> bytes:
     """``body`` as a gzip stream, level 1.
 
-    Level 1, not 6: the /jobs payload is the same thirty keys repeated per
-    job, so level 1 already reaches ~5% of the original in 0.12 ms (less
-    than the ETag digest sitting next to it) while level 6 costs 2.5x the
-    CPU for another 2 points.  ``wbits=31`` wraps the deflate stream in a
-    gzip container, so this needs no import beyond zlib.
+    Level 1 on purpose: the payloads are highly repetitive JSON, and
+    higher levels cost multiples of the CPU for little gain. ``wbits=31``
+    wraps the deflate stream in a gzip container, so zlib suffices.
     """
     packer = zlib.compressobj(1, zlib.DEFLATED, 31)
     return packer.compress(body) + packer.flush()
 
 
 def _jobs_response_product(
-    payload: List[Dict[str, Any]],
-    next_fire: Dict[str, datetime.datetime],
-) -> Tuple[str, bytes, Optional[bytes]]:
+    payload: list[dict[str, Any]],
+    next_fire: dict[str, datetime.datetime],
+) -> tuple[str, bytes, Optional[bytes]]:
     """The full /jobs response product: ETag, body, and gzipped body.
 
-    The tag is a strong hash of the payload with each job's volatile
-    relative ``scheduled_in`` swapped for its STABLE absolute next-fire
-    instant.  So it changes exactly when the displayed data changes (a
-    fire advancing, a run starting/finishing, a pause, a reload, a live
-    resource sample) but NOT merely because the countdown ticked down
-    between two polls (every client recomputes that locally from the
-    poll it holds, so a 304 that keeps the old body stays correct).  Pure
-    and free of scheduler state, so it can run on an executor for a large
-    fleet without a cross-thread read of ``self``.
+    The tag hashes a CANONICAL variant with the volatile relative
+    ``scheduled_in`` swapped for its stable absolute next-fire instant, so
+    it changes exactly when the displayed data changes, not per countdown
+    tick. Pure and free of scheduler state, so it can run on an executor.
 
-    ``next_fire`` carries raw aware datetimes; how they render into the
-    hashed bytes does not matter, only that the rendering is deterministic
-    and injective, so this dumps them through the fast encoder rather than
-    stringifying every one of them on the loop thread first.
-
-    Both the dump and the digest deliberately differ from the durable-record
-    rules.  ``trusted=True`` skips the portability walk, which costs 13x the
-    encode it guards and exists for bytes that are round-tripped through
-    ``loads``; and SHA-256 replaces BLAKE2b because CPython's blake2b is the
-    portable C reference implementation while sha256 reaches OpenSSL's
-    SHA-NI.  An ETag is an opaque per-response validator: two nodes (or two
-    builds) disagreeing on one degrades a 304 into a 200, never into a wrong
-    answer, unlike the job-set fingerprint and the cluster peer ETag that
-    :mod:`cronstable._json`'s stdlib-only rule is written about.
-
-    A large body is gzipped too (``None`` for one under the floor: every
-    real browser accepts gzip, so building it once per product beats
-    re-deciding per client).  The compression rides this call rather than
-    the handler so it lands inside the same executor hop the encode
-    already uses, and zlib releases the GIL.  The body carries no
-    per-request secret (the bearer token is a request header, never a
-    response field), so the BREACH/CRIME class of compression side channel
-    has nothing to leak here.  The If-None-Match check lives in the
-    handler, not here: one product is shared across every concurrent
-    poller for :data:`_JOBS_RESPONSE_TTL`, and which validator each of
-    them sent is the one per-request thing about it.
+    ``trusted=True`` and SHA-256 deliberately differ from durable-record
+    rules: two builds disagreeing degrades a 304 into a 200, never a wrong
+    answer. The body carries no per-request secret, so BREACH/CRIME has
+    nothing to leak; the If-None-Match check stays in the handler because
+    one product is shared across every concurrent poller.
     """
     canonical = [
         {**job, "scheduled_in": next_fire.get(job["name"])} for job in payload
@@ -1544,10 +1371,8 @@ def _jobs_response_product(
     try:
         raw = _json.dumps_bytes(canonical, trusted=True)
     except (_json.UnsupportedValue, ValueError, TypeError):
-        # The stdlib flavour of dumps_bytes has no `default` hook and cannot
-        # render a datetime at all, so a no-orjson install always lands here;
-        # so does any payload value orjson refuses. Same bytes-for-bytes
-        # determinism, just slower, which is all the tag needs.
+        # the stdlib flavour cannot render a datetime, so a no-orjson
+        # install always lands here; determinism is all the tag needs.
         raw = json.dumps(canonical, separators=(",", ":"), default=str).encode(
             "utf-8"
         )
@@ -1608,22 +1433,35 @@ def _cachable_json_response(
 ) -> web.Response:
     """A :func:`_json_response` that can 304 and gzip, for the poll fan-out.
 
-    ``GET /jobs`` grew conditional responses first (see
-    :func:`_jobs_response_product`, which must hash a CANONICAL variant
-    because its payload carries a per-poll relative countdown); this is the
-    plain-shaped sibling for the OTHER polled endpoints, whose serialized
-    body already changes exactly when the displayed data does, so the tag
-    can simply hash the body bytes.  The serialize/sha256[:32]/gzip-floor
-    core lives only in :func:`_cachable_json_product`, and the serve tail
-    in :func:`_conditional_response`; this is the unmemoized composition of
-    the two.  ``use_etag=False`` is for a payload that legitimately changes
-    on every request (``/cluster`` embeds this node's freshly sampled
-    CPU/memory), where a tag would be computed per poll and never match;
-    such a response still negotiates gzip.
+    Unmemoized sibling of :func:`_cachable_json_product`, feeding the same
+    :func:`_conditional_response` tail. ``use_etag=False`` is for a payload
+    that legitimately changes every request (``/cluster`` embeds freshly
+    sampled CPU/memory), where a tag would never match; such a response
+    still negotiates gzip.
+
+    Unlike the memoized product this serves ONE caller, so it builds only
+    what that caller takes: no sha256 for an untagged payload, and no gzip
+    for a client that did not ask or for a request the tag answers 304.
+    The memoized product still builds both eagerly, and must: it is shared
+    across pollers with mixed ``Accept-Encoding`` and ``If-None-Match``.
     """
-    etag, body, gz = _cachable_json_product(payload)
+    body = _json_body(payload)
+    etag = (
+        '"' + hashlib.sha256(body).hexdigest()[:32] + '"' if use_etag else None
+    )
+    # decided up front: a 304 carries no body, so compressing one is pure
+    # waste on the event loop, and /cluster (use_etag=False) never tagged
+    gz = (
+        _gzip_body(body)
+        if (
+            gzip_ok
+            and len(body) >= _GZIP_MIN_BYTES
+            and not (etag is not None and _etag_matches(if_none_match, etag))
+        )
+        else None
+    )
     return _conditional_response(
-        etag if use_etag else None,
+        etag,
         body,
         gz,
         if_none_match=if_none_match,
@@ -1634,48 +1472,42 @@ def _cachable_json_response(
 
 def _cachable_json_product(
     payload: Any,
-) -> Tuple[str, bytes, Optional[bytes]]:
+) -> tuple[str, bytes, Optional[bytes]]:
     """A memoized JSON endpoint's product: ETag, body, and gzipped body.
 
-    The plain-shaped sibling of :func:`_jobs_response_product`, for a payload
-    whose serialized form already changes exactly when the displayed data
-    does, so the tag can simply hash the body bytes.  Hashing the bytes we
-    actually send means a 304 is served only when the representation is
-    byte-identical: there is no canonical projection to get wrong, and no way
-    for a live reading embedded in the payload to freeze behind a stale tag.
-
-    Built once per memo window rather than per request, so the digest and the
-    compression are paid once however many pollers land in that window.
+    Plain sibling of :func:`_jobs_response_product`: the tag hashes the
+    body bytes, so a 304 is served only for a byte-identical
+    representation. Built once per memo window, however many pollers land.
     """
-    try:
-        body = _json.dumps_bytes(payload, trusted=True)
-    except (_json.UnsupportedValue, ValueError, TypeError):
-        body = json.dumps(payload, default=str).encode("utf-8")
+    body = _json_body(payload)
     etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
     gz = _gzip_body(body) if len(body) >= _GZIP_MIN_BYTES else None
     return etag, body, gz
+
+
+def _json_body(payload: Any) -> bytes:
+    """A payload's response bytes: the portable encoder, then the fallback.
+
+    The one serialize both the memoized product and the single-caller
+    response take, so the fallback for a payload the portable encoder
+    refuses cannot drift between them.
+    """
+    try:
+        return _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        return json.dumps(payload, default=str).encode("utf-8")
 
 
 def _metrics_response_product(
     render: Callable[..., str],
     families: Any,
     openmetrics: bool,
-) -> Tuple[bytes, Optional[bytes]]:
+) -> tuple[bytes, Optional[bytes]]:
     """The full /metrics response product: body bytes and gzipped body.
 
-    Pure over ``families`` (a freshly built list referenced by nobody else,
-    see :meth:`cronstable.prometheus.Metrics.families`), so a large job set
-    runs the whole thing on an executor (render AND compression, in one
-    thread hop rather than two).
-
-    The gzip is the point.  Exposition text is the same handful of metric
-    names and label blocks repeated once per job, which is close to the best
-    case for deflate: at 10,000 jobs the 22.0 MB body compresses to 1.32 MB
-    at level 1, a 16.7x reduction for about 7 ms of CPU that zlib spends with
-    the GIL released.  Prometheus advertises gzip on every scrape, so this is
-    the largest recurring payload the daemon serves and was the only large
-    one shipping uncompressed.  ``None`` below the floor, exactly as
-    :func:`_jobs_response_product` does it.
+    Pure over ``families`` (a freshly built list referenced by nobody
+    else), so a large job set runs render AND compression in one executor
+    hop. Gzip is ``None`` below the floor.
     """
     body = render(families, openmetrics=openmetrics).encode("utf-8")
     return body, _gzip_body(body) if len(body) >= _GZIP_MIN_BYTES else None
@@ -1684,12 +1516,9 @@ def _metrics_response_product(
 def _sse_frame(stream_name: str, line: str) -> bytes:
     """One ``event: line`` SSE frame, built in bytes throughout.
 
-    ``dumps_bytes`` already returns UTF-8, so decoding it only to concatenate
-    two ASCII literals and encode the result back was two transcodes of the
-    same data per line per subscriber.  ``trusted=True`` is sound here by
-    construction rather than by vouching for the job's output: both values
-    are ``str``, and the portability walk only ever rejects non-finite
-    floats.
+    ``trusted=True`` is sound by construction rather than by vouching for
+    the job's output: both values are ``str``, and the portability walk only
+    ever rejects non-finite floats.
     """
     return (
         b"event: line\ndata: "
@@ -1735,8 +1564,8 @@ async def _noop_state_write() -> None:
 def next_sleep_interval(subminute: bool = False) -> float:
     """Seconds to sleep until the next scheduling tick.
 
-    Minute mode (``subminute`` False, the default and the historical behaviour)
-    snaps to the top of the next minute.  When any enabled job pins specific
+    Minute mode (``subminute`` False, the default) snaps to the top of the
+    next minute.  When any enabled job pins specific
     seconds the scheduler switches to ``subminute`` mode and snaps to the next
     whole-second boundary instead, so a second-level schedule can fire on time.
     """
@@ -1754,21 +1583,19 @@ def schedule_slot(
     """The scheduling instant to test ``job`` against on this tick.
 
     Truncated to the job's own resolution: the whole second for a
-    second-level job (``has_seconds``), otherwise the top of the minute, which
-    reproduces the historical minute-tick behaviour exactly.  Used both to
-    decide whether the job is due (:meth:`Cron.job_should_run`) and to
-    de-duplicate launches (:meth:`Cron.spawn_jobs`): microseconds are always
-    zeroed so two ticks within one slot compare equal and the job fires once.
+    second-level job (``has_seconds``), otherwise the top of the minute.
+    Used both to decide whether the job is due (:meth:`Cron.job_should_run`)
+    and to de-duplicate launches (:meth:`Cron.spawn_jobs`): microseconds are
+    always zeroed so two ticks within one slot compare equal and the job
+    fires once.
 
     ``now`` is the pass instant supplied by :meth:`Cron._service_slots` (a
     timezone-aware UTC datetime).  Passing it means the whole pass reads the
     clock ONCE: the same instant decides "due" and is recorded for de-dup, so
     the two cannot straddle a slot boundary and double-launch a single-slot
-    job, and a whole-second slot the previous pass overran can be serviced
-    after the fact.  It is rendered into the job's own frame first: an explicit
-    timezone via ``astimezone``, or local time (naive, matching
-    ``get_now(None)``) for a job without one.  ``now`` omitted keeps the old
-    per-job fresh read.
+    job.  It is rendered into the job's own frame first: an explicit timezone
+    via ``astimezone``, or local time (naive, matching ``get_now(None)``) for
+    a job without one.  ``now`` omitted reads the clock fresh per job.
     """
     if now is None:
         now = get_now(job.timezone)
@@ -1833,17 +1660,12 @@ def _access_log_class() -> type:
     """aiohttp's access logger, with the feed token redacted.
 
     Built lazily and cached: importing ``aiohttp.web_log`` at module scope
-    would defeat the lazy aiohttp door above, which exists to keep 144 ms
-    and 14 MB of RSS off every daemon start.
+    would defeat the lazy aiohttp door above.
 
-    The hook is ``log``, the one method
-    :class:`aiohttp.abc.AbstractAccessLogger` actually declares.  The
-    tempting override is ``_format_r``, the ``%r`` directive's formatter,
-    but ``AccessLogger.compile_format`` resolves every directive with
-    ``getattr(AccessLogger, ...)`` against the base class and memoizes the
-    result in a class-level cache, so a subclass's ``_format_r`` is never
-    called.  Redacting the request before delegating leaves the log format
-    aiohttp's own and survives that internal.
+    The hook must be ``log``: overriding ``_format_r`` does not work because
+    ``AccessLogger.compile_format`` resolves directives against the base
+    class and memoizes them, so a subclass's ``_format_r`` is never called.
+    Redacting the request before delegating survives that internal.
     """
     global _ACCESS_LOG_CLASS
     if _ACCESS_LOG_CLASS is None:
@@ -1932,248 +1754,171 @@ class Cron:
     def __init__(
         self, config_arg: Optional[str], *, config_yaml: Optional[str] = None
     ) -> None:
-        # Prometheus accumulators (GET /metrics). Owned here (not by the
-        # web app) so counters survive web-app restarts and cluster-manager
-        # rebuilds; created before update_config so the first parse result is
-        # already recorded. See cronstable.prometheus.
+        # Prometheus accumulators (GET /metrics); owned here so counters
+        # survive web-app restarts, and created before update_config.
         self.metrics = PrometheusMetrics()
-        # whole-node CPU/memory sampler for the live node readout (GET /node
-        # and, in a gossip cluster, the fleet view). One long-lived instance
-        # so its "since last call" CPU% counters stay primed. Cheap and
-        # dependency-safe: a no-op yielding None if psutil is unavailable.
+        # whole-node CPU/memory sampler; long-lived so its CPU% counters
+        # stay primed. Yields None without psutil.
         self._node_sampler = NodeResourceSampler()
         # list of cron jobs we /want/ to run
-        self.cron_jobs = OrderedDict()  # type: Dict[str, JobConfig]
-        # the orchestration DAGs (name -> DagConfig), maintained
-        # alongside cron_jobs across reloads; empty keeps the classic no-DAG
-        # behaviour.
-        self.cron_dags: Dict[str, DagConfig] = OrderedDict()
-        # Memoized job-set fingerprint (see job_set_id). The fingerprint is a
-        # pure function of cron_jobs, but it is queried on hot, repeating paths
-        # (every /metrics scrape, every peer poll, each gossip round, several
-        # times per lease renew) while only ever changing on a reload. Computed
-        # lazily, cached here, and invalidated (set None) at every point
-        # cron_jobs is reassigned.
-        self._job_set_id_cache = None  # type: Optional[str]
-        # Memoized _needs_subminute answer, on the same lifecycle as the
-        # fingerprint above: a pure function of cron_jobs, invalidated
-        # wherever cron_jobs is reassigned. run() consults it on EVERY loop
-        # iteration to decide whether housekeeping is due, and a sub-minute
-        # job makes that once a second, so the underlying scan was O(all
-        # jobs) per second, worst-cased exactly when it hurts most: `any()`
-        # only short-circuits early if a second-level job happens to sit
-        # near the front of the job set.
-        self._needs_subminute_cache = None  # type: Optional[bool]
-        # Memoized name -> config position, same lifecycle again. The fire
-        # pass needs the due names in CONFIG order and used to recover it by
-        # walking every job in cron_jobs; the index exists so a pass is
-        # O(due), and rebuilding the order per pass threw that away.
-        self._job_pos_cache = None  # type: Optional[Dict[str, int]]
-        # Memoized "does any job carry an sla block", same lifecycle. The
-        # once-a-minute SLA pass walks the whole job set to answer it, in the
-        # overwhelmingly common case where the feature is unused.
-        self._any_sla_cache = None  # type: Optional[bool]
+        self.cron_jobs: dict[str, JobConfig] = OrderedDict()
+        # orchestration DAGs; empty keeps the classic no-DAG behaviour.
+        self.cron_dags: dict[str, DagConfig] = OrderedDict()
+        # Memo caches (these four plus _memo_gen and friends below): pure
+        # functions of cron_jobs, computed lazily; ALL must be invalidated
+        # at every point cron_jobs is reassigned (reload).
+        self._job_set_id_cache: str | None = None
+        self._needs_subminute_cache: bool | None = None
+        self._job_pos_cache: dict[str, int] | None = None
+        self._any_sla_cache: bool | None = None
         # list of cron jobs already running
         # name -> list of RunningJob
-        self.running_jobs = defaultdict(list)  # type: Dict[str, List[RunningJob]]
-        # name -> lock serialising maybe_launch_job per job. The
-        # Forbid/Replace gate reads running_jobs several awaits BEFORE the
-        # launch appends to it (cluster slot claim, subprocess spawn), so
-        # two concurrent entries for one job (a dashboard double-click, a
-        # manual start racing the scheduled fire, MCP) would both pass
-        # the gate and double-launch. Minted on first use; pruned with the
-        # other per-job maps on reload (never while held).
-        self._launch_locks = defaultdict(asyncio.Lock)  # type: Dict[str, asyncio.Lock]
-        # name -> the last scheduling slot (a UTC datetime) we launched the job
-        # in, retained for status/introspection.  Pruned on reload; the
-        # forward-only next-fire index below is what actually de-duplicates
-        # launches, so this no longer gates firing. See _launch_plan.
-        self._last_run_slot = {}  # type: Dict[str, datetime.datetime]
-        # name -> most recent finished run, for the web UI (in-memory only)
-        # name -> bounded history of recent finished runs, oldest first, for
-        # the web UI's history/stats view (in-memory only, like last_run).
-        # Both pruned on reload like _last_run_slot; initialized HERE, before
-        # the update_config() below runs _apply_reload the first time.
-        self.last_run = {}  # type: Dict[str, JobRunInfo]
-        self.run_history = defaultdict(lambda: deque(maxlen=RUN_HISTORY_LIMIT))  # type: Dict[str, Deque[JobRunInfo]]
+        self.running_jobs: dict[str, list[RunningJob]] = defaultdict(list)
+        # name -> lock serialising maybe_launch_job per job: the
+        # Forbid/Replace gate reads running_jobs several awaits before the
+        # launch appends, so unserialized entries could double-launch.
+        # Pruned on reload, never while held.
+        self._launch_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # name -> last launched slot, status/introspection only: the
+        # forward-only next-fire index is what de-duplicates launches.
+        self._last_run_slot: dict[str, datetime.datetime] = {}
+        # most recent finished run / bounded history per job (in-memory
+        # only); pruned on reload and initialized HERE, before the first
+        # update_config() runs _apply_reload.
+        self.last_run: dict[str, JobRunInfo] = {}
+        self.run_history: dict[str, deque[JobRunInfo]] = defaultdict(
+            lambda: deque(maxlen=RUN_HISTORY_LIMIT)
+        )
         # bounds concurrently-executing subprocess spawns (job and DAG-task
         # launches share it); see _SPAWN_BURST_LIMIT for the why.
         self._spawn_gate = asyncio.Semaphore(_SPAWN_BURST_LIMIT)
-        # the shared GET /jobs product memo, holding (etag, body, gz). See
-        # _JOBS_RESPONSE_TTL and _bust_response_memos.
+        # Per-endpoint response-product memos; policy lives in
+        # _shared_response_product, busting in _bust_response_memos.
+        # /metrics keeps one memo per exposition format.
         self._jobs_response_memo: _ResponseMemo[
-            Tuple[str, bytes, Optional[bytes]]
+            tuple[str, bytes, Optional[bytes]]
         ] = _ResponseMemo()
-        # the shared GET /metrics product memos, one per exposition format
-        # (each holding (body, gz)), so a deployment scraped in both formats
-        # memoizes both rather than thrashing one slot. See
-        # _METRICS_RESPONSE_TTL and _bust_response_memos.
-        self._metrics_response_memo: Dict[
-            bool, "_ResponseMemo[Tuple[bytes, Optional[bytes]]]"
+        self._metrics_response_memo: dict[
+            bool, "_ResponseMemo[tuple[bytes, Optional[bytes]]]"
         ] = {False: _ResponseMemo(), True: _ResponseMemo()}
-        # the shared GET /fleet product memo, holding (etag, body, gz). See
-        # _FLEET_RESPONSE_TTL and _bust_response_memos.
         self._fleet_response_memo: _ResponseMemo[
-            Tuple[str, bytes, Optional[bytes]]
+            tuple[str, bytes, Optional[bytes]]
         ] = _ResponseMemo()
-        # the shared GET /activity product memo, holding (etag, body, gz).
-        # See _ACTIVITY_RESPONSE_TTL and _bust_response_memos.
         self._activity_response_memo: _ResponseMemo[
-            Tuple[str, bytes, Optional[bytes]]
+            tuple[str, bytes, Optional[bytes]]
         ] = _ResponseMemo()
-        # Bumped by every _bust_response_memos call. Every scaffold build
-        # reads it before starting and re-checks it before storing, and a
-        # joiner re-checks it too before trusting a shared product (see
-        # _shared_response_product), so a bust that lands DURING a build
-        # cannot be undone by the pre-bust product arriving late. Without it
-        # a busted change fails to render on the very next poll exactly when
-        # the fleet is large enough for the build to be slow.
+        # The MCP cron_query_metrics snapshot: the same universe /metrics
+        # renders, materialised once per window and filtered per call. It
+        # lives here rather than on the handler so _bust_response_memos
+        # reaches it (that clears .cached outright, which a handler-held
+        # slot would miss, serving pre-bust rows out to the TTL).
+        self._metric_samples_memo: _ResponseMemo[
+            list[tuple[str, str, str]]
+        ] = _ResponseMemo()
+        # Bumped by every _bust_response_memos call; builds re-check it
+        # before storing and joiners before trusting a shared product, so a
+        # bust landing DURING a slow build cannot be undone by the pre-bust
+        # product arriving late.
         self._memo_gen = 0
-        # active runtime pauses by job name (POST /jobs/{name}/pause). The
-        # fire path consults ONLY this map (never store I/O there); it is
-        # rehydrated from the durable paused/ streams at boot and refreshed
-        # on the housekeeping tick so peers sharing a store converge within
-        # about a minute. Expired entries are ignored by every reader
-        # (_pause_active) and swept by the housekeeping pass. Pruned by
-        # _apply_reload, so it too must exist before update_config() below.
-        self._paused: Dict[str, PauseInfo] = {}
-        # monotonic count of local pause/resume writes per job. The
-        # _pause_write_tail entry below is level-triggered and its own
-        # done-callback deletes it, so a write that starts AND finishes
-        # inside a refresh's store read leaves no trace there; this counter
-        # is edge-triggered, which is what lets the refresh discard a
-        # snapshot taken before a local change landed.
-        self._pause_gen: Dict[str, int] = {}
-        # pause records that could not be written because the store is
-        # configured but down, newest per job, replayed when it comes back
-        # (see _defer_pause_write). Both are pruned by _apply_reload like
-        # _paused, so both must exist before update_config() below.
-        self._pause_pending_writes: Dict[str, Dict[str, Any]] = {}
+        # active runtime pauses by name; the fire path consults ONLY this
+        # map (never store I/O there). Rehydrated at boot, refreshed on
+        # housekeeping; expired entries ignored by readers. Pruned by
+        # _apply_reload, so it must exist before update_config() below.
+        self._paused: dict[str, PauseInfo] = {}
+        # monotonic count of local pause/resume writes per job: edge-
+        # triggered so the refresh can discard a snapshot taken before a
+        # local change landed (the write tail alone cannot show one that
+        # started and finished inside the read).
+        self._pause_gen: dict[str, int] = {}
+        # pause records unwritten because the store is down, newest per
+        # job, replayed when it returns (_defer_pause_write). Pruned by
+        # _apply_reload, so must exist before update_config().
+        self._pause_pending_writes: dict[str, dict[str, Any]] = {}
         # name -> (finished_at, outcome) of the newest success/failure, for
-        # the onlyIfLastSucceeded gate (see _depends_on_past_ok). run_history
-        # is a bounded ring that a long pause floods with synthetic "skipped"
-        # rows, so the gate cannot rely on it alone. Pruned by _apply_reload
-        # like the trackers below, so it must exist before update_config().
-        self._last_real_outcome: Dict[str, Tuple[datetime.datetime, str]] = {}
-        # name -> (monotonic deadline, payload): the short-lived trends cache
-        # (see JOB_TRENDS_CACHE_TTL / job_trends_payload). Busted per job by
-        # _record_run, so it never outlives a locally finished run.
-        self._trends_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-        # name -> finished_at of the newest row that represents an actual
-        # run (anything but a synthetic "skipped"), for the retry ladder's
-        # superseded-by-run guards. last_run alone cannot serve them: a
+        # the onlyIfLastSucceeded gate: run_history is a bounded ring a
+        # long pause floods with synthetic "skipped" rows, so the gate
+        # cannot rely on it alone. Must exist before update_config().
+        self._last_real_outcome: dict[str, tuple[datetime.datetime, str]] = {}
+        # name -> (monotonic deadline, payload): trends cache; busted per
+        # job by _record_run so it never outlives a locally finished run.
+        self._trends_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # name -> finished_at of the newest ACTUAL run (not a synthetic
+        # "skipped"), for the retry ladder's superseded-by-run guards: a
         # pause-held slot stamps a fresh finished_at on a row where nothing
-        # ran, which would settle a pending ladder as if the run happened.
-        # Pruned by _apply_reload like the trackers around it, so it must
-        # exist before the update_config() below.
-        self._last_completed_at: Dict[str, datetime.datetime] = {}
-        # The SLA monitor's trackers (see _sla_periodic). All name-keyed
-        # runtime state pruned by _apply_reload like _last_run_slot, so all
-        # four must exist before the update_config() below.
-        # name -> the finished_at of the job's newest known success: fed by
-        # _record_run, warmed from the durable ledger at rehydrate. The
-        # maxTimeSinceSuccess reference; a job with no entry is baselined on
-        # _process_start so a stateless boot never pages instantly.
-        self._sla_last_success = {}  # type: Dict[str, datetime.datetime]
+        # ran. Must exist before update_config().
+        self._last_completed_at: dict[str, datetime.datetime] = {}
+        # SLA monitor trackers (_sla_periodic); all pruned by
+        # _apply_reload, so all must exist before update_config() below.
+        # name -> newest known success (the maxTimeSinceSuccess reference);
+        # no entry baselines on _process_start so a stateless boot never
+        # pages instantly.
+        self._sla_last_success: dict[str, datetime.datetime] = {}
         # name -> the newest scheduling slot recorded while the job was NOT
         # paused (pause-skipped slots are excused from lateAfter).
-        self._sla_due = {}  # type: Dict[str, datetime.datetime]
-        # name -> wall-clock instant of the newest actual launch (scheduled,
-        # manual, catch-up or retry); any launch at/after the due slot
-        # clears the lateAfter breach condition.
-        self._sla_last_start = {}  # type: Dict[str, datetime.datetime]
-        # (name, check) -> the instant the breach was first seen: the latch.
+        self._sla_due: dict[str, datetime.datetime] = {}
+        # name -> instant of the newest actual launch; any launch at/after
+        # the due slot clears the lateAfter breach condition.
+        self._sla_last_start: dict[str, datetime.datetime] = {}
+        # (name, check) -> instant the breach was first seen: the latch.
         # Present = breached (onLate already fired once); absent = ok.
         # In-memory only, so a restart re-fires a still-breached check once.
-        self._sla_state = {}  # type: Dict[Tuple[str, str], datetime.datetime]
+        self._sla_state: dict[tuple[str, str], datetime.datetime] = {}
         # the maxTimeSinceSuccess fallback baseline (see _sla_last_success).
         self._process_start = get_now(datetime.timezone.utc)
-        # name -> when the job first entered cron_jobs; seeded and pruned by
-        # _apply_reload (which runs from update_config() below, so every
-        # boot-present job is baselined on the process start beside it). The
-        # maxTimeSinceSuccess reference for a job with no success on record:
-        # a job a RELOAD added to a long-running daemon must age into the
-        # breach from when it appeared, not from a process start it predates.
-        self._sla_first_seen = {}  # type: Dict[str, datetime.datetime]
-        # name -> the (since, ended_at) of finished pause windows, disjoint and
-        # newest last. Deliberately held time is credited against
-        # maxTimeSinceSuccess, so a resumed job gets a full threshold before it
-        # can page instead of paging the instant the pause lifts.
-        self._sla_pause_windows: Dict[
-            str, List[Tuple[datetime.datetime, datetime.datetime]]
+        # name -> when the job first entered cron_jobs: the staleness
+        # reference for a reload-added job, which must age from when it
+        # appeared, not a process start it predates.
+        self._sla_first_seen: dict[str, datetime.datetime] = {}
+        # name -> finished pause windows (disjoint, newest last), credited
+        # against maxTimeSinceSuccess so a resumed job gets a full
+        # threshold before it can page.
+        self._sla_pause_windows: dict[
+            str, list[tuple[datetime.datetime, datetime.datetime]]
         ] = {}
-        # name -> when a job's current DISABLED span began. Banked as a
-        # staleness credit (through _sla_bank_pause, the same machinery a
-        # pause uses) when the job is re-enabled, so a job that HAD succeeded
-        # then sat disabled past maxTimeSinceSuccess does not page the whole
-        # switched-off span the instant it is switched back on. Node-local,
-        # like _sla_pause_windows.
-        self._sla_disabled_since = {}  # type: Dict[str, datetime.datetime]
-        # The next-fire index: name -> the aware-UTC instant the job next
-        # fires, for every enabled CronTab job (a @reboot/string schedule or a
-        # disabled job is absent). _fire_heap is a min-heap of (when, name)
-        # over the same data, to find the soonest fire in O(1) and pop the due
-        # jobs in O(due log n); it may hold STALE entries (a name reseeded or
-        # removed on reload), validated against _next_fire lazily on pop. This
-        # replaces scanning every job with crontab.test each tick: the loop
-        # sleeps until the soonest fire and only touches jobs actually due.
-        self._next_fire = {}  # type: Dict[str, datetime.datetime]
-        self._fire_heap = []  # type: List[tuple[datetime.datetime, str]]
-        # names already warned about a schedule with no future occurrence,
-        # so the seeding pass says it loudly ONCE instead of every minute;
-        # pruned on reload so a changed schedule re-warns if still dead.
-        self._dead_schedules = set()  # type: Set[str]
-        # wall-clock minute of the last housekeeping pass (config reload,
-        # cluster/web (re)start, logging). Gates that work to once per minute
-        # even while a second-level job wakes the loop far more often. run().
+        # name -> start of the current DISABLED span; banked as staleness
+        # credit on re-enable (via _sla_bank_pause). Node-local.
+        self._sla_disabled_since: dict[str, datetime.datetime] = {}
+        # Next-fire index: name -> aware-UTC next fire for every enabled
+        # CronTab job. _fire_heap is a min-heap over the same data and may
+        # hold STALE entries (names reseeded/removed on reload), validated
+        # lazily against _next_fire on pop.
+        self._next_fire: dict[str, datetime.datetime] = {}
+        self._fire_heap: list[tuple[datetime.datetime, str]] = []
+        # names already warned about a no-future-occurrence schedule (warn
+        # once); pruned on reload so a changed schedule re-warns.
+        self._dead_schedules: set[str] = set()
+        # wall-clock minute of the last housekeeping pass; gates that work
+        # to once per minute even when sub-minute jobs wake the loop.
         self._last_housekeeping_minute: Optional[datetime.datetime] = None
-        # Config-reload skip cache. strictyaml is a slow pure-Python parser,
-        # so rereading and reparsing the whole config on every once-a-minute
-        # housekeeping pass when nothing changed on disk is pure wasted CPU (in
-        # a worker thread, but still real work + thread-pool churn). We
-        # remember the set of files the last successful parse read, a cheap
-        # stat fingerprint of them, and the config it produced; reload_config
-        # skips the reparse whenever the fingerprint is unchanged. See
-        # _config_signature / reload_config.
-        self._config_sources: FrozenSet[str] = frozenset()
+        # Config-reload skip cache: sources, stat fingerprint, and the
+        # config produced; reload_config skips the reparse when the
+        # fingerprint is unchanged.
+        self._config_sources: frozenset[str] = frozenset()
         self._config_sig: Optional[tuple] = None
         self._last_config: Optional[CronstableConfig] = None
-        # the optional `notify:` block: a report config fired on daemon events
-        # (DAG failures, approval gates, leadership/quorum changes). None keeps
-        # the classic job-runs-only reporting. Set from config in both the
-        # config_yaml (test) path below and in _apply_reload.
-        self._notify_config: Optional[Dict[str, Any]] = None
-        # the optional `push:` section's running service (device registry +
-        # relay client) and the config it was built from; managed by
-        # start_stop_push on every housekeeping pass. The service is also
-        # published module-globally (cronstable.push.set_service) so the
-        # stateless reporter singletons can reach it.
+        # the optional `notify:` block; None keeps job-runs-only reporting.
+        # Set in both the config_yaml (test) path below and _apply_reload.
+        self._notify_config: Optional[dict[str, Any]] = None
+        # the `push:` section's running service and its source config,
+        # managed by start_stop_push; also published module-globally
+        # (push.set_service) for the stateless reporter singletons.
         self._push_service: Optional[push.PushService] = None
-        self._applied_push_config: Optional[Dict[str, Any]] = None
-        # the opt-in Bonjour/mDNS advert; follows the web app's lifecycle
-        # (converged at the tail of start_stop_web_app, stopped on exit).
+        self._applied_push_config: Optional[dict[str, Any]] = None
+        # the opt-in Bonjour/mDNS advert; follows the web app's lifecycle.
         self._bonjour = discovery.BonjourAdvertiser()
-        # cluster-wide concurrency slots (concurrencyScope: cluster): the
-        # TTL lease each slot-gated job holds while it runs here, the renew
-        # task keeping it alive, a per-job asyncio.Lock serializing
-        # claim/release (an unserialized release racing the next claim
-        # could revoke the fresh claim's lease; same-holder re-acquire
-        # keeps the fence, so a stale release still matches), and the
-        # single-flight Replace pursuit tasks waiting out a foreign holder.
-        # Declared ABOVE the config load below because _apply_reload's prune
-        # block reads all five, and the constructor's own first load goes
-        # through it.
-        self._slot_leases: Dict[str, Lease] = {}
-        self._slot_renewers: Dict[str, asyncio.Task] = {}
-        self._slot_locks: Dict[str, asyncio.Lock] = {}
-        self._slot_pursuits: Dict[str, asyncio.Task] = {}
-        # count of live users of each job's slot: every successful claim
-        # (one per launched instance) increments, every finished instance
-        # of a cluster-scoped job decrements; the lease is released only at
-        # zero. A plain running_jobs emptiness check would race the window
-        # between a claim succeeding and its RunningJob being registered
-        # (the subprocess spawn awaits in between).
-        self._slot_refs: Dict[str, int] = {}
+        # cluster-wide concurrency slots: lease per running slot-gated job,
+        # renew task, per-job claim/release lock (an unserialized release
+        # racing the next claim could revoke it), and single-flight Replace
+        # pursuits. Declared ABOVE the config load: _apply_reload's prune
+        # block reads all five.
+        self._slot_leases: dict[str, Lease] = {}
+        self._slot_renewers: dict[str, asyncio.Task] = {}
+        self._slot_locks: dict[str, asyncio.Lock] = {}
+        self._slot_pursuits: dict[str, asyncio.Task] = {}
+        # live users of each job's slot; the lease is released only at
+        # zero. A plain running_jobs check would race the window between a
+        # claim succeeding and its RunningJob being registered.
+        self._slot_refs: dict[str, int] = {}
         self.config_arg = config_arg
         if config_arg is not None:
             self.update_config()
@@ -2190,182 +1935,134 @@ class Cron:
             self._job_pos_cache = None
             self._any_sla_cache = None
 
-        self._wait_for_running_jobs_task = None  # type: Optional[asyncio.Task]
+        self._wait_for_running_jobs_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._jobs_running = asyncio.Event()
-        self.retry_state = {}  # type: Dict[str, JobRetryState]
-        self.web_runner = None  # type: Optional[web.AppRunner]
-        self.web_config = None  # type: Optional[WebConfig]
-        # (scheme, socket name) per successfully bound TCP listener of the
-        # RUNNING web app, in listen order, recorded as each site starts:
-        # the Bonjour advert must name a port, scheme and address that all
-        # belong to one listener, which nothing can reconstruct after the
-        # fact (runner.addresses has no schemes and skips failed binds).
-        self._web_tcp_bound = []  # type: List[Tuple[str, Any]]
-        # On-disk fingerprint of the web.tls files as the RUNNING listener
-        # loaded them. The SSLContext is built once per (re)start and never
-        # reloaded, so an in-place rotation (same paths, new bytes, which is
-        # how cert-manager / Vault / a Kubernetes secret refresh renews) is
-        # otherwise invisible and the daemon serves the old certificate until
-        # it expires. Only meaningful while web_runner is not None, which is
-        # why every teardown clears it. See _web_tls_files_changed.
-        self._web_tls_signature = None  # type: Optional[Dict[str, Any]]
-        # the optional MCP server config and its handler. Both track the web
-        # app's lifecycle: the handler is (re)built inside start_stop_web_app
-        # so it always reflects the current config after a reload.
-        self.mcp_config = None  # type: Optional[MCPConfig]
-        self._mcp = None  # type: Optional[Any]
-        # Live SSE log-tail subscriptions, so a web-app teardown can end them
-        # (via the end-of-output sentinel) BEFORE aiohttp waits its shutdown
-        # timeout for in-flight handlers. A tail never finishes on its own:
-        # site.stop() only closes the listening socket and the keep-alive
-        # pings keep succeeding on the established connection, so without
-        # this every restart with an open tail froze the housekeeping loop
-        # (and with it all job launches) for the full 60s timeout.
-        # _web_draining refuses tails that arrive mid-teardown, after the
-        # sentinel broadcast already happened.
-        self._web_sse_queues = set()  # type: "set[asyncio.Queue]"
+        self.retry_state: dict[str, JobRetryState] = {}
+        self.web_runner: web.AppRunner | None = None
+        self.web_config: WebConfig | None = None
+        # (scheme, socket name) per bound TCP listener of the RUNNING web
+        # app, in listen order: the Bonjour advert needs a port, scheme and
+        # address from ONE listener, unreconstructable after the fact
+        # (runner.addresses has no schemes and skips failed binds).
+        self._web_tcp_bound: list[tuple[str, Any]] = []
+        # fingerprint of the web.tls files as the RUNNING listener loaded
+        # them (an in-place rotation is otherwise invisible); cleared on
+        # every teardown. See _web_tls_files_changed.
+        self._web_tls_signature: dict[str, Any] | None = None
+        # the optional MCP config and handler; (re)built inside
+        # start_stop_web_app so they track reloads.
+        self.mcp_config: MCPConfig | None = None
+        self._mcp: Any | None = None
+        # live SSE log tails, ended (via the sentinel) BEFORE aiohttp's
+        # shutdown wait: a tail never finishes on its own and would freeze
+        # teardown for the full 60s timeout. _web_draining refuses tails
+        # arriving mid-teardown.
+        self._web_sse_queues: "set[asyncio.Queue]" = set()
         self._web_draining = False
         # the leadership backend, when a cluster section is configured
         self.cluster_manager: Optional[LeadershipBackend] = None
-        # optional gossip observability overlay: a SECOND, election-inert
-        # gossip manager stood up alongside a lease leadership backend so a
-        # kubernetes/etcd/filesystem cluster can still share fleet data
-        # (per-node CPU/memory + job summaries). None when unused, including
-        # backend: gossip, where the election mesh (cluster_manager) already
-        # carries fleet data and IS the fleet backend. See
-        # start_stop_observability and _fleet_backend.
+        # optional election-inert second gossip manager so non-gossip
+        # clusters can share fleet data; None when unused (with backend:
+        # gossip the election mesh already IS the fleet backend).
         self.observability_mesh: Optional[LeadershipBackend] = None
-        # the durable state backend, when a `state` section is configured; None
-        # keeps cronstable's classic stateless, in-memory behaviour. See
-        # start_stop_state and cronstable.state.
+        # durable state backend when a `state` section is configured; None
+        # keeps the classic stateless behaviour.
         self.state_backend: Optional[StateBackend] = None
-        # in-flight fire-and-forget durable run-record writes, tracked so they
-        # are not GC'd mid-flight and can be flushed on shutdown. Durability is
-        # never allowed to gate the loop, so _record_run schedules the write
-        # here rather than awaiting it.
-        self._pending_state_writes: Set[asyncio.Task] = set()
-        # in-flight daemon-event notification fan-outs (the `notify:` block),
-        # spawned fire-and-forget off the raising loop (a slow SMTP/webhook
-        # reporter must never stall the scheduling or cluster loop); tracked so
-        # they are not GC'd mid-flight and can be cancelled at shutdown. See
-        # _dispatch_notify.
-        self._notify_tasks: Set[asyncio.Task] = set()
-        # in-flight report+retry-arm sequences of finished jobs, spawned off
-        # the reaper loop (one slow SMTP/webhook reporter must not stall every
-        # other job's completion handling); tracked so shutdown can drain them
-        # after the running-job drain, and chained per job name via
-        # _completion_tail so overlapping instances of one job are handled in
-        # finish order. See _queue_job_completion.
-        self._completion_tasks: Set[asyncio.Task] = set()
-        self._completion_tail: Dict[str, asyncio.Task] = {}
-        # the monitor's onLate reports get their OWN per-job tail: they are
-        # tracked in _completion_tasks (so shutdown drains them) and ordered
-        # behind _completion_tail, but must never BECOME it: a slow reporter
-        # sitting in the completion tail would delay the report and retry
-        # arming of a real run finishing behind it. See _queue_sla_report.
-        self._sla_report_tail: Dict[str, asyncio.Task] = {}
+        # in-flight fire-and-forget durable writes, tracked so they are not
+        # GC'd mid-flight and can be flushed at shutdown; durability never
+        # gates the loop.
+        self._pending_state_writes: set[asyncio.Task] = set()
+        # in-flight notify fan-outs, fire-and-forget (a slow reporter must
+        # never stall the loop); cancelled at shutdown.
+        self._notify_tasks: set[asyncio.Task] = set()
+        # in-flight completion sequences of finished jobs; drained at
+        # shutdown and chained per job via _completion_tail so overlapping
+        # instances are handled in finish order.
+        self._completion_tasks: set[asyncio.Task] = set()
+        self._completion_tail: dict[str, asyncio.Task] = {}
+        # onLate reports get their OWN per-job tail: ordered behind
+        # _completion_tail but never BECOMING it, or a slow reporter would
+        # delay a real run's report and retry arming.
+        self._sla_report_tail: dict[str, asyncio.Task] = {}
         # whether the in-memory history has been warmed from the durable ledger
         # yet; rehydration runs once, on the first successful backend start.
         self._state_rehydrated = False
         # how many finished runs to retain per job in the durable ledger; set
         # from state.maxRunsPerJob when the backend starts. <= 0 disables.
         self._state_max_runs = 0
-        # whether missed-run catch-up has fully resolved; evaluation starts on
-        # the first start-up pass but is NOT latched while it cannot actually
-        # run yet (the state backend failed to start and is being retried, or
-        # the cluster has no positive owner): latching there would forfeit
-        # the owed backfill forever. See _catch_up.
+        # whether missed-run catch-up has fully resolved; NOT latched while
+        # it cannot actually run yet (backend retrying, no positive cluster
+        # owner), or the owed backfill would be forfeited. See _catch_up.
         self._caught_up = False
-        # job names whose catch-up decision is final (backfill scheduled,
-        # nothing owed, or positively delegated to another node's owner), so
-        # an unresolved job elsewhere does not re-process them next pass.
-        self._catchup_done: Set[str] = set()
+        # names whose catch-up decision is final, so unresolved jobs
+        # elsewhere do not re-process them next pass.
+        self._catchup_done: set[str] = set()
         # loop-clock gate for re-evaluating unresolved catch-up (see
         # CATCHUP_RECHECK_INTERVAL); 0.0 means "evaluate on the next pass".
         self._catchup_next_retry = 0.0
-        # the instant of the FIRST catch-up evaluation: deferred retries
-        # (backend down at boot) must count missed slots against this, not a
-        # later "now"; the live scheduler ran (statelessly) in between, so
-        # a later window would replay runs that actually happened.
+        # instant of the FIRST catch-up evaluation: deferred retries count
+        # missed slots against this, not a later "now" (the live scheduler
+        # ran statelessly in between).
         self._catchup_reference: Optional[datetime.datetime] = None
-        # the in-flight catch-up evaluation, when one is running.  The
-        # evaluation awaits bounded store reads (up to STATE_OP_TIMEOUT
-        # each), so it runs as a background task rather than inline on the
-        # scheduler pass: a slow-but-alive mount must degrade catch-up, not
-        # delay job launches.
+        # in-flight catch-up evaluation; a background task, never inline
+        # (a slow mount must degrade catch-up, not delay launches).
         self._catchup_eval_task: Optional[asyncio.Task] = None
-        # whether the loaded config HAS a state section, tracked separately
-        # from state_backend so catch-up can tell "no durability configured"
-        # (latch and warn) from "configured but not started yet" (retry).
+        # whether the loaded config HAS a state section, so catch-up can
+        # tell "no durability configured" (latch and warn) from
+        # "configured but not started yet" (retry).
         self._state_configured = False
-        # effective state.onStoreUnavailable policy while a state section is
-        # configured: "degrade" (default: gates fail open, writes drop with
-        # a warning) or "fail-closed" (durable-truth gates prefer not
-        # running). Reset to "degrade" when the section is removed.
+        # effective state.onStoreUnavailable: "degrade" (gates fail open,
+        # writes drop with a warning) or "fail-closed" (durable-truth gates
+        # prefer not running); reset when the section is removed.
         self._state_on_unavailable = "degrade"
         # effective state.gcGraceSeconds; <= 0 disables automatic GC.
         self._state_gc_grace = 0.0
-        # host tag for the host-scoped durable streams (counter snapshots,
-        # @reboot boot markers): stable across restarts, unlike the state
-        # backend's per-process instance id, so a restarted daemon can
-        # reclaim its own records.
+        # host tag for host-scoped durable streams; stable across restarts
+        # (unlike the backend's per-process instance id) so a restarted
+        # daemon reclaims its own records.
         self._state_host = socket.gethostname() or "localhost"
         # loop-clock instant before which the next durable counter snapshot
         # is skipped (see COUNTER_SNAPSHOT_INTERVAL).
         self._counter_snapshot_next = 0.0
         # whether this PROCESS already seeded the Prometheus accumulators
-        # from a durable snapshot. Never reset (unlike _state_rehydrated):
-        # seeding ADDS into live counters, so a second seed (e.g. after a
-        # state.path change swapped stores) would double-count.
+        # from a durable snapshot. Never reset: seeding ADDS into live
+        # counters, so a second seed would double-count.
         self._counters_seeded = False
         # loop-clock instants the next manifest write / GC pass are due.
         self._manifest_next = 0.0
         self._gc_next = 0.0
-        # loop-clock instants the next paused/ refresh and foreign-retry claim
-        # scan are due (see PAUSE_REFRESH_INTERVAL). Single-flight on the task
-        # handles below is not a cadence: without these both re-spawn as fast
-        # as the store can answer once housekeeping runs more than once a
-        # minute.
+        # loop-clock instants the next paused/ refresh and foreign-retry
+        # claim scan are due (single-flight alone is not a cadence).
         self._pause_refresh_next = 0.0
         self._retry_claim_next = 0.0
         # the in-flight GC pass, if any (single-flight; a slow store must
         # not stack passes).
         self._gc_task: Optional[asyncio.Task] = None
-        # the newest in-flight retry-ladder write per job, so ladder records
-        # can be ORDERED (a settle chained after its pending): two
-        # unordered fire-and-forget appends could land newest-first
-        # inverted and resurrect a consumed retry on the next boot.
-        self._retry_write_tail: Dict[str, asyncio.Task] = {}
-        # the newest in-flight pause-stream write per job: pause records are
-        # newest-record-wins, so a pause and the resume racing it must land
-        # in event order (the _retry_write_tail rationale). Also consulted
-        # by the housekeeping refresh, so a store re-read cannot clobber a
-        # local change whose write has not landed yet.
-        self._pause_write_tail: Dict[str, asyncio.Task] = {}
+        # newest in-flight retry-ladder write per job, so a settle chains
+        # after its pending: unordered appends could land inverted and
+        # resurrect a consumed retry on the next boot.
+        self._retry_write_tail: dict[str, asyncio.Task] = {}
+        # newest in-flight pause write per job (same ordering rationale);
+        # also consulted by the refresh, so a store re-read cannot clobber
+        # a local change whose write has not landed yet.
+        self._pause_write_tail: dict[str, asyncio.Task] = {}
         # the in-flight housekeeping refresh of the paused/ streams, if any
         # (single-flight; a slow store must not stack refresh passes).
         self._pause_refresh_task: Optional[asyncio.Task] = None
-        # same ordering guard for the in-flight run stream: the open and its
-        # paired close are separate fire-and-forget appends whose filename
-        # sort key is the wall clock read on each write's own worker thread,
-        # so for a near-instant run (e.g. a start_failed job) the close
-        # could sort BEFORE the open and leave "open" newest for a finished
-        # run, which the next restart would reconcile as a spurious
-        # interrupted run. Chaining each job's inflight writes keeps the
-        # close after the open.
-        self._inflight_write_tail: Dict[str, asyncio.Task] = {}
-        # latched when a @reboot boot-marker store op times out during the
-        # startup pass: the remaining @reboot jobs then apply the policy
-        # without more I/O instead of serially stalling the first
-        # scheduling pass ~20s per job on a hung mount.
+        # same ordering guard for the inflight/ stream: a near-instant
+        # run's close could sort BEFORE its open, which the next restart
+        # would reconcile as a spurious interrupted run.
+        self._inflight_write_tail: dict[str, asyncio.Task] = {}
+        # latched when a @reboot marker op times out during startup, so the
+        # remaining @reboot jobs apply the policy without more I/O instead
+        # of serially stalling the first pass on a hung mount.
         self._reboot_gate_sick = False
-        # in-flight catch-up launch tasks (each may sleep its per-job jitter
-        # before launching), tracked so they are not GC'd and can be cancelled
-        # on shutdown.
-        self._catchup_tasks: Set[asyncio.Task] = set()
+        # in-flight catch-up launch tasks, tracked so they are not GC'd and
+        # can be cancelled on shutdown.
+        self._catchup_tasks: set[asyncio.Task] = set()
         # last job-set id we logged, so reloads only log it again on change
-        self._logged_job_set_id = None  # type: Optional[str]
+        self._logged_job_set_id: str | None = None
         # whether the loaded config asks us to gate jobs on leader election;
         # tracked separately from cluster_manager so the gate can fail closed
         # even when the manager failed to start.
@@ -2384,54 +2081,37 @@ class Cron:
         # @reboot Leader/PreferLeader jobs that could not start at boot because
         # the cluster had not yet elected an owner; run once on convergence.
         # name -> JobConfig; see _process_pending_reboots.
-        self._pending_reboot_jobs = {}  # type: Dict[str, JobConfig]
-        # @reboot jobs whose boot run a pause DEFERRED (never forfeited): the
-        # boot marker is left unwritten, so the run is still owed after a
-        # daemon restart inside the same OS boot, and _process_paused_reboots
-        # fires it once the pause lifts.
-        self._paused_reboot_jobs = set()  # type: Set[str]
-        # A per-PROCESS token stamped into in-flight run records (with the
-        # host and pid), so reconciliation can tell "a previous daemon on
-        # this host wrote this" from "this very process wrote it"; the
-        # state backend's own instance id will not do, because a state-
-        # section reload rebuilds the backend (new id) while runs from this
-        # process are still live.
+        self._pending_reboot_jobs: dict[str, JobConfig] = {}
+        # @reboot runs a pause DEFERRED (never forfeited): the marker stays
+        # unwritten so the run is still owed after a same-boot restart;
+        # _process_paused_reboots fires it once the pause lifts.
+        self._paused_reboot_jobs: set[str] = set()
+        # per-PROCESS token stamped into in-flight run records: the state
+        # backend's instance id will not do, since a state-section reload
+        # rebuilds the backend while this process's runs are still live.
         self._proc_token = os.urandom(6).hex()
         # effective state.slotTtlSeconds while a state section is configured
         self._slot_ttl = 30.0
-        # lock-fidelity latch for the slot gate: None until probed, then
-        # either "" (locks behave) or the human reason they cannot be
-        # trusted (treated per onStoreUnavailable at each claim). Reset
-        # whenever the backend is rebuilt.
+        # lock-fidelity latch for the slot gate: None until probed, "" when
+        # locks behave, else the reason they cannot be trusted. Reset when
+        # the backend is rebuilt.
         self._slot_fidelity: Optional[str] = None
-        # the in-flight cross-node retry claim scan, if any (single-flight,
-        # spawned from the housekeeping pass; see _retry_claim_scan).
+        # the in-flight cross-node retry claim scan, if any (single-flight;
+        # see _retry_claim_scan).
         self._retry_claim_task: Optional[asyncio.Task] = None
-        # the loopback job-state API (cronstable.jobapi.JobStateAPI),
-        # built when a `state` section with jobApi enabled starts and torn
-        # down when the backend is (its per-run tokens and staged secrets go
-        # with it). None keeps the classic behaviour: no endpoint, no injected
-        # CRONSTABLE_STATE_* env, jobs unaware of the store.
+        # the loopback job-state API, built when state.jobApi starts and
+        # torn down with the backend; None keeps the classic behaviour (no
+        # endpoint, no injected CRONSTABLE_STATE_* env).
         self._job_api: Optional["JobStateAPI"] = None
-        # On-disk fingerprint of the job API's TLS files (cert/key) as the
-        # RUNNING listener loaded them, or None for a plaintext endpoint. The
-        # SSLContext is built once inside JobStateAPI.start() and never
-        # reloaded, so an in-place rotation (same paths, new bytes) is
-        # otherwise invisible and the endpoint keeps serving the old
-        # certificate until it expires. The web-app analogue is
-        # _web_tls_signature; only meaningful while _job_api is not None, which
-        # is why _stop_job_api clears it. See _job_api_tls_files_changed.
-        self._job_api_tls_signature = None  # type: Optional[Dict[str, Any]]
-        # the durable DAG orchestrator (cronstable.dagrun.DagScheduler);
-        # inert until a `dags:` section and a state backend are configured. It
-        # holds a back-reference to this Cron and reuses its state/lease/launch
-        # seams. Constructed here (cheaply) so every code path has it.
+        # job-API analogue of _web_tls_signature (same in-place-rotation
+        # rationale); cleared by _stop_job_api.
+        self._job_api_tls_signature: dict[str, Any] | None = None
+        # the durable DAG orchestrator; inert until `dags:` plus a state
+        # backend are configured. Constructed here so every path has it.
         self._dag = DagScheduler(self)
-        # Whether the last _sleep_interval() was shortened by a DAG wake, i.e.
-        # whether this loop is currently ticking sub-minute for the
-        # orchestrator's sake. run()'s housekeeping gate reads it through
-        # _wakes_subminute; False until the first sleep is computed, which is
-        # the safe direction (the startup pass housekeeps unconditionally).
+        # whether the last _sleep_interval() was shortened by a DAG wake;
+        # read via _wakes_subminute. False until the first sleep, the safe
+        # direction (the startup pass housekeeps unconditionally).
         self._dag_shortens_sleep = False
 
     async def run(self) -> None:
@@ -2442,24 +2122,15 @@ class Cron:
         startup = True
         applied_logging_config: Optional[LoggingConfig] = None
         while not self._stop_event.is_set():
-            # Housekeeping (reloading the config from disk, (re)starting the
-            # cluster manager and web app, applying logging config) runs at
-            # most once per wall-clock minute. When a sub-minute schedule makes
-            # the loop tick every second (see the sleep below), rereading and
-            # reparsing the config 60 times a minute would be pointless IO/CPU,
-            # so gate it: config-reload latency stays ~1 minute, exactly as in
-            # the minute-tick era. In pure minute-tick mode (no second-level
-            # job and no DAG shortening the sleep) `not _wakes_subminute()`
-            # forces housekeeping every iteration, so behaviour there is
-            # byte-identical to before, and a frozen-clock test still reloads
-            # every loop.
+            # Housekeeping runs at most once per wall-clock minute even when
+            # a sub-minute schedule ticks faster. In pure minute-tick mode
+            # `not _wakes_subminute()` forces it every iteration, so a
+            # frozen-clock test still reloads every loop.
             now_minute = get_now(datetime.timezone.utc).replace(
                 second=0, microsecond=0
             )
-            # None when housekeeping is skipped this tick, or until the reload
-            # succeeds; on failure we keep running the previously loaded jobs
-            # (reload_config only swaps self.cron_jobs on a clean parse) and
-            # must not dereference an unbound config below.
+            # None when housekeeping is skipped or the reload failed; on
+            # failure we keep running the previously loaded jobs.
             config: Optional[CronstableConfig] = None
             if (
                 startup
@@ -2468,31 +2139,21 @@ class Cron:
             ):
                 self._last_housekeeping_minute = now_minute
                 try:
-                    # reload_config runs the disk read + full reparse OFF the
-                    # event loop (in a worker thread), so a slow parse no
-                    # longer freezes the whole loop (web API, cluster gossip,
-                    # job output pumping) for its duration once a minute. The
-                    # parsed job set is applied here, on the loop thread, and
-                    # BEFORE _service_slots below, so the cluster gate is in
-                    # place before the first spawn_jobs (a reload that enables
-                    # electLeader must gate its Leader jobs on that same tick,
-                    # not one tick late).
+                    # reload_config reparses OFF the loop; the job set is
+                    # applied here BEFORE _service_slots, so the cluster
+                    # gate is in place before the first spawn_jobs (a
+                    # reload enabling electLeader gates that same tick).
                     config = await self.reload_config()
                     self._log_job_set_id()
                     await self.start_stop_cluster(config.cluster_config)
-                    # the gossip observability overlay (lease clusters that opt
-                    # into cluster.observability); after start_stop_cluster so
-                    # the election backend exists first. No-op otherwise.
+                    # gossip observability overlay; after start_stop_cluster
+                    # so the election backend exists first.
                     await self.start_stop_observability(config.cluster_config)
                     await self.start_stop_state(config.state_config)
-                    # after the state backend (whose store the device
-                    # registry may ride); never raises, logs its own woes.
-                    # That guarantee is load-bearing here, not politeness:
-                    # push sits directly in front of _state_periodic, and
-                    # anything escaping it skipped the durable-state
-                    # manifest and garbage collection for that pass AND
-                    # every later one (the push config never records as
-                    # applied, so the next pass repeats the same failure).
+                    # after the state backend (the device registry may ride
+                    # its store); never raises, which is load-bearing:
+                    # anything escaping here would skip _state_periodic on
+                    # this and every later pass.
                     await self.start_stop_push(config.push_config)
                     # periodic durable-state chores (manifest, GC): cheap
                     # due-checks that spawn tracked background tasks.
@@ -2507,15 +2168,10 @@ class Cron:
                     logger.exception("please report this as a bug (1)")
                 self._pause_and_sla_periodic()
                 if config is not None:
-                    # The web app starts AFTER the cluster and under its OWN
-                    # error handling: a web misconfiguration raising a
-                    # ConfigError (an authToken that resolves empty) used to
-                    # share the try/except above and skip start_stop_cluster
-                    # entirely, so _elect_leader_configured stayed False and
-                    # every node ran every Leader job ungated: the gate
-                    # failed OPEN on an unrelated web error, on startup and on
-                    # every reload iteration. The cluster gate must engage
-                    # regardless of the web app's fate.
+                    # The web app starts AFTER the cluster, under its OWN
+                    # error handling: a shared try would let a web
+                    # ConfigError skip start_stop_cluster and fail the
+                    # Leader gate OPEN.
                     try:
                         await self.start_stop_web_app(
                             config.web_config, config.mcp_config
@@ -2545,24 +2201,19 @@ class Cron:
                             config.logging_config,
                         )
                     else:
-                        # only mark applied on success, and re-apply when the
-                        # config changes, so a fixed-after-error logging
-                        # section is picked up on reload without a restart.
+                        # mark applied only on success, so a fixed-after-
+                        # error logging section is picked up on reload.
                         applied_logging_config = config.logging_config
             # Service the due job(s). _service_slots re-reads the clock AFTER
             # the (possibly slow) housekeeping above, so a fire the reload
             # pushed past is still serviced instead of silently dropped.
             await self._service_slots(startup)
             startup = False
-            # Sleep until the soonest job's next fire (or the next housekeeping
-            # minute, whichever is first). asyncio.wait_for schedules its
-            # timeout against loop.time() (the event loop's MONOTONIC clock),
-            # so the wait length is derived from the wall clock but realized
-            # monotonically: a wall-clock/NTP step during the sleep cannot
-            # stretch or collapse it, and (because firing compares the wall
-            # clock against the fixed, forward-only next-fire instants in the
-            # heap) a step is absorbed cleanly on the next wake rather than
-            # re-firing already-fired slots or unleashing a catch-up storm.
+            # Sleep until the soonest fire or the next housekeeping minute.
+            # wait_for realizes the wall-derived length on the loop's
+            # MONOTONIC clock, and next-fire instants are fixed and
+            # forward-only, so an NTP step neither stretches the sleep nor
+            # re-fires already-fired slots.
             sleep_interval = self._sleep_interval()
             logger.debug("Will sleep for %.1f seconds", sleep_interval)
             try:
@@ -2573,8 +2224,7 @@ class Cron:
         logger.info("Shutting down (after currently running jobs finish)...")
         while self.retry_state:
             # settle=None: a graceful stop must NOT settle the durable
-            # ladder records; surviving the restart (re-arming from the
-            # persisted "pending" on the next boot) is the entire point of
+            # ladder records; re-arming on the next boot is the point of
             # restart-durable retries.
             cancel_all = [
                 self.cancel_job_retries(name, settle=None)
@@ -2585,33 +2235,24 @@ class Cron:
         # Replace pursuit could otherwise LAUNCH a job mid-shutdown, and
         # the retry claim scan could arm a ladder nobody will run.
         self._cancel_coordination_tasks()
-        # Release leadership BEFORE waiting out the running-job drain: the
-        # drain is unbounded (it waits for every running job, no deadline),
-        # and keeping the gossip listener / lease renew loop alive through it
-        # would hold leadership on a node that no longer schedules anything,
-        # stalling every Leader job cluster-wide until the slowest local job
-        # finishes, instead of the documented release-on-graceful-stop
-        # failover. Retries were all cancelled above, so no retry task is
-        # left to consult the stopped manager. The cost is confined to the
-        # jobs still draining: the new owner may start one of those while it
-        # finishes here (the same overlap a crash produces), rather than the
-        # whole Leader-gated job set standing still.
+        # Release leadership BEFORE the unbounded running-job drain, or
+        # every Leader job cluster-wide would stall until the slowest
+        # local job finishes. Retries were all cancelled above. Cost: the
+        # new owner may start a still-draining job (same overlap a crash
+        # produces).
         if self.cluster_manager is not None:
             logger.info("Stopping cluster manager")
             await self.cluster_manager.stop()
             self.cluster_manager = None
-        # the observability overlay holds no leadership, so its teardown order
-        # relative to the drain does not matter; stop it here alongside the
-        # election manager so its gossip listener/poll loop is released too.
+        # the overlay holds no leadership, so order vs the drain does not
+        # matter; stop it alongside the election manager.
         if self.observability_mesh is not None:
             logger.info("Stopping cluster observability overlay")
             await self.observability_mesh.stop()
             self.observability_mesh = None
         await self._wait_for_running_jobs_task
-        # the reaper spawned each finished run's report+retry-arm sequence as
-        # its own task; drain those too (unbounded, exactly as the old inline
-        # awaits were) so failure/success reports still go out on a graceful
-        # stop.
+        # drain the reaper-spawned completion tasks so failure/success
+        # reports still go out on a graceful stop.
         await self._drain_completions()
         # the drain released every slot (each finish cancels its renewer);
         # belt-and-braces for renewers whose release write raced teardown.
@@ -2619,35 +2260,29 @@ class Cron:
             task.cancel()
         self._slot_renewers.clear()
 
-        # cancel any pending catch-up backfills (they also self-abort on the
-        # stop event, set above, but cancelling is prompt and tidy at exit),
-        # and any in-flight event notifications (best-effort, fire-and-forget:
-        # a half-sent alert is fine at exit, each reporter is time-bounded).
+        # cancel pending catch-up backfills and in-flight notifications
+        # (best-effort; each reporter is time-bounded).
         for task in list(self._catchup_tasks) + list(self._notify_tasks):
             task.cancel()
 
         if self.state_backend is not None:
-            # one last counter snapshot (unthrottled), so restart-durable
-            # counters lose at most the throttle window's worth of events;
-            # it joins the pending writes and is flushed (bounded) below.
+            # one last unthrottled counter snapshot; joins the pending
+            # writes and is flushed (bounded) below.
             self._track_state_write(self._persist_counter_snapshot())
-            # flush the in-flight durable run-record writes so the last few
-            # runs are not lost on a clean shutdown; bounded so a stuck store
-            # cannot hang the exit (its writes are simply abandoned).
+            # flush in-flight run-record writes, bounded so a stuck store
+            # cannot hang the exit.
             if self._pending_state_writes:
                 logger.info(
                     "Flushing %d pending state write(s)",
                     len(self._pending_state_writes),
                 )
                 await asyncio.wait(set(self._pending_state_writes), timeout=5)
-            # release every held DAG advance lease (and stop its
-            # renewers) while the backend is still up, so a peer can adopt the
-            # runs at once rather than waiting out a whole lease TTL. The runs'
-            # tasks drained above; their completions flushed here.
+            # release held DAG advance leases while the backend is still
+            # up, so a peer adopts the runs at once rather than waiting
+            # out a lease TTL; the runs' tasks drained above.
             await self._dag.shutdown()
-            # stop the loopback job API while the backend is still alive, so it
-            # can release every held job lock (rather than leaving the fleet's
-            # locks pinned for a whole TTL after a clean shutdown).
+            # stop the loopback job API while the backend is alive, so it
+            # releases held job locks (not pinned for a whole TTL).
             await self._stop_job_api()
             logger.info("Stopping state backend")
             await self.state_backend.stop()
@@ -2659,27 +2294,32 @@ class Cron:
         if self.web_runner is not None:
             logger.info("Stopping http server")
             await self.web_runner.cleanup()
-        # Close the pooled statsd UDP endpoints for this loop. They are
-        # otherwise reclaimed only when the loop is garbage collected, which
-        # emits a ResourceWarning on teardown. Safe to call more than once.
+        # close the pooled statsd UDP endpoints (otherwise reclaimed only
+        # at loop GC, with a ResourceWarning). Safe to call twice.
         statsd.close_endpoints()
-        # Same for the pooled webhook connections: dropped rather than
-        # closed, they leave aiohttp logging "Unclosed connector" on the way
-        # out. Safe here because the reports themselves went out during
-        # _drain_completions above, so by now the pool holds only sockets
-        # idling out their keepalive.
+        # same for the pooled webhook connections; safe here because the
+        # reports went out during _drain_completions, so the pool holds
+        # only idle keepalive sockets.
         await close_webhook_pool()
 
     def _cancel_coordination_tasks(self) -> None:
-        """Cancel the Replace pursuits, retry claim scan and pause refresh.
+        """Cancel the launch-adjacent background work: Replace pursuits, the
+        DAG catch-up sleepers, the retry claim scan and the pause refresh.
 
-        All three are scoped to the current state backend; the pause refresh
-        is cancelled rather than awaited because it mutates the pause gate
-        map, which nothing left in the shutdown path reads.
+        All are scoped to the current state backend; the pause refresh is
+        cancelled rather than awaited because it mutates the pause gate map,
+        which nothing left in the shutdown path reads. The DAG sleepers are
+        cancelled at this seam, not at the later _dag.shutdown(), for the
+        same reason the pursuits are: both can LAUNCH work, and the drain
+        that follows is unbounded. (They also self-terminate on the stop
+        event; this stops them before the drain rather than after it.)
         """
         for task in list(self._slot_pursuits.values()):
             task.cancel()
         self._slot_pursuits.clear()
+        for task in list(self._dag._catchup_tasks):
+            task.cancel()
+        self._dag._catchup_tasks.clear()
         if self._retry_claim_task is not None:
             self._retry_claim_task.cancel()
             self._retry_claim_task = None
@@ -2711,18 +2351,15 @@ class Cron:
             logging_config=None,
         )
 
-    def _config_signature(self, files: FrozenSet[str]) -> tuple:
+    def _config_signature(self, files: frozenset[str]) -> tuple:
         """A cheap stat fingerprint of the files a parse read.
 
-        ``(abspath, st_mtime_ns, st_size)`` per file, sorted for determinism; a
-        file that has vanished collapses to a sentinel so a deletion still
-        registers as a change. When the config source is a DIRECTORY its own
-        mtime is folded in as well, so a brand-new entry dropped into the dir
-        (which touches none of the already-tracked files) is still noticed. All
-        of this is a handful of ``os.stat`` calls (microseconds) versus a
-        full strictyaml reparse, which is the whole point.
+        ``(abspath, st_mtime_ns, st_size)`` per file, sorted; a vanished
+        file collapses to a sentinel so a deletion still registers. A
+        DIRECTORY config source folds in its own mtime, so a brand-new
+        entry (touching no tracked file) is still noticed.
         """
-        parts: List[tuple] = []
+        parts: list[tuple] = []
         for f in sorted(files):
             try:
                 st = os.stat(f)
@@ -2739,25 +2376,10 @@ class Cron:
     def _quiet_gc_for_reparse(self) -> bool:
         """Whether this reload should run with the collector paused.
 
-        A reparse is a pure allocation phase, and rebuilding a large job set
-        while the previous one is still resident promotes every new survivor
-        at once, which is what keeps the collector busy through the whole
-        rebuild.  Measured on a real 3000-job reparse with 3000 jobs still
-        resident: 12,492 automatic collections costing 1.51 s, 11.5% of the
-        wall time, worst single pause 26.4 ms on 3.10 (3.14's incremental
-        collector is gentler: 7.0% and 12.1 ms).  The wall-clock saving is
-        modest (1.08x on 3.10, 1.02x on 3.14, both at 3000 jobs) because
-        strictyaml dominates; the point is the pauses.  They hold the GIL, so
-        they stall the event loop through a reload whose parse this module
-        went to the trouble of offloading precisely so it would not.
-
-        Gated on the resident job count because ``gc.disable()`` is
-        process-global: it is paused across an await, so every other coroutine
-        allocates uncollected cycles for the duration, and the duration is a
-        worker-thread file read that a wedged mount can stretch.  A fleet-scale
-        job set is where the pauses are worth that exposure; at a few hundred
-        jobs the difference is inside the noise, so the common deployment never
-        touches the collector at all.
+        A large reparse is pure allocation, and GC passes during it hold
+        the GIL and stall the loop. Gated on job count because
+        ``gc.disable()`` is process-global and spans an await a wedged
+        mount can stretch; the common deployment never touches it.
         """
         return len(self.cron_jobs) >= _GC_QUIET_RELOAD_MIN
 
@@ -2780,16 +2402,13 @@ class Cron:
         )
 
     def _record_config(
-        self, config: CronstableConfig, sources: FrozenSet[str]
+        self, config: CronstableConfig, sources: frozenset[str]
     ) -> None:
         """Cache a successful parse for the unchanged-config skip.
 
         Fingerprints ``sources`` immediately after the parse, so the next
-        housekeeping pass compares against the on-disk state we actually
-        parsed. (A file edited in the microseconds between the parse's read and
-        this stat would be recorded as already-current and picked up only on a
-        later change, an acceptable, vanishingly narrow window for a
-        once-a-minute reload.)
+        pass compares against the on-disk state actually parsed; an edit
+        inside that microsecond window is picked up on a later change.
         """
         self._config_sources = sources
         self._config_sig = self._config_signature(sources)
@@ -2798,13 +2417,10 @@ class Cron:
     def update_config(self) -> CronstableConfig:
         """Reload the config from disk and apply it, synchronously.
 
-        Used at construction (where there is no running event loop to offload
-        to) and by tests. The run loop instead calls :meth:`reload_config`,
-        which does the same work but runs the disk read + reparse off the event
-        loop; both paths share the pure parse
-        (:func:`parse_config_with_sources`) and :meth:`_apply_reload`. Always
-        parses (no unchanged-config skip): it runs once at construction to
-        establish the baseline the skip later compares against.
+        Used at construction (no running loop yet) and by tests; the run
+        loop uses :meth:`reload_config` instead. Always parses (no
+        unchanged-config skip): it establishes the baseline the skip later
+        compares against.
         """
         if self.config_arg is None:
             return self._empty_config()
@@ -2820,24 +2436,13 @@ class Cron:
         return result
 
     async def reload_config(self) -> CronstableConfig:
-        """Like :meth:`update_config`, but runs the disk read + full reparse
-        OFF the event loop, in a worker thread, and skips it entirely when
-        nothing the last parse read has changed on disk.
+        """:meth:`update_config`, but the reparse runs OFF the event loop
+        and is skipped when the stat fingerprint is unchanged (downstream
+        (re)starts are idempotent on the same config object).
 
-        The reparse is a synchronous file read plus a full strictyaml parse;
-        run inline on the scheduling tick it froze the entire event loop (web
-        API, cluster gossip, job output pumping) for its whole duration, once
-        a minute. First we compare a cheap stat fingerprint
-        (:meth:`_config_signature`) of the files the last successful parse read
-        against the stored one; if they match, the config on disk is unchanged
-        and we return the already-loaded config without touching strictyaml or
-        the thread pool. The downstream cluster/web/logging (re)starts in
-        :meth:`run` are idempotent, so handing them the same config object is a
-        no-op. Only a real change offloads the parse to a worker thread;
-        applying the result (which mutates shared scheduler state) stays on the
-        loop thread via :meth:`_apply_reload`, so there is no cross-thread
-        access to ``self``. The caller applies this BEFORE servicing due slots,
-        so the cluster gate is always current for the tick.
+        Applying the result stays on the loop thread via _apply_reload, so
+        there is no cross-thread access to ``self``. The caller applies
+        this BEFORE servicing due slots.
         """
         if self.config_arg is None:
             return self._empty_config()
@@ -2855,10 +2460,8 @@ class Cron:
                 None, parse_config_with_sources, self.config_arg
             )
         except ConfigError:
-            # feeds cronstable_config_last_reload_successful, the standard
-            # "config broken on disk" alert signal. The parse ran in the worker
-            # thread (parse_config_with_sources does not touch metrics), so
-            # record the failure here, back on the loop thread.
+            # feeds cronstable_config_last_reload_successful; recorded here
+            # on the loop thread (the parse ran in the worker).
             self.metrics.config_parse(False)
             raise
         finally:
@@ -2879,43 +2482,33 @@ class Cron:
         self.metrics.config_parse(True)
         old_jobs = self.cron_jobs
         self.cron_jobs = OrderedDict((job.name, job) for job in config.jobs)
-        # swap in the reloaded DAG set (the DagScheduler reads this
-        # live each pass, so a reload that adds/removes/edits a DAG is picked
-        # up on the next service tick; in-flight runs of a removed DAG finish
-        # and are GC'd).
+        # DagScheduler reads this live each pass; in-flight runs of a
+        # removed DAG finish and are GC'd.
         self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
-        # swap in the reloaded notify block (read live by _dispatch_notify), so
-        # a reload that adds/edits/removes `notify:` takes effect at once.
+        # read live by _dispatch_notify, so a reload takes effect at once.
         self._notify_config = config.notify_config
-        # The job set changed: drop the memoized fingerprint, sub-minute flag,
-        # config-order index and any-SLA flag so the next caller recomputes
-        # once.  A failed parse raises before this point, so a bad reload never
-        # stales any of them.
+        # The job set changed: invalidate the memo caches. A failed parse
+        # raises before this point, so a bad reload never stales them.
         self._job_set_id_cache = None
         self._needs_subminute_cache = None
         self._job_pos_cache = None
         self._any_sla_cache = None
-        # Drop metric series for jobs removed from the config, so a renamed
-        # job does not leave a stale twin behind forever. A removed job with
-        # an instance still running keeps its accumulator until the run
-        # finishes: pruning it mid-run would let the finishing run recreate
-        # the series from zero (a phantom counter reset); the reload after
-        # the run ends prunes it for good.
+        # Drop metric series for removed jobs. A removed-but-still-running
+        # job keeps its accumulator until the run finishes: pruning it
+        # mid-run would let the finishing run recreate the series from zero
+        # (a phantom counter reset).
         self.metrics.prune(set(self.cron_jobs) | set(self.running_jobs))
-        # Drop last-run slots for jobs no longer in the config, so churning job
-        # names cannot grow this map without bound. A removed-but-still-running
-        # job keeps its slot until it finishes and the next reload prunes it,
-        # matching how the metrics accumulators above are pruned.
+        # Drop last-run slots for removed jobs (churning names must not
+        # grow the map); a still-running job keeps its slot until a later
+        # reload, matching the metrics prune above.
         keep = set(self.cron_jobs) | set(self.running_jobs)
         self._last_run_slot = {
             name: slot
             for name, slot in self._last_run_slot.items()
             if name in keep
         }
-        # The trends cache is busted per job by _record_run, but a job the
-        # reload REMOVED (or a classic-crontab name reminted when a line
-        # shifts) never runs again under that name, so its entry would
-        # orphan forever; prune it here with every other per-job map.
+        # a REMOVED job never runs again under that name, so its trends
+        # entry would orphan forever; prune with the other per-job maps.
         self._trends_cache = {
             name: entry
             for name, entry in self._trends_cache.items()
@@ -2937,13 +2530,11 @@ class Cron:
             for name, rec in self._pause_pending_writes.items()
             if name in keep
         }
-        # The concurrency-slot mutex map (_slot_mutex mints an entry per name
-        # and nothing ever dropped one) leaks the same way. Pruning it is
-        # narrower than the maps above, because handing a second Lock out for
-        # a slot somebody still holds would defeat the mutual exclusion it
-        # exists for: forget a name only when nothing can still take its
-        # mutex, meaning no config entry, no live instance, no refcount,
-        # lease, renewer or pursuit, and no holder or waiter right now.
+        # Slot mutex prune is narrower: handing out a second Lock for a
+        # slot somebody still holds would defeat the mutual exclusion, so
+        # forget a name only when nothing can still take its mutex (no
+        # config entry, instance, refcount, lease, renewer, pursuit, holder
+        # or waiter).
         slot_live = (
             keep
             | set(self._slot_refs)
@@ -2956,10 +2547,8 @@ class Cron:
             for name, lock in self._slot_locks.items()
             if name in slot_live or lock.locked()
         }
-        # The per-job launch locks leak the same way and are pruned under
-        # the same rule: never drop one somebody holds (a waiter would mint
-        # a fresh lock and race the very launch the lock serialises); a
-        # removed-but-mid-launch name keeps its entry until a later reload.
+        # launch locks: same rule, never drop one somebody holds (a waiter
+        # would mint a fresh lock and race the launch it serialises).
         self._launch_locks = defaultdict(
             asyncio.Lock,
             {
@@ -2978,11 +2567,9 @@ class Cron:
             for name, at in self._last_completed_at.items()
             if name in keep
         }
-        # The SLA trackers survive a job edit the same way (the thresholds
-        # may have changed, but the job's history did not); only removed
-        # jobs are pruned. The (name, check) latch prunes on its name half;
-        # a check dropped from a surviving job's sla block is cleared by
-        # the next _sla_periodic pass instead.
+        # SLA trackers survive a job edit (history did not change); only
+        # removed jobs are pruned. A check dropped from a surviving job's
+        # sla block is cleared by the next _sla_periodic pass instead.
         self._sla_last_success = {
             name: at
             for name, at in self._sla_last_success.items()
@@ -3011,10 +2598,8 @@ class Cron:
             for name, at in self._sla_disabled_since.items()
             if name in keep
         }
-        # first-seen is the one tracker this pass also SEEDS: a job the reload
-        # just added gets its own baseline here, so it ages into
-        # maxTimeSinceSuccess from now rather than from a process start that
-        # may be days old.
+        # first-seen is the one tracker this pass also SEEDS: a just-added
+        # job ages into maxTimeSinceSuccess from now, not process start.
         self._sla_first_seen = {
             name: at
             for name, at in self._sla_first_seen.items()
@@ -3023,36 +2608,25 @@ class Cron:
         seen_at = get_now(datetime.timezone.utc)
         for name in self.cron_jobs:
             self._sla_first_seen.setdefault(name, seen_at)
-        # Prune the finished-run display data the same way. A removed job's
-        # last_run/run_history is unreachable (jobs_payload and the /runs
-        # endpoints iterate cron_jobs only), so keeping it is pure leaked
-        # memory, worst under classic crontabs, whose <file>:<line> job
-        # names are reminted by every line added or removed above them.
+        # a removed job's last_run/run_history is unreachable (payload
+        # builders iterate cron_jobs only), so keeping it is leaked memory.
         self.last_run = {
             name: info for name, info in self.last_run.items() if name in keep
         }
         for name in [n for n in self.run_history if n not in keep]:
             del self.run_history[name]
-        # Bring the next-fire index in step with the new job set: drop removed
-        # / now-unscheduled jobs, reseed jobs whose schedule changed, and keep
-        # the existing next-fire for jobs whose schedule is unchanged (a reseed
-        # would recompute a STRICTLY-future fire and could skip a fire
-        # that coincides with this reload's minute boundary).
+        # Re-sync the next-fire index: drop removed jobs, reseed changed
+        # schedules, KEEP unchanged ones (a reseed computes a strictly-
+        # future fire and could skip one on this reload's minute boundary).
         self._refresh_schedule(get_now(datetime.timezone.utc), old_jobs)
         return config
 
     def job_set_id(self) -> str:
         """Order-independent fingerprint of the currently-loaded job set.
 
-        Two cronstable instances return the same value iff they hold the same
-        set
-        of jobs (same effective config, any order); see cronstable.fingerprint.
-
-        Memoized: the fingerprint is a pure function of the loaded job set, so
-        it is computed once per reload and cached (invalidated wherever
-        cron_jobs is reassigned), keeping the per-job deepcopy/JSON/SHA-256
-        work off the scrape / gossip / lease-renew paths that query it each
-        cycle.
+        Same value iff two instances hold the same effective job set; see
+        cronstable.fingerprint. Memoized per reload, keeping the deepcopy/
+        JSON/SHA-256 work off the scrape/gossip/lease-renew paths.
         """
         cached = self._job_set_id_cache
         if cached is None:
@@ -3073,24 +2647,27 @@ class Cron:
             self._logged_job_set_id = current
 
     async def _web_get_version(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
+        # stripped like every other route: the endpoint's own text/plain
+        # wins over a web.headers Content-Type in any spelling
         return web.Response(
             text=cronstable.version.version,
-            headers=self._web_headers(),
+            headers=_strip_content_type(self._web_headers()),
         )
 
     async def _web_job_set_id(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         job_set = self.job_set_id()
-        headers = self._web_headers()
         if _accepts_json(request):
             return _json_response(
                 {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
-                headers=headers,
+                headers=self._web_headers(),
             )
-        return web.Response(text=job_set, headers=headers)
+        # the text branch owns its Content-Type too (_json_response strips
+        # on the JSON branch already)
+        return web.Response(
+            text=job_set, headers=_strip_content_type(self._web_headers())
+        )
 
-    def cluster_payload(self) -> Dict[str, Any]:
+    def cluster_payload(self) -> dict[str, Any]:
         """This node's cluster/leadership view.
 
         Behind ``GET /cluster`` and MCP ``cron_get_cluster``.
@@ -3100,22 +2677,17 @@ class Cron:
             return {"enabled": False, "peers": []}
         payload = dict(self.cluster_manager.view_dict())
         payload["enabled"] = True
-        # lease backends (kubernetes/etcd/filesystem) have no fleet view of
-        # their own, but the observability overlay mesh serves one when
-        # installed (see _fleet_backend): tell the dashboard whether its
-        # fleet view has data behind it. The gossip payload stays unchanged:
-        # its UI path always shows the fleet view.
+        # lease backends have no fleet view of their own; tell the
+        # dashboard whether the observability overlay provides one. The
+        # gossip payload stays unchanged (its UI always shows the view).
         if payload.get("backend") != "gossip":
             payload["fleet"] = self.observability_mesh is not None
-        # this node's own live CPU/memory, sampled fresh: always shown in the
-        # cluster panel (it is local and free), independent of whether peers
-        # share theirs. Peer load rides view_dict's per-peer node_stats (only
-        # populated when the cluster shares node stats: observability).
+        # this node's own live CPU/memory, always shown (local and free);
+        # peer load rides view_dict's per-peer node_stats.
         payload["node_stats"] = self.node_resource_snapshot()
         return payload
 
     async def _web_get_cluster(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         # no ETag: the payload embeds this node's freshly sampled CPU/memory,
         # so a tag would churn every poll and 304 would never fire; gzip is
         # the whole win here (peer summaries compress well).
@@ -3130,39 +2702,20 @@ class Cron:
     async def _web_get_fleet(self, request: web.Request) -> web.Response:
         """The cluster-wide per-job run view (the dashboard's fleet view).
 
-        Merged entirely from state this node already holds: its own scheduler
-        snapshot plus the per-job summaries each peer piggybacked on the
-        gossip exchanges this node has already made (see
-        :meth:`cronstable.cluster.ClusterManager.fleet_view`); serving this
-        endpoint triggers no peer traffic.  ``enabled: false`` when there is
-        no cluster, or the backend has no node-to-node channel to have
-        carried summaries (a lease backend without the observability
-        overlay); the dashboard then hides its fleet view.
-
-        Conditional, compressed and memoized like the other legs of the poll
-        fan-out.  This one was the outlier: it rides the same dashboard poll
-        cadence as ``/jobs`` while its build is O(nodes x jobs) with a dict
-        copy per summary entry, so every open tab paid a full merge, a full
-        serialization and a full uncompressed body on the scheduler's loop.
-        The memo shares one product across the pollers in a window
-        (:data:`_FLEET_RESPONSE_TTL`); the ETag hashes the bytes actually
-        sent, so a 304 fires only when the representation is byte-identical
-        and a live per-node reading can never freeze behind a stale tag.
-        Above :data:`_FLEET_SERIALIZE_OFFLOAD_MIN` summary entries the
-        serialize, hash and gzip run on the default executor.
+        Merged entirely from state this node already holds (own snapshot
+        plus gossip-piggybacked peer summaries); serving it triggers no
+        peer traffic. ``enabled: false`` when no cluster or no channel
+        carried summaries; the dashboard then hides the view. Conditional,
+        compressed and memoized like the other poll legs.
         """
-        assert self.web_config is not None
-        etag, body, gz = await self._fleet_product()
-        return _conditional_response(
-            etag,
-            body,
-            gz,
-            if_none_match=request.headers.get("If-None-Match"),
-            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
-            headers=self._web_headers(),
+        return await self._memoized_conditional_response(
+            request,
+            self._fleet_response_memo,
+            _FLEET_RESPONSE_TTL,
+            self._build_fleet_product,
         )
 
-    def fleet_payload(self) -> Dict[str, Any]:
+    def fleet_payload(self) -> dict[str, Any]:
         """The cluster-wide per-job run view.
 
         Behind ``GET /fleet`` and MCP ``cron_get_fleet``.
@@ -3178,21 +2731,9 @@ class Cron:
             return {"enabled": False, "nodes": []}
         return fleet
 
-    async def _fleet_product(self) -> Tuple[str, bytes, Optional[bytes]]:
-        """One shared ``/fleet`` product (etag, body, gz).
-
-        The TTL global is read at call time, like the ``/metrics`` and
-        ``/jobs`` wrappers.
-        """
-        return await self._shared_response_product(
-            self._fleet_response_memo,
-            _FLEET_RESPONSE_TTL,
-            self._build_fleet_product,
-        )
-
     async def _build_fleet_product(
         self,
-    ) -> Tuple[str, bytes, Optional[bytes]]:
+    ) -> tuple[str, bytes, Optional[bytes]]:
         # the merge reads live gossip state so it stays on the loop; the
         # product over the merged dict is pure and offloads for a large
         # fleet (see _FLEET_SERIALIZE_OFFLOAD_MIN).
@@ -3215,35 +2756,44 @@ class Cron:
         ``resources`` is ``null`` when sampling is unavailable (psutil could
         not read the host); the dashboard then hides the node meter.
         """
-        assert self.web_config is not None
         return _json_response(self.node_payload(), headers=self._web_headers())
 
-    def node_payload(self, history: bool = False) -> Dict[str, Any]:
+    def _node_name(self) -> str:
+        """The cluster node name when clustered, else the plain hostname the
+        durable-state layer already uses as this node's identity."""
+        mgr = self.cluster_manager
+        if mgr is not None and getattr(mgr, "node_name", None):
+            return mgr.node_name
+        return self._state_host
+
+    def _node_history_block(self) -> dict[str, Any]:
+        """The retained CPU/memory ring as its wire shape.
+
+        ``enabled`` is false (with no points) when the sampler is off
+        (``nodeHistory: false``) or psutil is unavailable, so the
+        dashboard hides the chart instead of showing an eternally-empty
+        one.
+        """
+        hist = self._node_sampler.history()
+        return {
+            "enabled": hist is not None,
+            "interval": hist["interval"] if hist is not None else None,
+            "points": hist["points"] if hist is not None else [],
+        }
+
+    def node_payload(self, history: bool = False) -> dict[str, Any]:
         """This node's live CPU/memory (`GET /node`, MCP `cron_get_node`).
 
         ``resources`` is ``None`` when sampling is unavailable.  With
         ``history=True`` a ``history`` block (the retained ring the dashboard
         chart uses) rides along.
         """
-        # the cluster node name when clustered, else the plain hostname the
-        # durable-state layer already uses as this node's identity.
-        mgr = self.cluster_manager
-        node_name = (
-            mgr.node_name
-            if mgr is not None and getattr(mgr, "node_name", None)
-            else self._state_host
-        )
-        payload: Dict[str, Any] = {
-            "node_name": node_name,
+        payload: dict[str, Any] = {
+            "node_name": self._node_name(),
             "resources": self._node_sampler.snapshot(),
         }
         if history:
-            hist = self._node_sampler.history()
-            payload["history"] = {
-                "enabled": hist is not None,
-                "interval": hist["interval"] if hist is not None else None,
-                "points": hist["points"] if hist is not None else [],
-            }
+            payload["history"] = self._node_history_block()
         return payload
 
     async def _web_node_history(self, request: web.Request) -> web.Response:
@@ -3251,28 +2801,10 @@ class Cron:
 
         Oldest-first ``[t, cpu%, mem%]`` points from the background sampler
         (see ``web.nodeHistory``), fetched lazily when the chart is opened
-        rather than riding the /node poll.  ``enabled`` is false (with no
-        points) when the sampler is off (``nodeHistory: false``) or psutil
-        is unavailable, so the dashboard hides the chart instead of showing
-        an eternally-empty one.
+        rather than riding the /node poll.
         """
-        assert self.web_config is not None
-        mgr = self.cluster_manager
-        node_name = (
-            mgr.node_name
-            if mgr is not None and getattr(mgr, "node_name", None)
-            else self._state_host
-        )
-        history = self._node_sampler.history()
         return _json_response(
-            {
-                "node_name": node_name,
-                "enabled": history is not None,
-                "interval": (
-                    history["interval"] if history is not None else None
-                ),
-                "points": history["points"] if history is not None else [],
-            },
+            {"node_name": self._node_name(), **self._node_history_block()},
             headers=self._web_headers(),
         )
 
@@ -3284,45 +2816,20 @@ class Cron:
     ) -> _ProductT:
         """Serve ``memo``'s product, building (or joining a build) on a miss.
 
-        The ONE memoized-response scaffold, shared by ``/jobs``,
-        ``/metrics``, ``/fleet`` and ``/activity``.  Memoization alone is
-        not enough on the path it was written for: above their offload
-        thresholds the builds span an executor hop, and a plain
-        check-then-store memo leaves that await between the miss and the
-        store, so every caller landing while the first one builds misses
-        too and N simultaneous pollers cost N full builds, which is the
-        pile-up the TTLs exist to prevent.  A follower awaits the
-        leader's future instead, so the window costs one build however
-        many callers land in it.
+        The ONE memoized-response scaffold (/jobs, /metrics, /fleet,
+        /activity). Single-flight: followers await the leader's future,
+        shielded so a hung-up client cannot cancel the shared build; a
+        failed build resolves the future to None (never set_exception) and
+        the failure propagates only to the builder.
 
-        ``asyncio.shield`` on that wait: a follower whose client hangs up
-        must not cancel the build every other follower is waiting on.  A
-        failed build resolves the future to ``None`` rather than an
-        exception, so nothing is left holding an exception nobody
-        retrieves; the failure still propagates to the caller that built.
-
-        The generation guard closes the two bust races.  The leader reads
-        :attr:`_memo_gen` before ``build()`` first touches live state and
-        re-checks it before storing, so a :meth:`_bust_response_memos`
-        landing DURING the build cannot be undone by the pre-bust product
-        arriving late (the leader still serves that product to its own
-        caller, exactly as a request answered a moment before the bust
-        would have been).  A joiner compares the generation recorded with
-        the future against the current one and treats a mismatch as a
-        miss, so a request arriving AFTER a bust is never served the
-        pre-bust product the bust just declared stale.
-
-        On a miss after a failed or invalidated shared build the waiter
-        loops rather than falling through: exactly one (the first to see
-        the free slot) self-promotes to leader and the rest join ITS
-        build, instead of every follower stampeding into a build of its
-        own.  There is no await between the cache check, the inflight
-        check and the registration, so leadership is decided atomically on
-        the loop.  Invariants: the future only ever gets ``set_result``
-        (``None`` or a product), never ``set_exception``; the registered
-        generation is read BEFORE the build; the store happens before
-        :meth:`_ResponseMemo.finish`, so woken followers find the cache
-        warm.
+        The generation guard closes the bust races: the leader reads
+        _memo_gen BEFORE build() and re-checks before storing; a joiner
+        compares the future's recorded generation before trusting the
+        product. After a failed or invalidated build the waiter loops and
+        exactly one self-promotes. No await sits between the cache check,
+        inflight check and registration, so leadership is decided
+        atomically on the loop; the store happens before finish(), so
+        woken followers find the cache warm.
         """
         loop = asyncio.get_running_loop()
         while True:
@@ -3353,9 +2860,64 @@ class Cron:
         memo.finish(fut, product)
         return product
 
+    async def _memoized_conditional_response(
+        self,
+        request: web.Request,
+        memo: "_ResponseMemo[tuple[str, bytes, bytes | None]]",
+        ttl: float,
+        build: Callable[[], Awaitable[tuple[str, bytes, bytes | None]]],
+    ) -> web.Response:
+        """One conditional GET over a shared memoized (etag, body, gz).
+
+        The common tail of the /jobs, /fleet and /activity handlers:
+        fetch (or join the build of) the shared product, then answer
+        304/200 per request. Handlers pass their TTL global per request,
+        so a deployment-wide tweak (or a test monkeypatch) takes effect
+        on the next poll.
+        """
+        etag, body, gz = await self._shared_response_product(memo, ttl, build)
+        return _conditional_response(
+            etag,
+            body,
+            gz,
+            if_none_match=request.headers.get("If-None-Match"),
+            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+            headers=self._web_headers(),
+        )
+
+    async def metric_samples_snapshot(self) -> list[tuple[str, str, str]]:
+        """The metric universe as ``(name, label_block, value)`` triples.
+
+        Behind MCP ``cron_query_metrics``, on the same shared-product memo
+        ``GET /metrics`` uses and busted by the same local events, so N
+        agents polling within a second cost ONE walk of the universe
+        rather than N. The per-call ``match``/``limit`` filter runs over
+        this snapshot, which keeps filtering per caller while the
+        expensive half is shared.
+        """
+        return await self._shared_response_product(
+            self._metric_samples_memo,
+            _METRICS_RESPONSE_TTL,
+            self._build_metric_samples,
+        )
+
+    async def _build_metric_samples(self) -> list[tuple[str, str, str]]:
+        # iter_samples reads live scheduler state EAGERLY (the family
+        # build, which must stay on the loop) and returns a lazy generator
+        # over that freshly built list, which nobody else references. The
+        # walk that assembles label blocks and formats values happens
+        # during iteration, so list() is exactly the expensive half and is
+        # safe to run in a worker thread, at the same gate /metrics uses.
+        pending = self.metrics.iter_samples(self)
+        if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+            return await asyncio.get_running_loop().run_in_executor(
+                None, list, pending
+            )
+        return list(pending)
+
     async def _metrics_product(
         self, openmetrics: bool
-    ) -> Tuple[bytes, Optional[bytes]]:
+    ) -> tuple[bytes, Optional[bytes]]:
         """One shared ``/metrics`` product (body, gz) per exposition format.
 
         The TTL global is read at call time, not bound at definition, so a
@@ -3370,7 +2932,7 @@ class Cron:
 
     async def _build_metrics_product(
         self, openmetrics: bool
-    ) -> Tuple[bytes, Optional[bytes]]:
+    ) -> tuple[bytes, Optional[bytes]]:
         # The family build reads live scheduler state, so it stays on the
         # loop; the render and the compression are pure over that
         # freshly-built list, so a large job set does both on the executor
@@ -3391,49 +2953,40 @@ class Cron:
         )
 
     async def _web_metrics(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         accept = request.headers.get("Accept", "")
         openmetrics = "application/openmetrics-text" in accept
         gzip_ok = _accepts_gzip(request.headers.get("Accept-Encoding"))
-        # One product (family build + render + gzip) is shared across every
-        # scraper for _METRICS_RESPONSE_TTL, per exposition format (the
-        # scaffold owns the memo and the single flight). Only the
-        # representation pick below is per-request.
+        # one product is shared across scrapers per exposition format;
+        # only the representation pick below is per-request.
         body, gz = await self._metrics_product(openmetrics)
-        # Unlike the other handlers, the Content-Type is the endpoint's
-        # contract (scrapers parse it for the format version), so it wins
-        # over an operator-configured web.headers one, in any spelling:
-        # see _strip_content_type.
+        # the Content-Type is the endpoint's contract (scrapers parse it
+        # for the format version), so it wins over web.headers.
         headers = _strip_content_type(self._web_headers())
         headers["Content-Type"] = (
             CONTENT_TYPE_OPENMETRICS if openmetrics else CONTENT_TYPE_TEXT
         )
-        # on EVERY representation, compressed or not: a shared cache that
-        # missed this would hand a gzipped body to a client that cannot
-        # read one, and the endpoint negotiates the exposition format on
-        # Accept too, so a cache keyed only on the coding would hand an
-        # openmetrics body to a text scraper.
+        # Vary on both: a shared cache must not hand a gzipped body to a
+        # client that cannot read one, nor an openmetrics body to a text
+        # scraper (the format is negotiated on Accept).
         headers["Vary"] = "Accept, Accept-Encoding"
         if gzip_ok and gz is not None:
             headers["Content-Encoding"] = "gzip"
             body = gz
         return web.Response(body=body, headers=headers)
 
-    def status_payload(self) -> List[Dict[str, Any]]:
+    def status_payload(self) -> list[dict[str, Any]]:
         """Per-job status rows (running / disabled / scheduled).
 
         The data behind ``GET /status`` and the MCP ``cron_get_status`` tool.
         """
-        # the old cron library's untyped next() left this list's value type
-        # as Any; the in-house engine types it Optional[float], so spell out
-        # the mixed-shape rows explicitly.
-        out: List[Dict[str, Any]] = []
+        # explicit annotation: the rows are mixed-shape.
+        out: list[dict[str, Any]] = []
         # one clock read for the whole pass; see _scheduled_in's `now`
         now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
             running = self.running_jobs.get(name, None)
             if running:
-                row = {
+                row: dict[str, Any] = {
                     "job": name,
                     "status": "running",
                     "pid": [
@@ -3441,7 +2994,7 @@ class Cron:
                         for runjob in running
                         if runjob.proc is not None
                     ],
-                }  # type: Dict[str, Any]
+                }
                 if self._schedule_never_fires(name, job):
                     # a running job with a dead schedule still never fires
                     # again; flag it here exactly as /jobs does, so the two
@@ -3454,7 +3007,7 @@ class Cron:
                 # instead of an inapplicable "scheduled (in N seconds)".
                 out.append({"job": name, "status": "disabled"})
             else:
-                crontab = job.schedule  # type: Union[CronTab, str]
+                crontab: CronTab | str = job.schedule
                 scheduled_in = (
                     self._scheduled_in(name, job, False, now)
                     if isinstance(crontab, CronTab)
@@ -3473,13 +3026,12 @@ class Cron:
         return out
 
     async def _web_get_status(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         out = self.status_payload()
         if _accepts_json(request):
             return _json_response(out, headers=self._web_headers())
         else:
             lines = []
-            for jobstat in out:  # type: Dict[str, Any]
+            for jobstat in out:
                 if jobstat["status"] == "running":
                     status = "running (pid: {pid})".format(
                         pid=", ".join(str(pid) for pid in jobstat["pid"])
@@ -3503,18 +3055,16 @@ class Cron:
                 )
             return web.Response(
                 text="\n".join(lines),
-                headers=self._web_headers(),
+                # the text branch owns its Content-Type, like every route
+                headers=_strip_content_type(self._web_headers()),
             )
 
-    def summary_payload(self) -> Dict[str, Any]:
+    def summary_payload(self) -> dict[str, Any]:
         """A single batched fleet overview (behind ``GET /summary``).
 
-        One call carries what an at-a-glance client (a home-screen widget, a
-        status tile) needs: the fleet's job counts, the soonest upcoming
-        fire, and this node's identity and cluster role, so it refreshes with
-        one request instead of pulling and folding the whole ``/jobs`` array.
-        Every count is derived from the same live scheduler state ``/jobs`` and
-        ``/status`` read, so the surfaces cannot disagree.
+        Job counts, soonest upcoming fire, node identity and cluster role
+        in one call, derived from the same live scheduler state /jobs and
+        /status read, so the surfaces cannot disagree.
         """
         now = get_now(datetime.timezone.utc)
         total = enabled = running = paused = failing = never_fires = 0
@@ -3550,24 +3100,16 @@ class Cron:
             ):
                 soonest_in = scheduled_in
                 soonest_name = name
-        # the cluster node name when clustered, else the plain hostname (the
-        # same identity node_payload reports).
         mgr = self.cluster_manager
-        node_name = (
-            mgr.node_name
-            if mgr is not None and getattr(mgr, "node_name", None)
-            else self._state_host
-        )
-        next_fire: Optional[Dict[str, Any]] = None
+        node_name = self._node_name()
+        next_fire: Optional[dict[str, Any]] = None
         if soonest_name is not None and soonest_in is not None:
             when = self._next_fire.get(soonest_name)
             next_fire = {
                 "job": soonest_name,
                 "in": soonest_in,
-                # absolute instant from the loop's next-fire index; during the
-                # brief pre-seed startup window it is derived from the relative
-                # countdown instead so the field is never null when a fire is
-                # known to be coming.
+                # from the next-fire index; derived from the countdown in
+                # the pre-seed startup window so it is never null.
                 "at": (
                     when.isoformat()
                     if when is not None
@@ -3576,7 +3118,7 @@ class Cron:
                     ).isoformat()
                 ),
             }
-        summary: Dict[str, Any] = {
+        summary: dict[str, Any] = {
             "version": cronstable.version.version,
             "node_name": node_name,
             "generated_at": now.isoformat(),
@@ -3606,7 +3148,6 @@ class Cron:
         return summary
 
     async def _web_get_summary(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         return _json_response(
             self.summary_payload(),
             headers=self._web_headers(),
@@ -3622,10 +3163,9 @@ class Cron:
         there is no token to describe: ``authenticated`` is false and
         every scope is effectively granted.
         """
-        assert self.web_config is not None
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         if matched is None:
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "authenticated": False,
                 "label": None,
                 "scopes": sorted(_WEB_ALL_SCOPES),
@@ -3661,21 +3201,10 @@ class Cron:
     ) -> web.HTTPException:
         """The 503 for registry-store trouble, detail kept to the log.
 
-        Store-trouble ``PushError`` messages are written for an operator
-        reading the daemon log, not for whoever holds a token at the far
-        end of the socket: they name the devices registry's absolute
-        path and quote the underlying OSError or state-backend text
-        verbatim, and deliberately so (:meth:`push.FileDeviceStore._read`
-        and :meth:`push.StateDeviceStore._bounded`, the latter folding in
-        the exception type precisely because a backend's bare string is
-        unactionable on its own).  Returning that text as the response
-        body published this daemon's filesystem layout to every caller of
-        the pairing routes, and the listing needs only a ``view`` scope.
-        So the detail goes where it was written to go, and the caller
-        gets the fact (the store is unreachable, the request did not
-        happen), which is all ``docs/openapi.yaml`` ever promised for a
-        503.  The same move as :meth:`_timezone_error`: build the body
-        from what the caller already knows, never from the exception.
+        Store PushError messages name absolute paths and quote backend
+        text; echoing them would publish the filesystem layout to any
+        view-scoped caller. Build the body from what the caller already
+        knows, never from the exception (the _timezone_error move).
         """
         logger.warning("push: %s failed: %s", doing, exc)
         return _api_error(
@@ -3685,7 +3214,6 @@ class Cron:
         )
 
     async def _web_push_devices(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         service = self._push_service_required()
         try:
             # force=True: a listing is the operator checking their
@@ -3701,27 +3229,20 @@ class Cron:
         )
 
     async def _web_push_pair(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         service = self._push_service_required()
-        try:
-            body = await request.json()
-        except ValueError:
-            raise _api_error(
-                web.HTTPBadRequest, "body must be a JSON object"
-            ) from None
+        # the shared reader, like every other body-taking route: a bare
+        # request.json() catch missed the non-ValueError decode failures
+        # (a bogus charset= raises LookupError), which escaped the JSON
+        # error envelope as aiohttp's plain-text 500.
+        body = await self._web_json_body(request)
         try:
             fields = push.validate_pairing(body)
         except push.PushError as exc:
             # Safe to echo, unlike the store's PushErrors either side of
             # it: every message validate_pairing can raise is a statically
-            # authored sentence about the caller's own body (missing or
-            # over-long field, bad base64, wrong key length, unusable
-            # key), carrying at most an integer length.  No path, no
-            # errno, no library text.  Both of its brushes with PyNaCl
-            # (the import failure in push._sealed_box and the low-order
-            # key refusal in push.validate_public_key) keep their detail
-            # in the log and raise a fixed string, so nacl's own wording
-            # cannot escape here.
+            # authored sentence about the caller's own body. No path, no
+            # errno, no library text; its PyNaCl brushes keep their detail
+            # in the log and raise a fixed string.
             raise _api_error(web.HTTPBadRequest, str(exc)) from None
         matched = request.get(WEB_TOKEN_REQUEST_KEY)
         try:
@@ -3746,7 +3267,6 @@ class Cron:
         )
 
     async def _web_push_revoke(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         service = self._push_service_required()
         device_id = request.match_info["id"]
         try:
@@ -3773,7 +3293,6 @@ class Cron:
         relay failed (the outcome body says which), so "my phone is
         silent" is debuggable from the dashboard instead of the logs.
         """
-        assert self.web_config is not None
         service = self._push_service_required()
         device_id = request.match_info["id"]
         try:
@@ -3796,25 +3315,15 @@ class Cron:
         )
 
     async def start_stop_push(
-        self, push_config: Optional[Dict[str, Any]]
+        self, push_config: Optional[dict[str, Any]]
     ) -> None:
         """Converge the push service onto ``push_config``, never raising.
 
-        Runs every housekeeping pass, right after ``start_stop_state``
-        (the registry may ride that store): a no-op while the section is
-        unchanged, a rebuild when it changed, a stop when it is gone.
-        A service that cannot warm its registry starts anyway and retries
-        on demand (the store may simply not be up yet), while the pairing
-        endpoints report store trouble per request.
-
-        Store trouble is :class:`~cronstable.push.PushError` by contract,
-        and :meth:`_converge_push` absorbs it already, so this wrapper is
-        the belt to that pair of braces: nothing about push is worth the
-        rest of a housekeeping pass, and what used to escape here (one
-        unreadable registry document was enough) silently stopped the
-        durable-state manifest and garbage collection for the life of the
-        process.  ``Exception``, not ``BaseException``: a cancelled pass
-        must still cancel.
+        Runs every housekeeping pass after start_stop_state (the registry
+        may ride that store). Never-raising is load-bearing: anything
+        escaping here silently stops the durable-state manifest and GC for
+        the life of the process (see the run() call site). ``Exception``,
+        not ``BaseException``: a cancelled pass must still cancel.
         """
         try:
             await self._converge_push(push_config)
@@ -3825,7 +3334,7 @@ class Cron:
             )
 
     async def _converge_push(
-        self, push_config: Optional[Dict[str, Any]]
+        self, push_config: Optional[dict[str, Any]]
     ) -> None:
         """The convergence itself; see :meth:`start_stop_push`."""
         if push_config == self._applied_push_config and (
@@ -3882,15 +3391,11 @@ class Cron:
 
     @staticmethod
     def _timezone_error(tz_name: Optional[str]) -> Optional[str]:
-        """The 400 message for a ``?tz=`` value that will not resolve, or
-        ``None`` when it does.
+        """The 400 message for a bad ``?tz=`` value, or None when valid.
 
-        Built from the requested name, never from the caught exception
-        (whose text can carry a server-side ZoneInfo filesystem path): a
-        handler validates here so a schedule endpoint answers 400 without
-        any exception string reaching the response body.  Mirrors
-        :meth:`_zone_from_name`'s own resolve/except so the two agree on
-        which names are unknown.
+        Built from the requested name, never the caught exception (whose
+        text can carry a server-side ZoneInfo filesystem path). Mirrors
+        :meth:`_zone_from_name` so the two agree on unknown names.
         """
         if not tz_name:
             return None
@@ -3955,25 +3460,21 @@ class Cron:
         tz_name: Optional[str] = None,
         count: int = 12,
         seed: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Parse, describe, preview and lint one schedule expression.
 
-        The data behind ``GET /schedule/preview``: the single source of
-        truth for sandboxes, computed by the same engine, describer and
-        linter the scheduler itself runs, so a preview can never disagree
-        with what the daemon will do (the web page's client-side preview is
-        a convenience, not an authority).  Raises ValueError for an unknown
-        timezone name; the handler turns that into a 400.  ``seed`` is the
-        hash key for the ``H`` form (a job name, real or prospective);
-        without it an ``H`` expression comes back invalid, with the
-        engine's own error saying a hash key is needed.
+        Behind ``GET /schedule/preview``, computed by the same engine,
+        describer and linter the scheduler runs, so a preview cannot
+        disagree with the daemon. Raises ValueError for an unknown
+        timezone. ``seed`` is the hash key for the ``H`` form; without it
+        an ``H`` expression comes back invalid.
         """
         zone = self._zone_from_name(tz_name)
         text = (expr or "").strip()
-        payload = {
+        payload: dict[str, Any] = {
             "expression": text,
             "timezone": str(zone),
-        }  # type: Dict[str, Any]
+        }
         if seed is not None:
             payload["seed"] = seed
         if text.lower() == "@reboot":
@@ -3999,7 +3500,10 @@ class Cron:
                 "valid": True,
                 "reboot": False,
                 "normalized": str(tab),
-                "description": describe_cron(text, hash_key=seed),
+                # `tab` is this very text parsed under `seed` a few
+                # lines up: the describer reuses it instead of parsing
+                # the same expression a second time per request
+                "description": describe_cron(text, hash_key=seed, tab=tab),
                 "fires": [when.isoformat() for when in fires],
                 "never_fires": not fires,
                 "lint": [
@@ -4018,7 +3522,6 @@ class Cron:
         self, request: web.Request
     ) -> web.Response:
         """Decode an arbitrary expression for the dashboards' sandboxes."""
-        assert self.web_config is not None
         headers = self._web_headers()
         expr = request.query.get("expr", "")
         if not expr.strip():
@@ -4028,10 +3531,9 @@ class Cron:
                 headers=headers,
             )
         tz = request.query.get("tz") or None
-        # Validate the one user input that would raise (the timezone), and
-        # answer 400 from the requested name.  The builder's own parse errors
-        # for the expression come back as payload data (valid=False), so no
-        # exception text ever reaches the response body.
+        # validate the one input that would raise; expression parse errors
+        # come back as payload data (valid=False), so no exception text
+        # ever reaches the response body.
         tz_error = self._timezone_error(tz)
         if tz_error is not None:
             return _json_response(
@@ -4063,18 +3565,15 @@ class Cron:
 
     def schedule_why_payload(
         self, name: str, at: str
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Why a job's schedule did (not) select a timestamp
         (``GET /schedule/why``, MCP ``cron_why_no_run``).
 
-        Decomposes the engine's own match test field by field via
-        :func:`cronstable.croninfo.why_no_run`, in the job's OWN resolved
-        timezone: an aware ``at`` is converted into that zone, a naive one
-        reads as wall time there.  The payload adds the job-level facts an
-        answer needs (``enabled``, the ``@reboot`` case) and the nearest
-        real fire on each side of the probe, from the same occurrence walk
-        the scheduler runs.  Returns ``None`` for an unknown job; raises
-        ValueError for an unparseable timestamp.
+        Decomposes the engine's own match test via why_no_run in the job's
+        OWN resolved timezone (aware ``at`` converts, naive reads as wall
+        time there), plus job-level facts and the nearest real fire on
+        each side. None for an unknown job; ValueError for a bad
+        timestamp.
         """
         job = self._job_or_dag_schedule(name)
         if job is None:
@@ -4082,7 +3581,7 @@ class Cron:
         # a schedule match says nothing about whether the fire would LAUNCH:
         # an active pause skips it, so the answer must carry that fact.
         pause = self._pause_active(name)
-        pause_note: Optional[Dict[str, str]] = None
+        pause_note: Optional[dict[str, str]] = None
         if pause is not None:
             message = "job is paused until {} (by {})".format(
                 pause.until.isoformat(), pause.by
@@ -4095,7 +3594,7 @@ class Cron:
                 "message": message,
             }
         zone = job.timezone or datetime.datetime.now().astimezone().tzinfo
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "job": name,
             "enabled": job.enabled,
             "timezone": (
@@ -4142,7 +3641,9 @@ class Cron:
             {
                 "expression": str(tab),
                 "reboot": False,
-                "description": describe_cron(str(tab), hash_key=job.name),
+                "description": describe_cron(
+                    str(tab), hash_key=job.name, tab=tab
+                ),
                 "at_in_zone": aware.isoformat(),
             }
         )
@@ -4173,7 +3674,6 @@ class Cron:
 
     async def _web_schedule_why(self, request: web.Request) -> web.Response:
         """Explain one job's schedule against one timestamp."""
-        assert self.web_config is not None
         headers = self._web_headers()
         name = request.query.get("job", "").strip()
         at = request.query.get("at", "").strip()
@@ -4198,7 +3698,7 @@ class Cron:
             raise web.HTTPNotFound()
         return _json_response(payload, headers=headers)
 
-    def _schedule_entries(self) -> List[ScheduleEntry]:
+    def _schedule_entries(self) -> list[ScheduleEntry]:
         """The analyzable fleet: every enabled, cron-scheduled job.
 
         DAG schedules ride along as their synthetic ``dag:<name>`` job
@@ -4227,8 +3727,8 @@ class Cron:
         self,
         hours: int = 24,
         tz_name: Optional[str] = None,
-        entries: Optional[List[ScheduleEntry]] = None,
-    ) -> Dict[str, Any]:
+        entries: Optional[list[ScheduleEntry]] = None,
+    ) -> dict[str, Any]:
         """The fleet collision heatmap (``GET /schedule/pressure``).
 
         Every enabled schedule's fires over the next ``hours``, bucketed
@@ -4261,8 +3761,8 @@ class Cron:
         return payload
 
     def schedule_duplicates_payload(
-        self, entries: Optional[List[ScheduleEntry]] = None
-    ) -> Dict[str, Any]:
+        self, entries: Optional[list[ScheduleEntry]] = None
+    ) -> dict[str, Any]:
         """Semantically identical schedules (``GET /schedule/duplicates``).
 
         Groups via the engine's own equality (``*/5`` == ``0-59/5``), so
@@ -4283,8 +3783,8 @@ class Cron:
         self,
         period: str = "hourly",
         tz_name: Optional[str] = None,
-        entries: Optional[List[ScheduleEntry]] = None,
-    ) -> Dict[str, Any]:
+        entries: Optional[list[ScheduleEntry]] = None,
+    ) -> dict[str, Any]:
         """The least-loaded slot for a new job (``GET /schedule/suggest``).
 
         Raises ValueError for an unknown period or timezone name.
@@ -4300,57 +3800,44 @@ class Cron:
             tz=self._zone_from_name(tz_name),
         )
 
-    # The three payload builders above walk up to 168 hours of fire
-    # instants for every schedule in the fleet: pure CPU that can take
-    # seconds at fleet scale.  The wrappers below take the (cheap) entries
-    # snapshot on the loop, then run the walk on the default executor over
-    # that immutable snapshot, keeping the scheduler's event loop free to
-    # dispatch jobs while a dashboard or MCP client asks for analysis.
-    # Both the web handlers and the MCP tools go through these, so the
-    # offload lives in exactly one place.  Exceptions (ValueError for an
-    # unknown timezone or period) propagate to the await unchanged.
+    # The three builders above are pure CPU that can take seconds at fleet
+    # scale. The wrappers below snapshot entries on the loop, then walk on
+    # the executor; web handlers AND MCP tools go through them, so the
+    # offload lives in one place. ValueError propagates unchanged.
+
+    async def _schedule_payload_offload(
+        self, build: Callable[..., dict[str, Any]], **kwargs: Any
+    ) -> dict[str, Any]:
+        entries = self._schedule_entries()
+        return await asyncio.get_running_loop().run_in_executor(
+            None, partial(build, entries=entries, **kwargs)
+        )
 
     async def schedule_pressure_payload_async(
         self, hours: int = 24, tz_name: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_pressure_payload`."""
-        entries = self._schedule_entries()
-        return await asyncio.get_running_loop().run_in_executor(
-            None,
-            partial(
-                self.schedule_pressure_payload,
-                hours=hours,
-                tz_name=tz_name,
-                entries=entries,
-            ),
+        return await self._schedule_payload_offload(
+            self.schedule_pressure_payload, hours=hours, tz_name=tz_name
         )
 
-    async def schedule_duplicates_payload_async(self) -> Dict[str, Any]:
+    async def schedule_duplicates_payload_async(self) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_duplicates_payload`."""
-        entries = self._schedule_entries()
-        return await asyncio.get_running_loop().run_in_executor(
-            None, partial(self.schedule_duplicates_payload, entries=entries)
+        return await self._schedule_payload_offload(
+            self.schedule_duplicates_payload
         )
 
     async def schedule_suggest_payload_async(
         self, period: str = "hourly", tz_name: Optional[str] = None
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Executor-offloaded :meth:`schedule_suggest_payload`."""
-        entries = self._schedule_entries()
-        return await asyncio.get_running_loop().run_in_executor(
-            None,
-            partial(
-                self.schedule_suggest_payload,
-                period=period,
-                tz_name=tz_name,
-                entries=entries,
-            ),
+        return await self._schedule_payload_offload(
+            self.schedule_suggest_payload, period=period, tz_name=tz_name
         )
 
     async def _web_schedule_pressure(
         self, request: web.Request
     ) -> web.Response:
-        assert self.web_config is not None
         headers = self._web_headers()
         hours = self._web_int_query(request, "hours", default=24, lo=1, hi=168)
         tz = request.query.get("tz") or None
@@ -4367,7 +3854,6 @@ class Cron:
     async def _web_schedule_duplicates(
         self, request: web.Request
     ) -> web.Response:
-        assert self.web_config is not None
         return _json_response(
             await self.schedule_duplicates_payload_async(),
             headers=self._web_headers(),
@@ -4376,7 +3862,6 @@ class Cron:
     async def _web_schedule_suggest(
         self, request: web.Request
     ) -> web.Response:
-        assert self.web_config is not None
         headers = self._web_headers()
         period = request.query.get("period") or "hourly"
         tz = request.query.get("tz") or None
@@ -4409,16 +3894,14 @@ class Cron:
 
     def _calendar_entries(
         self, name: Optional[str] = None
-    ) -> Optional[List[CalendarEntry]]:
+    ) -> Optional[list[CalendarEntry]]:
         """The calendar renderer's rows: the fleet, or one job when ``name``.
 
-        ``None`` for an unknown job name; a known job with no timetable
-        (``@reboot``, disabled) or a fleet of none is an empty list.  The
-        single-job feed filters the same :meth:`_schedule_entries` snapshot
-        the fleet feed uses, so the two can never disagree about
-        eligibility.  Reads live scheduler state, so this runs on the
-        event loop; the render then walks the immutable result on an
-        executor (see :meth:`_web_calendar_response`).
+        ``None`` for an unknown job; a known job with no timetable or a
+        fleet of none is an empty list. Both feeds filter the same
+        _schedule_entries snapshot, so they cannot disagree. Reads live
+        state, so it runs on the loop; the render walks the immutable
+        result on an executor.
         """
         if name is None:
             schedule_entries = sorted(
@@ -4449,19 +3932,15 @@ class Cron:
         per_job: int = 100,
         start: Optional[datetime.datetime] = None,
         now: Optional[datetime.datetime] = None,
-        entries: Optional[List[CalendarEntry]] = None,
+        entries: Optional[list[CalendarEntry]] = None,
     ) -> Optional[str]:
         """The iCalendar feed text: the fleet, or one job when ``name``.
 
-        Behind ``GET /calendar.ics`` and ``GET /jobs/{name}/calendar.ics``:
-        one VEVENT per upcoming fire over ``[start, start+days)``, from the
-        same occurrence walk the scheduler runs (see
-        :mod:`cronstable.ical`).  ``None`` for an unknown job name; a known
-        job with no timetable (``@reboot``) or a fleet of none renders as
-        a valid, empty calendar.  ``start``/``now`` pin the window and
-        DTSTAMP for tests.  ``entries`` is an optional pre-built
-        :meth:`_calendar_entries` snapshot (see the async handler); when
-        None it is built here.
+        One VEVENT per upcoming fire over ``[start, start+days)``, from
+        the same occurrence walk the scheduler runs. ``None`` for an
+        unknown job; no timetable renders as a valid empty calendar.
+        ``start``/``now`` pin the window and DTSTAMP for tests; ``entries``
+        is an optional pre-built snapshot.
         """
         if entries is None:
             entries = self._calendar_entries(name)
@@ -4485,7 +3964,6 @@ class Cron:
     async def _web_calendar_response(
         self, name: Optional[str], request: web.Request
     ) -> web.Response:
-        assert self.web_config is not None
         days = self._web_int_query(request, "days", default=14, lo=1, hi=60)
         per_job = self._web_int_query(
             request, "limit", default=100, lo=1, hi=1000, alias="per_job"
@@ -4546,23 +4024,20 @@ class Cron:
             raise ApiActionError(
                 "job {!r} is disabled".format(name), status=409
             )
-        # A manual start of a job still pending as a deferred @reboot one-shot
-        # IS its boot run: retire the pending entry and record the run with
-        # the cluster (when a manager is up), or _process_pending_reboots
-        # would find reboot_ran(name) False after convergence and run the
-        # one-shot a second time, possibly on another node, since the
-        # manual run was never gossiped/persisted as ran. Recording BEFORE
-        # spawning mirrors the deferred-launch path's at-most-once ordering.
+        # A manual start of a job still pending as a deferred @reboot
+        # one-shot IS its boot run: retire the pending entry and record the
+        # run with the cluster, or _process_pending_reboots would run the
+        # one-shot a second time (possibly on another node). Recording
+        # BEFORE spawning mirrors the deferred-launch path's at-most-once
+        # ordering.
         if name in self._pending_reboot_jobs:
             mgr = self.cluster_manager
             if mgr is not None:
                 await mgr.mark_reboot_ran(name)
-            # pop, not del: a concurrent manual start of the same name can
-            # retire the entry while the await above yields (the gossip push
-            # awaits peers), and the loser of that race must not 500 on a
-            # KeyError; the entry is retired (and logged) exactly once,
-            # mark_reboot_ran is idempotent, and both requests still launch
-            # below, exactly as two manual starts of any other job would.
+            # pop, not del: a concurrent manual start can retire the entry
+            # while the await above yields, and the loser of that race must
+            # not 500 on a KeyError; mark_reboot_ran is idempotent and both
+            # requests still launch below.
             if self._pending_reboot_jobs.pop(name, None) is not None:
                 logger.info(
                     "cluster: manual start of deferred @reboot job %s counts "
@@ -4644,19 +4119,16 @@ class Cron:
         note: str = "",
         by: str = "api",
         channel: str = "api",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Pause a job's scheduled fires (`POST /jobs/{name}/pause`).
 
-        The single pause path shared by the web API, MCP, and tests.  While
-        paused, due fires are skipped (each writes a synthetic "skipped"
-        ledger row so the catch-up watermark keeps advancing), pending
-        retries defer, and catch-up owes nothing for the window; manual
-        start and cancel are unaffected, as are running instances.  Exactly
-        one of ``duration`` (seconds) or ``until`` may be given; neither
-        means :data:`PAUSE_DEFAULT_SECONDS`.  Idempotent: pausing a paused
-        job overwrites the window.  Returns the JSON-safe pause record.
-        Raises :class:`ApiActionError` for an unknown job (404) or an
-        invalid window/oversized audit field (400).
+        The single pause path (web, MCP, tests). While paused, due fires
+        are skipped (synthetic "skipped" rows keep the catch-up watermark
+        advancing), retries defer, and catch-up owes nothing; manual
+        start/cancel and running instances are unaffected. One of
+        ``duration`` or ``until``; neither means PAUSE_DEFAULT_SECONDS.
+        Pausing a paused job overwrites the window. Raises ApiActionError
+        404/400.
         """
         if name not in self.cron_jobs:
             raise ApiActionError("job {!r} not found".format(name), status=404)
@@ -4747,12 +4219,10 @@ class Cron:
     def _pause_active(self, name: str) -> Optional[PauseInfo]:
         """The job's live pause window, or ``None``; expiry enforced HERE.
 
-        The one pause read every consumer (fire gate, retry gate, catch-up,
-        payloads) goes through: nothing in the store expires records, so a
-        window whose ``until`` has passed reads as absent everywhere at
-        once.  The stale entry itself is swept (and the auto-resume logged)
-        by the housekeeping pass; only memory is consulted, never store
-        I/O on a scheduling path.
+        The one pause read every consumer goes through: an expired window
+        reads as absent everywhere at once. The stale entry is swept by
+        housekeeping; only memory is consulted, never store I/O on a
+        scheduling path.
         """
         info = self._paused.get(name)
         if info is None:
@@ -4764,14 +4234,10 @@ class Cron:
     def _pause_and_sla_periodic(self) -> None:
         """Per-minute pause and SLA housekeeping, guarded on its own.
 
-        Deliberately NOT inside run()'s reload try/except: both passes work
-        off the job set already in memory and need nothing the reload
-        produces, while a broken config file on disk raises out of
-        :meth:`reload_config`.  Sharing that block would let an unparseable
-        config silently stop the late-run monitor, going quiet about jobs
-        that stopped running (the exact failure the SLA feature exists to
-        report), and would strand paused jobs past their expiry in the gauge
-        and the durable refresh.
+        Deliberately NOT inside run()'s reload try/except: both passes
+        need nothing the reload produces, and sharing that block would let
+        an unparseable config silently stop the late-run monitor (the
+        exact failure SLA exists to report) and strand expired pauses.
         """
         try:
             # pause expiry sweep + cross-node pause propagation; the sweep is
@@ -4788,20 +4254,11 @@ class Cron:
     def _pause_periodic(self) -> None:
         """Sweep expired pauses; refresh pause state from a shared store.
 
-        Called from the housekeeping pass (at most once per wall-clock
-        minute).  The sweep is purely in-memory and needs no durable write:
-        expiry is already enforced at every read (:meth:`_pause_active`),
-        so dropping the entry here only reclaims memory, clears the gauge,
-        and logs the auto-resume once.  The durable refresh then re-reads
-        the ``paused/`` streams as a tracked background task so peers
-        sharing a store pick up each other's pauses and resumes within
-        about a minute (the fire path itself never reads the store).
-
-        Records buffered by a failed append are retried first, so a store
-        that only hiccuped drains the backlog instead of holding those jobs
-        out of the refresh forever.  Retrying BEFORE the refresh is spawned
-        matters: :meth:`_queue_pause_write` installs the write tail
-        synchronously, so the refresh in the same pass already sees the
+        The sweep is purely in-memory (expiry is already enforced at every
+        read); the durable refresh re-reads the ``paused/`` streams as a
+        tracked task so peers converge within about a minute. Buffered
+        records are replayed BEFORE the refresh is spawned: the write tail
+        is installed synchronously, so the same pass's refresh sees the
         write in flight and leaves the job's memory alone.
         """
         now = get_now(datetime.timezone.utc)
@@ -4830,19 +4287,14 @@ class Cron:
     async def _refresh_pauses_from_store(self) -> None:
         """Converge the in-memory pause map on the durable ``paused/`` streams.
 
-        Cross-node propagation (and the boot rehydrate): newest record per
-        stream wins. A live ``paused`` record installs the window; a
-        ``resumed`` (or expired, or absent) record clears it.  A job whose
-        own write chain still has a pause record in flight is skipped, as is
-        one whose write generation moved while its record was being read:
-        this node's memory is by definition newer than the store for it.  On
-        any store trouble the LAST KNOWN in-memory state is kept and a
-        warning logged, under both onStoreUnavailable policies,
-        deliberately: a pause is an operator convenience, not a correctness
-        fence, so an unreadable store must neither resurrect nor drop pauses
-        at random, and must never block firing.  Store trouble reading ONE
-        job's stream keeps only that job's state and the sweep carries on;
-        only a failure to enumerate the streams at all ends the pass.
+        Cross-node propagation and the boot rehydrate: newest record per
+        stream wins. A job with its own write in flight, or whose write
+        generation moved mid-read, is skipped: memory is newer than the
+        store for it. On any store trouble the LAST KNOWN in-memory state
+        is kept (under both onStoreUnavailable policies): a pause is a
+        convenience, not a correctness fence, and must never block firing.
+        One unreadable stream keeps only that job's state; only a failed
+        enumeration ends the pass.
         """
         backend = self.state_backend
         if backend is None:
@@ -4890,20 +4342,16 @@ class Cron:
                     name,
                     ex,
                 )
-                # this job only: one unreadable stream must not starve every
-                # job after it in the sweep (the order is the store's sorted
-                # stream list, so it would be the same jobs every pass, and
-                # this sweep is also the boot rehydrate).
+                # this job only: one unreadable stream must not starve
+                # every job after it (the order is stable, so it would be
+                # the same jobs every pass).
                 continue
             if name not in self.cron_jobs:
-                # a reload removed the job while we were reading its stream.
-                # The generation guard below does not cover this: _apply_reload
-                # prunes _pause_gen along with _paused, so the sampled and the
-                # current generation are both 0 and it passes. Installing here
-                # would leave a permanent stale _paused entry and re-create the
-                # metric series prune() just dropped (PrometheusMetrics._job
-                # auto-creates), and no later sweep cleans either up: they
-                # all skip the stream at the membership test above.
+                # a reload removed the job mid-read. The generation guard
+                # below does not cover this (_apply_reload prunes
+                # _pause_gen, so both generations read 0); installing here
+                # would leave a permanent stale _paused entry and recreate
+                # the pruned metric series, and no later sweep cleans up.
                 continue
             if self._pause_gen.get(name, 0) != gen:
                 # a local pause/resume landed while we were reading: memory
@@ -4937,7 +4385,7 @@ class Cron:
 
     @staticmethod
     def _pause_info_from_record(
-        rec: Optional[Dict[str, Any]],
+        rec: Optional[dict[str, Any]],
     ) -> Optional[PauseInfo]:
         """Rebuild a :class:`PauseInfo` from a durable ``paused`` record.
 
@@ -4966,74 +4414,41 @@ class Cron:
     def _sla_periodic(self) -> None:
         """Evaluate the per-job SLA checks; latch, meter and report breaches.
 
-        Called from the housekeeping pass (at most once per wall-clock
-        minute) and deliberately NOT from _state_periodic: the checks are
-        purely in-memory, so they must run with no state backend
-        configured. A disabled or paused job is excused, and so is a job
-        this node does not own under election (:meth:`_cluster_allows`),
-        so one breach pages once, not once per node. Excused means the
-        job's latches are DROPPED, not merely left unevaluated: a job the
-        operator deliberately silenced must stop asserting a live breach,
-        and one still breaching when it becomes eligible again re-latches
-        and pages once, the same trade-off a restart already makes. The
-        (job, check) latch drives the transitions: ok to breached fires
-        onLate ONCE, sets the late gauge, counts the breach and warns;
-        breached to ok clears the gauge and logs, with no report.
-        Reporters are queued through the
-        completion-task idiom (:meth:`_queue_sla_report`), never awaited
-        here on the scheduler loop. The latch is in-memory only, so after
-        a restart a still-breached check re-fires once; that is the
-        documented trade-off.
+        Purely in-memory, so it runs with no state backend (hence NOT part
+        of _state_periodic). A disabled, paused, or not-owned job is
+        excused: its latches are DROPPED, and a still-breaching job
+        re-latches and pages once when eligible again. The (job, check)
+        latch drives transitions: ok to breached fires onLate ONCE;
+        breached to ok clears and logs, no report. Reporters are queued,
+        never awaited on the scheduler loop.
         """
         if not self._any_sla() and not self._sla_state:
-            # Nothing declares an sla and nothing is latched, so every job
-            # below would take the has_sla arm, whose only action
-            # (_sla_clear_latches) is itself a no-op on an empty latch map.
-            # Skipping the walk is exactly equivalent and saves 7-11 ms of
-            # loop-blocking work per minute at fleet scale. The reload that
-            # adds an sla block clears _any_sla_cache, so the first pass after
-            # it walks again.
+            # nothing declares an sla and nothing is latched: the walk
+            # below would be a no-op, so skip it. The reload that adds an
+            # sla block clears _any_sla_cache, so the next pass walks.
             return
         now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
             if not job.has_sla:
-                # a job with no sla check (never had one, or a reload just
-                # blanked its block) must not leave its latches (and the late
-                # gauge) stuck at breached. has_sla is precomputed on the
-                # JobConfig, so a deployment not using the feature does no more
-                # than this O(1) test per job each pass.
+                # no sla block (or a reload blanked it): latches must not
+                # stay stuck at breached. has_sla is precomputed, so a
+                # no-SLA deployment pays O(1) per job per pass.
                 self._sla_clear_latches(name)
                 continue
             if not job.enabled or self._pause_active(name) is not None:
-                # excused: a breach latched before the pause/disable would
-                # otherwise pin cronstable_job_late, the /jobs sla block and
-                # the OVERDUE chip at breached for the whole window.
+                # excused: a pre-pause/disable breach would otherwise pin
+                # the gauge, sla block and OVERDUE chip for the window.
                 self._sla_clear_latches(name)
                 if not job.enabled:
-                    # a disabled job cannot run, so its staleness baseline
-                    # rolls forward with the clock: re-enabling then gives it
-                    # a full threshold to succeed in, the same credit a pause
-                    # banks, instead of paging maxTimeSinceSuccess for the
-                    # whole span it was deliberately switched off. This roll
-                    # covers the never-succeeded fallback (the _sla_first_seen
-                    # arm of _sla_stale_reference); a job that HAS succeeded
-                    # takes the _sla_last_success arm, whose disabled span is
-                    # banked as a credit at the re-enable transition below.
-                    # Record the span start on the first disabled tick.
+                    # roll the staleness baseline forward so re-enabling
+                    # gives a full threshold (never-succeeded arm); a job
+                    # that HAS succeeded gets its span banked below.
                     self._sla_first_seen[name] = now
                     self._sla_disabled_since.setdefault(name, now)
                 continue
-            # Reaching here, the job is enabled and not paused. If it just
-            # left a disabled span, bank that span as a staleness credit,
-            # exactly as a lifted pause: _sla_paused_seconds then subtracts it
-            # from observed in _sla_observations against the _sla_last_success
-            # reference, so a previously-succeeded job does not page
-            # maxTimeSinceSuccess for the whole span it was switched off (the
-            # _sla_first_seen roll-forward above only reaches the
-            # never-succeeded arm). Banked once at the transition, mirroring
-            # _sla_bank_pause on resume, and before the cluster gate below so
-            # the credit is recorded on every node whether or not this one
-            # owns the job now.
+            # Just left a disabled span: bank it as a staleness credit like
+            # a lifted pause, once, at the transition, BEFORE the cluster
+            # gate so every node records the credit.
             disabled_since = self._sla_disabled_since.pop(name, None)
             if disabled_since is not None:
                 self._sla_bank_pause(
@@ -5110,14 +4525,10 @@ class Cron:
     def _sla_peer_owns_slot(self, name: str) -> None:
         """Excuse this node's lateAfter slot: a peer holds the run.
 
-        A cluster-scoped slot denied by a LIVE foreign holder means the
-        job is running somewhere in the fleet, so the slot this node
-        recorded as due was never this node's to launch.  Dropping the
-        reference lands lateAfter on its "nothing to be late for" branch
-        instead of paging every node that lost the race.  The fail-closed
-        denial (the store did not answer) deliberately keeps the
-        reference: no peer is known to have run it, so a breach there is
-        real.
+        A slot denied by a LIVE foreign holder was never this node's to
+        launch; dropping the reference stops every race loser paging. The
+        fail-closed denial (store did not answer) deliberately keeps the
+        reference: no peer is known to have run it, so a breach is real.
         """
         self._sla_due.pop(name, None)
 
@@ -5142,20 +4553,12 @@ class Cron:
     ) -> None:
         """Bank a pause window that just ended, for the staleness credit.
 
-        Called wherever a window leaves ``self._paused``: the expiry
-        sweep, an explicit resume, a re-pause that overwrites the window,
-        a peer's pause/resume arriving through the store refresh, and a
-        disabled span crediting itself on re-enable.  The banked spans are
-        kept sorted and disjoint by inserting the new window and coalescing
-        every span it touches, so a shared stretch is never credited twice
-        and a window that arrives OUT OF ``since`` order (a disabled span
-        banked after a later pause that overlaps it) still merges whole
-        rather than dropping the earlier stretch.  A window rehydrated from
-        the store carries its original ``since``, so a pause spanning a
-        restart is credited whole.  Windows the staleness reference has
-        already passed can never contribute again and are dropped, and what
-        is left is capped: dropping the OLDEST span understates the credit,
-        which fails toward paging.
+        Called wherever a window leaves ``self._paused``. Spans are kept
+        sorted and disjoint (insert + coalesce), so a shared stretch is
+        never credited twice and an out-of-order window still merges
+        whole. Windows the staleness reference has passed are dropped, and
+        the rest capped: dropping the OLDEST understates the credit, which
+        fails toward paging.
         """
         if ended_at > was.until:
             ended_at = was.until
@@ -5164,7 +4567,7 @@ class Cron:
         raw = sorted(
             self._sla_pause_windows.get(name, []) + [(was.since, ended_at)]
         )
-        merged: List[Tuple[datetime.datetime, datetime.datetime]] = []
+        merged: list[tuple[datetime.datetime, datetime.datetime]] = []
         for start, end in raw:
             if merged and start <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], end))
@@ -5202,7 +4605,7 @@ class Cron:
 
     def _sla_observations(
         self, name: str, job: JobConfig, now: datetime.datetime
-    ) -> Dict[str, Tuple[int, float, bool]]:
+    ) -> dict[str, tuple[int, float, bool]]:
         """The job's configured SLA checks, freshly measured against ``now``.
 
         check label -> (threshold_seconds, observed_seconds, breached),
@@ -5211,7 +4614,7 @@ class Cron:
         (which reports live observed values for latched checks), so both
         surfaces measure the same way.
         """
-        out: Dict[str, Tuple[int, float, bool]] = {}
+        out: dict[str, tuple[int, float, bool]] = {}
         threshold = job.sla.get("maxTimeSinceSuccessSeconds")
         if threshold is not None:
             reference = self._sla_stale_reference(name)
@@ -5265,37 +4668,35 @@ class Cron:
 
     def _install_tail_task(
         self,
-        tail: Dict[str, asyncio.Task],
+        tail: dict[str, asyncio.Task],
         name: str,
         body: Callable[[], Coroutine[Any, Any, None]],
         *,
         spawn: Callable[[Coroutine[Any, Any, None]], asyncio.Task],
         after: Optional[Iterable[Optional[asyncio.Task]]] = None,
+        bug_log: str | None = None,
     ) -> asyncio.Task:
         """Spawn ``body()`` behind ``name``'s current tail and become the tail.
 
-        The ONE implementation of the per-name chained-tail idiom, which
-        used to be pasted five times (the completion, SLA-report, inflight,
-        retry-write and pause-write paths).  Predecessors are awaited for
-        ordering only (``asyncio.wait``, so their errors stay their own);
-        ``after`` overrides the default single-predecessor list for a
-        chain that must order behind another chain too (the SLA report
-        waits on the completion tail as well as its own).  ``spawn`` turns
-        the ordered coroutine into the tracked task
-        (:meth:`_track_state_write` for state writes,
-        :meth:`_spawn_completion` for report sequences).  The
-        done-callback drops the registration only while it is still this
-        task's, so a successor installed meanwhile is never clobbered.
+        The ONE implementation of the per-name chained-tail idiom (the
+        completion, SLA-report, inflight, retry-write and pause-write
+        paths).  Predecessors are awaited for ordering only (``asyncio.wait``,
+        so their errors stay their own); ``after`` overrides the default
+        single-predecessor list for a chain that must order behind another
+        chain too.  ``spawn`` turns the ordered coroutine into the tracked
+        task.  The done-callback drops the registration only while it is
+        still this task's, so a successor installed meanwhile is never
+        clobbered.
 
-        ``body`` is a FACTORY, not a coroutine, and it is called inside the
-        ordered wrapper rather than at the call site.  The wrapper is what
-        :meth:`_track_state_write` closes when it sheds a write under
-        overload (``MAX_PENDING_STATE_WRITES``), and a coroutine built
-        eagerly by the caller would then never be awaited nor closed: a
-        ``RuntimeWarning`` per shed write, raised outright under ``-W
-        error``, at exactly the moment the store is already in trouble.
-        Building it here means the shed closes the only coroutine that was
-        ever created.
+        ``body`` MUST be a factory, not a coroutine, called inside the
+        ordered wrapper: the wrapper is what :meth:`_track_state_write`
+        closes when it sheds a write under overload, and a coroutine built
+        eagerly by the caller would then never be awaited nor closed (a
+        ``RuntimeWarning`` per shed write, an error under ``-W error``).
+
+        ``bug_log`` (a format string taking ``name``) logs-and-swallows
+        the body's unexpected exceptions instead of losing them to the
+        task object; cancellation always propagates.
         """
         earlier = list(after) if after is not None else [tail.get(name)]
 
@@ -5303,7 +4704,15 @@ class Cron:
             for prev in earlier:
                 if prev is not None and not prev.done():
                     await asyncio.wait({prev})
-            await body()
+            if bug_log is None:
+                await body()
+                return
+            try:
+                await body()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - defensive
+                logger.exception(bug_log, name)
 
         task = spawn(_ordered())
         tail[name] = task
@@ -5330,19 +4739,12 @@ class Cron:
     ) -> None:
         """Dispatch one onLate report as a tracked, per-job-chained task.
 
-        The :meth:`_queue_job_completion` idiom: reporters (SMTP, shell
-        commands, webhooks) legitimately take tens of seconds and must
-        never run inline on the scheduler loop. The report waits behind
-        ``_completion_tail`` (so it is ordered after the same job's
-        in-flight completion reports) but installs itself in its OWN
-        ``_sla_report_tail`` instead of becoming the completion tail: a
-        monitor-initiated report must never sit in FRONT of a real run's
-        report+retry-arm sequence, which blocks on the completion tail.
-        maxRuntime makes that the ordinary case rather than a corner: it
-        breaches while the run is still executing, so the report is
-        guaranteed to be in flight when that run finishes.
-        ``_completion_tasks`` membership still means shutdown (and tests)
-        drain it via :meth:`_drain_completions`.
+        Reporters can take tens of seconds and never run inline on the
+        loop. The report orders behind ``_completion_tail`` but installs
+        into its OWN ``_sla_report_tail``: a monitor report must never sit
+        in FRONT of a real run's report+retry-arm sequence (maxRuntime
+        breaches mid-run, making that the ordinary case). Membership in
+        ``_completion_tasks`` still means shutdown drains it.
         """
         name = job.name
         last_success = self._sla_last_success.get(name)
@@ -5357,55 +4759,39 @@ class Cron:
         )
         report_config = job.onLate["report"]
 
-        async def _report() -> None:
-            try:
-                await report_sla_breach(ctx, report_config)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover - defensive
-                logger.exception(
-                    "Unexpected error reporting the SLA breach of job %s; "
-                    "please report this as a bug (7)",
-                    name,
-                )
-
         self._install_tail_task(
             self._sla_report_tail,
             name,
-            _report,
+            lambda: report_sla_breach(ctx, report_config),
             spawn=self._spawn_completion,
             after=[
                 self._completion_tail.get(name),
                 self._sla_report_tail.get(name),
             ],
+            bug_log="Unexpected error reporting the SLA breach of job %s; "
+            "please report this as a bug (7)",
         )
 
+    @_maps_action_errors
     async def _web_start_job(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         name = request.match_info["name"]
-        try:
-            await self.start_job_by_name(name)
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        await self.start_job_by_name(name)
         # a minimal JSON ack in the MCP cron_run_job shape; this route once
         # returned an empty 200 while every sibling action returned JSON.
         return _json_response({"started": name}, headers=self._web_headers())
 
+    @_maps_action_errors
     async def _web_cancel_job(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         name = request.match_info["name"]
-        try:
-            count = await self.cancel_job_by_name(name)
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        count = await self.cancel_job_by_name(name)
         # the MCP cron_cancel_job shape, instances included
         return _json_response(
             {"cancelled": name, "instances": count},
             headers=self._web_headers(),
         )
 
+    @_maps_action_errors
     async def _web_pause_job(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         body = await self._web_json_body(request)
         duration = body.get("durationSeconds")
         # bool is an int subclass; `true` must not read as one second.
@@ -5435,48 +4821,40 @@ class Cron:
         by = body.get("by")
         if by is not None and not isinstance(by, str):
             raise _api_error(web.HTTPBadRequest, "by must be a string")
-        try:
-            paused = await self.pause_job_by_name(
-                request.match_info["name"],
-                duration=duration,
-                until=until,
-                note=note or "",
-                by=by or "api",
-                channel="api",
-            )
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        paused = await self.pause_job_by_name(
+            request.match_info["name"],
+            duration=duration,
+            until=until,
+            note=note or "",
+            by=by or "api",
+            channel="api",
+        )
         return _json_response({"paused": paused}, headers=self._web_headers())
 
+    @_maps_action_errors
     async def _web_resume_job(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         body = await self._web_json_body(request)
         by = body.get("by")
         if by is not None and not isinstance(by, str):
             raise _api_error(web.HTTPBadRequest, "by must be a string")
-        try:
-            await self.resume_job_by_name(
-                request.match_info["name"], by=by or "api", channel="api"
-            )
-        except ApiActionError as ex:
-            raise self._action_http_error(ex) from ex
+        await self.resume_job_by_name(
+            request.match_info["name"], by=by or "api", channel="api"
+        )
         return _json_response({"paused": None}, headers=self._web_headers())
 
     def _action_http_error(self, ex: "ApiActionError") -> web.HTTPException:
         # historical parity: web.headers ride the 409 conflict bodies of the
         # start/cancel routes, but NOT their 404 (unknown job).
-        assert self.web_config is not None
         headers = self._web_headers() if ex.status == 409 else None
         return _http_for_action_error(ex, headers)
 
-    def _security_headers(self) -> Dict[str, str]:
+    def _security_headers(self) -> dict[str, str]:
         """Security headers for the dashboard HTML page.
 
         Secure defaults (CSP, anti-clickjacking, nosniff) with any operator
         ``web.headers`` merged on top, so an operator who deliberately sets one
         of these (e.g. a relaxed CSP or framing policy) still wins.
         """
-        assert self.web_config is not None
         headers = dict(WEB_SECURITY_HEADERS)
         custom = self._web_headers()
         if custom:
@@ -5484,7 +4862,6 @@ class Cron:
         return headers
 
     async def _web_index(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         raw, etag = _index_document()
         # the page's own Content-Type wins, in any spelling: see
         # _strip_content_type
@@ -5523,26 +4900,19 @@ class Cron:
         """Seconds until the job's next scheduled run.
 
         ``None`` when not applicable: disabled, currently running, a
-        one-off ``@reboot`` schedule (a string, not a crontab), or a
-        schedule with no future occurrence.  Steady state reads the
-        loop's own next-fire index (the same source prometheus.py's
-        next-run gauge reads) rather than re-walking the crontab: this
-        runs per job on every /jobs poll, every /status call, and every
-        gossiped fleet summary.  The engine search survives only as the
-        fallback for the startup window before the loop's first pass
-        seeds the index.
+        one-off ``@reboot`` schedule, or a schedule with no future
+        occurrence.  Steady state reads the loop's own next-fire index (the
+        same source prometheus.py's next-run gauge reads) rather than
+        re-walking the crontab; the engine search survives only as the
+        fallback for the startup window before the index is seeded.
 
         ``now`` (aware UTC) lets a caller looping over the whole job set
-        read the clock ONCE for the pass instead of once per job: the
-        payload builders each ran a fresh ``datetime.now`` per job, which
-        on a large fleet is thousands of redundant clock reads per
-        request.  Passing it also makes the resulting snapshot internally
-        consistent, every countdown measured from the same instant rather
-        than from instants drifting apart across the loop.
+        read the clock ONCE for the pass, which also makes the snapshot
+        internally consistent: every countdown measured from one instant.
         """
         if not job.enabled or running:
             return None
-        crontab = job.schedule  # type: Union[CronTab, str]
+        crontab: CronTab | str = job.schedule
         if not isinstance(crontab, CronTab):
             return None
         when = self._next_fire.get(name)
@@ -5567,12 +4937,8 @@ class Cron:
         Holds for running jobs too (a running job with a dead schedule
         still never fires again).  Shared by the /jobs and /status
         payloads so the two surfaces cannot drift.  Steady state is two
-        set probes: once seeded, an enabled CronTab job is either in the
-        next-fire index (fires again) or in the dead-schedules latch
-        (never does).  The full engine search survives only as the
-        unseeded-startup fallback, which is the worst place for it: a
-        dead schedule is precisely the one that walks the whole horizon,
-        and it used to do so per running job per poll.
+        set probes (the next-fire index and the dead-schedules latch); the
+        full engine search survives only as the unseeded-startup fallback.
         """
         if not (job.enabled and isinstance(job.schedule, CronTab)):
             return False
@@ -5585,19 +4951,14 @@ class Cron:
             is None
         )
 
-    def fleet_job_summaries(self) -> Dict[str, Any]:
+    def fleet_job_summaries(self) -> dict[str, Any]:
         """Compact per-job snapshot gossiped to peers for the fleet view.
 
-        Installed on the leadership backend as its job-summaries provider
-        (see :meth:`start_stop_cluster`); the gossip backend piggybacks it on
-        every ``/peer`` response, which is how the dashboard's fleet view can
-        show runs happening on other nodes.  Deliberately lean (one small
-        fixed-shape entry per job) because it travels in a byte-capped
-        gossip payload: no command line, no ``fail_reason`` (arbitrary-length
-        operator text), no run history.  Those stay on the owning node's own
-        API.
+        Piggybacked on every ``/peer`` response. Deliberately lean (it
+        travels in a byte-capped gossip payload): no command line, no
+        fail_reason, no history; those stay on the owning node's API.
         """
-        out: Dict[str, Any] = {}
+        out: dict[str, Any] = {}
         # one clock read for the whole pass; see _scheduled_in's `now`
         now = get_now(datetime.timezone.utc)
         for name, job in self.cron_jobs.items():
@@ -5625,21 +4986,16 @@ class Cron:
         name: str,
         job: JobConfig,
         now: Optional[datetime.datetime] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         running = self.running_jobs.get(name) or []
         # next scheduled run, in seconds; None when not applicable (disabled,
         # currently running, or a one-off @reboot schedule).  ``now`` is the
         # caller's pass instant when it is looping the job set; see
         # _scheduled_in.
         scheduled_in = self._scheduled_in(name, job, bool(running), now)
-        # a dead schedule's None means NEVER, which the dashboards must be
-        # able to tell apart from the running/disabled Nones above.  For a
-        # job that is not running, _scheduled_in above already answered
-        # this (enabled + cron + no next instant is precisely "never
-        # fires"), so reuse its answer instead of asking twice per job on
-        # every /jobs poll.  Only a running job (whose scheduled_in is
-        # None by design) needs the direct probe: a running job with a
-        # dead schedule still never fires again.
+        # a dead schedule's None means NEVER, distinct from the running/
+        # disabled Nones. For a non-running job _scheduled_in already
+        # answered; only a running job needs the direct probe.
         if running:
             never_fires = self._schedule_never_fires(name, job)
         else:
@@ -5665,12 +5021,11 @@ class Cron:
             else []
         )
 
-        result = {
+        result: dict[str, Any] = {
             "name": name,
             "enabled": job.enabled,
-            # precomputed on the JobConfig at build time (see
-            # JobConfig._precompute_payload_views): these are pure functions
-            # of the config and were previously re-derived per job per poll.
+            # pure functions of the config, precomputed on the JobConfig at
+            # build time (see JobConfig._precompute_payload_views).
             "schedule": job.schedule_display,
             "command": job.command_display,
             "captureStdout": job.captureStdout,
@@ -5704,7 +5059,7 @@ class Cron:
                 if (pause := self._pause_active(name)) is not None
                 else None
             ),
-        }  # type: Dict[str, Any]
+        }
         if job.schedule_resolved_or_none is not None:
             # the H hash form: also ship the plain-dialect spelling it
             # resolved to, so the dashboards display the H the user wrote
@@ -5730,12 +5085,9 @@ class Cron:
                 "rss_bytes": sum(s["rss_bytes"] for s in live_snaps),
                 "instances": len(live_snaps),
             }
-        # durable-retry visibility: when a retry ladder is ARMED for this job,
-        # surface attempt/backoff so the dashboard can render a live
-        # "attempt N/M · next retry in Xs" chip. Gated on count > 0: the ladder
-        # is created eagerly at launch with count 0 even for a run that will
-        # succeed, so presence alone would flag every healthy retry-configured
-        # job with a phantom "attempt 0" chip. Omitted otherwise (lean).
+        # armed retry ladder: attempt/backoff for the dashboard chip.
+        # Gated on count > 0: the ladder is created eagerly at launch with
+        # count 0, so presence alone would flag healthy jobs.
         retry_state = self.retry_state.get(name)
         if (
             retry_state is not None
@@ -5755,19 +5107,11 @@ class Cron:
                 ),
                 "delaySeconds": retry_state.scheduled_delay,
             }
-        # per-job SLA introspection, only when the job configures a check:
-        # the non-null thresholds, the latched verdict, and the live
-        # breach detail (since = when the monitor latched it; observed is
-        # re-measured at payload time so the dashboards show a moving
-        # number, not the minute-old latch snapshot).
-        # has_sla is precomputed on the JobConfig and is true exactly when the
-        # comprehension below would be non-empty, so gating on it keeps the
-        # dict allocation off the overwhelming majority of jobs, which carry
-        # an all-None sla block.
+        # per-job SLA introspection, only when a check is configured:
+        # thresholds, latched verdict, and live breach detail (observed is
+        # re-measured at payload time, not the minute-old latch snapshot).
+        # has_sla is precomputed, keeping the allocation off no-SLA jobs.
         if job.has_sla:
-            # precomputed on the JobConfig; a real dict here (the shared
-            # read-only empty sentinel is only ever the value for a job with
-            # no check, which this branch excludes).
             thresholds = job.sla_thresholds
             observations = self._sla_observations(
                 name, job, get_now(datetime.timezone.utc)
@@ -5836,7 +5180,7 @@ class Cron:
                 )
         return result
 
-    def jobs_payload(self) -> List[Dict[str, Any]]:
+    def jobs_payload(self) -> list[dict[str, Any]]:
         """Full per-job dicts for ``GET /jobs`` and MCP ``cron_list_jobs``."""
         # one clock read for the whole pass; see _scheduled_in's `now`
         now = get_now(datetime.timezone.utc)
@@ -5845,7 +5189,7 @@ class Cron:
             for name, job in self.cron_jobs.items()
         ]
 
-    def job_detail_payload(self, name: str) -> Optional[Dict[str, Any]]:
+    def job_detail_payload(self, name: str) -> Optional[dict[str, Any]]:
         """One job's full dict, or ``None`` when there is no such job."""
         job = self.cron_jobs.get(name)
         if job is None:
@@ -5853,29 +5197,12 @@ class Cron:
         return self._job_to_dict(name, job)
 
     async def _web_list_jobs(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         # One product (payload build + ETag + body + gzip) is shared across
         # every poller for _JOBS_RESPONSE_TTL, busted by the local events
-        # that change the payload (_bust_response_memos): N dashboard tabs
-        # used to cost N identical builds per poll cycle. Only the
+        # that change the payload (_bust_response_memos). Only the
         # If-None-Match compare and the representation pick are per-request.
-        etag, body, gz = await self._jobs_product()
-        return _conditional_response(
-            etag,
-            body,
-            gz,
-            if_none_match=request.headers.get("If-None-Match"),
-            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
-            headers=self._web_headers(),
-        )
-
-    async def _jobs_product(self) -> Tuple[str, bytes, Optional[bytes]]:
-        """One shared ``/jobs`` product (etag, body, gz).
-
-        The TTL global is read at call time, like the ``/metrics`` and
-        ``/fleet`` wrappers.
-        """
-        return await self._shared_response_product(
+        return await self._memoized_conditional_response(
+            request,
             self._jobs_response_memo,
             _JOBS_RESPONSE_TTL,
             self._build_jobs_product,
@@ -5883,7 +5210,7 @@ class Cron:
 
     async def _build_jobs_product(
         self,
-    ) -> Tuple[str, bytes, Optional[bytes]]:
+    ) -> tuple[str, bytes, Optional[bytes]]:
         # Build on the loop (it reads live scheduler state), then hash +
         # serialize off it for a large fleet.  The tag is keyed on the
         # ABSOLUTE next-fire, not the relative scheduled_in, so it stays
@@ -5904,30 +5231,12 @@ class Cron:
     def _bust_response_memos(self) -> None:
         """Drop the shared endpoint products so a local change renders now.
 
-        Called from exactly the events that change the payloads on THIS
-        node: a run recorded, a launch (the ``running`` flag), a pause set
-        or cleared, and a reload.  Everything else (live resource samples,
-        a fire advancing, a counter ticking) ages out within the respective
-        TTL.
-
-        All four memoized read endpoints are busted together because all
-        four render the same local facts: ``/jobs`` shows the run and pause
-        state directly, ``/metrics`` exports it as ``cronstable_job_paused``
-        and the run counters, ``/fleet`` carries this node's own job
-        summaries alongside its peers', and ``/activity`` renders the same
-        run records again, batched for the heatmap.  Busting only one would
-        leave an operator watching a dashboard and a scrape that disagree
-        about a pause they just applied.
-
-        The generation bump closes the window a bust cannot otherwise cover:
-        all four scaffold builds (``/jobs``, ``/metrics``, ``/fleet``,
-        ``/activity``) can span an await, so one that STARTED before this
-        call can still be holding a pre-bust product and would re-populate
-        the slot with it moments later.  Each re-checks the counter before
-        storing, and a joiner re-checks it before trusting a shared
-        product (see :meth:`_shared_response_product`), so a bust that
-        lands mid-build makes that product non-cacheable rather than
-        silently reinstating it for another TTL.
+        Called from exactly the local events that change the payloads (run
+        recorded, launch, pause set/cleared, reload); everything else ages
+        out by TTL. Every memo busts together: they render the same local
+        facts and must not disagree. The generation bump stops a build that
+        STARTED pre-bust from re-populating the slot late (see
+        _shared_response_product).
         """
         self._memo_gen += 1
         self._jobs_response_memo.cached = None
@@ -5935,16 +5244,14 @@ class Cron:
             memo.cached = None
         self._fleet_response_memo.cached = None
         self._activity_response_memo.cached = None
+        self._metric_samples_memo.cached = None
 
     async def _web_get_job(self, request: web.Request) -> web.Response:
         """One job's full detail dict (``GET /jobs/{name}``).
 
-        The single-job sibling of ``GET /jobs``: the identical per-job shape
-        ``_job_to_dict`` builds, so a client (a widget, a detail screen) can
-        refresh one job without pulling and filtering the whole fleet.  The
-        detail dict was already exposed to MCP (``cron_get_job``); this puts it
-        on REST too.  ``404`` for an unknown job, like the sibling
-        ``/jobs/{name}/...`` routes.
+        The identical per-job shape _job_to_dict builds for /jobs, so a
+        client can refresh one job without pulling the fleet. 404 for an
+        unknown job.
         """
         payload = self.job_detail_payload(request.match_info["name"])
         if payload is None:
@@ -5957,13 +5264,12 @@ class Cron:
         """The operator-configured ``web.headers`` map (or ``None``).
 
         The ONE spelling of this lookup: every handler reads it through
-        here (a sweep replaced 35 inline copies), so a future policy
-        change edits one method instead of every route.
+        here, so a future policy change edits one method, not every route.
         """
         assert self.web_config is not None
         return self.web_config.get("headers", None)
 
-    async def dags_payload(self) -> List[Dict[str, Any]]:
+    async def dags_payload(self) -> list[dict[str, Any]]:
         """Configured DAGs + tasks (`GET /dags`, MCP `cron_list_dags`)."""
         dags = await self._dag.list_dags()
         # graft the human-readable schedule string here (schedule_str lives in
@@ -6027,13 +5333,12 @@ class Cron:
     # --- durable state inspector (metadata-only) --------------------------
 
     async def _web_state(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         return _json_response(
             await self.state_payload(),
             headers=self._web_headers(),
         )
 
-    async def state_payload(self) -> Dict[str, Any]:
+    async def state_payload(self) -> dict[str, Any]:
         """Store health + topology for the state inspector, metadata only.
 
         Per-prefix stream/document counts, capped scope lists, and active
@@ -6093,7 +5398,7 @@ class Cron:
         }
         return inv
 
-    async def state_documents_payload(self, ns: str) -> Dict[str, Any]:
+    async def state_documents_payload(self, ns: str) -> dict[str, Any]:
         """Documents of one KV/cursor/idempotency namespace, redacted.
 
         KV values are stripped to a ``valueSize``/``valueType`` summary
@@ -6142,19 +5447,16 @@ class Cron:
                 out.append(doc)
         return {"namespace": ns, "documents": out}
 
+    @_maps_action_errors
     async def _web_state_documents(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
-        try:
-            payload = await self.state_documents_payload(
-                request.query.get("ns", "")
-            )
-        except ApiActionError as ex:
-            raise _http_for_action_error(ex) from ex
+        payload = await self.state_documents_payload(
+            request.query.get("ns", "")
+        )
         return _json_response(payload, headers=self._web_headers())
 
     async def state_records_payload(
         self, stream: str, limit: int = 100
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Newest records of one stream, metadata-only.
 
         Archived-output (``logs/``) streams are refused: they carry raw job
@@ -6186,17 +5488,14 @@ class Cron:
             recs = []
         return {"stream": stream, "records": recs}
 
+    @_maps_action_errors
     async def _web_state_records(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         limit = self._web_int_query(
             request, "limit", default=100, lo=1, hi=500
         )
-        try:
-            payload = await self.state_records_payload(
-                request.query.get("stream", ""), limit=limit
-            )
-        except ApiActionError as ex:
-            raise _http_for_action_error(ex) from ex
+        payload = await self.state_records_payload(
+            request.query.get("stream", ""), limit=limit
+        )
         return _json_response(payload, headers=self._web_headers())
 
     async def _web_dag_trigger(self, request: web.Request) -> web.Response:
@@ -6258,11 +5557,8 @@ class Cron:
         """A clamped integer query param; falls back to ``default`` on a
         missing or unparseable value (a bad query is never a 400 here).
 
-        ``alias`` is a legacy spelling read only when ``name`` is absent:
-        the count-capping params had grown four names (``count``,
-        ``per_job``, ``runs``, ``limit``) endpoint by endpoint, so every
-        capped listing now reads ``limit`` first while its original
-        spelling keeps working.
+        ``alias`` is a legacy spelling read only when ``name`` is absent;
+        every capped listing reads ``limit`` first.
         """
         raw = request.query.get(name)
         if raw is None and alias is not None:
@@ -6276,7 +5572,7 @@ class Cron:
         return max(lo, min(hi, value))
 
     @staticmethod
-    async def _web_json_body(request: web.Request) -> Dict[str, Any]:
+    async def _web_json_body(request: web.Request) -> dict[str, Any]:
         if not request.can_read_body:
             return {}
         try:
@@ -6291,7 +5587,7 @@ class Cron:
             )
         return body
 
-    def job_runs_payload(self, name: str) -> Optional[Dict[str, Any]]:
+    def job_runs_payload(self, name: str) -> Optional[dict[str, Any]]:
         """Retained run history + stats for one job, or ``None`` if unknown.
 
         Behind ``GET /jobs/{name}/runs`` and MCP ``cron_list_runs``.
@@ -6306,7 +5602,6 @@ class Cron:
         }
 
     async def _web_job_runs(self, request: web.Request) -> web.Response:
-        assert self.web_config is not None
         name = request.match_info["name"]
         payload = self.job_runs_payload(name)
         if payload is None:
@@ -6328,94 +5623,99 @@ class Cron:
             payload["runs"] = payload["runs"][-limit:]  # newest retained
         return _json_response(payload, headers=self._web_headers())
 
-    def activity_payload(self) -> Dict[str, Any]:
+    def _activity_snapshot(self) -> dict[str, list[JobRunInfo]]:
+        """Per-job pointer copies of the run histories, for ``/activity``.
+
+        List copies of the deques, taken on the loop: an executor thread
+        must never iterate a live history deque (a reaper append mid-walk
+        raises "deque mutated during iteration").  Every configured job is
+        present (``[]`` for one with no history) so a client can tell "no
+        runs" from "unknown job".
+        """
+        return {
+            # .get, never a subscript: run_history is a defaultdict and a
+            # read must not grow it one empty deque per never-run job
+            name: list(self.run_history.get(name) or ())
+            for name in self.cron_jobs
+        }
+
+    def activity_payload(
+        self, limit: int = RUN_HISTORY_LIMIT
+    ) -> dict[str, Any]:
         """Every job's retained runs, cut down to what the heatmap plots.
 
         Behind ``GET /activity``: ``jobs`` maps each job name to its
-        retained runs oldest first, each row exactly ``{started_at,
-        finished_at, outcome}``.  Every configured job is present (``[]``
-        for one with no history) so a client can tell "no runs" from
-        "unknown job".
+        newest ``limit`` retained runs oldest first, each row exactly
+        ``{started_at, finished_at, outcome}``.  The default serves the
+        whole retained window.
         """
-        jobs: Dict[str, List[Dict[str, Any]]] = {}
-        for name in self.cron_jobs:
-            # .get, never a subscript: run_history is a defaultdict and a
-            # read must not grow it one empty deque per never-run job
-            history = self.run_history.get(name)
-            jobs[name] = [
-                {
-                    "started_at": (
-                        r.started_at.isoformat()
-                        if r.started_at is not None
-                        else None
-                    ),
-                    "finished_at": r.finished_at.isoformat(),
-                    "outcome": r.outcome,
-                }
-                for r in (history or ())
-            ]
-        return {"jobs": jobs}
+        return _activity_jobs(self._activity_snapshot(), limit)
 
     async def _web_get_activity(self, request: web.Request) -> web.Response:
         """Batched recent run outcomes for every job (the heatmap's feed).
 
-        Both dashboards used to assemble the activity punchcard from one
-        ``GET /jobs/{name}/runs`` per job per refresh, storm-controlled
-        client-side (a TUI semaphore, a sequential web loop).  This serves
-        the same records once, reduced to the three fields the overlay
-        plots, on the same memo, ETag and gzip scaffold as the other poll
-        legs, busted by the same local events that change run history.
+        Serves in one response what would otherwise be a
+        ``GET /jobs/{name}/runs`` per job per refresh, reduced to the three
+        fields the overlay plots, on the same memo, ETag and gzip scaffold
+        as the other poll legs, busted by the same local events.
         """
-        assert self.web_config is not None
-        etag, body, gz = await self._activity_product()
-        return _conditional_response(
-            etag,
-            body,
-            gz,
-            if_none_match=request.headers.get("If-None-Match"),
-            gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
-            headers=self._web_headers(),
+        # the same clamped `limit` (rows per job, newest retained) the
+        # other capped listings take; the default full-window response is
+        # the memo-shared one, and an explicit narrower cut is built per
+        # request (neither dashboard sends one, and a memo would otherwise
+        # need a slot per distinct limit).
+        limit = self._web_int_query(
+            request,
+            "limit",
+            default=RUN_HISTORY_LIMIT,
+            lo=1,
+            hi=RUN_HISTORY_LIMIT,
         )
-
-    async def _activity_product(self) -> Tuple[str, bytes, Optional[bytes]]:
-        """One shared ``/activity`` product (etag, body, gz).
-
-        The TTL global is read at call time, like the ``/jobs`` and
-        ``/fleet`` wrappers.
-        """
-        return await self._shared_response_product(
+        if limit != RUN_HISTORY_LIMIT:
+            etag, body, gz = await self._build_activity_product(limit)
+            return _conditional_response(
+                etag,
+                body,
+                gz,
+                if_none_match=request.headers.get("If-None-Match"),
+                gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+                headers=self._web_headers(),
+            )
+        return await self._memoized_conditional_response(
+            request,
             self._activity_response_memo,
             _ACTIVITY_RESPONSE_TTL,
             self._build_activity_product,
         )
 
     async def _build_activity_product(
-        self,
-    ) -> Tuple[str, bytes, Optional[bytes]]:
-        # the projection reads the live run histories so it stays on the
-        # loop; the serialize/hash/gzip over it is pure CPU and offloads
-        # for a large fleet, at the same gate as /jobs.
-        payload = self.activity_payload()
-        if len(payload["jobs"]) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+        self, limit: int = RUN_HISTORY_LIMIT
+    ) -> tuple[str, bytes, Optional[bytes]]:
+        # Past the /jobs offload gate, the row projection (jobs x runs of
+        # dict builds and isoformat calls, the expensive half at fleet
+        # scale) rides the SAME executor hop as the serialize/hash/gzip,
+        # over a loop-taken snapshot (see _activity_snapshot for why); the
+        # rows' three plotted fields are frozen at construction, so the
+        # worker reads immutable data.  Below the gate the whole build is
+        # cheaper than the thread hop.
+        if len(self.cron_jobs) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+            histories = self._activity_snapshot()
             return await asyncio.get_running_loop().run_in_executor(
-                None, _cachable_json_product, payload
+                None,
+                lambda: _cachable_json_product(
+                    _activity_jobs(histories, limit)
+                ),
             )
-        return _cachable_json_product(payload)
+        return _cachable_json_product(self.activity_payload(limit))
 
     async def _web_job_resources(self, request: web.Request) -> web.Response:
         """Chart-grade CPU/RSS series for one job (monitorResources jobs).
 
-        The heavyweight sibling of the summary numbers that ride /jobs and
-        /jobs/{name}/runs: fetched lazily when the dashboard opens a job's
-        resource chart, never on the poll loop.  ``live`` carries the
-        run-so-far series of each currently-running monitored instance;
-        ``runs`` the recorded series of recent finished runs (oldest first,
-        rehydrated from the durable ledger across restarts), capped by the
-        ``runs`` query parameter.  Both are empty, and ``monitored`` false,
-        for a job that never opted in, so the dashboard can tell "not
-        monitored" from "no data yet".
+        Fetched lazily when the dashboard opens the chart, never on the
+        poll loop. ``live`` is the run-so-far series per running instance;
+        ``runs`` the recorded series of recent finished runs. Both empty,
+        and ``monitored`` false, for a job that never opted in.
         """
-        assert self.web_config is not None
         name = request.match_info["name"]
         max_runs = self._web_int_query(
             request,
@@ -6434,7 +5734,7 @@ class Cron:
 
     def job_resources_payload(
         self, name: str, max_runs: int
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """CPU/RSS series for a job's live + recent runs, or ``None``.
 
         Behind ``GET /jobs/{name}/resources`` and MCP
@@ -6488,14 +5788,13 @@ class Cron:
         history (``source: memory``) without a healthy backend, so the
         endpoint always answers.
         """
-        assert self.web_config is not None
         name = request.match_info["name"]
         payload = await self.job_trends_payload(name)
         if payload is None:
             raise web.HTTPNotFound()
         return _json_response(payload, headers=self._web_headers())
 
-    async def job_trends_payload(self, name: str) -> Optional[Dict[str, Any]]:
+    async def job_trends_payload(self, name: str) -> Optional[dict[str, Any]]:
         """SLA trend aggregates over the durable run ledger, or ``None``.
 
         Behind ``GET /jobs/{name}/trends`` and MCP ``cron_get_job_trends``
@@ -6516,7 +5815,7 @@ class Cron:
             # serve that within the TTL instead of re-scanning up to
             # TREND_SCAN_LIMIT records again (see JOB_TRENDS_CACHE_TTL).
             return cached[1]
-        recs: Optional[List[Dict[str, Any]]] = None
+        recs: Optional[list[dict[str, Any]]] = None
         backend = self.state_backend
         if backend is not None:
             try:
@@ -6558,9 +5857,9 @@ class Cron:
     def _job_trends_build(
         self,
         name: str,
-        recs: Optional[List[Dict[str, Any]]],
-        fallback: Optional[List[JobRunInfo]],
-    ) -> Dict[str, Any]:
+        recs: Optional[list[dict[str, Any]]],
+        fallback: Optional[list[JobRunInfo]],
+    ) -> dict[str, Any]:
         """Parse and aggregate for :meth:`job_trends_payload` (executor side).
 
         Pure CPU over snapshots captured on the loop: ``recs`` is the
@@ -6569,7 +5868,7 @@ class Cron:
         """
         if recs is not None:
             source = "durable"
-            infos: List[JobRunInfo] = []
+            infos: list[JobRunInfo] = []
             recs.reverse()  # oldest first, matching _run_stats
             # one shared, already-closed output stream for every rehydrated
             # record: the trends aggregation never reads output, so the
@@ -6593,7 +5892,7 @@ class Cron:
         # records persist fire-and-forget, a shared mount interleaves other
         # nodes' appends, and a crash-reconciled record carries a past
         # interruption instant but lands in the stream at boot.
-        window_runs: Dict[str, List[JobRunInfo]] = {
+        window_runs: dict[str, list[JobRunInfo]] = {
             label: [] for label, _ in TREND_WINDOWS
         }
         for info in infos:
@@ -6650,20 +5949,16 @@ class Cron:
     async def _web_on_shutdown(self, app: web.Application) -> None:
         """End every live SSE tail so the web app can tear down promptly.
 
-        Runs inside ``web_runner.cleanup()`` BEFORE aiohttp waits (its 60s
-        shutdown timeout) for in-flight handlers, which is the only moment
-        the wait can be made short: a tail handler otherwise never returns,
-        so a web/mcp/TLS config change with one dashboard tab tailing logs
-        stalled scheduling for the full timeout, and sub-minute jobs lost
-        every slot past CATCHUP_LIMIT. The queue sentinel reuses the
-        end-of-output path, so the client sees an ordinary end-of-stream.
+        Runs inside ``web_runner.cleanup()`` BEFORE aiohttp waits its 60s
+        shutdown timeout: a tail handler never returns on its own, so an
+        open tail would stall scheduling for the full timeout. The queue
+        sentinel reuses the end-of-output path.
         """
         self._web_draining = True
         for queue in list(self._web_sse_queues):
             queue.put_nowait(None)
 
-    def _sse_headers(self) -> Dict[str, str]:
-        assert self.web_config is not None
+    def _sse_headers(self) -> dict[str, str]:
         # Like /metrics, the stream framing is this endpoint's contract: an
         # operator-configured Content-Type, cache policy, or proxy buffering
         # override in web.headers would silently break every live tail, so
@@ -6723,13 +6018,11 @@ class Cron:
                 if item is None:  # end-of-output sentinel
                     break
                 # Drain the burst behind the first line before writing: a
-                # chatty job publishes lines faster than one
-                # wait_for + write round trip each, and per-line delivery
-                # cost one fresh timer task, one frame build and one
-                # transport write PER LINE PER SUBSCRIBER on the scheduler's
-                # loop (a 5k line/s job with two viewers was ~10k coroutine
-                # steps a second). One joined write per drained burst
-                # mirrors the replay path above.
+                # chatty job publishes lines faster than one wait_for +
+                # write round trip each, and per-line delivery costs a
+                # timer task, frame build and transport write PER LINE PER
+                # SUBSCRIBER on the scheduler's loop. One joined write per
+                # drained burst mirrors the replay path above.
                 frames = [_sse_frame(item[0], item[1])]
                 while True:
                     try:
@@ -6754,7 +6047,7 @@ class Cron:
         output: Optional[JobOutputStream],
         tail: int,
         cursor: Optional[int],
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Poll-friendly snapshot of a retained output buffer.
 
         The non-streaming counterpart of :meth:`_pump_output`, backing the MCP
@@ -6784,7 +6077,7 @@ class Cron:
 
     def job_logs_tail_payload(
         self, name: str, tail: int = 100, cursor: Optional[int] = None
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Last retained log lines of a job, or ``None`` if unknown.
 
         Behind MCP ``cron_tail_job_logs``, the poll/cursor projection of the
@@ -6804,7 +6097,7 @@ class Cron:
         taskkey: str,
         tail: int = 100,
         cursor: Optional[int] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Last retained log lines of a running DAG task instance, or ``None``.
 
         Behind MCP ``cron_tail_dag_task_logs``.  Only a currently-running
@@ -6821,7 +6114,6 @@ class Cron:
         return payload
 
     async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:
-        assert self.web_config is not None
         name = request.match_info["name"]
         if name not in self.cron_jobs:
             raise web.HTTPNotFound()
@@ -6845,7 +6137,6 @@ class Cron:
         finished instance's buffer is not retained); the dashboard shows
         "no live output" otherwise.
         """
-        assert self.web_config is not None
         name = request.match_info["name"]
         run_key = request.match_info["run_key"]
         taskkey = request.match_info["taskkey"]
@@ -6890,14 +6181,10 @@ class Cron:
         if web_config is not None and not tlsutil.listener_tls_loadable(
             web_config.get("tls")
         ):
-            # Make-before-break is infeasible here for the same reason it is
-            # for gossip: the new runner binds the same port / socket path the
-            # old one still holds. So only proceed once the NEW material
-            # loads. A half-written rotation (cert-manager, Vault and
-            # Kubernetes secret refreshes are not atomic across the files), or
-            # a config edit racing one, would otherwise tear down a working
-            # listener and then fail to rebuild, leaving nothing serving until
-            # the next reload.
+            # Make-before-break is infeasible (the new runner binds the
+            # same port the old one holds), so only proceed once the NEW
+            # material loads: a half-written rotation would otherwise tear
+            # down a working listener and fail to rebuild.
             logger.warning(
                 "web: new TLS material is not yet loadable (a "
                 "partial/half-written rotation, or a config edit racing "
@@ -6907,8 +6194,8 @@ class Cron:
         return reason
 
     def _build_web_tls(
-        self, web_tls: Optional[Dict[str, Any]]
-    ) -> "tuple[Optional[ssl.SSLContext], Optional[Dict[str, Any]], bool]":
+        self, web_tls: Optional[dict[str, Any]]
+    ) -> "tuple[Optional[ssl.SSLContext], Optional[dict[str, Any]], bool]":
         """``(context, file signature, failed)`` for a listener about to start.
 
         On failure the caller must NOT fall back to a plaintext listener and
@@ -7171,7 +6458,7 @@ class Cron:
 
     def _bonjour_advert(
         self, web_config: Optional[WebConfig]
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """The `_cronstable._tcp` advert the current web state calls for.
 
         None whenever there is nothing (or no wish) to advertise: the
@@ -7188,7 +6475,7 @@ class Cron:
         if chosen is None:
             return None
         scheme, port, address = chosen
-        advert: Dict[str, Any] = {
+        advert: dict[str, Any] = {
             "name": bonjour.get("name") or report_hostname(),
             "port": port,
             "properties": {
@@ -7202,15 +6489,13 @@ class Cron:
 
     def _advertisable_listener(
         self,
-    ) -> Optional[Tuple[str, int, Optional[str]]]:
+    ) -> Optional[tuple[str, int, Optional[str]]]:
         """The one (scheme, port, address) worth advertising, or None.
 
         All three must describe the SAME listener: the advert exists to
-        be dialed by another machine, and its previous shape glued the
-        first bound port to an "https if any listen entry is https"
-        scheme and the outbound-route IP, which on a mixed listen list
-        (loopback http for local tools, https on the LAN) named an
-        endpoint nothing served.  Selection: the first bound https
+        be dialed by another machine, and mixing one listener's port with
+        another's scheme or address names an endpoint nothing serves.
+        Selection: the first bound https
         listener a LAN peer can reach, else the first such http one.
         A loopback-bound listener is never advertised (its port is
         unreachable from any other machine), and a listener bound to
@@ -7222,7 +6507,7 @@ class Cron:
         interface than the one the socket lives on) and None for a
         wildcard bind, where the advertiser probes the primary address.
         """
-        candidates = []  # type: List[Tuple[str, int, Optional[str]]]
+        candidates: list[tuple[str, int, Optional[str]]] = []
         skipped_v6 = False
         for scheme, sockname in self._web_tcp_bound:
             host, port = str(sockname[0]), int(sockname[1])
@@ -7254,25 +6539,43 @@ class Cron:
         return candidates[0]
 
     @staticmethod
-    def _election_relevant(cluster_config: ClusterConfig) -> Dict[str, Any]:
+    def _election_relevant(cluster_config: ClusterConfig) -> dict[str, Any]:
         """The cluster config minus its observability-only keys.
 
-        ``shareNodeStats`` and ``observabilityMesh`` are resolved onto the
-        same ClusterConfig dict (see
-        :func:`cronstable.config._attach_observability`) but are
-        election-inert:
-        they feed the overlay lifecycle (:meth:`start_stop_observability`) and
-        the share-flag reconciliation in :meth:`start_stop_cluster`, never the
-        election manager's behavior. Restarting the manager on a difference in
-        them would, on a lease backend, drop the leadership lease and pause
-        Leader jobs fleet-wide for an edit that changes nothing about
-        election, so the restart comparison strips them from both sides.
+        ``shareNodeStats`` and ``observabilityMesh`` are election-inert;
+        restarting the manager on a difference in them would drop the
+        leadership lease and pause Leader jobs fleet-wide for an edit that
+        changes nothing about election, so the restart comparison strips
+        them from both sides.
         """
         return {
             key: value
             for key, value in cluster_config.items()
             if key not in ("shareNodeStats", "observabilityMesh")
         }
+
+    @staticmethod
+    def _backend_start_errors() -> tuple[type[Exception], ...]:
+        """The operational failures a gossip/lease backend start may raise.
+
+        The one swallow list for start_stop_cluster and
+        start_stop_observability, so the two cannot drift.
+        ``aiohttp.ClientError`` / ``asyncio.TimeoutError`` cover a lease
+        backend that cannot reach or authenticate to its store at start(),
+        an operational misconfiguration to log, not the generic "report a
+        bug" path (a ClientResponseError on a rejected token is not
+        OSError). Built per call, never a module constant: naming
+        ``aiohttp.ClientError`` at module scope would open the lazy
+        aiohttp door on import (see :class:`_AiohttpDoor`).
+        """
+        return (
+            OSError,
+            ssl.SSLError,
+            ValueError,
+            ConfigError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        )
 
     async def start_stop_cluster(
         self, cluster_config: Optional[ClusterConfig]
@@ -7282,20 +6585,14 @@ class Cron:
         self._elect_leader_configured = bool(
             cluster_config and cluster_config.get("electLeader")
         )
-        # Restart the manager when the cluster section is removed or changed,
-        # mirroring start_stop_web_app. The id it reports tracks config reloads
-        # on its own (it calls self.job_set_id each round), so only a change to
-        # the cluster section itself (peers/tls/listen) needs a restart, plus
-        # an in-place TLS cert rotation, which leaves the config bytes
-        # identical but the on-disk material new (cert-manager / Vault / a
-        # Kubernetes secret refresh); without this the cluster keeps serving
-        # the old cert until it expires and then loses quorum fleet-wide.
+        # Restart the manager only on a cluster-section change or an
+        # in-place TLS cert rotation (config bytes identical, on-disk
+        # material new); without the latter the cluster keeps serving the
+        # old cert until it expires and loses quorum fleet-wide.
         mgr = self.cluster_manager
         if mgr is not None:
-            # observability-only edits (shareNodeStats / observabilityMesh)
-            # are stripped from the comparison: they never require an election
-            # restart (see _election_relevant); the overlay lifecycle and the
-            # share-flag reconciliation below pick them up instead.
+            # observability-only edits never require an election restart
+            # (see _election_relevant); the overlay lifecycle picks them up.
             if cluster_config is None or self._election_relevant(
                 cluster_config
             ) != self._election_relevant(mgr.config):
@@ -7308,26 +6605,11 @@ class Cron:
                 reason == "TLS certificate files changed"
                 and not mgr.tls_files_loadable()
             ):
-                # A cert rotation restarts the manager only to swap in the NEW
-                # on-disk material, so validate it BEFORE tearing the old one
-                # down: cert-manager / Vault / a Kubernetes secret refresh are
-                # not atomic across all three files, so a reload can observe a
-                # half-written or briefly-absent cert.  If the new material is
-                # not yet loadable, keep the running manager (still serving
-                # the valid old cert) and retry next reload, rather than
-                # stopping it and then failing to rebuild, which would wedge
-                # Leader / PreferLeader closed for up to a reload.  (Make-
-                # before-break is infeasible for gossip: the new manager binds
-                # the same listen port the old one still holds.)  Only this
-                # reason is gated; a genuine configuration change tears the old
-                # manager down regardless and lets start fail closed as before.
-                # The etcd backend also reaches here (it tracks client-TLS
-                # rotation and overrides tls_files_loadable to dry-run the new
-                # ca/cert/key), so it gets the same make-before-break. The
-                # kubernetes backend reports tls_files_changed but inherits the
-                # always-true tls_files_loadable default, so it skips the gate
-                # and rebuilds straight away. A backend with neither (plain
-                # http, no tracked files) never reaches here at all.
+                # Validate the NEW material BEFORE tearing the old manager
+                # down: rotations are not atomic across the files, and
+                # stop-then-fail-to-rebuild would wedge Leader/PreferLeader
+                # closed for up to a reload. Only this reason is gated; a
+                # genuine configuration change tears down regardless.
                 logger.warning(
                     "cluster: TLS certificate files changed but the new "
                     "material is not yet loadable (a partial/half-written "
@@ -7335,10 +6617,8 @@ class Cron:
                     "next reload"
                 )
                 reason = None
-            # local import to keep cluster.py out of the import graph until a
-            # running manager is actually being reconfigured (mirrors
-            # make_backend's deferred imports); the helper returns True
-            # at once for a non-gossip new config, so this is gossip-only.
+            # local import so cluster.py stays out of the import graph
+            # until a running manager is actually being reconfigured.
             from cronstable.cluster import gossip_tls_loadable
 
             if (
@@ -7346,19 +6626,9 @@ class Cron:
                 and cluster_config is not None
                 and not gossip_tls_loadable(cluster_config)
             ):
-                # A genuine config change (peers/listen) tears the old manager
-                # down regardless, but if it coincides with an in-flight cert
-                # rotation (half-written/absent cert files), the rebuild's
-                # ClusterManager.__init__ would raise on the bad material and
-                # leave NO manager, wedging Leader/PreferLeader closed up to
-                # a reload. The cert-only path above does not cover
-                # this combined case. Dry-run the NEW config's gossip TLS first
-                # (the incoming paths, which a config edit may have repointed):
-                # if it cannot load now, keep the running manager (still
-                # serving the valid old cert) and retry next reload, accepting
-                # that the peers/listen change also waits one reload (a stale-
-                # but-functional cluster beats no manager). Non-gossip backends
-                # and tls-less configs always pass, so this is gossip-only.
+                # a config change racing a cert rotation: dry-run the NEW
+                # config's gossip TLS first; a stale-but-functional cluster
+                # beats no manager. Non-gossip/tls-less configs always pass.
                 logger.warning(
                     "cluster: configuration changed but the new TLS material "
                     "is not yet loadable (a config edit racing a cert "
@@ -7368,13 +6638,11 @@ class Cron:
                 reason = None
             if reason is not None:
                 logger.info("cluster: %s, stopping", reason)
-                # Record losing leadership/quorum HERE if we held it: the flag
-                # resets below would otherwise suppress the transition log in
-                # _emit_cluster_role_logs, leaving the ex-leader's own log
-                # silent about why it stopped Leader jobs (until/unless a
-                # replacement manager comes up and re-logs). Only fires when
-                # election was on (the flags are only ever set then).
-                node = getattr(mgr, "node_name", None) or self._state_host
+                # Record losing leadership/quorum HERE if we held it: the
+                # flag resets below would otherwise suppress the transition
+                # log, leaving the ex-leader silent about why it stopped
+                # Leader jobs.
+                node = self._node_name()
                 if self._was_leader:
                     # a real leadership loss (the rebuilt manager re-elects
                     # from scratch), so it counts as a transition too
@@ -7419,27 +6687,17 @@ class Cron:
                     )
                 await mgr.stop()
                 self.cluster_manager = None
-                # The transition flags track the OLD manager's last-logged
-                # state; reset them so the first _log_cluster_role against the
-                # replacement (or against no manager) reflects a clean
-                # transition rather than suppressing or duplicating a log line.
+                # the transition flags track the OLD manager's last-logged
+                # state; reset so the replacement logs a clean transition.
                 self._was_leader = False
                 self._was_quorate = False
                 self._was_conflict = False
                 self._was_size_conflict = False
                 self._was_policy_conflict = False
         if cluster_config is not None and self.cluster_manager is not None:
-            # The manager was KEPT across this reload (only observability
-            # keys, or nothing, changed), but it latched the node-stats
-            # share flag once, at whichever set_node_stats_provider call it
-            # last saw. Re-reconcile it to the NEW config unconditionally, or
-            # a shareNodeStats toggle would never reach a running gossip
-            # election mesh: off would keep gossiping CPU/memory until some
-            # unrelated restart, on would never start. Safe on a running
-            # manager (the call only reassigns the provider and flag, picked
-            # up on the next /peer round) and a no-op on the lease backends
-            # (their seam default ignores it). Same share expression as the
-            # build path below.
+            # a KEPT manager latched the share flag at its last call;
+            # re-reconcile unconditionally or a shareNodeStats toggle would
+            # never reach a running gossip mesh. No-op on lease backends.
             self.cluster_manager.set_node_stats_provider(
                 self.node_resource_snapshot,
                 share=bool(cluster_config.get("shareNodeStats"))
@@ -7452,57 +6710,37 @@ class Cron:
             for warning in cluster_config_warnings(cluster_config):
                 logger.warning("%s", warning)
             try:
-                # Construct INSIDE the try: a backend's __init__/start can
-                # raise on an operational misconfiguration; the gossip
-                # manager builds the TLS contexts (loading the CA/cert/key
-                # files: OSError/ssl.SSLError) and start() parses listen
-                # (ValueError) and binds the port (OSError); a lease backend's
-                # start() may fail to load in-cluster/kubeconfig credentials
-                # or build a client TLS context (ConfigError/OSError/SSLError).
-                # All are misconfigurations we log and keep running through,
-                # not bugs, so they must not escape to the run loop's generic
-                # "please report this as a bug" handler.
+                # Construct INSIDE the try: __init__/start can raise on
+                # operational misconfiguration (TLS files, listen parse,
+                # bind, lease-store credentials). All are logged and run
+                # through, not bugs, so they must not escape to the run
+                # loop's "please report this as a bug" handler.
                 manager = make_backend(cluster_config, self.job_set_id)
-                # Install the fleet-view summaries provider BEFORE start():
-                # start() runs a full poll round up front, during which peers
-                # may already be polling us back, and their very first
-                # absorbed snapshot should carry our jobs rather than an
-                # empty block. No-op for the lease backends.
+                # Install the summaries provider BEFORE start(): peers may
+                # poll us during start()'s first round and their first
+                # absorbed snapshot should carry our jobs.
                 manager.set_job_summaries_provider(self.fleet_job_summaries)
-                # Always install the node-stats provider so a gossip cluster
-                # shows THIS node's own load in its /cluster + /fleet self
-                # readouts (local, free); `share` gates whether we ALSO gossip
-                # it to peers: on only when observability is enabled with
-                # backend: gossip (no separate overlay mesh; the lease+overlay
-                # case installs on the overlay in start_stop_observability). A
-                # no-op on the lease backends (their seam default ignores it).
+                # Always install the node-stats provider (local readouts
+                # are free); `share` gates gossiping it to peers, on only
+                # for observability with backend: gossip (the lease+overlay
+                # case installs on the overlay instead). No-op on lease
+                # backends.
                 manager.set_node_stats_provider(
                     self.node_resource_snapshot,
                     share=bool(cluster_config.get("shareNodeStats"))
                     and cluster_config.get("observabilityMesh") is None,
                 )
                 await manager.start()
-            except (
-                OSError,
-                ssl.SSLError,
-                ValueError,
-                ConfigError,
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-            ) as ex:
+            except self._backend_start_errors() as ex:
                 # bad cert/credential files / bad listen address / port already
                 # in use / unreachable setup: log and keep running jobs rather
                 # than aborting the reload. (A backend cleans up its own
-                # half-started state on failure.) aiohttp.ClientError /
-                # asyncio.TimeoutError cover a lease backend that cannot reach
-                # or authenticate to its store at start(), an operational
-                # misconfiguration to log, not the generic "report a bug" path
-                # (a ClientResponseError on a rejected token is not OSError).
+                # half-started state on failure.)
                 logger.error("cluster: failed to start: %s", ex)
                 return
             self.cluster_manager = manager
 
-    def node_resource_snapshot(self) -> Optional[Dict[str, Any]]:
+    def node_resource_snapshot(self) -> Optional[dict[str, Any]]:
         """This node's live CPU/memory for gossip and GET /node.
 
         The callable installed as the gossip node-stats provider; also used by
@@ -7530,21 +6768,12 @@ class Cron:
     ) -> None:
         """(Re)build the gossip observability overlay to match the config.
 
-        The overlay is a SECOND, election-inert gossip manager that a lease
-        cluster (kubernetes/etcd/filesystem) stands up purely to exchange fleet
-        data (per-node CPU/memory and job summaries), since a lease backend
-        has no node-to-node channel of its own.  It is built from the resolved
-        ``observabilityMesh`` config (see
-        :func:`cronstable.config._attach_observability`); ``None`` there means
-        no overlay is wanted (the section is absent, or ``backend: gossip``
-        already carries the data on the election mesh, handled in
-        :meth:`start_stop_cluster`).
-
-        Mirrors the rebuild logic of :meth:`start_stop_cluster` but simpler:
-        the overlay never elects, so there is no leadership/quorum transition
-        to log.  Like the election manager it is rebuilt on a config change or
-        an in-place TLS cert rotation, and a start failure is logged and
-        swallowed so a misconfigured overlay never stops jobs from running.
+        A SECOND, election-inert gossip manager a lease cluster stands up
+        purely to exchange fleet data; None in the resolved
+        ``observabilityMesh`` config means no overlay is wanted. Mirrors
+        start_stop_cluster's rebuild logic but simpler (no leadership to
+        log); a start failure is logged and swallowed so a misconfigured
+        overlay never stops jobs.
         """
         mesh_config = (
             cluster_config.get("observabilityMesh")
@@ -7578,15 +6807,11 @@ class Cron:
                 self.observability_mesh = None
         if mesh_config is not None and self.observability_mesh is not None:
             # The overlay was KEPT across this reload, and shareNodeStats
-            # lives on the CLUSTER config, not on the resolved mesh config the
-            # keep/rebuild comparison above sees, so a toggle always lands
-            # here. The mesh latched the flag at its last
-            # set_node_stats_provider call, so re-reconcile it to the new
-            # config unconditionally or a toggle off keeps gossiping
-            # CPU/memory until an unrelated restart and a toggle on never
-            # starts. Safe on a running mesh: the call only reassigns the
-            # provider and flag, picked up on the next /peer round. Same share
-            # expression as the build path below.
+            # lives on the CLUSTER config, not the resolved mesh config the
+            # keep/rebuild comparison sees, so a toggle always lands here:
+            # re-reconcile unconditionally (the same rationale as the
+            # election-mesh case above). Same share expression as the build
+            # path below.
             self.observability_mesh.set_node_stats_provider(
                 self.node_resource_snapshot,
                 share=bool(
@@ -7611,14 +6836,7 @@ class Cron:
                     ),
                 )
                 await mgr.start()
-            except (
-                OSError,
-                ssl.SSLError,
-                ValueError,
-                ConfigError,
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-            ) as ex:
+            except self._backend_start_errors() as ex:
                 # same swallow-and-keep-running contract as the election
                 # backend: a bad overlay cert/listen/peer must not stop jobs.
                 logger.error("cluster.observability: failed to start: %s", ex)
@@ -7630,20 +6848,12 @@ class Cron:
     ) -> None:
         """(Re)build the durable state backend to match the config.
 
-        Mirrors :meth:`start_stop_cluster` but simpler: the store backend has
-        no election or convergence to reason about, and is rebuilt only when
-        the ``state`` section is added, removed, or changed (the backend
-        tracks the job-set id itself via ``self.job_set_id``, so an ordinary
-        reload that only edits jobs does not disturb it).  A start failure
-        (an unwritable path, a bad mount) is logged and swallowed, exactly
-        like a cluster start failure, so durability being misconfigured never
-        stops cronstable from running jobs in memory.
-
-        The loopback job API in front of the backend *can* serve TLS (an
-        off-host ``state.jobApi.listen`` over ``https://``); an in-place
-        rotation of its certificate is picked up by restarting just that
-        listener, without disturbing the backend or its leases (see
-        :meth:`_maybe_restart_job_api_for_tls`).
+        Rebuilt only when the ``state`` section is added, removed or
+        changed (an ordinary job edit does not disturb it). A start
+        failure is logged and swallowed, so misconfigured durability never
+        stops in-memory job running. An in-place rotation of the job API's
+        TLS cert restarts just that listener (see
+        _maybe_restart_job_api_for_tls).
         """
         self._state_configured = state_config is not None
         if state_config is not None:
@@ -7663,19 +6873,13 @@ class Cron:
             state_config is None or state_config != backend.config
         ):
             logger.info("state: configuration changed, stopping")
-            # the pause refresh reads the OLD store through a local backend
+            # The pause refresh reads the OLD store through a backend
             # binding it captured before the swap: left to finish, it
-            # re-installs that store's pauses into the gate map on top of
-            # whatever the new store's rehydrate just resolved. Cancel it
-            # BEFORE the first await of this teardown: both stop() and
-            # _stop_job_api() yield (with a keep-alive connection open the
-            # latter spans several loop turns), and a pass whose store read
-            # resolves in that window runs its whole mutation loop against
-            # the abandoned store before any later cancel is reached. The
-            # new store's rehydrate does not undo it either: that pass
-            # walks only the streams that exist in the NEW store, so a job
-            # with no paused/ stream there stays gated until the dead
-            # window's own `until` elapses.
+            # re-installs that store's pauses on top of whatever the new
+            # store's rehydrate resolves, and the new rehydrate cannot undo
+            # that (it walks only the NEW store's streams). Cancel it
+            # BEFORE the first await of this teardown, which is the only
+            # point the race is closed.
             if self._pause_refresh_task is not None:
                 self._pause_refresh_task.cancel()
                 self._pause_refresh_task = None
@@ -7725,15 +6929,11 @@ class Cron:
             await self._maybe_restart_job_api_for_tls(state_config)
         if state_config is not None and self.state_backend is None:
             try:
-                # Construct INSIDE the try: building the backend resolves and
-                # creates the store directories and runs a write probe, any of
-                # which can raise OSError on a bad/unwritable path or mount.
-                # BOUNDED: on a hard-hung mount (dead NFS server) the probe's
-                # syscalls block uninterruptibly on the worker thread, and an
-                # unbounded await here would stall run() before it ever
-                # schedules a job.  Timing out degrades to the in-memory path
-                # and retries on the next housekeeping pass, exactly like the
-                # OSError branch.
+                # Construct INSIDE the try (dir creation + write probe can
+                # raise OSError). BOUNDED: a hard-hung mount blocks the
+                # probe uninterruptibly, and an unbounded await would stall
+                # run() before it ever schedules a job; timing out degrades
+                # to the in-memory path and retries next pass.
                 backend = make_state_backend(state_config, self.job_set_id)
                 await asyncio.wait_for(
                     backend.start(), timeout=STATE_OP_TIMEOUT
@@ -7789,7 +6989,7 @@ class Cron:
         # not a missed one. None for a plaintext endpoint (no cert/key), which
         # therefore never triggers a rotation restart.
         job_api_tls = job_api_cfg.get("tls")
-        tls_signature: Optional[Dict[str, Any]] = None
+        tls_signature: Optional[dict[str, Any]] = None
         if tlsutil.listener_tls_configured(job_api_tls):
             # listener_tls_configured is truthy only when cert and key are
             # present, so the block is non-None here; the assert is only so
@@ -7827,24 +7027,15 @@ class Cron:
             logger.warning("state: job API did not stop cleanly: %s", ex)
 
     def _job_api_tls_files_changed(
-        self, tls: Optional[Dict[str, Any]]
+        self, tls: Optional[dict[str, Any]]
     ) -> bool:
         """Whether the running job API's TLS files differ from what it loaded.
 
-        The job-state analogue of :meth:`_web_tls_files_changed`, and the only
-        thing that makes an in-place certificate rotation of the job API
-        listener visible: the state config is byte-identical across such a
-        rotation, so the ``state_config != backend.config`` gate never fires
-        for it.
-
-        Only the server material is watched, via
-        :data:`cronstable.tlsutil.JOB_API_TLS_KEYS` (``cert``/``key``): the
-        ``ca`` is handed to jobs as a path and read fresh by each one, so
-        nothing the daemon holds goes stale when it rotates.
-
-        Gated on ``_job_api_tls_signature`` (``None`` for a plaintext
-        endpoint, which therefore never restarts on this) rather than on the
-        config, so a loopback endpoint is untouched.
+        The only thing that makes an in-place cert rotation of this
+        listener visible (the state config is byte-identical across one).
+        Only cert/key are watched: the ``ca`` is handed to jobs as a path
+        and read fresh by each. None signature (plaintext endpoint) never
+        restarts on this.
         """
         if self._job_api_tls_signature is None or not tls:
             return False
@@ -7858,24 +7049,13 @@ class Cron:
     ) -> None:
         """Restart the job API listener if its TLS cert/key rotated in place.
 
-        Called on an otherwise no-op reload (state config byte-identical). The
-        web-app analogue is the TLS arm of :meth:`_web_restart_reason`; this
-        is lighter because only the listener is rebuilt: the store backend,
-        its leases and its renewers are untouched.
-
-        Restarting is gated on the new material actually loading. A
-        half-written rotation (cert-manager, Vault and Kubernetes secret
-        refreshes are not atomic across the files), or a config edit racing
-        one, would otherwise tear a working endpoint down and then fail to
-        rebuild it, leaving jobs with no state endpoint until the next reload;
-        keeping the old listener up and retrying is the safe direction.
-
-        The loadability gate covers the material; the rebind itself is not
-        pre-validated (make-before-break is infeasible, since the new listener
-        wants the same port the old one holds). A rebind that fails leaves the
-        endpoint down with the error :meth:`_start_job_api` logs, the same
-        degraded state as a failed initial start, until the ``state`` config
-        next changes.
+        Called on an otherwise no-op reload; only the listener is rebuilt,
+        the backend and its leases are untouched. Gated on the new
+        material actually loading: a half-written rotation would tear a
+        working endpoint down and fail to rebuild it. The rebind itself is
+        not pre-validated (make-before-break is infeasible on one port); a
+        failed rebind leaves the endpoint down until the state config next
+        changes.
         """
         tls = (state_config.get("jobApi") or {}).get("tls")
         if self._job_api is None or not self._job_api_tls_files_changed(tls):
@@ -7899,19 +7079,14 @@ class Cron:
     ) -> asyncio.Task:
         """Run a durable-state write as a tracked fire-and-forget task.
 
-        The single scheduling idiom for every durable write: tracked in
-        ``_pending_state_writes`` so it is not GC'd mid-flight and the
-        shutdown flush can bound-wait it; never awaited on a scheduling
-        path.  The coroutine itself is responsible for catching and logging
-        its own failures (they are all best-effort).
+        The single idiom for every durable write: tracked so it is not
+        GC'd mid-flight and the shutdown flush can bound-wait it; never
+        awaited on a scheduling path. The coroutine logs its own failures.
 
-        When the tracked set has grown past :data:`MAX_PENDING_STATE_WRITES`
-        (a store so slow that writes are not draining), the new write is shed
-        rather than tracked: its coroutine is closed, the drop is counted, and
-        an already-resolved placeholder task is returned so callers that store
-        or chain on the result (``_inflight_write_tail``, the pause-refresh and
-        GC/retry tasks) keep working unchanged.  Shedding is safe because
-        every state write is best-effort; the alternative is unbounded growth.
+        Past MAX_PENDING_STATE_WRITES the new write is shed: its coroutine
+        closed, the drop counted, and a resolved placeholder returned so
+        callers that chain on the result keep working. Safe because every
+        state write is best-effort; the alternative is unbounded growth.
         """
         if len(self._pending_state_writes) >= MAX_PENDING_STATE_WRITES:
             coro.close()
@@ -7935,14 +7110,10 @@ class Cron:
     ) -> None:
         """Fire the ``notify:`` reporters for a daemon/orchestration event.
 
-        A fast, synchronous edge callable from any loop (the cluster
-        role-transition path is sync, the DAG scheduler async): it schedules
-        the reporter fan-out as a tracked fire-and-forget task, returning at
-        once,
-        so a slow SMTP/webhook reporter never stalls the caller (a scheduling
-        pass, a cluster tick, a DAG advance holding its run lease).  A no-op
-        when no ``notify:`` block is configured or the event is not on its
-        allow-list, so the common (unconfigured) case costs one dict lookup.
+        Synchronous and callable from any loop: the fan-out runs as a
+        tracked fire-and-forget task so a slow reporter never stalls the
+        caller. No-op when notify: is unconfigured or the event is off
+        its allow-list.
         """
         cfg = self._notify_config
         if cfg is None:
@@ -7965,9 +7136,8 @@ class Cron:
     def _state_periodic(self) -> None:
         """Kick off the periodic durable-state chores that are due.
 
-        Called from the housekeeping pass: a pair of loop-clock due-checks
-        (cheap) that spawn tracked background tasks (manifest write, GC
-        pass).  No-op without a running backend.
+        Called from the housekeeping pass; spawns tracked background
+        tasks. No-op without a running backend.
         """
         if self.state_backend is None:
             return
@@ -8001,19 +7171,15 @@ class Cron:
     def _manifest_stream(self) -> str:
         return MANIFEST_STREAM_PREFIX + self._state_host
 
-    def _artifact_scope_names(self) -> Set[str]:
+    def _artifact_scope_names(self) -> set[str]:
         """Every artifact scope this config can write beyond its job names.
 
-        The shared scope plus each job's / dag task template's
-        stateAllowedScopes: with jobs writing artifacts under their own name
-        by default, this is exactly the set of scopes a keep-set cannot
-        derive from the job names alone.  Advertised in the manifest and
-        folded into the GC keep map so a scope stays alive while any node's
-        config still names it.
+        Advertised in the manifest and folded into the GC keep map so a
+        scope stays alive while any node's config still names it.
         """
         from cronstable.jobstate import GLOBAL_SCOPE
 
-        scopes: Set[str] = {GLOBAL_SCOPE}
+        scopes: set[str] = {GLOBAL_SCOPE}
         for job in self.cron_jobs.values():
             scopes.update(job.stateAllowedScopes)
         for dagcfg in self.cron_dags.values():
@@ -8024,15 +7190,10 @@ class Cron:
     async def _persist_manifest(self) -> None:
         """Record this node's loaded job set to its OWN manifest stream.
 
-        The anchor for cross-jobset garbage collection: a job's durable
-        streams are garbage only when NO recent manifest (from any host's
-        stream, running any job set, under this deploymentId) references
-        its name. Every node sharing the store contributes its own
-        ``manifests/<host>`` stream (see :data:`MANIFEST_STREAM_PREFIX`), so a
-        fleet whose members run different job sets never collects each
-        other's state, and the retained history never shrinks as the fleet
-        grows (each host's own count-based prune is independent of every
-        other host's write volume).
+        GC anchor: a job's streams are garbage only when NO recent
+        manifest from any host references its name. Per-host streams keep
+        each host's count-based prune independent of the rest of the
+        fleet.
         """
         backend = self.state_backend
         if backend is None:
@@ -8041,13 +7202,9 @@ class Cron:
             "jobSetId": self.job_set_id(),
             "host": self._state_host,
             "jobs": sorted(self.cron_jobs),
-            # what this node's config can WRITE beyond its job names: the
-            # shared artifact scopes its jobs/dag tasks may publish under and
-            # the dags it runs.  Load-bearing for GC: a keep-set built while
-            # any recent manifest lacks these keys cannot prove a peer's
-            # artifact scopes or dags absent, so artifact streams (and
-            # removed dags' runs) stay unmanaged until the whole fleet
-            # advertises them (see _collect_state_garbage).
+            # Load-bearing for GC: while any recent manifest lacks these
+            # keys, artifact streams and removed dags' runs stay unmanaged
+            # (see _collect_state_garbage).
             "scopes": sorted(self._artifact_scope_names()),
             "dags": sorted(self.cron_dags),
             "at": get_now(datetime.timezone.utc).isoformat(),
@@ -8062,23 +7219,14 @@ class Cron:
             logger.warning("state: failed to record the job manifest: %s", ex)
 
     async def _live_pause_keep(
-        self, backend: StateBackend, names: Set[str], now: datetime.datetime
-    ) -> Set[str]:
+        self, backend: StateBackend, names: set[str], now: datetime.datetime
+    ) -> set[str]:
         """The pause-stream keep-set: kept jobs that hold a LIVE pause.
 
-        Starts from every kept job name and DROPS only those whose
-        ``paused/<job>`` stream tops out at a non-live record (a resume, an
-        expired window, or a foreign/corrupt one), so
-        :meth:`StateBackend.collect_garbage` reclaims the dead stream. That
-        collection stays grace-gated on the record's OWN age, which
-        independently protects a pause a peer wrote moments ago (its fresh
-        record is younger than grace), so this need not re-check the race.
-        Fail-safe throughout: an unenumerable prefix, an unreadable stream,
-        or any doubt keeps the name, so GC never eats a live pause. A job with
-        no pause stream never appears in the listing and is simply kept. Reads
-        only streams that exist, so once the dead ones are collected the cost
-        falls away, and a later pause re-creates a collected stream, leaving
-        cross-node propagation (:meth:`_refresh_pauses_from_store`) intact.
+        Drops only names whose newest paused/<job> record is a resume,
+        expired, or foreign; collection stays grace-gated on the record's
+        own age, which covers the fresh-peer-write race. Fail-safe: any
+        doubt keeps the name, so GC never eats a live pause.
         """
         keep = set(names)
         try:
@@ -8100,11 +7248,9 @@ class Cron:
             if name not in keep:
                 continue  # a removed job's stream: already collected by name
             if name in self._paused:
-                # paused right now on THIS node: keep unconditionally, without
-                # a read. Covers the window where the pause write is still in
-                # flight and the stream's newest durable record is the prior
-                # resume; reading it would drop the stream mid-pause (GC then
-                # grace-keeps it only if that stale resume is young enough).
+                # paused on THIS node: keep without a read; the pause write
+                # may still be in flight with the prior resume as the
+                # newest durable record.
                 continue
             try:
                 recs = await asyncio.wait_for(
@@ -8130,15 +7276,11 @@ class Cron:
     async def _collect_state_garbage(self) -> None:
         """One automatic garbage-collection pass (see state.gcGraceSeconds).
 
-        Builds the keep-set from the union of recent manifests (read across
-        every host's own ``manifests/<host>`` stream, bounded per host) plus
-        this node's own loaded config, so GC still cannot eat live jobs even
-        when a manifest stream is unreadable or empty, and hands the deletion
-        to the backend.  The same pass manages the ``artifacts/`` streams and
-        removed dags' run documents (see :meth:`_gc_dag_state`) and finishes
-        by sweeping payload blobs no surviving artifact record references
-        (see :meth:`_sweep_orphan_artifact_blobs`).  Every failure degrades
-        to "collect nothing this pass".
+        Keep-set = recent manifests from every host plus this node's own
+        loaded config, so GC cannot eat live jobs even when a manifest
+        stream is unreadable. Also manages artifact streams and removed
+        dags' runs (_gc_dag_state) and sweeps orphan blobs. Every failure
+        degrades to "collect nothing this pass".
         """
         backend = self.state_backend
         grace = self._state_gc_grace
@@ -8171,7 +7313,7 @@ class Cron:
                 MANIFEST_HOSTS_CAP,
             )
             stream_names = stream_names[:MANIFEST_HOSTS_CAP]
-        manifests: List[Dict[str, Any]] = []
+        manifests: list[dict[str, Any]] = []
         try:
             for name in stream_names:
                 manifests.extend(
@@ -8194,12 +7336,9 @@ class Cron:
             )
             return
         now = get_now(datetime.timezone.utc)
-        # The anchor must be able to PROVE absence before anything is
-        # deleted: unless the manifest history reaches back at least one
-        # full grace window, a job could be missing from every manifest
-        # simply because nobody had recorded manifests yet (a fresh store,
-        # or the first pass after upgrading a pre-manifest store); defer
-        # rather than collect with zero effective grace.
+        # Prove absence before deleting: unless manifest history spans a
+        # full grace window, a job could be missing simply because nobody
+        # recorded manifests yet; defer rather than collect.
         oldest: Optional[datetime.datetime] = None
         for rec in manifests:
             at = _parse_iso_utc(rec.get("at"))
@@ -8216,55 +7355,23 @@ class Cron:
         hosts = {self._state_host}
         live_dags = set(self.cron_dags)
         art_scopes = self._artifact_scope_names()
-        recent: List[Dict[str, Any]] = []
-        for rec in manifests:
-            at = _parse_iso_utc(rec.get("at"))
-            if at is None or (now - at).total_seconds() > grace:
-                continue
-            recent.append(rec)
-            _fold_manifest(rec, names, hosts, art_scopes, live_dags)
-        # job names keep their default artifact scope too.
-        art_scopes |= names
+        keep, recent = build_gc_keep_set(
+            manifests, now, grace, names, hosts, art_scopes, live_dags
+        )
         scopes_covered = _manifests_cover_scopes(recent)
-        # Restrict pause-stream retention to jobs holding a LIVE pause. A job
-        # paused then resumed (or expired) long ago otherwise keeps a dead
-        # paused/<job> stream forever, which _refresh_pauses_from_store
-        # re-reads every minute just to conclude "not paused"; dropping it
-        # from the keep-set lets this same pass collect it, at GC cadence, once
-        # newest record ages past grace. Fail-safe (any doubt keeps the
-        # stream), and a future pause re-creates a collected stream, so
-        # cross-node pause propagation is unaffected.
-        pause_keep = await self._live_pause_keep(backend, names, now)
-        keep: Dict[str, Set[str]] = {
-            RUN_STREAM_PREFIX: names,
-            LOG_STREAM_PREFIX: names,
-            CATCHUP_STREAM_PREFIX: names,
-            RETRY_STREAM_PREFIX: names,
-            REBOOT_STREAM_PREFIX: names,
-            COUNTER_STREAM_PREFIX: hosts,
-            INFLIGHT_STREAM_PREFIX: names,
-            SLOT_STREAM_PREFIX: names,
-            PAUSE_STREAM_PREFIX: pause_keep,
-            # a host that stops writing (scaled down, renamed) leaves its own
-            # manifests/<host> stream behind forever otherwise; sweeping it
-            # once it is not among the currently-seen hosts and has aged past
-            # grace mirrors exactly how an abandoned counters/<host> stream
-            # is collected above.
-            MANIFEST_STREAM_PREFIX: hosts,
-        }
+        # Keep pause streams only for jobs holding a LIVE pause; dead
+        # paused/<job> streams age out like any other (fail-safe, see
+        # _live_pause_keep).
+        keep[PAUSE_STREAM_PREFIX] = await self._live_pause_keep(
+            backend, names, now
+        )
         if scopes_covered:
-            # the dag catch-up checkpoint streams age out with their dag,
-            # exactly as a removed job's catchup/<job> stream does above,
-            # but only under this guard: live_dags is complete only once
-            # every recent manifest advertises its dags, and gating a
-            # peer's rarely-written checkpoint stream on a partial view
-            # would collect it live and re-run work the checkpoint exists
-            # to fence.
+            # only under this guard: live_dags is complete only once every
+            # recent manifest advertises its dags; a partial view would
+            # collect a live checkpoint and re-run fenced work.
             keep[DAG_CATCHUP_STREAM_PREFIX] = live_dags
-            # folds artifacts/<scope> into ``keep`` (so a removed scope's
-            # stream ages out like any other) and collects removed dags' run
-            # documents; skipped entirely (everything kept) while any
-            # recent manifest predates scope advertising.
+            # folds artifacts/<scope> into keep and collects removed dags'
+            # run documents.
             await self._gc_dag_state(
                 backend, keep, art_scopes, live_dags, grace
             )
@@ -8278,9 +7385,8 @@ class Cron:
         from cronstable.dag import DAG_LEASE_PREFIX
 
         try:
-            # bounded: a worker thread wedged in a dead-mount syscall must
-            # not leave _gc_task pending forever; the single-flight check
-            # would then disable automatic GC for the life of the process.
+            # bounded: a wedged worker thread must not leave _gc_task
+            # pending forever (single-flight would then disable auto GC).
             result = await asyncio.wait_for(
                 backend.collect_garbage(
                     keep=keep,
@@ -8315,22 +7421,17 @@ class Cron:
     async def _gc_dag_state(
         self,
         backend: StateBackend,
-        keep: Dict[str, Set[str]],
-        art_scopes: Set[str],
-        live_dags: Set[str],
+        keep: dict[str, set[str]],
+        art_scopes: set[str],
+        live_dags: set[str],
         grace: float,
     ) -> None:
         """Extend one GC pass over artifact streams and dag run documents.
 
-        Enumerates the store's ``dagrun/<dag>`` namespaces, hands the dags
-        that are in neither any live config nor any recent manifest to
-        :meth:`DagScheduler.gc_removed_dags` (terminal runs older than the
-        grace only), then adds ``artifacts/`` to the keep map keyed by the
-        live scopes: job names, configured/manifested shared scopes, and the
-        XCom scope of every run document still on disk.  Any doubt
-        (namespaces or documents unreadable, a namespace whose name is
-        unrecoverable) leaves artifact streams unmanaged (all kept) this
-        pass instead of collecting on a partial view.
+        Hands removed dags to DagScheduler.gc_removed_dags, then keys
+        ``artifacts/`` retention on the live scopes (job names, shared
+        scopes, XCom scopes of run documents still on disk). Any doubt
+        leaves artifact streams unmanaged this pass.
         """
         from cronstable.dag import DAG_RUN_NS_PREFIX, xcom_scope
         from cronstable.jobstate import ARTIFACT_STREAM_PREFIX
@@ -8388,13 +7489,10 @@ class Cron:
     ) -> None:
         """Reclaim artifact/XCom payload blobs no surviving record names.
 
-        The reference set spans every enumerable ``artifacts/`` stream
-        (blobs dedupe across scopes), read strictly.  Deletion is biased to
-        KEEP on every doubt: the sweep is skipped outright when any artifact
-        stream is unenumerable (a legacy truncated directory without its
-        name sidecar) or any record unreadable, and the backend's own age
-        guard keeps blobs younger than the grace (a just-landed payload
-        whose record has not been appended yet).
+        Biased to KEEP on every doubt: skipped when any artifact stream is
+        unenumerable or any record unreadable, and the backend's age guard
+        keeps blobs younger than grace (payload landed, record not yet
+        appended).
         """
         from cronstable.jobstate import (
             ARTIFACT_STREAM_PREFIX,
@@ -8447,14 +7545,11 @@ class Cron:
 
     @staticmethod
     def _resolve_web_secret(spec: dict, what: str) -> str:
-        """Resolve one ``{value|fromFile|fromEnvVar}`` bearer secret, failing
-        closed.
+        """Resolve one ``{value|fromFile|fromEnvVar}`` bearer secret.
 
-        Shared by the scalar ``web.authToken`` and every scoped
-        ``web.authTokens`` entry: a source that is configured but resolves to
-        an empty secret raises :class:`ConfigError` rather than silently
-        leaving the web API (or one device) unauthenticated. ``what`` names
-        the config key for the error message.
+        Fails closed: a configured source that resolves empty raises
+        ConfigError rather than leaving the web API unauthenticated.
+        ``what`` names the config key for the error message.
         """
         if spec.get("value"):
             token = str(spec["value"])
@@ -8469,10 +7564,9 @@ class Cron:
                     spec["fromFile"], "rt", encoding="utf-8"
                 ) as token_file:
                     token = token_file.read().strip()
-            # UnicodeDecodeError alongside OSError: a binary token file
-            # raises it from read(), and only ConfigError gets the clean
-            # "not starting the web API" handling (see run()); anything else
-            # is logged as an internal bug. Mirrors config._resolve_secret.
+            # UnicodeDecodeError too: a binary token file raises it from
+            # read(), and only ConfigError gets the clean "not starting
+            # the web API" handling in run(). Mirrors config._resolve_secret.
             except (OSError, UnicodeDecodeError) as ex:
                 raise ConfigError(
                     "{}.fromFile could not be read: {}".format(what, ex)
@@ -8490,9 +7584,8 @@ class Cron:
 
     @staticmethod
     def _resolve_web_token(web_config: WebConfig) -> Optional[str]:
-        # The scalar web.authToken: an all-scopes ("god") token, or None when
-        # it is not configured. Kept as its own method so its behaviour (and
-        # tests) are unchanged; _resolve_web_tokens builds on it.
+        # The scalar web.authToken: an all-scopes token, or None when not
+        # configured. _resolve_web_tokens builds on it.
         auth = web_config.get("authToken")
         if not auth:
             return None
@@ -8504,18 +7597,13 @@ class Cron:
     ) -> "Optional[list[_WebToken]]":
         """Resolve every configured web bearer token into a lookup table.
 
-        The scalar ``web.authToken`` (if set) becomes a single all-scopes
-        token; each ``web.authTokens`` entry becomes a scoped token. Returns
-        None when neither is configured (auth stays off; this None is the
-        sentinel the caller keys on to decide whether to install the auth
-        middleware at all). Fails closed on any configured-but-empty source,
-        exactly like
-        :meth:`_resolve_web_token`, and on two tokens resolving to one secret:
-        matching is by secret, so only one entry's scopes could ever apply.
-        The likely duplicate is a scoped entry repeating the scalar authToken,
-        which would silently downgrade the all-scopes token to that entry.
+        Scalar authToken becomes an all-scopes token; each authTokens
+        entry a scoped one. Returns None when neither is configured (the
+        sentinel for "no auth middleware"). Fails closed on empty sources
+        and on two tokens sharing one secret: matching is by secret, so
+        only one entry's scopes could apply.
         """
-        tokens = []  # type: list[_WebToken]
+        tokens: list[_WebToken] = []
         scalar = Cron._resolve_web_token(web_config)
         if scalar is not None:
             tokens.append(
@@ -8527,7 +7615,7 @@ class Cron:
             scopes = _effective_web_scopes(entry.get("scopes") or [])
             label = entry.get("label") or what
             tokens.append(_WebToken(secret.encode("utf-8"), scopes, label))
-        seen = {}  # type: Dict[bytes, str]
+        seen: dict[bytes, str] = {}
         for token in tokens:
             first = seen.get(token.token_bytes)
             if first is not None:
@@ -8545,8 +7633,8 @@ class Cron:
     def _make_auth_middleware(
         tokens, public_paths: "frozenset[str]" = frozenset()
     ):
-        # Backward-compatible: a bare string is a single all-scopes token, so
-        # existing callers/tests that pass one keep working unchanged.
+        # A bare string is a single all-scopes token (callers/tests rely
+        # on this).
         if isinstance(tokens, str):
             tokens = [
                 _WebToken(tokens.encode("utf-8"), _WEB_ALL_SCOPES, "authToken")
@@ -8557,17 +7645,10 @@ class Cron:
         async def auth_middleware(request, handler):
             if public_paths and request.path in public_paths:
                 return await handler(request)
-            # A CORS preflight passes without a token: the Fetch standard
-            # strips credentials from preflights, so demanding a bearer here
-            # made the OPTIONS route registered for exactly this purpose
-            # (MCPHandler.handle_options, which enforces mcp.allowedOrigins)
-            # unreachable in every token-authenticated deployment, and config
-            # validation makes a token mandatory on any routable listener
-            # with MCP enabled: allow-listed browser MCP clients could never
-            # connect. Safe to pass: a preflight response carries only CORS
-            # policy, and the credentialed request that follows is
-            # authenticated normally. Matched by the defining header, not by
-            # path, so a bare unauthenticated OPTIONS probe stays a 401.
+            # CORS preflights pass without a token: the Fetch standard
+            # strips credentials from them, and a preflight response
+            # carries only CORS policy. Matched by the defining header,
+            # not by path, so a bare OPTIONS probe stays a 401.
             if (
                 request.method == "OPTIONS"
                 and "Access-Control-Request-Method" in request.headers
@@ -8579,16 +7660,11 @@ class Cron:
             # Compare only the token, in constant time, to avoid leaking it via
             # timing (the scheme is not secret).
             if scheme.lower() != "bearer":
-                # Calendar clients subscribing to an .ics feed cannot attach
-                # a bearer header, so for exactly the calendar-feed paths
-                # the token may ride a `token` query parameter instead (the
-                # secret-address model calendar services use).  Same token,
-                # same constant-time compare; every other path keeps the
-                # token out of URLs (and so out of referrers).  The access
-                # log is covered for this path too: the runner redacts the
-                # `token` value out of the request line (_access_log_class).
-                # Matched precisely so no future route gains URL-token auth
-                # by accident of its name.
+                # Calendar clients cannot attach a bearer header, so only
+                # the calendar-feed paths accept the token as a `token`
+                # query parameter (access log redacts it, see
+                # _access_log_class). Matched precisely so no future route
+                # gains URL-token auth by accident.
                 if request.path.endswith("/calendar.ics"):
                     presented = request.query.get("token", "")
                 else:
@@ -8607,18 +7683,15 @@ class Cron:
             # early return, so timing does not reveal which token (if any)
             # matched. A 401 means no token matched; authorization (scope)
             # is a separate, later check.
-            matched = None  # type: Optional[_WebToken]
+            matched: _WebToken | None = None
             for entry in token_table:
                 if hmac.compare_digest(presented_bytes, entry.token_bytes):
                     matched = entry
             if matched is None:
                 raise web.HTTPUnauthorized()
-            # A full-scope token satisfies every route, so skip the per-route
-            # scope lookup entirely (this is also what keeps the single-token
-            # path, and its tests, behaving exactly as before). A scoped
-            # token is checked against the route's required scope: a valid
-            # token that lacks it is 403 (Forbidden), distinct from the 401
-            # for an unrecognised token.
+            # Full-scope tokens skip the per-route scope lookup. A scoped
+            # token lacking the route's required scope is 403, distinct
+            # from the 401 for an unrecognised token.
             if matched.scopes != _WEB_ALL_SCOPES:
                 required = _required_web_scope(request)
                 if required not in matched.scopes:
@@ -8636,38 +7709,14 @@ class Cron:
     def _make_origin_middleware(allowed_origins: "frozenset[str]"):
         """Refuse cross-site browser requests to the mutating endpoints.
 
-        The CSRF/DNS-rebinding gate for the control API, mirroring the
-        Origin allow-list /mcp already enforces (see
-        :meth:`cronstable.mcp.MCPHandler.handle_http`): the POST control
-        routes (``/jobs/{name}/start``, ``/jobs/{name}/cancel``,
-        ``/jobs/{name}/pause``, ``/jobs/{name}/resume``,
-        ``/dags/{name}/trigger``, ...) are CORS "simple requests" (no
-        preflight), so without this any web page the operator happens to
-        visit can fire them at a localhost-bound daemon.  ``web.authToken``
-        also defeats that (a foreign page cannot attach the bearer header),
-        but the token is opt-in, and the default posture of an enabled
-        dashboard must not be "any website may start and cancel my jobs".
-
-        The rule, per request:
-
-        * safe methods (:data:`WEB_SAFE_METHODS`) pass: nothing they hit
-          mutates, and CORS preflight must keep reaching /mcp's handler;
-        * paths enforcing their own list (:data:`WEB_ORIGIN_EXEMPT_PATHS`)
-          pass: /mcp 403s foreign Origins itself;
-        * no ``Origin`` header passes: curl/CLI/monitoring clients (every
-          current browser sends Origin on cross-site POSTs, which are the
-          attack this defends against);
-        * an Origin naming this daemon's own authority
-          (:func:`_origin_matches_host`) or on the operator's
-          ``web.allowedOrigins`` list passes;
-        * anything else is a 403.
-
-        Honest residual: a DNS-rebinding page served on the daemon's OWN
-        port (so Origin and Host genuinely agree after the rebind) passes
-        the equality test: Origin-vs-Host cannot distinguish it from the
-        real dashboard. Cross-port and cross-host rebinds are refused, and
-        ``web.authToken`` closes the residual completely (a rebound page
-        holds no token).
+        CSRF/DNS-rebinding gate: the POST control routes are CORS "simple
+        requests" (no preflight), so without this any web page could fire
+        them at a localhost-bound daemon. Safe methods, exempt paths
+        (/mcp 403s foreign Origins itself), and Origin-less clients pass;
+        an Origin matching this daemon's authority or web.allowedOrigins
+        passes; anything else is 403. Residual: a rebinding page served on
+        the daemon's OWN port passes the equality test; web.authToken
+        closes that completely.
         """
 
         @web.middleware
@@ -8695,14 +7744,10 @@ class Cron:
     def _web_tls_files_changed(self) -> bool:
         """Whether the running listener's TLS files differ from what it loaded.
 
-        The web-app analogue of
-        :meth:`cronstable.cluster.ClusterManager.tls_files_changed`, and the
-        only thing that makes an in-place certificate rotation visible: the
-        config bytes are identical across such a rotation, so the ordinary
-        ``web_config != self.web_config`` gate never fires for it.
-
-        Gated on ``_web_tls_signature`` rather than on ``web_config``, because
-        a teardown leaves ``web_config`` stale while clearing the signature.
+        The only thing that makes an in-place cert rotation visible:
+        config bytes are identical across one, so the web_config
+        inequality gate never fires. Gated on _web_tls_signature because
+        a teardown leaves web_config stale while clearing the signature.
         """
         if self.web_config is None or self._web_tls_signature is None:
             return False
@@ -8732,18 +7777,9 @@ class Cron:
     def _needs_subminute(self) -> bool:
         """Whether any enabled job fires at second granularity.
 
-        Gates the once-per-minute housekeeping in :meth:`run`: while a
-        second-level job wakes the loop far more often than once a minute,
-        rereading and reparsing the config on every wake would be pointless
-        IO/CPU, so housekeeping still runs at most once per wall-clock minute.
-        Only enabled jobs count: a disabled second-level job never runs.
-
-        Memoized on :attr:`_needs_subminute_cache`: :meth:`run` asks once per
-        loop iteration, which a second-level job makes once a SECOND, while
-        the answer is a pure function of the job set and so can only change
-        on a reload (``enabled`` and ``has_seconds`` are both fixed at
-        JobConfig construction and nothing mutates a live one).  Every site
-        that reassigns ``cron_jobs`` clears the cache.
+        Gates run()'s once-per-minute housekeeping. Memoized on
+        _needs_subminute_cache: a pure function of the job set; every
+        site that reassigns cron_jobs clears the cache.
         """
         cached = self._needs_subminute_cache
         if cached is None:
@@ -8758,34 +7794,18 @@ class Cron:
     def _wakes_subminute(self) -> bool:
         """Whether this loop is waking more often than once a minute.
 
-        The predicate :meth:`run`'s housekeeping gate actually wants.
-        :meth:`_needs_subminute` answers it for the CRON job set only, but
-        :meth:`_sleep_interval` shortens the sleep for the DAG orchestrator
-        too: ``next_wake_delay`` always carries a 20 s schedule check and a
-        5 s approval poll, and floors at 0.2 s while an advance is in flight.
-        A deployment with DAGs and no second-level cron job therefore woke
-        several times a minute while answering "not sub-minute", so the gate
-        fell through to its every-iteration branch and the whole reload /
-        cluster / web / push / state / SLA block ran on every DAG wake,
-        falsifying the "at most once per wall-clock minute" contract
-        :meth:`_pause_periodic` and :meth:`_sla_periodic` are documented on.
-
-        Reads the flag :meth:`_sleep_interval` set when it computed the sleep
-        this wake came out of, rather than re-querying the orchestrator: the
-        question is "was the sleep I just finished a shortened one", which is
-        exactly what that flag records, and it costs nothing.
+        The predicate run()'s housekeeping gate wants: covers both the
+        cron job set and a DAG-shortened sleep, preserving the "at most
+        once per wall-clock minute" contract _pause_periodic and
+        _sla_periodic are documented on.
         """
         return self._needs_subminute() or self._dag_shortens_sleep
 
-    def _job_pos(self) -> Dict[str, int]:
+    def _job_pos(self) -> dict[str, int]:
         """Job name -> its position in the loaded config.
 
-        Memoized on :attr:`_job_pos_cache`, on exactly the lifecycle of
-        :meth:`_needs_subminute`'s cache: ``cron_jobs`` is only ever
-        reassigned wholesale, never mutated in place, and every one of those
-        sites clears this too.  :meth:`_spawn_due_jobs` needs config order for
-        the launch plan and nothing else, so this replaces a full walk of the
-        job set per firing pass with one dict lookup per DUE job.
+        Memoized on _job_pos_cache with the same lifecycle as the other
+        job-set memos; _spawn_due_jobs uses it for launch-plan order.
         """
         cached = self._job_pos_cache
         if cached is None:
@@ -8796,9 +7816,8 @@ class Cron:
     def _any_sla(self) -> bool:
         """Whether any loaded job carries an ``sla`` block.
 
-        Memoized alongside :meth:`_job_pos`.  Lets the once-a-minute SLA pass
-        skip a walk of the whole job set in the common case where nothing
-        declares an SLA at all.
+        Memoized alongside _job_pos; lets the SLA pass skip the walk when
+        nothing declares an SLA.
         """
         cached = self._any_sla_cache
         if cached is None:
@@ -8806,38 +7825,26 @@ class Cron:
             self._any_sla_cache = cached
         return cached
 
-    # ---- next-fire index ------------------------------------------------
-    #
-    # Instead of testing every job against the clock on every tick, each
-    # enabled CronTab job carries its next fire instant (aware UTC) in
-    # ``_next_fire``, mirrored into the ``_fire_heap`` min-heap.  The loop
-    # sleeps until the soonest entry and only touches the jobs actually due,
-    # turning the per-wake cost from O(all jobs) into O(due jobs).  Firing
-    # compares the wall clock against these fixed, forward-only instants, which
-    # is what makes the cadence immune to clock steps (see :meth:`run`).
+    # ---- next-fire index: each enabled CronTab job's next fire (aware
+    # UTC) lives in _next_fire, mirrored into the _fire_heap min-heap; the
+    # loop sleeps until the soonest entry and touches only due jobs.
+    # Firing compares the clock against fixed forward-only instants, which
+    # makes the cadence immune to clock steps (see run()).
 
     def _compute_next_fire(
         self, job: JobConfig, after: datetime.datetime
     ) -> Optional[datetime.datetime]:
         """The aware-UTC instant ``job`` next fires strictly after ``after``.
 
-        Render ``after`` into the job's own frame (its timezone, or the
-        system-local zone when it has none) and ask the cron engine for the
-        delay to the next match.  The frame is kept timezone-AWARE in both
-        cases, so ``CronTab.next`` computes the delay as a real duration,
-        correcting for any utcoffset (DST) change across the interval, and
-        adding it back to the UTC ``after`` yields the correct UTC fire
-        instant.  A naive local frame would defeat that correction: the
-        engine would return a civil wall-clock delta that, added to a UTC
-        instant, lands an hour off across a spring-forward/fall-back (the
-        same wall time the old per-tick ``crontab.test`` matched correctly).
-        ``None`` when the schedule has no further occurrence (a fixed past
-        year), so the job drops out of the index.
+        The frame stays timezone-AWARE (job tz or system-local) so
+        CronTab.next returns a real duration corrected for DST; a naive
+        frame would land an hour off across a DST change. None when the
+        schedule has no further occurrence.
         """
         crontab = job.schedule
         assert isinstance(crontab, CronTab)
         if job.timezone is not None:
-            frame = after.astimezone(job.timezone)  # type: datetime.datetime
+            frame: datetime.datetime = after.astimezone(job.timezone)
         else:
             # no explicit timezone -> the system-local wall clock, but kept
             # AWARE (not .replace(tzinfo=None)) so the engine applies its
@@ -8885,41 +7892,24 @@ class Cron:
     def _same_schedule(a: JobConfig, b: JobConfig) -> bool:
         """Whether two job configs fire on the same wall-clock instants.
 
-        Compares the schedule and the RESOLVED timezone (which already folds
-        in ``utc``: ``utc: true`` -> UTC, ``utc: false`` with no timezone ->
-        local, an explicit ``timezone`` -> that zone with ``utc`` inert).  The
-        timezone is compared by its canonical string so ``datetime.timezone``
-        ``.utc`` and ``ZoneInfo("UTC")`` (distinct objects that fire
-        identically) are treated as equal (an object-identity compare would
-        force a needless reseed that could skip a fire on the reload boundary).
-        The raw ``utc`` field is deliberately NOT compared: it is fully carried
-        by the resolved timezone and has no further effect on the fire instants
-        (:meth:`_compute_next_fire` reads an aware frame, so ``default_utc`` is
-        inert), so comparing it would only cause spurious reseeds.
-
-        The identity short-circuit on the timezone is not a micro-optimisation
-        for its own sake: ZoneInfo interns its instances and the resolved zone
-        of a job with no explicit one is the interned ``timezone.utc``, so the
-        two sides are usually the SAME object and the pair of ``str()``
-        allocations this pays for per job is pure waste on a reload sweep that
-        runs on the loop thread.
+        Compares the schedule and the RESOLVED timezone by canonical
+        string (so utc and ZoneInfo("UTC") compare equal). The raw
+        ``utc`` field is deliberately NOT compared: the resolved timezone
+        carries it, and comparing it would only cause spurious reseeds.
         """
         return a.schedule == b.schedule and (
             a.timezone is b.timezone or str(a.timezone) == str(b.timezone)
         )
 
     def _refresh_schedule(
-        self, now: datetime.datetime, old_jobs: Dict[str, JobConfig]
+        self, now: datetime.datetime, old_jobs: dict[str, JobConfig]
     ) -> None:
         """Reconcile the next-fire index with a reloaded job set.
 
-        Keeps the existing next-fire for a job whose schedule is unchanged (so
-        a reload never recomputes a strictly-future fire and skips a fire that
-        coincides with the reload's own minute boundary), drops a job that is
-        gone / disabled / no longer a CronTab schedule / has a changed
-        schedule, then reseeds anything now missing (changed schedules and
-        newly added jobs).  Stale heap entries left behind by a drop are
-        discarded lazily on pop (see :meth:`_due_names`).
+        Keeps the existing next-fire for unchanged schedules (so a reload
+        never skips a fire on its own minute boundary), drops
+        gone/disabled/changed jobs, then reseeds anything missing. Stale
+        heap entries are discarded lazily on pop (_due_names).
         """
         for name in list(self._next_fire):
             job = self.cron_jobs.get(name)
@@ -8943,15 +7933,9 @@ class Cron:
             and self._same_schedule(old, self.cron_jobs[name])
         }
         self._ensure_seeded(now)
-        # Compact the heap when the drops and reseeds above have left more
-        # stale tuples than live ones. Stale entries are otherwise discarded
-        # only when they reach the TOP, so one belonging to a daily or yearly
-        # schedule survives that whole horizon; a config regenerated often
-        # enough (classic crontabs remint <file>:<line> names on every line
-        # inserted above them) accumulates them across reloads. Rebuilding by
-        # heapify is cheaper than the pushes that caused the bloat (3.4 ms
-        # against 6.5 ms at 100k entries), so the gate can afford to be
-        # generous.
+        # Compact when stale tuples outnumber live ones: stale entries are
+        # only discarded at the TOP, so long-horizon schedules and
+        # frequently reminted names accumulate them across reloads.
         if len(self._fire_heap) > 2 * len(self._next_fire):
             self._fire_heap = [
                 (when, name) for name, when in self._next_fire.items()
@@ -8972,27 +7956,16 @@ class Cron:
     def _sleep_interval(self) -> float:
         """Seconds to sleep until the next wake.
 
-        The soonest job's next fire, capped by the next housekeeping boundary
-        (the next wall-clock minute) so config reloads and cluster/web upkeep
-        stay ~once a minute even when no job is due for a while.  Never
-        negative; a fire already due returns 0 and is serviced next pass.  The
-        housekeeping cap goes through :func:`next_sleep_interval`, so a test
-        can still patch that one function to spin the loop fast.
+        The soonest job's next fire, capped by the next housekeeping
+        boundary. Never negative. The cap goes through
+        next_sleep_interval so tests can patch that one function.
         """
         housekeeping = next_sleep_interval(False)
-        # wake sooner when a DAG sensor poke, task retry, or scheduled
-        # run is due, so sub-minute poke/retry schedules are honoured instead
-        # of waiting for the once-a-minute housekeeping boundary.  Floored at
-        # MIN_TICK_SLEEP: an already-due hint stays due until the pass that
-        # owns it rewrites the entry, so an unfloored hint spins the loop (and
-        # the whole housekeeping block with it) for that pass's entire
-        # duration rather than waking it once.
-        #
-        # Whether it actually shortened the sleep is recorded for run()'s
-        # housekeeping gate (see _wakes_subminute): the gate used to consult
-        # only the CRON job set, so a deployment with DAGs and no second-level
-        # cron job answered "not sub-minute" and re-ran the whole reload /
-        # cluster / web / state / SLA block on every DAG wake.
+        # Wake sooner when a DAG poke/retry/run is due, floored at
+        # MIN_TICK_SLEEP (an already-due hint stays due until its pass
+        # rewrites the entry; unfloored it would spin the loop). Whether
+        # the DAG shortened the sleep is recorded for run()'s housekeeping
+        # gate (see _wakes_subminute).
         self._dag_shortens_sleep = False
         dag_wake = self._dag.next_wake_delay()
         if dag_wake is not None:
@@ -9007,18 +7980,16 @@ class Cron:
         delta = (soonest - now).total_seconds()
         return max(0.0, min(housekeeping, delta))
 
-    def _due_names(self, now: datetime.datetime) -> List[str]:
+    def _due_names(self, now: datetime.datetime) -> list[str]:
         """Names of every job whose next fire is at or before ``now``.
 
-        Pops the matching heap entries (validated against ``_next_fire``, so
-        stale ones are discarded and a name that somehow holds two live entries
-        for the same instant is returned once).  The popped names' next-fire
-        entries are left in place for :meth:`_advance` to read the fired slot
-        and push the replacement.
+        Pops matching heap entries (stale ones discarded, duplicates
+        returned once); the popped names' next-fire entries are left for
+        _advance to read the fired slot and push the replacement.
         """
         heap = self._fire_heap
-        due = []  # type: List[str]
-        seen = set()  # type: set[str]
+        due: list[str] = []
+        seen: set[str] = set()
         while heap:
             when, name = heap[0]
             if when > now:
@@ -9036,27 +8007,16 @@ class Cron:
         job: JobConfig,
         fire_slot: datetime.datetime,
         now: datetime.datetime,
-    ) -> Tuple[List[datetime.datetime], Optional[datetime.datetime]]:
+    ) -> tuple[list[datetime.datetime], Optional[datetime.datetime]]:
         """The slots a due job launches this pass, plus its new next-fire.
 
-        When ``fire_slot`` (its current next-fire, known ``<= now``) is within
-        :data:`CATCHUP_LIMIT` of ``now``, walk forward occurrence by occurrence
-        while still ``<= now``, replaying each missed slot so a frequently
-        scheduled job overrun by a slow pass is not silently dropped.  This
-        walk is bounded: at most ``CATCHUP_LIMIT`` occurrences even for a
-        per-second job.
-
-        A larger gap is a stall/suspend/forward-clock-jump, NOT tick overhead,
-        and is handled WITHOUT walking the window: enumerating it would iterate
-        once per missed occurrence: millions of times for a per-second job
-        across a multi-hour gap, unbounded for an RTC-less boot corrected
-        forward by years, blocking the event loop and exhausting memory only
-        to discard the result.  Instead the job resumes exactly where the old
-        per-tick scheduler would, in O(1): fire the current slot only if now
-        itself matches (a per-second job fires once at the current second; a
-        sparse job (``*/15``, hourly, daily) whose current slot does not
-        match fires nothing), then resync to the next occurrence after ``now``.
-        This is cron's no-catch-up-after-an-outage rule.
+        Within CATCHUP_LIMIT of ``now``, walk occurrence by occurrence
+        (bounded) so a job overrun by a slow pass is not dropped. A
+        larger gap is a stall/suspend/clock jump and is handled WITHOUT
+        walking the window (unbounded for a per-second job): fire the
+        current slot only if now itself matches, then resync to the next
+        occurrence after now. This is cron's no-catch-up-after-an-outage
+        rule.
         """
         if now - fire_slot >= CATCHUP_LIMIT:
             logger.warning(
@@ -9066,20 +8026,16 @@ class Cron:
                 job.name,
                 (now - fire_slot).total_seconds(),
             )
-            # Resume at the current slot, firing only if it matches (the same
-            # decision the old tick made via schedule_slot + crontab.test)
-            # and resync to the first occurrence after now (no enumeration).
+            # Resume at the current slot, firing only if it matches, and
+            # resync to the first occurrence after now (no enumeration).
             crontab = job.schedule
             assert isinstance(crontab, CronTab)
             now_slot = schedule_slot(job, now)
-            # Record the fired slot as an aware-UTC instant, matching the
-            # normal branch below (whose fires are the aware-UTC next-fire
-            # entries), so _last_run_slot never mixes naive and aware values.
-            # schedule_slot renders now into the job's OWN frame (naive local
-            # for a job with no timezone), which is what crontab.test must
-            # match against; the recorded slot is then converted back to UTC.
-            # astimezone(utc) reads a naive slot as local (as schedule_slot
-            # produced it) and is a no-op for an already-UTC one.
+            # Record the fired slot as aware UTC, matching the normal
+            # branch, so _last_run_slot never mixes naive and aware
+            # values. schedule_slot renders now into the job's OWN frame
+            # (what crontab.test matches); astimezone(utc) reads a naive
+            # slot as local and is a no-op for an already-UTC one.
             fires = (
                 [now_slot.astimezone(datetime.timezone.utc)]
                 if crontab.test(now_slot)
@@ -9112,11 +8068,10 @@ class Cron:
     async def _pending_catchup_watermark(self, name: str) -> Optional[str]:
         """The watermark of an unfinished backfill cycle, if one is open.
 
-        Reads the newest checkpoint record: an ``open`` without a following
-        ``close`` means a previous backfill (here or on a crashed node) never
-        completed, and catch-up should resume from ITS watermark rather than
-        the run ledger's: ordinary runs finishing after that boot advanced
-        the derived watermark past the still-unreplayed slots.
+        An ``open`` without a following ``close`` means a previous
+        backfill never completed; catch-up resumes from ITS watermark,
+        not the run ledger's (later runs advanced the derived watermark
+        past the unreplayed slots).
         """
         backend = self.state_backend
         if backend is None:
@@ -9135,22 +8090,16 @@ class Cron:
 
     async def _pause_excusal_window(
         self, name: str
-    ) -> Optional[Tuple[Optional[datetime.datetime], datetime.datetime]]:
+    ) -> Optional[tuple[Optional[datetime.datetime], datetime.datetime]]:
         """The newest durable pause window ``(since, until)``, for catch-up.
 
-        Slots that fell inside a pause window while the daemon was DOWN are
-        not owed (a live pause skips them via the ledger rows; being down
-        must not owe more), so catch-up excuses the occurrences inside this
-        window.  It is a window, NOT a floor: a backlog owed from before
-        ``since`` predates the operator's decision to pause and is still
-        owed once the pause lifts, exactly as the slots after ``until`` are.
-        Read from the store, not ``self._paused``: an EXPIRED pause is
-        absent from memory at every read site by design, yet its window
-        still excuses the slots it covered.  ``since`` reads as ``None`` on
-        a record that does not carry it, which excuses everything up to
-        ``until``.  Degrades to no window on store trouble (backfilling is
-        the pre-pause behaviour, and pause is an operator convenience, not a
-        correctness fence).
+        Slots inside a pause window while the daemon was DOWN are not
+        owed. A window, NOT a floor: backlog from before ``since`` is
+        still owed once the pause lifts. Read from the store, not
+        self._paused: an EXPIRED pause is absent from memory yet still
+        excuses its window. A missing ``since`` excuses everything up to
+        ``until``. Degrades to no window on store trouble (pause is a
+        convenience, not a correctness fence).
         """
         backend = self.state_backend
         if backend is None:
@@ -9183,14 +8132,10 @@ class Cron:
     ) -> None:
         """Append an ``open``/``close`` catch-up checkpoint (best-effort).
 
-        A failure to checkpoint must never block the backfill itself: it only
-        costs crash-resume fidelity, which is logged.  At-least-once by
-        design in one more way: a checkpoint write abandoned by its timeout
-        is still applied later by its daemon worker thread, so a stalled
-        ``open`` can land on disk AFTER the cycle's ``close`` and sort newer
-        (record order is the writer's clock at the actual write).  The next
-        restart then resumes an already-completed cycle: a bounded replay,
-        never a loss.
+        A failure never blocks the backfill (costs crash-resume fidelity
+        only). At-least-once: a timed-out ``open`` write can land AFTER
+        the cycle's ``close`` and sort newer; the next restart then
+        replays a completed cycle. Bounded replay, never a loss.
         """
         backend = self.state_backend
         if backend is None:
@@ -9220,25 +8165,18 @@ class Cron:
 
     async def _missed_occurrences(
         self, job: JobConfig, now: datetime.datetime
-    ) -> Tuple[int, Optional[str]]:
+    ) -> tuple[int, Optional[str]]:
         """How many catch-up launches ``job`` is owed, and from where.
 
-        Reads the durable last-run watermark, hoisted back to an open
-        checkpoint's (older) watermark when a previous backfill never closed
-        (see :meth:`_pending_catchup_watermark`), and steps the schedule
-        forward from it (DST-safe, via :meth:`_compute_next_fire`), bounded by
-        ``startingDeadlineSeconds`` and :data:`MAX_CATCHUP_OCCURRENCES`.
-        Occurrences inside a durable pause window are stepped over instead of
-        counted (see :meth:`_pause_excusal_window`); occurrences on either
-        side of it stay owed.
-        Returns ``(0, ...)`` when nothing was missed or the job never ran
-        under this store (no reference point, so, like anacron/systemd, a
-        first-ever run just schedules forward); ``(1, ...)`` for ``run-once``
-        when at least one slot was missed (every missed slot coalesced into a
-        single launch); or the bounded count of missed slots for ``run-all``.
-        The second element is the reference watermark (ISO string) for the
-        cycle's checkpoint.  Store errors and timeouts propagate: the callers
-        treat them as "cannot evaluate yet", never as "nothing owed".
+        Steps the schedule forward (DST-safe) from the durable last-run
+        watermark, hoisted back to an open checkpoint's older watermark,
+        bounded by startingDeadlineSeconds and MAX_CATCHUP_OCCURRENCES.
+        Occurrences inside a durable pause window are stepped over.
+        Returns (0, ...) when nothing was missed or the job never ran
+        under this store; (1, ...) for run-once; the bounded count for
+        run-all. Second element is the reference watermark for the
+        cycle's checkpoint. Store errors propagate: callers treat them
+        as "cannot evaluate yet", never "nothing owed".
         """
         watermark = await asyncio.wait_for(
             self.durable_last_run_at(job.name), timeout=STATE_OP_TIMEOUT
@@ -9250,24 +8188,17 @@ class Cron:
             after, watermark = pending_dt, pending
         if after is None:
             return 0, None
-        # Slots inside a (possibly already expired) pause window are never
-        # owed, and ONLY those: the window is skipped over while walking,
-        # never used as a floor on `after`, so slots that came due before
-        # the operator paused stay owed (see _pause_excusal_window).
+        # Slots inside a (possibly expired) pause window are never owed,
+        # and ONLY those: the window is skipped while walking, never used
+        # as a floor on `after` (see _pause_excusal_window).
         window = await self._pause_excusal_window(job.name)
         if window is not None and after is not None:
             # Belt and braces beside the open-checkpoint pin in
-            # _evaluate_catch_up: a pause whose whole lifetime slipped between
-            # two startup catch-up passes (a sub-CATCHUP_RECHECK_INTERVAL
-            # pause, or catch-up deferred for cluster-election / backend
-            # startup while a short pause came and went) is never pinned, so
-            # held-slot skip rows can have walked durable_last_run_at past the
-            # pre-pause backlog. When a window exists, fall back to the
-            # skip-blind durable_last_completed_at if it is OLDER, restoring
-            # `after` to the last real run so the pre-pause slots stay owed.
-            # The `real < after` guard keeps the (older) checkpoint hoist
-            # above winning when both apply; the extra read fires only when a
-            # window exists.
+            # _evaluate_catch_up: an unpinned pause can have walked
+            # durable_last_run_at past the pre-pause backlog via held-slot
+            # skip rows. Fall back to the skip-blind
+            # durable_last_completed_at if OLDER; the `real < after` guard
+            # keeps the checkpoint hoist winning when both apply.
             real = _parse_iso_utc(
                 await asyncio.wait_for(
                     self.durable_last_completed_at(job.name),
@@ -9286,11 +8217,9 @@ class Cron:
         while nxt is not None and nxt <= now:
             if window is not None and _in_pause_window(nxt, window):
                 # Jump the cursor to the window's end rather than stepping
-                # over every excused slot: a long pause on a per-minute job
-                # is thousands of them. One microsecond back so a slot
-                # landing exactly on `until` (outside the half-open window)
-                # is not stepped past. There is only ever one window, so
-                # drop it once crossed.
+                # each excused slot. One microsecond back so a slot landing
+                # exactly on `until` (outside the half-open window) is not
+                # stepped past. Only one window ever; drop once crossed.
                 nxt = self._compute_next_fire(
                     job, window[1] - datetime.timedelta(microseconds=1)
                 )
@@ -9316,34 +8245,16 @@ class Cron:
     async def _catch_up(self, now: datetime.datetime) -> None:
         """Replay (or coalesce) runs missed while down, on start-up.
 
-        Evaluation begins on the first start-up pass, after the state backend
-        and the cluster gate are up.  For each enabled ``onMissed`` job it
-        counts the missed occurrences and, when this node is the job's cluster
-        owner, schedules the catch-up launches spread over
-        ``catchupJitterSeconds`` so a fleet does not all fire at once.  A
-        no-op without a ``state`` section (there is no durable watermark to
-        compare against): catch-up is a stateful-only feature.
-
-        Resolution is NOT latched while it cannot actually happen yet: with a
-        configured-but-unstarted backend (start_stop_state retries it every
-        housekeeping pass), a cluster that has no positive owner for a job
-        yet (still electing at boot), or a live pause (which excuses the
-        slots inside its own window, not a backlog owed from before it), the
-        affected jobs stay pending and are re-evaluated every
-        :data:`CATCHUP_RECHECK_INTERVAL`.  Latching there
-        (the old behaviour) forfeited the owed backfill forever.  Per-job
-        decisions that ARE final (backfill scheduled, nothing owed, another
-        node positively owns it) are remembered in ``_catchup_done`` so they
-        are not re-processed while a sibling job stays pending.  All store
-        I/O here is guarded and bounded: a store error defers (never forfeits,
-        never crashes the caller).
-
-        Every evaluation (including a deferred retry) is anchored to the
-        FIRST attempt's instant, not the current pass's: while the backend
-        was down the live scheduler kept firing jobs statelessly (nothing
-        recorded), so counting missed slots up to a later "now" would replay
-        runs that actually ran.  The owed window is the pre-boot downtime,
-        full stop.
+        Stateful-only (needs a durable watermark); no-op without a
+        ``state`` section. Owner-gated and spread over
+        catchupJitterSeconds. Resolution is NOT latched while it cannot
+        happen yet (backend not started, no positive owner, live pause):
+        pending jobs are re-evaluated every CATCHUP_RECHECK_INTERVAL;
+        latching would forfeit the owed backfill. Final per-job decisions
+        are remembered in _catchup_done. Every evaluation is anchored to
+        the FIRST attempt's instant: the live scheduler kept firing
+        statelessly while the backend was down, so a later "now" would
+        replay runs that actually ran.
         """
         if self._caught_up:
             return
@@ -9421,27 +8332,15 @@ class Cron:
                 self._catchup_done.add(name)
                 continue
             if self._pause_active(name) is not None:
-                # No backfill while paused, but a pause is transient and
-                # excuses only its own window: a backlog owed from before it
-                # began survives it. Defer (like a transient cluster denial),
-                # never latch, or that backlog is forfeited forever. The
-                # deferred retry still counts only the pre-boot downtime:
-                # every pass is anchored to _catchup_reference.
-                #
-                # Pin the pre-pause watermark before deferring. While paused,
-                # every held slot writes a synthetic "skipped" ledger row
-                # whose finished_at advances durable_last_run_at (the watermark
-                # _missed_occurrences reads) forward through the window, so by
-                # the time the pause lifts the derived watermark has walked
-                # past _catchup_reference and the deferred retry would count
-                # nothing owed. An open checkpoint fixes the watermark at the
-                # last real run: durable_last_completed_at is skip-blind, so it
-                # is immune to the held-slot rows however many land, and the
-                # checkpoint survives a manual resume that erases the pause
-                # window or a restart taken mid-pause. _missed_occurrences
-                # hoists `after` back to it. The is-None guard keeps the
-                # recheck loop from re-pinning (and churning the checkpoint
-                # stream) once the watermark is fixed.
+                # No backfill while paused, but a pause excuses only its
+                # own window: defer, never latch, or the pre-pause backlog
+                # is forfeited. Pin the pre-pause watermark first: held
+                # slots write synthetic "skipped" rows that advance
+                # durable_last_run_at through the window, so an open
+                # checkpoint fixes the watermark at the last real run
+                # (durable_last_completed_at is skip-blind) and survives a
+                # manual resume or mid-pause restart. The is-None guard
+                # keeps the recheck loop from re-pinning.
                 try:
                     if await self._pending_catchup_watermark(name) is None:
                         real = await asyncio.wait_for(
@@ -9520,25 +8419,15 @@ class Cron:
     ) -> None:
         """Launch a job's catch-up runs, after its jitter offset.
 
-        Sleeps out the per-job jitter (interruptibly, so shutdown wakes it at
-        once), then REVALIDATES everything the sleep may have invalidated:
-        the job may have been removed/disabled/edited by a reload (the live
-        definition is launched, never the boot-time capture), cluster
-        ownership may have moved (the new owner resumes from the open
-        checkpoint; launching here too would double-run the backfill), and
-        the owed count may have changed (another node backfilled).  Then
-        launches ``count`` times through the concurrency-gated path,
-        SERIALIZED: each launch waits for the job's previous instance(s) to
-        drain, so ``concurrencyPolicy: Forbid`` cannot swallow the rest of the
-        owed runs and ``run-all`` cannot stampede N concurrent instances.
-        Uses :meth:`maybe_launch_job` with ``with_retries=False``, not
-        :meth:`launch_scheduled_job`: a backfill is best-effort and must not
-        arm retries, nor capture a LIVE retry ladder armed by a concurrent
-        scheduled fire, whose budget its failures would burn.  Failure
-        reporting still applies (the reaper reports every finished run), and
-        each finished run is recorded to the ledger, advancing the watermark
-        so a later restart does not re-backfill the same slots; the cycle's
-        checkpoint is closed once the backfill completes.
+        Sleeps out the jitter (interruptibly), then REVALIDATES what the
+        sleep may have invalidated: reload (the live definition is
+        launched), moved ownership (the new owner resumes from the open
+        checkpoint), changed owed count. Launches are SERIALIZED so
+        Forbid cannot swallow owed runs and run-all cannot stampede.
+        Uses maybe_launch_job with with_retries=False: a backfill must
+        not arm retries nor capture a live retry ladder armed by a
+        concurrent scheduled fire. Each finished run advances the
+        watermark; the checkpoint closes when the backfill completes.
         """
         try:
             if offset > 0:
@@ -9571,12 +8460,9 @@ class Cron:
                     job.name,
                 )
                 return
-            # Recompute against the ORIGINAL pass instant, not a fresh clock
-            # read: the open checkpoint anchors the window's start at the
-            # boot-time watermark, so a fresh `now` would stretch the window
-            # over slots the live scheduler already fired during the jitter
-            # and replay them.  Slots that became due during the jitter are
-            # the scheduler's, not the backfill's.
+            # Recompute against the ORIGINAL pass instant: a fresh `now`
+            # would stretch the window over slots the live scheduler
+            # already fired during the jitter and replay them.
             try:
                 count, watermark = await self._missed_occurrences(job, now)
             except asyncio.CancelledError:
@@ -9598,11 +8484,10 @@ class Cron:
             logger.info(
                 "catch-up: replaying %d missed run(s) for %s", count, job.name
             )
-            # Only Forbid must wait for TOTAL idleness (launching would be
-            # swallowed).  For Allow/Replace the wait is mere anti-stampede
-            # pacing, so it is bounded: a job whose scheduled instances
-            # always overlap (runtime > interval) would otherwise starve the
-            # backfill forever and leave its checkpoint open.
+            # Only Forbid must wait for TOTAL idleness. For Allow/Replace
+            # the wait is anti-stampede pacing, so it is bounded; an
+            # always-overlapping job would otherwise starve the backfill
+            # forever and leave its checkpoint open.
             max_wait: Optional[float] = (
                 None
                 if job.concurrencyPolicy == "Forbid"
@@ -9667,13 +8552,9 @@ class Cron:
     ) -> bool:
         """Wait until no instance of ``name`` is running (backfill pacing).
 
-        Returns ``False`` when shutdown was signalled while waiting; ``True``
-        means "go ahead": either the job went idle or ``max_wait`` seconds
-        elapsed first (used by the non-Forbid policies, where the wait is
-        pacing rather than correctness and must not starve forever).  Polling
-        (rather than plumbing a completion event out of the reaper) keeps the
-        backfill decoupled from the reaper's bookkeeping; the half-second
-        cadence is plenty for runs that just finished.
+        False when shutdown was signalled while waiting; True means "go
+        ahead" (idle, or max_wait elapsed for the non-Forbid policies
+        where the wait is pacing, not correctness).
         """
         waited = 0.0
         while self.running_jobs.get(name):
@@ -9690,25 +8571,18 @@ class Cron:
     async def _service_slots(self, startup: bool) -> None:
         """Service the jobs due on this pass.
 
-        Reads the clock once (AFTER any slow housekeeping, so a fire the reload
-        pushed past is still serviced instead of dropped) and hands that
-        instant to :meth:`spawn_jobs`.  On the start-up pass it also seeds the
-        next-fire index for every scheduled job, so their first fire is the
-        boundary strictly after start-up (the skip-the-partial-period start),
-        and then runs missed-run catch-up once (:meth:`_catch_up`).
+        Reads the clock once, AFTER any slow housekeeping, so a fire the
+        reload pushed past is still serviced. The start-up pass seeds
+        the next-fire index strictly-future and runs catch-up.
         """
         now = get_now(datetime.timezone.utc)
         if startup:
             self._ensure_seeded(now)
         await self.spawn_jobs(startup, now)
-        # Every pass, not just start-up: _catch_up latches itself once fully
-        # resolved (one boolean check per pass thereafter) but must be able
-        # to retry when the backend or the cluster was not ready at boot;
-        # latching on the first pass forfeited the owed backfill forever.
-        # Spawned, not awaited: the evaluation performs bounded store reads
-        # (up to STATE_OP_TIMEOUT each), and a slow-but-alive mount must not
-        # stall this pass; job launches outrank catch-up bookkeeping.
-        # Tracked in _catchup_tasks so shutdown cancels a straggler.
+        # Every pass, not just start-up: _catch_up latches itself once
+        # resolved but must retry when backend/cluster were not ready at
+        # boot. Spawned, not awaited: a slow-but-alive mount must not
+        # stall this pass. Tracked so shutdown cancels a straggler.
         if not self._caught_up and (
             self._catchup_eval_task is None or self._catchup_eval_task.done()
         ):
@@ -9716,10 +8590,8 @@ class Cron:
             self._catchup_eval_task = task
             self._catchup_tasks.add(task)
             task.add_done_callback(self._catchup_tasks.discard)
-        # let the DAG scheduler create due runs and advance active
-        # ones. Single-flight and self-gated (only spawns work when a run's
-        # wake, a scheduled fire, or an adoption/GC interval is due), so a pass
-        # with no DAG work due is a couple of cheap in-memory checks.
+        # DAG scheduler: single-flight and self-gated, so a pass with no
+        # DAG work due is a couple of cheap in-memory checks.
         self._dag.service()
 
     async def spawn_jobs(
@@ -9727,15 +8599,11 @@ class Cron:
     ) -> None:
         """Launch the jobs due on this pass.
 
-        At start-up only ``@reboot`` jobs are due; scheduled (CronTab) jobs
-        never fire at start-up (they are seeded strictly-future in the
-        next-fire index).  On a normal pass the due jobs come from that index
-        (:meth:`_due_names`), each advanced past its fired slot with bounded
-        catch-up (:meth:`_advance`), so a job fires at most once per slot with
-        no per-tick scan or ``crontab.test`` over the whole job set.
-
-        ``now`` is the pass instant (aware UTC) from :meth:`_service_slots`; a
-        direct caller may omit it for a fresh read.
+        At start-up only ``@reboot`` jobs are due (CronTab jobs are
+        seeded strictly-future). Normal passes pull due jobs from the
+        next-fire index, each advanced with bounded catch-up, so a job
+        fires at most once per slot. ``now`` may be omitted by a direct
+        caller for a fresh read.
         """
         if now is None:
             now = get_now(datetime.timezone.utc)
@@ -9750,19 +8618,14 @@ class Cron:
     async def _spawn_reboot_jobs(self) -> None:
         """Launch ``@reboot`` jobs at start-up, in config order.
 
-        A ``@reboot`` Leader/PreferLeader job under election is deferred until
-        the cluster elects an owner (:meth:`_process_pending_reboots`) rather
-        than run now, when ownership is unknown: running it now would either
-        skip it forever (Leader sees no quorum) or run it on every node
-        (PreferLeader sees only itself).  ``EveryNode`` @reboot is not
-        deferred: it is meant to run on every node at boot.
-
-        A PAUSED @reboot job is deferred too (:meth:`_process_paused_reboots`)
-        instead of being handed to the launcher, whose pause gate would skip
-        it after :meth:`_reboot_boot_gate` had already burnt this OS boot's
-        marker: a pause defers the boot run, it does not forfeit it.
+        Leader/PreferLeader @reboot jobs under election are deferred
+        until an owner is elected (running now would skip forever or run
+        on every node); EveryNode is not deferred. A PAUSED @reboot job
+        is also deferred rather than handed to the launcher, whose pause
+        gate would skip it after the boot marker was already burnt: a
+        pause defers the boot run, it does not forfeit it.
         """
-        to_launch = []  # type: List[JobConfig]
+        to_launch: list[JobConfig] = []
         for job in self.cron_jobs.values():
             # job_should_run(startup=True) is True only for an enabled @reboot
             # job, so everything below concerns @reboot one-shots.
@@ -9781,11 +8644,18 @@ class Cron:
                     self._defer_paused_reboot(job.name)
                     continue
                 to_launch.append(job)
+        # Deferred Leader/PreferLeader jobs never reach here; their dedupe
+        # is the cluster's reboot_ran path.
+        await self._launch_boot_gated(to_launch)
+
+    async def _launch_boot_gated(self, to_launch: list[JobConfig]) -> None:
+        """Launch @reboot jobs behind the state-backed boot dedupe.
+
+        A daemon restart within one OS boot must not re-run boot
+        one-shots (standalone / EveryNode); stateless installs launch
+        ungated.
+        """
         if to_launch and self._state_configured:
-            # state-backed boot dedupe (standalone / EveryNode): a daemon
-            # restart within one OS boot must not re-run boot one-shots.
-            # Deferred Leader/PreferLeader jobs never reach here; their
-            # dedupe is the cluster's reboot_ran path.
             gated = []
             for job in to_launch:
                 if await self._reboot_boot_gate(job):
@@ -9814,21 +8684,14 @@ class Cron:
     async def _process_paused_reboots(self) -> None:
         """Run a paused @reboot job's deferred boot run once the pause lifts.
 
-        Called every scheduling pass (:meth:`spawn_jobs`), so an expiry or an
-        explicit resume fires the held one-shot without a restart.  The boot
-        marker is written HERE, by the normal :meth:`_reboot_boot_gate`, so
-        the deferred run is still deduplicated to once per OS boot: a daemon
-        that restarts while the job is still paused finds no marker, defers
-        again, and still owes the run.
-
-        Retirement mirrors :meth:`_process_pending_reboots`: a name that is
-        momentarily absent from ``cron_jobs`` stays owed (never-lose), while
-        one reused for a job that is no longer an enabled ``@reboot`` is
-        dropped without running.
+        Called every scheduling pass. The boot marker is written HERE by
+        _reboot_boot_gate, so the deferred run stays once per OS boot.
+        Retirement mirrors _process_pending_reboots: a transiently absent
+        name stays owed; a name reused for a non-@reboot job is dropped.
         """
         if not self._paused_reboot_jobs:
             return
-        to_launch = []  # type: List[JobConfig]
+        to_launch: list[JobConfig] = []
         for name in list(self._paused_reboot_jobs):
             job = self.cron_jobs.get(name)
             if job is None:
@@ -9851,13 +8714,7 @@ class Cron:
                 name,
             )
             to_launch.append(job)
-        if to_launch and self._state_configured:
-            gated = []
-            for job in to_launch:
-                if await self._reboot_boot_gate(job):
-                    gated.append(job)
-            to_launch = gated
-        await self._launch_concurrently(to_launch)
+        await self._launch_boot_gated(to_launch)
 
     async def _spawn_due_jobs(self, now: datetime.datetime) -> None:
         """Launch the jobs whose next fire has arrived, in config order.
@@ -9869,32 +8726,23 @@ class Cron:
         due = self._due_names(now)
         if not due:
             return
-        # Build the launch plan in config order. Each due job contributes its
-        # list of fire slots (usually one; more only when a slow pass or a
-        # forward clock jump missed whole occurrences within CATCHUP_LIMIT).
-        # Order comes from the memoized position index rather than a walk of
-        # the whole job set: the next-fire index above already made the pass
-        # O(due), and re-deriving config order by scanning every job put that
-        # back (measured 2.8-5.8 ms of loop-blocking work per firing pass at
-        # 100k jobs).  A name the index still holds but the config no longer
-        # does is skipped, exactly as the membership test used to.
+        # Build the launch plan in config order via the memoized position
+        # index (keeps the pass O(due), not O(all jobs)). A name the index
+        # holds but the config no longer does is skipped.
         pos = self._job_pos()
         ordered = [name for name in due if name in pos]
         ordered.sort(key=pos.__getitem__)
-        plan = []  # type: List[Tuple[JobConfig, List[datetime.datetime]]]
+        plan: list[tuple[JobConfig, list[datetime.datetime]]] = []
         for name in ordered:
             job = self.cron_jobs[name]
             fires, new_next = self._advance(job, self._next_fire[name], now)
             if new_next is not None:
                 self._set_next_fire(name, new_next)
             else:
-                # no further occurrence (a fixed past year now behind us):
-                # drop it from the index so it is not revisited, and latch
-                # the dead-schedules set so the status surfaces keep
-                # reporting never_fires from the latch instead of each
-                # re-walking the schedule's whole remaining horizon per
-                # poll (the latch is what _scheduled_in and
-                # _schedule_never_fires consult).
+                # no further occurrence: drop from the index and latch
+                # _dead_schedules (what _scheduled_in and
+                # _schedule_never_fires consult) so status polls do not
+                # re-walk the schedule horizon.
                 self._next_fire.pop(name, None)
                 if name not in self._dead_schedules:
                     self._dead_schedules.add(name)
@@ -9910,48 +8758,39 @@ class Cron:
         await self._launch_plan(plan)
 
     async def _launch_plan(
-        self, plan: List[Tuple[JobConfig, List[datetime.datetime]]]
+        self, plan: list[tuple[JobConfig, list[datetime.datetime]]]
     ) -> None:
         """Launch a due-job plan.
 
-        One round per catch-up depth: within a round the due jobs launch
-        concurrently in config order (so N jobs due in the same slot cost about
-        one spawn-time, not N), while a single job's own catch-up replays run
-        in successive rounds (i.e. sequentially), so its concurrencyPolicy
-        still applies between them.  The common case (every job has exactly one
-        fire) is a single round.
+        One round per catch-up depth: within a round due jobs launch
+        concurrently in config order; a single job's own catch-up replays
+        run in successive rounds so its concurrencyPolicy still applies
+        between them.
         """
         rounds = max((len(fires) for _, fires in plan), default=0)
         for r in range(rounds):
-            to_launch = []  # type: List[JobConfig]
+            to_launch: list[JobConfig] = []
             for job, fires in plan:
                 if r >= len(fires):
                     continue
-                # record the slot this fire is for (status/introspection), then
-                # gate on the cluster (recorded whether or not this node runs
-                # it, mirroring the old per-slot bookkeeping).
+                # record the slot this fire is for (status/introspection),
+                # recorded whether or not this node runs it.
                 self._last_run_slot[job.name] = fires[r]
                 if self._cluster_allows(job):
-                    # the lateAfter reference, recorded INSIDE the ownership
-                    # gate: only the node that would actually run the slot
-                    # owes it. A follower recording slots it never launches
-                    # has no matching _sla_last_start, so the next failover
-                    # would page a false breach on the incoming owner the
-                    # moment the gate opened. A slot skipped by a pause is
-                    # excused, so it never becomes the check's due slot.
+                    # lateAfter reference, recorded INSIDE the ownership
+                    # gate: only the node that would run the slot owes it
+                    # (a follower recording slots would page a false
+                    # breach on failover). A pause-skipped slot is excused.
                     if self._pause_active(job.name) is None:
                         self._sla_due[job.name] = fires[r]
                     to_launch.append(job)
             await self._launch_concurrently(to_launch)
 
-    async def _launch_concurrently(self, to_launch: List[JobConfig]) -> None:
+    async def _launch_concurrently(self, to_launch: list[JobConfig]) -> None:
         """Launch every job in ``to_launch`` concurrently, in config order.
 
-        Each launch awaits a subprocess spawn, so gathering collapses N due
-        jobs from N x spawn-time to about a single spawn-time.  The launches
-        are independent (each touches only its own name's running_jobs /
-        retry_state entry).  The single-job case (the norm) takes a direct
-        await so it is byte-identical to the pre-gather form; empty is a no-op.
+        Gathering collapses N spawns to about one spawn-time; launches
+        are independent (each touches only its own name's entries).
         """
         if len(to_launch) == 1:
             await self.launch_scheduled_job(to_launch[0])
@@ -9971,7 +8810,7 @@ class Cron:
             and job.clusterPolicy in ("Leader", "PreferLeader")
         )
 
-    def _same_boot(self, rec: Dict[str, Any]) -> bool:
+    def _same_boot(self, rec: dict[str, Any]) -> bool:
         """Whether a boot-marker record was written during THIS OS boot.
 
         Prefers the exact per-boot UUID (Linux); falls back to comparing
@@ -10022,17 +8861,13 @@ class Cron:
     async def _reboot_boot_gate(self, job: JobConfig) -> bool:
         """Record-then-run boot dedupe for a non-deferred @reboot job.
 
-        ``True`` -> launch (with the marker recorded FIRST, so a crash
-        between record and spawn errs toward not re-running, the same
-        at-most-once ordering as the cluster's mark_reboot_ran path).
-        ``False`` -> skip: the marker proves this boot's run already
-        happened, or the store is unavailable under ``onStoreUnavailable:
-        fail-closed``.  Under the default ``degrade`` policy an unreadable
-        or unwritable store runs the job (at-least-once, exactly the
-        stateless behaviour).  A store op TIMEOUT latches
-        ``_reboot_gate_sick`` so the startup pass's remaining @reboot jobs
-        apply the policy without further I/O, instead of serially stalling
-        the first scheduling pass on a hung mount.
+        True -> launch, with the marker recorded FIRST so a crash between
+        record and spawn errs toward not re-running (at-most-once).
+        False -> skip: the marker proves this boot ran, or the store is
+        unavailable under fail-closed. The default degrade policy runs
+        the job on store trouble (at-least-once). A store TIMEOUT latches
+        _reboot_gate_sick so the remaining @reboot jobs apply the policy
+        without serially stalling on a hung mount.
         """
         backend = self.state_backend
         fail_closed = self._state_on_unavailable == "fail-closed"
@@ -10089,10 +8924,9 @@ class Cron:
         }
         stream = self._reboot_stream(job.name)
         try:
-            # prune_keep folds the stream bound into the append's own worker
-            # call; the backend applies it only after the append LANDED and
-            # swallows its own failures, so it can never re-decide the launch
-            # the way a separate failing prune op once threatened to.
+            # prune_keep rides the append's worker call, applied only
+            # after the append LANDED, so a prune failure can never
+            # re-decide the launch.
             await asyncio.wait_for(
                 backend.append_record(
                     stream, record, prune_keep=REBOOT_STREAM_KEEP
@@ -10107,13 +8941,10 @@ class Cron:
                 self._reboot_gate_sick = True
                 if fail_closed:
                     # A timed-out append is NOT a failed append: the
-                    # abandoned worker thread can still land the marker
-                    # later, and skipping now would then lose the boot run
-                    # for this whole boot (every later restart would read
-                    # "already ran"). Re-check once: marker visible ->
-                    # record-before-run held, so launch; still absent ->
-                    # skip under the policy (the residual late-landing
-                    # window is accepted and logged).
+                    # worker thread can still land the marker later, and
+                    # skipping now would lose the boot run for this whole
+                    # boot. Re-check once: marker visible -> launch;
+                    # still absent -> skip under the policy.
                     try:
                         if await self._reboot_marker_covers(job):
                             return True
@@ -10137,54 +8968,29 @@ class Cron:
                 ex,
             )
             return True
-        # the marker landed (the stream bound rode along inside the append's
-        # worker call): the boot run is committed to happen.
+        # the marker landed: the boot run is committed to happen.
         return True
 
     async def _process_pending_reboots(self) -> None:
         """Run each deferred @reboot job once the cluster has elected an owner.
 
-        Each pending job is retired in one of two ways: this node runs it
-        because it is the elected owner, or we learn (via the cluster's
-        ``reboot_ran`` gossip) that it already ran somewhere and stand down
-        without re-running.  We deliberately do *not* drop a job merely because
-        some *other* node currently *looks like* the owner: that node may be
-        unable to run it (reachable from us but not quorate from its own view),
-        and dropping on speculation would lose the one-shot forever.  Dropping
-        only on positive confirmation keeps the never-lose property while
-        avoiding a re-run when leadership later moves to a node that still held
-        the job pending.  If election was turned off on a reload, the
-        quorum/owner gating is gone, so a still-pending one-shot runs here as
-        long as its name still maps to an ``@reboot`` job (a name reused for a
-        non-``@reboot`` job is retired without running, as on the gated path).
-
-        A name that is momentarily *absent* from ``cron_jobs`` (a templating
-        glitch or a remove-then-re-add seen mid-reload, before the cluster has
-        converged) is **kept pending**, not dropped: dropping on a transient
-        absence would lose the one-shot forever and break the never-lose
-        property.  The launch is always gated on the name being present *and*
-        still a deferrable @reboot, so a genuinely-removed job never runs, and
-        we run the *current* ``cron_jobs[name]`` (never the stale config we
-        captured at boot) so a name later reused for a different job runs the
-        live definition.  If a name is reused for a job that is no longer a
-        deferrable @reboot (e.g. it became ``EveryNode`` or a real schedule),
-        the pending entry is retired and the new job is left to its own
-        scheduling.
-
-        A PAUSED job keeps its pending entry untouched on every branch: a
-        pause defers the boot run rather than forfeiting it, so neither the
-        cluster's ``mark_reboot_ran`` token nor the entry itself is spent on
-        a run the launcher's pause gate would merely skip.
+        A pending job retires only two ways: this node runs it as the
+        elected owner, or reboot_ran gossip positively confirms it ran
+        elsewhere. Never dropped because another node merely LOOKS like
+        the owner (never-lose). A name transiently absent from cron_jobs
+        stays pending; the launch is gated on presence and on still being
+        a deferrable @reboot, and always runs the CURRENT cron_jobs[name].
+        A PAUSED job keeps its entry untouched on every branch: a pause
+        defers the boot run, so neither the mark_reboot_ran token nor the
+        entry is spent on a run the pause gate would skip.
         """
         if not self._pending_reboot_jobs:
             return
         if not self._elect_leader_configured:
-            # election removed on reload: the quorum/owner gating is gone, so
-            # run the *current* job for any present name still defining an
-            # @reboot one-shot. A momentarily-absent name is kept pending (not
-            # popped) for the same never-lose reason as the gated path below;
-            # a name reused for a non-@reboot job is retired without running
-            # (its new definition schedules itself), mirroring that path.
+            # election removed on reload: gating is gone, so run the
+            # CURRENT job for any present name still defining an @reboot
+            # one-shot; absent names stay pending (never-lose), reused
+            # names retire without running.
             for name in list(self._pending_reboot_jobs):
                 job = self.cron_jobs.get(name)
                 if job is None:
@@ -10194,14 +9000,10 @@ class Cron:
                     # than retiring it unrun, and re-check next wakeup.
                     continue
                 del self._pending_reboot_jobs[name]
-                # a job disabled (enabled: false) on the reload that also
-                # removed election is retired without running, the same way
-                # job_should_run and the manual web trigger refuse a disabled
-                # job rather than running it once on convergence. (enabled is
-                # checked last so a name reused for a non-@reboot job (which
-                # need not carry the attribute) short-circuits on the
-                # schedule check, as _is_deferrable_reboot does on the gated
-                # paths.)
+                # a disabled job retires without running, mirroring
+                # job_should_run; enabled is checked last so a name reused
+                # for a non-@reboot job short-circuits on the schedule
+                # check.
                 if (
                     isinstance(job.schedule, str)
                     and job.schedule == "@reboot"
@@ -10211,28 +9013,17 @@ class Cron:
             return
         mgr = self.cluster_manager
         if mgr is None:
-            # Election wanted but no manager (store unreachable / backend
-            # failed to start). A Leader @reboot one-shot stays fail-closed:
-            # keep it pending and re-evaluate once a manager comes up. But a
-            # PreferLeader one-shot's contract is NEVER-SKIP: it must run
-            # somewhere even when the store is unreachable (accepting a
-            # possible double-run), exactly the asymmetry _cluster_allows
-            # applies to *scheduled* PreferLeader jobs in this same mgr-is-None
-            # case. Not mirroring it here would drop the one-shot forever on a
-            # persistent start failure: the very store-unreachable case
-            # PreferLeader exists to survive. There is no store to record the
-            # run to, so a later-starting manager may not see it ran; that is
-            # the documented PreferLeader double-run cost, strictly better than
-            # never running.
+            # Election wanted but no manager. Leader one-shots stay
+            # fail-closed (pending). PreferLeader is NEVER-SKIP: it must
+            # run even with the store unreachable (accepting a possible
+            # double-run), the same asymmetry _cluster_allows applies to
+            # scheduled PreferLeader jobs in this mgr-is-None case.
             for name in list(self._pending_reboot_jobs):
                 if name not in self.cron_jobs:
                     continue  # transiently absent -> keep pending (never-lose)
                 job = self.cron_jobs[name]
                 if not self._is_deferrable_reboot(job) or not job.enabled:
-                    # name reused for a non-deferrable job, or the job was
-                    # disabled (enabled: false) on a reload while it sat
-                    # pending -> retire it without running, as job_should_run
-                    # refuses a disabled job on the normal scheduled path.
+                    # reused or disabled -> retire without running.
                     del self._pending_reboot_jobs[name]
                     continue
                 if self._pause_active(name) is not None:
@@ -10250,29 +9041,22 @@ class Cron:
             return
         for name in list(self._pending_reboot_jobs):
             if name not in self.cron_jobs:
-                # Absent right now, but @reboot only defers at startup, so a
-                # name that vanishes mid-reload (templating glitch, transient
-                # remove-then-re-add) could otherwise be lost forever. Keep it
-                # pending and re-evaluate next wakeup; the launch below is
-                # gated on presence, so a genuinely-removed job never runs.
+                # transiently absent mid-reload: keep pending (never-lose);
+                # the launch below is gated on presence, so a genuinely
+                # removed job never runs.
                 continue
             job = self.cron_jobs[name]
             if not self._is_deferrable_reboot(job) or not job.enabled:
-                # the name was reused for a job that is no longer a deferrable
-                # @reboot (now EveryNode, or a real schedule), or the job was
-                # disabled (enabled: false) on a reload while it sat pending:
-                # retire the stale entry without running it, mirroring
-                # job_should_run, which refuses a disabled job.
+                # reused for a non-deferrable job, or disabled: retire the
+                # stale entry without running it.
                 del self._pending_reboot_jobs[name]
                 continue
             try:
                 already_ran = mgr.reboot_ran(name)
             except Exception:
-                # A backend read must not escape: _process_pending_reboots is
-                # called from spawn_jobs, OUTSIDE run()'s try/except, so a
-                # raise here would kill the whole scheduler. Treat it as "not
-                # known to have run" and keep the job pending (never-lose);
-                # re-evaluate next wakeup. Mirrors the _cluster_allows guard.
+                # A backend read must not escape: this runs OUTSIDE run()'s
+                # try/except, so a raise would kill the scheduler. Treat as
+                # "not known to have run", keep pending (never-lose).
                 logger.exception(
                     "cluster: error checking whether @reboot job %s already "
                     "ran; keeping it pending",
@@ -10280,9 +9064,7 @@ class Cron:
                 )
                 continue
             if already_ran:
-                # positive confirmation it already ran in the cluster -> retire
-                # it without re-running (this is what prevents a re-run when
-                # leadership later lands on a node that still held it pending).
+                # positive confirmation -> retire without re-running.
                 del self._pending_reboot_jobs[name]
                 logger.info(
                     "cluster: deferred @reboot job %s already ran in the "
@@ -10291,19 +9073,14 @@ class Cron:
                 )
                 continue
             if self._pause_active(name) is not None:
-                # a pause DEFERS the boot run: keep the entry pending so the
-                # one-shot runs when the pause lifts. mark_reboot_ran must
-                # not burn the cluster's once-per-boot token for a run the
-                # launcher's pause gate would only skip.
+                # a pause DEFERS the boot run: keep pending; do not burn
+                # the once-per-boot token on a run the pause gate skips.
                 continue
             # Gate on the SAME boolean owner check as a scheduled job
-            # (_cluster_allows), not a name comparison: a lease backend's
-            # leader_name() reports the holder's display *identity*
-            # (cluster.kubernetes.identity), which may legitimately differ from
-            # node_name; comparing those two would make the holder fail to
-            # recognise itself, so the one-shot would never run on any node.
-            # is_leader()/is_available_leader()/is_job_owner() self-recognise
-            # correctly regardless of an identity != nodeName mismatch.
+            # (_cluster_allows), not a name comparison: leader_name()
+            # reports a display identity that may differ from node_name,
+            # so comparing names could make the holder fail to recognise
+            # itself and never run the one-shot on any node.
             if self._cluster_allows(job):
                 del self._pending_reboot_jobs[name]
                 logger.info(
@@ -10311,64 +9088,30 @@ class Cron:
                     "the elected owner)",
                     name,
                 )
-                # Record (and eagerly gossip / persist) intent-to-run BEFORE
-                # spawning, not after: a crash in the launch->record window
-                # would otherwise leave no peer/store aware it ran, so the
-                # failover owner re-runs it. Recording first means the worst
-                # case is a recorded-but-not-actually-run one-shot (at-most-
-                # once preserved), not a double-run.
+                # Record intent-to-run BEFORE spawning: worst case is a
+                # recorded-but-not-run one-shot (at-most-once preserved),
+                # not a double-run after failover.
                 await mgr.mark_reboot_ran(name)
                 await self.launch_scheduled_job(job)
-            # else: another node is (or will be) the owner, or the cluster has
-            # not converged yet (no quorum / a nodeName conflict) -> keep the
-            # job pending and re-evaluate next wakeup. Never drop a one-shot on
-            # another node's behalf: see this method's docstring.
+            # else: another node owns it or the cluster has not converged
+            # -> keep pending. Never drop a one-shot on another node's
+            # behalf.
 
     def _cluster_allows(self, job: JobConfig) -> bool:
         """Whether this node may run *scheduled* ``job`` this cycle.
 
-        Always true unless leader election is enabled
-        (``cluster.electLeader``); then it depends on the job's
-        ``clusterPolicy``:
-
-        * ``EveryNode``: run on every replica, independent of cluster state
-          (so these jobs keep firing even if the manager failed to start);
-        * ``Leader`` (default): only the quorum-gated elected owner runs it
-          (at-most-once; skips when there is no quorum);
-        * ``PreferLeader``: the reachable agreeing owner runs it, ignoring
-          quorum (never skips while a node is up, but may double-run across a
-          partition).
-
-        Under the default ``distribution: single-leader`` the "owner" is the
-        one cluster-wide elected leader (so all ``Leader`` jobs run on that
-        node); under ``distribution: spread`` it is a *per-job*
-        rendezvous-hashed owner, so leader-gated work fans out across the
-        quorate nodes.  Both keep the same quorum gate and the same guarantee.
-
-        When election is configured but no manager is running, ``Leader`` fails
-        *closed* (return False) so a broken cluster does not make every replica
-        fire, while ``PreferLeader`` (never-skip) runs anyway: a node with no
-        manager is the "store unreachable" case its contract already accepts a
-        double-run for, so skipping it would drop the job to at-most-zero.
-        Manual (API) triggers go through
-        ``maybe_launch_job`` directly and are deliberately *not* gated (an
-        explicit operator action runs where it is invoked).  Scheduled-job
-        *retries* re-check this gate in ``schedule_retry_job`` before
-        relaunching: a retry that outlives the leadership it began under is
-        abandoned once another node positively owns the job (rather than
-        double-running across a failover), but merely deferred and re-checked
-        on a transient fail-closed denial (see ``_cluster_owner_moved``).
-
-        A detected conflict (``mgr.has_conflict()``: a duplicate ``nodeName``,
-        an agreeing peer declaring a different cluster size ``N``, or an
-        agreeing peer running a different coordination policy
-        (``distribution`` / ``electLeader``)) additionally makes ``Leader``
-        jobs fail closed: the quorum election is unsafe while two nodes share a
-        name, disagree on ``N`` (either lets two nodes each elect themselves),
-        or pick owners by different rules (which would double-run or drop a
-        ``Leader`` job), so skipping is the at-most-once-preserving choice.
-        ``PreferLeader`` is left running: it already accepts double-runs as
-        the price of never skipping.
+        Always true without electLeader. EveryNode runs everywhere;
+        Leader runs only on the quorum-gated elected owner (at-most-once,
+        skips without quorum); PreferLeader runs on the reachable
+        agreeing owner ignoring quorum (never skips, may double-run
+        across a partition). Under distribution: spread the owner is
+        per-job rendezvous-hashed. With no manager running, Leader fails
+        CLOSED and PreferLeader runs anyway. Manual triggers are
+        deliberately NOT gated; retries re-check this gate in
+        schedule_retry_job (see _cluster_owner_moved). A detected
+        conflict (has_conflict: duplicate nodeName, differing N, or
+        differing coordination policy) also fails Leader closed;
+        PreferLeader keeps running.
         """
         if not self._elect_leader_configured:
             return True
@@ -10423,13 +9166,9 @@ class Cron:
         """
         if not self._elect_leader_configured:
             return
-        # spawn_jobs (this method's only caller) runs OUTSIDE run()'s
-        # try/except, so an exception from any backend read below would kill
-        # the whole scheduler: the failure mode _cluster_allows is hardened
-        # against, but this method runs one step earlier on the same unguarded
-        # path. It only logs, so swallow any backend-read error and keep
-        # scheduling (the run/skip decision stays fail-closed in
-        # _cluster_allows).
+        # Runs OUTSIDE run()'s try/except, so a backend-read exception
+        # here would kill the scheduler. It only logs, so swallow errors
+        # and keep scheduling.
         try:
             self._emit_cluster_role_logs()
         except Exception:
@@ -10440,9 +9179,8 @@ class Cron:
     def _emit_cluster_role_logs(self) -> None:
         mgr = self.cluster_manager
         if mgr is not None:
-            # A duplicate nodeName is a misconfiguration that pauses Leader
-            # jobs cluster-wide; log it loudly (and the recovery), once per
-            # transition, so an operator notices and fixes the names.
+            # Duplicate nodeName pauses Leader jobs cluster-wide; log the
+            # edge (and recovery) once per transition.
             conflict = mgr.conflict_names()
             if bool(conflict) != self._was_conflict:
                 if conflict:
@@ -10458,10 +9196,8 @@ class Cron:
                         "run again"
                     )
                 self._was_conflict = bool(conflict)
-            # A cluster-size disagreement (divergent peer lists) breaks the
-            # quorum proof exactly as a duplicate nodeName does; log it just as
-            # loudly so an operator reconciles cluster.peers (e.g. an in-flight
-            # resize that has not finished rolling out).
+            # A cluster-size disagreement breaks the quorum proof the same
+            # way; log it just as loudly.
             size_conflict = mgr.conflicting_sizes()
             if bool(size_conflict) != self._was_size_conflict:
                 if size_conflict:
@@ -10479,12 +9215,9 @@ class Cron:
                         "jobs may run again"
                     )
                 self._was_size_conflict = bool(size_conflict)
-            # A coordination-policy divergence (an agreeing peer running a
-            # different distribution / electLeader) selects a different owner
-            # and would double-run or drop Leader jobs, so it fails the Leader
-            # gate closed exactly like the two conflicts above, but unlike
-            # them it would otherwise stand Leader jobs down cluster-wide with
-            # nothing in the log. Surface it just as loudly, once per change.
+            # A coordination-policy divergence also fails the Leader gate
+            # closed but would otherwise leave nothing in the log; surface
+            # it just as loudly, once per change.
             policy_conflict = mgr.conflicting_policies()
             if bool(policy_conflict) != self._was_policy_conflict:
                 if policy_conflict:
@@ -10501,12 +9234,9 @@ class Cron:
                         "Leader jobs may run again"
                     )
                 self._was_policy_conflict = bool(policy_conflict)
-        # Quorum membership is logged on *every* node, in both modes, so a
-        # follower that drops below quorum (i.e. the whole cluster losing the
-        # ability to elect a leader) leaves a breadcrumb in its own log, not
-        # only the ex-leader's (in single-leader mode only the ex-leader's
-        # is_leader() flips, so without this a follower logs nothing on quorum
-        # loss).
+        # Quorum membership is logged on EVERY node: without this a
+        # follower logs nothing on quorum loss (only the ex-leader's
+        # is_leader() flips in single-leader mode).
         spread = mgr is not None and mgr.distribution == "spread"
         quorate = mgr is not None and mgr.is_quorate()
         if quorate != self._was_quorate:
@@ -10529,11 +9259,10 @@ class Cron:
                     "so Leader jobs cannot run until one is"
                 )
             if not quorate and self._notify_config is not None:
-                # losing quorum stands Leader jobs down: an alert-worthy edge.
-                # (Regaining quorum is recovery, logged above but not paged.)
-                # Guarded on _notify_config so an unconfigured daemon builds no
-                # payload, and mgr is touched only when the event fires.
-                node = getattr(mgr, "node_name", None) or self._state_host
+                # quorum loss is alert-worthy (regain is logged, not
+                # paged). Guarded so an unconfigured daemon builds no
+                # payload.
+                node = self._node_name()
                 self._dispatch_notify(
                     "quorum_loss",
                     success=False,
@@ -10555,10 +9284,9 @@ class Cron:
                 "cluster: this node %s scheduled-job leadership",
                 "acquired" if leader else "lost",
             )
-            # Guarded on _notify_config so an unconfigured daemon builds no
-            # payload and mgr.leader_name() runs only when the event fires.
+            # Guarded so an unconfigured daemon builds no payload.
             if self._notify_config is not None:
-                node = getattr(mgr, "node_name", None) or self._state_host
+                node = self._node_name()
                 self._dispatch_notify(
                     "leader_change",
                     success=False,
@@ -10601,13 +9329,10 @@ class Cron:
             else:
                 return False
         if isinstance(job.schedule, CronTab):
-            crontab = job.schedule  # type: CronTab
-            # schedule_slot truncates to the job's resolution: the top of the
-            # minute for a minute-level job (identical to the old
-            # replace(second=0)), or the whole second for a second-level one.
-            # `slot` is the pass instant precomputed by spawn_jobs so the
-            # due-test and the de-dup key are one and the same read; None means
-            # a direct caller wants a fresh read.
+            crontab: CronTab = job.schedule
+            # schedule_slot truncates to the job's resolution. `slot` is
+            # the pass instant precomputed by spawn_jobs (due-test and
+            # de-dup key are the same read); None means a fresh read.
             if slot is None:
                 slot = schedule_slot(job)
             if crontab.test(slot):
@@ -10628,30 +9353,19 @@ class Cron:
             return False
 
     async def launch_scheduled_job(self, job: JobConfig) -> None:
-        # The pause gate for scheduled fires. Manual start and catch-up go
-        # through maybe_launch_job directly, and the cluster gate already
-        # ran, so under election exactly the owning node writes the skip
-        # row. The synthetic ledger row is what keeps the derived catch-up
-        # watermark advancing across the pause: its finished_at is the skip
-        # instant, so the skipped slots are never owed later. It carries no
-        # ``ranAt`` and never enters _last_completed_at, so the retry
-        # ladder's superseded-by-run guards cannot mistake a held slot for
-        # the run that would resolve them.
+        # The pause gate for scheduled fires (manual start and catch-up
+        # use maybe_launch_job directly). The synthetic "skipped" ledger
+        # row keeps the catch-up watermark advancing across the pause; it
+        # carries no ranAt and never enters _last_completed_at, so the
+        # retry ladder's superseded-by-run guards cannot mistake a held
+        # slot for a run.
         #
-        # @reboot jobs are EXEMPT from this gate. One reaches this launcher
-        # only from the three pause-aware reboot callers (_spawn_reboot_jobs,
-        # _process_paused_reboots, _process_pending_reboots), never from a
-        # scheduled fire, because _ensure_seeded seeds the next-fire index
-        # for CronTab schedules only. Each caller already decided to run the
-        # job AND already spent the once-per-boot token (the boot marker, or
-        # the cluster's mark_reboot_ran) across an await before reaching
-        # here. That token cannot be un-spent, so skipping on a pause that
-        # lands in the record-then-run window would FORFEIT the boot run
-        # instead of deferring it, the exact loss the reboot callers avoid by
-        # deferring a job that is paused when THEY examine it. This exemption
-        # closes the remaining millisecond window between spending the token
-        # and reaching this gate. Safe because no scheduled fire can arrive
-        # here for an @reboot job, so nothing that should be paused is run.
+        # @reboot jobs are EXEMPT: they only arrive here from the
+        # pause-aware reboot callers, which already spent the
+        # once-per-boot token across an await. Skipping on a pause that
+        # lands in that window would FORFEIT the boot run instead of
+        # deferring it. Safe because no scheduled fire can arrive here
+        # for an @reboot job.
         pause = self._pause_active(job.name)
         is_reboot = isinstance(job.schedule, str) and job.schedule == "@reboot"
         if pause is not None and not is_reboot:
@@ -10703,25 +9417,14 @@ class Cron:
     ) -> bool:
         """Launch ``job`` unless concurrencyPolicy forbids it.
 
-        Returns whether a new instance was actually launched (False only
-        for the ``Forbid`` skip), so a caller accounting for launches
-        (the retry metric) does not count a swallowed one.
-
-        ``with_retries=False`` (catch-up backfills) launches WITHOUT the
-        job's retry state: a backfill must not attach itself to a live retry
-        ladder armed by a concurrent scheduled fire; its failures would
-        cancel the legitimate pending retry and burn the shared budget toward
-        a premature onPermanentFailure.
-
-        The whole method holds the job's launch lock: the concurrency gate
-        below reads ``running_jobs`` several awaits before the launch appends
-        to it (the cluster slot claim's store round-trips, the subprocess
-        spawn inside ``start()``), and every entry point here runs in its own
-        task (the scheduler loop, each web/MCP request, a retry timer). Two
-        concurrent entries for the same job would both see the gate open in
-        that window and double-launch a Forbid job. The lock is per job name,
-        so distinct jobs still launch concurrently; a second entry for the
-        SAME job waits and then reads the gate the first entry settled.
+        Returns whether a new instance was launched (False only for the
+        Forbid skip). with_retries=False (catch-up backfills) launches
+        WITHOUT the retry state: a backfill must not attach to a live
+        retry ladder and burn its budget. The whole method holds the
+        per-job launch lock: the concurrency gate reads running_jobs
+        several awaits before the launch appends to it, so two concurrent
+        entries for the same job would otherwise double-launch a Forbid
+        job. Distinct jobs still launch concurrently.
         """
         async with self._launch_locks[job.name]:
             return await self._launch_job_locked(job, with_retries)
@@ -10730,14 +9433,10 @@ class Cron:
         self, job: JobConfig, with_retries: bool
     ) -> bool:
         """The body of :meth:`maybe_launch_job`, under its per-job lock."""
-        # .get(), not self.running_jobs[job.name]: a bare subscript on this
-        # defaultdict would INSERT an empty-list entry for a not-yet-running
-        # job. Such a jobless key makes `self.running_jobs` truthy while
-        # holding nothing to reap, and the reaper's idle wait
-        # (_wait_for_running_jobs) blocks on _jobs_running without a timeout,
-        # so a phantom key left behind (e.g. if start() below raises before the
-        # append) would spin the reaper hot at shutdown instead of letting it
-        # exit. Reading with .get() never creates the key.
+        # .get(), not a bare subscript: subscripting this defaultdict
+        # would INSERT a phantom empty-list key, which makes running_jobs
+        # truthy with nothing to reap and spins the reaper hot at
+        # shutdown.
         if self.running_jobs.get(job.name):
             logger.warning(
                 "Job %s: still running and concurrencyPolicy is %s",
@@ -10747,25 +9446,17 @@ class Cron:
             if job.concurrencyPolicy == "Allow":
                 pass
             elif job.concurrencyPolicy == "Forbid":
-                # the slot is deliberately DROPPED, not late: an overrun is
-                # maxRuntime's to report, once. RECORD the excuse (pop the due
-                # slot) rather than only inferring it from running_jobs, so it
-                # survives the run ending and the reaper emptying running_jobs;
-                # otherwise the stale due latches lateAfter in the window
-                # between the run finishing and the next slot launching. This
-                # mirrors the cluster-slot path, which excuses via
-                # _sla_peer_owns_slot. Popping lands lateAfter on its "nothing
-                # to be late for" branch, so no fake start is fabricated and
-                # the next genuinely unserved slot still latches once
-                # _launch_plan records it.
+                # the slot is deliberately DROPPED, not late (an overrun
+                # is maxRuntime's to report). Pop the due slot so the
+                # stale due cannot latch lateAfter in the window between
+                # the run finishing and the next slot launching; mirrors
+                # the cluster-slot path's _sla_peer_owns_slot excuse.
                 self._sla_due.pop(job.name, None)
                 return False
             elif job.concurrencyPolicy == "Replace":
-                # over a SNAPSHOT: each cancel awaits (killTimeout), and the
-                # reaper concurrently remove()s finished instances from the
-                # live list; shrinking it mid-iteration would make the
-                # iterator skip the next instance, leaving it running,
-                # unmarked, beside the replacement.
+                # over a SNAPSHOT: the reaper concurrently remove()s from
+                # the live list; shrinking it mid-iteration would skip an
+                # instance, leaving it running beside the replacement.
                 for running_job in list(self.running_jobs[job.name]):
                     # mark before cancelling so the reaper treats the forced
                     # termination as a replacement, not a job failure.
@@ -10774,45 +9465,46 @@ class Cron:
             else:
                 raise AssertionError  # pragma: no cover
         if job.concurrencyScope == "cluster":
-            # the cluster-wide half of Forbid/Replace: a TTL slot lease on
-            # the shared state store excludes instances on OTHER nodes.
-            # Bounded (each store op capped at STATE_OP_TIMEOUT); a foreign
-            # Replace holder is pursued by a background task, never waited
-            # out here on the scheduler path.
+            # cluster-wide half of Forbid/Replace: a TTL slot lease on the
+            # shared store excludes instances on OTHER nodes. Bounded; a
+            # foreign Replace holder is pursued by a background task,
+            # never waited out on the scheduler path.
             if not await self._claim_cluster_slot(job):
                 return False
         logger.info("Starting job %s", job.name)
         retry_state = self.retry_state.get(job.name) if with_retries else None
-        # register this run with the loopback state API (minting its
-        # id + token and staging its secrets) BEFORE the child launches, so the
-        # child's first callback is already authorised. extra_env carries the
-        # endpoint URL/token/run-context the job needs to reach it.
-        run_token, extra_env = await self._prepare_job_api_run(
-            job, retry_state
-        )
-        running_job = RunningJob(
-            job,
-            retry_state,
-            extra_env=extra_env,
-            state_token=run_token,
-            run_id=extra_env.get("CRONSTABLE_RUN_ID"),
-        )
+        run_token: Optional[str] = None
         try:
+            # register with the loopback state API BEFORE the child
+            # launches, so the child's first callback is already
+            # authorised. Inside the try: staging fromFile secrets awaits
+            # the executor, and a cancellation parked there (a client gone
+            # mid-POST) must hand the slot claim back like any failed
+            # spawn. Cancellation cannot strand a registered token: the
+            # await in _prepare_job_api_run precedes register_run.
+            run_token, extra_env = await self._prepare_job_api_run(
+                job, retry_state
+            )
+            running_job = RunningJob(
+                job,
+                retry_state,
+                extra_env=extra_env,
+                state_token=run_token,
+                run_id=extra_env.get("CRONSTABLE_RUN_ID"),
+            )
             # the gate releases before the except arm runs, so cleanup
             # below never holds a spawn permit.
             async with self._spawn_gate:
                 await running_job.start()
         except BaseException:
-            # start() handles the expected spawn failures itself (the
-            # instance still registers, start_failed, and the reaper pairs
-            # the finish); anything escaping here never registers, so the
-            # slot claim above must be handed back or its refcount (and
-            # the lease's renew task) would outlive the launch forever.
+            # start() handles expected spawn failures itself; anything
+            # escaping here never registers, so the slot claim must be
+            # handed back or its refcount (and renew task) would outlive
+            # the launch forever.
             if job.concurrencyScope == "cluster":
                 await self._release_cluster_slot(job)
-            # likewise the job-API run registration: a launch that never
-            # registers is never reaped, so drop its token/secrets here or
-            # they would linger until shutdown.
+            # likewise the job-API registration: a launch that never
+            # registers is never reaped, so drop its token/secrets here.
             if run_token is not None and self._job_api is not None:
                 await self._job_api.finish_run(run_token)
             raise
@@ -10846,19 +9538,12 @@ class Cron:
 
     async def _prepare_job_api_run(
         self, job: JobConfig, retry_state: Optional[JobRetryState]
-    ) -> Tuple[Optional[str], Dict[str, str]]:
+    ) -> tuple[Optional[str], dict[str, str]]:
         """Register this run with the loopback state API; return its env.
 
-        Mints the run id + bearer token, resolves and stages the job's
-        run-scoped ``secrets`` (fresh, in memory), registers the whole
-        :class:`~cronstable.jobapi.RunContext`, and returns
-        ``(token, injected_env)`` so the launcher can hand the env to the child
-        and the reaper can revoke the token by it.  Returns ``(None, {})`` when
-        no job API is running (no ``state`` section, or jobApi disabled), so
-        the classic no-endpoint path is byte-identical.
-
-        Secret staging (including the fromFile executor offload) lives in
-        :func:`cronstable.jobapi.stage_secrets`.
+        Mints the run id + token, stages the job's secrets, registers the
+        RunContext, and returns (token, injected_env). (None, {}) when no
+        job API is running. Secret staging lives in jobapi.stage_secrets.
         """
         api = self._job_api
         if api is None or api.base_url is None:
@@ -10926,12 +9611,10 @@ class Cron:
     async def _acquire_slot_lease(
         self, backend: StateBackend, lease_name: str
     ) -> Optional[Lease]:
-        """``acquire_lease`` for a cluster slot, mapping a timeout OR a raised
-        store error to ``None`` so the caller's read-back-and-policy path
-        decides.  Never raises (bar cancellation): ``_claim_cluster_slot`` runs
-        under the slot service task that ``run()`` awaits OUTSIDE its
-        try/except, so an escaped store error (flock ENOLCK/EIO, ``os.open``
-        EMFILE) would terminate the whole scheduler loop.
+        """``acquire_lease`` for a cluster slot; timeout or store error
+        maps to ``None`` so the caller's read-back-and-policy path
+        decides. Never raises (bar cancellation): an escaped store error
+        here would terminate the whole scheduler loop.
         """
         try:
             return await asyncio.wait_for(
@@ -10952,28 +9635,20 @@ class Cron:
     async def _claim_cluster_slot(self, job: JobConfig) -> bool:
         """Claim the cluster-wide concurrency slot for one launch of ``job``.
 
-        ``True`` means launch (holding the slot lease, or having degraded
-        to node-local enforcement per ``onStoreUnavailable``); ``False``
-        means this launch is skipped (Forbid: a foreign holder; Replace:
-        a background pursuit will re-attempt once the holder yields;
-        fail-closed: the store did not answer).
-
-        The whole claim runs under a per-job asyncio lock, serializing it
-        against the release on the finish path: without it, a release
-        landing between a fresh claim and its instance registration could
-        revoke the new claim's lease (same-holder re-acquire keeps the
-        fence, so the stale release still matches it).
-
-        Honesty contract: at-least-once, not exactly-once.  A holder that
-        loses its lease to a store outage keeps running (never kill work
-        on a store blip), so a Forbid peer that then wins the slot overlaps
-        it; ``degrade`` explicitly trades the cluster gate for availability
-        when the store cannot answer.
+        True means launch (holding the lease, or degraded to node-local
+        per onStoreUnavailable); False means skipped (Forbid: foreign
+        holder; Replace: background pursuit re-attempts; fail-closed:
+        store did not answer). Runs under a per-job lock, serialized
+        against the finish-path release, which could otherwise revoke a
+        fresh claim's lease. Honesty contract: at-least-once, not
+        exactly-once; a holder that loses its lease to a store outage
+        keeps running, and degrade trades the cluster gate for
+        availability.
         """
         backend = self.state_backend
         if not self._state_configured:
-            # unreachable via the parse-time cross-check; test configs that
-            # bypass it just fall back to node-local enforcement.
+            # unreachable via the parse-time cross-check; bypassing test
+            # configs fall back to node-local enforcement.
             return True
         fail_closed = self._state_on_unavailable == "fail-closed"
         name = job.name
@@ -11013,9 +9688,9 @@ class Cron:
             lease_name = self._slot_name(name)
             got = await self._acquire_slot_lease(backend, lease_name)
             if got is None:
-                # denied, sick, or timed out: a bounded read tells a live
-                # foreign holder apart from a store that cannot answer (the
-                # lease API fails closed, so None alone proves nothing).
+                # denied, sick, or timed out: a bounded read tells a
+                # foreign holder apart from a store that cannot answer
+                # (the lease API fails closed; None alone proves nothing).
                 observed: Optional[Lease] = None
                 answered = False
                 try:
@@ -11109,15 +9784,11 @@ class Cron:
     ) -> None:
         """Ask a foreign slot holder to yield, wait, then re-attempt.
 
-        The cancel request is an immutable record aimed at the holder's
-        exact FENCE, so a request left over from a previous incarnation is
-        inert (a takeover always bumps the fence).  The holder's renew task
-        observes it within one renew period and cancels its instances
-        (marked replaced); when the slot frees (release or TTL expiry)
-        the launch goes back through every normal gate.  Bounded: a holder
-        that never yields (still running, or its node is gone but the
-        record write failed) forfeits this launch with a warning: no-run
-        over double-run.
+        The cancel record targets the holder's exact FENCE, so a stale
+        request from a previous incarnation is inert. The holder's renew
+        task observes it within one renew period; the re-launch goes back
+        through every normal gate. Bounded: a holder that never yields
+        forfeits this launch (no-run over double-run).
         """
         backend = self.state_backend
         name = job.name
@@ -11191,15 +9862,12 @@ class Cron:
     async def _slot_renewer(self, name: str) -> None:
         """Keep a held slot lease alive while the job runs here.
 
-        Renews at a third of the TTL, and doubles as the Replace listener:
-        each cycle reads the newest cancel record and, when one targets our
-        exact fence, cancels the local instances (marked replaced, not a
-        failure) so the requesting node can take the slot.  A renew that is
-        positively refused because another node took the lease over logs
-        and stops renewing but NEVER cancels the running work (a store blip
-        must not kill a healthy job); an ambiguous refusal keeps retrying:
-        the store deliberately allows a same-fence renew slightly past
-        expiry, so a single unreadable blip self-heals.
+        Renews at a third of the TTL and doubles as the Replace listener
+        (a cancel record for our exact fence cancels local instances,
+        marked replaced). A positively refused renew stops renewing but
+        NEVER cancels the running work; an ambiguous refusal keeps
+        retrying (same-fence renew slightly past expiry is allowed, so a
+        single blip self-heals).
         """
         period = max(1.0, self._slot_ttl / 3)
         me = asyncio.current_task()
@@ -11247,13 +9915,10 @@ class Cron:
                 continue  # unknown; retry next period
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - a RAISED store error (flock
-                # ENOLCK/EIO on NFS, a mount blip) is exactly as ambiguous as
-                # a timeout: it must NOT kill the renewer task, because a dead
-                # renewer stops renewing silently and the slot lease then
-                # expires under a live holder -> a standby takes it over and
-                # double-fires the very job the slot fences.  Retry next
-                # period, like the timeout and the sibling list/read calls.
+            except Exception:  # noqa: BLE001 - a RAISED store error is as
+                # ambiguous as a timeout and must NOT kill the renewer: a
+                # dead renewer lets the lease expire under a live holder
+                # and a standby double-fires the fenced job. Retry.
                 logger.warning(
                     "Job %s: cluster concurrency slot renewal errored; "
                     "will retry next period",
@@ -11261,20 +9926,14 @@ class Cron:
                 )
                 continue
             if self._slot_renewers.get(name) is not me:
-                # We were retired mid-renew: _release_cluster_slot popped us
-                # from _slot_renewers, popped the lease, and scheduled its
-                # release (or a re-acquire replaced us).  A cancel racing this
-                # exact point does NOT reliably raise: on Python <=3.11
-                # asyncio.wait_for returns the resolved renew result instead of
-                # propagating the CancelledError (`if fut.done(): return
-                # fut.result()`), so the cancel only lands at the next sleep,
-                # after this iteration's tail would otherwise run.  Stand down
-                # now, without touching _slot_leases: re-populating the entry
-                # the release just popped would make _release_slot_lease treat
-                # it as a fresh claim and skip the release (leaking the slot a
-                # whole TTL, its would-be holder spinning); the takeover branch
-                # below could likewise pop a genuine re-claim's lease.  The
-                # finish path owns the release from here.
+                # Retired mid-renew (release or re-acquire replaced us).
+                # A cancel racing this point does NOT reliably raise: on
+                # Python <=3.11 asyncio.wait_for returns the resolved
+                # result instead of propagating CancelledError. Stand down
+                # WITHOUT touching _slot_leases: re-populating the entry
+                # the release just popped would leak the slot a whole TTL,
+                # and the takeover branch below could pop a genuine
+                # re-claim's lease. The finish path owns the release.
                 return
             if renewed is not None:
                 self._slot_leases[name] = renewed
@@ -11308,15 +9967,11 @@ class Cron:
     async def _release_cluster_slot(self, job: JobConfig) -> None:
         """Hand back the slot when a cluster-scoped job's last user is done.
 
-        Refcounted (see ``_slot_refs``): every claim increments, every
-        finished instance decrements, and the lease is released only at
-        zero AND with no registered instances, so a Replace overlap or a
-        claim whose instance is still being spawned cannot lose its lease
-        to a stale release.  The release itself is fire-and-forget; when
-        no lease was recorded (a degraded launch, or an acquire whose
-        timeout abandoned a worker that later landed the write) a phantom
-        check read is made and any lease held by THIS process released, so
-        a phantom cannot block other nodes for a whole TTL.
+        Refcounted (_slot_refs): released only at zero AND with no
+        registered instances, so an overlap or mid-spawn claim cannot
+        lose its lease to a stale release. Fire-and-forget; with no
+        recorded lease a phantom check releases any lease held by THIS
+        process so a phantom cannot block other nodes for a whole TTL.
         """
         name = job.name
         async with self._slot_mutex(name):
@@ -11340,15 +9995,11 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        # Serialized under the per-job slot mutex, like _release_phantom_slot:
-        # this write is scheduled fire-and-forget by _release_cluster_slot, so
-        # a fresh same-holder re-claim can land before it, and a same-holder
-        # re-acquire KEEPS the fence, so this stale release would still match
-        # on disk and revoke the new claim's lease (its renewer spinning, a
-        # peer's Forbid claim then double-running). A fresh claim installs
-        # _slot_leases[name] under this same mutex, so once one is present
-        # this release is stale by definition and stands down; holding the
-        # mutex across the write keeps a claim from interleaving with it.
+        # Serialized under the per-job slot mutex: a same-holder
+        # re-acquire KEEPS the fence, so this stale fire-and-forget
+        # release could otherwise revoke a fresh claim's lease. Once
+        # _slot_leases[name] is present (installed under this mutex) this
+        # release is stale by definition and stands down.
         async with self._slot_mutex(name):
             if self._slot_leases.get(name) is not None:
                 return  # a fresh claim adopted the on-disk lease; keep it
@@ -11370,16 +10021,11 @@ class Cron:
         backend = self.state_backend
         if backend is None:
             return
-        # Serialized under the per-job slot mutex: the phantom read_lease +
-        # release match ONLY on the per-process holder string (a degraded
-        # launch left our token on disk but no local Lease), so without the
-        # mutex a fresh claim that installs a real lease L (same holder,
-        # since the token is process-wide) between this read and its
-        # release would see L released out from under a live run: the
-        # slot freed while we believe we hold it, its renewer spinning,
-        # and a peer's Forbid claim then double-running. A fresh claim
-        # installs _slot_leases[name] under this same mutex, so once one is
-        # present this cleanup is a no-op.
+        # Serialized under the per-job slot mutex: the phantom check
+        # matches only on the process-wide holder string, so without the
+        # mutex it could release a fresh claim's live lease out from
+        # under a run. Once _slot_leases[name] is present this cleanup is
+        # a no-op.
         async with self._slot_mutex(name):
             if self._slot_leases.get(name) is not None:
                 return  # a live claim owns the slot now; not a phantom
@@ -11413,18 +10059,11 @@ class Cron:
     ) -> asyncio.Task:
         """Run an inflight-stream write ordered behind the job's previous one.
 
-        The open and its paired close run on separate worker threads whose
-        filename sort key is each thread's own wall-clock read, so an
-        unordered pair could land filename-inverted (close before open) for
-        a near-instant run and leave "open" newest: a spurious interrupted
-        run on the next restart.  Chaining each job's inflight writes (the
-        same idiom as :meth:`_queue_retry_write`) keeps the stream's order
-        equal to the launch/finish order.
-
-        Takes a factory rather than a coroutine, for the reason
-        :meth:`_install_tail_task` gives: a write shed under overload closes
-        the ordered wrapper, and an eagerly-built inner coroutine would be
-        left neither awaited nor closed.
+        Unordered open/close pairs could land filename-inverted for a
+        near-instant run, leaving "open" newest: a spurious interrupted
+        run on restart. Takes a factory, not a coroutine, per
+        _install_tail_task: a shed write would leave an eager coroutine
+        neither awaited nor closed.
         """
         return self._install_tail_task(
             self._inflight_write_tail,
@@ -11452,9 +10091,8 @@ class Cron:
         }
         stream = self._inflight_stream(job.name)
         try:
-            # Bounded like every other store op: a wedged mount times the
-            # write out (caught below) instead of hanging this tracked task
-            # forever, which would pile up in _pending_state_writes.
+            # Bounded: a wedged mount must not hang this tracked task and
+            # pile up _pending_state_writes.
             await asyncio.wait_for(
                 backend.append_record(
                     stream, record, prune_keep=INFLIGHT_STREAM_KEEP
@@ -11502,27 +10140,18 @@ class Cron:
 
     async def _bounded_boot_scan(
         self,
-        items: List[Tuple[str, JobConfig]],
+        items: list[tuple[str, JobConfig]],
         step: Callable[[str, JobConfig], Awaitable[Optional[str]]],
         timeout_message: str,
     ) -> int:
         """Run ``step`` over ``items`` behind a small bounded worker pool.
 
-        The ONE implementation of the bounded boot-scan worker pool, which
-        used to be pasted three times (the history warm-up, the in-flight
-        reconciliation and the retry re-arm).  A small worker pool over one
-        shared item iterator, not a task per item: ``next()`` on the shared
-        iterator is synchronous, so the workers partition the items
-        race-free and each item is drawn exactly once, while a task per
-        item would only materialise coroutines that queue on the store's
-        16-slot bulk lane anyway.  ``step`` returns ``"timeout"`` to
-        abandon the pass (a store that cannot serve one read in
-        STATE_OP_TIMEOUT is unhealthy, and stalling boot for items x
-        timeout helps nobody): ``timeout_message`` is logged ONCE, by
-        whichever worker reports first with its item's name interpolated,
-        and every other worker breaks at its next loop top while one
-        mid-await finishes its current item.  ``"counted"`` adds one to
-        the returned tally; ``None`` counts nothing.
+        The one boot-scan pool (history warm-up, in-flight
+        reconciliation, retry re-arm). Workers share one iterator
+        (next() is synchronous, so items partition race-free). ``step``
+        returns "timeout" to abandon the whole pass (timeout_message
+        logged once, with the item name interpolated); "counted" adds to
+        the returned tally; None counts nothing.
         """
         it = iter(items)
         aborted = False
@@ -11533,7 +10162,23 @@ class Cron:
             for name, job in it:
                 if aborted:
                     break
-                outcome = await step(name, job)
+                try:
+                    outcome = await step(name, job)
+                except asyncio.CancelledError:
+                    raise  # shutdown still unwinds the scan
+                except Exception:  # noqa: BLE001 - degrade, never crash
+                    # gather() without return_exceptions hands the first
+                    # exception to the awaiter but does NOT cancel the
+                    # siblings, so an unexpected error here used to abort
+                    # the boot tail (dag reconcile, retry re-arm, the job
+                    # API start) while the other workers kept mutating
+                    # scheduler state behind it. One bad job degrades to a
+                    # logged skip, like the per-job arms inside the steps;
+                    # a sick STORE is the separate "timeout" verdict.
+                    logger.exception(
+                        "boot scan: job %s failed; skipping it", name
+                    )
+                    continue
                 if outcome == "timeout":
                     if not aborted:
                         aborted = True
@@ -11549,30 +10194,14 @@ class Cron:
     async def _reconcile_inflight(self) -> None:
         """Close runs the PREVIOUS daemon on this host left in flight.
 
-        Runs once per rehydration (after the ledger warm, before the retry
-        re-arm).  An ``open`` record from this host whose writing process
-        is gone means the run died with (or after) that daemon: it is made
-        visible as an ``unknown``-outcome ledger row instead of silently
-        vanishing.  Three guards keep live runs safe: a record written by
-        THIS process (a state-section reload rebuilt the backend under a
-        live run) is skipped; live local instances outrank the ledger; and
-        a recorded pid that still exists is left alone: a daemon crash
-        does not kill the job processes it spawned.
-
-        Reads run :data:`_REHYDRATE_CONCURRENCY` jobs at a time, the same
-        bounded worker pool as the history warm-up before it and the retry
-        re-arm after it, and for the same reason: this pass sits on the boot
-        path between them, so one strictly sequential read per job made boot
-        delay scale with job count.  The pool is safe here because every
-        per-job step is independent: the read touches only that job's own
-        in-flight stream, and the reconciliation it may trigger is
-        synchronous (:meth:`_reconcile_open_record`, no await inside) and
-        writes only that job's own keys, so no two workers can interleave on
-        one stream or on shared scheduler state.  Per-job write ORDER is
-        preserved too: the ``closed`` record still goes through
-        :meth:`_queue_inflight_write`, whose tail chain is per job.  The pool
-        does change the order in which DIFFERENT jobs are reconciled, which
-        nothing downstream depends on.
+        Runs once per rehydration (after the ledger warm, before the
+        retry re-arm): an ``open`` record from this host whose writing
+        process is gone becomes an ``unknown``-outcome ledger row. Three
+        guards keep live runs safe: a record by THIS process is skipped,
+        live local instances outrank the ledger, and a recorded pid that
+        still exists is left alone. Uses the bounded boot-scan pool; safe
+        because each per-job step touches only its own stream/keys and
+        per-job write order still goes through _queue_inflight_write.
         """
         backend = self.state_backend
         if backend is None:
@@ -11672,13 +10301,10 @@ class Cron:
         if rec is None or rec.get("kind") != "open":
             return
         if rec.get("host") == self._state_host:
-            # a same-host orphan (a previous daemon on this host): our own
-            # live run is never reconciled, and, exactly as the
-            # rehydration path does, a recorded pid that is still alive
-            # means the job process outlived its daemon (a crash does not
-            # kill spawned children), so the run is NOT interrupted. Only a
-            # genuinely foreign host's record is judged purely by fence
-            # supersession (its pid names another machine).
+            # same-host orphan: our own live run is never reconciled, and
+            # a still-alive recorded pid means the job outlived its daemon
+            # (NOT interrupted). Only a foreign host's record is judged
+            # purely by fence supersession (its pid names another machine).
             if rec.get("proc") == self._proc_token:
                 return  # our own live run
             pid = rec.get("pid")
@@ -11701,24 +10327,17 @@ class Cron:
         self,
         name: str,
         job: Optional[JobConfig],
-        rec: Dict[str, Any],
+        rec: dict[str, Any],
         reason: str,
     ) -> None:
         """Close an orphaned ``open`` record and make the run visible.
 
-        Appends a ``closed`` record (so the orphan is not re-reconciled)
-        and a synthetic ``unknown``-outcome ledger row.  ``unknown`` is a
-        non-verdict everywhere (onlyIfLastSucceeded, success-rate,
-        superseded-by-run all ignore it) and the row carries no
-        ``started_at`` so it cannot skew duration statistics.
-
-        The catch-up watermark is policy-aware: for the default
-        ``onMissed: skip`` the row carries ``finished_at`` (the run's start
-        instant, so the watermark advances over exactly the interrupted
-        slot); under ``run-once``/``run-all`` it carries the instant as
-        ``interruptedAt`` instead, leaving the durable watermark untouched
-        so the interrupted occurrence is still owed to catch-up: crash
-        recovery must not silently downgrade those jobs to at-most-once.
+        Appends a ``closed`` record and a synthetic ``unknown``-outcome
+        ledger row (a non-verdict everywhere; no started_at, so no skewed
+        durations). Policy-aware watermark: onMissed: skip carries
+        finished_at (watermark advances over the interrupted slot);
+        run-once/run-all carry interruptedAt instead so the occurrence
+        stays owed to catch-up.
         """
         started_iso = rec.get("startedAt")
         if not isinstance(started_iso, str):
@@ -11728,7 +10347,7 @@ class Cron:
             "started at {} on {} (daemon crash, or the node lost access "
             "to the state store mid-run)".format(started_iso, rec.get("host"))
         )
-        data: Dict[str, Any] = {
+        data: dict[str, Any] = {
             "outcome": "unknown",
             "exit_code": None,
             "started_at": None,
@@ -11778,7 +10397,7 @@ class Cron:
         )
 
     async def _persist_reconciled_record(
-        self, name: str, data: Dict[str, Any]
+        self, name: str, data: dict[str, Any]
     ) -> None:
         backend = self.state_backend
         if backend is None:
@@ -11804,14 +10423,11 @@ class Cron:
     # continually watches for the running jobs, clean them up when they exit
     async def _wait_for_running_jobs(self) -> None:
         # job -> wait task
-        wait_tasks = {}  # type: Dict[RunningJob, asyncio.Task]
-        # the standing wait on _jobs_running that sits in the busy branch's
-        # wait set below, so a launch or the shutdown signal (both set the
-        # event) wakes the reaper immediately. Fully event-driven: with it in
-        # the set there is nothing left for the old 1-second poll timeout to
-        # notice, so a daemon with one long-running job no longer wakes ~86k
-        # times a day just to re-count its running set.
-        event_wait = None  # type: Optional[asyncio.Task]
+        wait_tasks: dict[RunningJob, asyncio.Task] = {}
+        # standing wait on _jobs_running in the busy branch's wait set: a
+        # launch or the shutdown signal wakes the reaper immediately, so
+        # the loop is fully event-driven (no poll timeout).
+        event_wait: asyncio.Task | None = None
         try:
             while self.running_jobs or not self._stop_event.is_set():
                 try:
@@ -11822,11 +10438,8 @@ class Cron:
                                     job.wait()
                                 )
                     if not wait_tasks:
-                        # Nothing running: block until a job launches or
-                        # shutdown is signalled rather than polling. This is
-                        # the scheduler's most frequent idle wakeup, and the
-                        # loop condition can only change on those two events,
-                        # so a plain wait loses no liveness.
+                        # Nothing running: block until a launch or shutdown
+                        # (the only events that change the loop condition).
                         await self._jobs_running.wait()
                         continue
                     # Every job now running has its wait task registered
@@ -11863,37 +10476,22 @@ class Cron:
                                 raise
                             except Exception:
                                 # Per-job, so one job's failure to finish
-                                # (e.g. the state backend 503ing out of
-                                # _job_api.finish_run) does not skip the
-                                # remaining jobs in this batch. No
-                                # `pragma: no cover` unlike its siblings
-                                # below: this arm has a test
-                                # (test_reaper_finishes_whole_batch_when_
-                                # one_job_raises), so let the coverage gate
-                                # notice if it stops being reached.
+                                # does not skip the rest of the batch. No
+                                # pragma: this arm is covered by
+                                # test_reaper_finishes_whole_batch_when_
+                                # one_job_raises.
                                 logger.exception(
                                     "Unexpected error finishing job %s; "
                                     "please report this as a bug (6)",
                                     job.config.name,
                                 )
                     finally:
-                        # Record all DAG-task completions buffered while
-                        # handling this batch in one RMW per run (a mapped
-                        # fan-out finishing together no longer pays a full
-                        # document write+fsync per task). No-op when no DAG
-                        # tasks finished.
-                        #
-                        # In a finally: the buffer holds completions from jobs
-                        # ALREADY handled in this batch, so letting an
-                        # exception from a later job skip the flush would
-                        # strand their dag_run entries as RUNNING until some
-                        # unrelated job completes and reaches the next flush
-                        # (indefinitely, if none does: nothing else drains
-                        # this buffer; _retry_completions only sees
-                        # _pending_completions, which flush_completions
-                        # populates from its own except arm). Batching is what
-                        # made this cross-job: pre-batching each completion
-                        # wrote itself.
+                        # Flush buffered DAG-task completions in one RMW
+                        # per run. In a finally: the buffer holds
+                        # completions from jobs ALREADY handled, and
+                        # nothing else drains it, so skipping the flush on
+                        # a later job's exception would strand their
+                        # dag_run entries as RUNNING indefinitely.
                         await self._dag.flush_completions()
                 except asyncio.CancelledError:
                     raise
@@ -11908,11 +10506,9 @@ class Cron:
         """Register a launched instance; the ONE writer adding to
         ``running_jobs``.
 
-        Every launch (scheduled job and DAG task alike) funnels through
-        here so the memo bust can never be forgotten: the payload's
-        ``running`` flag must flip on the next poll instead of aging out
-        by TTL, the same discipline dagrun's ``_mutate`` applies to its
-        summary memo.  The source-shape test pins the funnel.
+        Every launch funnels through here so the memo bust cannot be
+        forgotten (running must flip on the next poll, not age out by
+        TTL). The source-shape test pins the funnel.
         """
         # returns True when this is the job's first live instance
         name = running_job.config.name
@@ -11942,6 +10538,14 @@ class Cron:
             try:
                 jobs_list.remove(running_job)
             except ValueError:  # pragma: no cover - defensive
+                # already reaped, but still drop an emptied key: a phantom
+                # empty list keeps running_jobs truthy with nothing to
+                # reap, which spins the reaper at shutdown (the hazard
+                # _launch_job_locked's own .get() comment names). The
+                # pre-refactor copy of this arm fell through to the same
+                # cleanup.
+                if not jobs_list:
+                    del self.running_jobs[name]
                 return False
         else:
             jobs_list = self.running_jobs[name]
@@ -11956,13 +10560,10 @@ class Cron:
         """Record one finished-run row; the ONE writer of ``run_history``
         and ``last_run``.
 
-        Every recording path (the reaper via ``_record_run``, boot
-        reconciliation, the ledger warm-up) funnels through here so the
-        memo bust can never be forgotten: the shared /jobs product folds
-        over last_run and the history slice, and a row that does not bust
-        would serve stale out to the TTL, the same discipline dagrun's
-        ``_mutate`` applies to its summary memo.  The source-shape test
-        pins the funnel.
+        Every recording path funnels through here so the memo bust
+        cannot be forgotten (the shared /jobs product folds over
+        last_run and the history slice). The source-shape test pins the
+        funnel.
         """
         self.run_history[name].append(info)
         self.last_run[name] = info
@@ -11985,36 +10586,24 @@ class Cron:
         # recorded success moves it, whatever path ran the job.
         if info.outcome == "success" and info.finished_at is not None:
             self._sla_last_success[name] = info.finished_at
-        # the onlyIfLastSucceeded gate's eviction-proof memo (see
-        # _depends_on_past_ok). run_history is a bounded ring, so a long
-        # pause (one synthetic "skipped" row per held slot) can push the
-        # last real outcome out of it and reopen a gate that a failure had
-        # correctly closed. This keeps the newest real outcome regardless of
-        # how many non-run rows follow it.
+        # onlyIfLastSucceeded's eviction-proof memo (_depends_on_past_ok):
+        # a long pause's synthetic rows can push the last real outcome out
+        # of the bounded ring and reopen a gate a failure had closed.
         if info.outcome in ("success", "failure") and (
             info.finished_at is not None
         ):
             self._last_real_outcome[name] = (info.finished_at, info.outcome)
-        # the retry ladder's superseded-by-run watermark (see
-        # _validate_pending_retry). Every outcome but "skipped" counts: a
-        # cancelled or crash-reconciled run still resolved the attempt,
-        # while a pause-held slot ran nothing and must not settle a ladder
-        # that is only waiting for the resume.
+        # retry ladder's superseded-by-run watermark
+        # (_validate_pending_retry). Every outcome but "skipped" counts:
+        # a pause-held slot ran nothing and must not settle a ladder.
         if info.outcome != "skipped" and info.finished_at is not None:
             self._last_completed_at[name] = info.finished_at
-        # and, when a durable state backend is configured, persist the run to
-        # the ledger so history/last-run survive a restart. Fire-and-forget: a
-        # slow store must never stall run handling, so the write is a tracked
-        # background task rather than an await here (this method is sync and on
-        # the finished-job path). No-op on the stateless default.
+        # persist the run to the ledger (fire-and-forget: a slow store
+        # must never stall run handling). No-op on the stateless default.
         if self.state_backend is not None:
-            # The archive's line snapshot is taken HERE, synchronously, not
-            # inside the persist task: the task body runs after an arbitrary
-            # store latency, and by then a back-to-back completion (an Allow
-            # concurrency overlap, a sub-minute job outrunning a slow mount)
-            # can have superseded this record and released its ring below.
-            # A list of the ring's line tuples pins exactly the bytes the
-            # archive still needs, for exactly as long as it needs them.
+            # The archive's line snapshot is taken HERE, synchronously: a
+            # back-to-back completion can supersede this record and
+            # release its ring before the persist task body runs.
             job = self.cron_jobs.get(name)
             archive_lines = (
                 list(info.output.lines)
@@ -12024,15 +10613,10 @@ class Cron:
             self._track_state_write(
                 self._persist_run_record(name, info, archive_lines)
             )
-        # Release the superseded record's ring buffer. Only the NEWEST
-        # finished run's output is ever replayable (_job_output serves
-        # last_run or a live instance), so the ring `prev` carries became
-        # unreachable the moment `info` replaced it, yet it would sit in
-        # run_history for up to RUN_HISTORY_LIMIT more completions. At the
-        # ring's own bounds that is up to 50x LIVE_LOG_LIMIT retained lines
-        # per job, gigabytes fleet-wide for chatty jobs, all unservable.
-        # The identity guards keep odd construction shapes safe (a re-record
-        # of the same info, or two records sharing one stream).
+        # Release the superseded record's ring buffer: only the NEWEST
+        # finished run's output is replayable, yet `prev`'s ring would
+        # otherwise sit in run_history for many more completions. The
+        # identity guards keep odd construction shapes safe.
         if (
             prev is not None
             and prev is not info
@@ -12073,32 +10657,24 @@ class Cron:
         self,
         name: str,
         info: JobRunInfo,
-        archive_lines: Optional[List[Tuple[str, str]]] = None,
+        archive_lines: Optional[list[tuple[str, str]]] = None,
     ) -> None:
         """Append one finished run to the durable ledger, prune, and archive.
 
-        Runs as a background task (see :meth:`_record_run`).  Errors are logged
-        and swallowed: a durability failure must never break job handling, and
-        an unhandled exception in a fire-and-forget task would otherwise show
-        as a noisy "task exception was never retrieved".  Pruning right after
-        the append bounds the stream where it just grew, avoiding a per-minute
-        fleet-wide scan.  When the job opts into ``archiveOutput`` the run's
-        captured output is archived too, in the same task, from
-        ``archive_lines``: the ring snapshot :meth:`_record_run` took at
-        record time.  The ring itself must not be read here, because the
-        record may have been superseded (and its ring released) while this
-        task waited on the store; ``None`` means the job did not archive at
-        record time, and a reload that flipped ``archiveOutput`` on since
-        then must not archive a ring this run never snapshotted.
+        Background task; errors are logged and swallowed (durability
+        failures must never break job handling). Archives from
+        ``archive_lines``, the record-time ring snapshot, never the live
+        ring (it may have been released by a newer completion); None
+        means the job did not archive at record time and a later
+        archiveOutput flip must not archive an unsnapshotted ring.
         """
         backend = self.state_backend
         if backend is None:  # torn down between scheduling and running
             return
         stream = self._run_stream(name)
         try:
-            # include_series: the ledger is what rehydrates the resource
-            # charts after a restart. Bounded per record by the job's
-            # monitorResources.history, per stream by the folded prune.
+            # include_series: the ledger rehydrates the resource charts
+            # after a restart; bounded per record and per stream.
             await asyncio.wait_for(
                 backend.append_record(
                     stream,
@@ -12123,9 +10699,8 @@ class Cron:
             logger.warning(
                 "state: failed to persist run record for %s: %s", name, ex
             )
-        # piggyback the (throttled) durable counter snapshot on the same
-        # background task: one finished run is also the moment the counters
-        # changed. Has its own error handling.
+        # piggyback the throttled counter snapshot: a finished run is the
+        # moment the counters changed. Has its own error handling.
         await self._persist_counter_snapshot(throttled=True)
 
     async def _persist_counter_snapshot(
@@ -12133,16 +10708,12 @@ class Cron:
     ) -> None:
         """Append a durable snapshot of the Prometheus counter accumulators.
 
-        Host-scoped stream (each node's counters are its own truth); pruned
-        to a handful, newest wins on rehydration.  ``throttled`` skips the
-        write when one landed within COUNTER_SNAPSHOT_INTERVAL, so a busy
-        job cannot double every durable write; the shutdown path writes one
-        final unthrottled snapshot.  Lossy by design: a crash forfeits at
-        most the events since the last snapshot, which Prometheus reads as
-        a small, ordinary counter reset.  Gated on ``_counters_seeded``: a
-        run finishing in the window between the backend coming up and the
-        seed attempt must not write a snapshot the seed would then read
-        back, ingesting this process's own events twice.
+        Host-scoped stream; newest wins on rehydration. ``throttled``
+        skips the write within COUNTER_SNAPSHOT_INTERVAL; shutdown writes
+        one final unthrottled snapshot. Lossy by design (a crash reads as
+        an ordinary counter reset). Gated on _counters_seeded so the seed
+        can never read back a snapshot this process wrote and
+        double-count.
         """
         backend = self.state_backend
         if backend is None or not self._counters_seeded:
@@ -12172,28 +10743,16 @@ class Cron:
         self,
         job: JobConfig,
         info: JobRunInfo,
-        raw: List[Tuple[str, str]],
+        raw: list[tuple[str, str]],
     ) -> None:
         """Write a finished run's captured output to the durable log store.
 
-        Opt-in per job (``archiveOutput``).  What is archived is ``raw``,
-        the record-time snapshot of the run's live-tail ring buffer: the
-        newest :data:`cronstable.job.LIVE_LOG_LIMIT`
-        lines (each already bounded by ``maxLineLength``); older lines were
-        evicted from the ring before archiving and are accounted for in the
-        record's ``dropped_lines`` rather than silently lost.  The snapshot
-        (not the live ring) is what gets archived because the ring may
-        already have been released by a newer completion of the same job by
-        the time this write runs; ``info.output.published`` is still safe to
-        read late, since nothing publishes to a closed stream.  A job with
-        ``saveLimit: 0`` (the operator's explicit "retain no output") archives
-        nothing.  The lines are scrubbed of recognisable secrets
-        (:func:`cronstable.redact.redact_lines`, which also tracks multi-line
-        PEM private-key blocks) unless the job set
-        ``redactArchivedSecrets: false``, then written as one immutable record
-        linked to the run by its ``finished_at``.  Encryption-at-rest is the
-        mount's job (an encrypted volume, EFS/S3 server-side encryption);
-        this only redacts.  Pruned to the same per-job bound as the ledger.
+        Opt-in per job (archiveOutput). Archives ``raw``, the record-time
+        ring snapshot (evicted lines are counted in dropped_lines).
+        saveLimit: 0 archives nothing. Lines are scrubbed via
+        redact.redact_lines unless redactArchivedSecrets: false;
+        encryption-at-rest is the mount's job, this only redacts. Pruned
+        to the same per-job bound as the ledger.
         """
         backend = self.state_backend
         if backend is None:
@@ -12202,12 +10761,10 @@ class Cron:
             return
         redact = job.redactArchivedSecrets
         if redact:
-            # Executor-offloaded: the scrub is pure CPU over job-controlled
-            # text (up to LIVE_LOG_LIMIT lines of maxLineLength each), and a
-            # pathological line must degrade THIS archive write, not stall
-            # job dispatch, the web server and cluster heartbeats.  The
-            # patterns themselves are kept linear (see cronstable.redact),
-            # so this is defence in depth against a future regex regression.
+            # Executor-offloaded: a pathological line must degrade THIS
+            # archive write, not stall dispatch/web/heartbeats. Patterns
+            # are linear (see cronstable.redact); this is defence in
+            # depth.
             texts = await asyncio.get_running_loop().run_in_executor(
                 None, redact_lines, [line for _stream, line in raw]
             )
@@ -12226,8 +10783,7 @@ class Cron:
             "lines": lines,
         }
         stream = self._log_stream(job.name)
-        # Bounded; the caller (_persist_run_record) catches a timeout as a
-        # dropped write rather than letting a wedged mount hang the task.
+        # Bounded; the caller catches a timeout as a dropped write.
         await asyncio.wait_for(
             backend.append_record(
                 stream,
@@ -12244,18 +10800,12 @@ class Cron:
     ) -> None:
         """Find the staleness reference outside the warmed history window.
 
-        The rehydrate warms RUN_HISTORY_LIMIT records; a job failing more
-        often than that since its last success has no success among them,
-        and leaving the reference unset re-baselines maxTimeSinceSuccess
-        on process start, so every restart buys a genuinely stale job
-        another silent threshold.  Re-read the stream once, deeper (the
-        ledger usually still holds the success: maxRunsPerJob defaults an
-        order of magnitude above the warm window), and failing that fall
-        back to the OLDEST record seen by either read.  Every record seen
-        is a non-success, so the true last success is at or before it: a
-        lower bound on staleness, which can only page later than the
-        truth, never earlier.  Only jobs configuring the check reach here,
-        so nothing else pays for the extra read.
+        A job failing more often than RUN_HISTORY_LIMIT since its last
+        success has no success in the warmed window, and an unset
+        reference re-baselines maxTimeSinceSuccess every restart. Re-read
+        deeper once; failing that fall back to the OLDEST record seen (a
+        lower bound on staleness: pages later than the truth, never
+        earlier). Only jobs configuring the check reach here.
         """
         backend = self.state_backend
         seen = [r.finished_at for r in history if r.finished_at is not None]
@@ -12298,18 +10848,12 @@ class Cron:
     ) -> None:
         """Warm the maxTimeSinceSuccess staleness reference from ``history``.
 
-        Split out of the rehydrate warm-up so the two early-continue guards
-        (a job that already carries in-memory history, or one that finished a
-        run while the read awaited) still seed the reference before skipping
-        the rest of the warm-up. Without it, a job that FAILED during a state
-        outage (non-empty run_history by the time the store finally comes
-        up) would skip seeding, and _sla_stale_reference would re-baseline
-        it on process start: exactly the silent threshold the deep re-read
-        exists to prevent, one guard higher. By finished_at, not by position:
-        record filenames order on WRITE time and run-record writes are
-        unserialized, so the last-APPENDED success can be older than one
-        appended before it. setdefault throughout, so a live success recorded
-        by _record_run while an await yielded is never clobbered.
+        Split out so the warm-up's early-continue guards still seed the
+        reference (a job that only FAILED during a state outage must not
+        re-baseline on process start). By finished_at, not position:
+        run-record writes are unserialized, so the last-APPENDED success
+        can be older than one appended before it. setdefault throughout,
+        so a live success recorded mid-await is never clobbered.
         """
         history = list(history)
         successes = [
@@ -12331,17 +10875,11 @@ class Cron:
     async def _rehydrate_from_state(self) -> None:
         """Warm the in-memory history from the durable ledger, once, on boot.
 
-        After the backend first starts, load each job's newest records back
-        into ``last_run`` and ``run_history`` so ``/status``, ``/jobs`` and the
-        dashboard (latest status, sparkline, success-rate stats) are correct
-        from the first scrape after a restart instead of blank until the job
-        next runs.  Bypasses :meth:`_record_run` deliberately: rehydration must
-        not re-emit Prometheus counters or re-persist what it just read.  A
-        poison record is skipped by :func:`_job_run_info_from_dict` (and
-        quarantined by the backend), never fatal to startup.  Reads run
-        :data:`_REHYDRATE_CONCURRENCY` jobs at a time: the warm-up sits
-        between backend start and the first scheduling pass, so its wall
-        clock is boot delay, and every per-job read is independent.
+        Loads each job's newest records into last_run/run_history so the
+        status surfaces are correct from the first scrape. Bypasses
+        _record_run deliberately: rehydration must not re-emit counters
+        or re-persist what it just read. Poison records are skipped,
+        never fatal. Reads via the bounded boot-scan pool.
         """
         backend = self.state_backend
         if backend is None or self._state_rehydrated:
@@ -12349,11 +10887,9 @@ class Cron:
         self._state_rehydrated = True
 
         async def _warm_one(name: str, _job: JobConfig) -> Optional[str]:
-            # a job that already accumulated in-memory history this process
-            # (unusual at boot) is left as the live source of truth, but the
-            # staleness reference is still seeded from that history, so a job
-            # that only FAILED during a state outage does not re-baseline
-            # maxTimeSinceSuccess on process start when the store returns.
+            # existing in-memory history stays the source of truth, but
+            # the staleness reference is still seeded from it (a job that
+            # only FAILED during a state outage must not re-baseline).
             if self.run_history.get(name):
                 await self._seed_stale_reference(name, self.run_history[name])
                 return None
@@ -12367,8 +10903,8 @@ class Cron:
                     timeout=STATE_OP_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                # abandoning the warm-up costs little: the dashboard fills
-                # in as jobs run, exactly as with no rehydration.
+                # abandoning the warm-up costs little: the dashboard
+                # fills in as jobs run.
                 return "timeout"
             except OSError as ex:
                 logger.warning(
@@ -12376,12 +10912,9 @@ class Cron:
                 )
                 return None
             if self.run_history.get(name):
-                # a run finished while we awaited the read (the await above
-                # yields): the live run is fresher than anything in the
-                # ledger snapshot; appending the old records after it would
-                # regress last_run and scramble the history's order. The
-                # staleness reference is still seeded from that live history
-                # (setdefault, so a fresher live success is never clobbered).
+                # a run finished while we awaited the read: the live run
+                # is fresher; appending old records would regress
+                # last_run and scramble history order.
                 await self._seed_stale_reference(name, self.run_history[name])
                 return None
             recs.reverse()  # oldest-first, to match the append order
@@ -12393,20 +10926,14 @@ class Cron:
             if not history:
                 return None
             # warm the staleness reference too: with a durable ledger
-            # the maxTimeSinceSuccess check must page from the REAL last
-            # success after a restart, not re-baseline on process start
-            # (that grace is only for stateless boots). Shared with the
-            # two early-continue guards above, so a job with pre-existing
-            # in-memory history is seeded the same way.
+            # maxTimeSinceSuccess must page from the REAL last success,
+            # not re-baseline on process start.
             await self._seed_stale_reference(name, history)
-            # and the onlyIfLastSucceeded memo, for the same reason the
-            # gate keeps one: a pause running across the restart would
-            # otherwise leave the warmed ring full of "skipped" rows
-            # with no real outcome behind them. By finished_at, not by
-            # position (the same unserialized-write hazard as the success
-            # scan above): seeding the last-APPENDED real outcome could
-            # pick an older success over a newer failure and reopen the
-            # very gate this memo exists to hold.
+            # and the onlyIfLastSucceeded memo: a pause across the
+            # restart can fill the warmed ring with "skipped" rows. By
+            # finished_at, not position (unserialized writes): the
+            # last-APPENDED real outcome could pick an older success
+            # over a newer failure and reopen the gate.
             reals = [
                 r
                 for r in history
@@ -12418,11 +10945,9 @@ class Cron:
                 self._last_real_outcome.setdefault(
                     name, (newest.finished_at, newest.outcome)
                 )
-            # and the retry ladder's supersede watermark: last_run is
-            # history[-1], which a pause running across the restart
-            # makes a "skipped" row with a fresh finished_at. Reading
-            # the ladder's guard off that row would settle every
-            # pending retry the pause is merely holding.
+            # and the retry ladder's supersede watermark: a pause across
+            # the restart makes history[-1] a "skipped" row whose fresh
+            # finished_at would settle every pending retry.
             for restored in reversed(history):
                 if (
                     restored.outcome != "skipped"
@@ -12453,26 +10978,19 @@ class Cron:
         # loop must defer on a durable pause from its very first check.
         await self._refresh_pauses_from_store()
         await self._rehydrate_retries()
-        # adopt and reconcile this node's active DAG runs from durable
-        # state (the DAG analogue of _reconcile_inflight): a run whose per-task
-        # state shows a task interrupted by the crash is resumed from that
-        # state, never from memory.
+        # adopt this node's active DAG runs from durable state (the DAG
+        # analogue of _reconcile_inflight); resumed from that state,
+        # never from memory.
         await self._dag.reconcile_on_boot()
 
     async def _rehydrate_counters(self) -> None:
         """Seed the Prometheus accumulators from the newest durable snapshot.
 
-        Attempted at most ONCE per process (never per backend generation):
-        seeding ADDS into the live accumulators (pre-restart and
-        post-restart events are disjoint), so seeding twice (or, worse,
-        seeding from a snapshot THIS process already wrote) would
-        double-count.  The latch is therefore set BEFORE the read: it also
-        gates :meth:`_persist_counter_snapshot`, so no snapshot of this
-        process's own counters can exist in the store until the one seed
-        attempt has finished.  A store unreadable at that instant simply
-        forfeits the seed (no retry on a later backend start), which the
-        lossy-durable contract allows: counters resume from zero, an
-        ordinary counter reset to Prometheus.
+        At most ONCE per process: seeding ADDS, so seeding twice (or from
+        a snapshot THIS process wrote) would double-count. The latch is
+        set BEFORE the read and also gates _persist_counter_snapshot. An
+        unreadable store forfeits the seed (an ordinary counter reset to
+        Prometheus).
         """
         backend = self.state_backend
         if backend is None or self._counters_seeded:
@@ -12507,36 +11025,17 @@ class Cron:
     async def _rehydrate_retries(self) -> None:
         """Re-arm pending durable retries after a restart.
 
-        The restart-surviving half of the retry ladder: a ``pending`` record
-        on top of a job's retry stream is a retry the previous process armed
-        but never resolved.  ABSOLUTE-deadline re-arming: the record's
-        ``notBefore`` is an instant, so the re-armed task sleeps only the
-        remaining time (zero when the deadline passed while the daemon was
-        down).  Invalidation is by PER-JOB config digest
-        (:func:`cronstable.fingerprint.job_digest`): stricter than whole-set
-        job-set-id invalidation, which would drop every pending retry
-        whenever ANY job changed, while a digest mismatch means THIS job's
-        behaviour-affecting config changed and its old ladder must not run
-        the new definition.  Every ambiguous case settles the ladder (no
-        re-arm): with live asyncio ladders, cluster gates, and @reboot
-        keep-alives in play, the wrong move here is a double-run, and
-        no-run-on-ambiguity is the documented bias.  For an ``@reboot`` job
-        the pending retry is re-armed only when the boot marker proves the
-        boot run already happened THIS boot (the keep-alive-continuity
-        case); when the job will fire fresh at this startup pass, the fresh
-        boot run supersedes the stale ladder.  The re-armed task is the
-        ordinary :meth:`schedule_retry_job`, so cluster-gate re-checks,
-        job-vanished cleanup, and shutdown behaviour are identical to a
-        never-restarted ladder.
-
-        Two more guards keep shared and unlucky stores honest: a pending
-        record written by ANOTHER host is that host's live business and is
-        neither re-armed nor settled here; and a pending record older than
-        the job's newest KNOWN run (the history warmed just above, plus
-        anything recorded in-memory) is settled as superseded: the ladder
-        demonstrably resolved somehow (perhaps while the store was down and
-        the settle write was dropped), and re-running it would be the exact
-        double-run this method promises to avoid.
+        ABSOLUTE-deadline re-arming: notBefore is an instant, so the
+        re-armed task sleeps only the remaining time. Invalidation is by
+        PER-JOB config digest (job_digest), not job-set id. Every
+        ambiguous case settles the ladder: no-run-on-ambiguity is the
+        documented bias. An @reboot ladder re-arms only when the boot
+        marker proves this boot already ran (a fresh boot run supersedes
+        the stale ladder). Foreign-host pending records are neither
+        re-armed nor settled; a record older than the newest KNOWN run is
+        settled as superseded. Re-armed via the ordinary
+        schedule_retry_job, so gate re-checks and shutdown behave as for
+        a never-restarted ladder.
         """
         backend = self.state_backend
         if backend is None:
@@ -12551,12 +11050,10 @@ class Cron:
     async def _rearm_pending_retry(
         self, name: str, job: JobConfig
     ) -> Optional[str]:
-        """One job's step of the retry re-arm scan (see the caller above).
+        """One job's step of the retry re-arm scan (see the caller).
 
-        Returns ``"timeout"`` when the ledger read timed out, which tells
-        the scan's worker pool to abandon the rest (a store that cannot
-        serve one read in STATE_OP_TIMEOUT is unhealthy); ``None`` in every
-        other case, re-armed or settled or skipped alike.
+        "timeout" abandons the rest of the pass; None in every other
+        case, re-armed or settled or skipped alike.
         """
         backend = self.state_backend
         if backend is None:
@@ -12586,24 +11083,15 @@ class Cron:
         rec_host = rec.get("host")
         if isinstance(rec_host, str) and rec_host != self._state_host:
             # another node's live ladder (shared store): not ours to
-            # re-arm OR settle. Cross-node retry resume is a later
-            # phase's leased, reconciled affair.
+            # re-arm OR settle.
             return None
         if name not in self._last_completed_at:
-            # The warmed ring (_rehydrate_from_state, above) is capped at
-            # RUN_HISTORY_LIMIT, so a pause holding at least that many
-            # slots fills every ring entry with "skipped" rows and floods
-            # out the real run that DID resolve this ladder, leaving the
-            # memo unset. The superseded-by-run guard would then read
-            # None and re-arm a ladder a real run already settled, a
-            # double-run this method exists to avoid (and a regression:
-            # pre-memo the skip row's fresh finished_at settled it by
-            # accident). The durable fold is flood-independent
-            # (derive_max over ranAt), so seed the memo from it before the
-            # guard reads it. One extra read, only when a pending record
-            # actually exists, so steady state is unchanged; it mirrors
-            # the deeper-read _warm_last_success_beyond_history sets for
-            # the SLA memo.
+            # A long pause can flood the warmed ring with "skipped" rows,
+            # leaving this memo unset; the superseded-by-run guard would
+            # then re-arm a ladder a real run already settled. Seed the
+            # memo from the flood-independent durable fold (derive_max
+            # over ranAt) first. One extra read, only when a pending
+            # record exists.
             try:
                 durable_at = await asyncio.wait_for(
                     self.durable_last_completed_at(name),
@@ -12662,8 +11150,8 @@ class Cron:
         return None
 
     def _validate_pending_retry(
-        self, name: str, job: JobConfig, rec: Dict[str, Any]
-    ) -> Optional[Tuple[int, datetime.datetime]]:
+        self, name: str, job: JobConfig, rec: dict[str, Any]
+    ) -> Optional[tuple[int, datetime.datetime]]:
         """Judge a pending-retry record against the LIVE job definition.
 
         Returns ``(attempt, notBefore)`` when the ladder may be re-armed;
@@ -12674,16 +11162,11 @@ class Cron:
         the job's own startingDeadlineSeconds window.
         """
         retry = job.onFailure["retry"]
-        attempt = rec.get("attempt")
-        not_before = _parse_iso_utc(rec.get("notBefore"))
-        if (
-            isinstance(attempt, bool)
-            or not isinstance(attempt, int)
-            or attempt < 1
-            or not_before is None
-        ):
+        parsed = _parse_retry_record(rec)
+        if parsed is None:
             self._persist_retry_settled(name, "invalid-record")
             return None
+        attempt, not_before = parsed
         rec_digest = rec.get("jobDigest")
         if not retry["maximumRetries"] or rec_digest != job_digest_cached(job):
             # retries disabled since arming, or any behaviour-affecting
@@ -12691,19 +11174,11 @@ class Cron:
             # (nor lurk until a later config revert).
             self._persist_retry_settled(name, "config-changed", attempt)
             return None
-        # a handoff carries the original arm time in ``armedAt`` (a pending has
-        # only ``at``, which for a pending IS its arm time).
-        armed_at = (
-            _parse_iso_utc(rec.get("armedAt"))
-            or _parse_iso_utc(rec.get("at"))
-            or not_before
-        )
-        # the newest ACTUAL run, not last_run: a pause-held slot appends a
-        # "skipped" row stamped now, and reading last_run here would settle
-        # every ladder the pause is only holding until the resume. It must
-        # still be the newest non-skipped instant rather than "ignore the
-        # guard when last_run is skipped", or a real run buried under a
-        # later pause would go unseen and the ladder would double-run.
+        armed_at = _retry_armed_at(rec, not_before)
+        # the newest ACTUAL run, not last_run: a pause-held slot's
+        # "skipped" row would settle every ladder the pause is only
+        # holding, while a real run buried under a later pause must
+        # still be seen.
         last_at = self._last_completed_at.get(name)
         if last_at is not None and last_at > armed_at:
             # a run finished AFTER this retry was armed: the ladder was
@@ -12730,12 +11205,9 @@ class Cron:
     async def durable_last_run_at(self, name: str) -> Optional[str]:
         """The last finished-run timestamp for a job, from the durable ledger.
 
-        The restart-surviving "last fired" watermark, derived as the max
-        ``finished_at`` over the immutable records (order-independent, so it is
-        correct even when several nodes append to one job's stream on a shared
-        mount).  ISO-8601 UTC, so a lexicographic max is a chronological max.
-        ``None`` with no backend or no records.  Consumed by the missed-run
-        catch-up; the ledger it reads is the durable run-record stream.
+        Max finished_at over the immutable records (order-independent;
+        ISO-8601 UTC, so lexicographic max is chronological max). None
+        with no backend or records. Consumed by missed-run catch-up.
         """
         backend = self.state_backend
         if backend is None:
@@ -12748,27 +11220,14 @@ class Cron:
     async def durable_last_completed_at(self, name: str) -> Optional[str]:
         """The last ACTUAL-run timestamp for a job, from the durable ledger.
 
-        :meth:`durable_last_run_at`'s skip-blind twin, for the cross-node
-        superseded-by-run guard.  ``finished_at`` is stamped on synthetic
-        ``skipped`` rows too (deliberately: the catch-up watermark must
-        advance over a pause rather than owe every held slot on resume), so
-        folding it here would let a pause settle every ladder the pause is
-        only holding.  This folds ``ranAt`` instead, which
-        :meth:`JobRunInfo.to_dict` writes on run rows only.
-
-        Records appended before ``ranAt`` existed carry only ``finished_at``,
-        and dropping them would re-arm ladders an upgrade's own ledger
-        already proves resolved, so the newest window of them is folded in
-        by outcome.  No pause could have written a ``skipped`` row into that
-        older shape, and a row carrying ``ranAt`` is already folded above.
-
-        Read by the claim scan (only when a foreign stale ladder actually
-        exists) AND by the local retry rehydrate
-        (:meth:`_rehydrate_retries`), so both the cross-node and single-node
-        superseded-by-run paths see the same resolved-ladder truth.  The
-        ``ranAt`` fold above is one ``derive_max`` and the capped fold below
-        one bounded read, so steady state pays two reads; the deeper re-read
-        fires ONLY on the pre-``ranAt`` None path, off that steady state.
+        durable_last_run_at's skip-blind twin, for the superseded-by-run
+        guards. Folds ``ranAt`` (written on run rows only), never
+        finished_at, which synthetic "skipped" rows also carry: folding
+        that would let a pause settle every ladder it is only holding.
+        Pre-``ranAt`` records (finished_at only) are folded in by outcome
+        so an upgrade does not re-arm resolved ladders. Read by the claim
+        scan and the local retry rehydrate, so both paths see the same
+        truth; the deeper re-read fires only on the pre-ranAt None path.
         """
         backend = self.state_backend
         if backend is None:
@@ -12778,7 +11237,7 @@ class Cron:
         best = derived if isinstance(derived, str) else None
 
         def _fold_pre_ranat(
-            records: List[Dict[str, Any]], acc: Optional[str]
+            records: list[dict[str, Any]], acc: Optional[str]
         ) -> Optional[str]:
             # A row with no ``ranAt`` and outcome != skipped is a real run
             # from before ``ranAt`` existed (a pause-skip row never took that
@@ -12797,18 +11256,10 @@ class Cron:
         )
         best = _fold_pre_ranat(recs, best)
         if best is None:
-            # KNOWN BOUND, now closed for the common case: a ledger written
-            # entirely before ``ranAt`` existed, then buried under at least
-            # RUN_HISTORY_LIMIT pause-skip rows, leaves every real row outside
-            # the capped window above and carrying no ``ranAt`` for derive_max
-            # to catch, so it folds to None. Both the LOCAL retry rehydrate
-            # (via _rehydrate_retries) and a peer's claim scan would then
-            # re-arm a ladder the ledger already proves resolved. Re-read ONCE,
-            # deeper, on this None path only, mirroring
-            # _warm_last_success_beyond_history: any post-upgrade run row
-            # carries ``ranAt`` and keeps this off the steady-state path. A
-            # residual bound survives only past `deeper` pre-``ranAt`` rows,
-            # which one post-upgrade real run heals.
+            # A pre-``ranAt`` ledger buried under RUN_HISTORY_LIMIT
+            # pause-skip rows folds to None and would re-arm a resolved
+            # ladder. Re-read ONCE, deeper, on this None path only; one
+            # post-upgrade real run keeps this off the steady state.
             deeper = max(SLA_SUCCESS_SCAN_LIMIT, self._state_max_runs)
             deep = await backend.list_records(
                 stream, limit=deeper, newest_first=True
@@ -12818,24 +11269,17 @@ class Cron:
 
     async def _list_gate_records(
         self, backend: Any, name: str
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Newest durable run records for the onlyIfLastSucceeded gate.
 
-        Read incrementally: the gate consumes only the single newest
-        success/failure record, but non-run outcomes (cancelled/skipped) at the
-        head must be skipped over.  Probe :data:`DEPENDS_GATE_PROBE` newest
-        records first and widen to the full :data:`RUN_HISTORY_LIMIT` window
-        ONLY when that page is entirely non-run outcomes, so the common case
-        (the newest record is a real outcome) materialises a few records
-        instead of all 50, without shrinking the skip window a real answer
-        may need.
-
-        Raises through to the caller's fail-closed/degrade handling on a store
-        error or timeout, exactly as the single read it replaces.
+        Probes DEPENDS_GATE_PROBE newest records and widens to
+        RUN_HISTORY_LIMIT only when that page is entirely non-run
+        outcomes. Raises through to the caller's fail-closed/degrade
+        handling on a store error or timeout.
         """
         stream = self._run_stream(name)
         probe = min(DEPENDS_GATE_PROBE, RUN_HISTORY_LIMIT)
-        recs: List[Dict[str, Any]] = await asyncio.wait_for(
+        recs: list[dict[str, Any]] = await asyncio.wait_for(
             backend.list_records(stream, limit=probe, newest_first=True),
             timeout=STATE_OP_TIMEOUT,
         )
@@ -12845,7 +11289,7 @@ class Cron:
             r.get("outcome") in ("success", "failure") for r in recs
         ):
             return recs
-        widened: List[Dict[str, Any]] = await asyncio.wait_for(
+        widened: list[dict[str, Any]] = await asyncio.wait_for(
             backend.list_records(
                 stream, limit=RUN_HISTORY_LIMIT, newest_first=True
             ),
@@ -12856,41 +11300,16 @@ class Cron:
     async def _depends_on_past_ok(self, job: JobConfig) -> bool:
         """Whether ``job``'s depends-on-past gate permits a scheduled fire.
 
-        ``True`` (allow) unless ``onlyIfLastSucceeded`` is set AND the job's
-        most recent *run* outcome was a failure, or its previous instance is
-        STILL RUNNING (an unfinished run has not "succeeded", and letting the
-        answer depend on whether it happens to finish first would make the
-        gate a race).  The last real outcome is the NEWEST of two sources,
-        by ``finished_at``:
-
-        * the in-memory history (``run_history``), which the finished-run
-          path updates synchronously: the durable write behind it is
-          fire-and-forget, so the ledger alone can be a beat stale and would
-          re-run a job whose failure record is still in flight;
-        * the durable ledger, which sees runs from OTHER nodes on a shared
-          mount (guarded and bounded: a store error/timeout degrades to the
-          in-memory view with a warning (fail open, like "no backend")
-          rather than stalling or crashing the launch path, which runs
-          outside run()'s try/except).
-
-        Non-run outcomes (``cancelled``/``skipped``) are skipped in both, so
-        a skipped tick does not itself clear the gate and only a genuine
-        success re-opens it, within each source's bounded window
-        (:data:`RUN_HISTORY_LIMIT` newest entries), which a pathological pile
-        of consecutive non-run records could in principle exhaust.  No prior
-        run in either source -> allow (there is nothing to depend on, and a
-        first-ever run must not be blocked).  Without a state backend the
-        gate still works from the in-memory history; it simply is not
-        restart-surviving (history resets with the process).
-
-        The still-running block is SKIPPED for ``concurrencyPolicy:
-        Replace``: that policy's contract is that a new fire supersedes the
-        running instance (its reaping happens in :meth:`maybe_launch_job`),
-        so blocking here would let one hung run freeze the job forever; the
-        gate then judges the last *finished* outcome, as it always did.
-        Applies to scheduled and @reboot fires
-        (:meth:`launch_scheduled_job`); retries, catch-up backfills, and
-        manual API triggers deliberately bypass it.
+        True unless onlyIfLastSucceeded is set AND the most recent run
+        outcome was a failure, or the previous instance is STILL RUNNING
+        (else the gate is a race). Judges the NEWEST of two sources by
+        finished_at: the in-memory history (the ledger alone can be a
+        beat stale) and the durable ledger (sees other nodes; a store
+        error degrades fail-open to the in-memory view). Non-run
+        outcomes are skipped in both; no prior run allows. The
+        still-running block is SKIPPED for concurrencyPolicy: Replace
+        (a hung run must not freeze the job). Applies to scheduled and
+        @reboot fires; retries, backfills, and manual triggers bypass it.
         """
         if not job.onlyIfLastSucceeded:
             return True
@@ -12898,12 +11317,9 @@ class Cron:
             job.name
         ):
             return False
-        # The newest real outcome by finished_at, NOT by list position: run
-        # records are written unserialized (two concurrencyPolicy: Allow
-        # instances, or a peer node on a shared mount), so the last-APPENDED
-        # real run can be OLDER than one appended before it. A positional
-        # `reversed(...); break` walk would take that newer-by-position stale
-        # record and clear the gate on a failure that is actually the newest.
+        # Newest real outcome by finished_at, NOT list position: records
+        # are written unserialized, so the last-APPENDED run can be OLDER
+        # than one appended before it.
         reals = [
             info
             for info in (self.run_history.get(job.name) or ())
@@ -12911,15 +11327,14 @@ class Cron:
             and info.finished_at is not None
         ]
         newest = max(reals, key=lambda i: i.finished_at, default=None)
-        latest: Optional[Tuple[datetime.datetime, str]] = (
+        latest: Optional[tuple[datetime.datetime, str]] = (
             (newest.finished_at, newest.outcome)
             if newest is not None
             else None
         )
-        # the ring above is bounded, so enough consecutive non-run rows (a
-        # pause writes one per held slot) evict the last real outcome from
-        # it entirely. The memo survives that eviction; take whichever is
-        # newer so a genuine success recorded after it still wins.
+        # the bounded ring can lose the last real outcome to consecutive
+        # non-run rows; the memo survives that eviction. Take whichever
+        # is newer.
         memo = self._last_real_outcome.get(job.name)
         if memo is not None and (latest is None or memo[0] > latest[0]):
             latest = memo
@@ -12929,9 +11344,8 @@ class Cron:
             and self._state_configured
             and self._state_on_unavailable == "fail-closed"
         ):
-            # the store holds the durable truth this gate exists for, it is
-            # configured but down, and the operator asked for fail-closed:
-            # prefer not running over deciding from a possibly-stale memory.
+            # store configured but down under fail-closed: prefer not
+            # running over deciding from possibly-stale memory.
             logger.warning(
                 "Job %s: onlyIfLastSucceeded blocked: the state store is "
                 "configured but unavailable and onStoreUnavailable is "
@@ -12974,13 +11388,9 @@ class Cron:
                     ),
                     str(outcome),
                 )
-                # Fold over ALL real records (already bounded to
-                # RUN_HISTORY_LIMIT) and keep the max by finished_at, NOT the
-                # first-by-sequence then break: an out-of-order write (a peer,
-                # or two Allow instances racing) can land a newer success
-                # ahead of the true-newest failure by sequence, and a
-                # first-real-then-break would clear the gate on that stale
-                # success while never examining the newer failure behind it.
+                # Fold over ALL real records, max by finished_at, NOT
+                # first-by-sequence: an out-of-order write could clear
+                # the gate on a stale success ahead of a newer failure.
                 if latest is None or candidate[0] > latest[0]:
                     latest = candidate
         if latest is None:
@@ -12989,37 +11399,29 @@ class Cron:
 
     async def _handle_finished_job(self, job: RunningJob) -> None:
         if getattr(job, "dag_ref", None) is not None:
-            # a DAG task instance, not a scheduled job. Route its
-            # completion to the DAG scheduler (which records the durable
-            # per-task transition and advances the graph) and skip the whole
-            # job record/retry/inflight/cluster-slot path: a task's lifecycle
-            # lives in its dag_run document, not the job streams.
+            # a DAG task instance: route to the DAG scheduler and skip
+            # the job record/retry/inflight/cluster-slot path; a task's
+            # lifecycle lives in its dag_run document.
             await self._handle_finished_dag_task(job)
             return
         last_instance = self._remove_running_instance(job)
         if last_instance and self.state_backend is not None:
-            # the job went 1 -> 0 live instances here: close the in-flight
-            # record. Fire-and-forget; runs before the replaced/cancelled
-            # early-returns below on purpose: a replaced instance ending
-            # the job's last local instance must still close the record.
-            # Ordered behind the open so a near-instant run's close cannot
-            # sort ahead of it (see _inflight_write_tail).
+            # 1 -> 0 live instances: close the in-flight record. Before
+            # the replaced/cancelled early-returns on purpose; ordered
+            # behind the open (see _inflight_write_tail).
             self._queue_inflight_write(
                 job.config.name,
                 lambda: self._persist_inflight_closed(job.config.name),
             )
         if job.config.concurrencyScope == "cluster":
-            # every claimed launch pairs with exactly one finish here; the
-            # slot lease is released when the refcount drains (see
-            # _release_cluster_slot). Before the early-returns below for
-            # the same reason as the in-flight close.
+            # every claimed launch pairs with exactly one finish here;
+            # before the early-returns for the same reason as above.
             await self._release_cluster_slot(job.config)
 
         if self._job_api is not None and job.state_token is not None:
-            # revoke this run's loopback token and staged secrets and
-            # release any mutex/semaphore it still holds. Before the early
-            # returns below (a replaced or cancelled run must clean up too),
-            # and paired one-to-one with the _prepare_job_api_run at launch.
+            # revoke the run's loopback token/secrets and release any
+            # lock it holds; before the early returns, paired one-to-one
+            # with _prepare_job_api_run.
             await self._job_api.finish_run(job.state_token)
 
         if job.replaced:
@@ -13086,49 +11488,35 @@ class Cron:
     def _queue_job_completion(self, job: RunningJob, *, failed: bool) -> None:
         """Run a finished job's report+retry-arm sequence as a tracked task.
 
-        Reporters (SMTP, webhooks, shell commands) legitimately take seconds
-        (bounded only in the tens of seconds) and used to run inline on
-        the reaper, the daemon's single job-completion loop, so one slow
-        reporter delayed every other job's completion handling, slot release
-        and retry arming daemon-wide.  Spawned per finished run instead,
-        chained behind the same job's previous sequence (the idiom of
-        :meth:`_queue_inflight_write`): the retry-ladder handling for
-        overlapping instances of one job keeps the reaper's old serial
-        semantics, while distinct jobs no longer wait on each other.
-        Tracked in ``_completion_tasks`` so shutdown drains the in-flight
-        reports after the running-job drain (see :meth:`_drain_completions`).
+        Spawned per finished run so a slow reporter cannot stall the
+        reaper daemon-wide, chained behind the same job's previous
+        sequence so overlapping instances keep serial retry semantics.
+        Tracked in _completion_tasks so shutdown drains in-flight reports
+        (_drain_completions).
         """
         name = job.config.name
 
         async def _handle() -> None:
-            try:
-                if failed:
-                    await self.handle_job_failure(job)
-                else:
-                    await self.handle_job_success(job)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # pragma: no cover - defensive
-                logger.exception(
-                    "Unexpected error handling the completion of job %s; "
-                    "please report this as a bug (8)",
-                    name,
-                )
+            if failed:
+                await self.handle_job_failure(job)
+            else:
+                await self.handle_job_success(job)
 
         self._install_tail_task(
             self._completion_tail,
             name,
             _handle,
             spawn=self._spawn_completion,
+            bug_log="Unexpected error handling the completion of job %s; "
+            "please report this as a bug (8)",
         )
 
     async def _drain_completions(self) -> None:
         """Await every in-flight report+retry-arm sequence.
 
-        The shutdown path runs this after the running-job drain, unbounded
-        exactly as the reaper's old inline awaits were: reports for runs that
-        finished before the stop signal must still go out.  Also the seam
-        tests use to observe completion side effects deterministically.
+        Run by shutdown after the running-job drain, unbounded: reports
+        for runs that finished before the stop signal must still go out.
+        Also the seam tests use to observe completion side effects.
         """
         while self._completion_tasks:
             await asyncio.wait(set(self._completion_tasks))
@@ -13149,17 +11537,12 @@ class Cron:
             await self._dag.on_task_finished(job)
         except Exception:  # noqa: BLE001 - never kill the reaper
             logger.exception("dag: failed to record a task completion")
-        # Fire the task's own run reporters (onFailure/onSuccess, set per-task
-        # or inherited from the `defaults:` block), after the durable
-        # transition above so a report can never delay it. No retry arming and
-        # no onPermanentFailure: a task's attempts are graph-driven (the DAG
-        # node's `retries`), so every failed attempt reports via onFailure.
-        # Cancelled/replaced runs are not failures (mirroring
-        # _handle_finished_job's early returns), and shutdown skips reporting
-        # exactly as handle_job_failure's stop-event gate does. The
-        # enabled-probe keeps the common unconfigured case at dict lookups: a
-        # mapped fan-out can land hundreds of completions in one reaper batch,
-        # and each spawn is a task plus a four-reporter gather.
+        # Fire the task's own run reporters after the durable transition
+        # so a report can never delay it. No retry arming and no
+        # onPermanentFailure: a task's attempts are graph-driven.
+        # Cancelled/replaced runs are not failures; shutdown skips
+        # reporting. The enabled-probe keeps the unconfigured case at
+        # dict lookups (a mapped fan-out lands many completions at once).
         if not (job.cancelled or job.replaced or self._stop_event.is_set()):
             failed = job.fail_reason is not None
             hook = job.config.onFailure if failed else job.config.onSuccess
@@ -13248,23 +11631,18 @@ class Cron:
             retry_num,
             delay,
         )
-        # Persist the pending retry (fire-and-forget, ordered behind the
-        # job's earlier ladder writes) with its ABSOLUTE deadline, so a
-        # restart re-arms it with only the remaining delay (see
-        # _rehydrate_retries). A write that never lands simply loses the
-        # durability (the retry dies with the process, exactly the
-        # pre-durable behaviour); later ladder writes are ordered after it
-        # via the per-job write chain (_queue_retry_write).
+        # Persist the pending retry with its ABSOLUTE deadline so a
+        # restart re-arms only the remaining delay (_rehydrate_retries).
+        # A write that never lands loses only durability; later ladder
+        # writes are ordered after it (_queue_retry_write).
         pending_job = self.cron_jobs.get(job_name)
         if pending_job is not None:
             now_arm = get_now(datetime.timezone.utc)
             not_before = now_arm + datetime.timedelta(seconds=delay)
             self._persist_retry_pending(pending_job, retry_num, not_before)
-            # record the armed retry's absolute fire time so GET /jobs can
-            # render a live next-retry countdown (see _job_to_dict), and the
-            # arm instant so a later cross-node hand-off can anchor its
-            # superseded-by-run guard on when the attempt was ARMED rather than
-            # on the hand-off instant (see _abandon_retry).
+            # record the absolute fire time (GET /jobs countdown) and the
+            # arm instant (a cross-node hand-off anchors its
+            # superseded-by-run guard on ARM time, see _abandon_retry).
             armed_state = self.retry_state.get(job_name)
             if armed_state is not None:
                 armed_state.next_retry_at = not_before
@@ -13286,11 +11664,9 @@ class Cron:
                 self.retry_state.pop(job_name, None)
                 self._persist_retry_settled(job_name, "job-removed", retry_num)
                 return
-            # A paused job DEFERS its pending retry exactly like a transient
-            # gate denial below: the attempt waits and fires after the
-            # resume, never consumed or cancelled by the pause (a pause is
-            # "hold my fires", not a verdict on the ladder). One gate covers
-            # boot-rehydrated ladders too, since they re-arm through here.
+            # A paused job DEFERS its pending retry: the attempt fires
+            # after the resume, never consumed by the pause. Covers
+            # boot-rehydrated ladders too (they re-arm through here).
             pause = self._pause_active(job_name)
             if pause is not None:
                 state = self.retry_state.get(job_name)
@@ -13313,27 +11689,20 @@ class Cron:
                 )
                 await asyncio.sleep(recheck)
                 continue
-            # Re-check the leadership gate before relaunching: a retry can
-            # outlive the leadership it started under (a partition / quorum
-            # loss / reload moved ownership while we slept), and
-            # maybe_launch_job does NOT gate. Relaunching unconditionally
-            # would run a Leader-policy job here while the new owner also
-            # runs it on its next tick: the exact double-run the
-            # abstraction promises to prevent.
+            # Re-check the leadership gate before relaunching: a retry
+            # can outlive the leadership it started under, and
+            # maybe_launch_job does NOT gate; relaunching unconditionally
+            # would double-run a Leader job against the new owner.
             if self._cluster_allows(job):
-                # Settle the durable pending record BEFORE launching (the
-                # same record-before-run ordering as the @reboot marker):
-                # a crash right after the launch must find the ladder
-                # settled, not re-arm the attempt that already ran. Under
-                # onStoreUnavailable: fail-closed an unsettleable record
-                # defers the launch like a closed gate; under degrade it
-                # launches anyway (at-least-once, bounded replay). When
-                # cross-node retry resume is active the decision also
-                # serializes on the per-job claim lease and re-checks that
-                # the newest ladder record is still OUR OWN pending: a
-                # peer that claimed this ladder while we slept or deferred
-                # ends it here ("abort") without settling, so the
-                # claimer's record stays newest.
+                # Settle the durable pending record BEFORE launching
+                # (record-before-run, like the @reboot marker): a crash
+                # after the launch must not re-arm the attempt that ran.
+                # fail-closed defers on an unsettleable record; degrade
+                # launches anyway. With cross-node retry resume active,
+                # the decision serializes on the claim lease and
+                # re-checks the newest ladder record is still OUR OWN
+                # pending; a peer's claim ends it here ("abort") without
+                # settling.
                 decision = await self._retry_consume_decision(
                     job, retry_num, quiet=deferrals > 0
                 )
@@ -13353,29 +11722,23 @@ class Cron:
                     )
                     return
             elif self._cluster_owner_moved(job):
-                # ownership genuinely moved: end this node's retry sequence
-                # (on a shared store the ladder is handed off for the new
-                # owner to resume; otherwise the new owner picks up only
-                # the job's future scheduled firings; see _abandon_retry).
+                # ownership genuinely moved: end this node's retry
+                # sequence (hand-off or forfeit; see _abandon_retry).
                 self._abandon_retry(job, retry_num)
                 return
-            # A transient fail-closed denial (lost quorum, a nodeName/size/
-            # policy conflict, a backend read error, no manager): this node
-            # may well still be the rightful owner, and ending the sequence
-            # here would end it EVERYWHERE for an @reboot keep-alive job
-            # (maximumRetries: -1): reboot_ran was recorded before the
-            # first launch, so no other node ever restarts it. Keep the
-            # retry alive and re-check the gate after another delay.
+            # A transient fail-closed denial: this node may still be the
+            # rightful owner, and ending the sequence would end it
+            # EVERYWHERE for an @reboot keep-alive (reboot_ran was
+            # recorded, so no other node restarts it). Keep it alive and
+            # re-check.
             state = self.retry_state.get(job_name)
             if state is None or state.cancelled or self._stop_event.is_set():
                 # the sequence ended (success / cancellation / shutdown)
                 # while we deliberated: nothing left to keep alive.
                 return
             recheck = max(delay, RETRY_GATE_RECHECK_FLOOR)
-            # first deferral at INFO (the operator-visible event), repeats at
-            # DEBUG: a long gate-closed outage with a tiny initialDelay would
-            # otherwise emit this line about once per second for its whole
-            # duration (the RETRY_GATE_RECHECK_FLOOR cadence).
+            # first deferral at INFO, repeats at DEBUG (a long outage
+            # with a tiny initialDelay would otherwise spam this line).
             log = logger.info if deferrals == 0 else logger.debug
             deferrals += 1
             log(
@@ -13401,12 +11764,10 @@ class Cron:
     ) -> Optional[asyncio.Task]:
         """Fire-and-forget append of a pending-retry record for ``job``.
 
-        Carries the ABSOLUTE deadline (``notBefore``) and the job's config
-        digest, which is everything a restart needs to re-arm the ladder at
-        the right position (the delay ladder itself is a pure function of
-        the retry config and the attempt number).  Returns the write task so
-        the caller can ORDER later ladder writes after it (never to gate on
-        its success).
+        Carries the ABSOLUTE deadline and the job's config digest:
+        everything a restart needs to re-arm the ladder. Returns the
+        write task so the caller can ORDER later ladder writes after it
+        (never to gate on its success).
         """
         if self.state_backend is None:
             self._note_retry_write_dropped(job.name, "pending")
@@ -13435,7 +11796,7 @@ class Cron:
         if self.state_backend is None:
             self._note_retry_write_dropped(name, reason)
             return
-        record: Dict[str, Any] = {
+        record: dict[str, Any] = {
             "kind": "settled",
             "reason": reason,
             "host": self._state_host,
@@ -13448,11 +11809,9 @@ class Cron:
     def _note_retry_write_dropped(self, name: str, what: str) -> None:
         """Make a retry-ladder write dropped for want of a backend VISIBLE.
 
-        Only when a ``state`` section is configured (stateless installs
-        write nothing by design): the store being down/rebuilding here can
-        leave a stale ``pending`` on top of the stream, which a later boot
-        would resurrect were it not for the superseded-by-run re-arm guard
-        (worth a counter and a line, never silence).
+        Only when a ``state`` section is configured: a stale pending left
+        newest could be resurrected but for the superseded-by-run guard;
+        worth a counter and a line, never silence.
         """
         if not self._state_configured:
             return
@@ -13465,16 +11824,14 @@ class Cron:
         )
 
     def _queue_retry_write(
-        self, name: str, record: Dict[str, Any]
+        self, name: str, record: dict[str, Any]
     ) -> asyncio.Task:
         """Queue a retry-stream write ORDERED after the job's previous one.
 
-        Newest-record-wins makes ordering load-bearing: two unordered
-        fire-and-forget appends (a pending and the settle racing it) run on
-        separate worker threads and could land filename-inverted, leaving
+        Newest-record-wins makes ordering load-bearing: an unordered
+        pending/settle pair could land filename-inverted, leaving
         ``pending`` newest and resurrecting a consumed retry on the next
-        boot.  Chaining each job's writes behind the previous one keeps the
-        stream's order equal to the ladder's event order.
+        boot.
         """
         return self._install_tail_task(
             self._retry_write_tail,
@@ -13484,7 +11841,7 @@ class Cron:
         )
 
     async def _append_retry_record(
-        self, name: str, record: Dict[str, Any]
+        self, name: str, record: dict[str, Any]
     ) -> None:
         backend = self.state_backend
         if backend is None:  # torn down between scheduling and running
@@ -13501,66 +11858,52 @@ class Cron:
                 "state: failed to persist retry state for %s: %s", name, ex
             )
 
-    def _persist_pause(self, name: str, info: "PauseInfo") -> None:
-        """Fire-and-forget append of a durable ``paused`` record.
+    def _persist_pause_record(self, name: str, record: dict[str, Any]) -> None:
+        """Fire-and-forget append of one pause-stream record.
 
-        ``host`` is audit info ONLY: unlike retry records, a pause is
-        honored by every node sharing the store (see
-        :data:`PAUSE_STREAM_PREFIX`).  Without a backend the pause still
-        holds in this process's memory, exactly like the classic stateless
-        behaviour of every other runtime nicety, and when a store IS
-        configured the record is held for replay (see
-        :meth:`_defer_pause_write`).
+        Stamps the shared audit fields (``host`` is audit info ONLY: a
+        pause is honored by every node sharing the store). Without a
+        backend the record holds in memory; with a configured store it
+        is held for replay (_defer_pause_write).
         """
-        record = {
-            "kind": "paused",
-            "since": info.since.isoformat(),
-            "until": info.until.isoformat(),
-            "note": info.note,
-            "by": info.by,
-            "channel": info.channel,
-            "at": get_now(datetime.timezone.utc).isoformat(),
-            "host": self._state_host,
-        }
+        record["at"] = get_now(datetime.timezone.utc).isoformat()
+        record["host"] = self._state_host
         if self.state_backend is None:
             self._defer_pause_write(name, record)
             return
         self._queue_pause_write(name, record)
+
+    def _persist_pause(self, name: str, info: "PauseInfo") -> None:
+        """Fire-and-forget append of a durable ``paused`` record."""
+        self._persist_pause_record(
+            name,
+            {
+                "kind": "paused",
+                "since": info.since.isoformat(),
+                "until": info.until.isoformat(),
+                "note": info.note,
+                "by": info.by,
+                "channel": info.channel,
+            },
+        )
 
     def _persist_resume(self, name: str, by: str, channel: str) -> None:
         """Fire-and-forget append of a durable ``resumed`` record."""
-        record = {
-            "kind": "resumed",
-            "by": by,
-            "channel": channel,
-            "at": get_now(datetime.timezone.utc).isoformat(),
-            "host": self._state_host,
-        }
-        if self.state_backend is None:
-            self._defer_pause_write(name, record)
-            return
-        self._queue_pause_write(name, record)
+        self._persist_pause_record(
+            name, {"kind": "resumed", "by": by, "channel": channel}
+        )
 
-    def _defer_pause_write(self, name: str, record: Dict[str, Any]) -> None:
+    def _defer_pause_write(self, name: str, record: dict[str, Any]) -> None:
         """Hold a pause record for replay once the store comes back.
 
-        A configured store that is down is transient: ``start_stop_state``
-        retries it every housekeeping pass.  Dropping the record meanwhile
-        would leave the stream's newest record contradicting memory, and the
-        refresh that follows the store's return would then quietly revert
-        the operator's pause (or resume): the exact opposite of the "keep
-        the last known in-memory state" contract, which covers only failed
-        READS.  An append that FAILS against a live store buffers the same
-        way (the record is owed either way) and the housekeeping pass retries
-        it.  Newest-per-job wins here as it does in the stream itself, so
-        a pause/resume pair taken during the outage collapses to the final
-        intent.  Stateless installs (no ``state`` section) buffer nothing
-        and say nothing: memory-only is their contract, but a buffer left
-        from before the ``state`` section was removed is DISCARDED here, or
-        a pause held from the outage would be replayed as fresh intent when
-        the section returns and re-pause a job resumed in between.  Bumping
-        the write generation keeps a refresh already reading this job's
-        stream from applying its now-stale snapshot.
+        Dropping it would let the post-return refresh quietly revert the
+        operator's pause (or resume) to the stale record still newest in
+        the stream. A failed append against a live store buffers the same
+        way. Newest-per-job wins, so a pause/resume pair during the
+        outage collapses to the final intent. Stateless installs buffer
+        nothing, and a buffer left from before the state section was
+        removed is DISCARDED here. The generation bump keeps an in-flight
+        refresh from applying its now-stale snapshot.
         """
         if not self._state_configured:
             self._pause_pending_writes.pop(name, None)
@@ -13578,14 +11921,10 @@ class Cron:
     def _replay_pending_pause_writes(self) -> None:
         """Queue the pause records buffered by an outage or a failed write.
 
-        Called from :meth:`start_stop_state` with a fresh backend in hand and
-        BEFORE the rehydrate's refresh pass, and again from every
-        :meth:`_pause_periodic` pass while a backend is up (which is what
-        retries an append that failed against a live store).  Both callers
-        run it before the refresh, so each replayed write installs its
-        :attr:`_pause_write_tail` entry first and that refresh leaves the
-        job's memory alone instead of reverting it to the stale record still
-        on top of the stream.
+        Called from start_stop_state BEFORE the rehydrate's refresh pass
+        and from every _pause_periodic pass. Both run it before the
+        refresh, so each replayed write installs its _pause_write_tail
+        entry first and the refresh leaves the job's memory alone.
         """
         pending = list(self._pause_pending_writes.items())
         self._pause_pending_writes.clear()
@@ -13598,16 +11937,14 @@ class Cron:
             self._queue_pause_write(name, record)
 
     def _queue_pause_write(
-        self, name: str, record: Dict[str, Any]
+        self, name: str, record: dict[str, Any]
     ) -> asyncio.Task:
         """Queue a pause-stream write ORDERED after the job's previous one.
 
-        The :meth:`_queue_retry_write` idiom: newest-record-wins makes
-        ordering load-bearing (a resume racing its pause could land
-        filename-inverted and leave ``paused`` newest forever).  The tail
-        entry doubles as the "local write in flight" signal the
-        housekeeping refresh consults, and the generation bump is the
-        edge-triggered half of that signal (see :attr:`_pause_gen`).
+        The _queue_retry_write idiom (a resume racing its pause could
+        land filename-inverted). The tail entry doubles as the "local
+        write in flight" signal the housekeeping refresh consults; the
+        generation bump is its edge-triggered half (see _pause_gen).
         """
         self._pause_gen[name] = self._pause_gen.get(name, 0) + 1
         return self._install_tail_task(
@@ -13618,7 +11955,7 @@ class Cron:
         )
 
     async def _append_pause_record(
-        self, name: str, record: Dict[str, Any]
+        self, name: str, record: dict[str, Any]
     ) -> None:
         backend = self.state_backend
         if backend is None:  # torn down between queueing and running
@@ -13633,11 +11970,9 @@ class Cron:
             logger.warning(
                 "state: failed to persist pause state for %s: %s", name, ex
             )
-            # a dropped pause write is not just a lost audit row: the record
-            # this one meant to supersede is still newest in the stream, so
-            # the next refresh would quietly revert the operator's intent.
-            # Buffer it (which also counts the drop and bumps the generation)
-            # and let the housekeeping pass retry the write.
+            # not just a lost audit row: the superseded record is still
+            # newest, so the next refresh would revert the operator's
+            # intent. Buffer and let housekeeping retry.
             self._defer_pause_write(name, record)
 
     async def _retry_consume_ok(
@@ -13645,15 +11980,11 @@ class Cron:
     ) -> bool:
         """Settle the pending-retry record ahead of the launch; may defer.
 
-        ``True`` -> proceed with the launch.  The bounded settle write is
-        the record-before-run half of restart-durable retries: once it
-        lands, a crash cannot re-arm the attempt that is about to run.
-        When it cannot land: the default ``degrade`` policy launches anyway
-        (at-least-once: a crash in the narrow window before the record
-        is retried by a later settle could replay this one attempt after a
-        restart), while ``fail-closed`` reports False so the caller defers
-        the launch and re-checks, exactly like a closed cluster gate.
-        Stateless (no ``state`` section) is always ``True`` with no I/O.
+        True -> launch. The settle is the record-before-run half of
+        restart-durable retries: once it lands, a crash cannot re-arm the
+        attempt about to run. When it cannot land, degrade launches
+        anyway (at-least-once) and fail-closed defers like a closed
+        cluster gate. Stateless is always True with no I/O.
         """
         backend = self.state_backend
         fail_closed = (
@@ -13693,10 +12024,8 @@ class Cron:
         }
         stream = self._retry_stream(job_name)
         try:
-            # the stream bound rides along inside the append's worker call;
-            # the backend applies it only after the append LANDED and
-            # swallows its own failures, so it cannot affect the settle
-            # decision below.
+            # prune_keep rides the append, applied only after it LANDED,
+            # so it cannot affect the settle decision below.
             await asyncio.wait_for(
                 backend.append_record(
                     stream, record, prune_keep=RETRY_STREAM_KEEP
@@ -13777,13 +12106,10 @@ class Cron:
         *,
         quiet: bool,
     ) -> Optional[Lease]:
-        """``acquire_lease`` for a retry claim, mapping a timeout OR a raised
-        store error to ``None`` so the caller's read-back-and-policy path
-        decides, the same containment as :meth:`_acquire_slot_lease`.  An
-        escape here kills the ``schedule_retry_job`` task (silently dropping
-        the due retry) AND is re-raised by ``cancel_job_retries``' awaiter on
-        the job's next fire, outside ``run()``'s try/except: the whole
-        daemon crashes.
+        """``acquire_lease`` for a retry claim; timeout or store error
+        maps to ``None`` (same containment as _acquire_slot_lease). An
+        escape here drops the due retry AND re-raises outside run()'s
+        try/except via cancel_job_retries, crashing the daemon.
         """
         try:
             return await asyncio.wait_for(
@@ -13817,27 +12143,17 @@ class Cron:
     ) -> str:
         """Decide a due retry's fate: ``launch`` | ``defer`` | ``abort``.
 
-        Without cross-node resume this is exactly the classic
-        :meth:`_retry_consume_ok` (launch/defer).  With it, two additions
-        close the claim/consume race:
-
-        * the consume serializes on the SAME per-job claim lease the scan
-          uses, so a claimer's re-read-then-append and our re-check-then-
-          settle cannot interleave;
-        * the newest ladder record must still be a record THIS host wrote:
-          a foreign newest record (a claimer's pending, or its
-          settled/"launched" after it already fired) means the ladder
-          positively moved, and the only safe move is to end it locally
-          without settling (``abort``): our settle landing on top would
-          bury the claimer's pending and could resurrect the attempt on
-          the next boot.
-
-        The staleness grace (:data:`RETRY_CLAIM_GRACE`) cannot protect a
-        gate-deferred owner (its re-check cadence is its own ladder
-        delay, arbitrarily longer than any constant), so this re-check is
-        load-bearing for at-most-once, not defensive hardening.  Read/
-        acquire failures follow ``onStoreUnavailable``: degrade proceeds
-        (unserialized, at-least-once), fail-closed defers.
+        Without cross-node resume this is exactly _retry_consume_ok.
+        With it, two additions close the claim/consume race: the consume
+        serializes on the SAME per-job claim lease the scan uses, and
+        the newest ladder record must still be one THIS host wrote; a
+        foreign newest record means the ladder positively moved, and the
+        only safe move is ``abort`` without settling (our settle on top
+        would bury the claimer's pending). RETRY_CLAIM_GRACE cannot
+        protect a gate-deferred owner (its re-check cadence is its own
+        ladder delay), so this re-check is load-bearing for
+        at-most-once. Read/acquire failures follow onStoreUnavailable:
+        degrade proceeds unserialized, fail-closed defers.
         """
         if not self._retry_cross_node_eligible(job):
             ok = await self._retry_consume_ok(job.name, retry_num, quiet=quiet)
@@ -13932,15 +12248,10 @@ class Cron:
         """
         if not self._retry_resume_active():
             return
-        # Enumerate first, read second, the shape _refresh_pauses_from_store
-        # already uses. Walking cron_jobs and reading each name's stream cost
-        # one store round trip per retry-configured job per minute, forever,
-        # on every HA node, when almost every one of those streams does not
-        # exist: a missing-stream read is 0.224 ms against 0.258 ms for the
-        # whole enumeration. A failure to enumerate degrades to "not this
-        # pass", exactly as each per-job read already does; with no backend at
-        # all there is nothing to enumerate and each candidate falls out at
-        # _maybe_claim_retry's own guard for free.
+        # Enumerate first, read second (the _refresh_pauses_from_store
+        # shape): almost every retry stream does not exist, so one
+        # enumeration beats a per-job read per minute per node. A failed
+        # enumeration degrades to "not this pass".
         backend = self.state_backend
         if backend is None:
             names = list(self.cron_jobs)
@@ -13969,6 +12280,28 @@ class Cron:
                     name,
                 )
 
+    async def _newest_retry_record(
+        self, backend: StateBackend, name: str
+    ) -> dict[str, Any] | None:
+        """The newest retry-ladder record, or None.
+
+        None for an empty stream AND for a failed/timed-out read: the
+        claim flows treat both as "not this pass" (never settle or claim
+        on a read they could not complete).
+        """
+        try:
+            recs = await asyncio.wait_for(
+                backend.list_records(
+                    self._retry_stream(name), limit=1, newest_first=True
+                ),
+                timeout=STATE_OP_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - not this pass
+            return None
+        return recs[0] if recs else None
+
     async def _maybe_claim_retry(self, name: str, job: JobConfig) -> None:
         backend = self.state_backend
         if backend is None or not self._retry_cross_node_eligible(job):
@@ -13985,18 +12318,7 @@ class Cron:
             return
         if not self._cluster_allows(job):
             return
-        try:
-            recs = await asyncio.wait_for(
-                backend.list_records(
-                    self._retry_stream(name), limit=1, newest_first=True
-                ),
-                timeout=STATE_OP_TIMEOUT,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - not this pass
-            return
-        rec = recs[0] if recs else None
+        rec = await self._newest_retry_record(backend, name)
         if rec is None:
             return
         claimable = self._retry_record_claimable(name, job, rec)
@@ -14032,18 +12354,13 @@ class Cron:
                 pass
         if not claimed:
             return
-        # Re-apply the top-guard invariant: the awaits above (list/acquire/
-        # claim/release, each up to STATE_OP_TIMEOUT) yield, and in that
-        # window a scheduled fire of this job could have launched, failed,
-        # and armed a LIVE local ladder (its retry_state.task). Overwriting
-        # retry_state[name] here would strand that task as a second,
-        # uncancelled same-node ladder, and because both write host ==
-        # self._state_host, the foreign-record abort in the consume path
-        # never fires, so the job double-fires on ONE node. That live
-        # ladder outranks (exactly as the top guard at the method start
-        # would have declined the claim); drop the just-made claim. Its
-        # durable pending is host-local and the live ladder settles it on
-        # consume.
+        # Re-apply the top-guard invariant: during the awaits above a
+        # scheduled fire could have armed a LIVE local ladder.
+        # Overwriting retry_state[name] would strand that task as a
+        # second same-node ladder (same host, so the foreign-record
+        # abort never fires) and double-fire on ONE node. The live
+        # ladder outranks; drop the just-made claim (its durable pending
+        # is host-local and the live ladder settles it on consume).
         existing = self.retry_state.get(name)
         if self.running_jobs.get(name) or (
             existing is not None
@@ -14082,7 +12399,7 @@ class Cron:
         self,
         name: str,
         job: JobConfig,
-        rec: Dict[str, Any],
+        rec: dict[str, Any],
         attempt: int,
         not_before: datetime.datetime,
     ) -> bool:
@@ -14095,30 +12412,16 @@ class Cron:
         if backend is None:
             return False
         # re-read under the lease: the record must not have moved.
-        try:
-            recheck = await asyncio.wait_for(
-                backend.list_records(
-                    self._retry_stream(name), limit=1, newest_first=True
-                ),
-                timeout=STATE_OP_TIMEOUT,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - not this pass
+        recheck = await self._newest_retry_record(backend, name)
+        if recheck is None or recheck != rec:
             return False
-        if not recheck or recheck[0] != rec:
-            return False
-        # superseded-by-run against the DURABLE ledger: the run that
-        # resolved this ladder most likely happened on ANOTHER host,
-        # which this node's in-memory history knows nothing about.  A handoff
-        # carries the original arm time in ``armedAt`` (its ``at`` is the
-        # hand-off instant, which would hide a run the prior owner already
-        # completed); a pending's own ``at`` is its arm time.
+        # superseded-by-run against the DURABLE ledger (the resolving run
+        # likely happened on ANOTHER host). A handoff carries the arm
+        # time in armedAt; a pending's own ``at`` is its arm time.
         armed_at = rec.get("armedAt") or rec.get("at") or rec.get("notBefore")
         try:
-            # the run-only watermark: a peer holding this job's slots under
-            # a pause stamps skip rows the catch-up watermark counts and
-            # this guard must not (see durable_last_completed_at).
+            # run-only watermark: pause-skip rows must not count here
+            # (see durable_last_completed_at).
             last_durable = await asyncio.wait_for(
                 self.durable_last_completed_at(name),
                 timeout=STATE_OP_TIMEOUT,
@@ -14155,48 +12458,36 @@ class Cron:
                 asyncio.shield(write), timeout=STATE_OP_TIMEOUT
             )
         except asyncio.TimeoutError:
-            # We are abandoning this claim (the caller arms no ladder). The
-            # write is shielded, so without this cancel it would still land
-            # LATER as an own-host pending, which our own future scans
-            # skip (a host never claims its own pending) and rehydration
-            # never re-arms, while a live original owner reading it aborts
-            # its ladder: an unreclaimable orphan that silently drops the
-            # retry. Cancel it so the foreign record stays newest and the
-            # next scan (here or on a peer) can re-claim cleanly. (If the
-            # append already completed at the instant of the timeout the
-            # cancel is a harmless no-op; the vanishingly small residual is
-            # the same at-least-once window every claim path accepts.)
+            # Abandoning the claim: without this cancel the shielded
+            # write could land LATER as an own-host pending that nothing
+            # re-arms while a live original owner aborts its ladder (an
+            # unreclaimable orphan). Cancel so the foreign record stays
+            # newest and the next scan can re-claim cleanly; if the
+            # append already completed the cancel is a harmless no-op.
             write.cancel()
             return False
         return True
 
     def _retry_record_claimable(
-        self, name: str, job: JobConfig, rec: Dict[str, Any]
-    ) -> Optional[Tuple[int, datetime.datetime]]:
+        self, name: str, job: JobConfig, rec: dict[str, Any]
+    ) -> Optional[tuple[int, datetime.datetime]]:
         """Judge whether a ladder record is another node's claimable retry.
 
-        Mirrors :meth:`_validate_pending_retry`'s checks (shape, digest,
-        budget, deadline) with the cross-node rules on top: only a FOREIGN
-        ``pending`` stale past :data:`RETRY_CLAIM_GRACE` (a crashed owner;
-        a live one fires within moments of its deadline) or a
-        ``handoff`` (an owner that positively relinquished; no grace)
-        qualifies.  Every validation failure here just declines the claim:
-        settling another host's record on local suspicion alone would
-        race its live owner; the durable superseded-by-run check (which
-        has store-wide evidence) happens under the claim lease instead.
+        Mirrors _validate_pending_retry's checks with the cross-node
+        rules on top: only a FOREIGN pending stale past
+        RETRY_CLAIM_GRACE (a crashed owner) or a handoff (positively
+        relinquished; no grace) qualifies. Every failure just declines:
+        settling another host's record on local suspicion would race its
+        live owner; the durable superseded-by-run check happens under
+        the claim lease instead.
         """
         kind = rec.get("kind")
         if kind not in ("pending", "handoff"):
             return None
-        attempt = rec.get("attempt")
-        not_before = _parse_iso_utc(rec.get("notBefore"))
-        if (
-            isinstance(attempt, bool)
-            or not isinstance(attempt, int)
-            or attempt < 1
-            or not_before is None
-        ):
+        parsed = _parse_retry_record(rec)
+        if parsed is None:
             return None
+        attempt, not_before = parsed
         if rec.get("jobDigest") != job_digest_cached(job):
             return None
         retry = job.onFailure["retry"]
@@ -14207,25 +12498,21 @@ class Cron:
         deadline = job.startingDeadlineSeconds
         if deadline and (now - not_before).total_seconds() > deadline:
             return None
+        if kind == "pending":
+            host = rec.get("host")
+            if not isinstance(host, str) or host == self._state_host:
+                # our own pending is rehydration's business, never the
+                # scan's; declined before the armed_at parse, which an
+                # own-host record never needs.
+                return None
+        armed_at = _retry_armed_at(rec, not_before)
         # the newest ACTUAL run (see _validate_pending_retry): a pause-held
         # slot's "skipped" row is not evidence anything ran.
         last_at = self._last_completed_at.get(name)
-        # a handoff carries the original arm time in ``armedAt``; its ``at`` is
-        # the hand-off instant, which would hide a run the prior owner already
-        # completed (a pending has no ``armedAt`` and its ``at`` is its arm).
-        armed_at = (
-            _parse_iso_utc(rec.get("armedAt"))
-            or _parse_iso_utc(rec.get("at"))
-            or not_before
-        )
         if last_at is not None and last_at > armed_at:
             return None  # locally-known newer run; the ladder resolved
         if kind == "handoff":
             return attempt, max(not_before, now)
-        host = rec.get("host")
-        if not isinstance(host, str) or host == self._state_host:
-            # our own pending is rehydration's business, never the scan's
-            return None
         due_anchor = max(not_before, armed_at)
         if (now - due_anchor).total_seconds() <= RETRY_CLAIM_GRACE:
             return None
@@ -14234,17 +12521,10 @@ class Cron:
     def _cluster_owner_moved(self, job: JobConfig) -> bool:
         """Whether another node is *positively* identified as ``job``'s owner.
 
-        Used by ``schedule_retry_job`` to tell a genuine ownership move
-        (another node runs the job on its own schedule, so a pending retry
-        may be abandoned without double-running) from a transient fail-closed
-        denial of ``_cluster_allows`` (lost quorum, a conflict, a
-        still-converging view, a backend read error, no manager), where this
-        node may well still be the rightful owner and abandoning would end
-        the sequence for good.
-        Decided from the seam's self-recognising ``is_available_*`` reads
-        (never a display-name comparison), so a lease holder in its
-        self-demotion window (still observing itself as holder while
-        ``is_leader()`` already reports False) is not mistaken for a move.
+        Tells a genuine ownership move (retry may be abandoned) from a
+        transient fail-closed denial of _cluster_allows (where abandoning
+        would end the sequence for good). Decided from self-recognising
+        is_available_* reads, never a display-name comparison.
         """
         mgr = self.cluster_manager
         if mgr is None:
@@ -14258,15 +12538,10 @@ class Cron:
                 # no trustworthy view of leadership -> no positive owner
                 return False
             if not mgr.view_settled():
-                # a freshly rebuilt gossip manager holds the never-skip
-                # available_* gates closed while peers re-attest its new
-                # instance_id, even on the rightful owner, and even while
-                # QUORATE (quorum needs only a majority attesting us; the
-                # hold waits for every current-build agreeing peer). A False
-                # from those gates is then the hold, not an observed move;
-                # abandoning here would end the sequence for good (fatal for
-                # an @reboot keep-alive). Bounded (~2 poll intervals), so
-                # defer and re-check like any transient denial.
+                # a freshly rebuilt gossip manager holds the available_*
+                # gates closed while peers re-attest it, even on the
+                # rightful owner; a False is then the hold, not a move.
+                # Bounded (~2 poll intervals), so defer and re-check.
                 return False
             if mgr.distribution == "spread":
                 return not mgr.is_available_job_owner(job.name)
@@ -14284,21 +12559,13 @@ class Cron:
     def _abandon_retry(self, job: JobConfig, retry_num: int) -> None:
         """End a pending retry sequence whose job's ownership moved off-node.
 
-        Marks the state cancelled BEFORE dropping it: a RunningJob launched
-        while the retry sat pending (a manual API start, a concurrencyPolicy
-        Allow overlap) captured this same JobRetryState, and its own later
-        failure would otherwise re-arm a retry on a state no longer in
-        ``retry_state``, which ``cancel_job_retries`` could never find or
-        cancel, so the orphan would relaunch the job even after a later
-        successful run.
-
-        When cross-node retry resume is active (a shared store plus leader
-        election) the ladder is HANDED OFF instead of settled dead: a
-        ``handoff`` record carrying the attempt, the job digest and a
-        now-due deadline lands on the stream, and the new owner's claim
-        scan picks it up (no staleness grace: the old owner has
-        positively relinquished).  No ``cancelled`` run-history record is
-        written on that path: the attempt is not ending, it is moving.
+        Marks the state cancelled BEFORE dropping it: a RunningJob that
+        captured this JobRetryState could otherwise re-arm an orphan
+        ladder cancel_job_retries can never find. With cross-node retry
+        resume active the ladder is HANDED OFF instead of settled dead
+        (a handoff record the new owner's claim scan picks up, no
+        staleness grace); no cancelled run-history record on that path:
+        the attempt is moving, not ending.
         """
         job_name = job.name
         state = self.retry_state.get(job_name)
@@ -14307,14 +12574,11 @@ class Cron:
         self.retry_state.pop(job_name, None)
         if self._retry_cross_node_eligible(job):
             now = get_now(datetime.timezone.utc)
-            # Anchor the new owner's superseded-by-run guard on when this
-            # attempt was originally ARMED, not on this hand-off instant. A
-            # peer that took ownership while we were demoted-but-blind may
-            # have claimed and RUN this attempt; that run finished BEFORE now,
-            # so a now-stamped anchor ("at") would make the completed run look
-            # older than the record and the new owner would re-run it: a
-            # double-fire across failover. notBefore stays now so the new owner
-            # still runs a genuinely-unresolved ladder promptly.
+            # Anchor the new owner's superseded-by-run guard on when the
+            # attempt was ARMED, not the hand-off instant: a peer may
+            # have already claimed and RUN it, and a now-stamped anchor
+            # would double-fire across failover. notBefore stays now so
+            # an unresolved ladder still runs promptly.
             armed_at = state.armed_at if state is not None else None
             self._queue_retry_write(
                 job_name,
@@ -14341,14 +12605,11 @@ class Cron:
                 retry_num,
             )
             return
-        # settle the durable ladder: the new owner runs the job's future
-        # firings, so re-arming this attempt on OUR next boot would be the
-        # exact cross-node double-run the abandonment avoids.
+        # settle the durable ladder: re-arming this attempt on OUR next
+        # boot would be the cross-node double-run abandonment avoids.
         self._persist_retry_settled(job_name, "owner-moved", retry_num)
-        # Wording note: the new owner picks up future *scheduled* firings; it
-        # does NOT re-run this failed attempt, and an @reboot one-shot has no
-        # future firing at all (its boot run is already recorded), so the
-        # message must not promise the job "runs elsewhere".
+        # Wording: the new owner picks up future SCHEDULED firings only;
+        # the message must not promise the job "runs elsewhere".
         logger.warning(
             "Cron job %s retry (#%i) abandoned: the cluster moved ownership "
             "of it to another node; onPermanentFailure will not fire for "
@@ -14358,12 +12619,9 @@ class Cron:
             job_name,
             retry_num,
         )
-        # Record the abandonment in the run history, like a web-UI
-        # cancellation: the sequence ended without a verdict on the job
-        # itself, so the dashboard should show why the retries stopped.
-        # There is no RunningJob at this point, so no report hook (and no
-        # statsd metric, which is per-run) can fire; the record and the
-        # WARNING above are the observable trace.
+        # Record the abandonment in run history, like a web-UI
+        # cancellation. No RunningJob exists here, so no report hook or
+        # statsd metric fires; the record and WARNING are the trace.
         output = JobOutputStream()
         output.close()
         self._record_run(
@@ -14412,13 +12670,10 @@ class Cron:
         except KeyError:
             return
         state.cancelled = True
-        # Settle the durable ladder record (fire-and-forget) so a pending
-        # retry is not re-armed on the next boot. Skipped when settle is
-        # None (the graceful-shutdown path, where surviving the restart is
-        # the point) and when no retry was ever scheduled this ladder
-        # (count == 0: nothing durable was written, and settling here would
-        # add one durable write to every successful run of a retry-armed
-        # job).
+        # Settle the durable ladder record so a pending retry is not
+        # re-armed on the next boot. Skipped when settle is None (the
+        # graceful-shutdown path: surviving the restart is the point) and
+        # when count == 0 (nothing durable was written).
         if settle is not None and state.count > 0:
             self._persist_retry_settled(name, settle, state.count)
         if state.task is not None:
