@@ -2171,7 +2171,9 @@ def test_absent_mapped_instance_holds_run_open_like_the_barrier():
     # hole as pending, so a damaged run document could complete as a run
     # whose mapped group still read "running" to every downstream.  Both
     # consumers now share _mapped_instance_state: the hole holds the run
-    # open, where the reconcile paths can see it.
+    # open.  This calls the terminaliser directly, so it pins that rule in
+    # isolation; a real advance pass runs _propagate_and_claim first, which
+    # repairs the hole (see the test below) rather than leaving it open.
     spec = _spec(
         TaskSpec("gen"),
         TaskSpec(
@@ -2194,6 +2196,60 @@ def test_absent_mapped_instance_holds_run_open_like_the_barrier():
     assert dag._mapped_group_state(body, "w") == dag.SUCCESS
     dag._maybe_terminalise(spec, body, 6.0, result)
     assert result.run_terminal is True
+
+
+def test_claim_pass_repairs_a_missing_mapped_instance():
+    # The other half of the rule above. Holding the run open is only safe
+    # if something can fill the hole, and nothing else can: the reconcile
+    # pass iterates the entries that EXIST and both GC paths only touch
+    # already-terminal runs, so a hole used to wedge the run forever,
+    # renewing its advance lease for the life of the daemon and never
+    # becoming eligible for retention. The claim pass, which runs before
+    # the terminaliser in the same transform, now materialises a
+    # run-recorded index it finds missing and fails it with a reason.
+    spec = _spec(
+        TaskSpec("gen"),
+        TaskSpec(
+            "w",
+            depends_on=("gen",),
+            expand=ExpandSpec(from_task="gen", key="items"),
+        ),
+    )
+    body = _body(spec)
+    body["tasks"]["gen"]["state"] = dag.SUCCESS
+    body["mapped"]["w"] = {"items": ["a", "b"], "expandedAt": 1.0}
+    body["tasks"]["w#0"] = {"id": "w", "state": dag.SUCCESS}
+    body["tasks"].pop("w#1", None)  # the hole
+    result = dag.AdvanceResult()
+    dag._propagate_and_claim(spec, body, 5.0, "proc", "host", result)
+    entry = body["tasks"]["w#1"]
+    assert entry["state"] == dag.FAILED
+    assert entry["mapIndex"] == 1
+    assert entry["mapItem"] == "b"  # the item the run recorded for it
+    assert "holds no entry" in entry["failReason"]
+    assert result.changed is True
+    # and now the run can finish, so its lease releases and GC can prune
+    dag._maybe_terminalise(spec, body, 6.0, result)
+    assert result.run_terminal is True
+    assert body["state"] == dag.FAILED
+
+
+def test_claim_pass_leaves_a_plain_task_with_no_entry_alone():
+    # The repair is scoped to MAPPED indices the run itself recorded. A
+    # plain task absent from the document is the deliberate "added by a
+    # config reload after the run was created" case, which both the claim
+    # pass and the terminaliser skip; materialising a failure for it would
+    # fail runs for work that was never part of their plan.
+    spec = _spec(TaskSpec("a"), TaskSpec("b", depends_on=("a",)))
+    body = _body(spec)
+    body["tasks"]["a"]["state"] = dag.SUCCESS
+    body["tasks"].pop("b")  # as a reload adding task "b" would leave it
+    result = dag.AdvanceResult()
+    dag._propagate_and_claim(spec, body, 5.0, "proc", "host", result)
+    assert "b" not in body["tasks"]
+    dag._maybe_terminalise(spec, body, 6.0, result)
+    assert result.run_terminal is True
+    assert body["state"] == dag.SUCCESS
 
 
 # set_task_pid: no-op on missing run / non-running entry
@@ -2369,13 +2425,15 @@ def test_reconcile_crashed_noop_on_none_and_terminal():
 
 def test_has_live_process_variants():
     # no proc recorded -> owner is gone (never treated as live).
-    assert dag._has_live_process(
-        {"proc": None}, "p", "h", lambda pid: True
-    ) is False
+    assert (
+        dag._has_live_process({"proc": None}, "p", "h", lambda pid: True)
+        is False
+    )
     # our own proc token -> trusted alive without a pid probe.
-    assert dag._has_live_process(
-        {"proc": "p"}, "p", "h", lambda pid: False
-    ) is True
+    assert (
+        dag._has_live_process({"proc": "p"}, "p", "h", lambda pid: False)
+        is True
+    )
     # a foreign token but a live child on this host -> alive.
     entry = {"proc": "other", "host": "h", "pid": 4321}
     assert dag._has_live_process(entry, "p", "h", lambda pid: True) is True

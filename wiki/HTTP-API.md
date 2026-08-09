@@ -672,7 +672,9 @@ to `[]`, so a client can tell "no runs" from "unknown job". The records, the
 bounds, and the restart behavior are exactly those of
 [`GET /jobs/{name}/runs`](#get-jobsnameruns), without the per-job fan-out,
 and one built response is shared across every viewer polling it (with
-`ETag` / `If-None-Match` and gzip, like `GET /jobs`).
+`ETag` / `If-None-Match` and gzip, like `GET /jobs`). An optional `?limit=`
+query caps the runs per job (newest kept, clamped to the retained window;
+the default serves the whole window).
 
 ### `GET /jobs/{name}/resources`
 
@@ -1007,8 +1009,9 @@ The response format depends on the request's `Accept` header:
   request.
 
 The configured `web.headers` are applied to the response as on every other
-route, except `Content-Type`, which this endpoint owns: the exposition
-format's contract always wins over an operator-configured header.
+route; as everywhere on this API, `Content-Type` stays the endpoint's own,
+so the exposition format's contract always wins over an operator-configured
+header.
 
 The endpoint is enabled by default whenever the web API is on. The
 `web.metrics` option tunes or disables it, accepting either a boolean
@@ -1062,7 +1065,9 @@ response across all routes (`/version`, `/status`, `/cluster`, `/job-set-id`,
 the job routes, and the `200` of `/jobs/{name}/start`) and to the `409`
 conflict bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. It is not
 applied to the `404` (unknown job) or `401` (authentication failure) responses,
-which are raised without the configured headers. Example:
+which are raised without the configured headers. One key is exempt everywhere:
+a `Content-Type` in this map (in any spelling) is ignored, because every
+endpoint owns its own content type. Example:
 
 ```yaml
 web:

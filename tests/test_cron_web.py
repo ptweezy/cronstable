@@ -509,11 +509,13 @@ async def test_web_list_jobs_single_flight_shares_one_build(monkeypatch):
         # running a build of its own would record it, or complete, and
         # this wait would fail.
         await _wait_until(
-            lambda: len(builds) == 1
-            and all(
-                inspect.getcoroutinestate(t.get_coro())
-                == inspect.CORO_SUSPENDED
-                for t in tasks
+            lambda: (
+                len(builds) == 1
+                and all(
+                    inspect.getcoroutinestate(t.get_coro())
+                    == inspect.CORO_SUSPENDED
+                    for t in tasks
+                )
             )
         )
         release.set()
@@ -627,6 +629,50 @@ async def test_web_list_dags_etag_304_and_gzip():
     changed = await cron._web_list_dags(_hdr_req(inm=etag))
     assert changed.status == 200
     assert changed.headers["ETag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_single_caller_response_builds_only_what_it_serves(monkeypatch):
+    """The unmemoized path serves ONE caller, so gzipping a body that
+    caller will not take is pure waste on the event loop. A 304 carries no
+    body, and a client that did not advertise gzip gets none, so neither
+    may pay for compression; /cluster never tags, so it must not hash
+    either. (The memoized product still builds both eagerly on purpose:
+    it is shared across pollers with mixed Accept-Encoding and
+    If-None-Match.)"""
+    import cronstable.cron
+
+    zipped = []
+    real_gzip = cronstable.cron._gzip_body
+
+    def counting_gzip(body):
+        zipped.append(len(body))
+        return real_gzip(body)
+
+    monkeypatch.setattr(cronstable.cron, "_gzip_body", counting_gzip)
+
+    cron = _cron(_FAT_DAG)
+    etag = (await cron._web_list_dags(_hdr_req())).headers["ETag"]
+    assert zipped == []  # no Accept-Encoding: nothing to compress
+
+    nm = await cron._web_list_dags(_hdr_req(inm=etag, ae="gzip"))
+    assert nm.status == 304
+    assert zipped == []  # a 304 has no body to compress
+
+    packed = await cron._web_list_dags(_hdr_req(ae="gzip"))
+    assert packed.headers["Content-Encoding"] == "gzip"
+    assert len(zipped) == 1  # only the representation actually served
+
+    hashed = []
+    real_sha = cronstable.cron.hashlib.sha256
+
+    def counting_sha(data=b""):
+        hashed.append(len(data))
+        return real_sha(data)
+
+    monkeypatch.setattr(cronstable.cron.hashlib, "sha256", counting_sha)
+    await cron._web_get_cluster(_hdr_req(ae="gzip"))
+    assert hashed == []  # use_etag=False: the digest was never taken
 
 
 @pytest.mark.asyncio
@@ -1607,7 +1653,9 @@ async def test_web_json_endpoints_tolerate_operator_content_type(
         cron,
         {
             "listen": ["http://127.0.0.1:0"],
-            "headers": {"content-type": "text/plain; charset=utf-8"},
+            # a sentinel no endpoint serves, so every row below (including
+            # the text/plain routes) discriminates operator-vs-own
+            "headers": {"content-type": "application/x-operator"},
             "ui": True,
         },
     )
@@ -1620,6 +1668,11 @@ async def test_web_json_endpoints_tolerate_operator_content_type(
         "/dags": "application/json",
         "/": "text/html",
         "/calendar.ics": "text/calendar",
+        # the plain-text trio (no Accept: application/json sent, so
+        # /job-set-id and /status take their text branches)
+        "/version": "text/plain",
+        "/job-set-id": "text/plain",
+        "/status": "text/plain",
     }
     async with aiohttp.ClientSession() as session:
         for path, ctype in expected.items():
@@ -1686,6 +1739,61 @@ async def test_web_errors_carry_the_json_envelope(start_web_app):
             assert resp.content_type == "application/json"
             assert "error" in await resp.json()
             assert "GET" in resp.headers.get("Allow", "")
+
+
+@pytest.mark.asyncio
+async def test_web_500_and_504_carry_the_json_envelope(
+    start_web_app, monkeypatch, caplog
+):
+    # The 500 was the one status a client could NOT parse uniformly: an
+    # unhandled error escaped to aiohttp's own handler, which answers
+    # text/plain. A store call that outran its budget is answered 504
+    # rather than folded into the 500, since that is the accurate status.
+    # Neither body may echo the exception: the reason goes to the log.
+    import logging
+
+    import aiohttp
+
+    cron = cronstable.cron.Cron(None, config_yaml=_WEB_ONE_JOB)
+    await start_web_app(cron, {"listen": ["http://127.0.0.1:0"], "ui": False})
+    port = cron.web_runner.addresses[0][1]
+    base = "http://127.0.0.1:{}".format(port)
+
+    # patch what the handler CALLS, not the handler: the routes bind their
+    # bound methods when the app is built, so replacing the attribute
+    # afterwards would never be seen.
+    def boom():
+        raise RuntimeError("secret detail: /var/lib/cronstable/state")
+
+    def slow():
+        raise asyncio.TimeoutError
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        async with aiohttp.ClientSession() as session:
+            monkeypatch.setattr(cron, "status_payload", boom)
+            async with session.get(base + "/status") as resp:
+                assert resp.status == 500
+                assert resp.content_type == "application/json"
+                body = await resp.json()
+            assert "error" in body
+            assert "secret detail" not in body["error"]
+            assert "/var/lib" not in body["error"]
+
+            monkeypatch.setattr(cron, "status_payload", slow)
+            async with session.get(base + "/status") as resp:
+                assert resp.status == 504
+                assert resp.content_type == "application/json"
+                assert "error" in await resp.json()
+    # the traceback aiohttp would have logged is not lost to the rewrap:
+    # it rides exc_info, not the message, so the reason is recoverable
+    # from the log even though the response withholds it
+    logged = [
+        r
+        for r in caplog.records
+        if r.exc_info and "secret detail" in str(r.exc_info[1])
+    ]
+    assert logged, [r.getMessage() for r in caplog.records]
+    assert "/status" in logged[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -2164,7 +2272,10 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
     monkeypatch.setattr(cron._dag, "backfill", bad_backfill)
     with pytest.raises(web.HTTPBadRequest):
         await cron._web_dag_backfill(
-            Req(match={"name": "d"}, body={"from": "2020-01-01", "to": "2020-01-02"})
+            Req(
+                match={"name": "d"},
+                body={"from": "2020-01-01", "to": "2020-01-02"},
+            )
         )
 
     async def ok_backfill(name, start, end):
@@ -2172,7 +2283,10 @@ async def test_webloop_web_dag_backfill_errors(monkeypatch):
 
     monkeypatch.setattr(cron._dag, "backfill", ok_backfill)
     resp = await cron._web_dag_backfill(
-        Req(match={"name": "d"}, body={"from": "2020-01-01", "to": "2020-01-02"})
+        Req(
+            match={"name": "d"},
+            body={"from": "2020-01-01", "to": "2020-01-02"},
+        )
     )
     assert _json.loads(resp.text)["runs"] == 2
 
@@ -2449,8 +2563,8 @@ async def test_cors_preflight_reaches_mcp_options_through_auth(start_web_app):
                 r.headers["Access-Control-Allow-Origin"]
                 == "https://inspector.example"
             )
-            assert "Authorization" in (
-                r.headers["Access-Control-Allow-Headers"]
+            assert (
+                "Authorization" in (r.headers["Access-Control-Allow-Headers"])
             )
         # a foreign origin's preflight is refused by the route itself
         async with session.options(
@@ -2643,3 +2757,33 @@ async def test_bounded_boot_scan_timeout_warns_once_and_aborts(caplog):
     ]
     assert len(warned) == 1
     assert counted == 0
+
+
+@pytest.mark.asyncio
+async def test_bounded_boot_scan_skips_a_job_whose_step_raises(caplog):
+    # asyncio.gather without return_exceptions hands the FIRST exception
+    # to the awaiter and leaves the siblings running, so an unexpected
+    # error out of one step used to abort the boot tail (dag reconcile,
+    # retry re-arm, the job API start) while the other workers went on
+    # mutating scheduler state behind it. One bad job is now a logged
+    # skip: every other item is still drawn, and the pass still returns
+    # its tally.
+    import logging
+
+    cron = cronstable.cron.Cron(None)
+    items = [("j%02d" % i, None) for i in range(20)]
+    calls = []
+
+    async def step(name, _job):
+        calls.append(name)
+        if name == "j03":
+            raise ValueError("a corrupt index entry")
+        return "counted"
+
+    with caplog.at_level(logging.ERROR, logger="cronstable"):
+        counted = await cron._bounded_boot_scan(items, step, "unused %s")
+    assert sorted(calls) == [name for name, _ in items]  # nothing skipped
+    assert counted == 19  # every item but the raiser
+    logged = [r for r in caplog.records if "boot scan: job" in r.message]
+    assert len(logged) == 1
+    assert "j03" in logged[0].getMessage()

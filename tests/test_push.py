@@ -327,8 +327,12 @@ def test_validate_pairing_rejects_unusable_key():
     zero_key = base64.b64encode(b"\x00" * 32).decode()
     with pytest.raises(push.PushError):
         push.validate_pairing(
-            {"name": "p", "platform": "ios", "pushToken": "t",
-             "publicKey": zero_key}
+            {
+                "name": "p",
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": zero_key,
+            }
         )
 
 
@@ -361,13 +365,21 @@ def test_validate_pairing_normalizes_and_rejects():
         push.validate_pairing("not a dict")
     with pytest.raises(push.PushError):
         push.validate_pairing(
-            {"name": "p", "platform": "ios", "pushToken": "t",
-             "publicKey": base64.b64encode(b"short").decode()}
+            {
+                "name": "p",
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": base64.b64encode(b"short").decode(),
+            }
         )
     with pytest.raises(push.PushError):
         push.validate_pairing(
-            {"name": "x" * 65, "platform": "ios", "pushToken": "t",
-             "publicKey": public_b64}
+            {
+                "name": "x" * 65,
+                "platform": "ios",
+                "pushToken": "t",
+                "publicKey": public_b64,
+            }
         )
 
 
@@ -858,7 +870,9 @@ async def test_send_report_survives_unreachable_relay(tmp_path):
     _, public_b64 = _device_keypair()
     service, _ = await _paired_service(
         # nothing listens on port 9; must log, never raise
-        tmp_path, "http://127.0.0.1:9/v1/notify", public_b64
+        tmp_path,
+        "http://127.0.0.1:9/v1/notify",
+        public_b64,
     )
     await service.send_report(_FakeJobCtx(), False, {"enabled": True})
 
@@ -883,10 +897,20 @@ async def test_one_bad_registry_key_does_not_break_the_fanout(tmp_path):
                 "devices": [
                     # the bad device first, so the loop must survive it
                     # to ever reach the good one
-                    {"id": "bad", "name": "evil", "platform": "ios",
-                     "publicKey": zero_b64, "pushToken": "tok-bad"},
-                    {"id": "good", "name": "phone", "platform": "ios",
-                     "publicKey": good_b64, "pushToken": "tok-good"},
+                    {
+                        "id": "bad",
+                        "name": "evil",
+                        "platform": "ios",
+                        "publicKey": zero_b64,
+                        "pushToken": "tok-bad",
+                    },
+                    {
+                        "id": "good",
+                        "name": "phone",
+                        "platform": "ios",
+                        "publicKey": good_b64,
+                        "pushToken": "tok-good",
+                    },
                 ],
             }
         ),
@@ -1106,8 +1130,9 @@ async def test_unexpected_error_stays_one_device_s_problem(tmp_path, caplog):
         await service.send_report(_FakeJobCtx(), False, {"enabled": True})
         assert len(relay.requests) == 2  # neither device was cancelled
     failures = [
-        r.getMessage() for r in caplog.records if "delivery to device" in
         r.getMessage()
+        for r in caplog.records
+        if "delivery to device" in r.getMessage()
     ]
     assert len(failures) == 2
     assert all("unexpected UnicodeDecodeError" in m for m in failures)
@@ -1178,8 +1203,7 @@ def test_push_is_a_registered_reporter_and_gates_fanout():
         isinstance(r, PushReporter) for r in RunningJob.REPORTERS
     )
     defaults = parse_config_string(
-        "jobs:\n  - name: j\n    command: \"true\"\n"
-        "    schedule: \"* * * * *\"\n",
+        'jobs:\n  - name: j\n    command: "true"\n    schedule: "* * * * *"\n',
         "",
     ).jobs[0]
     report = defaults.onFailure["report"]
@@ -1440,8 +1464,9 @@ push:
 )
 def test_push_relay_url_must_be_http(url):
     yaml = (
-        "push:\n  relay:\n    url: \"{}\"\n"
-        "  devicesFile: /tmp/d.json\n".format(url)
+        'push:\n  relay:\n    url: "{}"\n  devicesFile: /tmp/d.json\n'.format(
+            url
+        )
     )
     with pytest.raises(ConfigError):
         _parse_validated(yaml)
@@ -1462,8 +1487,9 @@ def test_push_relay_url_error_redacts_credentials(url):
     # every reparse until the config is fixed; like every other URL a
     # ConfigError echoes, it must never carry the secret.
     yaml = (
-        "push:\n  relay:\n    url: \"{}\"\n"
-        "  devicesFile: /tmp/d.json\n".format(url)
+        'push:\n  relay:\n    url: "{}"\n  devicesFile: /tmp/d.json\n'.format(
+            url
+        )
     )
     with pytest.raises(ConfigError) as err:
         _parse_validated(yaml)
@@ -1621,11 +1647,17 @@ def test_bonjour_off_forms_need_no_library(monkeypatch):
 
 
 class _Req:
-    """The slice of aiohttp's Request the push/whoami handlers read."""
+    """The slice of aiohttp's Request the push/whoami handlers read.
+
+    ``can_read_body`` arms the shared ``_web_json_body`` reader the
+    pairing handler goes through; an Exception body still raises from
+    ``json()`` so the malformed-body arms stay reachable.
+    """
 
     def __init__(self, match=None, body=None, token=None):
         self.match_info = match or {}
         self._body = body
+        self.can_read_body = body is not None
         self._store: dict[str, Any] = {}
         if token is not None:
             self._store[WEB_TOKEN_REQUEST_KEY] = token
@@ -1714,6 +1746,14 @@ async def test_pair_rejects_bad_bodies(tmp_path):
         await cron._web_push_pair(_Req(body=ValueError("bad json")))
     with pytest.raises(web.HTTPBadRequest):
         await cron._web_push_pair(_Req(body={"name": "x"}))
+    # the non-ValueError decode failures too: a bogus `charset=` makes
+    # aiohttp's json() raise LookupError, which a bare `except ValueError`
+    # let escape the JSON error envelope as a plain-text 500.  The shared
+    # _web_json_body reader catches the full decode surface.
+    with pytest.raises(web.HTTPBadRequest):
+        await cron._web_push_pair(
+            _Req(body=LookupError("unknown encoding: x-bogus"))
+        )
 
 
 @requires_pynacl

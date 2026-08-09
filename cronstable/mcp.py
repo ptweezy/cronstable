@@ -28,13 +28,11 @@ only (no resources/prompts yet), pinned to protocol revision
 2026 revision a near-no-op.
 """
 
-import asyncio
 import json as _stdlib_json
 import logging
 import re
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
-from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -47,7 +45,6 @@ from aiohttp import web
 from cronstable import _json
 from cronstable import version as _version
 from cronstable.cron import (
-    _METRICS_OFFLOAD_MIN_JOBS,
     WEB_TOKEN_REQUEST_KEY,
     ApiActionError,
 )
@@ -1090,22 +1087,15 @@ class MCPHandler:
         # other handler for the duration, and at fleet scale that is a
         # measurable freeze on a tool an agent may poll.
         #
-        # `iter_samples` reads the live scheduler state EAGERLY (the family
-        # build, which must stay on the loop) and returns a lazy generator
-        # over that freshly built list, which nobody else references.  So the
-        # drain below is pure CPU over a private snapshot and is safe in a
-        # worker thread; the only shared structure it touches is the
-        # label-block memo, where threads race to write equal values, the
-        # same argument `render_prepared` makes for the scrape render.
-        pending = cron.metrics.iter_samples(cron)
-        drain = partial(_filter_metric_samples, pending, match, limit)
-        if len(cron.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
-            rows, total = await asyncio.get_running_loop().run_in_executor(
-                None, drain
-            )
-        else:
-            # below the threshold the drain is cheaper than the thread hop
-            rows, total = drain()
+        # The universe walk (the expensive half: it assembles a label
+        # block and formats a value per sample) is shared across the
+        # callers that arrive within a second and offloaded past the same
+        # job-count gate GET /metrics uses, so an agent polling this tool
+        # neither stalls dispatch nor rebuilds what a concurrent caller is
+        # already building. The filter stays per call: it is substring
+        # matching over prebuilt strings, far cheaper than the walk.
+        samples = await cron.metric_samples_snapshot()
+        rows, total = _filter_metric_samples(iter(samples), match, limit)
         return _result(
             {
                 "samples": rows,

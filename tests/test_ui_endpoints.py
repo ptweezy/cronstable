@@ -1208,7 +1208,9 @@ def test_scheduled_in_reads_index_and_dead_latch():
     assert cron._scheduled_in("live", cron.cron_jobs["live"], False) == 0.0
     cron._ensure_seeded(now)
     # a dead schedule sits in the dead-latch: no next run
-    assert cron._scheduled_in("parked", cron.cron_jobs["parked"], False) is None
+    assert (
+        cron._scheduled_in("parked", cron.cron_jobs["parked"], False) is None
+    )
     # disabled / running jobs short-circuit to None
     assert cron._scheduled_in("off", cron.cron_jobs["off"], False) is None
     assert cron._scheduled_in("live", cron.cron_jobs["live"], True) is None
@@ -1222,7 +1224,9 @@ def test_schedule_never_fires_index_vs_latch():
     cron._ensure_seeded(now)
     # after seeding the two probes decide it: index -> fires, latch -> never
     assert cron._schedule_never_fires("live", cron.cron_jobs["live"]) is False
-    assert cron._schedule_never_fires("parked", cron.cron_jobs["parked"]) is True
+    assert (
+        cron._schedule_never_fires("parked", cron.cron_jobs["parked"]) is True
+    )
     # a disabled job is never "never fires" (it simply does not schedule)
     assert cron._schedule_never_fires("off", cron.cron_jobs["off"]) is False
 
@@ -1496,9 +1500,13 @@ def test_web_int_query_defaults_and_clamps():
     q = Cron._web_int_query
     assert q(Req(), "n", default=7, lo=1, hi=100) == 7  # missing -> default
     assert q(Req({"n": "20"}), "n", default=7, lo=1, hi=100) == 20
-    assert q(Req({"n": "500"}), "n", default=7, lo=1, hi=100) == 100  # hi clamp
+    assert (
+        q(Req({"n": "500"}), "n", default=7, lo=1, hi=100) == 100
+    )  # hi clamp
     assert q(Req({"n": "-3"}), "n", default=7, lo=1, hi=100) == 1  # lo clamp
-    assert q(Req({"n": "bad"}), "n", default=7, lo=1, hi=100) == 7  # unparsable
+    assert (
+        q(Req({"n": "bad"}), "n", default=7, lo=1, hi=100) == 7
+    )  # unparsable
 
 
 class _BodyReq:
@@ -1939,9 +1947,9 @@ async def test_web_activity_endpoint_is_conditional_gzipped_and_memoized(
     builds = []
     real_payload = cron.activity_payload
 
-    def counting_payload():
+    def counting_payload(*args, **kwargs):
         builds.append(1)
-        return real_payload()
+        return real_payload(*args, **kwargs)
 
     monkeypatch.setattr(cron, "activity_payload", counting_payload)
     first = await cron._web_get_activity(Req())
@@ -1987,11 +1995,11 @@ async def test_web_activity_memo_not_reinstated_over_a_bust(monkeypatch):
     builds = []
     real_payload = cron.activity_payload
 
-    def busting_payload():
+    def busting_payload(*args, **kwargs):
         builds.append(1)
         if len(builds) == 1:
             cron._bust_response_memos()
-        return real_payload()
+        return real_payload(*args, **kwargs)
 
     monkeypatch.setattr(cron, "activity_payload", busting_payload)
     first = await cron._web_get_activity(Req())
@@ -2029,3 +2037,59 @@ async def test_web_activity_offloaded_build_same_product(monkeypatch):
     assert resp.status == 200
     assert idents and idents[-1] != threading.get_ident()  # executor thread
     assert resp.body == real_product(cron.activity_payload())[1]
+
+
+async def test_web_activity_limit_caps_rows_per_job():
+    # /activity takes the same clamped `limit` (rows per job, newest
+    # retained) every capped listing takes; the default still serves the
+    # whole retained window, and an out-of-range or garbage value falls
+    # back rather than erroring (the _web_int_query contract).
+    cron = _cron(_ACTIVITY_YAML)
+    for i in range(5):
+        cron.run_history["a"].append(_heat_run("success", 60 * (5 - i)))
+    capped = await cron._web_get_activity(Req({"limit": "2"}))
+    rows = json.loads(capped.body)["jobs"]["a"]
+    assert len(rows) == 2
+    # the newest two, still oldest first
+    full_rows = cron.activity_payload()["jobs"]["a"]
+    assert rows == full_rows[-2:]
+    assert json.loads(capped.body)["jobs"]["b"] == []  # jobs stay present
+    # a capped response still tags, varies and 304s like the default one
+    assert capped.headers["Vary"] == "Accept-Encoding"
+    revalidated = await cron._web_get_activity(
+        Req({"limit": "2"}, headers={"If-None-Match": capped.headers["ETag"]})
+    )
+    assert revalidated.status == 304
+    # clamped, not erroring: 0 -> 1 row; over the window -> the whole window
+    one = await cron._web_get_activity(Req({"limit": "0"}))
+    assert len(json.loads(one.body)["jobs"]["a"]) == 1
+    wide = await cron._web_get_activity(Req({"limit": "9999"}))
+    assert json.loads(wide.body)["jobs"]["a"] == full_rows
+
+
+async def test_web_activity_projection_runs_off_loop_past_the_gate(
+    monkeypatch,
+):
+    # past the offload gate the ROW PROJECTION (jobs x runs of dict builds
+    # and isoformats, the expensive half at fleet scale) must ride the
+    # executor hop beside the serialize, not run on the loop first; the
+    # bytes must still match the inline build.
+    import threading
+
+    import cronstable.cron
+
+    monkeypatch.setattr(cronstable.cron, "_JOBS_SERIALIZE_OFFLOAD_MIN", 1)
+    cron = _cron(_ACTIVITY_YAML)
+    cron.run_history["a"].append(_heat_run("failure", 60))
+    idents = []
+    real_jobs = cronstable.cron._activity_jobs
+
+    def recording_jobs(histories, limit):
+        idents.append(threading.get_ident())
+        return real_jobs(histories, limit)
+
+    monkeypatch.setattr(cronstable.cron, "_activity_jobs", recording_jobs)
+    resp = await cron._web_get_activity(Req())
+    assert resp.status == 200
+    assert idents and idents[-1] != threading.get_ident()  # executor thread
+    assert json.loads(resp.body) == cron.activity_payload()

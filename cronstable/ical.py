@@ -180,7 +180,7 @@ def render_calendar(
         duration = _duration_text(block)
         description = "Schedule: {}\n{}\nTimezone: {}".format(
             str(entry.tab),
-            describe_cron(str(entry.tab), hash_key=entry.name),
+            describe_cron(str(entry.tab), hash_key=entry.name, tab=entry.tab),
             str(entry.timezone) if entry.timezone is not None else "local",
         )
         if entry.avg_duration is not None and entry.avg_duration > 0:

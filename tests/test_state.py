@@ -236,9 +236,11 @@ async def test_list_records_predicate_and_max_matches(fs_backend):
     )
     assert [r["i"] for r in limited] == [8]
     # no predicate/max_matches => unchanged behaviour.
-    assert [
-        r["i"] for r in await backend.list_records("s", limit=3)
-    ] == [0, 1, 2]
+    assert [r["i"] for r in await backend.list_records("s", limit=3)] == [
+        0,
+        1,
+        2,
+    ]
 
 
 async def test_records_are_immutable_and_versioned(fs_backend):
@@ -541,8 +543,10 @@ async def test_lease_lane_isolated_from_saturated_bulk_pool(fs_backend):
     try:
         # every wedged op acquires its bulk slot: the bulk lane is now full.
         assert await _wait_until(
-            lambda: backend.stats()["workers"]["bulk_inflight"]
-            == state.BULK_CALL_SLOTS,
+            lambda: (
+                backend.stats()["workers"]["bulk_inflight"]
+                == state.BULK_CALL_SLOTS
+            ),
             raise_on_timeout=False,
         )
         assert backend.stats()["workers"]["lease_inflight"] == 0
@@ -2685,6 +2689,74 @@ async def test_gc_sweeps_expired_idempotency_docs(fs_backend, monkeypatch):
         await backend.stop()
 
 
+async def test_gc_idem_sweep_does_not_read_young_docs(fs_backend, monkeypatch):
+    # The sweep used to open, read and JSON-parse EVERY idempotency doc on
+    # every pass before testing its age, so a namespace of permanent
+    # claims and live TTLs (the shapes it can never delete) cost a full
+    # read each, on the same lane and budget the rest of the gc shares.
+    # A claim's expiry is its write time plus its ttl, so an mtime at or
+    # after the cutoff is proof it cannot have lapsed a whole grace ago.
+    from cronstable import jobstate
+
+    backend = fs_backend
+    try:
+        await jobstate.idempotency_claim(backend, "scope", "permanent")
+        await jobstate.idempotency_claim(
+            backend, "scope", "alive", ttl=999999.0
+        )
+        reads = []
+        real_read = backend._read_doc_file
+
+        def counting_read(path):
+            reads.append(path)
+            return real_read(path)
+
+        monkeypatch.setattr(backend, "_read_doc_file", counting_read)
+        # cutoff is in the past, so every doc's mtime is at or after it
+        grace = 3600.0
+        monkeypatch.setattr(state, "_now", lambda: time.time() - 10.0)
+        assert (
+            backend._gc_sync({"runs/": set()}, grace, (), False)[
+                "idem_docs_removed"
+            ]
+            == 0
+        )
+        idem_reads = [p for p in reads if "idem" in p]
+        assert idem_reads == [], (
+            "the sweep still opens docs it cannot possibly delete: {}".format(
+                idem_reads
+            )
+        )
+    finally:
+        await backend.stop()
+
+
+def test_idem_doc_expired_boundary_and_unclassifiable(fs_backend):
+    # The sweep rests on "expiry lapsed a WHOLE grace ago", so the
+    # boundary belongs to the survivor: expiresAt == cutoff is expired
+    # (dead for exactly the window), one tick later is not. And a doc this
+    # build cannot classify is never expired: bool is an int subclass, so
+    # a JSON `true` would otherwise compare as expiresAt == 1 and read as
+    # long dead.
+    backend = fs_backend
+    cutoff = 1_000_000.0
+    assert backend._idem_doc_expired({"expiresAt": cutoff - 1}, cutoff)
+    assert backend._idem_doc_expired({"expiresAt": cutoff}, cutoff)
+    assert not backend._idem_doc_expired({"expiresAt": cutoff + 1}, cutoff)
+    for unclassifiable in (
+        {},  # a permanent claim carries no expiresAt
+        {"expiresAt": None},
+        {"expiresAt": True},  # not 1
+        {"expiresAt": False},  # not 0
+        {"expiresAt": "1"},
+        {"expiresAt": [1]},
+    ):
+        assert not backend._idem_doc_expired(unclassifiable, cutoff), (
+            unclassifiable
+        )
+    assert not backend._idem_doc_expired(None, cutoff)
+
+
 async def test_gc_idem_sweep_skips_doc_whose_lock_is_held(fs_backend):
     # REGRESSION: the idem-doc sweep used to take each candidate's flock
     # with the blocking _locked, so on a shared store one peer wedged
@@ -3566,7 +3638,9 @@ async def test_lease_dead_past_grace_false_when_read_returns_none(
     with open(lease_path, "wb") as fobj:
         fobj.write(b"{}")
     monkeypatch.setattr(backend, "_read_lease_file", lambda *a, **k: None)
-    assert backend._lease_dead_past_grace(lease_path, time.time() + 100) is False
+    assert (
+        backend._lease_dead_past_grace(lease_path, time.time() + 100) is False
+    )
 
 
 async def test_gc_leases_rejudge_keeps_revived_lease(fs_backend, monkeypatch):
@@ -4331,9 +4405,7 @@ async def test_sweep_orphan_blobs_keeps_young_unreferenced_blobs(fs_backend):
     old = time.time() - 7200.0
     os.utime(backend._blob_path(digest), (old, old))
     # dry run counts it but must not delete...
-    assert (
-        await backend.sweep_orphan_blobs(set(), 3600.0, dry_run=True) == 1
-    )
+    assert await backend.sweep_orphan_blobs(set(), 3600.0, dry_run=True) == 1
     assert await backend.get_blob(digest) is not None
     # ...the real pass reclaims it.
     assert await backend.sweep_orphan_blobs(set(), 3600.0) == 1

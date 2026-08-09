@@ -2047,6 +2047,36 @@ async def test_deferred_catch_up_skips_a_dag_removed_meanwhile(
     assert [r["kind"] for r in runs].count("catchup") == 0
 
 
+async def test_deferred_catch_up_aborts_when_the_daemon_is_stopping(
+    tmp_path, monkeypatch, dag_cron
+):
+    # The sleeper used to hold a bare asyncio.sleep, so a jitter window
+    # elapsing during a graceful stop created the whole backfill (and
+    # forked its task subprocesses) mid-shutdown, after the reaper had
+    # already been told to wind down. It now waits on the stop event, so
+    # setting the event both wakes it AT ONCE and makes it write nothing;
+    # the checkpoint stays open so the next boot resumes the owed slots.
+    cron = await dag_cron(_HOURLY)
+    dagcfg = cron.cron_dags["cu"]
+    dagcfg.schedule_job.catchupJitterSeconds = 300
+    # a long offset: only the stop event can end this sleep in time
+    monkeypatch.setattr(
+        Cron, "_catchup_offset", staticmethod(lambda name, jitter: 3600.0)
+    )
+    base = datetime.datetime(2026, 1, 1, 0, 0, tzinfo=_UTC)
+    now_dt = datetime.datetime(2026, 1, 1, 3, 45, tzinfo=_UTC)
+    await cron._dag._create_run(dagcfg, base, "scheduled")
+    await cron._dag._catch_up(dagcfg, now_dt)
+    assert cron._dag._catchup_tasks  # a sleeper is parked
+    cron._stop_event.set()
+    # with the old bare sleep this waits out the full hour
+    await asyncio.wait_for(
+        asyncio.gather(*cron._dag._catchup_tasks), timeout=5
+    )
+    runs = await cron._dag.list_runs("cu", limit=10)
+    assert [r["kind"] for r in runs].count("catchup") == 0
+
+
 async def test_deferred_catch_up_replays_the_reloaded_dag(
     tmp_path, monkeypatch, dag_cron
 ):
@@ -2805,6 +2835,44 @@ async def test_run_summaries_mid_rebuild_write_is_not_memoized(
     # without waiting out the (here: huge) TTL.
     second = await cron._dag._run_summaries(backend, "xc")
     assert [s["state"] for s in second] == [dag.SUCCESS]
+
+
+async def test_run_summaries_invalidated_when_the_write_times_out(
+    tmp_path, monkeypatch, dag_cron
+):
+    # asyncio.wait_for CANCELS the await but cannot undo the work: the
+    # store call runs on a worker thread that keeps going, so a timed-out
+    # (or otherwise raised) mutate may still have LANDED. Invalidating
+    # only on the success path therefore served the pre-write summary for
+    # the whole TTL, on a document that had in fact changed.
+    monkeypatch.setattr(dagrun, "DAG_SUMMARY_LIST_TTL", 3600.0)
+    cron = await dag_cron(_XC_YAML)
+    await _mint_run(cron, "r1")
+    backend = cron.state_backend
+
+    # prime the memo so there is a stale entry to serve
+    primed = await cron._dag._run_summaries(backend, "xc")
+    assert [s["state"] for s in primed] == [dag.RUNNING]
+    assert "xc" in cron._dag._summaries_memo
+
+    def _finish(body):
+        body["state"] = dag.SUCCESS
+        return body, None
+
+    real_mutate = backend.mutate_document
+
+    async def landing_but_timing_out(ns, key, transform):
+        await real_mutate(ns, key, transform)  # the write lands ...
+        raise asyncio.TimeoutError  # ... and the caller still sees a timeout
+
+    backend.mutate_document = landing_but_timing_out
+    with pytest.raises(asyncio.TimeoutError):
+        await cron._dag._mutate("xc", "r1", _finish)
+    backend.mutate_document = real_mutate
+
+    assert "xc" not in cron._dag._summaries_memo
+    after = await cron._dag._run_summaries(backend, "xc")
+    assert [s["state"] for s in after] == [dag.SUCCESS]
 
 
 # --------------------------------------------------------------------------

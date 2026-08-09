@@ -137,13 +137,6 @@ def _list_join(items: Sequence[str]) -> str:
     return "%s and %s" % (", ".join(parts[:-1]), parts[-1])
 
 
-# The tolerant field expansion (and the month/weekday name tables it
-# resolves against) lives beside the engine's own parser these days; the
-# old name stays importable because the test suite pins its tolerant
-# branches (wrap-around ranges, lazy over-range rejection) under it.
-_field_values = expand_field
-
-
 def _finish_split(
     spec: str, plain: list[str], phrases: list[str]
 ) -> tuple[str, list[str]]:
@@ -278,7 +271,9 @@ def _engine_accepts(expr: str, hash_key: Optional[str]) -> bool:
     return True
 
 
-def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
+def describe_cron(
+    expr: str, hash_key: Optional[str] = None, tab: Optional[CronTab] = None
+) -> str:
     """Plain-English schedule text, a port of the web ``describeCron``.
 
     Handles the 5-field core plus the 6-/7-field (year / second) forms the
@@ -287,6 +282,14 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
     raising.  With a ``hash_key`` (the job name), Jenkins-style ``H``
     items are resolved through the engine and the prose describes the
     hashed slot, marked as such.
+
+    ``tab`` is the same escape hatch :func:`lint_schedule` takes: a caller
+    that already parsed ``expr`` passes the result, and the engine gate
+    reuses it instead of parsing a second time.  Every hot caller (the
+    schedule preview, the job payload, the calendar feed) holds one
+    already, so the default path is now one parse per request rather than
+    two.  The tab MUST be the parse of ``expr`` under ``hash_key``; a
+    mismatched one would describe a schedule the daemon does not run.
     """
     low = (expr or "").strip().lower()
     if low == "@reboot":
@@ -335,7 +338,9 @@ def describe_cron(expr: str, hash_key: Optional[str] = None) -> str:
     except (ValueError, KeyError):
         return "Custom schedule: %s" % expr
 
-    if not _engine_accepts(expr, hash_key):
+    # a caller-supplied tab IS the engine's verdict (it parsed), so the
+    # gate reuses it rather than parsing the same text a second time
+    if tab is None and not _engine_accepts(expr, hash_key):
         # tolerantly phraseable but engine-rejected (a wrap-around range,
         # a step whose stride escapes the field): never describe it as if
         # the daemon would run it.

@@ -10423,7 +10423,9 @@ var qrcode = function() {
       ["data-cancel", cancelJob],
       ["data-pause", pauseJob],
       ["data-resume", resumeJob],
-      ["data-logs", openDrawer],
+      // wrapped: the dispatch calls fn(name, btn), and openDrawer's second
+      // parameter is a tab name (the button element would blank the drawer)
+      ["data-logs", (name) => openDrawer(name)],
     ];
     $("rows").addEventListener("click", (e) => {
       for (const [attr, fn] of rowActions) {

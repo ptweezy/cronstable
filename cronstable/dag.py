@@ -477,8 +477,12 @@ def _mapped_instance_state(
     reads as ``pending`` (non-terminal) in BOTH consumers.  The two once
     disagreed (barrier held, terminaliser skipped), so the same document
     could complete as a run while its group still read ``running`` to every
-    downstream; under the shared rule a hole holds the run open instead,
-    where the reconcile/GC paths can see it.
+    downstream; under the shared rule a hole holds the run open instead.
+    Holding it open is safe because the claim pass repairs it: the same
+    advance transform runs :func:`_propagate_and_claim` first, which
+    materialises a run-recorded index it finds missing and fails it (see
+    :func:`_resolve_missing_instance`), so the run terminalises on that
+    very pass rather than wedging.
     """
     entry = tasks.get(prefix + str(index))
     return PENDING if entry is None else str(entry.get("state", PENDING))
@@ -796,6 +800,20 @@ def _propagate_and_claim(
         for taskkey, map_index, item in _instances_of(spec, body, task):
             entry = body["tasks"].get(taskkey)
             if entry is None:
+                if map_index is not None:
+                    # A HOLE: the run's own mapped item list records this
+                    # index, so the entry should exist. Materialise it as
+                    # failed rather than skipping, or the terminaliser's
+                    # absent-instance rule (which reads a hole as pending,
+                    # holding the run open) would wedge the run forever:
+                    # nothing else can create an entry that is not there.
+                    _resolve_missing_instance(
+                        task, taskkey, map_index, item, body, now, result
+                    )
+                    continue
+                # a plain task with no entry is the deliberate
+                # "added by a reload after the run was created" case,
+                # skipped here and by the terminaliser alike
                 continue
             if verdict is None and entry.get("state") == PENDING:
                 verdict = _deps_verdict(spec, body, task)
@@ -896,6 +914,40 @@ def _resolve_unmaterialised_source(task, entry, now, result) -> None:
         "expands normally)".format(task.expand.from_task)
     )
     _terminalise_task(entry, FAILED, now, result)
+
+
+def _resolve_missing_instance(
+    task, taskkey, map_index, item, body, now, result
+) -> None:
+    """Materialise and fail a mapped instance the run records but lacks.
+
+    The run document's own ``mapped[<task>].items`` records this index, so
+    :func:`_apply_expansions` wrote an entry for it and something later
+    removed it: a partial backup restore, a hand edit, or a peer on a
+    different build.  The entry cannot be recovered, and leaving the hole is
+    worse than failing it: :func:`_mapped_instance_state` reads an absent
+    entry as PENDING (the fan-in barrier's rule), so the terminaliser would
+    hold the run open forever, renewing its advance lease for the life of the
+    daemon and never becoming eligible for retention.
+
+    Failed with a reason, like :func:`_resolve_unmaterialised_source` and
+    :func:`_resolve_stale_placeholder`: the instance genuinely cannot run,
+    an operator wants to see why, and terminalising lets the run finish,
+    release its lease and be pruned.
+    """
+    entry = _new_task_entry(task, now)
+    entry["mapIndex"] = map_index
+    entry.pop("mapped", None)
+    entry["mapItem"] = item
+    body["tasks"][taskkey] = entry
+    entry["failReason"] = (
+        "this run records mapped index {} for task {!r} but holds no entry "
+        "for it: the run document was restored from a partial backup, hand "
+        "edited, or written by a foreign build. Failed so the run can "
+        "finish (the next run expands normally)".format(map_index, task.id)
+    )
+    _terminalise_task(entry, FAILED, now, result)
+    result.changed = True
 
 
 def _resolve_stale_placeholder(task, entry, now, result) -> None:
@@ -1155,6 +1207,9 @@ def _maybe_terminalise(spec, body, now, result) -> None:
             # entry missing for a run-recorded index reads as pending, so a
             # damaged document holds the run open (matching the fan-in
             # barrier's verdict) instead of completing around the hole.
+            # _propagate_and_claim, earlier in this same transform, has
+            # already materialised and failed any such hole, so holding
+            # open here costs at most the rest of this pass.
             st = _mapped_instance_state(tasks, prefix, i)
             if st not in TERMINAL_STATES:
                 return

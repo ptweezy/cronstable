@@ -65,9 +65,9 @@ scrape_configs:
 
 If your scraper cannot send credentials, set `web.metrics.public: true` to exempt `/metrics` from authentication while everything else stays gated. The metrics reveal job names, schedules and outcomes (but never command lines, output, or secrets); treat `public` accordingly.
 
-Two response details differ from the other endpoints:
+Two response details:
 
-- `web.headers` are stamped onto the response as usual, **except** `Content-Type`, which is the exposition format's contract and always wins.
+- `web.headers` are stamped onto the response as usual, **except** `Content-Type`: the exposition format's contract always wins.
 - Content negotiation is on the `Accept` header: any request advertising `application/openmetrics-text` gets OpenMetrics (terminated by `# EOF`); everything else gets the text format.
 
 ## Metric reference

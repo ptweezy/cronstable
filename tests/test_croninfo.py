@@ -676,9 +676,9 @@ def test_duplicate_schedules_distinguish_extension_forms():
 # describe_cron / linter step + DST edges
 # ---------------------------------------------------------------------------
 import pytest  # noqa: E402
+from cronstable.cronexpr import expand_field as _field_values  # noqa: E402
 from cronstable.croninfo import (  # noqa: E402
     _DOW_NAMES,
-    _field_values,
     _finish_split,
     _split_special_dow,
 )
@@ -888,3 +888,37 @@ def test_describe_degrades_when_the_engine_rejects():
     ):
         CronTab(expr)  # engine-valid by definition of this arm
         assert not describe_cron(expr).startswith("Custom schedule"), expr
+
+
+# --- describe_cron's prebuilt-tab escape hatch ------------------------------
+
+
+def _golden_exprs():
+    import json
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), "data", "cron_golden.json")
+    with open(path, encoding="utf-8") as fobj:
+        return sorted(json.load(fobj)["exprs"])
+
+
+@pytest.mark.parametrize("expr", _golden_exprs())
+def test_describe_cron_prebuilt_tab_matches_the_reparse(expr):
+    # The engine gate used to build a throwaway CronTab on every call, so
+    # the two hot web endpoints and the calendar feed parsed the same
+    # expression twice per request. Callers that already hold the parse
+    # now pass it, the same escape hatch lint_schedule has. Passing it
+    # must be a pure cost change: identical prose for every expression the
+    # engine accepts, hashed and unhashed.
+    from cronstable.cronexpr import CronTab
+    from cronstable.croninfo import describe_cron
+
+    try:
+        tab = CronTab(expr)
+    except (ValueError, KeyError):
+        return  # engine-rejected: no tab exists to hand in
+    assert describe_cron(expr, tab=tab) == describe_cron(expr)
+    hashed = CronTab(expr, hash_key="a-job")
+    assert describe_cron(expr, hash_key="a-job", tab=hashed) == describe_cron(
+        expr, hash_key="a-job"
+    )

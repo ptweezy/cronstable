@@ -1851,7 +1851,7 @@ def test_rebuilt_manager_holds_available_gates_until_reattested(no_tls):
             (name, "inst-" + name, True),
             ("node-c", "inst-old-c", True),
         ]
-    assert mgr._view_settled() is False
+    assert mgr.view_settled() is False
     assert mgr.is_available_leader() is False
     assert mgr.is_available_job_owner("job-x") is False
     # a peer re-polls this incarnation and attests it: the view settles and
@@ -1859,7 +1859,7 @@ def test_rebuilt_manager_holds_available_gates_until_reattested(no_tls):
     # min-name owner instead of double-running.
     for host in ("a:1", "b:1"):
         mgr.view.peers[host].members.append(("node-c", mgr.instance_id, True))
-    assert mgr._view_settled() is True
+    assert mgr.view_settled() is True
     assert mgr.available_leader_name() == "node-a"
     assert mgr.is_available_leader() is False
 
@@ -1918,7 +1918,7 @@ def test_convergence_hold_is_bounded_for_one_way_peers(no_tls):
     peer.members = [("node-a", "inst-a", True)]  # never lists node-b
     assert mgr.is_available_leader() is False  # still converging
     mgr._poll_rounds = _SETTLE_ROUNDS  # ~2 real intervals later
-    assert mgr._view_settled() is True
+    assert mgr.view_settled() is True
     assert mgr.is_available_leader() is True  # one-way peer: lean to running
     assert mgr.is_available_job_owner("job-x") is True
 
@@ -1937,7 +1937,7 @@ def test_legacy_peer_does_not_hold_available_gates(no_tls):
     peer.job_set_id = "v1:mine"
     peer.members = []
     peer.reports_members = False  # a legacy build
-    assert mgr._view_settled() is True
+    assert mgr.view_settled() is True
     assert mgr.is_available_leader() is True  # min name, counted one-way
 
 
@@ -2182,7 +2182,7 @@ def _spread_mesh(mgr_graph, distribution, electLeader=True):
             else:
                 # a CONVERGED view of a node this one cannot reach: polled and
                 # failed. Leaving it never-polled (unknown) would instead hold
-                # the never-skip available_* gates closed (see _view_settled),
+                # the never-skip available_* gates closed (see view_settled),
                 # which is the startup state, not the converged mesh these
                 # tests model.
                 mgrs[n].view.record_failure(
@@ -2958,6 +2958,17 @@ _POLL_PEER_FAILURE_CASES = [
         None,
         True,
         id="non-string-node-name",
+    ),
+    # an EMPTY node_name passes the length/printability checks ("" is
+    # printable) yet sorts below every real name; stored, it would count
+    # toward quorum as a peer no election fold can name.  Rejected at the
+    # same parse seam that drops the set-shaped fields' empties.
+    pytest.param(
+        {"payload": _peer_body(node_name="")},
+        STATUS_UNREACHABLE,
+        "empty",
+        True,
+        id="empty-node-name",
     ),
     # #4: an over-cap body is refused rather than buffered (OOM guard).
     pytest.param(
@@ -3797,6 +3808,50 @@ async def test_candidate_truncation_warning_does_not_flood(no_tls, caplog):
 
 
 @pytest.mark.asyncio
+async def test_candidate_truncation_warning_survives_membership_churn(
+    no_tls, caplog
+):
+    # The limiter used to key on the exact oversize COUNT, so it only held
+    # while that number stood still. One node joining or leaving an
+    # over-cap fleet changed it and re-fired both lines every poll round,
+    # which is the flood the limiter exists to stop (the test above cannot
+    # see it: it re-seeds the identical set every round). It is a
+    # per-episode latch now.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = _mgr(["b:1"])
+    base = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES + 40)
+    }
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        for extra in range(6):
+            # every round the fleet is a DIFFERENT size, and every round
+            # it is still over the cap
+            churned = base | {"churn{:02d}".format(i) for i in range(extra)}
+            _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | churned)
+            mgr._bridge_candidates()
+            mgr._capped_vouched()
+    warned = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    assert len(warned) == 2, [r.getMessage() for r in warned]
+
+    # dropping under the cap and growing back over it IS a new episode
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        _seed_agree(mgr, "b:1", "node-b", mutual={"node-a", "node-c"})
+        mgr._bridge_candidates()
+        mgr._capped_vouched()
+        _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | base)
+        mgr._bridge_candidates()
+        mgr._capped_vouched()
+    again = [
+        r for r in caplog.records if "advertisement cap" in r.getMessage()
+    ]
+    assert len(again) == 2, [r.getMessage() for r in again]
+
+
+@pytest.mark.asyncio
 async def test_cluster_read_does_not_blank_advert_truncation(no_tls):
     # The /cluster view flag rode the same scalar the bridge derive zeroes
     # when ITS half fits, and view_dict cascades into that derive, so the
@@ -3868,6 +3923,34 @@ async def test_candidates_truncated_clears_when_the_fleet_shrinks(no_tls):
 
 
 @pytest.mark.asyncio
+async def test_candidates_truncated_reports_growth_before_any_peer_poll(
+    no_tls,
+):
+    # The mirror of the shrink case, and the more dangerous direction: the
+    # advert cell is written only by a /peer response build, so a node
+    # nobody polls yet reported 0 while its union had ALREADY outgrown the
+    # cap and every future advert would drop a co-owner. The read must
+    # re-derive the advert side in both directions, not only clear it.
+    from cronstable.cluster import MAX_ADVERTISED_CANDIDATE_NAMES
+
+    mgr = _mgr(["b:1", "c:1"])
+    flood = {
+        "n{:04d}".format(i) for i in range(MAX_ADVERTISED_CANDIDATE_NAMES)
+    }
+    # the bridge half fits the cap exactly, so its own cell stays 0 ...
+    _seed_agree(mgr, "b:1", "node-b", mutual={"node-a"} | flood)
+    _seed_agree(mgr, "c:1", "node-c", mutual={"node-a"})
+    assert mgr._bridge_candidates() == sorted(flood)
+    assert mgr._candidates_trunc_seen.get("bridge", 0) == 0
+    # ... while the union (the bridge set plus the two direct peers) does
+    # not. No /peer poll has ever rebuilt the body here.
+    union = len(mgr._eligible_candidates())
+    assert union > MAX_ADVERTISED_CANDIDATE_NAMES
+    assert mgr._candidates_truncated == union
+    assert mgr.view_dict()["candidates_truncated"] == union
+
+
+@pytest.mark.asyncio
 async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
     no_tls, monkeypatch
 ):
@@ -3910,6 +3993,38 @@ async def test_handle_peer_drops_summaries_rather_than_ship_oversized(
     req = _Req()
     req.headers = {"If-None-Match": resp.headers["ETag"]}
     assert (await mgr._handle_peer(req)).status == 304
+
+
+@pytest.mark.asyncio
+async def test_handle_peer_says_so_when_shedding_cannot_fit_the_body(
+    no_tls, monkeypatch, caplog
+):
+    # The shed is the only lever here, so it can fail two ways: no
+    # provider is installed (job_summaries is already {}, so dropping it
+    # removes nothing) or the rest of the body is over on its own. Either
+    # way the old code logged "dropped job_summaries ... " as if that had
+    # worked and shipped a body every honest poller rejects. Say what is
+    # actually happening instead, and do not claim a drop that was a
+    # no-op.
+    import logging
+
+    import cronstable.cluster as cluster_mod
+
+    monkeypatch.setattr(cluster_mod, "MAX_PEER_RESPONSE_BYTES", 64)
+    mgr = _mgr([])  # no job-summaries provider: the shed removes nothing
+    with caplog.at_level(logging.WARNING, logger="cronstable.cluster"):
+        resp = await mgr._handle_peer(_Req())
+    payload = json.loads(resp.text)
+    assert len(resp.body) > 64  # still over: nothing left to shed
+    # the no-op shed did not flip the marker: nothing was truncated, and a
+    # poller must not be told the fleet view was cut when it never existed
+    assert payload["job_summaries"] == {}
+    assert payload["job_summaries_truncated"] is False
+    records = [r for r in caplog.records if "/peer response" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert "drop it from their quorum" in records[0].getMessage()
+    assert "dropped job_summaries" not in records[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -5958,7 +6073,9 @@ async def test_handle_peer_compresses_without_gzip(tmp_path, monkeypatch):
     req = _FakeReq(b"", {"Accept-Encoding": "identity"})
     resp = await mgr._handle_peer(req)
     assert resp.status == 200
-    assert isinstance(resp.body, bytes) and len(resp.body) >= MIN_COMPRESS_BYTES
+    assert (
+        isinstance(resp.body, bytes) and len(resp.body) >= MIN_COMPRESS_BYTES
+    )
     assert codings == [None]  # bare call: aiohttp negotiates
     # and the gzip-advertised path picks gzip EXPLICITLY (the sibling branch)
     req_gzip = _FakeReq(b"", {"Accept-Encoding": "gzip, deflate"})

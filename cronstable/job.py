@@ -261,6 +261,12 @@ class _MirrorWriter:
                 with self._lock:
                     warn = self._drop_warn_pending
                     self._drop_warn_pending = False
+                    # re-arm: this episode is over (the consumer is
+                    # provably draining again), so the NEXT backup gets
+                    # its own warning. Without the reset the latch was
+                    # per-process and every later episode shed job output
+                    # silently.
+                    self._drop_logged = False
                 if warn:
                     logger.warning(
                         "passthrough mirror is backed up (its consumer is "
@@ -607,6 +613,25 @@ class StreamReader:
         return output, self.discarded_lines
 
 
+async def _resolve_secret_async(
+    spec: Optional[dict[str, Any]], what: str
+) -> Optional[str]:
+    """:func:`config._resolve_secret`, off the event loop for a file source.
+
+    The reporters run from the completion path, so a ``fromFile`` secret on
+    a slow or hung mount (a Kubernetes secret volume, NFS) would block the
+    whole scheduler on an ordinary open+read.  Same offload rule
+    :func:`cronstable.jobapi.stage_secrets` applies at launch: only a file
+    source pays the thread hop, since value and env sources cost less than
+    the hop itself.
+    """
+    if spec and spec.get("fromFile"):
+        return await asyncio.get_running_loop().run_in_executor(
+            None, _resolve_secret, spec, what
+        )
+    return _resolve_secret(spec, what)
+
+
 class Reporter:
     async def report(
         self, success: bool, job: "RunningJob", config: dict[str, Any]
@@ -630,7 +655,7 @@ class SentryReporter(Reporter):
             # var is a clean skip, never a traceback out of the completion
             # path, and its messages name the config key so env var names
             # stay out of the logs.
-            dsn = _resolve_secret(config["dsn"], "sentry.dsn")
+            dsn = await _resolve_secret_async(config["dsn"], "sentry.dsn")
         except ConfigError as ex:
             logger.error("sentry: %s; not reporting", ex)
             return
@@ -699,7 +724,9 @@ class MailReporter(Reporter):
             # Shared secret resolver; see SentryReporter for the rationale
             # (clean skip on a bad source, env var names stay out of logs).
             # None (no source configured) means unauthenticated SMTP.
-            password = _resolve_secret(mail["password"], "mail.password")
+            password = await _resolve_secret_async(
+                mail["password"], "mail.password"
+            )
         except ConfigError as ex:
             logger.error("mail: %s; not sending email", ex)
             return
@@ -1082,7 +1109,7 @@ class WebhookReporter(Reporter):
         try:
             # Shared secret resolver; see SentryReporter (clean skip on a
             # bad source; the URL itself is the secret here).
-            url = _resolve_secret(webhook["url"], "webhook.url")
+            url = await _resolve_secret_async(webhook["url"], "webhook.url")
         except ConfigError as ex:
             logger.error("webhook: %s; not reporting", ex)
             return
@@ -1498,8 +1525,19 @@ class RunningJob:
                 await asyncio.wait_for(task, STATSD_START_FLUSH_TIMEOUT)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - telemetry is best-effort
+            except asyncio.TimeoutError:
+                # the documented "host that misses this window" case: the
+                # open is still in flight and stays pooled, nothing to say
                 pass
+            except Exception as ex:  # noqa: BLE001 - best-effort telemetry
+                # same failure as the done branch above, so log it the same
+                # way: which arm runs is pure timing, and swallowing here
+                # made an identical fault diagnosable or invisible by race.
+                logger.warning(
+                    "Job %s: failed to send statsd job_started metric",
+                    self.config.name,
+                    exc_info=ex,
+                )
         if self.statsd_writer:
             # best-effort: the statsd machinery can raise beyond OSError,
             # and a telemetry failure must never break the completion

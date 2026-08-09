@@ -390,7 +390,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
           set -euo pipefail
-          .tox/py/bin/python -m pytest tests/test_web_engine_parity.py \
+          .tox/py/bin/python -m pytest \
+            tests/test_web_engine_parity.py \
+            tests/test_web_heat_e2e.py \
+            tests/test_web_drawer_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
           .tox/py/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
@@ -634,7 +637,8 @@ jobs:
       # restore-keys seeds the rebuild from the previous cache when either
       # file changes.
       - name: Restore pip cache (QEMU-built wheels)
-        uses: actions/cache@v6.1.0
+        id: pip-cache
+        uses: actions/cache/restore@v6.1.0
         with:
           path: .pip-cache
           key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
@@ -673,6 +677,13 @@ jobs:
               # enough on its own, and a failed index fetch is a hard job
               # failure, so the matrix-provided commands wrap themselves in it.
               . /src/.github/scripts/retry.sh
+              # pip refuses to use a cache directory it does not own: this
+              # container runs as root while the bind-mounted workspace is
+              # the runner user, so without the chown every pip call logs
+              # "The cache has been disabled" and the whole persisted cache
+              # stores nothing. The host-side step after the build hands
+              # ownership back so the cache save can read it.
+              mkdir -p /src/.pip-cache && chown -R root:root /src/.pip-cache
               # Per-libc C toolchain + strip (the spec sets strip=True), plus
               # libffi/zlib headers for the deps that ship no wheel for this
               # libc/arch and fall back to compiling from sdist (notably the
@@ -725,6 +736,30 @@ jobs:
               fi
               mv dist/cronstable dist/cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}
             '
+      # The container runs as root and pip creates its cache files via
+      # tempfile (mode 0600), so without this the runner-user tar in
+      # actions/cache's save step cannot read them: the save fails with a
+      # permissions warning the job ignores, and every push recompiles the
+      # QEMU wheels the cache exists to keep.
+      - name: Make the pip cache readable by the cache save
+        run: |
+          set -euo pipefail
+          if [ -d .pip-cache ]; then
+            sudo chown -R "$(id -u):$(id -g)" .pip-cache
+          fi
+      # Branch-gated like the docker job's buildx export, and for the same
+      # reason: the Actions cache is ONE 10 GB pool per repository, shared
+      # with that exporter's multi-GB layer blobs, and this job alone is 13
+      # matrix rows. Writing from every branch and every fork PR would evict
+      # the layer cache the docker build depends on. Every other branch
+      # still RESTORES through to what develop and main stored, which is
+      # where the QEMU compile savings actually come from.
+      - name: Save pip cache (long-lived branches only)
+        if: ${{ steps.pip-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') }}
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .pip-cache
+          key: pip-${{ matrix.libc }}-${{ matrix.arch }}-${{ hashFiles('pyproject.toml', '.github/workflows/release.yml') }}
       - uses: actions/upload-artifact@v7.0.1
         with:
           name: cronstable-linux-${{ matrix.arch }}${{ matrix.suffix }}

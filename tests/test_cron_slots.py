@@ -370,6 +370,7 @@ def _slotlease_cluster_cron(policy_yaml=_SLOTLEASE_CLUSTER_FORBID, monkeypatch=N
     cron._state_configured = True
     cron._slot_fidelity = ""  # verified: locks fence, skip the probe
     if monkeypatch is not None:
+
         async def _noop_reconcile(job):
             return None
 
@@ -479,7 +480,9 @@ async def test_slotlease_claim_adopts_own_late_acquire(
 
 
 @pytest.mark.asyncio
-async def test_slotlease_claim_expired_unreclaimed_falls_to_policy(monkeypatch):
+async def test_slotlease_claim_expired_unreclaimed_falls_to_policy(
+    monkeypatch,
+):
     cron = _slotlease_cluster_cron(monkeypatch=monkeypatch)
     # a foreign lease whose TTL already lapsed: treated as unanswered, so the
     # degrade policy grants a node-local run.
@@ -581,7 +584,9 @@ async def test_slotlease_pursue_replace_stops_on_shutdown():
 
 
 @pytest.mark.asyncio
-async def test_slotlease_pursue_replace_relaunches_when_slot_frees(monkeypatch):
+async def test_slotlease_pursue_replace_relaunches_when_slot_frees(
+    monkeypatch,
+):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
     # append ok, then the slot reads back free (holder released) -> relaunch.
@@ -687,7 +692,10 @@ async def test_slotlease_slot_renewer_list_error_then_taken_over(monkeypatch):
         # cycle 2: list ok empty; renew denied (None) -> read shows a peer
         #          took the slot over -> pop + return.
         list_script=[RuntimeError("list blip"), []],
-        renew_script=[_slotlease_lease(holder=cron._slot_holder(), fence=6), None],
+        renew_script=[
+            _slotlease_lease(holder=cron._slot_holder(), fence=6),
+            None,
+        ],
         read_script=[None, _slotlease_lease(holder="peer#9", fence=9)],
     )
     cron.state_backend = backend
@@ -721,7 +729,9 @@ async def test_slotlease_slot_renewer_renew_timeout_then_error_then_taken_over(
 
 
 @pytest.mark.asyncio
-async def test_slotlease_slot_renewer_replace_request_cancels_instance(monkeypatch):
+async def test_slotlease_slot_renewer_replace_request_cancels_instance(
+    monkeypatch,
+):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_REPLACE)
     mine = _slotlease_lease(holder=cron._slot_holder(), fence=5)
@@ -892,6 +902,7 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
             finished.append(token)
 
     cron._job_api = _Api()
+
     async def _fake_prepare(j, rs):
         return ("tok123", {"CRONSTABLE_RUN_ID": "rid"})
 
@@ -909,6 +920,54 @@ async def test_slotlease_maybe_launch_job_releases_slot_on_start_failure(
         await cron.maybe_launch_job(job)
     assert released == ["s"]
     assert finished == ["tok123"]
+
+
+@pytest.mark.asyncio
+async def test_slotlease_maybe_launch_job_releases_slot_on_prepare_cancel(
+    monkeypatch,
+):
+    """Cancellation inside _prepare_job_api_run hands the claim back.
+
+    Staging fromFile secrets awaits the executor, so a client gone
+    mid-POST cancels the launch right there; the claim made a few lines
+    above must not outlive it (the leak pinned here kept the refcount and
+    renew task forever, wedging a Forbid job cluster-wide).  finish_run
+    stays uncalled: the await precedes register_run, so no token exists.
+    """
+    cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
+    job = cron.cron_jobs["s"]
+
+    async def _claim(j):
+        return True
+
+    monkeypatch.setattr(cron, "_claim_cluster_slot", _claim)
+    released = []
+
+    async def _release(j):
+        released.append(j.name)
+
+    monkeypatch.setattr(cron, "_release_cluster_slot", _release)
+    finished = []
+
+    class _Api:
+        async def finish_run(self, token):
+            finished.append(token)
+
+    cron._job_api = _Api()
+    parked = asyncio.Event()
+
+    async def _hung_prepare(j, rs):
+        parked.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(cron, "_prepare_job_api_run", _hung_prepare)
+    task = asyncio.create_task(cron.maybe_launch_job(job))
+    await parked.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert released == ["s"]
+    assert finished == []
 
 
 # --- cancellation propagates through every store call (never swallowed) -----
@@ -966,7 +1025,9 @@ async def test_slotlease_slot_renewer_renew_cancel_propagates(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_slotlease_slot_renewer_readback_error_then_takeover(monkeypatch):
+async def test_slotlease_slot_renewer_readback_error_then_takeover(
+    monkeypatch,
+):
     monkeypatch.setattr(asyncio, "sleep", _slotlease_fast_sleep)
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_CLUSTER_FORBID)
     cron._slot_leases["s"] = _slotlease_lease(holder=cron._slot_holder(), fence=5)
@@ -976,7 +1037,10 @@ async def test_slotlease_slot_renewer_readback_error_then_takeover(monkeypatch):
         # renew denied both cycles; cycle 1 read-back errors -> continue,
         # cycle 2 read-back shows a takeover -> pop + return.
         renew_script=[None, None],
-        read_script=[RuntimeError("blip"), _slotlease_lease(holder="peer#2", fence=8)],
+        read_script=[
+            RuntimeError("blip"),
+            _slotlease_lease(holder="peer#2", fence=8),
+        ],
     )
     cron.state_backend = backend
     task = asyncio.create_task(cron._slot_renewer("s"))
@@ -1058,6 +1122,7 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
             finished.append(token)
 
     cron._job_api = _Api()
+
     async def _fake_prepare(j, rs):
         return ("tokN", {})
 
@@ -1078,9 +1143,12 @@ async def test_slotlease_maybe_launch_node_scope_start_failure_finishes_run(
 
 
 @pytest.mark.asyncio
-async def test_slotlease_maybe_launch_start_failure_without_job_api(monkeypatch):
+async def test_slotlease_maybe_launch_start_failure_without_job_api(
+    monkeypatch,
+):
     cron = cronstable.cron.Cron(None, config_yaml=_SLOTLEASE_NODE_JOB)
     job = cron.cron_jobs["s"]
+
     async def _fake_prepare(j, rs):
         return (None, {})
 

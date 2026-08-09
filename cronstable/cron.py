@@ -650,6 +650,38 @@ async def _error_envelope_middleware(request, handler):
             headers=headers,
             content_type="application/json",
         )
+    except asyncio.CancelledError:
+        raise  # a disconnected client is not an error to report
+    except asyncio.TimeoutError:
+        # a store call that outran its budget: aiohttp would answer 500,
+        # but the accurate status is a gateway timeout, and either way the
+        # body must be the envelope like every other error.
+        logger.exception("web: timed out serving %s", request.rel_url.path)
+        return web.Response(
+            text=_error_body(
+                "the request timed out; the reason is in the cronstable log"
+            ),
+            status=504,
+            content_type="application/json",
+        )
+    except Exception:  # noqa: BLE001 - the envelope's last arm
+        # An unhandled error used to escape to aiohttp's own handler,
+        # which answers text/plain (or text/html on an Accept), so the ONE
+        # status a client could not parse uniformly was the 500. Message
+        # is fixed: the reason goes to the log, never to the caller (the
+        # rule _push_store_unavailable and the MCP/jobapi surfaces follow).
+        # aiohttp's own log_exception is lost once this arm handles it, so
+        # log here or the traceback disappears.
+        logger.exception(
+            "web: internal error serving %s", request.rel_url.path
+        )
+        return web.Response(
+            text=_error_body(
+                "internal error; the reason is in the cronstable log"
+            ),
+            status=500,
+            content_type="application/json",
+        )
 
 
 # aiohttp's decorator is this assignment plus a return, so this is the same
@@ -842,6 +874,36 @@ def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
         "last_rss_bytes": (
             last_usage.max_rss_bytes if last_usage is not None else None
         ),
+    }
+
+
+def _activity_jobs(
+    histories: dict[str, list[JobRunInfo]], limit: int
+) -> dict[str, Any]:
+    """The ``/activity`` payload over a snapshot of per-job run histories.
+
+    Each job maps to its newest ``limit`` retained runs, oldest first,
+    each row exactly ``{started_at, finished_at, outcome}``.  Pure over
+    its arguments, and the three fields it reads are frozen at row
+    construction, so the large-fleet branch of the product build runs
+    this on a worker thread beside the serialize/hash/gzip.
+    """
+    return {
+        "jobs": {
+            name: [
+                {
+                    "started_at": (
+                        r.started_at.isoformat()
+                        if r.started_at is not None
+                        else None
+                    ),
+                    "finished_at": r.finished_at.isoformat(),
+                    "outcome": r.outcome,
+                }
+                for r in rows[-limit:]
+            ]
+            for name, rows in histories.items()
+        }
     }
 
 
@@ -1371,15 +1433,35 @@ def _cachable_json_response(
 ) -> web.Response:
     """A :func:`_json_response` that can 304 and gzip, for the poll fan-out.
 
-    Unmemoized composition of :func:`_cachable_json_product` and
-    :func:`_conditional_response`. ``use_etag=False`` is for a payload
+    Unmemoized sibling of :func:`_cachable_json_product`, feeding the same
+    :func:`_conditional_response` tail. ``use_etag=False`` is for a payload
     that legitimately changes every request (``/cluster`` embeds freshly
     sampled CPU/memory), where a tag would never match; such a response
     still negotiates gzip.
+
+    Unlike the memoized product this serves ONE caller, so it builds only
+    what that caller takes: no sha256 for an untagged payload, and no gzip
+    for a client that did not ask or for a request the tag answers 304.
+    The memoized product still builds both eagerly, and must: it is shared
+    across pollers with mixed ``Accept-Encoding`` and ``If-None-Match``.
     """
-    etag, body, gz = _cachable_json_product(payload)
+    body = _json_body(payload)
+    etag = (
+        '"' + hashlib.sha256(body).hexdigest()[:32] + '"' if use_etag else None
+    )
+    # decided up front: a 304 carries no body, so compressing one is pure
+    # waste on the event loop, and /cluster (use_etag=False) never tagged
+    gz = (
+        _gzip_body(body)
+        if (
+            gzip_ok
+            and len(body) >= _GZIP_MIN_BYTES
+            and not (etag is not None and _etag_matches(if_none_match, etag))
+        )
+        else None
+    )
     return _conditional_response(
-        etag if use_etag else None,
+        etag,
         body,
         gz,
         if_none_match=if_none_match,
@@ -1397,13 +1479,23 @@ def _cachable_json_product(
     body bytes, so a 304 is served only for a byte-identical
     representation. Built once per memo window, however many pollers land.
     """
-    try:
-        body = _json.dumps_bytes(payload, trusted=True)
-    except (_json.UnsupportedValue, ValueError, TypeError):
-        body = json.dumps(payload, default=str).encode("utf-8")
+    body = _json_body(payload)
     etag = '"' + hashlib.sha256(body).hexdigest()[:32] + '"'
     gz = _gzip_body(body) if len(body) >= _GZIP_MIN_BYTES else None
     return etag, body, gz
+
+
+def _json_body(payload: Any) -> bytes:
+    """A payload's response bytes: the portable encoder, then the fallback.
+
+    The one serialize both the memoized product and the single-caller
+    response take, so the fallback for a payload the portable encoder
+    refuses cannot drift between them.
+    """
+    try:
+        return _json.dumps_bytes(payload, trusted=True)
+    except (_json.UnsupportedValue, ValueError, TypeError):
+        return json.dumps(payload, default=str).encode("utf-8")
 
 
 def _metrics_response_product(
@@ -1714,6 +1806,14 @@ class Cron:
         ] = _ResponseMemo()
         self._activity_response_memo: _ResponseMemo[
             tuple[str, bytes, Optional[bytes]]
+        ] = _ResponseMemo()
+        # The MCP cron_query_metrics snapshot: the same universe /metrics
+        # renders, materialised once per window and filtered per call. It
+        # lives here rather than on the handler so _bust_response_memos
+        # reaches it (that clears .cached outright, which a handler-held
+        # slot would miss, serving pre-bust rows out to the TTL).
+        self._metric_samples_memo: _ResponseMemo[
+            list[tuple[str, str, str]]
         ] = _ResponseMemo()
         # Bumped by every _bust_response_memos call; builds re-check it
         # before storing and joiners before trusting a shared product, so a
@@ -2203,15 +2303,23 @@ class Cron:
         await close_webhook_pool()
 
     def _cancel_coordination_tasks(self) -> None:
-        """Cancel the Replace pursuits, retry claim scan and pause refresh.
+        """Cancel the launch-adjacent background work: Replace pursuits, the
+        DAG catch-up sleepers, the retry claim scan and the pause refresh.
 
-        All three are scoped to the current state backend; the pause refresh
-        is cancelled rather than awaited because it mutates the pause gate
-        map, which nothing left in the shutdown path reads.
+        All are scoped to the current state backend; the pause refresh is
+        cancelled rather than awaited because it mutates the pause gate map,
+        which nothing left in the shutdown path reads. The DAG sleepers are
+        cancelled at this seam, not at the later _dag.shutdown(), for the
+        same reason the pursuits are: both can LAUNCH work, and the drain
+        that follows is unbounded. (They also self-terminate on the stop
+        event; this stops them before the drain rather than after it.)
         """
         for task in list(self._slot_pursuits.values()):
             task.cancel()
         self._slot_pursuits.clear()
+        for task in list(self._dag._catchup_tasks):
+            task.cancel()
+        self._dag._catchup_tasks.clear()
         if self._retry_claim_task is not None:
             self._retry_claim_task.cancel()
             self._retry_claim_task = None
@@ -2539,20 +2647,25 @@ class Cron:
             self._logged_job_set_id = current
 
     async def _web_get_version(self, request: web.Request) -> web.Response:
+        # stripped like every other route: the endpoint's own text/plain
+        # wins over a web.headers Content-Type in any spelling
         return web.Response(
             text=cronstable.version.version,
-            headers=self._web_headers(),
+            headers=_strip_content_type(self._web_headers()),
         )
 
     async def _web_job_set_id(self, request: web.Request) -> web.Response:
         job_set = self.job_set_id()
-        headers = self._web_headers()
         if _accepts_json(request):
             return _json_response(
                 {"job_set_id": job_set, "jobs": len(self.cron_jobs)},
-                headers=headers,
+                headers=self._web_headers(),
             )
-        return web.Response(text=job_set, headers=headers)
+        # the text branch owns its Content-Type too (_json_response strips
+        # on the JSON branch already)
+        return web.Response(
+            text=job_set, headers=_strip_content_type(self._web_headers())
+        )
 
     def cluster_payload(self) -> dict[str, Any]:
         """This node's cluster/leadership view.
@@ -2772,6 +2885,36 @@ class Cron:
             headers=self._web_headers(),
         )
 
+    async def metric_samples_snapshot(self) -> list[tuple[str, str, str]]:
+        """The metric universe as ``(name, label_block, value)`` triples.
+
+        Behind MCP ``cron_query_metrics``, on the same shared-product memo
+        ``GET /metrics`` uses and busted by the same local events, so N
+        agents polling within a second cost ONE walk of the universe
+        rather than N. The per-call ``match``/``limit`` filter runs over
+        this snapshot, which keeps filtering per caller while the
+        expensive half is shared.
+        """
+        return await self._shared_response_product(
+            self._metric_samples_memo,
+            _METRICS_RESPONSE_TTL,
+            self._build_metric_samples,
+        )
+
+    async def _build_metric_samples(self) -> list[tuple[str, str, str]]:
+        # iter_samples reads live scheduler state EAGERLY (the family
+        # build, which must stay on the loop) and returns a lazy generator
+        # over that freshly built list, which nobody else references. The
+        # walk that assembles label blocks and formats values happens
+        # during iteration, so list() is exactly the expensive half and is
+        # safe to run in a worker thread, at the same gate /metrics uses.
+        pending = self.metrics.iter_samples(self)
+        if len(self.cron_jobs) >= _METRICS_OFFLOAD_MIN_JOBS:
+            return await asyncio.get_running_loop().run_in_executor(
+                None, list, pending
+            )
+        return list(pending)
+
     async def _metrics_product(
         self, openmetrics: bool
     ) -> tuple[bytes, Optional[bytes]]:
@@ -2912,7 +3055,8 @@ class Cron:
                 )
             return web.Response(
                 text="\n".join(lines),
-                headers=self._web_headers(),
+                # the text branch owns its Content-Type, like every route
+                headers=_strip_content_type(self._web_headers()),
             )
 
     def summary_payload(self) -> dict[str, Any]:
@@ -3086,12 +3230,11 @@ class Cron:
 
     async def _web_push_pair(self, request: web.Request) -> web.Response:
         service = self._push_service_required()
-        try:
-            body = await request.json()
-        except ValueError:
-            raise _api_error(
-                web.HTTPBadRequest, "body must be a JSON object"
-            ) from None
+        # the shared reader, like every other body-taking route: a bare
+        # request.json() catch missed the non-ValueError decode failures
+        # (a bogus charset= raises LookupError), which escaped the JSON
+        # error envelope as aiohttp's plain-text 500.
+        body = await self._web_json_body(request)
         try:
             fields = push.validate_pairing(body)
         except push.PushError as exc:
@@ -3357,7 +3500,10 @@ class Cron:
                 "valid": True,
                 "reboot": False,
                 "normalized": str(tab),
-                "description": describe_cron(text, hash_key=seed),
+                # `tab` is this very text parsed under `seed` a few
+                # lines up: the describer reuses it instead of parsing
+                # the same expression a second time per request
+                "description": describe_cron(text, hash_key=seed, tab=tab),
                 "fires": [when.isoformat() for when in fires],
                 "never_fires": not fires,
                 "lint": [
@@ -3495,7 +3641,9 @@ class Cron:
             {
                 "expression": str(tab),
                 "reboot": False,
-                "description": describe_cron(str(tab), hash_key=job.name),
+                "description": describe_cron(
+                    str(tab), hash_key=job.name, tab=tab
+                ),
                 "at_in_zone": aware.isoformat(),
             }
         )
@@ -5085,9 +5233,9 @@ class Cron:
 
         Called from exactly the local events that change the payloads (run
         recorded, launch, pause set/cleared, reload); everything else ages
-        out by TTL. All four memos bust together: they render the same
-        local facts and must not disagree. The generation bump stops a
-        build that STARTED pre-bust from re-populating the slot late (see
+        out by TTL. Every memo busts together: they render the same local
+        facts and must not disagree. The generation bump stops a build that
+        STARTED pre-bust from re-populating the slot late (see
         _shared_response_product).
         """
         self._memo_gen += 1
@@ -5096,6 +5244,7 @@ class Cron:
             memo.cached = None
         self._fleet_response_memo.cached = None
         self._activity_response_memo.cached = None
+        self._metric_samples_memo.cached = None
 
     async def _web_get_job(self, request: web.Request) -> web.Response:
         """One job's full detail dict (``GET /jobs/{name}``).
@@ -5474,33 +5623,33 @@ class Cron:
             payload["runs"] = payload["runs"][-limit:]  # newest retained
         return _json_response(payload, headers=self._web_headers())
 
-    def activity_payload(self) -> dict[str, Any]:
+    def _activity_snapshot(self) -> dict[str, list[JobRunInfo]]:
+        """Per-job pointer copies of the run histories, for ``/activity``.
+
+        List copies of the deques, taken on the loop: an executor thread
+        must never iterate a live history deque (a reaper append mid-walk
+        raises "deque mutated during iteration").  Every configured job is
+        present (``[]`` for one with no history) so a client can tell "no
+        runs" from "unknown job".
+        """
+        return {
+            # .get, never a subscript: run_history is a defaultdict and a
+            # read must not grow it one empty deque per never-run job
+            name: list(self.run_history.get(name) or ())
+            for name in self.cron_jobs
+        }
+
+    def activity_payload(
+        self, limit: int = RUN_HISTORY_LIMIT
+    ) -> dict[str, Any]:
         """Every job's retained runs, cut down to what the heatmap plots.
 
         Behind ``GET /activity``: ``jobs`` maps each job name to its
-        retained runs oldest first, each row exactly ``{started_at,
-        finished_at, outcome}``.  Every configured job is present (``[]``
-        for one with no history) so a client can tell "no runs" from
-        "unknown job".
+        newest ``limit`` retained runs oldest first, each row exactly
+        ``{started_at, finished_at, outcome}``.  The default serves the
+        whole retained window.
         """
-        jobs: dict[str, list[dict[str, Any]]] = {}
-        for name in self.cron_jobs:
-            # .get, never a subscript: run_history is a defaultdict and a
-            # read must not grow it one empty deque per never-run job
-            history = self.run_history.get(name)
-            jobs[name] = [
-                {
-                    "started_at": (
-                        r.started_at.isoformat()
-                        if r.started_at is not None
-                        else None
-                    ),
-                    "finished_at": r.finished_at.isoformat(),
-                    "outcome": r.outcome,
-                }
-                for r in (history or ())
-            ]
-        return {"jobs": jobs}
+        return _activity_jobs(self._activity_snapshot(), limit)
 
     async def _web_get_activity(self, request: web.Request) -> web.Response:
         """Batched recent run outcomes for every job (the heatmap's feed).
@@ -5510,6 +5659,28 @@ class Cron:
         fields the overlay plots, on the same memo, ETag and gzip scaffold
         as the other poll legs, busted by the same local events.
         """
+        # the same clamped `limit` (rows per job, newest retained) the
+        # other capped listings take; the default full-window response is
+        # the memo-shared one, and an explicit narrower cut is built per
+        # request (neither dashboard sends one, and a memo would otherwise
+        # need a slot per distinct limit).
+        limit = self._web_int_query(
+            request,
+            "limit",
+            default=RUN_HISTORY_LIMIT,
+            lo=1,
+            hi=RUN_HISTORY_LIMIT,
+        )
+        if limit != RUN_HISTORY_LIMIT:
+            etag, body, gz = await self._build_activity_product(limit)
+            return _conditional_response(
+                etag,
+                body,
+                gz,
+                if_none_match=request.headers.get("If-None-Match"),
+                gzip_ok=_accepts_gzip(request.headers.get("Accept-Encoding")),
+                headers=self._web_headers(),
+            )
         return await self._memoized_conditional_response(
             request,
             self._activity_response_memo,
@@ -5518,17 +5689,24 @@ class Cron:
         )
 
     async def _build_activity_product(
-        self,
+        self, limit: int = RUN_HISTORY_LIMIT
     ) -> tuple[str, bytes, Optional[bytes]]:
-        # the projection reads the live run histories so it stays on the
-        # loop; the serialize/hash/gzip over it is pure CPU and offloads
-        # for a large fleet, at the same gate as /jobs.
-        payload = self.activity_payload()
-        if len(payload["jobs"]) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+        # Past the /jobs offload gate, the row projection (jobs x runs of
+        # dict builds and isoformat calls, the expensive half at fleet
+        # scale) rides the SAME executor hop as the serialize/hash/gzip,
+        # over a loop-taken snapshot (see _activity_snapshot for why); the
+        # rows' three plotted fields are frozen at construction, so the
+        # worker reads immutable data.  Below the gate the whole build is
+        # cheaper than the thread hop.
+        if len(self.cron_jobs) >= _JOBS_SERIALIZE_OFFLOAD_MIN:
+            histories = self._activity_snapshot()
             return await asyncio.get_running_loop().run_in_executor(
-                None, _cachable_json_product, payload
+                None,
+                lambda: _cachable_json_product(
+                    _activity_jobs(histories, limit)
+                ),
             )
-        return _cachable_json_product(payload)
+        return _cachable_json_product(self.activity_payload(limit))
 
     async def _web_job_resources(self, request: web.Request) -> web.Response:
         """Chart-grade CPU/RSS series for one job (monitorResources jobs).
@@ -9288,19 +9466,25 @@ class Cron:
                 return False
         logger.info("Starting job %s", job.name)
         retry_state = self.retry_state.get(job.name) if with_retries else None
-        # register with the loopback state API BEFORE the child launches,
-        # so the child's first callback is already authorised.
-        run_token, extra_env = await self._prepare_job_api_run(
-            job, retry_state
-        )
-        running_job = RunningJob(
-            job,
-            retry_state,
-            extra_env=extra_env,
-            state_token=run_token,
-            run_id=extra_env.get("CRONSTABLE_RUN_ID"),
-        )
+        run_token: Optional[str] = None
         try:
+            # register with the loopback state API BEFORE the child
+            # launches, so the child's first callback is already
+            # authorised. Inside the try: staging fromFile secrets awaits
+            # the executor, and a cancellation parked there (a client gone
+            # mid-POST) must hand the slot claim back like any failed
+            # spawn. Cancellation cannot strand a registered token: the
+            # await in _prepare_job_api_run precedes register_run.
+            run_token, extra_env = await self._prepare_job_api_run(
+                job, retry_state
+            )
+            running_job = RunningJob(
+                job,
+                retry_state,
+                extra_env=extra_env,
+                state_token=run_token,
+                run_id=extra_env.get("CRONSTABLE_RUN_ID"),
+            )
             # the gate releases before the except arm runs, so cleanup
             # below never holds a spawn permit.
             async with self._spawn_gate:
@@ -9971,7 +10155,23 @@ class Cron:
             for name, job in it:
                 if aborted:
                     break
-                outcome = await step(name, job)
+                try:
+                    outcome = await step(name, job)
+                except asyncio.CancelledError:
+                    raise  # shutdown still unwinds the scan
+                except Exception:  # noqa: BLE001 - degrade, never crash
+                    # gather() without return_exceptions hands the first
+                    # exception to the awaiter but does NOT cancel the
+                    # siblings, so an unexpected error here used to abort
+                    # the boot tail (dag reconcile, retry re-arm, the job
+                    # API start) while the other workers kept mutating
+                    # scheduler state behind it. One bad job degrades to a
+                    # logged skip, like the per-job arms inside the steps;
+                    # a sick STORE is the separate "timeout" verdict.
+                    logger.exception(
+                        "boot scan: job %s failed; skipping it", name
+                    )
+                    continue
                 if outcome == "timeout":
                     if not aborted:
                         aborted = True
@@ -10331,6 +10531,14 @@ class Cron:
             try:
                 jobs_list.remove(running_job)
             except ValueError:  # pragma: no cover - defensive
+                # already reaped, but still drop an emptied key: a phantom
+                # empty list keeps running_jobs truthy with nothing to
+                # reap, which spins the reaper at shutdown (the hazard
+                # _launch_job_locked's own .get() comment names). The
+                # pre-refactor copy of this arm fell through to the same
+                # cleanup.
+                if not jobs_list:
+                    del self.running_jobs[name]
                 return False
         else:
             jobs_list = self.running_jobs[name]
