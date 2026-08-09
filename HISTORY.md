@@ -79,6 +79,19 @@ Reduction of code. Fixing of bugs and optimizations throughout.
   card and its own fan-out fallback do, instead of holding a row list per
   job at fleet scale, and an approval gate parked on a decision paints as
   pending again.
+- Python 3.15 is supported and tested. It gates in CI on both Linux and
+  Windows, and it has a PyPI classifier, a `py315` tox env and matching
+  docs. Windows is covered as widely as Linux because 3.15 makes UTF-8 the
+  default encoding (PEP 686) and the Linux runners were already UTF-8, so
+  a regression from that change could only ever surface on Windows. Two
+  things still wait on upstream wheels: orjson publishes none for 3.15, so
+  the optional `speedups` extra leaves it out there and JSON falls back to
+  the standard library, and aiohttp publishes none for `win_arm64`, so
+  Windows on ARM64 stays on 3.14. Nothing changes for 3.10 through 3.14.
+  The standalone binaries are built on 3.15 across all five lanes (Linux
+  glibc and musl, macOS, Windows). Those lanes exercise 3.15 without any
+  wheels available, since aiohttp, zeroconf and uvloop all compile from
+  source there. The Docker images are still built on 3.14.
 
 ## 1.2.37
 
@@ -449,19 +462,6 @@ Reduction of code. Fixing of bugs and optimizations throughout.
   inside the poll loop, which froze every panel for the sum of up to 40
   round trips each refresh; entries for jobs removed by a reload are
   pruned.
-- Python 3.15 is supported and tested. It gates in CI on both Linux and
-  Windows, and it has a PyPI classifier, a `py315` tox env and matching
-  docs. Windows is covered as widely as Linux because 3.15 makes UTF-8 the
-  default encoding (PEP 686) and the Linux runners were already UTF-8, so
-  a regression from that change could only ever surface on Windows. Two
-  things still wait on upstream wheels: orjson publishes none for 3.15, so
-  the optional `speedups` extra leaves it out there and JSON falls back to
-  the standard library, and aiohttp publishes none for `win_arm64`, so
-  Windows on ARM64 stays on 3.14. Nothing changes for 3.10 through 3.14.
-  The standalone binaries are built on 3.15 across all five lanes (Linux
-  glibc and musl, macOS, Windows). Those lanes exercise 3.15 without any
-  wheels available, since aiohttp, zeroconf and uvloop all compile from
-  source there. The Docker images are still built on 3.14.
 
 ## 1.2.36 (2026-08-03)
 
