@@ -228,10 +228,19 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
     whose pid is by construction its own pgid (a POSIX session leader, a
     Windows ``CREATE_NEW_PROCESS_GROUP`` root).  Signalling the *group*
     rather than the pid is what reaches an orphaned descendant, and it keeps
-    working after the leader itself has exited: a process group lives as
-    long as any member does, and the kernel will not recycle a pid that is
-    still in use as a pgid, so there is no risk of hitting an unrelated
-    group.
+    working after the leader itself has exited.
+
+    Nothing here can address an unrelated group on either platform, but
+    they rule that out by different means.  POSIX does it through the group
+    itself: one lives as long as any member does, and the kernel will not
+    recycle a pid still in use as a pgid.  Windows reserves nothing once
+    the root exits, and what rules out a recycled id there is asyncio
+    holding the child's process handle open until it reaps the child, since
+    Windows frees a pid for reuse only after the last handle to it closes.
+    The caller's contract is therefore narrower than POSIX makes it look:
+    signal through the ``Process`` object that owns the handle, as
+    :meth:`cronstable.job.RunningJob.cancel` does, never through a bare pid
+    remembered across a reap.
 
     The Windows sequence mirrors the POSIX one.  The graceful call delivers
     ``CTRL_BREAK_EVENT`` to the job's process group; that event is trappable

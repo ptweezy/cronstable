@@ -152,8 +152,9 @@ def _add_init_command(sub: Any) -> None:
 #: dashboard with an API token) left commented out.
 _INIT_STARTER = """\
 # cronstable starter configuration (written by `cronstable init`).
-# Every *.yaml file in this directory is loaded; classic crontab files
-# (*.crontab, *.cron, or a file named `crontab`) are accepted here too.
+# Every *.yaml and *.yml file in this directory is loaded; classic crontab
+# files (*.crontab, *.cron, or a file named `crontab`) are accepted here
+# too. Names beginning with _ or . are skipped, which is how you park one.
 # Reference: https://github.com/ptweezy/cronstable/wiki/Configuration-Reference
 #
 # Windows note: quote paths with single quotes ('C:\\scripts\\nightly.bat').

@@ -111,6 +111,65 @@ def test_machine_wide_config_names_match_the_loader():
     )
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        # the plain forms, then the same names as a Windows editor may
+        # spell them: case is preserved on that filesystem but carries no
+        # meaning, so every one of these has to be judged identically by
+        # the handover check and by the loader it speaks for.
+        "jobs.yaml",
+        "jobs.yml",
+        "JOBS.YAML",
+        "jobs.YAML",
+        "Jobs.Yml",
+        "nightly.crontab",
+        "NIGHTLY.CRONTAB",
+        "jobs.cron",
+        "crontab",
+        "CRONTAB",
+        # and names neither side may claim
+        "README.md",
+        "notes.txt",
+        "jobs.yaml.bak",
+        "_disabled.yaml",
+        ".hidden.yaml",
+    ],
+)
+def test_holds_config_agrees_with_the_loader_per_name(tmp_path, filename):
+    # The set equality above pins the VOCABULARY; this pins the decision.
+    # A divergence here is silent in the worst way: _holds_config saying
+    # yes where the loader says no hands the Windows default to a
+    # directory that parses to zero jobs, and because the directory
+    # exists the configuration-not-found guard never fires, so the daemon
+    # comes up healthy and schedules nothing.
+    directory = tmp_path / "cronstable"
+    directory.mkdir()
+    (directory / filename).write_text("jobs: []\n")
+
+    assert platform._holds_config(str(directory)) == _loader_reads(
+        str(directory)
+    )
+
+
+def _loader_reads(directory: str) -> bool:
+    """Whether the real loader consults the single file in ``directory``.
+
+    Asks _parse_config_dir itself rather than restating its filter, which
+    would just be a third copy to drift.  The probe content (``jobs: []``)
+    is deliberately readable by one front end and not the other: claimed
+    as YAML it parses to zero jobs and the file lands in the reported
+    sources, claimed as a crontab it is not a valid entry line and raises.
+    Either outcome proves the loader opened it; only a skipped file
+    produces neither.
+    """
+    try:
+        _, sources = cronstable.config.parse_config_with_sources(directory)
+    except cronstable.config.ConfigError:
+        return True
+    return bool(sources)
+
+
 def test_windows_config_home_survives_bare_environments(tmp_path):
     # no APPDATA (a bare service account): fall back under the profile.
     got = platform._windows_config_home({})

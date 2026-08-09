@@ -4476,9 +4476,19 @@ def _parse_config_dir(
         # YAML by extension, or a classic crontab by filename marker
         # (.crontab / .cron / a file named "crontab"); anything else is
         # skipped, so a stray README or data file never becomes jobs.
-        if ext not in {".yml", ".yaml"} and not crontabs.is_crontab_path(
-            direntry.name
-        ):
+        #
+        # Case-folded, like every other place a config name is judged
+        # (_is_crontab_config, crontabs.is_crontab_path, and
+        # platform._holds_config, which picks the Windows default config
+        # directory).  Windows filesystems preserve case without
+        # distinguishing it, so a JOBS.YAML written by an editor that
+        # upper-cases the suffix is the same file to the user, and a
+        # case-sensitive test here would skip it in silence: a directory
+        # of such files parses to zero jobs, and no error path reports
+        # that.  It would also split this loop from the same file named
+        # directly, which case-folds before it picks a front end.
+        is_yaml = ext.lower() in _YAML_EXTENSIONS
+        if not is_yaml and not crontabs.is_crontab_path(direntry.name):
             continue
         try:
             config, file_sources, _ = _parse_file_cached(direntry.path)
