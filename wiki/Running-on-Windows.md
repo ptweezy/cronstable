@@ -99,15 +99,21 @@ platform-specific:
 | Platform | Default `-c` path |
 | --- | --- |
 | POSIX | `/etc/cronstable.d` |
-| Windows, machine-wide | `%ProgramData%\cronstable` (e.g. `C:\ProgramData\cronstable`), whenever that directory exists |
+| Windows, machine-wide | `%ProgramData%\cronstable` (e.g. `C:\ProgramData\cronstable`), whenever that directory holds configuration |
 | Windows, per-user | `%APPDATA%\cronstable` (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`), otherwise |
 
 `%ProgramData%\cronstable` is the Windows analog of `/etc/cronstable.d`:
 machine-scoped and shared by every account. cronstable never creates it on its
 own; once you (or `cronstable init C:\ProgramData\cronstable`, run from an
-elevated prompt) create the directory, it takes precedence for everyone, so
+elevated prompt) put a config file in it, it takes precedence for everyone, so
 an interactive administrator and a service account resolve to the same
-config. Until it exists, the default stays the historical per-user
+config. The directory has to hold a config file, not merely exist. An empty
+`%ProgramData%\cronstable`, left behind by an interrupted `init` or an
+uninstall that took the files but not the folder, would otherwise take over
+and load zero jobs, and because the path exists the "configuration file not
+found" error would stay quiet too, so a working per-user setup would come up
+healthy and running nothing. Until the machine-wide directory holds a config,
+the default stays the historical per-user
 `%APPDATA%\cronstable`; note that a service account's `APPDATA` points into
 its own profile (LocalSystem: `C:\Windows\System32\config\systemprofile\...`),
 which is why a per-user config that works interactively is not found when
@@ -125,8 +131,9 @@ cronstable -c C:\path\to\cronstable.yaml
 ```
 
 `cronstable init` writes a commented starter configuration into the default
-directory (or any directory you name), creating it if needed and refusing to
-touch one that already holds configuration:
+directory (or any directory you name, either positionally or with `-c`),
+creating it if needed and refusing to touch one that already holds
+configuration:
 
 ```shell
 cronstable init
@@ -164,10 +171,18 @@ used to hand the command over, differ per platform and per shell:
 | POSIX | `/bin/sh` | `["/bin/sh", "-c", command]` |
 | Windows | empty | `command` through the native command processor `%ComSpec%` (cmd.exe) |
 
-An explicit `shell:` runs as `[shell, <flag>, command]`, where the flag is
-`/c` for `cmd` / `cmd.exe` and `-c` for every other shell (PowerShell reads
-`-c` as an abbreviation of `-Command`). So `shell: cmd`, `shell: powershell`
-and `shell: pwsh` all work as written on Windows. A `shell:` naming a binary
+An explicit `shell:` runs as `[shell, "-c", command]` (PowerShell reads `-c`
+as an abbreviation of `-Command`), except for `cmd` / `cmd.exe`, which takes
+the same route as the empty default below: the command string goes to
+`%ComSpec% /c` whole, with no argv rendering in between. cmd.exe needs both
+halves of that: it wants `/c` rather than `-c`, and it parses its command
+line by its own rules instead of the `CommandLineToArgvW` rules that argv
+rendering is built to be undone by, so a command containing double quotes
+would otherwise arrive with the escaping still visible (`echo "hello world"`
+printing `\"hello world\"`). Naming an absolute path to a particular cmd.exe
+still uses that one rather than `%ComSpec%`. So `shell: cmd`,
+`shell: powershell` and `shell: pwsh` all work as written on Windows. A
+`shell:` naming a binary
 that does not exist on the machine (for example `/bin/sh` carried over from a
 POSIX config) fails at spawn with a `start_failed` run, visible in the
 dashboard and reports; only the `SHELL=` line of a classic crontab is refused
@@ -249,20 +264,28 @@ waits for it. (`Ctrl-Break` also stops the daemon, but a console-generated
 break reaches every process attached to the console, jobs included, so
 `Ctrl-C` is the stop that leaves running jobs untouched.)
 
-Closing the console window, logging off, and an OS shutdown or restart
-trigger the same graceful drain, on a shorter leash: cronstable registers a
-native console-control handler for those events (Python's signal module never
+Closing the console window and an OS shutdown or restart trigger the same
+graceful drain, on a shorter leash: cronstable registers a native
+console-control handler for those events (Python's signal module never
 surfaces them), and Windows grants the process only a few seconds before
 terminating it regardless, so the drain is best-effort; jobs still running
 when that grace expires are killed by the OS with the daemon.
+
+Logging off deliberately does not stop the daemon. Windows sends its logoff
+event only to session-0 processes, which is to say services and scheduled
+tasks, and the event says nothing about which user signed out; treating it as
+a shutdown would stop an unattended daemon the first time anyone closed an
+RDP session on the box. An interactive daemon is unaffected either way, since
+Windows terminates interactive processes at logoff before that event is ever
+sent. To stop a daemon that has no console of its own, use `POST /shutdown`.
 
 Internally, POSIX wires `SIGINT`/`SIGTERM` onto the asyncio event loop. The
 Windows Proactor loop has no `add_signal_handler`, so on Windows cronstable
 instead installs `signal.signal` handlers for `SIGINT` (Ctrl-C) and `SIGBREAK`
 (Ctrl-Break), runs a lightweight heartbeat timer so the interpreter observes
 the pending handler promptly even while the loop is blocked in I/O, and adds
-the `SetConsoleCtrlHandler` hook above for console close, logoff, and OS
-shutdown. The user-visible behavior is identical to POSIX. For the shutdown
+the `SetConsoleCtrlHandler` hook above for console close and OS shutdown. The
+user-visible behavior is identical to POSIX. For the shutdown
 sequence in detail, see
 [Signal handling and graceful shutdown](CLI-Reference#signal-handling-and-graceful-shutdown)
 in the [Command-Line Reference](CLI-Reference).

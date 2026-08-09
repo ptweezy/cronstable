@@ -20,7 +20,7 @@ followed by the argument help, and exit code `1`.
 
 **Cause.** `__main__.py` defaults `-c`/`--config` to a platform-specific
 `CONFIG_DEFAULT = platform.DEFAULT_CONFIG_PATH`: `/etc/cronstable.d` on POSIX; on
-Windows `%ProgramData%\cronstable` when that directory exists, otherwise
+Windows `%ProgramData%\cronstable` when that directory holds configuration, otherwise
 `%APPDATA%\cronstable` (for example `C:\Users\<you>\AppData\Roaming\cronstable`,
 falling back to the user profile `~` if `APPDATA` is unset). When that default is in
 effect *and* the path does not exist

@@ -142,9 +142,8 @@ def _add_init_command(sub: Any) -> None:
         nargs="?",
         default=None,
         metavar="DIRECTORY",
-        help="target configuration directory (default: {})".format(
-            CONFIG_DEFAULT
-        ),
+        help="target configuration directory (default: -c/--config if "
+        "given, else {})".format(CONFIG_DEFAULT),
     )
 
 
@@ -189,7 +188,23 @@ def _run_init(args: Any) -> int:
     # parser must stay import-light for every thin-client invocation.
     from cronstable.crontabs import is_crontab_path
 
-    target = args.directory or CONFIG_DEFAULT
+    # Precedence: the positional DIRECTORY, then a root-level -c/--config,
+    # then the platform default. Honoring -c matters because the
+    # configuration-not-found error that sends people here names that very
+    # flag, so `cronstable -c D:\jobs init` is a natural reading of it; the
+    # starter belongs in D:\jobs, not in the default location the caller
+    # just steered away from.
+    target = args.directory or args.config
+    if (
+        args.directory
+        and args.config != CONFIG_DEFAULT
+        and os.path.abspath(args.config) != os.path.abspath(args.directory)
+    ):
+        print(
+            "cronstable init: -c {} and DIRECTORY {} disagree; writing to "
+            "{}".format(args.config, args.directory, args.directory),
+            file=sys.stderr,
+        )
     if os.path.isfile(target):
         print(
             "cronstable init: {} is a file; init writes a starter file "
@@ -200,7 +215,17 @@ def _run_init(args: Any) -> int:
         return 1
     existing = []
     if os.path.isdir(target):
-        for name in sorted(os.listdir(target)):
+        try:
+            names = sorted(os.listdir(target))
+        except OSError as ex:
+            # an unreadable target must report like every other init
+            # failure, not traceback; the write below would fail anyway.
+            print(
+                "cronstable init: could not read {}: {}".format(target, ex),
+                file=sys.stderr,
+            )
+            return 1
+        for name in names:
             base, ext = os.path.splitext(name)
             if not base or base[0] in {"_", "."}:
                 continue
@@ -234,9 +259,9 @@ def _run_init(args: Any) -> int:
         )
         return 1
     print("wrote {}".format(path))
-    if args.directory and os.path.abspath(target) != os.path.abspath(
-        CONFIG_DEFAULT
-    ):
+    # Bare `cronstable` finds the default location on its own; anywhere else
+    # has to be named, whichever way the caller named it here.
+    if os.path.abspath(target) != os.path.abspath(CONFIG_DEFAULT):
         print("start the scheduler with: cronstable -c {}".format(target))
     else:
         print("start the scheduler with: cronstable")

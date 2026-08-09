@@ -540,9 +540,12 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
 
 1. **`start()`** chooses the spawn function from the command form:
    `create_subprocess_exec` for a list command, or when `shell` is set the
-   command is run as `[shell, <flag>, command]` via `exec`, where the flag is
-   per-shell (`/c` for cmd.exe, `-c` otherwise; `shell_invocation_flag`); a
-   string command with no `shell` uses `create_subprocess_shell`. The default
+   command is run as `[shell, "-c", command]` via `exec`; a string command with
+   no `shell` uses `create_subprocess_shell`. Windows naming `cmd`/`cmd.exe` is
+   the one exception (`shell_spawn`): cmd.exe wants `/c`, and it parses its
+   command line by its own rules rather than the `CommandLineToArgvW` rules
+   argv rendering assumes, so it takes the `create_subprocess_shell` path too
+   and the command string reaches `%ComSpec% /c` unrendered. The default
    `shell` is platform-specific (via `platform.DEFAULT_SHELL`): POSIX
    defaults to `/bin/sh`, so a string command runs as
    `["/bin/sh", "-c", command]`; on Windows the default is empty, so a

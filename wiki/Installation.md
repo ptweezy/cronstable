@@ -311,8 +311,9 @@ cronstable -c /etc/cronstable.d
 ```
 
 The `-c` default is platform-specific: `/etc/cronstable.d` on POSIX; on Windows
-the machine-wide `%ProgramData%\cronstable` when that directory exists,
-otherwise `%APPDATA%\cronstable` (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`,
+the machine-wide `%ProgramData%\cronstable` when that directory holds
+configuration, otherwise `%APPDATA%\cronstable`
+(e.g. `C:\Users\<you>\AppData\Roaming\cronstable`,
 falling back to the user profile `~` if `APPDATA` is unset). `cronstable init`
 writes a commented starter configuration into the default location. The
 default `shell` also differs: `/bin/sh` on POSIX, and on Windows an empty

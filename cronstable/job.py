@@ -112,22 +112,61 @@ def loggable_spawn_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
-def shell_invocation_flag(shell: str) -> str:
-    """The flag that makes ``shell`` execute a command string.
+def is_cmd_shell(shell: str) -> bool:
+    """Whether ``shell`` names the Windows command processor.
 
-    ``/c`` for cmd.exe, ``-c`` for everything else.  cmd.exe does not
-    understand ``-c``: handed one it starts an interactive shell, prints its
-    version banner, reads EOF on stdin and exits 0, so a ``shell: cmd`` job
-    used to record a clean success without ever running its command.  Every
-    other shell a job realistically names takes ``-c`` (PowerShell reads it
-    as an abbreviation of ``-Command``).  Matched on the basename so
-    ``cmd``, ``cmd.exe`` and a full ``C:\\Windows\\System32\\cmd.exe`` all
-    resolve alike.
+    Matched on the basename, so ``cmd``, ``cmd.exe`` and a full
+    ``C:\\Windows\\System32\\cmd.exe`` all resolve alike.
     """
     name = os.path.basename(shell.replace("\\", "/")).lower()
-    if name in ("cmd", "cmd.exe"):
-        return "/c"
-    return "-c"
+    return name in ("cmd", "cmd.exe")
+
+
+def shell_spawn(
+    shell: str, command: str, windows: Optional[bool] = None
+) -> tuple[Any, list[str], dict[str, Any]]:
+    """The spawn call, argv and extra kwargs for ``command`` under ``shell``.
+
+    Every shell but cmd.exe is spawned directly, as ``<shell> -c
+    <command>`` (PowerShell reads ``-c`` as an abbreviation of
+    ``-Command``).  Windows has no argv, so that list is rendered into one
+    command line by the MSVC runtime's quoting rules, and those are the
+    rules ``CommandLineToArgvW`` reverses, which is how every one of those
+    shells recovers the command it was handed.
+
+    cmd.exe is the exception, for two reasons.  It wants ``/c``, not
+    ``-c``: handed ``-c`` it starts an interactive shell, prints its
+    version banner, reads EOF on stdin and exits 0, so a ``shell: cmd`` job
+    records a clean success without ever running its command.  It also
+    parses its own command line by its own rules rather than
+    ``CommandLineToArgvW``'s, so the ``\\"`` the renderer emits for an
+    embedded double quote survives into the command verbatim and ``echo
+    "hello world"`` prints ``\\"hello world\\"``.  Handing the command
+    string to :func:`asyncio.create_subprocess_shell` instead skips the
+    rendering entirely: the string goes to ``CreateProcess`` as
+    ``%ComSpec% /c "<command>"``, which is both the flag cmd.exe wants and
+    the shape its ``/c`` quote rules are written for.  An empty ``shell:``
+    takes that same path, so the Windows default and an explicit
+    ``shell: cmd`` land on one spawn rather than two.
+
+    An absolute ``shell:`` is passed as ``executable`` so a deliberately
+    chosen cmd.exe still beats ``%ComSpec%``; a bare ``cmd`` resolves
+    through ComSpec, which is also what keeps an unqualified name from
+    being searched for in the current directory first.
+
+    All of which is Windows' business alone, so ``windows`` (defaulting to
+    :data:`~cronstable.platform.IS_WINDOWS`, and injectable so both
+    branches are testable from either OS) gates it: a POSIX box running a
+    shell that happens to be named ``cmd`` gets the ordinary treatment,
+    and a ``shell: cmd`` typo there still fails to spawn rather than
+    quietly running under /bin/sh.
+    """
+    if windows is None:
+        windows = platform.IS_WINDOWS
+    if windows and is_cmd_shell(shell):
+        kwargs = {"executable": shell} if os.path.isabs(shell) else {}
+        return asyncio.create_subprocess_shell, [command], kwargs
+    return asyncio.create_subprocess_exec, [shell, "-c", command], {}
 
 
 def _decode_output_line(raw: bytes) -> str:
@@ -861,17 +900,15 @@ class ShellReporter(Reporter):
         if shell_config["command"] is None:
             return
 
+        shell_kwargs: dict[str, Any] = {}
         if isinstance(shell_config["command"], list):
             create: Any = asyncio.create_subprocess_exec
             cmd = shell_config["command"]
         else:
             if shell_config["shell"]:
-                create = asyncio.create_subprocess_exec
-                cmd = [
-                    shell_config["shell"],
-                    shell_invocation_flag(shell_config["shell"]),
-                    shell_config["command"],
-                ]
+                create, cmd, shell_kwargs = shell_spawn(
+                    shell_config["shell"], shell_config["command"]
+                )
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [shell_config["command"]]
@@ -964,6 +1001,7 @@ class ShellReporter(Reporter):
         # below reaches the reporter's descendants as a unit (see
         # platform.new_process_group_kwargs).
         kwargs = platform.new_process_group_kwargs()
+        kwargs.update(shell_kwargs)
         try:
             proc = await create(*cmd, env=env, **kwargs)
         # OSError: a missing reporter binary or a spawn-time resource
@@ -1617,12 +1655,10 @@ class RunningJob:
             cmd = self.config.command
         else:
             if self.config.shell:
-                create = asyncio.create_subprocess_exec
-                cmd = [
-                    self.config.shell,
-                    shell_invocation_flag(self.config.shell),
-                    self.config.command,
-                ]
+                create, cmd, shell_kwargs = shell_spawn(
+                    self.config.shell, self.config.command
+                )
+                kwargs.update(shell_kwargs)
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [self.config.command]
