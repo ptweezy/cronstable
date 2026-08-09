@@ -472,7 +472,7 @@ Windows fixes and additions from a gap review against Task Scheduler.
   running anything. The shell reporter had the same flaw and the same fix.
 - Jobs are spawned in their own Windows process group. Ctrl-C in the
   daemon's console no longer kills every in-flight job with 0xC000013A
-  (and then reported each one failed through every configured reporter);
+  and then reports each one failed through every configured reporter;
   a graceful daemon shutdown now genuinely waits for running jobs, as the
   docs always said.
 - Job termination on Windows is a real two-step: a trappable
@@ -486,10 +486,10 @@ Windows fixes and additions from a gap review against Task Scheduler.
   trigger the graceful drain (a native console-control handler; Python's
   signal module never surfaces those events), bounded by the few seconds
   of grace Windows grants.
-- `POST /shutdown`: an authenticated route that runs the same graceful
-  drain as Ctrl-C/SIGTERM, for supervised and console-less deployments.
-  Refused unless the request carries a configured bearer token, even
-  where the rest of the API is open.
+- `POST /shutdown` runs the same graceful drain as Ctrl-C/SIGTERM, for
+  supervised and console-less deployments. It is refused unless the
+  request carries a configured bearer token, even where the rest of the
+  API is open.
 - The Windows default config path prefers the machine-wide
   `%ProgramData%\cronstable` whenever that directory exists, falling back
   to the per-user `%APPDATA%\cronstable` as before, so a service account

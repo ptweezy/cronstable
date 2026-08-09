@@ -421,7 +421,7 @@ to stop; raise it for jobs that need longer to shut down, lower it for jobs
 that may ignore the graceful signal and must be force-killed quickly. The
 guidance applies on both platforms (the graceful signal is SIGTERM on POSIX
 and `CTRL_BREAK_EVENT` on Windows), with one Windows caveat: a daemon
-without a console cannot deliver the break, and there the grace period has
+without a console cannot deliver the break, and there `killTimeout` has
 nothing to bound because the tree kill runs at once. See
 [Running on Windows](Running-on-Windows).
 

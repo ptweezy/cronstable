@@ -411,8 +411,8 @@ on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
 ## Features not supported on Windows
 
-Three POSIX-specific features cannot work on Windows; none is silently
-dropped, each is reported clearly. A fourth platform difference (POSIX file
+Three POSIX-specific features cannot work on Windows. None is silently
+dropped: each is reported clearly. A fourth platform difference (POSIX file
 modes) is silent by nature and called out at the end of this section so it is
 on the record.
 
@@ -477,8 +477,8 @@ Windows `PATH` for the entries below it. See
 The durable state store creates its directories `0o700` and its files
 `0o600` on POSIX. Windows does not map POSIX mode bits onto ACLs: the
 requested modes are effectively ignored and every file simply inherits its
-parent directory's ACL. Records and archived output can carry job output and
-staged secrets, so on a multi-user Windows host put `state.path` (and any
+parent directory's ACL. The store's records and archives can hold job output
+and staged secrets, so on a multi-user Windows host put `state.path` (and any
 `cronstable state backup` output) under a directory whose ACL is already
 restricted to the account running the daemon, for example:
 
