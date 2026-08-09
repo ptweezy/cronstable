@@ -99,68 +99,11 @@ surface and auth only; the JSON-RPC protocol it speaks is documented under
 
 ## Endpoints
 
-All routes are registered in `start_stop_web_app`:
-
-| Method | Path | Handler | Success status |
-| --- | --- | --- | --- |
-| `GET` | `/version` | `_web_get_version` | `200` |
-| `GET` | `/job-set-id` | `_web_job_set_id` | `200` |
-| `GET` | `/cluster` | `_web_get_cluster` | `200` |
-| `GET` | `/fleet` | `_web_get_fleet` | `200` |
-| `GET` | `/node` | `_web_get_node` | `200` |
-| `GET` | `/node/history` | `_web_node_history` | `200` |
-| `GET` | `/status` | `_web_get_status` | `200` |
-| `GET` | `/summary` | `_web_get_summary` | `200` |
-| `GET` | `/schedule/preview` | `_web_schedule_preview` | `200` (`400` for a missing `expr` or unknown `tz`) |
-| `GET` | `/schedule/pressure` | `_web_schedule_pressure` | `200` (`400` for an unknown `tz`) |
-| `GET` | `/schedule/duplicates` | `_web_schedule_duplicates` | `200` |
-| `GET` | `/schedule/suggest` | `_web_schedule_suggest` | `200` (`400` for a bad `period` or unknown `tz`) |
-| `GET` | `/schedule/why` | `_web_schedule_why` | `200` (`400` for a missing `job`/`at` or an unparseable `at`; `404` for an unknown job) |
-| `GET` | `/calendar.ics` | `_web_calendar` | `200` (`text/calendar`) |
-| `GET` | `/jobs` | `_web_list_jobs` | `200` |
-| `GET` | `/activity` | `_web_get_activity` | `200` |
-| `GET` | `/jobs/{name}` | `_web_get_job` | `200` (`404` for an unknown job) |
-| `GET` | `/jobs/{name}/runs` | `_web_job_runs` | `200` |
-| `GET` | `/jobs/{name}/calendar.ics` | `_web_job_calendar` | `200` (`text/calendar`; `404` for an unknown job) |
-| `GET` | `/jobs/{name}/resources` | `_web_job_resources` | `200` |
-| `GET` | `/jobs/{name}/trends` | `_web_job_trends` | `200` |
-| `POST` | `/jobs/{name}/start` | `_web_start_job` | `200` |
-| `POST` | `/jobs/{name}/cancel` | `_web_cancel_job` | `200` |
-| `POST` | `/jobs/{name}/pause` | `_web_pause_job` | `200` |
-| `POST` | `/jobs/{name}/resume` | `_web_resume_job` | `200` |
-| `GET` | `/jobs/{name}/logs` | `_web_job_logs` | `200` (SSE stream) |
-| `GET` | `/dags` | `_web_list_dags` | `200` |
-| `GET` | `/dags/{name}/runs` | `_web_dag_runs` | `200` |
-| `GET` | `/dags/{name}/runs/{run_key}` | `_web_dag_run` | `200` |
-| `GET` | `/dags/{name}/runs/{run_key}/xcom` | `_web_dag_xcom` | `200` |
-| `GET` | `/dags/{name}/runs/{run_key}/tasks/{taskkey}/logs` | `_web_dag_task_logs` | `200` (SSE stream) |
-| `POST` | `/dags/{name}/trigger` | `_web_dag_trigger` | `200` |
-| `POST` | `/dags/{name}/backfill` | `_web_dag_backfill` | `200` |
-| `POST` | `/dags/{name}/runs/{run_key}/tasks/{taskkey}/decision` | `_web_dag_decision` | `200` |
-| `GET` | `/state` | `_web_state` | `200` |
-| `GET` | `/state/documents` | `_web_state_documents` | `200` |
-| `GET` | `/state/records` | `_web_state_records` | `200` |
-| `GET` | `/whoami` | `_web_whoami` | `200` |
-| `GET` | `/push/devices` | `_web_push_devices` | `200` (`404` until a `push:` section is configured) |
-| `POST` | `/push/devices` | `_web_push_pair` | `201` (`200` when an existing public key re-pairs) |
-| `DELETE` | `/push/devices/{id}` | `_web_push_revoke` | `200` |
-| `POST` | `/push/devices/{id}/test` | `_web_push_test` | `200` (`502` when sealing or the relay failed) |
-| `POST` | `/shutdown` | `_web_shutdown` | `200` (`403` unless bearer-token authenticated) |
-| `POST` | `/mcp` | `MCPHandler.handle_http` | `200` (JSON-RPC response; `202` for a notification; omitted unless `mcp.enabled`) |
-| `GET` | `/mcp` | `MCPHandler.handle_http_get` | `405` (always, with `Allow: POST, OPTIONS`; omitted unless `mcp.enabled`) |
-| `OPTIONS` | `/mcp` | `MCPHandler.handle_options` | `204` (CORS preflight for an allow-listed `Origin`; omitted unless `mcp.enabled`) |
-| `GET` | `/metrics` | `_web_metrics` | `200` (Prometheus exposition; omitted when `metrics: false`) |
-| `GET` | `/` | `_web_index` | `200` (dashboard page; omitted when `ui: false`) |
-
-The `/dags/...` routes are documented under [DAG endpoints](#dag-endpoints),
-the `/state...` routes under
-[State inspector endpoints](#state-inspector-endpoints), and the `/mcp`
-routes under [`POST /mcp`](#post-mcp-the-mcp-server).
-
-The configured `headers` map is applied to every `200` success response across
-all routes (including `/cluster` and `/job-set-id`) and to the `409` conflict
-bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. The `404` (unknown
-job) and `401` (authentication failure) responses are raised without it.
+The authoritative route list, with every path, method, per-route status code,
+and request/response schema, is [`docs/openapi.yaml`](#openapi-specification),
+which CI pins against the daemon's served route table in both directions. The
+sections below carry what the spec deliberately leaves to prose: field
+meanings, defaults, edge cases, and behavior.
 
 Every error body on this API is one JSON envelope: `{"error": "<reason>"}`
 (`Content-Type: application/json`), across the job, DAG, schedule, state, and
@@ -168,20 +111,9 @@ push routes alike. That includes the `401` from the auth middleware and the
 router's own responses (`405` on a wrong method, `404` on an unmatched path).
 `docs/openapi.yaml` declares the same envelope as the `Error` schema.
 
-> The same interface serves the **[Web Dashboard](Web-Dashboard)** at `/`; that
-> page is the visual tour of the UI these endpoints feed.
-
 ### `GET /version`
 
 Returns the cronstable version as `text/plain` (the value of `cronstable.version.version`).
-
-```shell
-$ http get http://127.0.0.1:8080/version
-HTTP/1.1 200 OK
-Content-Type: text/plain; charset=utf-8
-
-1.0.13
-```
 
 ### `GET /status`
 
@@ -217,8 +149,6 @@ stays visible while an instance is in flight.
 The `disabled` status is reported honestly instead of an inapplicable
 `scheduled (in N seconds)`.
 
-Text form:
-
 ```shell
 $ http get http://127.0.0.1:8080/status
 HTTP/1.1 200 OK
@@ -232,20 +162,8 @@ test-03: disabled
 In the text form, `scheduled_in` is rendered as a human-readable relative time
 (`in N seconds` / `minutes` / `hours` / `days`), running jobs show
 `running (pid: <comma-separated pids>)`, and disabled jobs show `disabled`.
-
-JSON form:
-
-```shell
-$ http get http://127.0.0.1:8080/status Accept:application/json
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-
-[
-    {"job": "test-01", "status": "scheduled", "scheduled_in": 6.16588},
-    {"job": "test-02", "status": "running", "pid": [12345]},
-    {"job": "test-03", "status": "disabled"}
-]
-```
+The JSON form is an array of `{job, status}` objects carrying the per-status
+fields from the table above.
 
 ### `GET /summary`
 
@@ -266,21 +184,6 @@ read, so the surfaces never disagree.
 | `next_fire` | The soonest upcoming scheduled fire across the fleet, `{job, in, at}` where `in` is seconds from now and `at` is the absolute ISO-8601 instant, or `null` when nothing is due (every job disabled, running, `@reboot`, dead-scheduled, or paused through its next fire; a [paused](#post-jobsnamepause) slot is skipped at the gate, so it is never reported as the next fire). |
 | `dags` | `{total}`; present only when DAGs are configured. |
 | `cluster` | `{enabled: false}` with no `cluster` section; otherwise `{enabled: true, distribution, quorate, is_leader, leader}`, the compact leadership view (full detail is [`GET /cluster`](#get-cluster)). |
-
-```shell
-$ http get http://127.0.0.1:8080/summary
-{
-    "version": "1.2.29",
-    "node_name": "node-a",
-    "generated_at": "2026-07-22T14:00:00+00:00",
-    "jobs": {
-        "total": 42, "enabled": 40, "disabled": 2, "running": 3,
-        "paused": 1, "failing": 2, "never_fires": 0
-    },
-    "next_fire": {"job": "backup", "in": 118.4, "at": "2026-07-22T14:01:58+00:00"},
-    "cluster": {"enabled": false}
-}
-```
 
 `failing` is a last-outcome verdict (the same signal the dashboard's failing
 badge shows), not a count of jobs mid-retry.
@@ -501,31 +404,6 @@ Content-Type: application/json; charset=utf-8
 }
 ```
 
-A lease backend (here `kubernetes`) returns the lease-shaped view instead:
-
-```jsonc
-{
-    "enabled": true,
-    "backend": "kubernetes",
-    "node_name": "cronstable-0",
-    "job_set_id": "v1:…",
-    "cluster_size": 1,
-    "quorum": 1,
-    "elect_leader": true,
-    "distribution": "single-leader",
-    "conflict": false, "conflict_names": [],
-    "size_conflict": false, "conflicting_sizes": [],
-    "policy_conflict": false, "conflicting_policies": [],
-    "quorate": true,
-    "leader": "cronstable-0",
-    "is_leader": true,
-    "peers": [],
-    "lease": {"name": "cronstable-leader", "namespace": "default",
-              "identity": "cronstable-0", "holder": "cronstable-0",
-              "expiry": "2026-06-24T19:00:14.000000Z"}
-}
-```
-
 The per-peer `status` values (`agreed`, `syncing`, `drifted`, `unreachable`,
 `untrusted`, `self`, `conflict`, `unknown`) are documented in
 [Clustering and Leader Election](Clustering-and-Leader-Election#per-peer-status).
@@ -580,31 +458,6 @@ sorted-name prefix. A briefly unreachable peer keeps its last-known summaries
 with the old `as_of` rather than being blanked, so stale data is visibly stale
 instead of silently missing.
 
-```shell
-$ http get http://127.0.0.1:8080/fleet Accept:application/json
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-
-{
-    "enabled": true,
-    "backend": "gossip",
-    "node_name": "node-a",
-    "distribution": "spread",
-    "elect_leader": true,
-    "interval": 30,
-    "nodes": [
-        {"node_name": "node-a", "host": null, "self": true, "status": "self",
-         "as_of": "2026-06-23T19:00:02+00:00", "truncated": false,
-         "jobs": {"backup": {"running": false, "enabled": true, "scheduled_in": 1042.5,
-                             "last": {"outcome": "success", "finished_at": "2026-06-23T18:00:01+00:00",
-                                      "duration": 12.4, "exit_code": 0}}}},
-        {"node_name": "node-b", "host": "cronstable-b.internal:8443", "self": false, "status": "agreed",
-         "as_of": "2026-06-23T18:59:45+00:00", "truncated": false,
-         "jobs": {"backup": {"running": true, "enabled": true, "scheduled_in": null, "last": null}}}
-    ]
-}
-```
-
 The summaries are observability data only: they never feed leader election or
 any run/skip decision, and a malformed or hostile peer payload degrades to
 "no data for that node" rather than poisoning the view.
@@ -612,27 +465,10 @@ any run/skip decision, and a malformed or hostile peer payload degrades to
 ### `GET /node`
 
 The serving node's **live** CPU and memory, sampled fresh per request (this is
-what drives the dashboard header's node meter). Returns the node identity and a
-`resources` object:
-
-```shell
-$ http get http://127.0.0.1:8080/node
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-
-{
-    "node_name": "node-a",
-    "resources": {
-        "cpu_percent": 37.2,
-        "cpu_count": 8,
-        "mem_percent": 61.4,
-        "mem_used_bytes": 5284167680,
-        "mem_total_bytes": 8589934592,
-        "proc_rss_bytes": 58720256,
-        "proc_cpu_percent": 1.1
-    }
-}
-```
+what drives the dashboard header's node meter). Returns the node identity
+(`node_name`) and a `resources` object with `cpu_percent`, `cpu_count`,
+`mem_percent`, `mem_used_bytes`, `mem_total_bytes`, `proc_rss_bytes`, and
+`proc_cpu_percent`.
 
 `node_name` is the cluster node name when clustered, else the hostname.
 `cpu_percent` / `mem_percent` are whole-host utilisation; `proc_rss_bytes` /
@@ -656,28 +492,17 @@ never changes.
 ### `POST /jobs/{name}/start`
 
 Launches the named job immediately, regardless of its schedule. `{name}` is the
-job's `name`.
+job's `name`. Success answers `{"started": "<name>"}` (the `cron_run_job`
+[MCP tool](MCP)'s ack shape).
 
-| Condition | Response |
-| --- | --- |
-| No job with that name. | `404 Not Found`, body `{"error": "job '<name>' not found"}`. |
-| The job exists but has `enabled: false`. | `409 Conflict`, body `{"error": "job '<name>' is disabled"}`. |
-| Otherwise. | `200 OK`, body `{"started": "<name>"}` (the `cron_run_job` [MCP tool](MCP)'s ack shape); the job is launched via the normal launch path. |
-
-The `409` is deliberate: a disabled job behaves as if it is not there,
-so the API refuses to launch it manually rather than overriding the config.
+The `409` for a disabled job is deliberate: a disabled job behaves as if it is
+not there, so the API refuses to launch it manually rather than overriding the
+config.
 
 Manual launch goes through `maybe_launch_job`, so the job's `concurrencyPolicy`
 applies. If an instance is already running, `Allow` starts another, `Forbid` does
 not start a new one (the `200` still returns), and `Replace` cancels the running
 instance(s) first. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
-
-```shell
-$ http post http://127.0.0.1:8080/jobs/test-02/start
-HTTP/1.1 200 OK
-
-{"started": "test-02"}
-```
 
 ### `POST /jobs/{name}/cancel`
 
@@ -685,25 +510,15 @@ Terminates every currently-running instance of the named job, using the same
 graceful terminate-then-kill sequence cronstable uses elsewhere (honoring the
 job's `killTimeout`; see [Concurrency and Timeouts](Concurrency-and-Timeouts)).
 Instances are cancelled concurrently, so a job with several running instances
-costs at most one `killTimeout`, not one per instance.
-
-| Condition | Response |
-| --- | --- |
-| No job with that name. | `404 Not Found`, body `{"error": "job '<name>' not found"}`. |
-| The job exists but no instance is running. | `409 Conflict`, body `{"error": "job '<name>' is not running"}`. |
-| Otherwise. | `200 OK`, body `{"cancelled": "<name>", "instances": <count>}` (the `cron_cancel_job` [MCP tool](MCP)'s ack shape); all running instances are cancelled. |
+costs at most one `killTimeout`, not one per instance. A job with no running
+instance is a `409`; success answers
+`{"cancelled": "<name>", "instances": <count>}` (the `cron_cancel_job`
+[MCP tool](MCP)'s ack shape).
 
 A run cancelled this way is recorded in the job's history with the outcome
 `cancelled`. Cancellation is a deliberate operator action, not a job failure,
 so it is **not** reported (`onFailure` does not fire) and does **not** trigger
 retries.
-
-```shell
-$ http post http://127.0.0.1:8080/jobs/test-03/cancel
-HTTP/1.1 200 OK
-
-{"cancelled": "test-03", "instances": 1}
-```
 
 ### `POST /jobs/{name}/pause`
 
@@ -723,30 +538,12 @@ The JSON body is optional; every field is optional:
 | `note` | string | `""` | Audit note, at most 500 characters. |
 | `by` | string | `"api"` | Acting operator, at most 100 characters. |
 
-| Condition | Response |
-| --- | --- |
-| No job with that name. | `404 Not Found`. |
-| Both `durationSeconds` and `until`, a wrong type, an out-of-range duration, a past or over-cap `until`, an oversized `note`/`by`, or a malformed body. | `400 Bad Request` with the reason as text. |
-| Otherwise. | `200 OK`, body `{"paused": {since, until, note, by, channel}}` (ISO-8601 instants; `channel` is `"api"` here). |
-
-Pausing an already-paused job overwrites the window (idempotent; also how a
-pause is extended).
-
-```shell
-$ http post http://127.0.0.1:8080/jobs/test-02/pause durationSeconds:=7200 note="db migration"
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-
-{
-    "paused": {
-        "since": "2026-07-19T14:00:00+00:00",
-        "until": "2026-07-19T16:00:00+00:00",
-        "note": "db migration",
-        "by": "api",
-        "channel": "api"
-    }
-}
-```
+A body that violates any of those constraints (both `durationSeconds` and
+`until`, an out-of-range duration, a past or over-cap `until`, an oversized
+`note`/`by`, a malformed body) is a `400` naming the problem. Success answers
+`{"paused": {since, until, note, by, channel}}` (ISO-8601 instants; `channel`
+is `"api"` here). Pausing an already-paused job overwrites the window
+(idempotent; also how a pause is extended).
 
 ### `POST /jobs/{name}/resume`
 
@@ -756,13 +553,6 @@ otherwise `200 OK` with `{"paused": null}`, including when the job was not
 paused (resume is a no-op then, but with a [state store](Durable-State) the
 durable "resumed" record is still written, so a pause taken on another node
 that this node has not yet seen is revoked too).
-
-```shell
-$ http post http://127.0.0.1:8080/jobs/test-02/resume by=parker
-HTTP/1.1 200 OK
-
-{"paused": null}
-```
 
 ### `GET /jobs`
 
@@ -836,20 +626,6 @@ unknown job, like the other `/jobs/{name}/...` routes. The same detail dict has
 long been available to AI agents as the `cron_get_job` [MCP tool](MCP); this
 puts it on the REST surface too.
 
-```shell
-$ http get http://127.0.0.1:8080/jobs/test-01
-{
-    "name": "test-01",
-    "enabled": true,
-    "schedule": "*/5 * * * *",
-    "command": "echo foobar",
-    "running": false,
-    "scheduled_in": 42.1,
-    "last_run": {"outcome": "success", "exit_code": 0, "...": "..."},
-    "history": [{"outcome": "success", "duration": 1.02}]
-}
-```
-
 ### `GET /jobs/{name}/runs`
 
 Returns the job's retained run history (oldest first, bounded, and held in
@@ -885,34 +661,6 @@ Skipped rows carry no `started_at`, `exit_code`, or `duration`, and like
 | `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Resource-Monitoring) runs in the window; `null` when none were monitored. |
 | `avg_rss_bytes`, `max_rss_bytes`, `last_rss_bytes` | Peak-RSS aggregates (bytes) over the monitored runs; `null` when none were monitored. |
 
-```shell
-$ http get http://127.0.0.1:8080/jobs/test-01/runs
-{
-    "name": "test-01",
-    "runs": [
-        {
-            "outcome": "success",
-            "exit_code": 0,
-            "started_at": "2026-06-21T12:00:00+00:00",
-            "finished_at": "2026-06-21T12:00:01+00:00",
-            "duration": 1.02,
-            "fail_reason": null
-        }
-    ],
-    "stats": {
-        "total": 1,
-        "success": 1,
-        "failure": 0,
-        "cancelled": 0,
-        "success_rate": 1.0,
-        "avg_duration": 1.02,
-        "min_duration": 1.02,
-        "max_duration": 1.02,
-        "last_duration": 1.02
-    }
-}
-```
-
 ### `GET /activity`
 
 The feed behind the activity heatmap on the
@@ -924,23 +672,9 @@ to `[]`, so a client can tell "no runs" from "unknown job". The records, the
 bounds, and the restart behavior are exactly those of
 [`GET /jobs/{name}/runs`](#get-jobsnameruns), without the per-job fan-out,
 and one built response is shared across every viewer polling it (with
-`ETag` / `If-None-Match` and gzip, like `GET /jobs`).
-
-```shell
-$ http get http://127.0.0.1:8080/activity
-{
-    "jobs": {
-        "test-01": [
-            {
-                "started_at": "2026-06-21T12:00:00+00:00",
-                "finished_at": "2026-06-21T12:00:01+00:00",
-                "outcome": "success"
-            }
-        ],
-        "never-ran": []
-    }
-}
-```
+`ETag` / `If-None-Match` and gzip, like `GET /jobs`). An optional `?limit=`
+query caps the runs per job (newest kept, clamped to the retained window;
+the default serves the whole window).
 
 ### `GET /jobs/{name}/resources`
 
@@ -1011,20 +745,8 @@ The serving node's retained CPU/memory history — the time-series companion to
 [`GET /node`](#get-node)'s live snapshot, driving the dashboard's node chart
 (click the header meter). Sampled in the background per
 [`web.nodeHistory`](Configuration-Reference#web) (every 5s, last hour, by
-default), independent of whether anyone is polling.
-
-```shell
-$ http get http://127.0.0.1:8080/node/history
-HTTP/1.1 200 OK
-Content-Type: application/json; charset=utf-8
-
-{
-    "node_name": "node-a",
-    "enabled": true,
-    "interval": 5.0,
-    "points": [[1751889600.0, 37.2, 61.4], [1751889605.0, 35.9, 61.5]]
-}
-```
+default), independent of whether anyone is polling. The response carries
+`node_name`, `enabled`, the sampling `interval` in seconds, and `points`.
 
 `points` is oldest-first `[t, cpu_percent, mem_percent]` (epoch seconds; the
 same cgroup-aware percentages `GET /node` reports). A gap between consecutive
@@ -1044,23 +766,7 @@ The response carries the job `name`, a `source` field, a `generated_at`
 timestamp, and a `windows` map with keys `1h`, `24h`, `7d`, `30d`, and `all`,
 each holding the stats object documented under
 [`GET /jobs/{name}/runs`](#get-jobsnameruns) for the runs that finished inside
-that window:
-
-```shell
-$ http get http://127.0.0.1:8080/jobs/test-01/trends
-{
-    "name": "test-01",
-    "source": "durable",
-    "generated_at": "2026-07-04T12:00:00+00:00",
-    "windows": {
-        "1h":  { "total": 4, "success": 4, "...": "..." },
-        "24h": { "total": 96, "success": 95, "...": "..." },
-        "7d":  { "total": 672, "success": 668, "...": "..." },
-        "30d": { "...": "..." },
-        "all": { "...": "..." }
-    }
-}
-```
+that window.
 
 `source` is `"durable"` when the aggregates were computed over the durable
 ledger (the horizon is then bounded by `state.maxRunsPerJob` retention, and
@@ -1091,15 +797,6 @@ Only the streams a job captures (`captureStdout` / `captureStderr`) appear
 here; see [Output Capturing](Output-Capturing). The response carries
 `X-Accel-Buffering: no` so reverse proxies (e.g. nginx) do not buffer the
 stream.
-
-```shell
-$ curl -N http://127.0.0.1:8080/jobs/test-01/logs
-event: line
-data: {"stream": "stdout", "line": "foobar"}
-
-event: end
-data: {}
-```
 
 ### DAG endpoints
 
@@ -1205,22 +902,12 @@ empty `stream` parameter is a `400`; a stateless install is a `404`
 
 ### `GET /whoami`
 
-Describes the bearer token that authenticated this request: its `label`, the
-scopes it grants (with the implied `view` expanded), and whether it is an
-all-scopes token. A companion app uses it to show what it may do; the
-dashboard uses it to warn when its pairing QR would hand a phone the
-all-scopes token (see [Push Notifications](Push-Notifications)). Requires the
-`view` scope.
-
-```shell
-$ curl -H "Authorization: Bearer s3cr3t" http://127.0.0.1:8080/whoami
-{
-    "authenticated": true,
-    "label": "wallboard-ipad",
-    "scopes": ["view"],
-    "allScopes": false
-}
-```
+Describes the bearer token that authenticated this request, as
+`{authenticated, label, scopes, allScopes}`: its `label`, the scopes it
+grants (with the implied `view` expanded), and whether it is an all-scopes
+token. A companion app uses it to show what it may do; the dashboard uses it
+to warn when its pairing QR would hand a phone the all-scopes token (see
+[Push Notifications](Push-Notifications)). Requires the `view` scope.
 
 When no token is configured there is no auth middleware and no token to
 describe: `authenticated` is `false`, `label` is `null`, `scopes` lists every
@@ -1275,26 +962,12 @@ pairing. A malformed body, a missing or over-long field, or an invalid key
 is a `400` naming the problem; no `push:` section is a `404`; a store that
 cannot be written is a `503`.
 
-```shell
-$ curl -X POST -H "Authorization: Bearer s3cr3t" \
-    -H "Content-Type: application/json" \
-    -d '{"name": "parker-iphone", "platform": "ios", "publicKey": "jSNlDu28No2itHnvrs6ajHHuNAxvqgOjmGxHJrMo8yg=", "pushToken": "8f3a1bc2…d94af1c9"}' \
-    http://127.0.0.1:8080/push/devices
-{"device": {"id": "f1e2d3c4b5a69788", "…": "…"}, "created": true}
-```
-
 ### `DELETE /push/devices/{id}`
 
 Revokes one paired device; the daemon stops sealing alerts to it. Requires
 the `control` scope. Answers `{"revoked": "<id>"}`, or `404` when no device
 has that id (or no `push:` section is configured), or `503` when the store
 is unavailable.
-
-```shell
-$ curl -X DELETE -H "Authorization: Bearer s3cr3t" \
-    http://127.0.0.1:8080/push/devices/f1e2d3c4b5a69788
-{"revoked": "f1e2d3c4b5a69788"}
-```
 
 ### `POST /push/devices/{id}/test`
 
@@ -1306,12 +979,6 @@ when the relay accepted the alert and `502` when sealing failed or the relay
 refused or was unreachable (the `error` field says which); `404` for an
 unknown device id or no `push:` section; `503` when the registry store is
 unavailable.
-
-```shell
-$ curl -X POST -H "Authorization: Bearer s3cr3t" \
-    http://127.0.0.1:8080/push/devices/f1e2d3c4b5a69788/test
-{"device": "f1e2d3c4b5a69788", "status": 200, "error": null}
-```
 
 ### `POST /shutdown`
 
@@ -1344,15 +1011,7 @@ same set of jobs (see [job-set id](Job-Set-ID)).
 The response is `text/plain` by default; when `Accept` lists
 `application/json` among its media ranges it is a JSON object that also
 carries the job count (wildcards keep the text default, as on
-[`GET /status`](#get-status)).
-
-```shell
-$ http get http://127.0.0.1:8080/job-set-id
-v1:b834d7565aee0da50cd017f666651a5ba3b2e6b161daf0cb6e430f23f51ce90b
-
-$ http get http://127.0.0.1:8080/job-set-id Accept:application/json
-{"job_set_id": "v1:b834d7…51ce90b", "jobs": 3}
-```
+[`GET /status`](#get-status)): `{"job_set_id": "v1:…", "jobs": 3}`.
 
 ### `GET /metrics`
 
@@ -1361,7 +1020,7 @@ info, per-job run counters and duration histograms, live per-job gauges, and
 (when a `cluster` section is configured) the cluster health series that mirror
 `GET /cluster`. The exposition is generated by cronstable itself, with no
 exporter sidecar and no extra dependency. This section covers the endpoint
-mechanics; the full metric reference lives in
+mechanics; the exposition sample and the full metric reference live in
 [Metrics with Prometheus](Metrics-with-Prometheus).
 
 The response format depends on the request's `Accept` header:
@@ -1373,8 +1032,9 @@ The response format depends on the request's `Accept` header:
   request.
 
 The configured `web.headers` are applied to the response as on every other
-route, except `Content-Type`, which this endpoint owns: the exposition
-format's contract always wins over an operator-configured header.
+route; as everywhere on this API, `Content-Type` stays the endpoint's own,
+so the exposition format's contract always wins over an operator-configured
+header.
 
 The endpoint is enabled by default whenever the web API is on. The
 `web.metrics` option tunes or disables it, accepting either a boolean
@@ -1390,23 +1050,6 @@ The metric registry is owned by the daemon rather than the web app, so
 counters survive config reloads (including ones that restart the web server)
 and reset only when the process restarts; series for jobs removed by a reload
 are pruned.
-
-```shell
-$ curl http://127.0.0.1:8080/metrics
-# HELP cronstable_info cronstable build information.
-# TYPE cronstable_info gauge
-cronstable_info{version="1.0.13"} 1
-# HELP cronstable_jobs Number of configured jobs by enablement state.
-# TYPE cronstable_jobs gauge
-cronstable_jobs{state="enabled"} 2
-cronstable_jobs{state="disabled"} 1
-# HELP cronstable_job_runs_total Finished job runs by outcome, as recorded in the run history.
-# TYPE cronstable_job_runs_total counter
-cronstable_job_runs_total{job_name="test-01",status="success"} 12
-cronstable_job_runs_total{job_name="test-01",status="failure"} 1
-cronstable_job_runs_total{job_name="test-01",status="cancelled"} 0
-...
-```
 
 ### `GET /` (the dashboard page)
 
@@ -1445,7 +1088,9 @@ response across all routes (`/version`, `/status`, `/cluster`, `/job-set-id`,
 the job routes, and the `200` of `/jobs/{name}/start`) and to the `409`
 conflict bodies of `/jobs/{name}/start` and `/jobs/{name}/cancel`. It is not
 applied to the `404` (unknown job) or `401` (authentication failure) responses,
-which are raised without the configured headers. Example:
+which are raised without the configured headers. One key is exempt everywhere:
+a `Content-Type` in this map (in any spelling) is ignored, because every
+endpoint owns its own content type. Example:
 
 ```yaml
 web:

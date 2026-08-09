@@ -847,9 +847,10 @@ absence. `set` refuses a value larger than `maxValueBytes`.
 `cronstable cursor advance NAME VALUE` moves a monotonic watermark: the stored
 value only ever goes to `max(current, VALUE)`, so an out-of-order or replayed
 batch never walks it backwards, and on a shared store several nodes converge
-on the furthest point. A numeric value compares numerically (`9 < 10`); an
-ISO-8601 timestamp compares as the string it is (`2026-06 < 2026-07`). This is
-the ETL "process only what is new" pattern:
+on the furthest point. A numeric value compares numerically (`9 < 10`);
+anything else compares as the string it is, which orders ISO-8601 timestamps
+correctly (`2026-06 < 2026-07`). This is the ETL "process only what is new"
+pattern:
 
 ```shell
 since=$(cronstable cursor get watermark 2>/dev/null || echo 0)
@@ -858,7 +859,8 @@ cronstable cursor advance watermark "$new_max"
 ```
 
 Pass `--force` to set the value even if it moves the cursor backwards (a
-deliberate rewind).
+deliberate rewind). Both `cursor get` and `cursor advance` print the
+resulting value.
 
 ### Idempotency keys
 
@@ -888,7 +890,8 @@ concurrency slots use. The daemon holds the lease on the run's behalf, renews
 it while the job holds the lock, and releases it the instant the job releases
 *or the run ends* -- so a job that crashes or forgets to unlock never leaks a
 lock (the lease also self-frees by its TTL as the backstop). `lock run` is the
-convenient form, holding the lock for the duration of a wrapped command:
+convenient form: it holds the lock while the wrapped command runs and always
+releases it afterward, even when the command fails or is signalled:
 
 ```shell
 # only one holder of "db-maintenance" runs across the whole fleet at a time:
@@ -954,7 +957,8 @@ jobs:
 ```
 
 `cronstable secret get NAME` prints the value (exit `4` if it was not staged);
-`cronstable secret list` prints the staged names (not their values). Declaring
+`cronstable secret list` prints one staged name per line (names, not their
+values). Declaring
 `secrets` needs a `state` section with `jobApi` enabled, else the config is
 rejected.
 

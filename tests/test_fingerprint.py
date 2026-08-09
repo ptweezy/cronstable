@@ -13,6 +13,7 @@ from cronstable.fingerprint import (
     job_set_id,
 )
 from cronstable.platform import IS_WINDOWS
+from tests._configs import job_yaml
 
 
 def _jobs(yaml: str):
@@ -64,14 +65,9 @@ def test_empty_job_set_is_stable():
 
 
 def test_inline_vs_defaults_block_match():
-    inline = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    shell: /bin/bash
-    captureStdout: true
-"""
+    inline = job_yaml(
+        "a", extra="    shell: /bin/bash\n    captureStdout: true\n"
+    )
     via_defaults = """
 defaults:
   shell: /bin/bash
@@ -91,76 +87,44 @@ def test_inline_default_numeric_matches_inherited_default():
     # strictyaml coerces it to float 30.0. The two must still fingerprint the
     # same, or HA replicas (one omitting the field, one spelling out the
     # default) would wrongly disagree.
-    bare = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
-    inline = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    killTimeout: 30
-"""
+    bare = job_yaml("a")
+    inline = job_yaml("a", extra="    killTimeout: 30\n")
     assert _id(bare) == _id(inline)
 
 
 def test_inline_default_retry_block_matches_inherited():
     # the same int-vs-float hazard for the retry delays (defaults 1/300/2 are
     # ints; written inline they parse to floats)
-    bare = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
-    full_retry = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      retry:
-        maximumRetries: 0
-        initialDelay: 1
-        maximumDelay: 300
-        backoffMultiplier: 2
-"""
+    bare = job_yaml("a")
+    full_retry = job_yaml(
+        "a",
+        extra=(
+            "    onFailure:\n"
+            "      retry:\n"
+            "        maximumRetries: 0\n"
+            "        initialDelay: 1\n"
+            "        maximumDelay: 300\n"
+            "        backoffMultiplier: 2\n"
+        ),
+    )
     assert _id(bare) == _id(full_retry)
 
 
 def test_fractional_float_is_preserved():
     # normalization must only collapse whole-number floats, not lose precision
-    half = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    killTimeout: 0.5
-"""
-    one = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    killTimeout: 1
-"""
+    half = job_yaml("a", extra="    killTimeout: 0.5\n")
+    one = job_yaml("a", extra="    killTimeout: 1\n")
     assert _id(half) != _id(one)
 
 
 def test_utc_flag_redundant_when_timezone_set():
     # with an explicit timezone, the raw utc flag has no effect on firing, so
     # two configs differing only in utc must fingerprint the same
-    a = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "0 0 * * *"
-    timezone: America/New_York
-    utc: false
-"""
+    a = job_yaml(
+        "a",
+        schedule="0 0 * * *",
+        extra="    timezone: America/New_York\n    utc: false\n",
+    )
     b = a.replace("utc: false", "utc: true")
     assert _id(a) == _id(b)
 
@@ -168,40 +132,19 @@ jobs:
 def test_utc_flag_matters_without_timezone():
     # with no explicit timezone, utc:false (local) vs utc:true (UTC) is a real
     # firing-frame difference and must change the id
-    local = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "0 0 * * *"
-    utc: false
-"""
+    local = job_yaml("a", schedule="0 0 * * *", extra="    utc: false\n")
     utc = local.replace("utc: false", "utc: true")
     assert _id(local) != _id(utc)
 
 
 def test_schedule_string_whitespace_normalized():
-    single = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "*/5 * * * *"
-"""
-    doubled = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "*/5  *   * * *"
-"""
+    single = job_yaml("a", schedule="*/5 * * * *")
+    doubled = job_yaml("a", schedule="*/5  *   * * *")
     assert _id(single) == _id(doubled)
 
 
 def test_schedule_string_and_object_forms_match():
-    as_string = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "*/5 * * * *"
-"""
+    as_string = job_yaml("a", schedule="*/5 * * * *")
     as_object = """
 jobs:
   - name: a
@@ -215,12 +158,7 @@ jobs:
 def test_schedule_seconds_string_and_object_forms_match():
     # the object second: form fingerprints identically to the equivalent
     # 7-field crontab string (same equivalence property, extended to seconds)
-    as_string = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "*/15 * * * * * *"
-"""
+    as_string = job_yaml("a", schedule="*/15 * * * * * *")
     as_object = """
 jobs:
   - name: a
@@ -235,29 +173,14 @@ jobs:
 def test_schedule_seconds_change_id():
     # a schedule that pins seconds is a different job set from the minute-only
     # one (the second column is part of the identity)
-    minute_only = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "*/15 * * * *"
-"""
-    with_seconds = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "*/15 * * * * * *"
-"""
+    minute_only = job_yaml("a", schedule="*/15 * * * *")
+    with_seconds = job_yaml("a", schedule="*/15 * * * * * *")
     assert _id(minute_only) != _id(with_seconds)
 
 
 def test_schedule_year_string_and_object_forms_match():
     # the object year: form (now honored, 6-field) matches the crontab string
-    as_string = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "0 12 * * * 2030"
-"""
+    as_string = job_yaml("a", schedule="0 12 * * * 2030")
     as_object = """
 jobs:
   - name: a
@@ -271,58 +194,54 @@ jobs:
 
 
 def test_environment_order_independent():
-    one = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    environment:
-      - key: FOO
-        value: "1"
-      - key: BAR
-        value: "2"
-"""
-    two = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    environment:
-      - key: BAR
-        value: "2"
-      - key: FOO
-        value: "1"
-"""
+    one = job_yaml(
+        "a",
+        extra=(
+            "    environment:\n"
+            "      - key: FOO\n"
+            '        value: "1"\n'
+            "      - key: BAR\n"
+            '        value: "2"\n'
+        ),
+    )
+    two = job_yaml(
+        "a",
+        extra=(
+            "    environment:\n"
+            "      - key: BAR\n"
+            '        value: "2"\n'
+            "      - key: FOO\n"
+            '        value: "1"\n'
+        ),
+    )
     assert _id(one) == _id(two)
 
 
 def test_environment_value_not_part_of_identity():
     # only env var NAMES are fingerprinted, not values (values may be secret /
     # per-host); two configs differing only in a value must match
-    a = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    environment:
-      - key: TOKEN
-        value: secret-A
-"""
+    a = job_yaml(
+        "a",
+        extra=(
+            "    environment:\n"
+            "      - key: TOKEN\n"
+            "        value: secret-A\n"
+        ),
+    )
     b = a.replace("secret-A", "secret-B")
     assert _id(a) == _id(b)
 
 
 def test_environment_key_set_is_part_of_identity():
     # adding/renaming a variable does change the id
-    one = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    environment:
-      - key: FOO
-        value: "1"
-"""
+    one = job_yaml(
+        "a",
+        extra=(
+            "    environment:\n"
+            "      - key: FOO\n"
+            '        value: "1"\n'
+        ),
+    )
     two = one.replace("FOO", "BAR")
     assert _id(one) != _id(two)
 
@@ -338,13 +257,7 @@ def test_schedule_change_changes_id():
 
 
 def test_enabled_toggle_changes_id():
-    disabled = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    enabled: false
-"""
+    disabled = job_yaml("a", extra="    enabled: false\n")
     enabled = disabled.replace("enabled: false", "enabled: true")
     assert _id(disabled) != _id(enabled)
 
@@ -353,13 +266,7 @@ def test_cluster_policy_changes_id():
     # clusterPolicy is behaviour-affecting and host-independent, so two
     # configs differing only in it must fingerprint differently (replicas
     # disagreeing on it should surface as drift, not coordinate differently).
-    leader = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    clusterPolicy: Leader
-"""
+    leader = job_yaml("a", extra="    clusterPolicy: Leader\n")
     every = leader.replace("Leader", "EveryNode")
     assert _id(leader) != _id(every)
     # the default is Leader, so omitting it matches an explicit Leader
@@ -368,12 +275,7 @@ jobs:
 
 
 def test_shell_command_vs_argv_do_not_collide():
-    as_shell = """
-jobs:
-  - name: a
-    command: echo a b
-    schedule: "* * * * *"
-"""
+    as_shell = job_yaml("a", command="echo a b")
     as_argv = """
 jobs:
   - name: a
@@ -389,40 +291,33 @@ jobs:
 def test_inline_secret_value_is_redacted():
     # two jobs differing only in the literal sentry DSN value must produce the
     # same id: the fingerprint must not embed secret material.
-    tmpl = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        sentry:
-          dsn:
-            value: {secret}
-"""
+    tmpl = job_yaml(
+        "a",
+        extra=(
+            "    onFailure:\n"
+            "      report:\n"
+            "        sentry:\n"
+            "          dsn:\n"
+            "            value: {secret}\n"
+        ),
+    )
     a = tmpl.format(secret="https://aaa@example.com/1")
     b = tmpl.format(secret="https://bbb@example.com/2")
     assert _id(a) == _id(b)
 
 
 def test_having_a_secret_still_differs_from_not_having_one():
-    with_dsn = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        sentry:
-          dsn:
-            value: https://aaa@example.com/1
-"""
-    without = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
+    with_dsn = job_yaml(
+        "a",
+        extra=(
+            "    onFailure:\n"
+            "      report:\n"
+            "        sentry:\n"
+            "          dsn:\n"
+            "            value: https://aaa@example.com/1\n"
+        ),
+    )
+    without = job_yaml("a")
     # redaction hides the *value*, not the fact that sentry is configured
     assert _id(with_dsn) != _id(without)
 
@@ -431,14 +326,7 @@ def test_canonical_job_uses_configured_user_not_resolved_uid():
     # construct a job without user (so no root/passwd resolution is needed),
     # then check the fingerprint reflects the configured user/group attributes
     # rather than any resolved uid/gid.
-    (job,) = _jobs(
-        """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
-    )
+    (job,) = _jobs(job_yaml("a"))
     canon = canonical_job(job)
     assert canon["user"] is None and canon["group"] is None
     assert "uid" not in canon and "gid" not in canon
@@ -456,17 +344,16 @@ def test_canonical_job_is_json_safe_and_pure():
     # canonical_job must not mutate the job's own (shared) config dicts when it
     # redacts secrets, and must be stable across repeated calls.
     (job,) = _jobs(
-        """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        sentry:
-          dsn:
-            value: https://aaa@example.com/1
-"""
+        job_yaml(
+            "a",
+            extra=(
+                "    onFailure:\n"
+                "      report:\n"
+                "        sentry:\n"
+                "          dsn:\n"
+                "            value: https://aaa@example.com/1\n"
+            ),
+        )
     )
     first = job_digest(job)
     # the real config still holds the original secret (not redacted in place)
@@ -569,17 +456,16 @@ def test_job_set_id_golden_value_windows():
 # changing at all -- which is exactly how the reporter `timeout` first shipped
 # into every job's digest, repointing the persisted retry ladders and @reboot
 # markers keyed by job_digest.
-_REPORT_TIMEOUT_JOB = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        shell:
-          command: "true"
-{timeout}
-"""
+_REPORT_TIMEOUT_JOB = job_yaml(
+    "a",
+    extra=(
+        "    onFailure:\n"
+        "      report:\n"
+        "        shell:\n"
+        '          command: "true"\n'
+        "{timeout}\n"
+    ),
+)
 
 
 def _report_timeout_job(timeout=None):
@@ -653,31 +539,23 @@ def test_canonical_job_field_set_is_locked():
     # adding or removing a field from the identity changes every id, so it must
     # be a deliberate decision. This fails loudly and names the drift, instead
     # of a field silently entering/leaving identity in an unrelated edit.
-    (job,) = _jobs(
-        """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
-    )
+    (job,) = _jobs(job_yaml("a"))
     assert set(canonical_job(job).keys()) == EXPECTED_CANONICAL_FIELDS
 
 
-_IDENTITY_BASE = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    concurrencyPolicy: Allow
-    captureStderr: false
-    captureStdout: false
-    streamPrefix: "p"
-    saveLimit: 4096
-    maxLineLength: 4096
-    executionTimeout: 10
-    killTimeout: 30
-"""
+_IDENTITY_BASE = job_yaml(
+    "a",
+    extra=(
+        "    concurrencyPolicy: Allow\n"
+        "    captureStderr: false\n"
+        "    captureStdout: false\n"
+        '    streamPrefix: "p"\n'
+        "    saveLimit: 4096\n"
+        "    maxLineLength: 4096\n"
+        "    executionTimeout: 10\n"
+        "    killTimeout: 30\n"
+    ),
+)
 
 
 @pytest.mark.parametrize(
@@ -703,53 +581,41 @@ def test_identity_field_change_changes_id(old, new):
 
 
 def test_statsd_presence_changes_id():
-    without = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
-    with_statsd = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    statsd:
-      host: localhost
-      port: 8125
-      prefix: yacron
-"""
+    without = job_yaml("a")
+    with_statsd = job_yaml(
+        "a",
+        extra=(
+            "    statsd:\n"
+            "      host: localhost\n"
+            "      port: 8125\n"
+            "      prefix: yacron\n"
+        ),
+    )
     assert _id(without) != _id(with_statsd)
 
 
 def test_fails_when_change_changes_id():
-    base = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    failsWhen:
-      producesStdout: false
-"""
+    base = job_yaml(
+        "a", extra="    failsWhen:\n      producesStdout: false\n"
+    )
     variant = base.replace("producesStdout: false", "producesStdout: true")
     assert _id(base) != _id(variant)
 
 
 def _mail_pw_config(secret):
-    return """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        mail:
-          from: a@b.com
-          to: c@d.com
-          smtpHost: smtp
-          password:
-            value: {secret}
-""".format(secret=secret)
+    return job_yaml(
+        "a",
+        extra=(
+            "    onFailure:\n"
+            "      report:\n"
+            "        mail:\n"
+            "          from: a@b.com\n"
+            "          to: c@d.com\n"
+            "          smtpHost: smtp\n"
+            "          password:\n"
+            "            value: {secret}\n"
+        ).format(secret=secret),
+    )
 
 
 def test_inline_mail_password_is_redacted():
@@ -760,34 +626,32 @@ def test_inline_mail_password_is_redacted():
 
 def test_mail_password_presence_still_changes_id():
     with_pw = _mail_pw_config("hunter2")
-    without_pw = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        mail:
-          from: a@b.com
-          to: c@d.com
-          smtpHost: smtp
-"""
+    without_pw = job_yaml(
+        "a",
+        extra=(
+            "    onFailure:\n"
+            "      report:\n"
+            "        mail:\n"
+            "          from: a@b.com\n"
+            "          to: c@d.com\n"
+            "          smtpHost: smtp\n"
+        ),
+    )
     # redaction hides the value, not the fact that a password is configured
     assert _id(with_pw) != _id(without_pw)
 
 
 def _sentry_action_config(action, secret):
-    return """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    {action}:
-      report:
-        sentry:
-          dsn:
-            value: {secret}
-""".format(action=action, secret=secret)
+    return job_yaml(
+        "a",
+        extra=(
+            "    {action}:\n"
+            "      report:\n"
+            "        sentry:\n"
+            "          dsn:\n"
+            "            value: {secret}\n"
+        ).format(action=action, secret=secret),
+    )
 
 
 @pytest.mark.parametrize("action", ["onSuccess", "onPermanentFailure"])
@@ -800,19 +664,18 @@ def test_sentry_secret_redacted_in_action_block(action):
 
 
 def _webhook_config(url, auth="s3cret"):
-    return """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    onFailure:
-      report:
-        webhook:
-          url:
-            value: {url}
-          headers:
-            Authorization: {auth}
-""".format(url=url, auth=auth)
+    return job_yaml(
+        "a",
+        extra=(
+            "    onFailure:\n"
+            "      report:\n"
+            "        webhook:\n"
+            "          url:\n"
+            "            value: {url}\n"
+            "          headers:\n"
+            "            Authorization: {auth}\n"
+        ).format(url=url, auth=auth),
+    )
 
 
 def test_inline_webhook_url_is_redacted():
@@ -833,12 +696,7 @@ def test_webhook_header_values_are_redacted():
 
 def test_webhook_presence_still_changes_id():
     with_hook = _webhook_config("https://example.com/hook")
-    without = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
+    without = job_yaml("a")
     # redaction hides the value, not the fact that a webhook is configured
     assert _id(with_hook) != _id(without)
 
@@ -912,27 +770,21 @@ def test_redact_action_with_report_redacts_nested_secret():
 # the moment an operator adds a threshold.
 # ---------------------------------------------------------------------------
 
-_SLA_BARE = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-"""
+_SLA_BARE = job_yaml("a")
 
-_SLA_CONFIGURED = """
-jobs:
-  - name: a
-    command: echo a
-    schedule: "* * * * *"
-    sla:
-      maxTimeSinceSuccessSeconds: 3600
-      lateAfterSeconds: 300
-      maxRuntimeSeconds: 1200
-    onLate:
-      report:
-        shell:
-          command: notify
-"""
+_SLA_CONFIGURED = job_yaml(
+    "a",
+    extra=(
+        "    sla:\n"
+        "      maxTimeSinceSuccessSeconds: 3600\n"
+        "      lateAfterSeconds: 300\n"
+        "      maxRuntimeSeconds: 1200\n"
+        "    onLate:\n"
+        "      report:\n"
+        "        shell:\n"
+        "          command: notify\n"
+    ),
+)
 
 
 def test_sla_and_onlate_stay_out_of_canonical_job():

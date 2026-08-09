@@ -44,7 +44,8 @@ import os
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urlparse
 
 if TYPE_CHECKING:
@@ -301,7 +302,7 @@ def validate_public_key(value: Any) -> str:
     return base64.b64encode(raw).decode("ascii")
 
 
-def _validate_field(payload: Dict[str, Any], field: str) -> str:
+def _validate_field(payload: dict[str, Any], field: str) -> str:
     value = payload.get(field)
     if not isinstance(value, str) or not value.strip():
         raise PushError("{} is required".format(field))
@@ -315,7 +316,7 @@ def _validate_field(payload: Dict[str, Any], field: str) -> str:
     return value
 
 
-def validate_pairing(payload: Any) -> Dict[str, str]:
+def validate_pairing(payload: Any) -> dict[str, str]:
     """Validate a ``POST /push/devices`` body into a clean field dict.
 
     Raises :class:`PushError` with a message safe to return in a 400.
@@ -358,7 +359,7 @@ def seal_to_device(public_key_b64: str, plaintext: bytes) -> str:
     return base64.b64encode(sealed).decode("ascii")
 
 
-def _encode(payload: Dict[str, Any]) -> bytes:
+def _encode(payload: dict[str, Any]) -> bytes:
     return json.dumps(
         payload, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
@@ -366,7 +367,7 @@ def _encode(payload: Dict[str, Any]) -> bytes:
 
 def build_payload(
     ctx: Any, success: bool, include_log_tail: bool
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """The sealed plaintext for one alert, before size fitting.
 
     ``ctx`` is duck-typed exactly as the other reporters take it: a
@@ -384,7 +385,7 @@ def build_payload(
         kind = "sla"
     else:
         kind = "success" if success else "failure"
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "v": PUSH_PROTOCOL_VERSION,
         "kind": kind,
         "name": tv.get("name"),
@@ -430,7 +431,7 @@ def build_payload(
     return payload
 
 
-def _trim_log_tail(payload: Dict[str, Any], tail: List[str]) -> bytes:
+def _trim_log_tail(payload: dict[str, Any], tail: list[str]) -> bytes:
     """Drop the FEWEST oldest log-tail lines that fit the cap; re-encode.
 
     The encoded size falls monotonically as lines are dropped, so the
@@ -475,7 +476,7 @@ def _trim_log_tail(payload: Dict[str, Any], tail: List[str]) -> bytes:
     return fitted
 
 
-def fit_payload(payload: Dict[str, Any]) -> bytes:
+def fit_payload(payload: dict[str, Any]) -> bytes:
     """Shrink ``payload`` in place until it seals under the APNs cap.
 
     Trim order: oldest log-tail lines first (the newest lines carry the
@@ -508,7 +509,7 @@ def fit_payload(payload: Dict[str, Any]) -> bytes:
     return data
 
 
-def collapse_id(payload: Dict[str, Any], salt: str) -> str:
+def collapse_id(payload: dict[str, Any], salt: str) -> str:
     """An opaque coalescing key for the relay: same alert, same id.
 
     A keyed hash of the alert's identity fields, so the relay can
@@ -562,7 +563,7 @@ def key_fingerprint(public_key_b64: Optional[str]) -> Optional[str]:
     return "-".join(digest[i : i + 4] for i in range(0, 12, 4))
 
 
-def public_device(device: Dict[str, Any]) -> Dict[str, Any]:
+def public_device(device: dict[str, Any]) -> dict[str, Any]:
     """A device record as served by ``GET /push/devices``.
 
     The push token is redacted to its tail: it is not key material, but
@@ -639,7 +640,7 @@ async def _call_on_daemon_thread(fn: Callable[[], Any], name: str) -> Any:
 #: abandoned by the old instance racing the new one's writers: a reload is
 #: exactly when someone is most likely to be poking at a wedged install.
 #: One entry per configured path, so the map cannot grow.
-_FILE_LOCKS: Dict[str, threading.Lock] = {}
+_FILE_LOCKS: dict[str, threading.Lock] = {}
 _FILE_LOCKS_GUARD = threading.Lock()
 
 
@@ -733,7 +734,7 @@ class FileDeviceStore:
                 )
             ) from None
 
-    def _read(self) -> List[Dict[str, Any]]:
+    def _read(self) -> list[dict[str, Any]]:
         try:
             with open(self.path, "rt", encoding="utf-8") as stream:
                 doc = json.load(stream)
@@ -790,7 +791,7 @@ class FileDeviceStore:
                     if os.stat(stale).st_mtime < cutoff:
                         os.unlink(stale)
 
-    def _write(self, devices: List[Dict[str, Any]]) -> None:
+    def _write(self, devices: list[dict[str, Any]]) -> None:
         if self._corrupt is not None:
             # Never overwrite a file we could not parse: the operator
             # may still recover pairings from it by hand.
@@ -798,7 +799,7 @@ class FileDeviceStore:
                 "refusing to overwrite unreadable devices file {} "
                 "({}); fix or remove it first".format(self.path, self._corrupt)
             )
-        doc: Dict[str, Any] = {"version": 1, "devices": devices}
+        doc: dict[str, Any] = {"version": 1, "devices": devices}
         if self._salt:
             doc["collapseSalt"] = self._salt
         # A unique name plus O_EXCL, the way
@@ -836,14 +837,14 @@ class FileDeviceStore:
                 )
             ) from None
 
-    async def load(self) -> List[Dict[str, Any]]:
+    async def load(self) -> list[dict[str, Any]]:
         async with self._lock:
-            devices: List[Dict[str, Any]] = await self._run(
+            devices: list[dict[str, Any]] = await self._run(
                 self._read, "reading"
             )
             return devices
 
-    async def upsert(self, device: Dict[str, Any]) -> None:
+    async def upsert(self, device: dict[str, Any]) -> None:
         def _do() -> None:
             devices = self._read()
             devices = [d for d in devices if d.get("id") != device.get("id")]
@@ -958,7 +959,7 @@ class StateDeviceStore:
                 )
             ) from None
 
-    async def load(self) -> List[Dict[str, Any]]:
+    async def load(self) -> list[dict[str, Any]]:
         backend = self._backend()
         docs = await self._bounded(
             "listing paired devices",
@@ -966,10 +967,10 @@ class StateDeviceStore:
         )
         return [d for d in docs if isinstance(d, dict) and d.get("id")]
 
-    async def upsert(self, device: Dict[str, Any]) -> None:
+    async def upsert(self, device: dict[str, Any]) -> None:
         backend = self._backend()
 
-        def _put(_current: Optional[Dict[str, Any]]) -> Tuple[Any, None]:
+        def _put(_current: Optional[dict[str, Any]]) -> tuple[Any, None]:
             # Pure and idempotent: mutate_document may retry it on a
             # torn read, and it runs on the store's worker thread.
             return dict(device), None
@@ -1003,13 +1004,13 @@ class StateDeviceStore:
         backend = self._backend()
         candidate = secrets.token_hex(16)
 
-        def _ensure(current: Optional[Dict[str, Any]]) -> Tuple[Any, str]:
+        def _ensure(current: Optional[dict[str, Any]]) -> tuple[Any, str]:
             existing = (current or {}).get("salt")
             if isinstance(existing, str) and existing:
                 return DOC_KEEP, existing
             return {"salt": candidate}, candidate
 
-        mutated: Tuple[Any, str] = await self._bounded(
+        mutated: tuple[Any, str] = await self._bounded(
             "reading the collapse salt",
             backend.mutate_document(PUSH_META_NAMESPACE, "collapse", _ensure),
         )
@@ -1039,7 +1040,7 @@ class PushService:
         self.relay_timeout = relay_timeout
         self.store = store
         self.host = host
-        self._devices: Dict[str, Dict[str, Any]] = {}
+        self._devices: dict[str, dict[str, Any]] = {}
         self._mirror_fresh_until = 0.0
         # Why the last read failed, or None while the mirror is trusted.
         # The freshness deadline alone cannot say that: inside the retry
@@ -1134,18 +1135,18 @@ class PushService:
                         exc,
                     )
 
-    def devices_payload(self) -> List[Dict[str, Any]]:
+    def devices_payload(self) -> list[dict[str, Any]]:
         devices = sorted(
             self._devices.values(), key=lambda d: d.get("createdAt") or ""
         )
         return [public_device(d) for d in devices]
 
-    def get_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+    def get_device(self, device_id: str) -> Optional[dict[str, Any]]:
         return self._devices.get(device_id)
 
     async def pair(
-        self, fields: Dict[str, str], created_by: Optional[str]
-    ) -> Tuple[Dict[str, Any], bool]:
+        self, fields: dict[str, str], created_by: Optional[str]
+    ) -> tuple[dict[str, Any], bool]:
         """Register (or re-register) a device; returns (record, created).
 
         Re-pairing is keyed on the public key: the same device pairing
@@ -1183,7 +1184,7 @@ class PushService:
         return bool(removed)
 
     async def send_report(
-        self, ctx: Any, success: bool, push_config: Dict[str, Any]
+        self, ctx: Any, success: bool, push_config: dict[str, Any]
     ) -> None:
         """Fan one alert out to every paired device (the reporter path).
 
@@ -1233,7 +1234,7 @@ class PushService:
                     result["error"],
                 )
 
-    async def send_test(self, device: Dict[str, Any]) -> Dict[str, Any]:
+    async def send_test(self, device: dict[str, Any]) -> dict[str, Any]:
         """Send a test alert to one device; returns the relay outcome."""
         payload = {
             "v": PUSH_PROTOCOL_VERSION,
@@ -1258,12 +1259,12 @@ class PushService:
 
     async def _send_payload(
         self,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
         *,
         priority: str,
-        only: Optional[Dict[str, Any]] = None,
+        only: Optional[dict[str, Any]] = None,
         collapse: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         plaintext = fit_payload(payload)
         coalesce = collapse or collapse_id(
             payload, self._collapse_salt or self._local_salt
@@ -1340,12 +1341,12 @@ class PushService:
     async def _send_to_device(
         self,
         session: "aiohttp.ClientSession",
-        device: Dict[str, Any],
+        device: dict[str, Any],
         plaintext: bytes,
         coalesce: str,
         priority: str,
         is_event: bool,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Seal and POST one alert; the outcome, never an exception."""
         # Re-imported per call rather than shared from the caller: past the
         # first send this is a sys.modules hit, which is nothing next to the
@@ -1353,7 +1354,7 @@ class PushService:
         # resolvable without a module-scope aiohttp.
         import aiohttp
 
-        outcome: Dict[str, Any] = {
+        outcome: dict[str, Any] = {
             "device": device.get("id"),
             "status": None,
             "error": None,

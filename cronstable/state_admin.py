@@ -25,7 +25,8 @@ import shutil
 import socket
 import sys
 import tarfile
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from collections.abc import Iterator
+from typing import Any, Optional
 
 from cronstable.config import ConfigError, parse_config
 from cronstable.state import (
@@ -71,7 +72,7 @@ def _load_state_backend(config_arg: str) -> FilesystemStateBackend:
     return backend
 
 
-def _config_keep_sets(config_arg: str) -> Tuple[Set[str], Set[str], Set[str]]:
+def _config_keep_sets(config_arg: str) -> tuple[set[str], set[str], set[str]]:
     """(job names, extra artifact scopes, dag names) the config keeps alive.
 
     The same three seed sets the daemon derives from its loaded config for a
@@ -81,10 +82,10 @@ def _config_keep_sets(config_arg: str) -> Tuple[Set[str], Set[str], Set[str]]:
     """
     config = parse_config(config_arg)
     names = {job.name for job in config.jobs}
-    scopes: Set[str] = set()
+    scopes: set[str] = set()
     for job in config.jobs:
         scopes.update(job.stateAllowedScopes)
-    dag_names: Set[str] = set()
+    dag_names: set[str] = set()
     for dagcfg in config.dags:
         dag_names.add(dagcfg.name)
         for template in dagcfg.task_templates.values():
@@ -92,7 +93,7 @@ def _config_keep_sets(config_arg: str) -> Tuple[Set[str], Set[str], Set[str]]:
     return names, scopes, dag_names
 
 
-def _walk_carried(base: str) -> Iterator[Tuple[str, str]]:
+def _walk_carried(base: str) -> Iterator[tuple[str, str]]:
     """Yield (absolute path, base-relative arcname) for every carried file."""
     for sub in _CARRIED_DIRS:
         root = os.path.join(base, sub)
@@ -366,28 +367,20 @@ def cmd_migrate(
 
 async def _gc_async(
     backend: FilesystemStateBackend,
-    keep_names: Set[str],
-    keep_scopes: Set[str],
-    keep_dags: Set[str],
+    keep_names: set[str],
+    keep_scopes: set[str],
+    keep_dags: set[str],
     dry_run: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     import datetime
 
     from cronstable.cron import (
-        CATCHUP_STREAM_PREFIX,
-        COUNTER_STREAM_PREFIX,
-        INFLIGHT_STREAM_PREFIX,
-        LOG_STREAM_PREFIX,
         MANIFEST_HOSTS_CAP,
         MANIFEST_STREAM_KEEP,
         MANIFEST_STREAM_PREFIX,
-        REBOOT_STREAM_PREFIX,
-        RETRY_STREAM_PREFIX,
-        RUN_STREAM_PREFIX,
-        SLOT_STREAM_PREFIX,
-        _fold_manifest,
         _manifests_cover_scopes,
         _parse_iso_utc,
+        build_gc_keep_set,
         get_now,
     )
     from cronstable.dag import DAG_LEASE_PREFIX, DAG_RUN_NS_PREFIX, xcom_scope
@@ -406,7 +399,7 @@ async def _gc_async(
     stream_names = sorted(
         set(await backend.list_stream_names(MANIFEST_STREAM_PREFIX))
     )[:MANIFEST_HOSTS_CAP]
-    manifests: List[Dict[str, Any]] = []
+    manifests: list[dict[str, Any]] = []
     for name in stream_names:
         manifests.extend(
             await backend.list_records(
@@ -427,32 +420,14 @@ async def _gc_async(
     names = set(keep_names)
     # keep this machine's own counter snapshots even if no daemon has
     # manifested from here recently.
-    hosts: Set[str] = {socket.gethostname() or "localhost"}
+    hosts: set[str] = {socket.gethostname() or "localhost"}
     art_scopes = set(keep_scopes) | {GLOBAL_SCOPE}
     live_dags = set(keep_dags)
-    recent: List[Dict[str, Any]] = []
-    for rec in manifests:
-        at = _parse_iso_utc(rec.get("at"))
-        if at is None or (now - at).total_seconds() > grace:
-            continue
-        recent.append(rec)
-        _fold_manifest(rec, names, hosts, art_scopes, live_dags)
-    # job names keep their default artifact scope too.
-    art_scopes |= names
-    keep: Dict[str, Set[str]] = {
-        RUN_STREAM_PREFIX: names,
-        LOG_STREAM_PREFIX: names,
-        CATCHUP_STREAM_PREFIX: names,
-        RETRY_STREAM_PREFIX: names,
-        REBOOT_STREAM_PREFIX: names,
-        COUNTER_STREAM_PREFIX: hosts,
-        # without these two, a manual `cronstable state gc` diverges from the
-        # daemon's automatic pass and never reclaims in-flight/slot-lease
-        # bookkeeping for a removed job.
-        INFLIGHT_STREAM_PREFIX: names,
-        SLOT_STREAM_PREFIX: names,
-        MANIFEST_STREAM_PREFIX: hosts,
-    }
+    # the daemon's automatic pass builds its keep-set through the same
+    # function, so the two passes cannot drift.
+    keep, recent = build_gc_keep_set(
+        manifests, now, grace, names, hosts, art_scopes, live_dags
+    )
     # artifact streams are managed only when (a) every recent manifest
     # advertises its scopes/dags (an older node's silence proves nothing --
     # mirrors the daemon's pass) and (b) every dagrun/<dag> namespace could
@@ -500,8 +475,8 @@ async def _sweep_blobs_async(
     backend: FilesystemStateBackend,
     grace: float,
     dry_run: bool,
-    pruned_tokens: Set[str],
-) -> Tuple[int, Optional[str]]:
+    pruned_tokens: set[str],
+) -> tuple[int, Optional[str]]:
     """One orphan-blob sweep; ``(count, why-skipped-or-None)``.
 
     Biased to KEEP on every doubt, exactly like the daemon's pass
@@ -583,7 +558,7 @@ def cmd_gc(config_arg: str, dry_run: bool) -> int:
     return 0
 
 
-async def _check_async(backend: FilesystemStateBackend) -> Dict[str, Any]:
+async def _check_async(backend: FilesystemStateBackend) -> dict[str, Any]:
     await backend.start()
     return backend.view_dict()
 
@@ -597,13 +572,13 @@ def cmd_check(config_arg: str) -> int:
         print("  {}: {}".format(key, view.get(key)))
     base = backend.base
     records_root = os.path.join(base, RECORDS_DIR)
-    streams: List[str] = []
+    streams: list[str] = []
     records = 0
     try:
         streams = sorted(os.listdir(records_root))
     except OSError:
         pass
-    per_prefix: Dict[str, int] = {}
+    per_prefix: dict[str, int] = {}
     for token in streams:
         stream_dir = os.path.join(records_root, token)
         if not os.path.isdir(stream_dir):
@@ -630,7 +605,7 @@ def cmd_check(config_arg: str) -> int:
 
 async def _migrate_schema_async(
     backend: FilesystemStateBackend, dry_run: bool
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     await backend.start()
     return await backend.migrate_schema(dry_run=dry_run)
 

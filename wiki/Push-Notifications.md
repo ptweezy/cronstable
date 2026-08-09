@@ -309,7 +309,7 @@ renders the notification on the device.
 
 ## Related pages
 
-- [Reporting](Reporting): the other four reporters and the shared report schema
+- [Reporting](Reporting): the mail, Sentry, shell, and webhook reporters and the shared report schema
 - [HTTP Control API](HTTP-API): the `/push/devices` endpoints and `GET /whoami`
 - [Durable State](Durable-State): the store the device registry rides when configured
 - [LAN Discovery](LAN-Discovery): how a companion app finds the daemon on the local network

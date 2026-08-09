@@ -57,7 +57,7 @@ When the job stops (normal exit, timeout, or cancellation), cronstable computes 
 
 - `<prefix>.stop:1|g`: gauge, always `1`.
 - `<prefix>.success:<1|0>|g`: gauge. `1` if the job did **not** fail, `0` if it failed. The value comes from `0 if job.failed else 1`, where `job.failed` is the [failure-detection](Failure-Detection-and-Retries) result (`failsWhen`). A nonzero exit code, output on a watched stream, or `failsWhen: always` therefore reports `success:0`.
-- `<prefix>.duration:<ms>|ms`: timer (`|ms`) with no sample-rate suffix. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. Every run sends exactly one duration observation. (Releases up to 1.2.37 appended a literal `@0.1` sample-rate flag here; a dashboard that corrected for it should drop the correction.)
+- `<prefix>.duration:<ms>|ms`: timer (`|ms`) with no sample-rate suffix. The numeric value is the integer wall-clock duration in milliseconds, measured with `perf_counter` between start and stop. Every run sends exactly one duration observation. (Releases through 1.2.36 appended a literal `@0.1` sample-rate flag here; a dashboard that corrected for it should drop the correction.)
 
 When the job has [`monitorResources`](Configuration-Reference#metrics) on (see [resource monitoring](Resource-Monitoring)), the same stop datagram also carries the run's resource accounting:
 

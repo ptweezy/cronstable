@@ -21,6 +21,7 @@ from cronstable.config import ConfigError
 from cronstable.cron import Cron
 from cronstable.dagrun import DagScheduler
 from cronstable.job import NotifyEventContext, _compiled_template
+from tests.conftest import _cron
 
 # ---------------------------------------------------------------------------
 # Config parsing
@@ -170,12 +171,6 @@ def test_notify_default_webhook_body_renders_valid_json():
 # ---------------------------------------------------------------------------
 
 _JOB = "jobs:\n  - name: a\n    command: 'x'\n    schedule: '@reboot'\n"
-
-
-def _cron(yaml):
-    cron = Cron(None, config_yaml=yaml)
-    cron.web_config = {}
-    return cron
 
 
 async def _drain_notify(cron):

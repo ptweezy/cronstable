@@ -1,6 +1,6 @@
 """Stitch the showcase stills into the README's animated loops.
 
-Reads the frames `capture_showcase.py` dropped in ./reel/ and assembles two
+Reads the frames `capture.py showcase` dropped in ./reel/ and assembles two
 seamless loops:
 
 * `dashboard-reel.webp`  -- the hero tour, in ONE consistent style throughout
@@ -36,6 +36,12 @@ from PIL import Image
 HERE = Path(__file__).parent
 SRC = HERE / "reel"
 IMG = HERE.parent / "img"          # docs/img
+ROOT = Path(__file__).resolve().parents[2]
+
+# Same stdlib-only leaf import as capture.py: the theme row follows the CLI's
+# canonical hue list, so a new hue cannot ship without joining the reel.
+sys.path.insert(0, str(ROOT))
+from cronstable._cliargs import THEME_HUES  # noqa: E402
 
 # The reel cuts hard (few frames), so we can afford a large, high-quality
 # frame: 1600px supersampled from the 3360px stills, near-max libwebp quality.
@@ -86,11 +92,7 @@ SEGMENTS = [
 # ---- the theme row: overview under every theme, in BOTH the monospace and
 # the readable sans interface font, dissolving between each -- so it showcases
 # the theme axis and the font axis together. ----
-THEME_ORDER = [
-    "carolina", "carolina-light", "amber", "amber-light",
-    "green", "green-light", "modern", "modern-light",
-    "standard", "standard-light",
-]
+THEME_ORDER = [t for h in THEME_HUES for t in (h, h + "-light")]
 THEMES_HOLD = 0.85
 
 

@@ -32,7 +32,7 @@ output and exit status instead of mailed via ``MAILTO``, and the
 import logging
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cronstable import platform
@@ -113,7 +113,7 @@ _CONTROL_CHARS = re.compile(
 )
 
 
-def _physical_lines(data: str) -> List[str]:
+def _physical_lines(data: str) -> list[str]:
     """``data`` split into physical lines, exactly as cron and editors do.
 
     A crontab is LF-delimited (``man 5 crontab``; cron splits on LF only),
@@ -180,7 +180,7 @@ def looks_like_crontab(data: str) -> bool:
     return False
 
 
-def parse_crontab(data: str, path: str) -> List[Dict[str, Any]]:
+def parse_crontab(data: str, path: str) -> list[dict[str, Any]]:
     """Lower classic crontab text into YAML-equivalent job dictionaries.
 
     Each returned dict is shaped exactly like one ``jobs:`` entry out of
@@ -203,8 +203,8 @@ def parse_crontab(data: str, path: str) -> List[Dict[str, Any]]:
         line carrying a control character), with a ``path:line`` prefix.
     """
     label = os.path.basename(path) or CRONTAB_BASENAME
-    environment: Dict[str, str] = {}
-    jobs: List[Dict[str, Any]] = []
+    environment: dict[str, str] = {}
+    jobs: list[dict[str, Any]] = []
     for lineno, raw in enumerate(_physical_lines(data), start=1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -273,8 +273,8 @@ def _job_from_line(
     where: str,
     label: str,
     lineno: int,
-    environment: Dict[str, str],
-) -> Dict[str, Any]:
+    environment: dict[str, str],
+) -> dict[str, Any]:
     if line.startswith("@"):
         parts = line.split(None, 1)
         nickname = parts[0]
@@ -316,7 +316,7 @@ def _job_from_line(
             raise CrontabError(
                 "{}: invalid schedule {!r}: {}".format(where, schedule, ex)
             ) from ex
-    job: Dict[str, Any] = {
+    job: dict[str, Any] = {
         "name": name,
         "schedule": schedule,
         "command": _unescape_percent(command, where),
@@ -374,7 +374,7 @@ def _unescape_percent(command: str, where: str) -> str:
     overwhelmingly the common case, e.g. ``date +\%F`` -- becomes a
     literal ``%`` exactly as cron would make it.
     """
-    out: List[str] = []
+    out: list[str] = []
     index = 0
     while index < len(command):
         char = command[index]

@@ -1,6 +1,6 @@
 # Late-Run Detection (SLA Monitoring)
 
-Cron's failure model only sees runs that happened; the runs that hurt most are the ones that did not. Per-job SLA monitoring watches for exactly that: a job that has gone too long without a success, a due slot that never started, or a run that is still going long past what it should take. Each job declares its thresholds in an `sla:` block, and a dedicated `onLate` reporting hook fires once when a threshold is breached, through the same four reporters as [failure reporting](Reporting).
+Cron's failure model only sees runs that happened; the runs that hurt most are the ones that did not. Per-job SLA monitoring watches for exactly that: a job that has gone too long without a success, a due slot that never started, or a run that is still going long past what it should take. Each job declares its thresholds in an `sla:` block, and a dedicated `onLate` reporting hook fires once when a threshold is breached, through the same five reporters as [failure reporting](Reporting).
 
 The monitor lives in `cronstable/cron.py` (`Cron._sla_periodic`), evaluating every configured check once per wall-clock minute, entirely in memory: it needs no [state store](Durable-State), though one improves the staleness check across restarts. Breaches surface on every dashboard surface: the [HTTP API](HTTP-API#get-jobs) (`sla` on `GET /jobs`), the [web](Web-Dashboard) and [terminal](Terminal-Dashboard) dashboards (an **OVERDUE** badge), [Prometheus](Metrics-with-Prometheus#per-job), and the [MCP](MCP) observe tools.
 

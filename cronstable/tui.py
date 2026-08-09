@@ -58,19 +58,15 @@ import sys
 import textwrap
 import time
 import unicodedata
+from collections.abc import Callable, Coroutine
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Coroutine,
-    Dict,
-    List,
     Optional,
-    Set,
-    Tuple,
     cast,
 )
 
+from cronstable import _cliargs
 from cronstable.cronexpr import CronTab
 from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-compat)
     Finding,
@@ -106,19 +102,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no import cost
 
 logger = logging.getLogger("tui")
 
-#: Client-side conventions shared with the web dashboard (same values).
-DEFAULT_URL = "http://127.0.0.1:8080"
-ENV_TOKEN = "CRONSTABLE_WEB_TOKEN"
-
-#: TLS material for an https:// listener, resolved flag-then-env exactly
-#: like the token.  The names are identical in every cronstable client, so
-#: one exported set of variables serves the TUI, the MCP bridge and the
-#: thin CLIs at once; a shell that can reach the daemon can reach it from
-#: any of them without re-teaching the paths.
-ENV_CACERT = "CRONSTABLE_WEB_CACERT"
-ENV_CLIENT_CERT = "CRONSTABLE_WEB_CLIENT_CERT"
-ENV_CLIENT_KEY = "CRONSTABLE_WEB_CLIENT_KEY"
-ENV_INSECURE = "CRONSTABLE_WEB_INSECURE"
+#: Client-side conventions shared with the web dashboard (same values),
+#: owned by cronstable._cliargs (the argparse leaf __main__ registers the
+#: `tui` subcommand from) and re-exported under their original names.
+#: The TLS material for an https:// listener is resolved flag-then-env
+#: exactly like the token; the names are identical in every cronstable
+#: client, so one exported set of variables serves the TUI, the MCP
+#: bridge and the thin CLIs at once.
+DEFAULT_URL = _cliargs.WEB_DEFAULT_URL
+ENV_TOKEN = _cliargs.WEB_ENV_TOKEN
+ENV_CACERT = _cliargs.WEB_ENV_CACERT
+ENV_CLIENT_CERT = _cliargs.WEB_ENV_CLIENT_CERT
+ENV_CLIENT_KEY = _cliargs.WEB_ENV_CLIENT_KEY
+ENV_INSECURE = _cliargs.WEB_ENV_INSECURE
 
 #: Poll cadence choices (ms), mirroring the web settings sheet; 0 = paused.
 POLL_CHOICES = [1000, 2000, 3000, 5000, 10000, 0]
@@ -135,6 +131,12 @@ WB_STALE_AFTER_MS = 15000
 #: mirroring TAIL_MAX / TAIL_RETRY_MS in the web page.
 TAIL_MAX = 4
 TAIL_RETRY_MS = 5000
+
+#: Activity punchcard: max jobs retained and drawn, the same constant as
+#: HEAT_MAX_JOBS in the web page.  Both heat paths apply it, so the
+#: batched feed cannot retain a fleet's worth of rows the card never
+#: draws while the fan-out fallback holds a smaller set.
+HEAT_MAX_JOBS = 80
 
 #: The boot self-test replays after this long, like the web page's.
 BOOT_EVERY_S = 12 * 3600
@@ -425,6 +427,11 @@ DAG_STATE_COLOR = {
     "upstream_failed": "fail",
     "expanded": "dim",
     "scheduled": "pending",  # run-level: created, awaiting its slot
+    # TUI-only pseudo-state: _dag_tasks_tab substitutes it for an approval
+    # gate parked on a decision, so it never reaches here from dag.py.
+    # Painted "pending" as the old ladder did: the gate is waiting, not
+    # inert, and it is the one row the operator has to act on.
+    "awaiting": "pending",
     "unknown": "dim",
 }
 
@@ -434,7 +441,7 @@ def outcome_color(outcome: Optional[str]) -> str:
     return OUTCOME_COLOR[outcome_key(outcome)]
 
 
-def health(job: Dict[str, Any]) -> Tuple[str, str]:
+def health(job: dict[str, Any]) -> tuple[str, str]:
     """``(key, label)`` for a /jobs entry: the web ``health()`` port."""
     if not job.get("enabled"):
         return ("disabled", "Disabled")
@@ -469,22 +476,22 @@ def segment_of(key: str) -> str:
     return ""  # pending/unknown/cancelled/paused match only "all"
 
 
-def sla_overdue(job: Dict[str, Any]) -> bool:
+def sla_overdue(job: dict[str, Any]) -> bool:
     """True when the payload's ``sla`` block reports the job late."""
     sla = job.get("sla")
     return isinstance(sla, dict) and sla.get("state") == "late"
 
 
 def correlate(
-    failing: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
+    failing: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
     """Group failing jobs by (exit_code, fail_reason); dominant group wins.
 
     Port of the web ``correlate()``: the returned dict carries the group
     size ``n``, the finish-time ``span`` (ms), the shared ``exit`` /
     ``reason``, and the member ``jobs``.
     """
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for job in failing:
         last = job.get("last_run") or {}
         exit_code = last.get("exit_code")
@@ -493,7 +500,7 @@ def correlate(
             last.get("fail_reason") or "",
         )
         groups.setdefault(key, []).append(job)
-    best: Optional[Dict[str, Any]] = None
+    best: Optional[dict[str, Any]] = None
     for group in groups.values():
         if len(group) < 2:
             continue
@@ -518,7 +525,7 @@ def correlate(
     return best
 
 
-def cluster_alert(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def cluster_alert(data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Distill /cluster into one alert signal (web ``setClusterAlert``)."""
     if not data or not data.get("enabled"):
         return None
@@ -548,9 +555,9 @@ def cluster_alert(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def verdict_info(
-    jobs: List[Dict[str, Any]],
-    alert: Optional[Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    jobs: list[dict[str, Any]],
+    alert: Optional[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], list[str]]:
     """One operator headline, or ``None`` when healthy.
 
     Port of the web ``verdictInfo()``: returns ``(verdict, incident_set)``
@@ -631,12 +638,12 @@ def fuzzy(query: str, label: str) -> int:
 
 
 def compute_view(
-    jobs: List[Dict[str, Any]],
+    jobs: list[dict[str, Any]],
     filter_text: str,
     status_filter: str,
     sort_key: str,
     sort_dir: int,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Filter + sort the job list (web ``computeView`` port).
 
     The text filter substring-matches name OR command, lowercased; the
@@ -656,7 +663,7 @@ def compute_view(
             continue
         view.append(job)
 
-    def sort_value(job: Dict[str, Any]) -> Tuple[Any, Any]:
+    def sort_value(job: dict[str, Any]) -> tuple[Any, Any]:
         name = job.get("name", "")
         # The web sorts (and tie-breaks) names with localeCompare, whose
         # CLDR root collation is case-insensitive at the primary level and
@@ -702,8 +709,10 @@ def compute_view(
 # ===================================================================
 #: hue -> (dark aka phosphor, light aka paper) palettes.  Each palette is
 #: a flat name->#rrggbb map; the painter turns them into SGR sequences.
-#: Same five hues and the same t / T cycling as the web page.
-THEME_HUES = ["carolina", "amber", "green", "modern", "standard"]
+#: Same five hues and the same t / T cycling as the web page; the hue list
+#: itself lives in cronstable._cliargs (the --theme choices are built from
+#: it) and is re-exported here under its original name.
+THEME_HUES = _cliargs.THEME_HUES
 
 _P = {
     # carolina: the default Carolina-blue CRT phosphor
@@ -904,7 +913,7 @@ class Theme:
         return got if got is not None else self._bg["bg"]
 
 
-def _hex_rgb(spec: str) -> Tuple[int, int, int]:
+def _hex_rgb(spec: str) -> tuple[int, int, int]:
     spec = spec.lstrip("#")
     return (int(spec[0:2], 16), int(spec[2:4], 16), int(spec[4:6], 16))
 
@@ -992,7 +1001,7 @@ def char_width(ch: str) -> int:
 #: dozen glyphs (● ✕ ▶ ⏸ │ — · ↻ and the box drawing), so the memo is warm
 #: after the first paint; it is capped and reset wholesale because log
 #: lines arrive from job stdout, which makes the key set job-controlled.
-_CHAR_W: Dict[str, int] = {}
+_CHAR_W: dict[str, int] = {}
 _CHAR_W_MAX = 4096
 _char_w_get = _CHAR_W.get
 
@@ -1040,7 +1049,7 @@ def truncate(text: str, width: int, ellipsis: str = _ELLIPSIS) -> str:
     if text_width(text) <= width:
         return text
     ell_w = 1 if ellipsis == _ELLIPSIS else text_width(ellipsis)
-    out: List[str] = []
+    out: list[str] = []
     used = 0
     for ch in text:
         w = char_width(ch)
@@ -1153,7 +1162,7 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
         return line
 
     def replace(match: "re.Match[str]") -> str:
-        out: List[str] = []
+        out: list[str] = []
         params = match.group(1) or "0"
         parts = params.split(";")
         i = 0
@@ -1190,7 +1199,7 @@ def rewrite_sgr(line: str, theme: Theme) -> str:
     return _ANSI_RE.sub(dispatch, line)
 
 
-def sparkline(history: List[Dict[str, Any]], width: int = 10) -> str:
+def sparkline(history: list[dict[str, Any]], width: int = 10) -> str:
     """Recent-run sparkline: bar height = relative duration, one bar per
     run, oldest first (the terminal cousin of the web SVG sparkline).
     Returns a plain string; the caller colours per-bar via
@@ -1210,15 +1219,15 @@ WEEK_FREQ_MAX = 56
 
 
 def spark_cells(
-    history: List[Dict[str, Any]], width: int = 10
-) -> List[Tuple[str, str]]:
+    history: list[dict[str, Any]], width: int = 10
+) -> list[tuple[str, str]]:
     """``(bar-char, health-colour-key)`` cells for the recent-run tail."""
     tail = history[-width:] if history else []
     durations = [
         float(r["duration"]) for r in tail if r.get("duration") is not None
     ]
     top = max(durations) if durations else 0.0
-    cells: List[Tuple[str, str]] = []
+    cells: list[tuple[str, str]] = []
     for run in tail:
         dur = run.get("duration") or 0
         idx = (
@@ -1233,7 +1242,7 @@ def spark_cells(
     return cells
 
 
-def colour_runs(cells: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+def colour_runs(cells: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """Merge neighbouring cells that share a colour key into ``(text,
     key)`` runs.
 
@@ -1243,8 +1252,8 @@ def colour_runs(cells: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
     row the differ decides has changed.  Painted output is unchanged
     because the style spans re-assert the same ink either way.
     """
-    runs: List[Tuple[str, str]] = []
-    parts: List[str] = []
+    runs: list[tuple[str, str]] = []
+    parts: list[str] = []
     key = ""
     for ch, ck in cells:
         if parts and ck == key:
@@ -1263,7 +1272,7 @@ def colour_runs(cells: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
 #  preferences: the localStorage analogue (a small JSON file)
 # ===================================================================
 #: Defaults mirror the web page's prefs where they translate to a tty.
-PREF_DEFAULTS: Dict[str, Any] = {
+PREF_DEFAULTS: dict[str, Any] = {
     "theme": "carolina",  # hue
     "light": False,  # phosphor (dark) vs paper (light)
     "cvd": "none",  # colour-vision remap
@@ -1291,7 +1300,7 @@ def prefs_path() -> str:
     return os.path.join(base, "cronstable", "tui.json")
 
 
-def load_prefs(path: Optional[str] = None) -> Dict[str, Any]:
+def load_prefs(path: Optional[str] = None) -> dict[str, Any]:
     """Read prefs; unknown keys are dropped, bad values fall back."""
     prefs = dict(PREF_DEFAULTS)
     target = path or prefs_path()
@@ -1314,7 +1323,7 @@ def load_prefs(path: Optional[str] = None) -> Dict[str, Any]:
     return prefs
 
 
-def save_prefs(prefs: Dict[str, Any], path: Optional[str] = None) -> None:
+def save_prefs(prefs: dict[str, Any], path: Optional[str] = None) -> None:
     """Best-effort persist; the TUI never fails over a prefs write."""
     target = path or prefs_path()
     try:
@@ -1415,8 +1424,8 @@ class KeyDecoder:
         self._utf8 = codecs.getincrementaldecoder("utf-8")("replace")
         self._pending = ""  # a partially-received escape sequence
 
-    def feed(self, data: bytes) -> List[str]:
-        keys: List[str] = []
+    def feed(self, data: bytes) -> list[str]:
+        keys: list[str] = []
         for ch in self._utf8.decode(data):
             if self._pending:
                 self._pending += ch
@@ -1435,7 +1444,7 @@ class KeyDecoder:
                 keys.append(ch)
         return keys
 
-    def flush_escape(self) -> List[str]:
+    def flush_escape(self) -> list[str]:
         """Resolve a lone ``Esc`` (or abandon a malformed sequence)."""
         if not self._pending:
             return []
@@ -1443,7 +1452,7 @@ class KeyDecoder:
         return ["esc"] if pending == "\x1b" else []
 
     @staticmethod
-    def _try_escape(seq: str) -> Tuple[bool, Optional[str]]:
+    def _try_escape(seq: str) -> tuple[bool, Optional[str]]:
         """``(complete, key-or-None)`` for a buffered escape sequence."""
         if len(seq) == 1:
             return (False, None)
@@ -1583,7 +1592,7 @@ class Term:
     def __init__(self, stream: Any = None) -> None:
         self._out = stream if stream is not None else sys.stdout
         self._saved: Any = None
-        self._last_rows: List[str] = []
+        self._last_rows: list[str] = []
         self._last_size = (0, 0)
 
     # ---- lifecycle ---------------------------------------------------
@@ -1606,7 +1615,7 @@ class Term:
             )
 
     # ---- painting ----------------------------------------------------
-    def size(self) -> Tuple[int, int]:
+    def size(self) -> tuple[int, int]:
         """``(cols, rows)`` right now."""
         try:
             sz = shutil.get_terminal_size()
@@ -1614,12 +1623,12 @@ class Term:
         except OSError:  # pragma: no cover - no tty
             return (80, 24)
 
-    def paint(self, rows: List[str], bg: str) -> None:
+    def paint(self, rows: list[str], bg: str) -> None:
         """Present a frame: ``rows`` are ready-made ANSI row strings."""
         cols, lines = self.size()
         full = self._last_size != (cols, lines)
         self._last_size = (cols, lines)
-        out: List[str] = [SYNC_ON]
+        out: list[str] = [SYNC_ON]
         if full:
             out.append(bg + CLEAR)
         for idx in range(lines):
@@ -1673,9 +1682,9 @@ class HeadlessTerm(Term):
         super().__init__(stream=None)
         self._cols = cols
         self._lines = lines
-        self.frames: List[List[str]] = []
+        self.frames: list[list[str]] = []
         self.bells = 0
-        self.copied: List[str] = []
+        self.copied: list[str] = []
 
     def enter(self) -> None:  # no tty to configure
         pass
@@ -1683,10 +1692,10 @@ class HeadlessTerm(Term):
     def exit(self) -> None:
         pass
 
-    def size(self) -> Tuple[int, int]:
+    def size(self) -> tuple[int, int]:
         return (self._cols, self._lines)
 
-    def paint(self, rows: List[str], bg: str) -> None:
+    def paint(self, rows: list[str], bg: str) -> None:
         self.frames.append(list(rows))
 
     def bell(self) -> None:
@@ -1788,7 +1797,7 @@ class Api:
 
             # No total timeout: SSE streams are held open indefinitely.
             # Individual JSON calls pass their own per-request timeout.
-            kwargs: Dict[str, Any] = {
+            kwargs: dict[str, Any] = {
                 "timeout": aiohttp.ClientTimeout(total=None)
             }
             if self._ssl is not None:
@@ -1804,7 +1813,7 @@ class Api:
             self._session = aiohttp.ClientSession(**kwargs)
         return self._session
 
-    def _headers(self, accept: str = "application/json") -> Dict[str, str]:
+    def _headers(self, accept: str = "application/json") -> dict[str, str]:
         headers = {"Accept": accept}
         if self.token:
             headers["Authorization"] = "Bearer %s" % self.token
@@ -1852,15 +1861,15 @@ class Api:
     async def post(
         self,
         path: str,
-        body: Optional[Dict[str, Any]] = None,
+        body: Optional[dict[str, Any]] = None,
         timeout_s: float = 15.0,
-    ) -> Tuple[int, Any]:
+    ) -> tuple[int, Any]:
         """POST; returns ``(status, parsed-body-or-text)``, raising only
         on auth (the callers toast per-status, mirroring the page)."""
         import aiohttp
 
         session = await self._ensure()
-        kwargs: Dict[str, Any] = {
+        kwargs: dict[str, Any] = {
             "headers": self._headers(),
             "timeout": aiohttp.ClientTimeout(total=timeout_s),
         }
@@ -1902,7 +1911,7 @@ class Api:
             if resp.status >= 400:
                 raise ApiError(resp.status)
             event = "message"
-            data_lines: List[str] = []
+            data_lines: list[str] = []
             async for raw in resp.content:
                 line = raw.decode("utf-8", "replace").rstrip("\r\n")
                 if line == "":
@@ -1950,7 +1959,7 @@ class LogTail:
         self.api = api
         self.path = path
         self.label = label
-        self.lines: List[Tuple[str, str, float]] = []  # (stream, line, t)
+        self.lines: list[tuple[str, str, float]] = []  # (stream, line, t)
         #: entries the MAX_LINES cap has trimmed off the head.  A reader
         #: that remembers this alongside ``lines``' identity can tell
         #: "the buffer only grew" from "the buffer shifted under me",
@@ -1980,10 +1989,10 @@ class LogTail:
             del self.lines[:excess]
             self.dropped += excess
 
-    def _last_block(self) -> List[Tuple[str, str]]:
+    def _last_block(self) -> list[tuple[str, str]]:
         """The ``(stream, line)`` pairs of the newest run on screen:
         the entries between the last two end markers."""
-        block: List[Tuple[str, str]] = []
+        block: list[tuple[str, str]] = []
         for stream, line, _ in reversed(self.lines):
             if stream == "meta":
                 if not block:
@@ -2011,7 +2020,7 @@ class LogTail:
             # is the next run's output and flushes through, so runs
             # stack up behind their end markers, like the page.
             expect = self._last_block() if dedupe_next else []
-            staged: Optional[List[Tuple[str, str, float]]] = (
+            staged: Optional[list[tuple[str, str, float]]] = (
                 [] if dedupe_next else None
             )
             dedupe_next = False
@@ -2105,7 +2114,7 @@ def cut_to_width(row: str, width: int) -> str:
         # is a plain slice with no per-character regex attempts or width sums.
         cut = row[:width]
         return cut + " " * (width - len(cut)) + RESET
-    out: List[str] = []
+    out: list[str] = []
     used = 0
     idx = 0
     row_len = len(row)
@@ -2145,7 +2154,7 @@ def cut_to_width(row: str, width: int) -> str:
     return "".join(out)
 
 
-def drawer_widths(cols: int) -> Tuple[int, int]:
+def drawer_widths(cols: int) -> tuple[int, int]:
     """``(drawer width, left gutter width)`` for the right-hand aside.
 
     Shared by the compositor and by the caller that renders the base
@@ -2157,12 +2166,12 @@ def drawer_widths(cols: int) -> Tuple[int, int]:
 
 
 def overlay_center(
-    base: List[str],
-    panel: List[str],
+    base: list[str],
+    panel: list[str],
     cols: int,
     lines: int,
     fill: str,
-) -> List[str]:
+) -> list[str]:
     """Replace a centered band of ``base`` rows with ``panel`` rows.
 
     Modal surfaces (palette, help, settings, ...) take whole rows (the
@@ -2232,15 +2241,15 @@ class Painter:
 
 
 def finding_rows(
-    findings: List[Finding],
+    findings: list[Finding],
     paint: "Painter",
     width: int,
     limit: int,
-) -> List[str]:
+) -> list[str]:
     """Painted rows for schedule-lint findings, shared by the cron
     sandbox and the job drawer so the two panels cannot drift in how a
     finding level looks."""
-    rows: List[str] = []
+    rows: list[str] = []
     for finding in findings[:limit]:
         if finding.code == "never-fires":
             marker, color = "✕", "fail"
@@ -2258,10 +2267,10 @@ def finding_rows(
 def panel_frame(
     paint: Painter,
     title: str,
-    body: List[str],
+    body: list[str],
     width: int,
     footer: str = "",
-) -> List[str]:
+) -> list[str]:
     """A bordered modal panel: title bar, body rows, optional hint row.
 
     ``body`` rows are pre-styled ANSI strings no wider than ``width - 4``
@@ -2360,7 +2369,7 @@ class App:
         api: Api,
         term: Term,
         keys: Any,
-        prefs: Dict[str, Any],
+        prefs: dict[str, Any],
         start_wallboard: bool = False,
         start_job: Optional[str] = None,
         boot: Optional[bool] = None,
@@ -2376,21 +2385,21 @@ class App:
         )
 
         # ---- data mirrors of the daemon ----
-        self.jobs: List[Dict[str, Any]] = []
-        self.by_name: Dict[str, Dict[str, Any]] = {}
+        self.jobs: list[dict[str, Any]] = []
+        self.by_name: dict[str, dict[str, Any]] = {}
         self.fetched_mono = 0.0  # monotonic stamp of the last good /jobs
         self.version = ""
         self.job_set_id = ""
-        self.cluster: Optional[Dict[str, Any]] = None
-        self.fleet: Optional[Dict[str, Any]] = None
-        self.dags: List[Dict[str, Any]] = []
-        self.state_data: Optional[Dict[str, Any]] = None
-        self.node: Optional[Dict[str, Any]] = None
+        self.cluster: Optional[dict[str, Any]] = None
+        self.fleet: Optional[dict[str, Any]] = None
+        self.dags: list[dict[str, Any]] = []
+        self.state_data: Optional[dict[str, Any]] = None
+        self.node: Optional[dict[str, Any]] = None
         self.connected = False
         self.conn_error = ""
 
         # ---- list view ----
-        self.view: List[Dict[str, Any]] = []
+        self.view: list[dict[str, Any]] = []
         self.sel = 0
         self.table_offset = 0
         self.filter_text = ""
@@ -2399,31 +2408,31 @@ class App:
         self.sort_dir = 1
 
         # ---- surfaces ----
-        self.open_overlays: List[str] = []  # stack, last = topmost
+        self.open_overlays: list[str] = []  # stack, last = topmost
         self.wallboard = bool(start_wallboard)
         self.booting = False
         self.focus: Optional[str] = None
-        self.inputs: Dict[str, str] = dict.fromkeys(INPUT_HOMES, "")
+        self.inputs: dict[str, str] = dict.fromkeys(INPUT_HOMES, "")
         self.quit = False
         self._start_job = start_job
         self._boot_override = boot
 
         # ---- verdict / alarm (fleetSound port) ----
-        self.verdict: Optional[Dict[str, Any]] = None
-        self.incident_set: List[str] = []
-        self.prev_fin: Dict[str, str] = {}
-        self.just_failed: Set[str] = set()
+        self.verdict: Optional[dict[str, Any]] = None
+        self.incident_set: list[str] = []
+        self.prev_fin: dict[str, str] = {}
+        self.just_failed: set[str] = set()
         self.any_failing = False
         self.alarm_ack = False
 
         # ---- drawer ----
         self.drawer_job: Optional[str] = None
         self.drawer_tab = "logs"
-        self.drawer_runs: Optional[Dict[str, Any]] = None
-        self.drawer_res: Optional[Dict[str, Any]] = None
+        self.drawer_runs: Optional[dict[str, Any]] = None
+        self.drawer_res: Optional[dict[str, Any]] = None
         self.log_tail: Optional[LogTail] = None
         self.log_scroll = 0  # rows up from the tail; 0 = following
-        self.log_matches: List[int] = []
+        self.log_matches: list[int] = []
         self.log_match_idx = 0
         self.wrap = bool(prefs["wrap"])
         self.timestamps = bool(prefs["timestamps"])
@@ -2431,15 +2440,15 @@ class App:
         # ---- DAG drawer ----
         self.dag_name: Optional[str] = None
         self.dag_tab = "runs"
-        self.dag_runs: List[Dict[str, Any]] = []
-        self.dag_run: Optional[Dict[str, Any]] = None
+        self.dag_runs: list[dict[str, Any]] = []
+        self.dag_run: Optional[dict[str, Any]] = None
         self.dag_run_key: Optional[str] = None
-        self.dag_xcom: Optional[Dict[str, Any]] = None
+        self.dag_xcom: Optional[dict[str, Any]] = None
         self.dag_sel = 0
         self.dag_task_tail: Optional[LogTail] = None
 
         # ---- multi-tail ----
-        self.tails: List[LogTail] = []
+        self.tails: list[LogTail] = []
         self.tail_sel = 0
 
         # ---- palette ----
@@ -2448,72 +2457,72 @@ class App:
         # ---- timeline / mitigate ----
         self.timeline_fail_only = False
         self.timeline_sel = 0
-        self.mitigate_names: List[str] = []
+        self.mitigate_names: list[str] = []
         self.mitigate_label = ""
-        self.mitigate_log: List[str] = []
+        self.mitigate_log: list[str] = []
         self.mitigate_running = False
         self.mitigate_abort = False
 
         # ---- cards ----
-        self.heat_data: Dict[str, List[Dict[str, Any]]] = {}
+        self.heat_data: dict[str, list[dict[str, Any]]] = {}
         # per heatmap row: (the run list it was built from, its parsed
         # (epoch, outcome key) pairs).  Keyed by identity of the payload
         # _load_heat swaps in, so it stays the size of heat_data itself.
-        self._heat_parsed: Dict[str, Tuple[Any, List[Tuple[float, str]]]] = {}
+        self._heat_parsed: dict[str, tuple[Any, list[tuple[float, str]]]] = {}
         self.heat_loaded = 0.0
         # schedule pressure: computed LOCALLY from the /jobs snapshot via
         # croninfo (the same analyzers the daemon serves), so the panel
         # works against any daemon version; recomputed when stale.
-        self.pressure: Optional[Dict[str, Any]] = None
-        self.press_dups: List[Dict[str, Any]] = []
-        self.press_suggest: Dict[str, Dict[str, Any]] = {}
+        self.pressure: Optional[dict[str, Any]] = None
+        self.press_dups: list[dict[str, Any]] = []
+        self.press_suggest: dict[str, dict[str, Any]] = {}
         self.press_computed = 0.0
         self._press_busy = False
         # heat overlay load in flight (spawned off the poll path; the flag
         # stops a slow load from being double-spawned past the 60s gate)
         self._heat_busy = False
         # week calendar: 7-day fire outlook computed locally, like pressure
-        self.week: Optional[Dict[str, Any]] = None
+        self.week: Optional[dict[str, Any]] = None
         self.week_computed = 0.0
         self._week_busy = False
         self.state_tab = "view"
-        self.state_detail: Optional[Dict[str, Any]] = None
+        self.state_detail: Optional[dict[str, Any]] = None
         self.state_sel = 0
         self.settings_sel = 0
         self.panel_scroll = 0
         self.dags_sel = 0
         self.fleet_fail_only = False
-        self.node_history: Optional[Dict[str, Any]] = None
+        self.node_history: Optional[dict[str, Any]] = None
 
         # ---- wallboard / zen / boot ----
         self.zen_on = False
         self.last_key_mono = time.monotonic()
-        self.boot_rows: List[str] = []
+        self.boot_rows: list[str] = []
 
         # ---- plumbing ----
         # memo for the per-line ANSI transforms: line -> (rewritten,
         # plain).  rewrite_sgr inks with the current theme, so the memo
         # is valid for one theme only; _retheme() clears it.
-        self._ansi_cache: Dict[str, Tuple[str, str]] = {}
+        self._ansi_cache: dict[str, tuple[str, str]] = {}
         # wrapped-row counts per line, valid for one content width (a
         # resize or a timestamp toggle changes it and clears the memo)
-        self._wrap_rows_cache: Dict[str, int] = {}
+        self._wrap_rows_cache: dict[str, int] = {}
         self._wrap_width = -1
         # last inputs of _log_search_recompute, so a repaint with an
         # unchanged needle and buffer skips the full rescan
         self._log_search_state: Optional[
-            Tuple[str, Optional["LogTail"], int, Any]
+            tuple[str, Optional["LogTail"], int, Any]
         ] = None
         # what the last scan actually covered: (needle, tail, the buffer
         # list itself, LogTail.dropped at the time, entries scanned, the
         # last entry scanned).  _log_search_carry resumes from it.
         self._log_search_scan: Optional[
-            Tuple[str, "LogTail", List[Tuple[str, str, float]], int, int, Any]
+            tuple[str, "LogTail", list[tuple[str, str, float]], int, int, Any]
         ] = None
-        self.toasts: List[Tuple[str, str, float]] = []
+        self.toasts: list[tuple[str, str, float]] = []
         self._dirty_event = asyncio.Event()
         self._poll_wakeup = asyncio.Event()
-        self._tasks: List["asyncio.Task[None]"] = []
+        self._tasks: list["asyncio.Task[None]"] = []
         self._paint_gate = 0.0
 
     # ---------------------------------------------------------------
@@ -2527,7 +2536,7 @@ class App:
     #: console tails), so all buffers fit yet the memo stays finite.
     ANSI_CACHE_MAX = 2 * LogTail.MAX_LINES * (TAIL_MAX + 2)
 
-    def _ansi_line(self, line: str) -> Tuple[str, str]:
+    def _ansi_line(self, line: str) -> tuple[str, str]:
         """``(rewrite_sgr(line), strip_ansi(line))``, memoised.
 
         Buffered log lines are immutable and repaint every frame, so
@@ -2589,12 +2598,12 @@ class App:
             self.tails = []
         self.mark()
 
-    def selected_job(self) -> Optional[Dict[str, Any]]:
+    def selected_job(self) -> Optional[dict[str, Any]]:
         if not self.view:
             return None
         return self.view[min(self.sel, len(self.view) - 1)]
 
-    def next_run_seconds(self, job: Dict[str, Any]) -> Optional[float]:
+    def next_run_seconds(self, job: dict[str, Any]) -> Optional[float]:
         """scheduled_in, drift-corrected since the poll (web port)."""
         sched = job.get("scheduled_in")
         if sched is None:
@@ -2819,8 +2828,8 @@ class App:
 
     def _fleet_sound(self, first: bool) -> None:
         """Poll-diff for failure cues + the standing alarm (web port)."""
-        just_failed: Set[str] = set()
-        next_fin: Dict[str, str] = {}
+        just_failed: set[str] = set()
+        next_fin: dict[str, str] = {}
         for job in self.jobs:
             name = job.get("name", "")
             last = job.get("last_run") or {}
@@ -2930,10 +2939,16 @@ class App:
         if isinstance(jobs, dict):
             # wholesale replacement, so the fan-out path's prune of
             # removed names is implicit here and _heat_parsed's orphan
-            # sweep covers the shrinkage
+            # sweep covers the shrinkage. Capped like the fan-out and the
+            # web card: /activity is uncapped in JOBS, so a fleet-scale
+            # daemon would otherwise hand every refresh a row list per
+            # job, all but HEAT_MAX_JOBS of them never drawn. Selected in
+            # the order render_heat draws, so the retained set is the set
+            # the user can actually reach.
+            names = sorted(str(name) for name in jobs)[:HEAT_MAX_JOBS]
             self.heat_data = {
-                str(name): rows if isinstance(rows, list) else []
-                for name, rows in jobs.items()
+                name: (jobs[name] if isinstance(jobs.get(name), list) else [])
+                for name in names
             }
         return True
 
@@ -2948,7 +2963,7 @@ class App:
         """
         gate = asyncio.Semaphore(5)
 
-        async def fetch(job: Dict[str, Any]) -> None:
+        async def fetch(job: dict[str, Any]) -> None:
             name = job.get("name", "")
             async with gate:
                 with contextlib.suppress(Exception):
@@ -2957,15 +2972,17 @@ class App:
                     )
                     self.heat_data[name] = data.get("runs", [])
 
-        # same spirit as the web page's cap
-        await asyncio.gather(*(fetch(j) for j in self.jobs[:40]))
+        # the web page's cap, and the same selection the batched path
+        # makes, so the two agree on WHICH jobs the card retains
+        ordered = sorted(self.jobs, key=lambda j: str(j.get("name", "")))
+        await asyncio.gather(*(fetch(j) for j in ordered[:HEAT_MAX_JOBS]))
         # a job removed (or renamed) by a reload never refreshes its
         # entry again; without this prune a long session with name
         # churn accretes one dead run-list payload per old name.
         for stale in [k for k in self.heat_data if k not in self.by_name]:
             del self.heat_data[stale]
 
-    def _pressure_entries(self) -> List[ScheduleEntry]:
+    def _pressure_entries(self) -> list[ScheduleEntry]:
         """Analyzable rows from the /jobs and /dags snapshots.
 
         Mirrors the daemon's own entry builder: enabled cron-scheduled
@@ -2981,7 +2998,7 @@ class App:
         """
         from zoneinfo import ZoneInfo
 
-        entries: List[ScheduleEntry] = []
+        entries: list[ScheduleEntry] = []
         for job in self.jobs:
             if not job.get("enabled"):
                 continue
@@ -3086,15 +3103,15 @@ class App:
             end = start + datetime.timedelta(days=7)
             local_tz = _local_tzinfo()
             grid = [[0] * 24 for _ in range(7)]
-            items: List[Tuple[datetime.datetime, str]] = []
-            frequent: List[Tuple[str, int, bool]] = []
+            items: list[tuple[datetime.datetime, str]] = []
+            frequent: list[tuple[str, int, bool]] = []
             # from one second before midnight, so a fire exactly at 00:00
             # lands in the window (occurrences() is strictly-after), the
             # same rule as the web panel
             probe = start - datetime.timedelta(seconds=1)
             for entry in entries:
                 zone = entry.timezone or local_tz
-                fires: List[datetime.datetime] = []
+                fires: list[datetime.datetime] = []
                 capped = False
                 for when in entry.tab.occurrences(probe.astimezone(zone)):
                     utc = when.astimezone(datetime.timezone.utc)
@@ -3194,14 +3211,14 @@ class App:
                 )
                 self.mark()
 
-    def _state_namespaces(self) -> List[str]:
+    def _state_namespaces(self) -> list[str]:
         data = self.state_data or {}
         docs = data.get("documents") or {}
         if isinstance(docs, dict):
             return sorted(str(k) for k in docs.keys())
         return []
 
-    def _state_streams(self) -> List[str]:
+    def _state_streams(self) -> list[str]:
         data = self.state_data or {}
         records = data.get("records") or {}
         if isinstance(records, dict):
@@ -3244,27 +3261,27 @@ class App:
 
     def settings_rows(
         self,
-    ) -> List[Tuple[str, str, Callable[[], None]]]:
+    ) -> list[tuple[str, str, Callable[[], None]]]:
         raise NotImplementedError
 
     def timeline_entries(
         self,
-    ) -> List[Tuple[str, Optional[str], str, Any, str, Any]]:
+    ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
         raise NotImplementedError
 
     def _compose_drawer(
         self,
         paint: "Painter",
-        base: List[str],
+        base: list[str],
         cols: int,
         lines: int,
         which: str,
-    ) -> List[str]:
+    ) -> list[str]:
         raise NotImplementedError
 
     def render_overlay(
         self, paint: "Painter", top: str, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         raise NotImplementedError
 
 
@@ -3365,7 +3382,7 @@ class AppActions(App):
         for name in failing:
             await self.run_job(name)
 
-    def copy_command(self, job: Dict[str, Any]) -> None:
+    def copy_command(self, job: dict[str, Any]) -> None:
         copy_to_clipboard(self.term, job.get("command", ""))
         self.toast("ok", "❏ copied command")
 
@@ -3468,7 +3485,7 @@ class AppActions(App):
             self.dag_task_tail = None
         self.dag_name = None
 
-    def open_tail(self, names: List[str]) -> None:
+    def open_tail(self, names: list[str]) -> None:
         self.open("tail")
         for name in names:
             self.add_tail(name)
@@ -3498,7 +3515,7 @@ class AppActions(App):
             return
         self.open_tail(wanted)
 
-    def open_mitigate(self, names: List[str], label: str) -> None:
+    def open_mitigate(self, names: list[str], label: str) -> None:
         self.mitigate_names = names
         self.mitigate_label = label
         self.mitigate_log = []
@@ -3707,7 +3724,7 @@ class AppActions(App):
 #  the application: command palette
 # ===================================================================
 class AppPalette(AppActions):
-    def palette_commands(self) -> List[Tuple[str, str, Callable[[], Any]]]:
+    def palette_commands(self) -> list[tuple[str, str, Callable[[], Any]]]:
         """(icon, label, action) rows: the page's three command pools.
 
         Web-only rows (CRT effects, desktop notifications, UI scale, run
@@ -3715,7 +3732,7 @@ class AppPalette(AppActions):
         panel toggles reach the TUI's overlay screens instead of inline
         cards, which is the same action under the same name.
         """
-        out: List[Tuple[str, str, Callable[[], Any]]] = [
+        out: list[tuple[str, str, Callable[[], Any]]] = [
             ("↻", "Refresh now", self.refresh_now),
             (
                 "▶",
@@ -3859,7 +3876,7 @@ class AppPalette(AppActions):
 
     def palette_matches(
         self,
-    ) -> List[Tuple[str, str, Callable[[], Any]]]:
+    ) -> list[tuple[str, str, Callable[[], Any]]]:
         query = self.inputs["palette"].strip()
         scored = [
             (fuzzy(query, label), (icon, label, action))
@@ -4520,7 +4537,7 @@ class AppKeys(AppPalette):
 
     def _log_search_carry(
         self, needle: str, tail: Optional["LogTail"]
-    ) -> Tuple[List[int], int]:
+    ) -> tuple[list[int], int]:
         """Matches already known for this needle, and where to resume.
 
         A live tail invalidates the whole-buffer memo above on every
@@ -4623,7 +4640,7 @@ class AppKeys(AppPalette):
             return
         await self._panel_scroll_key(key)
 
-    def dag_run_tasks(self) -> List[Dict[str, Any]]:
+    def dag_run_tasks(self) -> list[dict[str, Any]]:
         run = self.dag_run or {}
         tasks = run.get("tasks")
         if isinstance(tasks, list):
@@ -4667,11 +4684,11 @@ _ZEN_BREATH_OUT = ("·", "dim", char_width("·"))
 #: Dot placement per job name.  The digest is a pure function of the name,
 #: so an entry can never go stale; the memo is only capped (and reset
 #: wholesale) so a long-lived session that churns job names stays bounded.
-_ZEN_SEEDS: Dict[str, Tuple[int, int]] = {}
+_ZEN_SEEDS: dict[str, tuple[int, int]] = {}
 _ZEN_SEEDS_MAX = 20000
 
 
-def _zen_seed(name: str) -> Tuple[int, int]:
+def _zen_seed(name: str) -> tuple[int, int]:
     """``(row byte, column byte)`` of ``name``'s md5, memoised."""
     seed = _ZEN_SEEDS.get(name)
     if seed is None:
@@ -4727,7 +4744,7 @@ class AppRender(AppKeys):
         cols: int,
         lines: int,
         cut: Optional[int] = None,
-    ) -> List[str]:
+    ) -> list[str]:
         """The default screen's rows, laid out for ``cols``.
 
         ``cut`` narrows the width each row is finally cut to without
@@ -4824,7 +4841,7 @@ class AppRender(AppKeys):
                 "dim",
             )
         )
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for job in self.jobs:
             # health() is a multi-branch walk of the payload; calling it
             # twice to produce one count doubled the toolbar's whole cost
@@ -4864,7 +4881,7 @@ class AppRender(AppKeys):
         )
 
     # ---- the jobs table ---------------------------------------------
-    def _column_flags(self) -> Tuple[bool, bool, bool, bool]:
+    def _column_flags(self) -> tuple[bool, bool, bool, bool]:
         """``(spread, monitored, overdue, paused)`` for the layout.
 
         One walk, not four: every frame asks the job list the same four
@@ -4887,11 +4904,11 @@ class AppRender(AppKeys):
                 break
         return (spread, monitored, overdue, paused)
 
-    def _columns(self, cols: int) -> List[Tuple[str, int]]:
+    def _columns(self, cols: int) -> list[tuple[str, int]]:
         """(column, width) picks that fit ``cols``, widest board first."""
         compact = bool(self.prefs["compact"])
         spread, monitored, overdue, paused = self._column_flags()
-        layout: List[Tuple[str, int]] = [
+        layout: list[tuple[str, int]] = [
             ("status", 11),
             ("name", 24),
         ]
@@ -4949,7 +4966,7 @@ class AppRender(AppKeys):
         cols: int,
         body_rows: int,
         cut: Optional[int] = None,
-    ) -> List[str]:
+    ) -> list[str]:
         layout = self._columns(cols)
         titles = {
             "status": "status",
@@ -4993,8 +5010,8 @@ class AppRender(AppKeys):
     def _job_row(
         self,
         paint: Painter,
-        job: Dict[str, Any],
-        layout: List[Tuple[str, int]],
+        job: dict[str, Any],
+        layout: list[tuple[str, int]],
         cols: int,
         selected: bool,
         cut: Optional[int] = None,
@@ -5003,7 +5020,7 @@ class AppRender(AppKeys):
         ascii_mode = bool(self.prefs["ascii"])
         color = HEALTH_COLOR[key]
         last = job.get("last_run") or {}
-        cells: List[str] = []
+        cells: list[str] = []
         bg = "sel" if selected else None
         for col, width in layout:
             if col == "status":
@@ -5150,8 +5167,8 @@ class AppRender(AppKeys):
 
     # ---- toasts ------------------------------------------------------
     def _compose_toasts(
-        self, paint: Painter, rows: List[str], cols: int, lines: int
-    ) -> List[str]:
+        self, paint: Painter, rows: list[str], cols: int, lines: int
+    ) -> list[str]:
         if not self.toasts:
             return rows
         colors = {"ok": "ok", "fail": "fail", "warn": "warn", "info": "accent"}
@@ -5171,18 +5188,18 @@ class AppRender(AppKeys):
     # ---- wallboard + zen --------------------------------------------
     def render_wallboard(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         ascii_mode = bool(self.prefs["ascii"])
         # health() drives the tile order, the tile ink AND the footer
         # counts, so it is walked once per job per frame: the sort key,
         # the per-tile lookup and the doubled footer count together used
         # to call it three times per job plus once per painted tile.
         keyed = [(health(job)[0], job) for job in self.jobs]
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for key, _job in keyed:
             counts[key] = counts.get(key, 0) + 1
         stale = self.stale()
-        rows: List[str] = []
+        rows: list[str] = []
         if self.verdict is not None:
             rows.append(self.render_verdict_bar(paint, cols))
         if stale:
@@ -5210,7 +5227,7 @@ class AppRender(AppKeys):
         )
         for chunk_start in range(0, len(shown), per_row):
             chunk = shown[chunk_start : chunk_start + per_row]
-            lines3: List[List[str]] = [[], [], []]
+            lines3: list[list[str]] = [[], [], []]
             for key, job in chunk:
                 color = HEALTH_COLOR[key]
                 last = job.get("last_run") or {}
@@ -5295,7 +5312,7 @@ class AppRender(AppKeys):
         )
         return rows
 
-    def render_zen(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_zen(self, paint: Painter, cols: int, lines: int) -> list[str]:
         """The calm all-clear field: one breathing dot per job, pulsing
         on its real next fire, a terminal read of the web screensaver."""
         rows = [paint.row() for _ in range(lines)]
@@ -5366,14 +5383,14 @@ HELP_EXTRA_ROWS = [
 class AppOverlays(AppRender):
     def render_overlay(
         self, paint: Painter, top: str, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         renderer = getattr(self, "render_" + top, None)
         if renderer is None:
             return []
-        return cast(List[str], renderer(paint, cols, lines))
+        return cast(list[str], renderer(paint, cols, lines))
 
     # ---- help --------------------------------------------------------
-    def render_help(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_help(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(64, cols - 4)
         body = [paint.style("the web dashboard's keys", "dim")]
         for keycap, action in HELP_ROWS:
@@ -5400,7 +5417,7 @@ class AppOverlays(AppRender):
     # ---- palette -----------------------------------------------------
     def render_palette(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         width = min(72, cols - 4)
         matches = self.palette_matches()
         self.palette_sel = min(self.palette_sel, max(0, len(matches) - 1))
@@ -5436,7 +5453,7 @@ class AppOverlays(AppRender):
     # ---- settings ----------------------------------------------------
     def settings_rows(
         self,
-    ) -> List[Tuple[str, str, Callable[[], None]]]:
+    ) -> list[tuple[str, str, Callable[[], None]]]:
         prefs = self.prefs
 
         def poll_label() -> str:
@@ -5484,7 +5501,7 @@ class AppOverlays(AppRender):
 
     def render_settings(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         width = min(56, cols - 4)
         rows = self.settings_rows()
         self.settings_sel = min(self.settings_sel, len(rows) - 1)
@@ -5519,7 +5536,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- token modal -------------------------------------------------
-    def render_token(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_token(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(56, cols - 4)
         masked = "•" * len(self.inputs["token"])
         body = [
@@ -5537,7 +5554,7 @@ class AppOverlays(AppRender):
     # ---- incident timeline ------------------------------------------
     def timeline_entries(
         self,
-    ) -> List[Tuple[str, Optional[str], str, Any, str, Any]]:
+    ) -> list[tuple[str, Optional[str], str, Any, str, Any]]:
         """(name, finished_at, outcome, exit, reason, duration), newest
         first: every job's most recent finish, like the web overlay."""
         out = []
@@ -5563,7 +5580,7 @@ class AppOverlays(AppRender):
 
     def render_timeline(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         width = min(90, cols - 4)
         entries = self.timeline_entries()
         ascii_mode = bool(self.prefs["ascii"])
@@ -5624,7 +5641,7 @@ class AppOverlays(AppRender):
     # ---- mitigate console -------------------------------------------
     def render_mitigate(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         width = min(76, cols - 4)
         body = [
             paint.style(
@@ -5666,7 +5683,7 @@ class AppOverlays(AppRender):
     # ---- cron sandbox ------------------------------------------------
     def render_sandbox(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         width = min(64, cols - 4)
         expr = self.inputs["sandbox"]
         body = [
@@ -5748,7 +5765,7 @@ class AppOverlays(AppRender):
         return panel_frame(paint, "cron sandbox", body, width, "esc close")
 
     # ---- DAGs index --------------------------------------------------
-    def render_dags(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_dags(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(76, cols - 4)
         body = []
         self.dags_sel = min(self.dags_sel, max(0, len(self.dags) - 1))
@@ -5798,7 +5815,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- durable-state inspector ------------------------------------
-    def render_state(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_state(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(80, cols - 4)
         data = self.state_data or {}
         body = []
@@ -5838,8 +5855,8 @@ class AppOverlays(AppRender):
         )
 
     def _render_state_view(
-        self, paint: Painter, data: Dict[str, Any], width: int
-    ) -> List[str]:
+        self, paint: Painter, data: dict[str, Any], width: int
+    ) -> list[str]:
         body = []
         for key in ("view", "stats"):
             section = data.get(key)
@@ -5884,7 +5901,7 @@ class AppOverlays(AppRender):
 
     def _render_state_listing(
         self, paint: Painter, width: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         body = []
         names = (
             self._state_namespaces()
@@ -5923,7 +5940,7 @@ class AppOverlays(AppRender):
     # ---- cluster panel ----------------------------------------------
     def render_cluster(
         self, paint: Painter, cols: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         width = min(84, cols - 4)
         data = self.cluster or {}
         body = []
@@ -6032,7 +6049,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- fleet matrix ------------------------------------------------
-    def render_fleet(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_fleet(self, paint: Painter, cols: int, lines: int) -> list[str]:
         # no fixed cap: a 9-node matrix needs the room, and the per-node
         # cell width below already shrinks to fit what the terminal gives
         width = cols - 4
@@ -6052,8 +6069,8 @@ class AppOverlays(AppRender):
         # failing somewhere, and how many cells are running.  Walking it
         # per question re-read every cell three times, and four under the
         # failing-only filter.
-        names: Set[str] = set()
-        failed: Set[str] = set()
+        names: set[str] = set()
+        failed: set[str] = set()
         running_cells = 0
         for node in nodes:
             for job_name, cell in (node.get("jobs") or {}).items():
@@ -6151,7 +6168,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- activity heatmap -------------------------------------------
-    def _heat_runs(self, name: str) -> List[Tuple[float, str]]:
+    def _heat_runs(self, name: str) -> list[tuple[float, str]]:
         """``(finish epoch, outcome key)`` for one heatmap row, cached.
 
         The punchcard refetches at most once a minute (``_load_heat``) but
@@ -6187,7 +6204,7 @@ class AppOverlays(AppRender):
                 for key, value in self._heat_parsed.items()
                 if key in self.heat_data
             }
-        parsed: List[Tuple[float, str]] = []
+        parsed: list[tuple[float, str]] = []
         for run in runs:
             epoch = parse_iso(run.get("finished_at"))
             if epoch is not None:
@@ -6196,7 +6213,7 @@ class AppOverlays(AppRender):
         self._heat_parsed[name] = (runs, parsed)
         return parsed
 
-    def render_heat(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_heat(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(96, cols - 4)
         buckets = 24
         body = [
@@ -6214,7 +6231,7 @@ class AppOverlays(AppRender):
             0, min(self.panel_scroll, max(0, len(names) - visible))
         )
         for name in names[self.panel_scroll : self.panel_scroll + visible]:
-            cells: List[Tuple[int, str]] = [
+            cells: list[tuple[int, str]] = [
                 (0, "skipped") for _ in range(buckets)
             ]
             for epoch, key in self._heat_runs(name):
@@ -6248,7 +6265,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- schedule pressure ------------------------------------------
-    def render_press(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_press(self, paint: Painter, cols: int, lines: int) -> list[str]:
         """Forward-looking fleet collision view (web pressure card port):
         the next 24h of fires by minute of hour, the hour by minute grid,
         duplicate schedule groups, and the least-loaded slot."""
@@ -6262,7 +6279,7 @@ class AppOverlays(AppRender):
                 width,
                 "r refresh · esc close",
             )
-        body: List[str] = []
+        body: list[str] = []
         busiest = data["busiest_minute"]
         body.append(
             paint.style(
@@ -6373,7 +6390,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- week calendar ----------------------------------------------
-    def render_week(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_week(self, paint: Painter, cols: int, lines: int) -> list[str]:
         """The web week calendar, terminal-shaped: a 7-day by 24-hour
         shaded fire grid, a chronological agenda of the calendar-worthy
         fires, and the background-hum summary of jobs too frequent to
@@ -6388,7 +6405,7 @@ class AppOverlays(AppRender):
                 width,
                 "r refresh · esc close",
             )
-        body: List[str] = []
+        body: list[str] = []
         items = data["items"]
         frequent = data["frequent"]
         start = data["start"]
@@ -6477,7 +6494,7 @@ class AppOverlays(AppRender):
         )
 
     # ---- next-fire radar --------------------------------------------
-    def render_radar(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_radar(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(56, cols - 4)
         items = []
         for job in self.jobs:
@@ -6510,7 +6527,7 @@ class AppOverlays(AppRender):
         return panel_frame(paint, "next-fire radar", body, width, "esc close")
 
     # ---- node resources ---------------------------------------------
-    def render_node(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_node(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(64, cols - 4)
         node = self.node or {}
         body = [
@@ -6577,11 +6594,11 @@ class AppDrawers(AppOverlays):
     def _compose_drawer(
         self,
         paint: Painter,
-        base: List[str],
+        base: list[str],
         cols: int,
         lines: int,
         which: str,
-    ) -> List[str]:
+    ) -> list[str]:
         """Splice a right-hand drawer over the dimmed table, like the
         web page's aside.
 
@@ -6606,7 +6623,7 @@ class AppDrawers(AppOverlays):
             )
         return self._compose_toasts(paint, rows, cols, lines)
 
-    def _tabs_row(self, paint: Painter, tabs: List[str], active: str) -> str:
+    def _tabs_row(self, paint: Painter, tabs: list[str], active: str) -> str:
         spans = []
         for tab in tabs:
             is_active = tab == active
@@ -6623,7 +6640,7 @@ class AppDrawers(AppOverlays):
     # ---- the job drawer ---------------------------------------------
     def render_drawer_panel(
         self, paint: Painter, width: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         key, label = health(job) if job else ("unknown", "?")
         color = HEALTH_COLOR[key]
@@ -6678,9 +6695,9 @@ class AppDrawers(AppOverlays):
 
     def _drawer_logs(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         tail = self.log_tail
-        rows: List[str] = []
+        rows: list[str] = []
         search = self.inputs["logsearch"]
         status_bits = []
         if tail is not None:
@@ -6710,7 +6727,7 @@ class AppDrawers(AppOverlays):
         needle = search.strip().lower()
         content_width = width - 4 - (9 if self.timestamps else 0)
 
-        def render(stream: str, line: str, when: float) -> List[str]:
+        def render(stream: str, line: str, when: float) -> list[str]:
             if stream == "meta":  # inline end-of-run separator
                 return [paint.style("  ── %s ──" % line, "dim")]
             text, plain = self._ansi_line(line)
@@ -6724,7 +6741,7 @@ class AppDrawers(AppOverlays):
             if needle and needle in plain.lower():
                 text = paint.style(plain, "bright", bg="sel")
             if self.wrap and text_width(plain) > content_width:
-                chunks: List[str] = []
+                chunks: list[str] = []
                 start = 0
                 while start < len(plain):
                     chunk = plain[start : start + content_width]
@@ -6735,7 +6752,7 @@ class AppDrawers(AppOverlays):
                 return chunks
             return [" " + marker + prefix + text]
 
-        suffix: List[str] = []
+        suffix: list[str] = []
         if tail.error:
             suffix.append(paint.style("  ⚠ %s" % tail.error, "fail"))
         elif tail.ended == "no-output":
@@ -6766,7 +6783,7 @@ class AppDrawers(AppOverlays):
         return rows
 
     def _wrap_rows(
-        self, entry: Tuple[str, str, float], content_width: int
+        self, entry: tuple[str, str, float], content_width: int
     ) -> int:
         """Screen rows one buffered entry occupies with wrap on.
 
@@ -6798,11 +6815,11 @@ class AppDrawers(AppOverlays):
     def _wrapped_window(
         self,
         tail: "LogTail",
-        suffix: List[str],
-        render: Callable[[str, str, float], List[str]],
+        suffix: list[str],
+        render: Callable[[str, str, float], list[str]],
         content_width: int,
         available: int,
-    ) -> List[str]:
+    ) -> list[str]:
         """The visible rows of a wrapped log buffer.
 
         A wrapped entry spans an unknown number of rows, so this branch
@@ -6821,7 +6838,7 @@ class AppDrawers(AppOverlays):
         self.log_scroll = min(self.log_scroll, max_scroll)
         end = total - self.log_scroll
         begin = max(0, end - available)
-        window: List[str] = []
+        window: list[str] = []
         first_row = min(begin, body_rows)
         cursor = 0
         for idx, count in enumerate(counts):
@@ -6839,8 +6856,8 @@ class AppDrawers(AppOverlays):
 
     def _drawer_history(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
-        rows: List[str] = []
+    ) -> list[str]:
+        rows: list[str] = []
         data = self.drawer_runs
         if data is None:
             return [paint.style("  loading run history…", "dim")]
@@ -6941,7 +6958,7 @@ class AppDrawers(AppOverlays):
 
     def _drawer_resources(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         data = self.drawer_res
         if data is None:
             return [paint.style("  loading resource data…", "dim")]
@@ -6952,7 +6969,7 @@ class AppDrawers(AppOverlays):
                     "  (set monitorResources: true on the job)", "dim"
                 ),
             ]
-        rows: List[str] = []
+        rows: list[str] = []
         live = data.get("live") or []
         if live:
             snap = live[-1] if isinstance(live, list) else {}
@@ -7001,7 +7018,7 @@ class AppDrawers(AppOverlays):
 
     def _drawer_schedule(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         job = self.by_name.get(self.drawer_job or "") or {}
         schedule = str(job.get("schedule", ""))
         resolved = str(job.get("schedule_resolved") or "").strip()
@@ -7073,7 +7090,7 @@ class AppDrawers(AppOverlays):
     # ---- the DAG drawer ---------------------------------------------
     def render_dag_panel(
         self, paint: Painter, width: int, lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         dag = next(
             (d for d in self.dags if str(d.get("name", "")) == self.dag_name),
             {},
@@ -7107,8 +7124,8 @@ class AppDrawers(AppOverlays):
 
     def _dag_runs_tab(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
-        rows: List[str] = []
+    ) -> list[str]:
+        rows: list[str] = []
         self.dag_sel = min(self.dag_sel, max(0, len(self.dag_runs) - 1))
         start = scroll_window(len(self.dag_runs), body_lines, self.dag_sel, 0)
         for idx, run in enumerate(self.dag_runs[start : start + body_lines]):
@@ -7145,10 +7162,10 @@ class AppDrawers(AppOverlays):
     def _dag_graph_tab(
         self,
         paint: Painter,
-        dag: Dict[str, Any],
+        dag: dict[str, Any],
         width: int,
         body_lines: int,
-    ) -> List[str]:
+    ) -> list[str]:
         """The task graph as topological layers with edge lists."""
         tasks = dag.get("tasks")
         if isinstance(tasks, dict):
@@ -7168,9 +7185,9 @@ class AppDrawers(AppOverlays):
             str(t.get("id") or t.get("key") or t.get("name", "")): t
             for t in task_list
         }
-        depth_cache: Dict[str, int] = {}
+        depth_cache: dict[str, int] = {}
 
-        def depth(key: str, seen: Tuple[str, ...] = ()) -> int:
+        def depth(key: str, seen: tuple[str, ...] = ()) -> int:
             if key in depth_cache:
                 return depth_cache[key]
             if key in seen:  # cycle guard; the daemon validates anyway
@@ -7187,13 +7204,13 @@ class AppDrawers(AppOverlays):
             depth_cache[key] = level
             return level
 
-        layers: Dict[int, List[str]] = {}
+        layers: dict[int, list[str]] = {}
         for key in by_key:
             layers.setdefault(depth(key), []).append(key)
-        run_states: Dict[str, str] = {}
+        run_states: dict[str, str] = {}
         for task in self.dag_run_tasks():
             run_states[str(task.get("key", ""))] = str(task.get("state", ""))
-        rows: List[str] = []
+        rows: list[str] = []
         ascii_mode = bool(self.prefs["ascii"])
         arrow = "->" if ascii_mode else "─▶"
         for level in sorted(layers):
@@ -7226,9 +7243,9 @@ class AppDrawers(AppOverlays):
 
     def _dag_tasks_tab(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         tasks = self.dag_run_tasks()
-        rows: List[str] = []
+        rows: list[str] = []
         if not self.dag_run_key:
             rows.append(
                 paint.style("  open a run first (runs tab, enter)", "dim")
@@ -7278,7 +7295,7 @@ class AppDrawers(AppOverlays):
 
     def _dag_xcom_tab(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         data = self.dag_xcom
         if not self.dag_run_key:
             return [paint.style("  open a run first (runs tab, enter)", "dim")]
@@ -7291,7 +7308,7 @@ class AppDrawers(AppOverlays):
                 for k, v in data.items()
                 if k not in ("dag", "runKey", "run_key")
             }
-        rows: List[str] = []
+        rows: list[str] = []
         if isinstance(entries, dict) and entries:
             for key, value in list(entries.items())[:body_lines]:
                 rows.append(
@@ -7309,7 +7326,7 @@ class AppDrawers(AppOverlays):
 
     def _dag_logs_tab(
         self, paint: Painter, width: int, body_lines: int
-    ) -> List[str]:
+    ) -> list[str]:
         tail = self.dag_task_tail
         if tail is None:
             return [
@@ -7318,7 +7335,7 @@ class AppDrawers(AppOverlays):
                 )
             ]
         rows = [paint.style(" task: %s" % tail.label, "dim")]
-        suffix: List[str] = []
+        suffix: list[str] = []
         if tail.error:
             suffix.append(paint.style("  ⚠ %s" % tail.error, "fail"))
         elif tail.ended == "no-output":
@@ -7345,7 +7362,7 @@ class AppDrawers(AppOverlays):
         return rows
 
     # ---- multi-tail console -----------------------------------------
-    def render_tail(self, paint: Painter, cols: int, lines: int) -> List[str]:
+    def render_tail(self, paint: Painter, cols: int, lines: int) -> list[str]:
         width = min(cols - 4, 110)
         identity = ["run", "ok", "pending", "warn"]
         head_spans = []
@@ -7379,7 +7396,7 @@ class AppDrawers(AppOverlays):
         # stable across the trim (tuples are built in the same order),
         # so ties on the timestamp render identically too.
         window = available + self.panel_scroll
-        merged: List[Tuple[float, int, str, str, str]] = []
+        merged: list[tuple[float, int, str, str, str]] = []
         for idx, tail in enumerate(self.tails):
             for stream, line, when in tail.lines[-window:]:
                 if stream == "meta":
@@ -7484,7 +7501,7 @@ class TuiApp(AppDrawers):
                 "fg",
             ):
                 return
-            jobs: List[Dict[str, Any]] = []
+            jobs: list[dict[str, Any]] = []
             with contextlib.suppress(Exception):
                 data = await _race_skip(self.api.get_json("/jobs"), skip, None)
                 if isinstance(data, list):
@@ -7584,112 +7601,11 @@ async def _race_skip(
     return task.result()
 
 
-def add_tui_command(sub: Any) -> None:
-    """Attach the ``tui`` subcommand to the root parser's subparsers."""
-    parser = sub.add_parser(
-        "tui",
-        help=(
-            "open the terminal dashboard (the web dashboard's TUI "
-            "sibling) against a running daemon's web listener"
-        ),
-        description=(
-            "A keyboard-driven terminal rendition of the cronstable web "
-            "dashboard, speaking the same HTTP control API. The web "
-            "page's shortcuts apply: j/k move, Enter opens a job, r "
-            "runs it, x cancels, / filters, Ctrl-K opens the command "
-            "palette, ? lists every key."
-        ),
-    )
-    parser.add_argument(
-        "--url",
-        default=DEFAULT_URL,
-        help="daemon web listener (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="bearer token for web.authToken-protected daemons",
-    )
-    parser.add_argument(
-        "--token-env",
-        default=ENV_TOKEN,
-        metavar="VAR",
-        help=(
-            "environment variable to read the token from when --token "
-            "is not given (default: %(default)s)"
-        ),
-    )
-    parser.add_argument(
-        "--cacert",
-        default=None,
-        metavar="PATH",
-        help=(
-            "verify an https:// listener against this CA file instead "
-            "of the system trust store (env: %s)" % ENV_CACERT
-        ),
-    )
-    parser.add_argument(
-        "--client-cert",
-        default=None,
-        metavar="PATH",
-        help=(
-            "certificate to present to a listener that requires one "
-            "(web.tls.clientCa is set) (env: %s)" % ENV_CLIENT_CERT
-        ),
-    )
-    parser.add_argument(
-        "--client-key",
-        default=None,
-        metavar="PATH",
-        help="private key for --client-cert (env: %s)" % ENV_CLIENT_KEY,
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help=(
-            "skip certificate verification; the token is still sent, so "
-            "it reaches whoever answers (env: %s)" % ENV_INSECURE
-        ),
-    )
-    parser.add_argument(
-        "--theme",
-        default=None,
-        choices=list(THEME_HUES) + [h + "-light" for h in THEME_HUES],
-        help="start on a specific theme (persisted for next time)",
-    )
-    parser.add_argument(
-        "--tv",
-        action="store_true",
-        help="start straight on the wallboard (the page's #tv)",
-    )
-    parser.add_argument(
-        "--job",
-        default=None,
-        metavar="NAME",
-        help="open a job's drawer at startup (the page's #job/NAME)",
-    )
-    parser.add_argument(
-        "--boot",
-        action="store_true",
-        help="force the boot self-test even if one ran recently",
-    )
-    parser.add_argument(
-        "--no-boot",
-        action="store_true",
-        help="skip the boot self-test",
-    )
-    parser.add_argument(
-        "--ascii",
-        action="store_true",
-        help="plain-ASCII status glyphs (limited fonts/terminals)",
-    )
-    parser.add_argument(
-        "--poll",
-        type=float,
-        default=None,
-        metavar="SECONDS",
-        help="refresh interval; 0 pauses (default: remembered, else 3)",
-    )
+# The `cronstable tui` parser definition lives in cronstable._cliargs so
+# __main__ registers the subcommand without importing this module (its
+# ~7000-line body plus unicodedata, ~50ms) until the dashboard is actually
+# dispatched; re-exported under its original name.
+add_tui_command = _cliargs.add_tui_command
 
 
 def _resolve_token(args: Any) -> Optional[str]:
