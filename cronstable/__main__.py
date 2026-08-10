@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import sys
+from typing import Any
 
 import cronstable.version
 from cronstable import _cliargs, platform
@@ -119,6 +120,153 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_job_commands(sub)
     _cliargs.add_mcp_command(sub)
     _cliargs.add_tui_command(sub)
+    _add_init_command(sub)
+
+
+def _add_init_command(sub: Any) -> None:
+    """Register `cronstable init`: write a starter configuration and exit.
+
+    The answer to the very first wall a new install hits, the
+    "configuration file not found" exit: one command creates the config
+    directory and a commented starter file at the platform default (or a
+    directory of the caller's choosing, e.g. a machine-wide
+    ``%ProgramData%\\cronstable`` on Windows).
+    """
+    init = sub.add_parser(
+        "init",
+        help="write a commented starter configuration into DIRECTORY "
+        "(default: the platform config directory) and exit",
+    )
+    init.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        metavar="DIRECTORY",
+        help="target configuration directory (default: -c/--config if "
+        "given, else {})".format(CONFIG_DEFAULT),
+    )
+
+
+#: The starter file `cronstable init` writes: one working job in the
+#: platform's own shell, and the most commonly wanted next step (a local
+#: dashboard with an API token) left commented out.
+_INIT_STARTER = """\
+# cronstable starter configuration (written by `cronstable init`).
+# Every *.yaml and *.yml file in this directory is loaded; classic crontab
+# files (*.crontab, *.cron, or a file named `crontab`) are accepted here
+# too. Names beginning with _ or . are skipped, which is how you park one.
+# Reference: https://github.com/ptweezy/cronstable/wiki/Configuration-Reference
+#
+# Windows note: quote paths with single quotes ('C:\\scripts\\nightly.bat').
+# In double-quoted YAML strings a backslash starts an escape sequence.
+
+jobs:
+  - name: hello
+    command: {hello}
+    schedule: "*/5 * * * *"
+
+# Uncomment for the web dashboard and HTTP control API on localhost. The
+# bearer token also unlocks POST /shutdown, the graceful stop for service
+# wrappers and supervisors:
+#
+# web:
+#   listen:
+#     - http://127.0.0.1:8080
+#   authToken:
+#     fromEnvVar: CRONSTABLE_TOKEN
+"""
+
+
+def _run_init(args: Any) -> int:
+    """Write a commented starter configuration (`cronstable init`).
+
+    Creates the target directory when needed and writes ``cronstable.yaml``
+    into it. Never touches an existing setup: a target that is a file, that
+    already holds config files, or that already has a ``cronstable.yaml``
+    is refused with the reason, so re-running init is always safe.
+    """
+    # dispatch-time import, like the other subcommand branches: building the
+    # parser must stay import-light for every thin-client invocation.
+    from cronstable.crontabs import is_crontab_path
+
+    # Precedence: the positional DIRECTORY, then a root-level -c/--config,
+    # then the platform default. Honoring -c matters because the
+    # configuration-not-found error that sends people here names that very
+    # flag, so `cronstable -c D:\jobs init` is a natural reading of it; the
+    # starter belongs in D:\jobs, not in the default location the caller
+    # just steered away from.
+    target = args.directory or args.config
+    if (
+        args.directory
+        and args.config != CONFIG_DEFAULT
+        and os.path.abspath(args.config) != os.path.abspath(args.directory)
+    ):
+        print(
+            "cronstable init: -c {} and DIRECTORY {} disagree; writing to "
+            "{}".format(args.config, args.directory, args.directory),
+            file=sys.stderr,
+        )
+    if os.path.isfile(target):
+        print(
+            "cronstable init: {} is a file; init writes a starter file "
+            "into a configuration DIRECTORY. Name a directory, or edit "
+            "the existing file directly.".format(target),
+            file=sys.stderr,
+        )
+        return 1
+    existing = []
+    if os.path.isdir(target):
+        try:
+            names = sorted(os.listdir(target))
+        except OSError as ex:
+            # an unreadable target must report like every other init
+            # failure, not traceback; the write below would fail anyway.
+            print(
+                "cronstable init: could not read {}: {}".format(target, ex),
+                file=sys.stderr,
+            )
+            return 1
+        for name in names:
+            base, ext = os.path.splitext(name)
+            if not base or base[0] in {"_", "."}:
+                continue
+            if ext in {".yml", ".yaml"} or is_crontab_path(name):
+                existing.append(name)
+    if existing:
+        print(
+            "cronstable init: {} already holds configuration ({}); "
+            "refusing to add a starter to a live setup".format(
+                target, ", ".join(existing[:5])
+            ),
+            file=sys.stderr,
+        )
+        return 1
+    hello = (
+        "echo hello from cronstable on %COMPUTERNAME%"
+        if platform.IS_WINDOWS
+        else 'echo "hello from cronstable on $(hostname)"'
+    )
+    path = os.path.join(target, "cronstable.yaml")
+    try:
+        os.makedirs(target, exist_ok=True)
+        # "x": exclusive create, so a config racing into place between the
+        # scan above and this write still cannot be clobbered.
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(_INIT_STARTER.format(hello=hello))
+    except OSError as ex:
+        print(
+            "cronstable init: could not write {}: {}".format(path, ex),
+            file=sys.stderr,
+        )
+        return 1
+    print("wrote {}".format(path))
+    # Bare `cronstable` finds the default location on its own; anywhere else
+    # has to be named, whichever way the caller named it here.
+    if os.path.abspath(target) != os.path.abspath(CONFIG_DEFAULT):
+        print("start the scheduler with: cronstable -c {}".format(target))
+    else:
+        print("start the scheduler with: cronstable")
+    return 0
 
 
 def main_loop(loop=None):
@@ -134,7 +282,8 @@ def main_loop(loop=None):
         "--config",
         default=CONFIG_DEFAULT,
         metavar="FILE-OR-DIR",
-        help="configuration file, or directory containing configuration files",
+        help="configuration file, or directory containing configuration "
+        "files (default: %(default)s)",
     )
     parser.add_argument(
         "-l",
@@ -266,10 +415,15 @@ def main_loop(loop=None):
 
         sys.exit(tui.dispatch(args))
 
+    if command == "init":
+        sys.exit(_run_init(args))
+
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
-            "cronstable error: configuration file not found, please provide "
-            "one with the --config option",
+            "cronstable error: configuration file not found at the default "
+            "location ({}). Run `cronstable init` to create a starter "
+            "configuration there, or point -c/--config at an existing file "
+            "or directory.".format(CONFIG_DEFAULT),
             file=sys.stderr,
         )
         parser.print_help(sys.stderr)

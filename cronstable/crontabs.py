@@ -29,12 +29,16 @@ output and exit status instead of mailed via ``MAILTO``, and the
 "Classic crontabs" documentation for the full list of deviations.
 """
 
+import logging
 import os
 import re
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from cronstable import platform
 from cronstable.cronexpr import CronTab
+
+logger = logging.getLogger("cronstable")
 
 #: Filename markers the config loader treats as "this is a classic
 #: crontab" without looking at the content: the two conventional
@@ -218,11 +222,47 @@ def parse_crontab(data: str, path: str) -> list[dict[str, Any]]:
         assignment = _ENV_LINE.match(line)
         if assignment is not None:
             value = _unquote(assignment.group("value"))
-            if assignment.group("name") == "CRON_TZ":
+            name = assignment.group("name")
+            if name == "CRON_TZ":
                 # Checked at the assignment so the error carries the
                 # file:line of the typo, not of some job below it.
                 _check_timezone(value, where)
-            environment[assignment.group("name")] = value
+            # A POSIX crontab almost always carries SHELL=/bin/sh (and often
+            # a POSIX PATH). On Windows that shell path cannot exist, so
+            # every entry below the line would parse cleanly and then fail
+            # at spawn; the module's documented bias is to refuse at parse
+            # with the file:line instead. A bare name (SHELL=bash) is left
+            # alone: it resolves through PATH wherever such a shell is
+            # installed.
+            if (
+                platform.IS_WINDOWS
+                and name == "SHELL"
+                and value.startswith("/")
+            ):
+                raise CrontabError(
+                    "{}: SHELL={} names a POSIX shell path, which does not "
+                    "exist on Windows, so every entry below this line would "
+                    "fail to spawn. Remove the SHELL line to run entries "
+                    "through the platform default (%ComSpec%, i.e. cmd.exe), "
+                    "or name a shell that exists here (e.g. "
+                    "SHELL=powershell).".format(where, value)
+                )
+            if (
+                platform.IS_WINDOWS
+                and name == "PATH"
+                and value.startswith("/")
+            ):
+                # Not fatal (a job with absolute command paths still runs),
+                # but it REPLACES the Windows PATH for the entries below, so
+                # plain command names stop resolving. Say so, with the line.
+                logger.warning(
+                    "%s: PATH=%s replaces the Windows PATH with a POSIX one "
+                    "for the entries below it; plain command names will not "
+                    "resolve. Set a Windows PATH or remove the line.",
+                    where,
+                    value,
+                )
+            environment[name] = value
             continue
         jobs.append(_job_from_line(line, where, label, lineno, environment))
     return jobs
