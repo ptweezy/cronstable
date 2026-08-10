@@ -462,7 +462,11 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
     needs a console shared with the daemon: where there is none (a detached
     or service context), or ``pid`` is not a group root, delivery fails and
     the graceful call becomes the tree kill immediately, this function's
-    previous behavior on every call (:func:`_windows_graceful_break`).  The
+    previous behavior on every call (:func:`_windows_graceful_break`).  A
+    service can opt back into the two-step with ``cronstable service
+    install --console``, which allocates one
+    (:meth:`cronstable.winservice.ServiceHost._prepare_console`); it is off
+    by default because a console changes what a job inherits.  The
     forced tree walk resolves descendants through their live parents, so the
     root is deliberately never killed first: that would orphan every
     descendant beyond the walk's reach, and the string-form ``command:``

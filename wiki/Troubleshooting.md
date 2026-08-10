@@ -648,6 +648,55 @@ use that grace). See
 [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout)
 on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
+### The Windows service will not start
+
+Read the bootstrap log first: by default
+`<config directory>\logs\cronstable-service.log`. A service has no stderr,
+so that file is where a startup failure is recorded.
+
+`cronstable service status` decodes the last failure without opening
+anything:
+
+| It says | Fix |
+| --- | --- |
+| `the configuration did not parse` | Run `cronstable -v -c <path>` interactively against the same path. |
+| `the service log could not be opened` | The log directory is not writable by LocalSystem. Pass `--log-file` somewhere it is, or `--no-log-file` with a `logging:` section. |
+| `the scheduler stopped with an error` | The scheduler raised; the bootstrap log has the traceback. |
+
+If it starts and schedules nothing, check which configuration it read. A
+service runs as LocalSystem, whose `%APPDATA%` is
+`C:\Windows\System32\config\systemprofile\AppData\Roaming`, not yours, so a
+per-user path is not the path you tested. `cronstable service install`
+refuses to install the per-user default for that reason; use a machine-wide
+directory and name it with `-c`.
+
+### `install` says a one-file build cannot host a service
+
+It cannot, and this is not a cronstable limitation to work around. The
+published one-file `.exe` (which is what winget installs) unpacks itself and
+runs the program in a **child** process, so the process the Service Control
+Manager starts and watches never registers with the service dispatcher, and
+the start fails on the SCM's timeout. Install with pip or pipx to run as a
+service, or use the `schtasks` recipe on
+[Running on Windows](Running-on-Windows#running-unattended).
+
+### A reinstall fails with "the service is pending deletion"
+
+Something still holds a handle to the removed service, so Windows marked it
+for deletion rather than deleting it. The usual culprits are the Services
+console (`services.msc`) and Task Manager's Services tab. Close them and run
+`cronstable service install` again.
+
+### `killTimeout` does nothing under the service
+
+Expected, unless the service was installed with `--console`. The graceful
+step of stopping a job is a console control event, and a service has no
+console, so the kill goes straight to the forced tree kill and there is
+nothing for `killTimeout` to bound. `cronstable service install --console`
+allocates one; it is off by default because an allocated console changes
+what a job inherits. See
+[Windows Service](Windows-Service#--console-and-job-termination).
+
 ## Reference: exit codes used internally
 
 | Code   | Meaning                                                                    |

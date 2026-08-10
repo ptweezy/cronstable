@@ -120,6 +120,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_job_commands(sub)
     _cliargs.add_mcp_command(sub)
     _cliargs.add_tui_command(sub)
+    _cliargs.add_service_command(sub)
     _add_init_command(sub)
 
 
@@ -418,6 +419,25 @@ def main_loop(loop=None):
     if command == "init":
         sys.exit(_run_init(args))
 
+    if command == "service":
+        # Before the configuration-not-found guard below: `service remove`
+        # and `service status` have to keep working on a host whose config
+        # was deleted, which is exactly when an operator reaches for them.
+        # _run_daemon and _new_event_loop are PASSED rather than imported by
+        # winservice: the ImagePath `install` writes for a source install is
+        # `python -m cronstable`, and importing this module by name from
+        # there would execute it a second time under its package name,
+        # giving the process two module objects and two CONFIG_DEFAULTs.
+        from cronstable import winservice
+
+        sys.exit(
+            winservice.dispatch(
+                args,
+                run_daemon=_run_daemon,
+                new_event_loop=_new_event_loop,
+            )
+        )
+
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
             "cronstable error: configuration file not found at the default "
@@ -525,7 +545,7 @@ def _install_default_executor(loop) -> None:
     )
 
 
-def _run_daemon(cron, loop=None) -> None:
+def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
     """Run the scheduler to completion, with shutdown signalling wired up.
 
     The event loop is built HERE rather than in :func:`main` because asyncio
@@ -538,14 +558,27 @@ def _run_daemon(cron, loop=None) -> None:
     Wiring Ctrl-C / termination to a graceful shutdown differs per platform
     (loop signal handlers on POSIX, signal.signal on Windows), so it lives
     behind platform.install_shutdown_handlers.
+
+    ``shutdown_handlers=False`` skips that wiring, for a caller that runs
+    this off the main thread and has its own stop surface.  It exists for
+    :mod:`cronstable.winservice`, whose loop runs on a thread the Service
+    Control Manager creates and whose stop request arrives as an SCM
+    control rather than a console event.  The flag is needed rather than
+    merely tidy: the Windows arm of install_shutdown_handlers reaches
+    ``signal.signal``, which the interpreter refuses anywhere but the main
+    thread, and the POSIX arm's ``loop.add_signal_handler`` refuses the
+    same way, so leaving it on would abort the run before the scheduler
+    ever started.
     """
     owned = loop is None
     if owned:
         loop = _new_event_loop()
     try:
         _install_default_executor(loop)
-        remove_shutdown_handlers = platform.install_shutdown_handlers(
-            loop, cron.signal_shutdown
+        remove_shutdown_handlers = (
+            platform.install_shutdown_handlers(loop, cron.signal_shutdown)
+            if shutdown_handlers
+            else (lambda: None)
         )
         try:
             loop.run_until_complete(cron.run())

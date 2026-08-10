@@ -323,19 +323,34 @@ See [Running unattended](#running-unattended) below and the
 
 ## Running unattended
 
-cronstable is a single foreground process and does not install itself as a
-Windows service. To run it unattended (starting at boot, surviving logoff),
-register it with the in-box Task Scheduler or wrap it in a service manager.
-Use the machine-wide config directory for either, so the daemon reads the
-same configuration no matter which account runs it.
-
-One-time setup, from an elevated prompt:
+The supported way to run cronstable unattended is as a Windows service.
+From an elevated prompt:
 
 ```shell
 cronstable init C:\ProgramData\cronstable
+cronstable service install -c C:\ProgramData\cronstable
+cronstable service start
 ```
 
-Then register a boot-time task running as `SYSTEM` (adjust the .exe path to
+That registers cronstable with the Service Control Manager, so it starts at
+boot, keeps running after you log off, appears in `services.msc`, and gets
+Windows' own recovery actions. Stopping it drains running jobs first, and
+the SCM is told the stop is in progress for as long as that takes. See
+[Windows Service](Windows-Service) for the full command set, the logging
+story, and the one install shape that cannot host a service: the published
+one-file `.exe` (also what winget installs), whose bootloader runs the
+program in a child process the SCM never sees. Install with pip or pipx to
+run as a service.
+
+### Task Scheduler, for the one-file executable
+
+Where the service is not available, the in-box Task Scheduler starts
+cronstable at boot and survives logoff too. It gives you neither the
+Services console nor a real stop control, but it does the job. Use the
+machine-wide config directory either way, so the daemon reads the same
+configuration no matter which account runs it.
+
+Register a boot-time task running as `SYSTEM` (adjust the .exe path to
 where you installed it):
 
 ```shell
@@ -349,7 +364,8 @@ restart-on-failure. A service wrapper such as
 [NSSM](https://nssm.cc) works the same way and additionally supervises
 crashes; point it at the same command line.
 
-Three things every unattended deployment should add:
+Three things a Task Scheduler or wrapper deployment should add. A service
+installed with `cronstable service install` already has the first two.
 
 **A stop path.** With no console there is no Ctrl-C. Configure a loopback
 listener with an auth token, and stop the daemon gracefully over HTTP; this
@@ -479,7 +495,11 @@ it.
 The break needs a console shared between the daemon and the job. Where there
 is none (a daemon started by a service wrapper with no console), the graceful
 step cannot be delivered and becomes the tree kill immediately; the job gets
-no notice there, and `killTimeout` has nothing left to bound.
+no notice there, and `killTimeout` has nothing left to bound. A service
+installed with `cronstable service install --console` allocates one so the
+two-step keeps working; it is off by default because an allocated console
+changes what a job inherits. See
+[Windows Service](Windows-Service#--console-and-job-termination).
 
 Honest bounds on the sequence: a descendant that moved itself into a new
 process group (`start /b` does) never receives the break, though the forced
