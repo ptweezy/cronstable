@@ -2,8 +2,7 @@
 
 `cronstable service` registers the scheduler with the Windows Service
 Control Manager, so it starts at boot and keeps running whether or not
-anyone is logged on. "Run whether user is logged on or not" is the first
-checkbox on a Task Scheduler task's General tab.
+anyone is logged on.
 
 See [Running on Windows](Running-on-Windows) for the rest of the platform's
 behavior, and [CLI Reference](CLI-Reference) for every other subcommand.
