@@ -90,11 +90,13 @@ from cronstable.job import (
     NotifyEventContext,
     RunningJob,
     SlaBreachContext,
+    close_event_log_writers,
     close_webhook_pool,
     report_config_enabled,
     report_event,
     report_hostname,
     report_sla_breach,
+    retire_event_log_writers,
     schedule_string,
 )
 from cronstable.leadership import LeadershipBackend, make_backend
@@ -2418,6 +2420,13 @@ class Cron:
         # reports went out during _drain_completions, so the pool holds
         # only idle keepalive sockets.
         await close_webhook_pool()
+        # and the Event Log writer threads, on the same reasoning: the
+        # records were queued during _drain_completions, so this drains
+        # what the last completion left and stops the threads. Bounded, so
+        # a wedged EventLog service cannot hold the exit open. Its joins
+        # run on the default executor, which is idle by now because the
+        # state backend stopped above.
+        await close_event_log_writers()
 
     def _cancel_coordination_tasks(self) -> None:
         """Cancel the launch-adjacent background work: Replace pursuits, the
@@ -2588,6 +2597,37 @@ class Cron:
         self._record_config(config, sources)
         return result
 
+    @staticmethod
+    def _eventlog_sources(config: CronstableConfig) -> set[str]:
+        """Every ``report.eventlog.source`` an enabled block names.
+
+        Enabled blocks only: ``source`` carries a default into every report
+        block of every job and into notify, so collecting them all would
+        keep a writer alive for a name nobody asked to write to.
+        """
+        sources: set[str] = set()
+        holders: list[Any] = list(config.jobs)
+        for dag_config in config.dags:
+            holders.extend(dag_config.task_templates.values())
+        blocks: list[dict[str, Any]] = []
+        for holder in holders:
+            for action in (
+                "onFailure",
+                "onPermanentFailure",
+                "onSuccess",
+                "onLate",
+            ):
+                block = getattr(holder, action, None)
+                if isinstance(block, dict):
+                    blocks.append(block)
+        if config.notify_config is not None:
+            blocks.append(config.notify_config)
+        for block in blocks:
+            eventlog = (block.get("report") or {}).get("eventlog") or {}
+            if eventlog.get("enabled"):
+                sources.add(eventlog.get("source") or "cronstable")
+        return sources
+
     def _apply_reload(self, config: CronstableConfig) -> CronstableConfig:
         """Swap in a freshly parsed config's job set (event-loop thread only).
 
@@ -2604,6 +2644,12 @@ class Cron:
         self.cron_dags = OrderedDict((d.name, d) for d in config.dags)
         # read live by _dispatch_notify, so a reload takes effect at once.
         self._notify_config = config.notify_config
+        # Retire the Event Log writer of a source this config no longer
+        # names. A writer is an OS thread plus a registered source handle,
+        # keyed on a config STRING rather than on anything that dies by
+        # itself, so editing report.eventlog.source and reloading would
+        # otherwise leave the old one running for the life of the process.
+        retire_event_log_writers(self._eventlog_sources(config))
         # The job set changed: invalidate the memo caches. A failed parse
         # raises before this point, so a bad reload never stales them.
         self._job_set_id_cache = None

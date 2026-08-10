@@ -1,8 +1,9 @@
 # Reporting (Mail, Sentry, Shell, Webhook)
 
-cronstable can report a job's outcome through five reporters: Sentry, e-mail
+cronstable can report a job's outcome through six reporters: Sentry, e-mail
 (SMTP), an arbitrary shell command, an HTTP webhook (Slack-compatible out
-of the box), and end-to-end encrypted push to paired devices, configured
+of the box), end-to-end encrypted push to paired devices, and the Windows
+Event Log, configured
 under the `report` block of the `onFailure`,
 `onPermanentFailure`, `onSuccess`, and `onLate` hooks. This page documents
 every reporter
@@ -36,9 +37,9 @@ A run that is deliberately terminated to make way for a newer instance
 (`concurrencyPolicy: Replace`) is not treated as a failure and is neither
 reported nor retried. See [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
-### All five reporters always run
+### All six reporters always run
 
-For any given hook, cronstable always invokes all five reporters concurrently
+For any given hook, cronstable always invokes all six reporters concurrently
 (`asyncio.gather` with `return_exceptions=True`). A reporter that is not
 configured returns early and does nothing:
 
@@ -47,6 +48,8 @@ configured returns early and does nothing:
 - Shell returns if `command` is unset (`None`).
 - Webhook returns if no `url` source is set.
 - Push returns if `enabled` is `false` (the default).
+- Event Log returns if `enabled` is `false` (the default), and again on
+  any platform that is not Windows.
 
 An exception raised by one reporter is logged at `ERROR` level (with traceback)
 and does not prevent the other reporters from running, nor does it propagate to
@@ -507,11 +510,50 @@ Notes on behavior:
 - The same block under `notify.report` (below) pushes daemon events: DAG
   failures, approval gates, and leadership/quorum changes.
 
+## Windows Event Log reporter
+
+Writes each outcome to the Windows Event Log. Windows only: on any other
+platform the reporter returns early, and the configuration load warns once,
+naming every hook that enabled it. It needs no extra and no dependency.
+
+```yaml
+onFailure:
+  report:
+    eventlog:
+      enabled: true
+      source: cronstable
+      includeOutput: false
+```
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Write records for this hook. |
+| `source` | string | `cronstable` | Event source name. Refused at load when empty, when it contains a path separator, or when it names a log (`Application`, `System`, `Security`); only enabled blocks are checked. |
+| `includeOutput` | bool | `false` | Carry a bounded output tail as the last insertion string. |
+
+Notes on behavior:
+
+- Unlike the other reporters there is no template. A record is a stable
+  event ID plus a fixed, ordered set of insertion strings, because the ID
+  and the field positions are what consumers key on, and a free-text
+  override of either is a contract this reporter cannot keep. An operator
+  who wants prose has the shell and webhook reporters.
+- Writes go to a background thread, so a busy Event Log service can never
+  delay a job's completion handling. A graceful shutdown drains the queue
+  with a five second bound; a hard kill drops whatever it still held.
+- `includeOutput` is off by default, the opposite of push's
+  `includeLogTail`, because the Application log is readable by every local
+  account while a push payload is sealed to a paired device's key.
+
+See [Windows Event Log](Windows-Event-Log) for the event-ID table, the
+insertion-string positions, the "description cannot be found" preamble, and
+the optional source registration.
+
 ## Daemon event notifications (`notify:`)
 
 The four hooks above report on **job runs**. A separate top-level `notify:`
 block reports on **daemon and orchestration events** that are not job runs, over
-the same five reporters:
+the same six reporters:
 
 | Event | Fires when |
 | --- | --- |
@@ -521,7 +563,7 @@ the same five reporters:
 | `quorum_loss` | This node leaves quorum, so its `Leader` jobs stand down. |
 
 The block carries a `report` block (the identical `sentry` / `mail` / `shell` /
-`webhook` / `push` schema documented above) and an optional `events` allow-list. Omit
+`webhook` / `push` / `eventlog` schema documented above) and an optional `events` allow-list. Omit
 `events` to report on every event; list a subset to filter. There is at most
 one `notify:` block across a config (like `web:`), and it is picked up on a
 reload.

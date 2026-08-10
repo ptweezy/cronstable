@@ -203,6 +203,32 @@ Windows fixes and additions. The first of many updates to address Windows first-
   reach, and the merged view counts it as missed. Both Codecov
   statuses stay `informational`, so the drop annotates a pull request and
   cannot fail one.
+- A sixth reporter, `eventlog`, writes job outcomes to the Windows Event
+  Log, which is where a Windows shop's monitoring already looks: Event
+  Viewer, a Windows Event Forwarding subscription, SCOM, every SIEM
+  connector. It sits in the same `report` block as the other five and fires
+  from the same hooks. Each record carries a stable event id (1000
+  succeeded, 1001 failed, 1002 failed permanently, 1003 overdue, 1010 and
+  1011 for daemon events) and eleven insertion strings in a fixed order, so
+  a rule written against it keeps working; there is deliberately no
+  template, because the id and the field positions are the contract.
+  cronstable does not register its event source, since that needs an HKLM
+  write and buys nothing without a message DLL, so Event Viewer prefixes
+  the rendered text with its generic "description cannot be found" note.
+  That costs the prose only: the provider, the id, the level and every
+  insertion string are all present, so the XML view, `wevtutil`, forwarding
+  and SIEM connectors read the record normally. Writes go to a background
+  thread because registering a source and writing a record are both
+  synchronous calls into the Event Log service, and reports run inline on
+  the completion path. Fields are capped by arithmetic rather than trimmed
+  at the API, because a vector past the combined ceiling makes the write
+  fail outright, which would drop exactly the alerts for the jobs that
+  produced the most output. `includeOutput` is off by default, the opposite
+  of push's `includeLogTail`, because the Application log is readable by
+  every local account. On any other platform the reporter does nothing and
+  the load warns once, naming every hook that asked for it, rather than
+  refusing: nothing can be installed on Linux to satisfy a refusal, so one
+  config directory still serves a mixed fleet.
 - An `onLate` block that enables only the push reporter and sets no `sla`
   thresholds is now refused at config load, as the same block naming any
   other reporter already was. The check that decides whether an `onLate`

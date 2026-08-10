@@ -51,6 +51,7 @@ from typing import (
 )
 
 from cronstable.config import (
+    DEFAULT_EVENTLOG_REPORT,
     DEFAULT_PUSH_REPORT,
     DEFAULT_REPORT_SHELL_TIMEOUT,
     JobConfig,
@@ -226,6 +227,15 @@ def _omit_default_report_fields(report: dict[str, Any]) -> dict[str, Any]:
     # safe: `report` is the fresh top-level copy _redact_report returned.
     if report.get("push") == DEFAULT_PUSH_REPORT:
         report.pop("push")
+    # The eventlog block post-dates v1 exactly as push does, and takes the
+    # same rule: at its defaults it leaves identity entirely, so no existing
+    # job's digest moves on upgrade, while a job that enables it gets a new
+    # one, correctly, because what happens on failure changed. Nothing here
+    # is redacted on the way past: `source` is a machine-local name and the
+    # block holds no secret, which is why it has no entry in
+    # _redact_report.
+    if report.get("eventlog") == DEFAULT_EVENTLOG_REPORT:
+        report.pop("eventlog")
     return report
 
 

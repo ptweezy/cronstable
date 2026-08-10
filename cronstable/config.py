@@ -418,6 +418,25 @@ DEFAULT_PUSH_REPORT = {
     "includeLogTail": True,
 }
 
+# Named for the same fingerprint reason as DEFAULT_PUSH_REPORT above: the
+# eventlog block post-dates the v1 identity scheme, so cronstable.fingerprint
+# omits it from a job's canonical form while it still equals these defaults.
+DEFAULT_EVENTLOG_REPORT = {
+    "enabled": False,
+    # The Event Log source name, which is also the registry key name a
+    # message DLL would be registered under. cronstable never registers the
+    # source (that needs HKLM writes, and buys nothing without a message
+    # DLL); it is configurable so two instances on one host, or a shop that
+    # does register a source of its own, can tell their records apart.
+    "source": "cronstable",
+    # Carry a bounded tail of the run's captured output. Off by default, the
+    # opposite of push's includeLogTail, and not for symmetry's sake: a push
+    # payload is sealed to a paired device's key, while the Application log
+    # is readable by every authenticated account on the machine. Turning
+    # this on is a decision to publish job output locally.
+    "includeOutput": False,
+}
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -466,6 +485,9 @@ _REPORT_DEFAULTS = {
     # Off by default; the relay endpoint and device registry live in the
     # daemon-global `push:` section, this block only opts a job/event in.
     "push": dict(DEFAULT_PUSH_REPORT),
+    # Windows Event Log records (cronstable.job.EventLogReporter). Off by
+    # default and a no-op on POSIX, where the load says so once.
+    "eventlog": dict(DEFAULT_EVENTLOG_REPORT),
 }
 
 
@@ -610,6 +632,7 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
         # make this function true for every job and trip the import-time
         # drift guard below.
         or bool((report.get("push") or {}).get("enabled"))
+        or bool((report.get("eventlog") or {}).get("enabled"))
     )
 
 
@@ -729,6 +752,18 @@ _report_schema = Map(
                 # carry the last captured output lines inside the sealed
                 # payload (trimmed oldest-first to fit the APNs size cap).
                 Opt("includeLogTail"): Bool(),
+            }
+        ),
+        Opt("eventlog"): Map(
+            {
+                # Windows only, and a no-op elsewhere rather than a load
+                # error; the load announces that once, naming every hook
+                # that enabled it (see _validate_eventlog_config).
+                Opt("enabled"): Bool(),
+                Opt("source"): Str(),
+                # publish a bounded output tail into a log every local
+                # account can read; see DEFAULT_EVENTLOG_REPORT.
+                Opt("includeOutput"): Bool(),
             }
         ),
     }
@@ -3736,6 +3771,120 @@ def _push_report_users(config: "CronstableConfig") -> list[str]:
     return users
 
 
+def _eventlog_report_users(config: "CronstableConfig") -> list[str]:
+    """Every place the assembled config ENABLES the eventlog reporter.
+
+    Deliberately a near-copy of :func:`_push_report_users` rather than the
+    two sharing one walker.  That function's inner ``_uses`` returns on the
+    first matching hook, so it yields at most one name per job, and it feeds
+    a fail-closed refusal whose exact wording operators have been reading
+    since push shipped.  Folding both through one traversal would either
+    change that wording or constrain this one; nine duplicated lines is the
+    cheaper of the two.
+    """
+
+    def _uses(holder: Any) -> bool:
+        for action in (
+            "onFailure",
+            "onPermanentFailure",
+            "onSuccess",
+            "onLate",
+        ):
+            block = getattr(holder, action, None)
+            if isinstance(block, dict):
+                report = (block.get("report") or {}).get("eventlog") or {}
+                if report.get("enabled"):
+                    return True
+        return False
+
+    users = []
+    for job in config.jobs:
+        if _uses(job):
+            users.append("job {}".format(job.name))
+    for dag_config in config.dags:
+        for taskkey, template in dag_config.task_templates.items():
+            if _uses(template):
+                users.append("dag {} task {}".format(dag_config.name, taskkey))
+    notify = config.notify_config
+    if notify is not None:
+        report = (notify.get("report") or {}).get("eventlog") or {}
+        if report.get("enabled"):
+            users.append("notify")
+    return users
+
+
+#: Log names, which are not source names.  Registering a source under one of
+#: these addresses the log's own key rather than a source under it, so the
+#: write either lands somewhere the operator did not mean or (Security) is
+#: refused for want of a privilege the daemon does not hold.
+_EVENTLOG_RESERVED_SOURCES = frozenset({"application", "system", "security"})
+
+
+def _validate_eventlog_config(config: "CronstableConfig") -> None:
+    """Shape checks for ``report.eventlog``, plus the POSIX advisory.
+
+    Both refusals apply ONLY to blocks that are enabled.  ``source`` carries
+    a default into every report block of every job, every DAG task template
+    and ``notify:`` through ``_REPORT_DEFAULTS``, so inspecting disabled
+    blocks would let a stray value in a block nobody turned on refuse the
+    whole configuration.
+
+    On POSIX this warns rather than refusing, which is the opposite of what
+    ``user``/``group`` does one screen up, and the difference is the point.
+    ``user`` on Windows is a ConfigError because the alternative is running
+    a job as the WRONG account, and ``push`` without a ``push:`` section is
+    one because the operator can add the section.  Neither applies here:
+    nothing can be installed on Linux to make an Event Log appear, so
+    refusing would mean one config directory cannot serve a mixed fleet,
+    which is precisely the complaint the Windows notes file against the
+    ``user``/``group`` rejection.  What keeps a warning honest rather than a
+    silent self-disable is that it fires on every load, names every hook
+    that asked, and is emitted by ``--validate-config`` too.
+    """
+    users = _eventlog_report_users(config)
+
+    def _blocks() -> Any:
+        for job in config.jobs:
+            for action in (
+                "onFailure",
+                "onPermanentFailure",
+                "onSuccess",
+                "onLate",
+            ):
+                block = getattr(job, action, None)
+                if isinstance(block, dict):
+                    yield job.name, (block.get("report") or {})
+        notify = config.notify_config
+        if notify is not None:
+            yield "notify", (notify.get("report") or {})
+
+    for where, report in _blocks():
+        eventlog = report.get("eventlog") or {}
+        if not eventlog.get("enabled"):
+            continue
+        source = eventlog.get("source") or ""
+        if not source or "\\" in source or "/" in source:
+            raise ConfigError(
+                "{}: report.eventlog.source must be a non-empty name with "
+                "no path separator (it names a registry key under the "
+                "event log, not a path); got {!r}".format(where, source)
+            )
+        if source.lower() in _EVENTLOG_RESERVED_SOURCES:
+            raise ConfigError(
+                "{}: report.eventlog.source {!r} is the name of a LOG, not "
+                "of a source within one; choose a source name such as "
+                "'cronstable'".format(where, source)
+            )
+
+    if users and not platform.IS_WINDOWS:
+        logger.warning(
+            "report.eventlog is enabled (%s) but there is no Windows Event "
+            "Log on this platform, so those reports are dropped; the rest "
+            "of each report block still fires normally",
+            ", ".join(sorted(users)),
+        )
+
+
 def _validate_push_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for push that need the fully assembled config.
 
@@ -4347,6 +4496,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_dags(config)
     _validate_mcp_config(config)
     _validate_push_config(config)
+    _validate_eventlog_config(config)
 
 
 def _validate_dags(config: CronstableConfig) -> None:

@@ -30,6 +30,7 @@
 - **Integrations**
   - [Reporting (Mail, Sentry, Shell, Webhook)](Reporting)
   - [Push Notifications](Push-Notifications)
+  - [Windows Event Log](Windows-Event-Log)
   - [Metrics with Prometheus](Metrics-with-Prometheus)
   - [Metrics with statsd](Metrics-with-Statsd)
   - [HTTP Control API](HTTP-API)

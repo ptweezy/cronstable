@@ -560,7 +560,7 @@ See [Failure Detection and Retries](Failure-Detection-and-Retries).
 ### Retries and reporting hooks
 
 Three lifecycle hooks each carry a `report` block (mail, sentry, shell,
-webhook, push); `onFailure` also carries a `retry` block. The `report`
+webhook, push, eventlog); `onFailure` also carries a `retry` block. The `report`
 blocks all share the same `_report_schema` and the same `_REPORT_DEFAULTS`
 (deep-copied so the three blocks do not alias one another).
 
@@ -570,7 +570,7 @@ blocks all share the same `_report_schema` and the same `_REPORT_DEFAULTS`
 | `onFailure.retry.initialDelay` | `Float` | `1` | Seconds before the first retry. Must be `>= 0`. |
 | `onFailure.retry.maximumDelay` | `Float` | `300` | Upper bound on the backoff delay. Must be `> 0`. |
 | `onFailure.retry.backoffMultiplier` | `Float` | `2` | Multiplier applied to the delay between retries (exponential backoff). Must be `> 0`. |
-| `onFailure.report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`/`push`) | defaults below | Reporters fired on every detected failure (including each failed attempt). |
+| `onFailure.report` | `_report_schema` (`mail`/`sentry`/`shell`/`webhook`/`push`/`eventlog`) | defaults below | Reporters fired on every detected failure (including each failed attempt). |
 | `onPermanentFailure.report` | `_report_schema` | defaults below | Reporters fired only after all retries are exhausted. |
 | `onSuccess.report` | `_report_schema` | defaults below | Reporters fired on a successful run. |
 
@@ -649,6 +649,19 @@ daemon-global [`push:` section](#push) (relay + device registry) and the
 | `enabled` | `Bool` | `false` | Opt this job/event into the push channel. |
 | `priority` | `Enum` of `time-sensitive` / `passive` | `time-sensitive` | Relayed to APNs as the interruption level: `time-sensitive` breaks through scheduled summaries, `passive` does not. |
 | `includeLogTail` | `Bool` | `true` | Carry the last captured output lines inside the sealed payload (trimmed oldest-first to fit the APNs size cap). |
+
+#### `report.eventlog`
+
+Windows Event Log records, and a no-op on every other platform (the load
+warns once, naming each hook that enabled it). Needs no extra and no
+dependency. See [Windows Event Log](Windows-Event-Log) for the event-ID and
+insertion-string tables.
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | `Bool` | `false` | Write Event Log records for this hook. |
+| `source` | `Str` | `cronstable` | Event source name. Refused when empty, when it contains `\` or `/`, or when it is one of the log names `Application`, `System` or `Security`; the check applies only to enabled blocks. |
+| `includeOutput` | `Bool` | `false` | Carry a bounded output tail as the last insertion string. Off by default because the Application log is readable by every local account. |
 
 ### SLA monitoring and the `onLate` hook
 
