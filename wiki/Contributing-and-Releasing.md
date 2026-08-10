@@ -34,22 +34,31 @@ The `dev` optional-dependency group (`pyproject.toml`) and the equivalent `requi
 
 ## Running the checks
 
-All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py310, py311, py312, py313, py314, lint, mypy, bandit`.
+All CI checks are driven by `tox` (`tox.ini`). The default `envlist` is `py3{10,11,12,13,14}-{windows,posix}, lint, mypy, bandit, openapi`.
 
 ```sh
-tox            # all envs: py310-py314, lint, mypy, bandit
-tox -e lint    # ruff check + ruff format --check
-tox -e mypy    # mypy
-tox -e bandit  # bandit security lint (medium+ severity)
-tox -e py      # pytest on the current interpreter
+tox                # all envs: py310-py314 in both OS arms, lint, mypy, bandit, openapi
+tox -e lint        # ruff check + ruff format --check
+tox -e mypy        # mypy
+tox -e bandit      # bandit security lint (medium+ severity)
+tox -e py          # pytest on the current interpreter, POSIX coverage profile
+tox -e py-windows  # Windows hosts: the Windows coverage profile explicitly
+tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
 ```
+
+Each interpreter row exists twice, once per OS coverage profile (see [Per-OS coverage profiles](#per-os-coverage-profiles) below), and `tox.ini`'s `platform` key makes the arm that does not match the running OS skip. A skip is a pass as long as the invocation also names an arm that does match; an invocation whose only env skips exits 1. So a bare `tox` measures the profile for the machine you are on, CI runs `tox -e py-windows,py-posix` on every runner, and naming the single wrong arm for your box fails: on Windows, `tox -e py-posix` prints `py-posix: skipped because platform win32 does not match (?!win32).*` followed by `evaluation failed :(`.
+
+An unfactored env such as `tox -e py` or `tox -e py312` still runs the whole suite, at the POSIX profile. On Windows, use a bare `tox` or `tox -e py-windows` instead: the POSIX profile hides the Windows branches you are editing and counts the POSIX ones you cannot run as missed, against the same `--cov-fail-under`.
 
 | Env | Installs package | What it runs |
 | --- | --- | --- |
-| `py313`, `py314` | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` |
+| `py313-posix`, `py314-windows`, ... | yes (`-rrequirements_dev.txt`, `PYTHONPATH={toxinidir}`) | `pytest --color=yes -vv` under coverage, gated at `--cov-fail-under={env:CRONSTABLE_COV_FLOOR}` |
 | `lint` | no (`skip_install = true`) | `ruff check cronstable` then `ruff format --check cronstable` |
 | `mypy` | yes | `mypy -p cronstable` |
 | `bandit` | no (`skip_install = true`) | `bandit -c pyproject.toml -r cronstable --severity-level=medium` |
+| `openapi` | no (`skip_install = true`) | `python .github/scripts/check_openapi.py` |
+
+The interpreter rows carry two environment variables the others do not. `CRONSTABLE_COVERAGE_SKIP` picks the coverage profile and `CRONSTABLE_COV_FLOOR` is the `--cov-fail-under` number, one per arm so the two cells can be ratcheted independently. The command line itself is deliberately not factor-conditional: a factored `commands` resolves to nothing in an unfactored env, so `tox -e py312` would build a venv, run no tests and report success.
 
 `tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and installs dependencies with uv automatically (much faster; behavior-identical). Force the legacy virtualenv+pip path with `tox --runner virtualenv` if ever needed.
 
@@ -63,10 +72,33 @@ The `lint` and `bandit` envs deliberately skip installing the package: ruff and 
 - **mypy**: `no_implicit_optional = true`, `warn_no_return = true`, `warn_return_any = true`, `strict_optional = true`.
 - **pytest**: `asyncio_mode = "auto"`, `testpaths = ["tests"]`.
 - **bandit**: `exclude_dirs = ["tests"]` and `skips = ["B104"]` (B104's only matches are non-bind wildcard-listen host constants in `config.py`). CI runs it at medium severity via `tox -e bandit`.
+- **coverage**: `source = ["cronstable"]`, `branch = true`, `omit = ["cronstable/version.py"]`, `show_missing = true`, plus the `exclude_lines` block described next.
+
+### Per-OS coverage profiles
+
+`# pragma: no cover` comes in three forms:
+
+| Form | Hidden on | Measured on |
+| --- | --- | --- |
+| `# pragma: no cover` | every OS | nowhere |
+| `# pragma: no cover (windows)` | POSIX | Windows |
+| `# pragma: no cover (posix)` | Windows | POSIX |
+
+The reason there is more than one is that a single vocabulary scored the wrong file on the Windows rows. Every Windows branch carried a bare pragma, so the code that actually ran on those cells was invisible to `--cov-fail-under`, while the POSIX code that can never run there stayed in the denominator and counted as missed. Retagging `cronstable/platform.py` moves it from 149 measured statements at 69% to 250 at 87% on a Windows run, and changes nothing on Linux.
+
+Use the bare form only for code that no CI row can reach: defensive branches, unreachable raises, the etcd/kubernetes network glue, and `tui.py`'s macOS branch (the matrix has no macOS row, so a third token would have no profile to be measured in).
+
+A branch guarded by `IS_WINDOWS` or `sys.platform == "win32"` takes a token where its clause genuinely cannot execute on the other OS, because it reaches for something that exists only there: `msvcrt`, `fcntl`, `grp`/`pwd`, `os.nice`, `os.killpg`, `ctypes.windll`. Where it does, the other side of the branch takes the other token. Not every platform branch qualifies, and the ones that do not stay untagged deliberately: much of `state.py`'s Windows handling is plain Python whose arms the tests drive from either box by monkeypatching `IS_WINDOWS`, so both are genuinely measured on both profiles and hiding either would remove real coverage. `tests/test_coverage_profiles.py` enforces the half that can be enforced, which is that a branch tagged on one side is tagged on the other.
+
+Three mechanics are worth knowing before writing one. Tagging an `if` header excludes that clause only, so an `else` needs its own tag, and a fall-through tail (code after the `if` block rather than inside an `else`) has no header to tag at all; `cronstable/platform.py` therefore spells its POSIX arms out as explicit `else` clauses. The token may sit anywhere after `cover`, so a site can keep the trailing prose that explains it. And the guard has to keep the spelling its tests drive: arms exercised from Linux by monkeypatching `platform.IS_WINDOWS` break if the guard is rewritten to `sys.platform == "win32"`, which no monkeypatch can reach, and the test then takes the POSIX arm for real.
+
+The profile is selected by `CRONSTABLE_COVERAGE_SKIP`, which names the platform whose branches **cannot** run in that environment: `posix` on a Windows run, `windows` on a POSIX one. `pyproject.toml` reads it through coverage's own `${VAR-default}` substitution, so there is one coverage configuration rather than two files to keep in step, and the default (`windows`) is the historical POSIX-shaped measurement that a bare `pytest --cov` or an IDE run has always reported. `tests/test_coverage_profiles.py` pins the vocabulary, both profiles and the tox wiring.
+
+One consequence to expect rather than diagnose: the merged Codecov number and the README badge will read lower once the profiles land, without anything regressing. The published figure is a union across two different exclusion sets now, so a `(windows)` line that no Windows test happens to hit is excluded from the POSIX reports and counted as missed in the merged view. `.github/codecov.yml` keeps `informational: true` on both the project and the patch status, so that drop annotates a PR and cannot fail one; the tox gate stays the only pass/fail.
 
 ### CI for every commit
 
-There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is a `tox-static` job (`tox -e lint,mypy,bandit`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**.
+There is **one** workflow, `.github/workflows/release.yml` (named `CI`), and it runs on every `push` (any branch) and every `pull_request`. On an ordinary commit it builds and tests the whole product in parallel and stops there; only a release (see below) proceeds to publish. The test half is a `tox-static` job (`tox -e lint,mypy,bandit,openapi`) on `ubuntu-latest`, plus a `tox` matrix running `tox -e py-windows,py-posix` (`fail-fast: false`) across `os` `[ubuntu-latest, windows-latest]` × Python `3.10`–`3.14`, with an experimental `ubuntu-latest`/`3.15` row (`continue-on-error`, never gates) and a `windows-11-arm`/`3.14` row for **Windows ARM64**. Both arms are named on every runner because the one that does not match the OS skips.
 
 Alongside the tests, the same run builds every release artifact at the computed version (all the PyInstaller binaries, the wheel + sdist) and does a **build-only pass over every Docker image** (the `docker` job — all 8 distros at their full published arch sets, no push), so a broken `Dockerfile` fails CI before a release. On an ordinary commit the version is the natural `setuptools_scm` dev version; no **software** is published, pushed, tagged, or signed. The lone exception is documentation: the `wiki` job publishes `wiki/` to the GitHub wiki whenever it changes on `develop` (see [Editing the wiki](#editing-the-wiki)). See [Production and Container Deployment](Production-Deployment).
 

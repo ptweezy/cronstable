@@ -374,7 +374,11 @@ jobs:
           set -euo pipefail
           pip install "$(grep -E '^playwright' requirements_dev.txt)"
           python -m playwright install --with-deps chromium
-      - run: tox -e py
+      # Both arms on every runner: the one that does not match the OS skips
+      # (a pass, no venv), so ubuntu-latest, windows-latest and
+      # windows-11-arm all take the same line and each measures the coverage
+      # profile for the OS it is on. See tox.ini's `platform` key.
+      - run: tox -e py-windows,py-posix
       # The differential self-skips wherever Chromium is missing (every other
       # cell, by design), so THIS cell must prove it actually ran: re-drive it
       # through the tox env's own interpreter (and therefore the env's own
@@ -390,12 +394,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
         run: |
           set -euo pipefail
-          .tox/py/bin/python -m pytest \
+          .tox/py-posix/bin/python -m pytest \
             tests/test_web_engine_parity.py \
             tests/test_web_heat_e2e.py \
             tests/test_web_drawer_e2e.py \
             -v -rs --junitxml=parity-enforce.xml
-          .tox/py/bin/python - <<'EOF'
+          .tox/py-posix/bin/python - <<'EOF'
           import xml.etree.ElementTree as ET
           totals = {"tests": 0, "failures": 0, "errors": 0, "skipped": 0}
           for suite in ET.parse("parity-enforce.xml").getroot().iter("testsuite"):

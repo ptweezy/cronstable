@@ -50,9 +50,9 @@ if TYPE_CHECKING:
 # guard so each OS pulls in only the module it has (``fcntl`` is Unix-only,
 # ``msvcrt`` Windows-only) and mypy, pinned to ``platform = linux``, checks
 # just the POSIX branch, exactly as the signal handling below is arranged.
-if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
+if sys.platform == "win32":  # pragma: no cover (windows)
     import msvcrt
-else:
+else:  # pragma: no cover (posix) - fcntl exists nowhere else
     import fcntl
 
 logger = logging.getLogger("cronstable")
@@ -132,9 +132,10 @@ def _windows_config_home(environ: Mapping[str, str]) -> str:
 
 
 def _default_config_path() -> str:
-    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
         return _windows_config_home(os.environ)
-    return "/etc/cronstable.d"
+    else:  # pragma: no cover (posix) - /etc has no Windows analogue
+        return "/etc/cronstable.d"
 
 
 #: The directory (or file) ``-c`` defaults to when not given on the command
@@ -163,9 +164,10 @@ def encode_argv(argv: list[str]) -> list[str | bytes]:
     rejects ``bytes`` (``subprocess`` would fail building the command line), so
     the strings are passed through unchanged.
     """
-    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
         return list(argv)
-    return [arg.encode() for arg in argv]
+    else:  # pragma: no cover (posix) - CreateProcessW rejects bytes
+        return [arg.encode() for arg in argv]
 
 
 # --- Subprocess process groups -------------------------------------------
@@ -471,29 +473,38 @@ async def kill_process_group(pid: int, *, force: bool) -> bool:
     it, which is why the stream drain is separately bounded rather than
     trusting this to always succeed.
     """
-    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+    # An explicit ``else`` rather than a fall-through tail, because a clause
+    # with a header is a clause the coverage profiles can tag and a tail has
+    # no header to tag.  The guard stays spelled ``IS_WINDOWS``: the tests
+    # drive the Windows arm from POSIX by monkeypatching that name, which a
+    # ``sys.platform`` comparison cannot express, and the gating mypy config
+    # is pinned to ``platform = linux`` where the POSIX arm type-checks
+    # either way.
+    if IS_WINDOWS:  # pragma: no cover (windows)
         if force:
             return await _taskkill_tree(pid)
         return await _windows_graceful_break(pid)
-    sig = signal.SIGKILL if force else signal.SIGTERM
-    try:
-        os.killpg(pid, sig)
-    except ProcessLookupError:
-        return False  # the whole group is already gone: nothing to signal
-    except OSError as ex:
-        logger.warning(
-            "could not signal the process group of pid %s (%s); "
-            "falling back to signalling that process alone",
-            pid,
-            ex,
-        )
-        return False
-    return True
+    else:  # pragma: no cover (posix) - POSIX signals
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            # the whole group is already gone: nothing to signal
+            return False
+        except OSError as ex:
+            logger.warning(
+                "could not signal the process group of pid %s (%s); "
+                "falling back to signalling that process alone",
+                pid,
+                ex,
+            )
+            return False
+        return True
 
 
 async def _windows_graceful_break(
     pid: int,
-) -> bool:  # pragma: no cover - Windows-only
+) -> bool:  # pragma: no cover (windows) - Windows-only
     """The graceful half of the Windows kill: CTRL_BREAK to ``pid``'s group.
 
     ``os.kill`` with ``CTRL_BREAK_EVENT`` calls ``GenerateConsoleCtrlEvent``,
@@ -519,7 +530,7 @@ async def _windows_graceful_break(
     return await _taskkill_tree(pid)
 
 
-async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover - Windows-only
+async def _taskkill_tree(pid: int) -> bool:  # pragma: no cover (windows)
     """Kill ``pid`` and its process tree via ``taskkill /F /T``."""
     import asyncio
 
@@ -571,7 +582,7 @@ def install_shutdown_handlers(
     turning them into the same graceful drain, bounded by the few seconds
     Windows grants before terminating the process regardless.
     """
-    if not IS_WINDOWS:
+    if not IS_WINDOWS:  # pragma: no cover (posix) - loop signal handlers
         sigs = (signal.SIGINT, signal.SIGTERM)
         for sig in sigs:
             loop.add_signal_handler(sig, callback)
@@ -585,12 +596,12 @@ def install_shutdown_handlers(
     # Windows path lives in its own helper so it is measured only where it can
     # run (like :func:`_taskkill_tree`); this delegation never executes on
     # POSIX, where the branch above has already returned.
-    return _install_windows_shutdown_handlers(  # pragma: no cover - Windows
+    return _install_windows_shutdown_handlers(  # pragma: no cover (windows)
         loop, callback
     )
 
 
-def _install_windows_shutdown_handlers(  # pragma: no cover - Windows-only
+def _install_windows_shutdown_handlers(  # pragma: no cover (windows)
     loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
 ) -> Callable[[], None]:
     """Windows fallback for :func:`install_shutdown_handlers`.
@@ -680,7 +691,7 @@ def _console_event_requests_shutdown(event: int) -> bool:
     )
 
 
-def _install_windows_console_handler(  # pragma: no cover - Windows-only
+def _install_windows_console_handler(  # pragma: no cover (windows)
     loop: asyncio.AbstractEventLoop, callback: Callable[[], None]
 ) -> Callable[[], None]:
     """Catch console close and OS shutdown and drain gracefully.
@@ -764,7 +775,7 @@ def os_boot_time() -> Optional[float]:
     (macOS/BSD): the caller then treats every daemon start as a fresh boot,
     which is the pre-dedupe behaviour.
     """
-    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
         try:
             import ctypes
 
@@ -775,12 +786,13 @@ def os_boot_time() -> Optional[float]:
         except Exception:  # noqa: BLE001 - any ctypes failure -> cannot tell
             return None
         return time.time() - uptime
-    try:
-        with open("/proc/uptime", encoding="ascii") as fobj:
-            uptime = float(fobj.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        return None
-    return time.time() - uptime
+    else:  # pragma: no cover (posix) - /proc/uptime
+        try:
+            with open("/proc/uptime", encoding="ascii") as fobj:
+                uptime = float(fobj.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+        return time.time() - uptime
 
 
 # --- Process liveness -------------------------------------------------------
@@ -799,7 +811,7 @@ def pid_alive(pid: int) -> Optional[bool]:
     """
     if pid <= 0:
         return None
-    if sys.platform == "win32":  # pragma: no cover - Windows-only path
+    if sys.platform == "win32":  # pragma: no cover (windows)
         try:
             import ctypes
 
@@ -821,17 +833,18 @@ def pid_alive(pid: int) -> Optional[bool]:
             return False
         except Exception:  # noqa: BLE001 - any ctypes failure -> cannot tell
             return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # exists, owned by someone else (should not happen for our own
-        # spawned jobs, but existence is what was asked).
+    else:  # pragma: no cover (posix) - signal 0 probe
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # exists, owned by someone else (should not happen for our own
+            # spawned jobs, but existence is what was asked).
+            return True
+        except OSError:
+            return None
         return True
-    except OSError:
-        return None
-    return True
 
 
 # --- Advisory exclusive file locking -------------------------------------
@@ -873,7 +886,7 @@ def exclusive_file_lock(
     skips a contended document rather than park the whole sweep behind one
     wedged holder.
     """
-    if sys.platform == "win32":  # pragma: no cover - Windows-only path
+    if sys.platform == "win32":  # pragma: no cover (windows)
         # msvcrt.locking locks ``nbytes`` from the current file position; lock
         # the first byte (the caller guarantees the lock file has one).
         # msvcrt has no true blocking mode: LK_LOCK retries internally about
@@ -901,7 +914,7 @@ def exclusive_file_lock(
         finally:
             os.lseek(fileno, 0, os.SEEK_SET)
             msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
-    else:
+    else:  # pragma: no cover (posix) - fcntl.flock
         flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
         fcntl.flock(fileno, flags)
         try:
@@ -933,7 +946,7 @@ def fsync_directory(path: str) -> None:
     vanished) is swallowed, because the data this guards is still correct
     without it, just not crash-durable for this one write.
     """
-    if IS_WINDOWS:  # pragma: no cover - Windows-only path
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
         try:
             import ctypes
             from ctypes import wintypes
@@ -980,13 +993,14 @@ def fsync_directory(path: str) -> None:
         except Exception:  # noqa: BLE001 - best-effort; never raise
             return
         return
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
+    else:  # pragma: no cover (posix) - fsync on a directory fd
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
