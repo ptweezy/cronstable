@@ -121,6 +121,32 @@ Windows fixes and additions. The first of many updates to address Windows first-
   is deliberately not offered, since a runaway job at that class outranks
   the threads servicing disk, keyboard and mouse. The level is part of the
   job-set id when it is set, and rides on `GET /jobs` the same way.
+- Ten endpoints that answered a `404` with aiohttp's own `404: Not Found`
+  now say what was not found. `GET /jobs/{name}`, its trends and its log
+  stream name the job, and the DAG task log stream names the DAG.
+  `/schedule/why` and `/jobs/{name}/calendar.ics` answer `no job or DAG
+  schedule named ...`, because both resolve a DAG's schedule as readily as
+  a job, so the older phrasing described a lookup neither route performs.
+  The MCP tool over the same lookup, `cron_why_no_run`, says the same thing
+  and now points at `cron_list_dags` alongside `cron_list_jobs`.
+  On the loopback endpoint jobs use for durable state, the four `get`
+  routes name the missing key, cursor, artifact or secret, and the scoped
+  three name the scope they looked in, which is the calling job's own name
+  unless the request passed one. That endpoint also gained the error
+  envelope the web API already had, so its `401`, the router's `404` and
+  `405`, an oversized body's `413` and an unexpected `500` now arrive as
+  `{"error": "..."}` rather than plain text a client has to sniff for.
+  A DAG's run and XCom routes no longer report every DAG as nonexistent on
+  a daemon with no `state:` section: run documents only live in a durable
+  store, and the `404` now says which of the two it was.
+  The published claim is scoped to match what these two applications serve:
+  a request that fails before it reaches one, meaning a malformed request
+  line, an unparseable method token, request headers past 8190 bytes or an
+  unrecognised `Expect:`, is answered by the HTTP server itself as plain
+  text, and the cluster peer transport is a separate mTLS listener that
+  answers its own bodyless `4xx`. The wiki and the OpenAPI spec now say
+  that, and every `4xx` and `5xx` in the spec declares the envelope as its
+  response body.
 
 ## 1.2.38
 

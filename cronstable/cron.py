@@ -556,10 +556,17 @@ def _strip_content_type(headers: Optional[Any]) -> dict[str, str]:
 def _error_body(message: str) -> str:
     """The web API's ONE error envelope: a JSON object ``{"error": msg}``.
 
-    Every 4xx/5xx body this origin serves carries it (via :func:`_api_error`,
-    ``_json_response({"error": ...})``, or :func:`_error_envelope_middleware`
-    for anything that would escape as text/plain), matching the jobapi and
-    MCP surfaces, so a client parses failures one way.
+    Every 4xx/5xx body this origin's application serves carries it, matching
+    the jobapi and MCP surfaces, so a client parses failures one way.  A
+    handler builds its own through :func:`_api_error` or
+    ``_json_response({"error": ...})``, so the reason is a sentence the
+    caller can act on rather than aiohttp's ``"404: Not Found"``;
+    :func:`_error_envelope_middleware` is the BACKSTOP, not an equal third
+    route, and what legitimately reaches it is the deliberately reasonless
+    401s, the router's own 404/405, and a transport 413 from a chunked body
+    past aiohttp's ``client_max_size``.  A handler that raises a bare
+    ``web.HTTP*``, or returns one, is a defect, pinned by
+    ``tests/_helpers.py:bare_http_raises``.
     """
     return json.dumps({"error": message})
 
@@ -627,10 +634,32 @@ def _maps_action_errors(
 async def _error_envelope_middleware(request, handler):
     """Give every escaping HTTP error the one JSON envelope.
 
-    Installed outermost so it catches errors that would escape as aiohttp's
-    text/plain defaults (bare raises, the auth middleware's 401s, the
-    router's 404/405). Errors already carrying the envelope pass through;
-    headers the error legitimately owns (a 405's ``Allow``) are preserved.
+    Installed outermost, as the BACKSTOP under the handlers: each builds its
+    own envelope through :func:`_api_error` so the reason names what went
+    wrong, and what legitimately arrives here is the deliberately reasonless
+    401s, the router's own 404/405, and a transport 413 (``/mcp`` reads its
+    body after a ``content_length`` pre-check a chunked request has no
+    length for, so aiohttp's own ``client_max_size`` failure escapes the
+    handler; pinned by tests/test_cron_web.py's
+    ``test_chunked_oversized_mcp_body_413s_with_the_envelope``). Errors
+    already carrying the envelope pass through; headers the error
+    legitimately owns (a 405's ``Allow``) are preserved.
+
+    What it cannot reach: a transport-level failure (a malformed request
+    line, an unparseable method token, oversized request headers, a failed
+    ``Expect:``) is answered by aiohttp's own ``RequestHandler.handle_error``
+    as text/plain and never enters the middleware chain, so the published
+    claim is scoped to what the application serves (wiki/HTTP-API.md).  The
+    cluster peer transport is a second aiohttp ``Application`` on its own
+    mTLS listener (cronstable/cluster.py) and is outside this contract too;
+    it answers its own bodyless 4xx.
+
+    ``JobStateAPI._middlewares`` (cronstable/jobapi.py) carries a local twin
+    of the ``web.HTTPException`` arm below; that module deliberately does not
+    import cron. Change one, change the other.  The pairing is that arm
+    only: the two modules' body readers deliberately differ on 413, since
+    :meth:`Cron._web_json_body` masks it as a 400 "not valid JSON" while
+    ``JobStateAPI._json_body`` re-raises it unmasked.
 
     Marked new-style below rather than with ``@web.middleware`` here.  The
     decorator reads an attribute off the lazy aiohttp door above while this
@@ -3708,7 +3737,16 @@ class Cron:
                 headers=headers,
             )
         if payload is None:
-            raise web.HTTPNotFound()
+            # the lookup is _job_or_dag_schedule, so a DAG's synthetic
+            # dag:<name> schedule job is a legitimate 200 here; say what
+            # was actually searched. No headers, matching the action
+            # routes' 404s (see _action_http_error: web.headers ride a 409
+            # body, not a 404). The 400s above take them because they are
+            # handler-built payloads, not aiohttp error responses.
+            raise _api_error(
+                web.HTTPNotFound,
+                "no job or DAG schedule named {!r}".format(name),
+            )
         return _json_response(payload, headers=headers)
 
     def _schedule_entries(self) -> list[ScheduleEntry]:
@@ -3987,7 +4025,16 @@ class Cron:
         # builders
         entries = self._calendar_entries(name)
         if entries is None:
-            raise web.HTTPNotFound()
+            # Only the per-job feed reaches this: _calendar_entries(None)
+            # builds a list from the fleet snapshot and never returns
+            # None, so `name` is a real path segment here even though
+            # mypy sees Optional[str]. The lookup is _job_or_dag_schedule,
+            # so /jobs/dag:mydag/calendar.ics is a legitimate 200 and the
+            # reason must not claim a job was the only thing searched.
+            raise _api_error(
+                web.HTTPNotFound,
+                "no job or DAG schedule named {!r}".format(name),
+            )
         text = await asyncio.get_running_loop().run_in_executor(
             None,
             partial(
@@ -5304,9 +5351,12 @@ class Cron:
         client can refresh one job without pulling the fleet. 404 for an
         unknown job.
         """
-        payload = self.job_detail_payload(request.match_info["name"])
+        name = request.match_info["name"]
+        payload = self.job_detail_payload(name)
         if payload is None:
-            raise web.HTTPNotFound()
+            raise _api_error(
+                web.HTTPNotFound, "job {!r} not found".format(name)
+            )
         return _json_response(payload, headers=self._web_headers())
 
     # --- DAG introspection + control --------------------------------------
@@ -5344,13 +5394,34 @@ class Cron:
             headers=self._web_headers(),
         )
 
+    def _dag_run_lookup_reason(
+        self, name: str, run_key: Optional[str] = None
+    ) -> str:
+        """Why a DAG run lookup came back empty.
+
+        ``DagRunStore`` answers a plain ``None`` whether the DAG is unknown
+        or no ``state:`` store is configured at all (``backend is None or
+        dag_name not in self._dags()``, dagrun.py), so reporting "dag not
+        found" for both would tell an operator with no ``state:`` section
+        that every DAG they configured does not exist.  Run documents only
+        live in a durable store, so say that instead.
+        """
+        if self.state_backend is None:
+            return (
+                "no `state:` store is configured; DAG run documents only "
+                "exist in a durable store"
+            )
+        if run_key is not None and name in self.cron_dags:
+            return "dag {!r} has no run {!r}".format(name, run_key)
+        return "dag {!r} not found".format(name)
+
     async def _web_dag_runs(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
         limit = self._web_int_query(request, "limit", default=50, lo=1, hi=500)
         runs = await self._dag.list_runs(name, limit=limit)
         if runs is None:
             raise _api_error(
-                web.HTTPNotFound, "dag {!r} not found".format(name)
+                web.HTTPNotFound, self._dag_run_lookup_reason(name)
             )
         # the subject rides under "name" too, the key the job runs payload
         # uses, so generic clients can read both runs endpoints one way
@@ -5366,7 +5437,7 @@ class Cron:
         if body is None:
             raise _api_error(
                 web.HTTPNotFound,
-                "dag {!r} has no run {!r}".format(name, run_key),
+                self._dag_run_lookup_reason(name, run_key),
             )
         return _json_response(body, headers=self._web_headers())
 
@@ -5377,7 +5448,7 @@ class Cron:
         if result is None:
             raise _api_error(
                 web.HTTPNotFound,
-                "dag {!r} has no run {!r}".format(name, run_key),
+                self._dag_run_lookup_reason(name, run_key),
             )
         return _json_response(result, headers=self._web_headers())
 
@@ -5842,7 +5913,11 @@ class Cron:
         name = request.match_info["name"]
         payload = await self.job_trends_payload(name)
         if payload is None:
-            raise web.HTTPNotFound()
+            # job_trends_payload returns None only for an unknown job; a
+            # store that cannot answer degrades to `source: memory`.
+            raise _api_error(
+                web.HTTPNotFound, "job {!r} not found".format(name)
+            )
         return _json_response(payload, headers=self._web_headers())
 
     async def job_trends_payload(self, name: str) -> Optional[dict[str, Any]]:
@@ -6167,7 +6242,11 @@ class Cron:
     async def _web_job_logs(self, request: web.Request) -> web.StreamResponse:
         name = request.match_info["name"]
         if name not in self.cron_jobs:
-            raise web.HTTPNotFound()
+            # raised before prepare() below, so nothing has been written
+            # and an error response is still legal on this SSE route.
+            raise _api_error(
+                web.HTTPNotFound, "job {!r} not found".format(name)
+            )
 
         resp = web.StreamResponse(headers=self._sse_headers())
         await resp.prepare(request)
@@ -6192,7 +6271,10 @@ class Cron:
         run_key = request.match_info["run_key"]
         taskkey = request.match_info["taskkey"]
         if name not in self.cron_dags:
-            raise web.HTTPNotFound()
+            # before prepare(), as in _web_job_logs above.
+            raise _api_error(
+                web.HTTPNotFound, "dag {!r} not found".format(name)
+            )
 
         resp = web.StreamResponse(headers=self._sse_headers())
         await resp.prepare(request)
@@ -7712,8 +7794,21 @@ class Cron:
                 if request.path.endswith("/calendar.ics"):
                     presented = request.query.get("token", "")
                 else:
+                    # Deliberately reasonless, and the ONE class the
+                    # bare-raise guard allowlists (see
+                    # tests/_helpers.py:bare_http_raises). A 401 that
+                    # distinguished "no header" from "wrong scheme"
+                    # from "unknown token" would confirm to an
+                    # unauthenticated caller which half of a guess was
+                    # right, turning the endpoint into an oracle it can
+                    # enumerate against. The envelope backstop still gives
+                    # the body its JSON shape, so a client parses this
+                    # failure like every other one; only the reason is
+                    # withheld. The same rule holds at the three sites in
+                    # JobStateAPI._run (jobapi.py).
                     raise web.HTTPUnauthorized()
             if not presented:
+                # reasonless by design: see the 401 note above.
                 raise web.HTTPUnauthorized()
             try:
                 # compare as bytes: compare_digest raises TypeError on any
@@ -7722,6 +7817,7 @@ class Cron:
                 # from raw header bytes) can never match a real token.
                 presented_bytes = presented.encode("utf-8")
             except UnicodeEncodeError:
+                # reasonless by design: see the 401 note above.
                 raise web.HTTPUnauthorized() from None
             # Match against every configured token in constant time, with no
             # early return, so timing does not reveal which token (if any)
@@ -7732,6 +7828,7 @@ class Cron:
                 if hmac.compare_digest(presented_bytes, entry.token_bytes):
                     matched = entry
             if matched is None:
+                # reasonless by design: see the 401 note above.
                 raise web.HTTPUnauthorized()
             # Full-scope tokens skip the per-route scope lookup. A scoped
             # token lacking the route's required scope is 403, distinct

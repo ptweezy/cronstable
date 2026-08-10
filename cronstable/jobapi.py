@@ -675,8 +675,44 @@ class JobStateAPI:
         async def error_mw(request: web.Request, handler: Any) -> Any:
             try:
                 return await handler(request)
-            except web.HTTPException:
-                raise
+            except web.HTTPException as ex:
+                # No route in this module can reach either disjunct today:
+                # nothing here redirects, and the bare-raise guard
+                # (tests/_helpers.py) forbids naming a web.HTTP* class
+                # outside the reasonless 401. Kept so the arm stays
+                # diff-identical with its cron.py twin, and pinned by
+                # test_job_api_error_mw_passes_through_non_rewrap_cases
+                # rather than left as an uncovered line.
+                if ex.status < 400 or ex.content_type == "application/json":
+                    raise
+                # The local twin of cron._error_envelope_middleware's
+                # HTTPException arm, spelled here because this module
+                # deliberately does not import cron (see _json_response
+                # above). Change one, change the other. The pairing is
+                # this arm only: the two modules' body readers
+                # deliberately differ on 413, since Cron._web_json_body
+                # masks it as a 400 "not valid JSON" while _json_body
+                # below re-raises it unmasked.
+                #
+                # What lands here: the deliberately reasonless 401s from
+                # _run, the router's own 404 on an unrouted /v1 path and
+                # 405 on a wrong method, and the transport 413 that
+                # _json_body re-raises unmasked. aiohttp answers each as
+                # text/plain, which is the one shape a job's client cannot
+                # parse like the rest. Rewrap, keeping headers the error
+                # owns (a 405's Allow) and dropping only the pair that
+                # describes the body being replaced.
+                headers = {
+                    key: value
+                    for key, value in dict(ex.headers).items()
+                    if key.lower() not in ("content-type", "content-length")
+                }
+                return web.Response(
+                    text=json.dumps({"error": ex.text or ex.reason}),
+                    status=ex.status,
+                    headers=headers,
+                    content_type="application/json",
+                )
             except JobStateError as ex:
                 return _json_response({"error": str(ex)}, status=ex.status)
             except _json.UnsupportedValue as ex:
@@ -716,6 +752,25 @@ class JobStateAPI:
                     status=503,
                     trusted=True,
                 )
+            except Exception:  # noqa: BLE001 - the envelope's last arm
+                # Without this the 500 was the one status a job's client
+                # could not parse like the rest: an unhandled error escaped
+                # to aiohttp's own handler, which answers text/plain. The
+                # message is fixed and the reason goes to the log, the same
+                # no-leak rule the backend arm above follows. Mirrors
+                # cron._error_envelope_middleware's last arm.
+                logger.exception(
+                    "state job API: internal error serving %s",
+                    request.rel_url.path,
+                )
+                return _json_response(
+                    {
+                        "error": "internal error; the reason is in the "
+                        "cronstable log"
+                    },
+                    status=500,
+                    trusted=True,
+                )
 
         return [error_mw]
 
@@ -730,6 +785,12 @@ class JobStateAPI:
         header = request.headers.get("Authorization", "")
         scheme, _, presented = header.partition(" ")
         if scheme.lower() != "bearer" or not presented:
+            # Deliberately reasonless, and the ONE class the bare-raise
+            # guard allowlists (tests/_helpers.py). A 401 that said which
+            # half of a guess was wrong would let an unauthenticated caller
+            # enumerate against it; error_mw still gives the body the JSON
+            # envelope, so only the reason is withheld. Same rule as
+            # cron.py's auth_middleware.
             raise web.HTTPUnauthorized()
         try:
             # compare as bytes: compare_digest raises TypeError on any
@@ -738,10 +799,12 @@ class JobStateAPI:
             # header bytes) can never match a real token.
             presented_bytes = presented.encode("utf-8")
         except UnicodeEncodeError:
+            # reasonless by design: see the 401 note above.
             raise web.HTTPUnauthorized() from None
         for ctx in self._runs.values():
             if hmac.compare_digest(presented_bytes, ctx.token_bytes):
                 return ctx
+        # reasonless by design: see the 401 note above.
         raise web.HTTPUnauthorized()
 
     def _routes(self) -> list[Any]:
@@ -845,7 +908,10 @@ class JobStateAPI:
         key = self._require(request.query.get("key"), "key")
         body = await jobstate.kv_get(self._backend(), scope, key)
         if body is None:
-            raise web.HTTPNotFound()
+            raise JobStateError(
+                "key {!r} is not set in scope {!r}".format(key, scope),
+                status=404,
+            )
         return _json_response(
             {"value": body.get("value"), "updatedAt": body.get("updatedAt")}
         )
@@ -900,7 +966,10 @@ class JobStateAPI:
         name = self._require(request.query.get("name"), "name")
         body = await jobstate.cursor_get(self._backend(), scope, name)
         if body is None:
-            raise web.HTTPNotFound()
+            raise JobStateError(
+                "cursor {!r} is not set in scope {!r}".format(name, scope),
+                status=404,
+            )
         return _json_response(
             {"value": body.get("value"), "updatedAt": body.get("updatedAt")}
         )
@@ -978,7 +1047,13 @@ class JobStateAPI:
         name = self._require(request.query.get("name"), "name")
         got = await jobstate.artifact_get(self._backend(), scope, name)
         if got is None:
-            raise web.HTTPNotFound()
+            # naming the scope is the useful half: it defaults to the
+            # run's own job name, so a caller who omitted it and looked in
+            # the wrong namespace otherwise has nothing to go on.
+            raise JobStateError(
+                "artifact {!r} not found in scope {!r}".format(name, scope),
+                status=404,
+            )
         record, data = got
         return web.Response(
             body=data,
@@ -1058,7 +1133,13 @@ class JobStateAPI:
         ctx = self._run(request)
         name = self._require(request.query.get("name"), "name")
         if name not in ctx.secrets:
-            raise web.HTTPNotFound()
+            # naming it leaks nothing: the caller supplied the name, and
+            # the status already says it is not staged. The VALUE is what
+            # this endpoint guards.
+            raise JobStateError(
+                "secret {!r} is not staged for this run".format(name),
+                status=404,
+            )
         return _json_response({"value": ctx.secrets[name]})
 
     async def _h_secret_list(self, request: web.Request) -> web.Response:
