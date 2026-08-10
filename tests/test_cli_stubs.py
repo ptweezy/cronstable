@@ -31,6 +31,7 @@ def test_building_cli_does_not_import_tui(monkeypatch):
         "cronstable.mcpcli",
         "cronstable.jobcli",
         "cronstable.winservice",
+        "cronstable.taskxml",
     )
     for name in heavy:
         monkeypatch.delitem(sys.modules, name, raising=False)
@@ -92,7 +93,7 @@ def test_entry_point_module_does_not_import_heavy_surfaces():
         "import sys, cronstable.__main__; "
         "print(sorted(m for m in sys.modules if m in ("
         "'cronstable.tui', 'cronstable.mcpcli', 'cronstable.jobcli', "
-        "'cronstable.winservice')))"
+        "'cronstable.winservice', 'cronstable.taskxml')))"
     )
     assert _probe(probe) == "[]"
 

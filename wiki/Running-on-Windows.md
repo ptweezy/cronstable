@@ -768,6 +768,7 @@ dashboard (which enables VT mode on the Windows console and reads keys via
 `msvcrt`) all work as documented elsewhere in this wiki:
 
 - [Classic Crontabs](Classic-Crontabs)
+- [Importing from Task Scheduler](Importing-Task-Scheduler)
 - [Schedules and Timezones](Schedules-and-Timezones)
 - [Commands and Environment](Commands-and-Environment)
 - [Output Capturing](Output-Capturing)

@@ -20,6 +20,7 @@ cronstable xcom push|pull|list ...
 cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
 cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
 cronstable service install|remove|start|stop|status|run [options]
+cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
 ```
 
 Without a subcommand, `cronstable` is the scheduler daemon described below. With
@@ -478,6 +479,33 @@ cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [--theme NAME]
 running daemon's web listener (`--url`, default `http://127.0.0.1:8080`). It
 requires an interactive terminal. Every option, key, and panel is documented
 on the [Terminal Dashboard](Terminal-Dashboard) page.
+
+## The `import-taskscheduler` subcommand
+
+```
+cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
+```
+
+Converts Windows Task Scheduler XML exports into cronstable jobs and exits.
+`PATH` may be an export file, a directory of `*.xml`, or `-` for standard
+input. The configuration goes to stdout or `-o`; a report of everything that
+could not be carried across goes to stderr, so the two separate cleanly:
+
+```shell
+schtasks /query /XML ONE > tasks.xml
+cronstable import-taskscheduler tasks.xml -o jobs.yaml 2> report.txt
+cronstable -v -c jobs.yaml
+```
+
+Exit `0` when something converted, `1` when the input could not be read or
+nothing usable came out, `2` for a usage error. It runs on any platform, not
+only Windows.
+
+Review the output before loading it: exporting a task does not unregister it.
+Expect a whole-machine export to convert only in part, since most registered
+tasks on a stock Windows install are COM-handler or event-driven internals.
+[Importing from Task Scheduler](Importing-Task-Scheduler) has the full
+mapping table and the reason behind every refusal.
 
 ## The `service` subcommand
 
