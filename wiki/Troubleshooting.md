@@ -284,11 +284,11 @@ such as `failsWhen=nonzeroReturn and retcode=<n>` or
 | `always`        | Bool | `false` | The job is always considered failed when it exits   |
 
 A job whose command cannot be launched at all is reported as an ordinary failure with
-exit code `127`, not an internal error. Two things produce it: the executable does not
-exist, or the job's `workingDirectory` does not exist. The second is the harder one to
-read off a log, because the directory reaches the message only through the `kwargs=`
-repr of the spawn line, and on Windows the OS error there (`WinError 267`) names no
-path of its own. See [workingDirectory](Commands-and-Environment#workingdirectory).
+exit code `127`, not an internal error. Either the executable does not exist, or the
+job's `workingDirectory` does not. The missing directory is the harder one to read off
+a log: it reaches the message only through the `kwargs=` repr of the spawn line, and on
+Windows the OS error there (`WinError 267`) names no path of its own. See
+[workingDirectory](Commands-and-Environment#workingdirectory).
 Note `producesStderr`/`producesStdout` only apply when the corresponding stream is
 captured, and they also fire when output was *discarded* (`saveLimit: 0` still counts
 discarded lines as output).
@@ -302,23 +302,23 @@ defaults above. See [Failure Detection and Retries](Failure-Detection-and-Retrie
 
 **Symptom.** The config says `priority: high` (or `above-normal`), but `top` or
 `ps -o ni` shows the job at the same nice value as everything else. Nothing is
-logged, and the run is reported as a success.
+logged, and cronstable reports the run as a success.
 
 **Cause.** Lowering a nice value is a raise in priority, and raising a priority
-needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom. A kernel that refuses is not a
-job failure: the run goes on at the priority it inherited, deliberately, so an
-unprivileged host does not turn a minutely job into some 1,440 warnings a day
-about a condition that will not change until the deployment does. Note "raise"
-is relative to cronstable's own nice, so on a daemon started at nice 15 even
-`below-normal` (nice 10) is a raise.
+needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom. A kernel that refuses does not
+fail the job: the run goes on at the priority it inherited. That is deliberate,
+so an unprivileged host does not turn a minutely job into some 1,440 warnings a day
+about a condition that will not change until the deployment does. Note
+"raise" is relative to cronstable's own nice, so on a daemon started at nice 15
+even `below-normal` (nice 10) is a raise.
 
 **Fix.** Look for the one-shot config-load `WARNING` naming the job, which is
-where cronstable reports the ask it may not be able to meet. To see the refusal
-itself, run at `DEBUG`: `platform.apply_priority` logs one line per refused
-renice naming the level, the pid and the errno. To grant the headroom, give the
-daemon `CAP_SYS_NICE` (`AmbientCapabilities=CAP_SYS_NICE` in a systemd unit) or
-raise its `RLIMIT_NICE`. On Windows every class in the vocabulary is available
-to an unprivileged account, so nothing is refused there. See
+where cronstable flags a priority it may not be able to apply. To see the
+refusal itself, run at `DEBUG`: `platform.apply_priority` logs one line per
+refused renice naming the level, the pid and the errno. To grant the headroom,
+give the daemon `CAP_SYS_NICE` (`AmbientCapabilities=CAP_SYS_NICE` in a systemd
+unit) or raise its `RLIMIT_NICE`. On Windows an unprivileged account can set
+every class in the vocabulary, so nothing is refused there. See
 [priority](Commands-and-Environment#priority).
 
 ### A Windows job's `high` priority does not reach the programs it launches
@@ -327,17 +327,17 @@ to an unprivileged account, so nothing is refused there. See
 cmd.exe at High in Task Manager, but the program it actually runs sits at
 Normal.
 
-**Cause.** `CreateProcess` gives a child with no priority-class flag of its own
-the creator's class only when the creator is idle or below-normal, and NORMAL
-otherwise. cronstable sets the class on the job's own process, and cmd.exe
-launches its programs with no class flag, so a raised class stops at cmd.exe.
-Lowered classes (`idle`, `below-normal`) do carry down the whole tree, which is
-the same rule seen from the other side.
+**Cause.** When a child carries no priority-class flag of its own,
+`CreateProcess` gives it the creator's class only if the creator is idle or
+below-normal, and NORMAL otherwise. cronstable sets the class on the job's own
+process, and cmd.exe launches its programs with no class flag, so a raised
+class stops at cmd.exe. By that same rule, lowered classes (`idle`,
+`below-normal`) do carry down the whole tree.
 
 **Fix.** Name the program that needs the priority as the job's `command`
-instead of wrapping it in a `.cmd`, so cronstable creates it directly. There is
-no POSIX equivalent of this: `setpriority(PRIO_PGRP)` covers the group and a
-later fork inherits the nice value. See
+instead of wrapping it in a `.cmd`, so cronstable creates it directly. POSIX
+has no equivalent split: `setpriority(PRIO_PGRP)` covers the group and a later
+fork inherits the nice value. See
 [Process priority](Running-on-Windows#process-priority).
 
 ### stderr capture vs. routing
@@ -655,8 +655,8 @@ on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 | `127`  | Command could not be launched (executable or `workingDirectory` not found) |
 | `-100` | Job cancelled because it exceeded `executionTimeout`                       |
 
-A missing `workingDirectory` reports the same `127` as a missing executable, and
-the directory it tried appears only inside the `kwargs=` repr of the spawn log
+A missing `workingDirectory` gets the same `127` as a missing executable, and
+the path it tried shows up only inside the `kwargs=` repr of the spawn log
 line. See [workingDirectory](Commands-and-Environment#workingdirectory).
 
 Two Windows codes worth recognizing in run history: `1` is what

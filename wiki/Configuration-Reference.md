@@ -362,7 +362,7 @@ separate, client-local feature, unrelated to this store.)
 | `path` | `Str` | required | Directory the store lives in. A local path gives single-node durability; a shared Amazon EFS (NFSv4) / S3 Files mount gives the same durability fleet-wide. Must be non-empty: a blank or whitespace-only value is a `ConfigError` at load (`state.path is required and must be non-empty`). |
 | `topology` | `Enum(["auto", "single-node", "shared"])` | `auto` | Whether the store may offer cross-node coordination. `auto` probes `/proc/mounts` for a shared network mount (NFS/EFS/S3 Files) and otherwise assumes `single-node`; Windows and macOS cannot probe, so there `auto` resolves to `single-node` unless overridden with `shared`. |
 | `deploymentId` | `Str` | none (namespace `default`) | Stable namespace prefix so several deployments can share one store/bucket without colliding or cross-reading. Unset means the `default` namespace. |
-| `maxRunsPerJob` | `Int` | `1000` | Durable finished-run retention per job (the durable analogue of the in-memory history ring); the ledger is pruned to this after each append. `<= 0` disables pruning (unbounded; rely on an external lifecycle rule). Durable retention is larger than the in-memory window on purpose. `1` is raised to `2` and the adjustment is logged once at startup, because the prune keeps the newest records by write order and a retention of one can leave the older run of an inverted pair; see [Durable State](Durable-State#operational-notes). |
+| `maxRunsPerJob` | `Int` | `1000` | Durable finished-run retention per job (the durable analogue of the in-memory history ring); the ledger is pruned to this after each append. `<= 0` disables pruning (unbounded; rely on an external lifecycle rule). Durable retention is larger than the in-memory window on purpose. cronstable raises `1` to `2` and logs the adjustment once at startup, because the prune keeps the newest records by write order and a retention of one can leave the older run of an inverted pair; see [Durable State](Durable-State#operational-notes). |
 | `onStoreUnavailable` | `Enum(["degrade", "fail-closed"])` | `degrade` | What the stateful features do while the store is configured but unavailable (down, unreadable, hung). `degrade`: durable-truth gates fail open to the in-memory state and failed writes are dropped with a warning (counted in `cronstable_state_dropped_writes_total`). `fail-closed`: prefer not running over possibly running wrong -- the `onlyIfLastSucceeded` gate blocks, a due durable retry defers until the store answers, and an unverifiable `@reboot` boot marker skips the boot run. Plain scheduled fires are **never** gated on the store under either policy. |
 | `gcGraceSeconds` | `Int` | `604800` (7 days) | Age past which durable state belonging to a job that no recent manifest references (no node's loaded config under this `deploymentId` has mentioned it for this long) is garbage collected. `<= 0` disables automatic GC. Values between `1` and `86399` are a `ConfigError` at load: a grace below the manifest cadence would make live peers' manifests look stale and collect their state. |
 | `maxOpsPerSecond` | `Int` or `Float` | `0` | Token-bucket cap on store operations per second (burst of one second's tokens), for request-rate/cost control on mounts that bill per request; throttled ops queue and are counted. `0` disables throttling. Must be `>= 0` (a negative value is a `ConfigError` at load). Lease (coordination) operations bypass the bucket: a lease renew queued behind bulk writes could overshoot its TTL and double-run the very job the lease exists to fence. |
@@ -434,11 +434,10 @@ Plus the shared launch fields a job takes: `shell`, `environment`,
 `maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
 `killTimeout`, `priority`, `statsd`, `user` / `group`, `env_file`,
 `workingDirectory`, `secrets`, `stateAllowedScopes`, and report-only
-`onFailure` / `onSuccess` hooks
-(each accepts a `report` block that fires on the task's runs; there is no
-`onFailure.retry` on a task, since a task's attempts come from the node's
-`retries` field above). Where a task's `monitorResources` numbers surface is
-covered under [Metrics](#metrics) below.
+`onFailure` / `onSuccess` hooks (each accepts a `report` block that fires on
+the task's runs; there is no `onFailure.retry` on a task, since a task's
+attempts come from the node's `retries` field above). Where a task's
+`monitorResources` numbers surface is covered under [Metrics](#metrics) below.
 
 The graph is validated at load: unknown/duplicate ids, a cycle, a self-edge, or
 an `expand.fromTask` that is not a direct non-mapped dependency are config
@@ -696,7 +695,7 @@ in-memory history alone (the gate then resets on restart). See
 | --- | --- | --- | --- |
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
-| `workingDirectory` | `Str` or null | none | Directory the job's process starts in, the equivalent of the "Start in" box on a Task Scheduler action. Unset inherits cronstable's own working directory; under a `defaults:` block that sets it, a bare `workingDirectory:` on a job opts that one job back out to inheriting. `~` and `${VAR}` are expanded and the result is made absolute at load, so a relative value settles against cronstable's working directory once, at load, rather than per run. Existence is deliberately not checked at load, since a load also happens on hosts that are not the target; the OS checks at spawn, and a directory that is not there records the run as a launch failure (exit `127`) whose log line names it. Not part of the [job-set ID](Job-Set-ID). See [Commands and Environment](Commands-and-Environment#workingdirectory) and [Running on Windows](Running-on-Windows#working-directory). |
+| `workingDirectory` | `Str` or null | none | Directory the job's process starts in, the equivalent of the "Start in" box on a Task Scheduler action. Unset inherits cronstable's own working directory; under a `defaults:` block that sets it, a bare `workingDirectory:` on a job opts that one job back out to inheriting. cronstable expands `~` and `${VAR}` and makes the result absolute at load, so a relative value settles against cronstable's working directory once rather than per run. It deliberately does not check that the directory exists at load, since a load also happens on hosts that are not the target; the OS checks at spawn, and a missing directory records the run as a launch failure (exit `127`) whose log line names it. Not part of the [job-set ID](Job-Set-ID). See [Commands and Environment](Commands-and-Environment#workingdirectory) and [Running on Windows](Running-on-Windows#working-directory). |
 | `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `cronstable secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
 | `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `cronstable state\|cursor\|lock\|artifact` calls may explicitly name via `--scope`. Naming any other scope -- most dangerously another job's own name, which IS that job's private scope -- is refused (`403`). See [Scopes](Durable-State#scopes). |
 
@@ -732,23 +731,23 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `priority` | `Enum(idle, below-normal, normal, above-normal, high)` | `normal` | Scheduling priority of the job's process. `normal` is the one level that is never applied: the job keeps cronstable's own nice on POSIX, and cronstable's own class on Windows only when cronstable is at idle or below-normal, otherwise NORMAL. On Windows the level becomes the process's priority class at creation. On POSIX the job's process group is reniced right after the spawn, to an absolute value: `idle` 19, `below-normal` 10, `above-normal` -5, `high` -10. Lowered levels are inherited by descendants; raised ones apply to the job's own process, because Windows resets an unflagged child of an above-normal or high parent to NORMAL. POSIX renices the whole group, so it has no such split. Any other value is a `ConfigError` listing the five that are accepted. Part of the [job-set ID](Job-Set-ID) only when set. |
+| `priority` | `Enum(idle, below-normal, normal, above-normal, high)` | `normal` | Scheduling priority of the job's process. `normal` is the one level that is never applied: on POSIX the job keeps cronstable's own nice, and on Windows it keeps cronstable's own class only when cronstable is at idle or below-normal, otherwise NORMAL. On Windows the level becomes the process's priority class at creation. On POSIX cronstable renices the job's process group right after the spawn, to an absolute value: `idle` 19, `below-normal` 10, `above-normal` -5, `high` -10. Descendants inherit lowered levels; raised ones apply to the job's own process, because Windows resets an unflagged child of an above-normal or high parent to NORMAL. POSIX renices the whole group, so it has no such split. Any other value is a `ConfigError` listing the five that are accepted. Part of the [job-set ID](Job-Set-ID) only when set. |
 
-Raising a priority (any level whose nice sits below cronstable's own; from
-the usual nice 0 that means `above-normal` and `high`) needs `CAP_SYS_NICE`
-or `RLIMIT_NICE` headroom on POSIX. cronstable says so
-once, at config load, naming the job; if the kernel then refuses the renice
-the run is **not** failed, the job simply runs at the priority it inherited,
-and the refusal is logged at `DEBUG`. Windows hands every one of these classes
-to an unprivileged account, so nothing is refused there.
+Raising a priority (any level whose nice sits below cronstable's own; from the
+usual nice 0 that means `above-normal` and `high`) needs `CAP_SYS_NICE` or
+`RLIMIT_NICE` headroom on POSIX. cronstable says so once, at config load,
+naming the job. If the kernel then refuses the renice, cronstable does **not**
+fail the run; the job simply runs at the priority it inherited, and the refusal
+is logged at `DEBUG`. Windows hands every one of these classes to an
+unprivileged account, so nothing is refused there.
 
 `realtime` is deliberately not on the list. On Windows that class outranks the
 threads that service disk, keyboard and mouse, so a runaway job at REALTIME
 can put the host out of reach of the operator who has to stop it.
 
-See [Commands and Environment](Commands-and-Environment#priority) and, for how
-the levels line up with Task Scheduler's `-Priority` numbers,
-[Running on Windows](Running-on-Windows#process-priority).
+See [Commands and Environment](Commands-and-Environment#priority).
+[Running on Windows](Running-on-Windows#process-priority) shows how the levels
+line up with Task Scheduler's `-Priority` numbers.
 
 ### Metrics
 
