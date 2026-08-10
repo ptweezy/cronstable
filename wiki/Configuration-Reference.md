@@ -432,8 +432,8 @@ Per-task keys:
 Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
 `maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
-`killTimeout`, `statsd`, `user` / `group`, `env_file`, `secrets`,
-`stateAllowedScopes`, and report-only `onFailure` / `onSuccess` hooks
+`killTimeout`, `statsd`, `user` / `group`, `env_file`, `workingDirectory`,
+`secrets`, `stateAllowedScopes`, and report-only `onFailure` / `onSuccess` hooks
 (each accepts a `report` block that fires on the task's runs; there is no
 `onFailure.retry` on a task, since a task's attempts come from the node's
 `retries` field above). Where a task's `monitorResources` numbers surface is
@@ -695,6 +695,7 @@ in-memory history alone (the gate then resets on restart). See
 | --- | --- | --- | --- |
 | `environment` | `Seq(Map({"key": Str, "value": Str}))` | `[]` | Environment variables set for the process. Both `key` and `value` are required per entry. Merged by key with `defaults` and with `env_file` (config values win). |
 | `env_file` | `Str` | none | Path to a `KEY=VALUE` file; blank lines and `#` comments are ignored. Variables in `environment` override file values. A read error or a line without `=` raises a `ConfigError`. |
+| `workingDirectory` | `Str` or null | none | Directory the job's process starts in, the equivalent of the "Start in" box on a Task Scheduler action. Unset inherits cronstable's own working directory; under a `defaults:` block that sets it, a bare `workingDirectory:` on a job opts that one job back out to inheriting. `~` and `${VAR}` are expanded and the result is made absolute at load, so a relative value settles against cronstable's working directory once, at load, rather than per run. Existence is deliberately not checked at load, since a load also happens on hosts that are not the target; the OS checks at spawn, and a directory that is not there records the run as a launch failure (exit `127`) whose log line names it. Not part of the [job-set ID](Job-Set-ID). See [Commands and Environment](Commands-and-Environment#workingdirectory) and [Running on Windows](Running-on-Windows#working-directory). |
 | `secrets` | `Seq(Map({"name": Str, "value"/"fromFile"/"fromEnvVar": Str}))` | `[]` | Run-scoped secrets staged for the job over the [job-facing state endpoint](Durable-State#run-scoped-secrets) rather than placed in the environment, so they never show in `/proc/<pid>/environ`. Each needs a `name` and exactly one source (a nameless or sourceless entry is a `ConfigError`; a same-named entry merges last-wins, like `environment`). The job reads one with `cronstable secret get NAME`. Requires a `state` section with `jobApi` enabled, else load fails naming the offending job(s). |
 | `stateAllowedScopes` | `Seq(Str)` | `[]` | Extra scope names (besides the job's own name and `global`) this job's `cronstable state\|cursor\|lock\|artifact` calls may explicitly name via `--scope`. Naming any other scope -- most dangerously another job's own name, which IS that job's private scope -- is refused (`403`). See [Scopes](Durable-State#scopes). |
 

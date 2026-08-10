@@ -283,8 +283,12 @@ such as `failsWhen=nonzeroReturn and retcode=<n>` or
 | `nonzeroReturn` | Bool | `true`  | A nonzero exit code marks the job failed            |
 | `always`        | Bool | `false` | The job is always considered failed when it exits   |
 
-A job whose command cannot be launched at all (for example, the executable does not
-exist) is reported as an ordinary failure with exit code `127`, not an internal error.
+A job whose command cannot be launched at all is reported as an ordinary failure with
+exit code `127`, not an internal error. Two things produce it: the executable does not
+exist, or the job's `workingDirectory` does not exist. The second is the harder one to
+read off a log, because the directory reaches the message only through the `kwargs=`
+repr of the spawn line, and on Windows the OS error there (`WinError 267`) names no
+path of its own. See [workingDirectory](Commands-and-Environment#workingdirectory).
 Note `producesStderr`/`producesStdout` only apply when the corresponding stream is
 captured, and they also fire when output was *discarded* (`saveLimit: 0` still counts
 discarded lines as output).
@@ -604,10 +608,14 @@ on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 
 ## Reference: exit codes used internally
 
-| Code   | Meaning                                                              |
-| ------ | ------------------------------------------------------------------- |
-| `127`  | Command could not be launched (e.g. executable not found)           |
-| `-100` | Job cancelled because it exceeded `executionTimeout`                |
+| Code   | Meaning                                                                    |
+| ------ | -------------------------------------------------------------------------- |
+| `127`  | Command could not be launched (executable or `workingDirectory` not found) |
+| `-100` | Job cancelled because it exceeded `executionTimeout`                       |
+
+A missing `workingDirectory` reports the same `127` as a missing executable, and
+the directory it tried appears only inside the `kwargs=` repr of the spawn log
+line. See [workingDirectory](Commands-and-Environment#workingdirectory).
 
 Two Windows codes worth recognizing in run history: `1` is what
 `taskkill /F` leaves behind (a run reaped by the forced tree kill reports it,

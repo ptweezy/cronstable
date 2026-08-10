@@ -26,9 +26,10 @@
 #                   @reboot, @daily, SECOND-level (7-field), the trailing YEAR
 #                   field, timezones (NY/London/Tokyo), utc:false
 #   Execution       string vs argv-list commands, environment + env_file,
-#                   captureStdout/Stderr toggles, streamPrefix templating +
-#                   empty prefix, maxLineLength, executionTimeout + killTimeout,
-#                   user/group privilege drop, enabled:false, saveLimit
+#                   workingDirectory, captureStdout/Stderr toggles,
+#                   streamPrefix templating + empty prefix, maxLineLength,
+#                   executionTimeout + killTimeout, user/group privilege drop,
+#                   enabled:false, saveLimit
 #   Failure/report  failsWhen (stderr / stdout / always), onFailure /
 #                   onPermanentFailure / onSuccess, retry with backoff (finite
 #                   AND retry-forever), and ALL FIVE reporters: mail (-> Mailpit,
@@ -267,10 +268,15 @@ jobs:
       - key: REGION
         value: us-east-1
 
+  # [feature: workingDirectory] the process starts in this directory instead
+  # of inheriting the daemon's, which is the equivalent of "Start in" on a
+  # Task Scheduler action and what makes a script full of relative paths
+  # portable. `pwd` in the output proves it.
   - name: clickstream-collect
-    command: echo "flushed clickstream events on $HOSTNAME"
+    command: echo "flushed clickstream events on $HOSTNAME from $(pwd)"
     schedule: "* * * * *"
     clusterPolicy: PreferLeader
+    workingDirectory: /tmp
 
   # [feature: cursor] Incremental export driven by a DURABLE, monotonic
   # watermark stored under an EXPLICIT shared scope ("orders-domain") rather

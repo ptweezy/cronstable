@@ -17,6 +17,7 @@ Types and defaults are taken from the strictyaml schema and `DEFAULT_CONFIG`.
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used when `command` is a string. The default is platform-specific: `/bin/sh` on POSIX, empty on Windows (an empty default routes a string command through the native command processor `%ComSpec%` / `cmd.exe`). To use PowerShell or another interpreter, set `shell:` explicitly, or pass `command` as a list (which bypasses the shell on every platform). See [Running on Windows](Running-on-Windows). |
 | `environment` | `Seq(Map({key, value}))` | `[]` | Environment variables (each an item with `key` and `value`, both `Str`) added to the subprocess environment. |
 | `env_file` | `Str` | `None` | Path to a `KEY=VALUE` file whose variables are merged into `environment`. |
+| `workingDirectory` | `Str` or null | `None` | Directory the subprocess starts in. Unset inherits cronstable's own working directory. See [workingDirectory](#workingdirectory) below. |
 | `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 | `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 
@@ -222,6 +223,73 @@ process environment (including injected `HOSTNAME`) < `env_file` < merged
 `environment` (defaults then job, job winning). See
 [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) for how
 `defaults` and includes are merged overall.
+
+## workingDirectory
+
+`workingDirectory` is the directory the job's process starts in. It is the
+`cwd` of the spawn, and the equivalent of the "Start in (optional)" box on a
+Task Scheduler action or of systemd's `WorkingDirectory=`.
+
+```yaml
+jobs:
+  - name: nightly-report
+    command: python report.py
+    schedule: "0 2 * * *"
+    workingDirectory: /srv/reports
+```
+
+With the key unset, the job inherits cronstable's own working directory. Like
+the other launch fields it can be set in a `defaults:` block and on a DAG
+task; under a `defaults:` block that sets it, a bare `workingDirectory:` on
+one job opts that job back out to inheriting.
+
+At load, `~` is expanded and the result is made absolute:
+
+- `~/jobs` means the home directory, not a directory literally named `~`
+  under wherever cronstable was started. On a job that also sets `user`, note
+  that the expansion resolves against cronstable's own user, because it
+  happens once at load while the demotion happens per run.
+- `${VAR}` is expanded from cronstable's environment like any other config
+  scalar, unlike `command` and `shell`, which are left verbatim for the
+  runtime shell to expand. See
+  [Environment Variable Interpolation](Environment-Variable-Interpolation).
+- A relative value is settled against cronstable's working directory at load
+  rather than at each fire, so the directory a job runs in is decided once
+  and the resolved form is what the logs show. There is no absolute-only
+  rejection: what counts as an absolute path on Windows is a question
+  `ntpath.isabs` answers differently across the Python versions cronstable
+  supports, and which directory a job runs in must not depend on the
+  interpreter that scheduled it.
+
+Whether the directory exists is not checked at load. Config load runs on
+every hot reload, and under `--validate-config` on machines that are not the
+target host, so one job naming a share that is not mounted yet must not fail
+the whole load. The OS checks at spawn instead, and a directory that is not
+there is an ordinary [launch failure](#launch-failures): the run records exit
+`127` and the logged spawn line carries the `cwd` that was attempted. On
+Windows that log line is the only place the directory appears, since the
+error the OS returns there (`WinError 267`, "The directory name is invalid")
+carries no filename of its own.
+
+`workingDirectory` is deliberately not part of the
+[job-set ID](Job-Set-ID), so replicas that run the same jobs from paths their
+own hosts spell differently still agree on what they are running.
+
+Two behaviors are worth knowing before relying on it:
+
+- The child changes directory **before** `preexec_fn` runs, so on a job that
+  also sets `user`/`group` the change uses cronstable's privileges, not the
+  target user's. A demoted child can therefore end up sitting in a directory
+  it cannot itself read.
+- A list-form `command` that names its program by a **relative path**, one
+  containing a separator such as `./import.sh`, resolves that path against
+  `workingDirectory` on POSIX and fails on Windows, where `CreateProcessW`
+  searches the calling process's directory instead. A **bare** name carrying
+  no separator is looked up on `PATH` on both platforms and never comes from
+  the working directory, because CPython builds the `PATH` candidate list in
+  the parent, before the child changes directory. Name the program by full
+  path, or set `shell:` and let the shell resolve it. See
+  [Running on Windows](Running-on-Windows#workingdirectory-does-not-change-program-lookup).
 
 ## user and group (privilege switching)
 

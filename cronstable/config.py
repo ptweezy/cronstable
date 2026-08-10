@@ -551,6 +551,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (403). See cronstable.jobapi.JobStateAPI._scope.
     "stateAllowedScopes": [],
     "env_file": None,
+    # directory the job's process starts in ("Start in" on a Task Scheduler
+    # action).  None, the default, inherits the daemon's own CWD, which is
+    # what every job got before this key existed.
+    "workingDirectory": None,
     "executionTimeout": None,
     "killTimeout": 30,
     "statsd": None,
@@ -806,6 +810,12 @@ _job_defaults_common = {
     # loopback state calls; see cronstable.jobapi.JobStateAPI._scope.
     Opt("stateAllowedScopes"): Seq(Str()),
     Opt("env_file"): Str(),
+    # ~ and ${VAR} are expanded and the result is made absolute at load (see
+    # JobConfig._resolve_working_directory).  EmptyNone() so a job under a
+    # `defaults:` block that sets this key still has a spelling that means
+    # "inherit the daemon's CWD instead": a bare `workingDirectory:` writes
+    # the inherited value back to None, like startingDeadlineSeconds above.
+    Opt("workingDirectory"): EmptyNone() | Str(),
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
     Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
@@ -856,6 +866,7 @@ _DAG_TASK_LAUNCH_KEYS = frozenset(
         "user",
         "group",
         "env_file",
+        "workingDirectory",
         "secrets",
         "stateAllowedScopes",
         "onSuccess",
@@ -1500,6 +1511,7 @@ class JobConfig:
         "environment",
         "secrets",
         "stateAllowedScopes",
+        "workingDirectory",
         "executionTimeout",
         "killTimeout",
         "statsd",
@@ -1607,6 +1619,14 @@ class JobConfig:
         self.stateAllowedScopes = config.pop("stateAllowedScopes")
         if self.env_file is not None:
             self._merge_env_file(env_cache)
+        # Where the job's process starts; None keeps the daemon's own CWD.
+        # Deliberately NOT fingerprinted, for the reason the environment
+        # VALUES are not (see cronstable.fingerprint.canonical_job): a path
+        # is per-host, and a Windows replica running the same logical job
+        # from D:\jobs must not read as drift against a Linux one on
+        # /srv/jobs.
+        self.workingDirectory: Optional[str] = config.pop("workingDirectory")
+        self._resolve_working_directory()
 
         self.executionTimeout = config.pop("executionTimeout")
         self.killTimeout = config.pop("killTimeout")
@@ -1792,6 +1812,48 @@ class JobConfig:
             {"key": key, "value": value}
             for key, value in file_environs.items()
         ]
+
+    def _resolve_working_directory(self) -> None:
+        """Normalize ``workingDirectory`` to an absolute path, once, at load.
+
+        ``~`` is expanded first, for the reason the filesystem state backend
+        expands it (see cronstable.state): ``~/jobs`` must mean the home
+        directory, not a literal ``~`` under whatever directory the daemon
+        happened to start in.  On a job that also sets ``user``, note that
+        the expansion resolves against the DAEMON user's home, because it
+        happens at load and the demotion happens per run; operators who want
+        the target user's home should write ``${HOME}`` in an environment
+        the demoted child sees instead.
+
+        ``abspath`` then settles a relative value against the daemon's CWD
+        at load time rather than at fire time, so the directory a job runs
+        in is decided once, and the resolved form is what the spawn log and
+        any launch failure show.
+
+        There is deliberately no absolute-only rejection.  ``ntpath.isabs``
+        was rewritten in 3.13 and answers differently for the same string
+        across the interpreters this project supports, so gating on it would
+        make ``\\\\fileserver\\share\\jobs`` legal config on one Python and a
+        load failure on another.  cronstable.job.shell_spawn already carries
+        that lesson for shell paths; which directory a job runs in must not
+        depend on the interpreter that scheduled it either.
+
+        Existence is not checked.  Config load runs on every hot reload and
+        under ``--validate-config`` on machines that are not the target
+        host, so one job naming a share that is not mounted yet must not
+        fail the whole load.  The OS checks at spawn, where a bad directory
+        lands on RunningJob.start's start_failed path like any command that
+        cannot launch.
+        """
+        configured = self.workingDirectory
+        if not configured:
+            # Unset, or written back to None by a job opting out of an
+            # inherited `defaults:` value.  The empty string an interpolated
+            # ${VAR} can produce means the same thing, and must NOT reach
+            # abspath, which would silently pin the daemon's load-time CWD.
+            self.workingDirectory = None
+            return
+        self.workingDirectory = os.path.abspath(os.path.expanduser(configured))
 
     def _resolve_user_group(self, config: dict) -> None:
         user = config.pop("user", None)

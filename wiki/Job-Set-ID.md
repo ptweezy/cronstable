@@ -56,10 +56,14 @@ not the raw YAML text, which gives it these properties:
 Deliberately **not** part of the identity: the catch-up trio (`onMissed`,
 `startingDeadlineSeconds`, `catchupJitterSeconds`) and the archival pair
 (`archiveOutput`, `redactArchivedSecrets`), which are restart-time or
-observability-only, node-local behaviour; environment variable *values* and
-inline secret values (next section); and everything outside the job
-definitions, in particular the `cluster` section itself (the peer list,
-`distribution`, and the rest of the coordination config never move the id).
+observability-only, node-local behaviour; `workingDirectory`, for the reason
+environment *values* are excluded (it is a per-host path, and a fleet
+legitimately runs the same logical job from `D:\jobs` on a Windows replica
+and `/srv/jobs` on a Linux one, which must not read as permanent drift);
+environment variable *values* and inline secret values (next section); and
+everything outside the job definitions, in particular the `cluster` section
+itself (the peer list, `distribution`, and the rest of the coordination config
+never move the id).
 
 Fields added after the `v1` scheme shipped enter the identity only when they
 are set away from their default (`concurrencyScope` above is one), so

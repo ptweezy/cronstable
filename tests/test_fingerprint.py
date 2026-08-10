@@ -543,6 +543,25 @@ def test_canonical_job_field_set_is_locked():
     assert set(canonical_job(job).keys()) == EXPECTED_CANONICAL_FIELDS
 
 
+def test_working_directory_stays_out_of_identity(tmp_path):
+    # A deliberate exclusion, for the reason environment VALUES are excluded:
+    # a working directory is a per-host path, and a fleet legitimately runs
+    # the same logical job from a Windows path on one replica and a POSIX
+    # path on another.  Folding it in would make byte-identical job sets
+    # fingerprint differently across those hosts, which reads as permanent
+    # drift and splits the job-set id the state and cluster backends
+    # namespace on.  Set is the interesting direction: unset would pass
+    # against any implementation that respected omit-when-default.
+    plain = job_yaml("a")
+    relocated = job_yaml(
+        "a", extra="    workingDirectory: '{}'\n".format(tmp_path)
+    )
+    (job,) = _jobs(relocated)
+    assert job.workingDirectory == str(tmp_path)
+    assert "workingDirectory" not in canonical_job(job)
+    assert _id(plain) == _id(relocated)
+
+
 _IDENTITY_BASE = job_yaml(
     "a",
     extra=(

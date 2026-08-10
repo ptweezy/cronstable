@@ -203,6 +203,32 @@ jobs:
     captureStdout: true
 ```
 
+### Working directory
+
+A job inherits cronstable's own working directory unless it says otherwise,
+and on Windows that is rarely where you want to be: a daemon started from an
+elevated console starts in the system directory, and one started by Task
+Scheduler starts wherever that action was configured to start. Either way,
+every relative path inside a `.bat` or `.ps1` resolves somewhere the author
+did not mean. `workingDirectory` names the directory the job's process starts
+in, and is the equivalent of the "Start in (optional)" box on a Task
+Scheduler action:
+
+```yaml
+jobs:
+  - name: importer
+    command: import.bat
+    schedule: "0 * * * *"
+    workingDirectory: C:\jobs\importer
+```
+
+`~` and `${VAR}` are expanded and the result is made absolute at config load.
+A directory that does not exist is not a load error: the OS reports it at
+spawn and the run is recorded as a launch failure with exit `127`. See
+[Commands and Environment](Commands-and-Environment#workingdirectory) for
+the full semantics, and the note below on program lookup, which is the one
+place Windows and POSIX disagree about what `workingDirectory` covers.
+
 ### Using PowerShell or another interpreter
 
 To run a command under PowerShell, or any interpreter other than `cmd.exe`, you
@@ -435,9 +461,10 @@ on [Concurrency and Timeouts](Concurrency-and-Timeouts).
 ## Features not supported on Windows
 
 Three POSIX-specific features cannot work on Windows. None is silently
-dropped: each is reported clearly. A fourth platform difference (POSIX file
-modes) is silent by nature and called out at the end of this section so it is
-on the record.
+dropped: each is reported clearly. Two further platform differences (program
+lookup under `workingDirectory`, and POSIX file modes) are not reported at
+config load, and are called out at the end of this section so they are on the
+record.
 
 ### Per-job `user` / `group` switching
 
@@ -494,6 +521,42 @@ through `%ComSpec%` (cmd.exe), or assign a shell that exists on the machine
 assignment with a POSIX value is kept but warned about, since it replaces the
 Windows `PATH` for the entries below it. See
 [Classic Crontabs](Classic-Crontabs) for the format's full semantics.
+
+### `workingDirectory` does not change program lookup
+
+Setting a job's
+[`workingDirectory`](Commands-and-Environment#workingdirectory) changes where
+the process starts, on Windows exactly as on POSIX. What it does not change on
+Windows is where the *program* is looked up: `CreateProcessW` searches the
+calling process's directory (cronstable's) rather than the child's working
+directory. A list-form `command` naming its program by a relative path, one
+carrying a separator such as `.\import.bat`, therefore resolves against the
+working directory on POSIX and fails on Windows with a `start_failed` run and
+a `FileNotFoundError`, from the same config. A bare name with no separator is
+looked up on `PATH` on both platforms and never comes from the working
+directory at all, since CPython assembles the `PATH` candidates in the parent,
+before the child changes directory.
+
+Name the program by full path, or leave `command` as a string so the command
+processor resolves it, since `cmd.exe` starts in the working directory and
+searches there:
+
+```yaml
+jobs:
+  # cmd.exe starts in workingDirectory and finds import.bat there
+  - name: importer
+    command: import.bat
+    schedule: "0 * * * *"
+    workingDirectory: C:\jobs\importer
+
+  # the list form bypasses the command processor, and CreateProcessW searches
+  # cronstable's own directory rather than the child's, so this fails to launch
+  - name: importer-argv
+    command:
+      - import.bat
+    schedule: "0 * * * *"
+    workingDirectory: C:\jobs\importer
+```
 
 ### POSIX file modes are advisory only
 

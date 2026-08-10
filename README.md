@@ -1348,6 +1348,29 @@ This feature is POSIX-only (it relies on `setuid`/`setgid`). On Windows, a job
 with `user` or `group` set is rejected with a configuration error; see
 [Running on Windows](#running-on-windows).
 
+### Working directory
+
+By default a job starts in whatever directory cronstable itself is running in.
+`workingDirectory` names the directory instead, which matters most on Windows,
+where an elevated console starts the daemon in the system directory and every
+relative path in a script resolves somewhere unintended. It is the equivalent
+of the "Start in" box on a Task Scheduler action.
+
+```yaml
+- name: nightly-import
+  command: import.bat
+  schedule:
+    minute: "0"
+    hour: "2"
+  workingDirectory: C:\jobs\importer
+```
+
+`~` and `${VAR}` are expanded and the result is made absolute at config load.
+Existence is checked by the OS at spawn, not at load, so a directory that is
+not there records that run as a launch failure rather than failing the whole
+config. The key can also be set in a `defaults:` block and on a DAG task. See
+[Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#workingdirectory).
+
 ### Remote web/HTTP interface
 
 If you wish to remotely control cronstable, you can optionally enable an HTTP REST
@@ -1435,7 +1458,9 @@ which gives it some useful properties:
 * it covers **every behavior-affecting field** (command, schedule, shell, the
   *names* of `environment` variables, capture flags, `failsWhen`,
   retry/reporting policy, timezone, `enabled`, and so on), so any meaningful
-  change to a job changes the id;
+  change to a job changes the id; per-host values are deliberately left out,
+  `workingDirectory` among them, so a Windows replica and a Linux one running
+  the same jobs from paths they spell differently still agree;
 * `user`/`group` are fingerprinted **as configured** (e.g. `www-data`), not as
   the resolved numeric uid/gid, which can differ host to host;
 * **secret/value material is never embedded**: inline reporting secrets
