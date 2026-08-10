@@ -336,14 +336,24 @@ POSIX. A few platform details differ:
   job runs in its own console process group, so the keystroke never reaches
   the jobs themselves). Closing the console window and OS shutdown trigger the
   same drain on the OS's few seconds of grace, and the authenticated
-  `POST /shutdown` route stops a console-less daemon. Logging off does not stop
-  it: an unattended daemon sees that event for every user on the machine.
+  `POST /shutdown` route stops a console-less daemon (and stops the Windows
+  service cleanly, without tripping its recovery actions). Logging off does
+  not stop it: an unattended daemon sees that event for every user on the
+  machine.
 
-* **Running unattended.** Register cronstable as a boot-time Task Scheduler task
-  (or under a service wrapper) with the machine-wide config; the wiki's
-  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows)
-  page carries the copy-paste `schtasks` recipe, a rotating-log config, and
-  the stop path.
+* **Running unattended, as a real Windows service.** `cronstable service
+  install -c C:\ProgramData\cronstable` registers the scheduler with the
+  Service Control Manager, so it starts at boot, runs whether or not anyone
+  is logged on, appears in `services.msc`, and gets Windows' own recovery
+  actions; stopping it drains running jobs first, and the SCM is told the
+  stop is still in progress for as long as that takes. It is a ctypes shim
+  over advapi32, so it adds no dependency. The published one-file `.exe`
+  cannot host a service (its bootloader runs the program in a child process
+  the SCM never sees) and `install` says so; install with pip or pipx for
+  that, or use the `schtasks` recipe. See
+  [Windows Service](https://github.com/ptweezy/cronstable/wiki/Windows-Service)
+  and
+  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows).
 
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,

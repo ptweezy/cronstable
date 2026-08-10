@@ -390,6 +390,163 @@ def add_mcp_command(sub: Any) -> None:
     )
 
 
+#: The service the SCM knows cronstable by when nothing else is said.  Also
+#: the display name's stem and the key `sc query cronstable` answers to.
+SERVICE_NAME_DEFAULT = "cronstable"
+
+
+def _add_service_config_flag(parser: argparse.ArgumentParser) -> None:
+    """Give a `service` action its own -c/--config.
+
+    ``SUPPRESS``, not a real default, for the reason written at
+    ``cronstable.__main__._add_state_subcommands``: argparse applies a
+    subparser's defaults AFTER the root parse, so a concrete default here
+    would overwrite a root-level ``cronstable -c X service install``.  The
+    root parser already supplies the default.
+    """
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=argparse.SUPPRESS,
+        metavar="FILE-OR-DIR",
+        help="configuration the installed service will read",
+    )
+
+
+def _add_service_log_flags(parser: argparse.ArgumentParser) -> None:
+    """The bootstrap-log flags `run` needs and `install` bakes in."""
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="bootstrap log file (default: a logs/ directory beside the "
+        "configuration). A service has no console, so without this there "
+        "is nowhere for a startup failure to be reported",
+    )
+    parser.add_argument(
+        "--no-log-file",
+        default=False,
+        action="store_true",
+        help="do not open a bootstrap log; use when the configuration's "
+        "own `logging:` section is the only log you want",
+    )
+    parser.add_argument(
+        "--console",
+        default=False,
+        action="store_true",
+        help="allocate a console for the service, so a job kill can send "
+        "the trappable CTRL_BREAK step that killTimeout bounds "
+        "(off by default; see the Windows Service documentation)",
+    )
+
+
+def add_service_command(sub: Any) -> None:
+    """Register ``cronstable service <action>`` on the root subparsers.
+
+    Declared here, in the stdlib-only leaf, for the reason this module
+    exists at all: ``cronstable.winservice`` pulls in ctypes, the Win32
+    surface and (in the ``run`` branch) the entire scheduler graph, and
+    every invocation of the program builds this parser first.  The real
+    module is imported only inside its dispatch branch.
+    """
+    parser = sub.add_parser(
+        "service",
+        help="install, remove or control cronstable as a Windows service "
+        "(Windows only)",
+        description=(
+            "Run cronstable as a Windows service, so it starts at boot and "
+            "keeps running whether or not anyone is logged on. `install` "
+            "registers it with the Service Control Manager and needs an "
+            "elevated prompt; `run` is what the SCM itself invokes and is "
+            "not meant to be typed."
+        ),
+    )
+    actions = parser.add_subparsers(dest="service_command", metavar="ACTION")
+
+    def _named(action_parser):
+        action_parser.add_argument(
+            "--name",
+            default=SERVICE_NAME_DEFAULT,
+            metavar="NAME",
+            help="service name, for running more than one instance on a "
+            "host (default: %(default)s)",
+        )
+        return action_parser
+
+    install = _named(
+        actions.add_parser(
+            "install", help="register the service (needs an elevated prompt)"
+        )
+    )
+    _add_service_config_flag(install)
+    _add_service_log_flags(install)
+    install.add_argument(
+        "--start-type",
+        default="auto",
+        choices=["auto", "delayed", "demand"],
+        help="when Windows starts it: at boot, at boot after the other "
+        "auto services, or only on request (default: %(default)s)",
+    )
+    install.add_argument(
+        "--log-level",
+        default="INFO",
+        metavar="LEVEL",
+        help="log level baked into the service's command line "
+        "(default: %(default)s)",
+    )
+    install.add_argument(
+        "--restart-delay",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="how long Windows waits before restarting the service after "
+        "it fails (default: %(default)s)",
+    )
+    install.add_argument(
+        "--no-restart",
+        default=False,
+        action="store_true",
+        help="do not configure recovery actions, so a failed service "
+        "stays stopped",
+    )
+    _named(actions.add_parser("remove", help="stop and unregister"))
+    started = _named(actions.add_parser("start", help="start the service"))
+    started.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="how long to wait for it to report running "
+        "(default: %(default)s)",
+    )
+    stopped = _named(
+        actions.add_parser(
+            "stop",
+            help="stop the service, waiting for running jobs to finish",
+        )
+    )
+    stopped.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="how long to wait for the drain; 0 (the default) waits as "
+        "long as the running jobs take",
+    )
+    _named(
+        actions.add_parser("status", help="print the service's state and pid")
+    )
+    run = _named(
+        actions.add_parser(
+            "run",
+            help="the entry point the Service Control Manager invokes; "
+            "not meant to be run by hand",
+        )
+    )
+    _add_service_config_flag(run)
+    _add_service_log_flags(run)
+
+
 def add_tui_command(sub: Any) -> None:
     """Attach the ``tui`` subcommand to the root parser's subparsers."""
     parser = sub.add_parser(

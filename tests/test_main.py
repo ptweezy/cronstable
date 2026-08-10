@@ -515,3 +515,52 @@ def test_run_and_shutdown_wiring(monkeypatch):
     finally:
         loop.close()
     assert ran["value"] is True
+
+
+def test_run_daemon_installs_shutdown_handlers_by_default(monkeypatch):
+    installed = []
+    monkeypatch.setattr(
+        main.platform,
+        "install_shutdown_handlers",
+        lambda loop, callback: installed.append(callback) or (lambda: None),
+    )
+
+    class _Cron:
+        async def run(self):
+            return None
+
+        def signal_shutdown(self):
+            pass
+
+    cron = _Cron()
+    loop = asyncio.new_event_loop()
+    try:
+        main._run_daemon(cron, loop)
+    finally:
+        loop.close()
+    assert installed == [cron.signal_shutdown]
+
+
+def test_run_daemon_can_skip_the_shutdown_handlers(monkeypatch):
+    # The Windows service host runs the loop on a thread the SCM created,
+    # and install_shutdown_handlers reaches signal.signal there, which the
+    # interpreter refuses off the main thread (loop.add_signal_handler
+    # refuses the same way on POSIX). Its stop surface is the SCM control
+    # handler instead, so it opts out.
+    def _refuse(loop, callback):
+        raise AssertionError("must not be reached")
+
+    monkeypatch.setattr(main.platform, "install_shutdown_handlers", _refuse)
+
+    class _Cron:
+        async def run(self):
+            return None
+
+        def signal_shutdown(self):
+            pass
+
+    loop = asyncio.new_event_loop()
+    try:
+        main._run_daemon(_Cron(), loop, shutdown_handlers=False)
+    finally:
+        loop.close()

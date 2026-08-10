@@ -203,6 +203,41 @@ Windows fixes and additions. The first of many updates to address Windows first-
   reach, and the merged view counts it as missed. Both Codecov
   statuses stay `informational`, so the drop annotates a pull request and
   cannot fail one.
+- cronstable installs itself as a Windows service. `cronstable service
+  install -c C:\ProgramData\cronstable` registers it with the Service
+  Control Manager, so it starts at boot and runs whether or not anyone is
+  logged on, which is the first thing a Windows evaluation asks for and
+  the one thing the documented lifecycle (a console window stopped with
+  Ctrl-C) could not do. `remove`, `start`, `stop` and `status` round out
+  the set, and `run` is what the SCM invokes; typed by hand it says so
+  rather than appearing to hang. It is a ctypes shim over advapi32, in the
+  shape the platform module already used for its kernel32 work, so it adds
+  no runtime dependency, no PyInstaller hidden import and no second binary.
+  Stopping drains running jobs exactly as Ctrl-C does, and the service
+  keeps reporting the stop as in progress for as long as the drain takes,
+  so an hour-long job does not make Windows call the service hung. The same
+  mechanism covers startup, so a slow configuration parse is never a failed
+  start. Windows' own recovery actions are configured at install, along
+  with the flag that makes them apply to an orderly exit carrying a nonzero
+  code rather than only to a crash, without which they would have been
+  decorative here. `POST /shutdown` stops the service cleanly and it stays
+  stopped.
+  Two things an operator has to know, both documented rather than papered
+  over. The published one-file executable, which is also what winget
+  installs, cannot host a service at all: its bootloader unpacks itself and
+  runs the program in a child process, so the process the SCM starts and
+  watches never registers. `install` refuses that shape by name and points
+  at pip, pipx or the existing `schtasks` recipe. And a service has no
+  console, which is what the graceful CTRL_BREAK step of a job kill needs,
+  so `killTimeout` bounds nothing unless the service is installed with
+  `--console`; that is off by default because an allocated console changes
+  what a job inherits, and the trade is written out in full.
+  A service also has no stderr, so `service run` opens a rotating bootstrap
+  log before anything else and refuses to start if it cannot. Without it a
+  service that fails to start is undiagnosable: its standard streams are
+  not merely redirected somewhere unhelpful, they are `None`, so the
+  default logging setup formats every record, fails to write it, and
+  swallows the failure too.
 - A sixth reporter, `eventlog`, writes job outcomes to the Windows Event
   Log, which is where a Windows shop's monitoring already looks: Event
   Viewer, a Windows Event Forwarding subscription, SCOM, every SIEM
