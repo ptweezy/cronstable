@@ -108,7 +108,7 @@ Two assignments are interpreted as well as exported:
 
 | Variable | Effect |
 | --- | --- |
-| `SHELL` | Sets the job's `shell` option, so the command runs as `$SHELL -c "command"`, as in cron. Without it, cronstable's standard default applies (`/bin/sh` on POSIX, the native command processor on Windows). |
+| `SHELL` | Sets the job's `shell` option, so the command runs as `$SHELL -c "command"`, as in cron. Without it, cronstable's standard default applies (`/bin/sh` on POSIX, the native command processor on Windows). On Windows a `SHELL` naming an absolute POSIX path (`SHELL=/bin/sh`, as `/etc/crontab` exports always carry) is a load-time error at the assignment's line, because that shell cannot exist there and every entry below it would fail at spawn; a bare name (`SHELL=powershell`) is kept. A POSIX-style `PATH=` assignment is kept but warned about on Windows, since it replaces the Windows `PATH` for the entries below it. See [Running on Windows](Running-on-Windows). |
 | `CRON_TZ` | Sets the job's `timezone` option: schedules below it are evaluated in that IANA zone (cronie's `CRON_TZ` semantics). An unknown zone is a load-time error at the assignment's line. |
 
 ## What each entry becomes
