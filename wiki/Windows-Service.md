@@ -2,17 +2,15 @@
 
 `cronstable service` registers the scheduler with the Windows Service
 Control Manager, so it starts at boot and keeps running whether or not
-anyone is logged on. That is the first checkbox on a Task Scheduler task's
-General tab, and it is the shape a Windows estate expects a scheduler to
-take.
+anyone is logged on. "Run whether user is logged on or not" is the first
+checkbox on a Task Scheduler task's General tab.
 
-This page covers installing, controlling and diagnosing the service. See
-[Running on Windows](Running-on-Windows) for the rest of the platform's
+See [Running on Windows](Running-on-Windows) for the rest of the platform's
 behavior, and [CLI Reference](CLI-Reference) for every other subcommand.
 
 ## Quick start
 
-From an **elevated** prompt:
+From an elevated prompt:
 
 ```shell
 cronstable init C:\ProgramData\cronstable
@@ -75,7 +73,7 @@ rather than appearing to hang.
 | `--restart-delay SECONDS` | `60` | How long Windows waits before restarting after a failure. |
 | `--no-restart` | off | Do not configure recovery actions at all. |
 
-The service is installed to run as **LocalSystem**. Per-job and per-service
+The service is installed to run as LocalSystem. Per-job and per-service
 identity (a named account, a gMSA, run levels) is not implemented; cronstable
 is single-principal on Windows.
 
@@ -86,7 +84,7 @@ A service runs as LocalSystem, whose `%APPDATA%` points into
 per-user configuration that works perfectly when you run `cronstable`
 interactively is simply not found when the SCM starts the same program.
 
-`install` therefore **refuses** when `-c` was left at the platform default
+`install` therefore refuses when `-c` was left at the platform default
 and that default resolved inside your own user profile: you did not choose
 that path, and installing it would produce a service that starts cleanly and
 schedules nothing. Name a machine-wide directory instead:
@@ -96,7 +94,7 @@ cronstable init C:\ProgramData\cronstable
 cronstable service install -c C:\ProgramData\cronstable
 ```
 
-A per-user path you name **explicitly** is a deliberate act and works, since
+A per-user path you name explicitly is a deliberate act and works, since
 LocalSystem can read the profile; it prints a note about the fragility and
 proceeds.
 
@@ -105,7 +103,7 @@ proceeds.
 Unless `--no-restart` is given, `install` configures Windows' own recovery:
 restart after `--restart-delay` seconds for the first two failures, then
 stop trying, with the failure count resetting daily. It also sets the flag
-that makes recovery apply to a **clean exit with a nonzero code**, not only
+that makes recovery apply to a clean exit with a nonzero code, not only
 to a crash. Without that flag the recovery actions would be decorative here,
 because this host reports its own failures as an orderly stop carrying an
 exit code rather than by crashing.
@@ -128,7 +126,7 @@ A service has no console. Its `sys.stdout` and `sys.stderr` are not
 redirected somewhere unhelpful, they are `None`, so the default logging
 setup writes into nothing and cannot even report that it failed.
 
-`service run` therefore opens a rotating **bootstrap log** before it does
+`service run` therefore opens a rotating bootstrap log before it does
 anything else, by default at `<config directory>\logs\cronstable-service.log`
 (10 MB, five backups). It records the command line, the resolved
 configuration path, the console decision and the log level; it is the first
@@ -156,7 +154,7 @@ applies to `executionTimeout`, to `concurrencyPolicy: Replace` and to a
 cancel from the API.
 
 `--console` allocates a console for the service so the two-step works. It is
-off by default because it is not free and not invisible:
+off by default, because a console changes what a job inherits:
 
 - the job is genuinely attached to that console. It can open `CONIN$` and
   `CONOUT$`, `GetConsoleWindow` no longer returns NULL, and a `pause` or
