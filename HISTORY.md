@@ -7,8 +7,7 @@ project, on which cronstable is based.
 
 ## 1.2.39
 
-Windows fixes and additions from a gap review against Task Scheduler. One
-durable-store ordering fix came along with them.
+Windows fixes and additions. The first of many updates to address Windows first-class support.
 
 - `shell: cmd` actually runs the command. cronstable now spawns it the way
   the Windows default shell has always been spawned: the command string
