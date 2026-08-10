@@ -56,6 +56,7 @@ from cronstable.config import (
     JobConfig,
     schedule_object_to_crontab,
 )
+from cronstable.platform import DEFAULT_PRIORITY
 
 # Canonicalization scheme version.  Prefixes the emitted ID and is folded into
 # the hash input, so a future change to what/how we canonicalize can bump this
@@ -339,6 +340,12 @@ def canonical_job(
         # disagreeing on it must show as drift), so it is identity -- but
         # only when set, per the omit-when-default rule above.
         out["concurrencyScope"] = job.concurrencyScope
+    if job.priority != DEFAULT_PRIORITY:
+        # A launch-shaping field, like executionTimeout and killTimeout, and
+        # host-independent: the LEVEL is identity, never the nice number or
+        # priority class it resolves to on one platform.  Only when set, per
+        # the same rule, so no existing digest moves.
+        out["priority"] = job.priority
     return out
 
 

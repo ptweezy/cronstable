@@ -1669,7 +1669,12 @@ class RunningJob:
         # Isolate the job in its own process group, so cancel() can take its
         # whole descendant tree down as a unit rather than only the process we
         # spawned -- see cronstable.platform.new_process_group_kwargs.
-        kwargs: dict[str, Any] = platform.new_process_group_kwargs()
+        # The job's scheduling priority rides along on Windows, where the
+        # creation flags are the only race-free place to set one; POSIX is
+        # served by the renice below, once there is a group to renice.
+        kwargs: dict[str, Any] = platform.new_process_group_kwargs(
+            self.config.priority
+        )
         if isinstance(self.config.command, list):
             create: Any = asyncio.create_subprocess_exec
             cmd = self.config.command
@@ -1762,6 +1767,16 @@ class RunningJob:
             )
             self.start_failed = True
             return
+
+        if self.proc.pid is not None:
+            # POSIX: renice the group now that it exists (on Windows the
+            # class already rode in on the creation flags).  First thing
+            # after the spawn, so the window in which the job runs at the
+            # inherited priority is as short as it can be, and called for
+            # its effect alone: a refusal is best-effort by design and
+            # apply_priority logs it, so there is nothing to decide here and
+            # nothing to say twice.
+            platform.apply_priority(self.proc.pid, self.config.priority)
 
         # Spawned, not awaited: every launch path holds the daemon-wide
         # spawn gate around start(), and a stalled statsd send would hold

@@ -109,6 +109,23 @@ Windows fixes and additions. The first of many updates to address Windows first-
   log line names the directory. It is deliberately not part of the job-set
   id, so replicas running the same jobs from paths their own hosts spell
   differently still agree on what they are running.
+- Jobs can declare a `priority`, one of `idle`, `below-normal`, `normal`,
+  `above-normal` and `high`. On Windows it becomes the process's priority
+  class at creation; on POSIX the job's process group is reniced to an
+  absolute value just after the spawn. How far a Windows class carries is
+  asymmetric: `idle` and `below-normal` are inherited by descendants, while
+  `above-normal` and `high` apply to the job's own process, since Windows
+  resets an unflagged child of an above-normal or high parent to NORMAL. So
+  a `shell: cmd` job at `high` gets cmd.exe at HIGH and the programs cmd.exe
+  launches at NORMAL. POSIX renices the whole group and a later fork
+  inherits the value, so it has no such split. `normal`, the default, is the
+  one level that is never applied. Raising a priority needs
+  `CAP_SYS_NICE` or `RLIMIT_NICE` headroom on POSIX: cronstable says so once
+  at config load, naming the job, and a kernel that then refuses leaves the
+  run going at the priority it inherited instead of failing it. `realtime`
+  is deliberately not offered, since a runaway job at that class outranks
+  the threads servicing disk, keyboard and mouse. The level is part of the
+  job-set id when it is set, and rides on `GET /jobs` the same way.
 
 ## 1.2.38
 

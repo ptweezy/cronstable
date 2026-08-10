@@ -432,8 +432,9 @@ Per-task keys:
 Plus the shared launch fields a job takes: `shell`, `environment`,
 `captureStdout` / `captureStderr`, `monitorResources`, `saveLimit`,
 `maxLineLength`, `streamPrefix`, `failsWhen`, `executionTimeout`,
-`killTimeout`, `statsd`, `user` / `group`, `env_file`, `workingDirectory`,
-`secrets`, `stateAllowedScopes`, and report-only `onFailure` / `onSuccess` hooks
+`killTimeout`, `priority`, `statsd`, `user` / `group`, `env_file`,
+`workingDirectory`, `secrets`, `stateAllowedScopes`, and report-only
+`onFailure` / `onSuccess` hooks
 (each accepts a `report` block that fires on the task's runs; there is no
 `onFailure.retry` on a task, since a task's attempts come from the node's
 `retries` field above). Where a task's `monitorResources` numbers surface is
@@ -726,6 +727,28 @@ is raised. Privilege switching is **not supported on Windows**: a job with
 `Job <name>: changing user/group is not supported on Windows`. See
 [Production and Container Deployment](Production-Deployment) and
 [Running on Windows](Running-on-Windows).
+
+### Process priority
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `priority` | `Enum(idle, below-normal, normal, above-normal, high)` | `normal` | Scheduling priority of the job's process. `normal` is the one level that is never applied: the job keeps cronstable's own nice on POSIX, and cronstable's own class on Windows only when cronstable is at idle or below-normal, otherwise NORMAL. On Windows the level becomes the process's priority class at creation. On POSIX the job's process group is reniced right after the spawn, to an absolute value: `idle` 19, `below-normal` 10, `above-normal` -5, `high` -10. Lowered levels are inherited by descendants; raised ones apply to the job's own process, because Windows resets an unflagged child of an above-normal or high parent to NORMAL. POSIX renices the whole group, so it has no such split. Any other value is a `ConfigError` listing the five that are accepted. Part of the [job-set ID](Job-Set-ID) only when set. |
+
+Raising a priority (any level whose nice sits below cronstable's own; from
+the usual nice 0 that means `above-normal` and `high`) needs `CAP_SYS_NICE`
+or `RLIMIT_NICE` headroom on POSIX. cronstable says so
+once, at config load, naming the job; if the kernel then refuses the renice
+the run is **not** failed, the job simply runs at the priority it inherited,
+and the refusal is logged at `DEBUG`. Windows hands every one of these classes
+to an unprivileged account, so nothing is refused there.
+
+`realtime` is deliberately not on the list. On Windows that class outranks the
+threads that service disk, keyboard and mouse, so a runaway job at REALTIME
+can put the host out of reach of the operator who has to stop it.
+
+See [Commands and Environment](Commands-and-Environment#priority) and, for how
+the levels line up with Task Scheduler's `-Priority` numbers,
+[Running on Windows](Running-on-Windows#process-priority).
 
 ### Metrics
 

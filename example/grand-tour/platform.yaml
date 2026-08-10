@@ -26,7 +26,7 @@
 #                   @reboot, @daily, SECOND-level (7-field), the trailing YEAR
 #                   field, timezones (NY/London/Tokyo), utc:false
 #   Execution       string vs argv-list commands, environment + env_file,
-#                   workingDirectory, captureStdout/Stderr toggles,
+#                   workingDirectory, priority, captureStdout/Stderr toggles,
 #                   streamPrefix templating + empty prefix, maxLineLength,
 #                   executionTimeout + killTimeout, user/group privilege drop,
 #                   enabled:false, saveLimit
@@ -432,12 +432,18 @@ jobs:
     schedule: "*/2 * * * *"
     clusterPolicy: EveryNode
 
+  # [feature: priority] housekeeping that must never outrank real work: the
+  # job is created at the lowest level the key offers (nice 19 here,
+  # IDLE_PRIORITY_CLASS on Windows), and a LOWERED level is the one that both
+  # platforms hand down to descendants. Lowering never needs privilege; a
+  # raise (any level whose nice sits below the daemon's own) does, on POSIX.
   - name: warehouse-vacuum
     command: |
       echo "warehouse-vacuum compacting tables on $HOSTNAME at $(date -u +%H:%M:%S)"
       sleep 5
     schedule: "*/10 * * * *"
     clusterPolicy: Leader
+    priority: idle
 
   # =====================================================================
   #  3b. Resource-heavy workloads  (per-job + per-node monitoring)

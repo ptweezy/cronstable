@@ -5224,6 +5224,11 @@ class Cron:
                     if job.clusterPolicy == "PreferLeader"
                     else mgr.job_owner(job.name)
                 )
+        # the job's scheduling priority, and only when it asks for one, so
+        # the polled payload is unchanged for everything else (the same
+        # omit-when-default rule as the blocks above).
+        if job.priority != platform.DEFAULT_PRIORITY:
+            result["priority"] = job.priority
         return result
 
     def jobs_payload(self) -> list[dict[str, Any]]:

@@ -579,6 +579,7 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `retry` | Present only while a [retry ladder](Failure-Detection-and-Retries) is armed for the job: `{attempt, maxAttempts, nextRetryAt, delaySeconds}`. `maxAttempts` is `null` for an unlimited ladder (`maximumRetries: -1`). |
 | `rebootPending` | Present (as `true`) only for a deferred `@reboot` one-shot still awaiting its boot run (the cluster had not elected an owner at boot, or a pause is holding it), so a client can tell "pending boot run" from "already ran". |
 | `concurrencyScope`, `slot` | Present only for `concurrencyScope: cluster` jobs: the literal scope, and `slot` as `{held, holder, refs}`: whether this node holds the job's [cluster-wide concurrency slot](Clustering-and-Leader-Election) lease, the holding node's name (`null` when unheld), and how many live instances reference it. |
+| `priority` | Present only when the job sets a non-default [scheduling priority](Commands-and-Environment#priority): one of `idle`, `below-normal`, `above-normal`, `high`. A job at the default level (`normal`, the one level that is never applied) carries no key. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
 
 ```shell

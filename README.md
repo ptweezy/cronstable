@@ -1371,6 +1371,32 @@ not there records that run as a launch failure rather than failing the whole
 config. The key can also be set in a `defaults:` block and on a DAG task. See
 [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#workingdirectory).
 
+### Process priority
+
+`priority` says how a job should be scheduled against everything else on the
+box, in five levels: `idle`, `below-normal`, `normal`, `above-normal`,
+`high`.
+
+```yaml
+- name: nightly-reindex
+  command: reindex.sh
+  schedule:
+    minute: "0"
+    hour: "3"
+  priority: idle
+```
+
+On Windows the level becomes the process's priority class at creation; on
+POSIX the job's process group is reniced right after the spawn (`idle` is
+nice 19, `high` is nice -10). Lowered levels are inherited by descendants on
+both platforms; a raised one applies to the job's own process on Windows,
+which resets an unflagged child of an above-normal or high parent to NORMAL.
+POSIX renices the whole group, so it has no such split. The default,
+`normal`, is the one level that is never applied. Raising a priority needs
+privilege on POSIX, and a kernel that refuses leaves the run going at the
+priority it inherited rather than failing it. See
+[Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#priority).
+
 ### Remote web/HTTP interface
 
 If you wish to remotely control cronstable, you can optionally enable an HTTP REST

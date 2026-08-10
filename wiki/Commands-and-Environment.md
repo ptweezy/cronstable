@@ -18,6 +18,7 @@ Types and defaults are taken from the strictyaml schema and `DEFAULT_CONFIG`.
 | `environment` | `Seq(Map({key, value}))` | `[]` | Environment variables (each an item with `key` and `value`, both `Str`) added to the subprocess environment. |
 | `env_file` | `Str` | `None` | Path to a `KEY=VALUE` file whose variables are merged into `environment`. |
 | `workingDirectory` | `Str` or null | `None` | Directory the subprocess starts in. Unset inherits cronstable's own working directory. See [workingDirectory](#workingdirectory) below. |
+| `priority` | `Enum(idle, below-normal, normal, above-normal, high)` | `normal` | Scheduling priority of the subprocess. Lowered levels are inherited by its descendants; raised ones apply to the subprocess itself on Windows. The default level is never applied: the job keeps cronstable's own nice on POSIX, and cronstable's own class on Windows only when cronstable is at idle or below-normal, otherwise NORMAL. See [priority](#priority) below. |
 | `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 | `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 
@@ -71,8 +72,10 @@ Whatever the command form, the subprocess is spawned with
 fresh session (`start_new_session`), placing it and every descendant in their
 own process group, so a cancellation (an `executionTimeout` expiry,
 `concurrencyPolicy: Replace`, or an API cancel) can take the whole tree down
-as a unit; on Windows no creation flag is used and cancellation walks the
-process tree instead. See
+as a unit; on Windows the job is created with `CREATE_NEW_PROCESS_GROUP`,
+which shields it from the daemon console's Ctrl-C and makes it a trappable
+`CTRL_BREAK_EVENT` target ahead of the forced tree kill. Those same Windows
+creation flags carry the job's [`priority`](#priority). See
 [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout).
 
 ```yaml
@@ -290,6 +293,100 @@ Two behaviors are worth knowing before relying on it:
   the parent, before the child changes directory. Name the program by full
   path, or set `shell:` and let the shell resolve it. See
   [Running on Windows](Running-on-Windows#workingdirectory-does-not-change-program-lookup).
+
+## priority
+
+`priority` is how the job is scheduled against everything else on the box. It
+takes one of five levels, lowest first:
+
+```yaml
+jobs:
+  - name: reindex
+    command: reindex.sh
+    schedule: "0 3 * * *"
+    priority: idle
+```
+
+| Level | Windows priority class | POSIX nice |
+| --- | --- | --- |
+| `idle` | `IDLE_PRIORITY_CLASS` | 19 |
+| `below-normal` | `BELOW_NORMAL_PRIORITY_CLASS` | 10 |
+| `normal` (default) | no class set; see below | inherited, no renice |
+| `above-normal` | `ABOVE_NORMAL_PRIORITY_CLASS` | -5 |
+| `high` | `HIGH_PRIORITY_CLASS` | -10 |
+
+The default level is the one that is never applied. On POSIX that means the
+job keeps cronstable's own nice, which on a daemon started at nice 10 is nice
+10, not nice 0. On Windows it means the job gets cronstable's own class when
+cronstable runs at idle or below normal, and NORMAL when cronstable runs at
+normal or above, because that is what `CreateProcess` gives a child with no
+class flag. Either way cronstable never promotes a job that did not ask to be
+promoted. Like the other launch fields it can be set in a `defaults:` block
+and on a DAG task.
+
+The four levels that are applied are **absolute**, not offsets: `idle` means
+nice 19 whatever the daemon sits at, so a level describes where the job runs
+rather than how far it moved.
+
+The two platforms take it at different moments:
+
+- **Windows** sets the priority class at `CreateProcess` time, on the same
+  creation flags that give the job its own process group. That is race-free.
+  `normal` emits no class flag at all rather than `NORMAL_PRIORITY_CLASS`,
+  because a child only defaults to NORMAL when its creator is not itself idle
+  or below-normal; emitting the flag would silently *promote* the jobs of a
+  daemon that was launched below normal, which is what Task Scheduler does by
+  default.
+- **POSIX** has no such spawn-time knob, so the job's process *group* is
+  reniced (`setpriority` with `PRIO_PGRP`) as the first thing after a
+  successful spawn. The group, not the process, so a helper the shell forked
+  in the microseconds before the call is reniced too. It is not done in a
+  `preexec_fn`: that hook runs between fork and exec, where only
+  async-signal-safe calls are sound, and it would put a fork-time hook on
+  every spawn including the jobs that have no privilege to drop.
+
+How far the level reaches also differs, and the difference is the same
+`CreateProcess` rule. Lowered levels (`idle`, `below-normal`) are inherited
+by descendants on both platforms. A raised level (`above-normal`, `high`)
+applies to the job's own process on Windows and not to the tree it spawns,
+because an unflagged child of an above-normal or high parent is given NORMAL.
+For the commonest Windows job shape that matters: a `shell: cmd` job or a
+`.cmd` file at `priority: high` runs cmd.exe at HIGH, and every program
+cmd.exe launches runs at NORMAL. POSIX has no such asymmetry, because
+`setpriority(PRIO_PGRP)` covers the whole group and anything forked after it
+inherits the nice value. Asking for `high` is still the right thing to do
+where the job's own process is the work; it is not a way to raise a tree of
+Windows helpers.
+
+Lowering a priority is always allowed. **Raising** one on POSIX (any level
+whose nice sits below cronstable's own; from the usual nice 0 that means
+`above-normal` and `high`) needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom,
+and cronstable cannot know at load whether the kernel will grant it. What it
+does instead:
+
+- at config load, if the level is a raise from cronstable's own nice and
+  cronstable is not root, one `WARNING` naming the job, so the deployment
+  that introduces the ask is the thing that reports it;
+- at run time, if the kernel refuses, the run is **not** failed. The job runs
+  at the priority it inherited and the refusal is logged at `DEBUG`. A
+  minutely job on an unprivileged host would otherwise emit some 1,440
+  warnings a day about a condition that will not change until the deployment
+  does.
+
+Windows grants all five classes to an unprivileged account, so none of that
+applies there.
+
+`realtime` is deliberately not offered. It outranks the threads that service
+disk, keyboard and mouse, so one runaway job at REALTIME can put the host out
+of reach of the operator who has to stop it. `priority: realtime` is a load
+error listing the levels that are accepted, not a silent downgrade.
+
+The level (never the nice number or priority class it resolves to) is part of
+the [job-set ID](Job-Set-ID) when it is set, so replicas that disagree about
+how a job is scheduled show as drift. It is also on the
+[`GET /jobs`](HTTP-API#get-jobs) payload when set. See
+[Running on Windows](Running-on-Windows#process-priority) for how the levels
+compare with Task Scheduler's own `-Priority` numbers.
 
 ## user and group (privilege switching)
 

@@ -86,6 +86,7 @@ or task that demonstrates it. The big ones:
 | | timezones (New York / London / Tokyo) + DST advisory | `finance-eod-close`, `eu-/apac-open-report` |
 | **Execution** | string vs **argv-list** command, `environment`, **`env_file`** | `orders-ingest`, `pulse-*`, `backup-warehouse` |
 | | **`workingDirectory`** (the process's `cwd`, "Start in") | `clickstream-collect` |
+| | **`priority`** (nice / Windows priority class for the job's process) | `warehouse-vacuum` |
 | | `streamPrefix` **templating** (`{job_name}`/`{stream_name}`) + empty prefix | `orders-ingest`, `sla-rollup` |
 | | `captureStdout/Stderr` off, **`maxLineLength`** | `silent-cleanup`, `log-rotate` |
 | | `executionTimeout` + `killTimeout` (job is killed) | `slow-report-generator` |

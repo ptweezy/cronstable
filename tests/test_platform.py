@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import signal
 import sys
@@ -189,6 +190,223 @@ def test_new_process_group_kwargs_matches_platform():
         assert kwargs == {"creationflags": 0x00000200}
     else:
         assert kwargs == {"start_new_session": True}
+
+
+# ---------------------------------------------------------------------------
+# Job scheduling priority (the `priority:` job key).
+#
+# The Windows half is set at spawn, so it is tested through the flags;
+# the POSIX half is a renice after the spawn, so it is tested through
+# os.setpriority.  Both are driven with the `windows=` injection rather than
+# by monkeypatching IS_WINDOWS, so each arm is measured on every box instead
+# of only on the OS it ships for.
+# ---------------------------------------------------------------------------
+
+# Neither name exists on Windows, and the POSIX arm is exercised there too
+# (windows=False), so the stand-in is what lets one test cover both.
+_PRIO_PGRP = getattr(os, "PRIO_PGRP", 1)
+
+
+def _record_setpriority(monkeypatch, calls, failing=None):
+    def fake_setpriority(which, who, value):
+        calls.append((which, who, value))
+        if failing is not None:
+            raise failing
+
+    monkeypatch.setattr(os, "PRIO_PGRP", _PRIO_PGRP, raising=False)
+    monkeypatch.setattr(os, "setpriority", fake_setpriority, raising=False)
+
+
+@pytest.mark.parametrize(
+    "level, expected_class",
+    [
+        pytest.param("idle", 0x00000040, id="idle"),
+        pytest.param("below-normal", 0x00004000, id="below-normal"),
+        # no class bit at all: CreateProcess defaults a child to NORMAL only
+        # when the creator is not itself idle or below-normal, so emitting
+        # NORMAL_PRIORITY_CLASS here would silently promote every job of a
+        # daemon that was launched below normal.
+        pytest.param("normal", 0x00000000, id="normal"),
+        pytest.param("above-normal", 0x00008000, id="above-normal"),
+        pytest.param("high", 0x00000080, id="high"),
+    ],
+)
+def test_new_process_group_kwargs_ors_the_priority_class(
+    level, expected_class
+):
+    kwargs = platform.new_process_group_kwargs(level, windows=True)
+    flags = kwargs["creationflags"]
+    # The process-group bit survives every level: it and the class are OR-ed
+    # in one place, so a priority can never cost a job its group (and with
+    # it the CTRL_BREAK target and the console shielding).
+    assert flags & 0x00000200
+    assert flags == 0x00000200 | expected_class
+    # POSIX takes no flags from here at any level; the renice does that work.
+    assert platform.new_process_group_kwargs(level, windows=False) == {
+        "start_new_session": True
+    }
+
+
+def test_the_default_level_has_no_posix_nice_of_its_own():
+    # DEFAULT_PRIORITY resolves to no number on purpose: it is never applied,
+    # and nice 0 would misdescribe it (on a daemon started at nice 10,
+    # `normal` means 10).  posix_nice_for is what the config layer's advisory
+    # asks "is this a raise", so the None has to be the answer for it.
+    assert platform.posix_nice_for(platform.DEFAULT_PRIORITY) is None
+    assert platform.posix_nice_for("idle") == 19
+
+
+def test_the_table_drift_guard_names_the_levels_that_drifted():
+    # Asserting the real tables agree with the real vocabulary would be a
+    # tautology: platform.py's import-time call raises before the module
+    # finishes importing, so a drifted table fails collection of this whole
+    # file rather than this assertion.  Drive the helper with a deliberately
+    # drifted pair instead, which is the only way to see what it reports.
+    assert (
+        platform._priority_table_drift(
+            ("idle", "normal"),
+            "normal",
+            {"idle": 0x40, "normal": 0x00},
+            {"idle": 19},
+        )
+        == []
+    )
+    # a level in the vocabulary that no Windows row maps, and a POSIX row for
+    # the one level that must never have one: both would KeyError at a spawn.
+    drifted = (
+        ("idle", "normal", "high"),
+        "normal",
+        {"idle": 0x40, "normal": 0x00},
+        {"idle": 19, "normal": 0, "high": -10},
+    )
+    assert platform._priority_table_drift(*drifted) == ["high", "normal"]
+
+    # and the import-time guard turns that into the RuntimeError that stops
+    # the module loading, naming both levels so the fix is in the message.
+    # The real call is the quiet one, so this arm has no other way to run.
+    with pytest.raises(RuntimeError) as exc:
+        platform._refuse_drifted_priority_tables(*drifted)
+    assert "high, normal" in str(exc.value)
+    assert (
+        platform._refuse_drifted_priority_tables(
+            ("idle", "normal"),
+            "normal",
+            {"idle": 0x40, "normal": 0x00},
+            {"idle": 19},
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "level, expected_nice",
+    [
+        # Pinned as literals, because three doc tables publish these four
+        # numbers; a typo in _POSIX_NICE would otherwise ship green and
+        # silently contradict them.
+        pytest.param("idle", 19, id="idle"),
+        pytest.param("below-normal", 10, id="below-normal"),
+        pytest.param("above-normal", -5, id="above-normal"),
+        pytest.param("high", -10, id="high"),
+    ],
+)
+def test_apply_priority_renices_the_whole_group(
+    monkeypatch, level, expected_nice
+):
+    calls = []
+    _record_setpriority(monkeypatch, calls)
+
+    assert platform.apply_priority(4242, level, windows=False) is True
+    # PRIO_PGRP, not PRIO_PROCESS: a descendant the shell forked in the
+    # microseconds before the call has to be reniced with the leader.
+    assert calls == [(_PRIO_PGRP, 4242, expected_nice)]
+    # and the same number the config layer's raise/lowering test reads.
+    assert platform.posix_nice_for(level) == expected_nice
+
+
+def test_apply_priority_applies_nothing_at_the_default_or_on_windows(
+    monkeypatch,
+):
+    calls = []
+    _record_setpriority(monkeypatch, calls)
+
+    # The default level is skipped, not applied as nice 0, which is what
+    # keeps a config that says nothing spawning exactly as it always did.
+    assert (
+        platform.apply_priority(
+            4242, platform.DEFAULT_PRIORITY, windows=False
+        )
+        is True
+    )
+    # Windows had its priority class set at CreateProcess time, so there is
+    # nothing left to do after the spawn (and nothing that could reach the
+    # descendants a raised class does not carry to anyway).
+    assert platform.apply_priority(4242, "high", windows=True) is True
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "failing, expected",
+    [
+        # EPERM: no CAP_SYS_NICE and no RLIMIT_NICE headroom for the raise.
+        pytest.param(PermissionError(1, "denied"), False, id="eperm"),
+        # ESRCH: the group emptied between the spawn and the renice, so
+        # nothing was refused and there is nothing to report.
+        pytest.param(ProcessLookupError(3, "gone"), True, id="esrch"),
+    ],
+)
+def test_apply_priority_never_raises_on_a_refusal(
+    monkeypatch, caplog, failing, expected
+):
+    calls = []
+    _record_setpriority(monkeypatch, calls, failing=failing)
+
+    with caplog.at_level(logging.DEBUG, logger="cronstable"):
+        got = platform.apply_priority(4242, "high", windows=False)
+    assert got is expected
+    assert calls == [(_PRIO_PGRP, 4242, -10)]
+    # A refusal never fails the run and never raises a WARNING: on a minutely
+    # job that would be ~1,440 lines a day for a condition that does not
+    # change until the deployment does.  The config layer says it once, at
+    # load; here it is DEBUG for whoever goes looking.
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    said = [r for r in caplog.records if "priority" in r.getMessage()]
+    assert bool(said) is (expected is False)
+    # DEBUG exactly, not merely "below WARNING": three docs promise that
+    # level by name, so a quiet promotion to INFO has to go red here.
+    assert all(rec.levelno == logging.DEBUG for rec in said)
+
+
+def test_creationflags_has_exactly_one_writer():
+    # The whole reason new_process_group_kwargs takes a LEVEL rather than
+    # handing callers a flag to OR in themselves: while it is the only place
+    # that writes creationflags, the process-group bit and the priority
+    # class cannot be set independently, so neither can be dropped by a
+    # caller that meant to set the other.  A second writer somewhere in the
+    # package would quietly retire that guarantee.
+    package = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "cronstable",
+    )
+    writers = []
+    for dirpath, _dirnames, filenames in os.walk(package):
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, filename)
+            with open(path, encoding="utf-8") as fobj:
+                for lineno, line in enumerate(fobj, 1):
+                    if line.lstrip().startswith("#"):
+                        continue  # prose about the key is not a writer
+                    if '"creationflags"' in line or "creationflags=" in line:
+                        writers.append(
+                            (os.path.relpath(path, package), lineno)
+                        )
+    # Distinct FILES, not the per-occurrence list: the invariant is "one
+    # writer module", so a second mention inside platform.py itself must not
+    # turn it red and invite someone to weaken the guard.  `writers` stays as
+    # the message, so a real second writer still names the file and line.
+    assert sorted({name for name, _ in writers}) == ["platform.py"], writers
 
 
 @pytest.mark.asyncio
