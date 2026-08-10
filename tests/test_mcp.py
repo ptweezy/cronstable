@@ -949,7 +949,9 @@ async def test_why_no_run_unknown_job_and_bad_timestamp():
         h, "cron_why_no_run", {"name": "nope", "at": "2026-07-18T03:00"}
     )
     assert result["isError"] is True
-    assert "not found" in result["content"][0]["text"]
+    # the lookup resolves DAG schedules too, so the reason names both and
+    # points at both listers (tests/test_mcp_tools.py holds the full pin)
+    assert "no job or DAG schedule named" in result["content"][0]["text"]
     result = await _call(
         h, "cron_why_no_run", {"name": "weekday-report", "at": "yesterday"}
     )

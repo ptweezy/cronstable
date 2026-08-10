@@ -345,9 +345,11 @@ def test_artifact_list(job_cli, capsys):
 
 
 def test_artifact_get_plaintext_error_body_clean_error(job_cli, capsys):
-    # a daemon that restarted mid-run no longer knows the run token; its
-    # bare 401 renders as PLAINTEXT "401: Unauthorized", not JSON. That must
-    # surface as the endpoint's HTTP error (a clean _CliError), never a
+    # a PLAINTEXT error body, not JSON. This daemon's endpoint now wraps
+    # even its reasonless 401 in the envelope (jobapi error_mw), so the
+    # shape below comes from a daemon older than that arm, a reverse proxy,
+    # or a transport-level failure aiohttp answers itself. It must surface
+    # as the endpoint's HTTP error (a clean _CliError), never a
     # JSONDecodeError traceback -- the binary artifact/xcom verbs used to
     # parse error bodies unguarded, unlike every _json-routed verb.
     http = _FakeHTTP({"/v1/artifact/get": (401, b"401: Unauthorized")})

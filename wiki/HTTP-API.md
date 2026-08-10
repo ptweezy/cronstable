@@ -105,11 +105,32 @@ which CI pins against the daemon's served route table in both directions. The
 sections below carry what the spec deliberately leaves to prose: field
 meanings, defaults, edge cases, and behavior.
 
-Every error body on this API is one JSON envelope: `{"error": "<reason>"}`
-(`Content-Type: application/json`), across the job, DAG, schedule, state, and
-push routes alike. That includes the `401` from the auth middleware and the
-router's own responses (`405` on a wrong method, `404` on an unmatched path).
-`docs/openapi.yaml` declares the same envelope as the `Error` schema.
+Every error body the web API and the loopback state endpoint serve is one JSON
+envelope: `{"error": "<reason>"}` (`Content-Type: application/json`), across
+the job, DAG, schedule, state, and push routes alike. That includes the `401`
+from the auth middleware and the router's own responses (`405` on a wrong
+method, `404` on an unmatched path). `docs/openapi.yaml` declares the same
+envelope as the `Error` schema.
+
+A `404` for a named subject says what was not found, for example
+`{"error": "job 'nightly' not found"}` or, on the routes that also accept a
+DAG's schedule (`/schedule/why`, `/jobs/{name}/calendar.ics`),
+`{"error": "no job or DAG schedule named 'nightly'"}`. The `401` is the one
+error whose reason says nothing: its `error` is the generic
+`401: Unauthorized`, the same bytes for a missing header, a wrong scheme and
+an unknown token, so the response cannot be used to tell them apart.
+
+Requests that fail before they reach the application are answered by aiohttp
+itself, as `text/plain`: a malformed request line, an unparseable method
+token, and request headers past 8190 bytes are each a `400`, and an
+unrecognised `Expect:` header is a `417`. The envelope covers every response
+from the routing layer inward.
+
+One listener is outside this contract: the cluster peer transport
+([Clustering and Leader Election](Clustering-and-Leader-Election)) is a
+separate mTLS listener running its own application, and it answers its own
+`4xx` with no body at all, since its only client is another cronstable
+daemon.
 
 ### `GET /version`
 
@@ -828,12 +849,15 @@ count. `name` duplicates `dag` (the generic subject key the job routes use):
 
 The `limit` query parameter caps the number of runs returned (default 50,
 max 500); a missing or unparseable value falls back to the default rather
-than erroring. `404` if the DAG is not configured.
+than erroring. `404` if the DAG is not configured, or if no
+[`state:` store](Durable-State) is configured at all, since run documents
+only exist in a durable store; the `error` says which.
 
 #### `GET /dags/{name}/runs/{run_key}`
 
 One run's full durable document -- every task's state, attempt, timing, XCom
-expansion (`mapped`), and approval decisions. `404` if the run is unknown.
+expansion (`mapped`), and approval decisions. `404` if the run is unknown,
+with the same split between an unknown DAG and a missing `state:` store.
 
 #### `POST /dags/{name}/trigger`
 
@@ -860,7 +884,8 @@ Body: `{"decision": "approve"|"reject", "by": "<who>"}`. `200` on success,
 The XCom outputs the run's tasks published, as a flat list of entries (task,
 key, sha256, size, timestamp) with small text values inlined and larger ones
 metadata-only; `truncated` flags a run with more entries than the cap. `404`
-if the DAG or run is unknown.
+if the DAG or run is unknown, or if no [`state:` store](Durable-State) is
+configured; the `error` says which.
 
 #### `GET /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs`
 
@@ -1433,7 +1458,9 @@ job can test the variable instead of guessing whether it was set.
 Every request must carry `Authorization: Bearer $CRONSTABLE_STATE_TOKEN`. The token
 is matched in constant time against the live run set, so a missing, malformed,
 forged, or stale token returns `401 Unauthorized` before any state is touched.
-Other outcomes:
+Its body is the same JSON envelope as every other error here, but its `error`
+is the generic `401: Unauthorized`, the same bytes whichever of those it was,
+so the response tells a caller nothing beyond the status. Other outcomes:
 
 | Status | When | Body |
 | --- | --- | --- |
@@ -1441,7 +1468,8 @@ Other outcomes:
 | `409` | A cursor advanced with a value not comparable to its stored one (a type clash). | `{"error": "..."}` |
 | `410` | An artifact record survives but its payload blob was garbage collected. | `{"error": "..."}` |
 | `413` | A value or artifact larger than the configured `maxValueBytes` / `maxArtifactBytes`. | `{"error": "..."}` |
-| `404` | A `get` for a key, cursor, artifact, or secret that is not set. | (empty) |
+| `404` | A `get` for a key, cursor, artifact, or secret that is not set. The reason names it, and the scoped three name the scope too. | `{"error": "..."}` |
+| `500` | An unexpected failure inside the endpoint. The reason is in the cronstable log, not the body. | `{"error": "..."}` |
 | `503` | The state store is unavailable or a backend call timed out. | `{"error": "..."}` |
 
 ### Scopes

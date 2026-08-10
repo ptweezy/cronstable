@@ -994,6 +994,38 @@ def test_why_summary_shapes():
     assert nothing_matched.startswith("NO; minute 5 is not in 0")
 
 
+async def test_why_no_run_miss_names_both_lookups():
+    # cron_why_no_run and GET /schedule/why share one payload builder
+    # (Cron.schedule_why_payload), which resolves a DAG's synthetic
+    # dag:<name> schedule job as readily as a job. So the miss must not
+    # claim only jobs were searched, and must not point at a tool that
+    # cannot list a DAG schedule. The HTTP twin's reason is pinned in
+    # tests/test_cron_web.py.
+    yaml = (
+        _YAML
+        + "dags:\n  - name: sch\n    schedule: '*/5 * * * *'\n"
+        "    tasks:\n      - id: a\n        command: x\n"
+    )
+    h = _handler(yaml=yaml)
+    result = await _call(
+        h, "cron_why_no_run", {"name": "ghost", "at": "2026-01-01T00:00:00Z"}
+    )
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert text == (
+        "no job or DAG schedule named 'ghost'. Use cron_list_jobs or "
+        "cron_list_dags to enumerate."
+    )
+    # the half that makes the old wording false: a dag: name answers
+    result = await _call(
+        h,
+        "cron_why_no_run",
+        {"name": "dag:sch", "at": "2026-01-01T00:00:00Z"},
+    )
+    assert "isError" not in result
+    assert result["structuredContent"]["job"] == "dag:sch"
+
+
 def test_opt_int_rejects_junk():
     assert mcp_mod._opt_int(None) is None
     assert mcp_mod._opt_int("7") == 7

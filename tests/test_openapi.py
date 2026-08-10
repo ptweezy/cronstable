@@ -82,3 +82,74 @@ def test_scope_overrides_name_registered_routes():
                 override_path
             )
         )
+
+
+_ERROR_SCHEMA_REF = "#/components/schemas/Error"
+
+
+def _is_error_schema(schema):
+    """The schema IS the Error envelope, or composes it in via ``allOf``.
+
+    The composed form is for the one error body that carries extra keys
+    alongside `error` (the push `test` 502's `device`/`status`), which is
+    still an envelope a generic client can read.
+    """
+    if schema.get("$ref") == _ERROR_SCHEMA_REF:
+        return True
+    return any(
+        part.get("$ref") == _ERROR_SCHEMA_REF
+        for part in schema.get("allOf") or ()
+    )
+
+
+def test_every_error_response_declares_the_json_envelope():
+    # The spec's Error schema claims every 4xx/5xx body this API's
+    # application serves is that object. Most error responses are written
+    # inline with their own description rather than as a
+    # #/components/responses ref, so the claim only holds if each of those
+    # declares application/json + Error itself; a generated client
+    # otherwise reads them as bodiless. Half a sweep leaves the spec less
+    # internally consistent than none, so this is the pin that keeps it
+    # whole: a new 4xx/5xx must carry the two lines.
+    spec = YAML(typ="safe").load(_SPEC_PATH.read_text(encoding="utf-8"))
+    shared = spec["components"]["responses"]
+    for name, resp in shared.items():
+        body = resp.get("content", {}).get("application/json", {})
+        assert _is_error_schema(body.get("schema") or {}), (
+            "components/responses/{} does not declare the Error "
+            "envelope".format(name)
+        )
+    checked = 0
+    for path, item in spec["paths"].items():
+        for method, op in item.items():
+            if method not in _OPENAPI_METHODS:
+                continue
+            for status, resp in (op.get("responses") or {}).items():
+                if not str(status).isdigit() or int(status) < 400:
+                    continue
+                checked += 1
+                ref = resp.get("$ref")
+                if ref is not None:
+                    # a shared response, already checked above
+                    assert ref.startswith("#/components/responses/"), (
+                        "{} {} {} refs {!r}".format(method, path, status, ref)
+                    )
+                    continue
+                body = resp.get("content", {}).get("application/json", {})
+                assert _is_error_schema(body.get("schema") or {}), (
+                    "{} {} {} declares no application/json Error body; add "
+                    "a content block or use a #/components/responses "
+                    "ref".format(method.upper(), path, status)
+                )
+    # The walk asserts inside its loops, so it "passes" just as quietly on
+    # zero responses as on every response conforming. This says which one
+    # happened, and nothing more: a floor with headroom would turn a
+    # legitimate respelling (consolidating inline responses onto shared
+    # #/components/responses refs, say) into a failure about a number
+    # rather than about the envelope.
+    assert checked, (
+        "the walk visited no 4xx/5xx response at all, so this passed by "
+        "finding nothing rather than by finding the spec whole; the "
+        "structure it walks has moved (a renamed `paths` key, or statuses "
+        "that stopped being plain integers)"
+    )
