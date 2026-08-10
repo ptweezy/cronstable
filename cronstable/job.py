@@ -3,6 +3,7 @@ import asyncio.subprocess
 import atexit
 import html
 import logging
+import ntpath
 import os
 import subprocess
 import sys
@@ -149,10 +150,10 @@ def shell_spawn(
     takes that same path, so the Windows default and an explicit
     ``shell: cmd`` land on one spawn rather than two.
 
-    An absolute ``shell:`` is passed as ``executable`` so a deliberately
-    chosen cmd.exe still beats ``%ComSpec%``; a bare ``cmd`` resolves
-    through ComSpec, which is also what keeps an unqualified name from
-    being searched for in the current directory first.
+    A ``shell:`` spelled out as a path is passed as ``executable`` so a
+    deliberately chosen cmd.exe still beats ``%ComSpec%``; a bare ``cmd``
+    resolves through ComSpec, which is also what keeps an unqualified name
+    from being searched for in the current directory first.
 
     All of which is Windows' business alone, so ``windows`` (defaulting to
     :data:`~cronstable.platform.IS_WINDOWS`, and injectable so both
@@ -164,7 +165,18 @@ def shell_spawn(
     if windows is None:
         windows = platform.IS_WINDOWS
     if windows and is_cmd_shell(shell):
-        kwargs = {"executable": shell} if os.path.isabs(shell) else {}
+        # ntpath, not the host's os.path: `windows=True` drives this
+        # branch from POSIX too, where posixpath reads all of
+        # `C:\Windows\System32\cmd.exe` as one long bare name and
+        # silently drops the operator's chosen shell. The test is
+        # against the basename rather than ntpath.isabs(), which
+        # stopped counting a rooted `\Windows\System32\cmd.exe` as
+        # absolute in 3.13: which cmd.exe a job runs must not depend
+        # on the interpreter that scheduled it. Anything carrying a
+        # directory or a drive is a path the operator spelled out;
+        # only a bare name goes to ComSpec.
+        spelled_out = ntpath.basename(shell) != shell
+        kwargs = {"executable": shell} if spelled_out else {}
         return asyncio.create_subprocess_shell, [command], kwargs
     return asyncio.create_subprocess_exec, [shell, "-c", command], {}
 
