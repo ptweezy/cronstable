@@ -3,6 +3,7 @@ import asyncio.subprocess
 import atexit
 import html
 import logging
+import ntpath
 import os
 import subprocess
 import sys
@@ -110,6 +111,101 @@ def loggable_spawn_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     redacted = dict(kwargs)
     redacted["env"] = "<{} vars, values omitted>".format(len(kwargs["env"]))
     return redacted
+
+
+def is_cmd_shell(shell: str) -> bool:
+    """Whether ``shell`` names the Windows command processor.
+
+    Matched on the basename, so ``cmd``, ``cmd.exe`` and a full
+    ``C:\\Windows\\System32\\cmd.exe`` all resolve alike.
+    """
+    name = os.path.basename(shell.replace("\\", "/")).lower()
+    return name in ("cmd", "cmd.exe")
+
+
+def shell_spawn(
+    shell: str, command: str, windows: Optional[bool] = None
+) -> tuple[Any, list[str], dict[str, Any]]:
+    """The spawn call, argv and extra kwargs for ``command`` under ``shell``.
+
+    Every shell but cmd.exe is spawned directly, as ``<shell> -c
+    <command>`` (PowerShell reads ``-c`` as an abbreviation of
+    ``-Command``).  Windows has no argv, so that list is rendered into one
+    command line by the MSVC runtime's quoting rules, and those are the
+    rules ``CommandLineToArgvW`` reverses, which is how every one of those
+    shells recovers the command it was handed.
+
+    cmd.exe is the exception, for two reasons.  It wants ``/c``, not
+    ``-c``: handed ``-c`` it starts an interactive shell, prints its
+    version banner, reads EOF on stdin and exits 0, so a ``shell: cmd`` job
+    records a clean success without ever running its command.  It also
+    parses its own command line by its own rules rather than
+    ``CommandLineToArgvW``'s, so the ``\\"`` the renderer emits for an
+    embedded double quote survives into the command verbatim and ``echo
+    "hello world"`` prints ``\\"hello world\\"``.  Handing the command
+    string to :func:`asyncio.create_subprocess_shell` instead skips the
+    rendering entirely: the string goes to ``CreateProcess`` as
+    ``%ComSpec% /c "<command>"``, which is both the flag cmd.exe wants and
+    the shape its ``/c`` quote rules are written for.  An empty ``shell:``
+    takes that same path, so the Windows default and an explicit
+    ``shell: cmd`` land on one spawn rather than two.
+
+    A ``shell:`` spelled out as a path is passed as ``executable`` so a
+    deliberately chosen cmd.exe still beats ``%ComSpec%``; a bare ``cmd``
+    resolves through ComSpec, which is also what keeps an unqualified name
+    from being searched for in the current directory first.
+
+    All of which is Windows' business alone, so ``windows`` (defaulting to
+    :data:`~cronstable.platform.IS_WINDOWS`, and injectable so both
+    branches are testable from either OS) gates it: a POSIX box running a
+    shell that happens to be named ``cmd`` gets the ordinary treatment,
+    and a ``shell: cmd`` typo there still fails to spawn rather than
+    quietly running under /bin/sh.
+    """
+    if windows is None:
+        windows = platform.IS_WINDOWS
+    if windows and is_cmd_shell(shell):
+        # ntpath, not the host's os.path: `windows=True` drives this
+        # branch from POSIX too, where posixpath reads all of
+        # `C:\Windows\System32\cmd.exe` as one long bare name and
+        # silently drops the operator's chosen shell. The test is
+        # against the basename rather than ntpath.isabs(), which
+        # stopped counting a rooted `\Windows\System32\cmd.exe` as
+        # absolute in 3.13: which cmd.exe a job runs must not depend
+        # on the interpreter that scheduled it. Anything carrying a
+        # directory or a drive is a path the operator spelled out;
+        # only a bare name goes to ComSpec.
+        spelled_out = ntpath.basename(shell) != shell
+        kwargs = {"executable": shell} if spelled_out else {}
+        return asyncio.create_subprocess_shell, [command], kwargs
+    return asyncio.create_subprocess_exec, [shell, "-c", command], {}
+
+
+def _decode_output_line(raw: bytes) -> str:
+    """Decode one captured line (or unterminated tail) of job output.
+
+    UTF-8 first, strictly: the overwhelmingly common case on every
+    platform, and what POSIX tools and PowerShell 7 emit.  On Windows the
+    native console tools (cmd.exe builtins, ``dir``, OS error messages,
+    Windows PowerShell 5) emit the console's OEM code page instead, so a
+    line that is not valid UTF-8 is retried through the Windows-only
+    ``"oem"`` codec, keeping accented output from a non-English install
+    intact rather than collapsing it to U+FFFD.  Anything still undecodable
+    falls back to UTF-8 with replacement (the old unconditional behavior),
+    so the reader task can never die on job-controlled bytes.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        if platform.IS_WINDOWS:
+            try:
+                # East Asian OEM code pages are multi-byte and can also
+                # fail to decode; LookupError guards a Python built
+                # without the codec.
+                return raw.decode("oem")
+            except (UnicodeDecodeError, LookupError):
+                pass
+        return raw.decode("utf-8", errors="replace")
 
 
 # How many of the most recent output lines a JobOutputStream retains for the
@@ -427,11 +523,27 @@ class StreamReader:
 
     @staticmethod
     def _emit(out_stream, out_line: str) -> None:
-        # Write bytes so we control the encoding; fall back to ASCII with
-        # replacement when the console encoding can't represent the text.
+        # Write bytes so we control the encoding, and use the STREAM'S OWN
+        # encoding, not a hardcoded UTF-8: a Windows daemon whose output is
+        # redirected to a pipe or log file declares the ANSI code page, and
+        # UTF-8 bytes in that file read back as mojibake. Replacement (not
+        # raising) for what the target encoding cannot carry; ASCII with
+        # replacement remains the last-ditch fallback for a stream with a
+        # broken or unknown encoding.
+        #
+        # A real console and almost every POSIX process declare UTF-8 (PEP
+        # 538 coerces the C locale, PEP 540 turns UTF-8 mode on by default
+        # from 3.15), so those streams get the same bytes either way. Under
+        # an explicit non-UTF-8 locale they do not: non-ASCII job output
+        # reaches the mirror as `?` rather than as UTF-8 the stream never
+        # claimed it could carry. That side of the trade is deliberate,
+        # since the mirror is read by whatever the operator pointed the
+        # daemon's stdout at.
         try:
-            out_stream.buffer.write(out_line.encode())
-        except UnicodeEncodeError:
+            encoding = getattr(out_stream, "encoding", None) or "utf-8"
+            payload = out_line.encode(encoding, errors="replace")
+            out_stream.buffer.write(payload)
+        except (LookupError, UnicodeEncodeError):
             safe = out_line.encode("ascii", "replace").decode("ascii")
             out_stream.write(safe)
         out_stream.flush()
@@ -517,16 +629,12 @@ class StreamReader:
                     # so the per-line cap check only runs once the buffer
                     # itself has passed the cap.
                     parts = [p for p in parts if not self._too_long(p, cap)]
-                # errors="replace" so a job emitting non-UTF-8 bytes does
-                # not crash the reader task with UnicodeDecodeError.
-                lines = [
-                    raw.decode("utf-8", errors="replace") + "\n"
-                    for raw in parts
-                ]
+                # decoded per line: strict UTF-8 with an OEM-code-page
+                # retry on Windows, never an exception (see
+                # _decode_output_line).
+                lines = [_decode_output_line(raw) + "\n" for raw in parts]
             elif tail_len and not self._over_cap(tail_len, cap):
-                lines = [
-                    b"".join(tail_parts).decode("utf-8", errors="replace")
-                ]
+                lines = [_decode_output_line(b"".join(tail_parts))]
             else:
                 lines = []
             for line in lines:
@@ -812,13 +920,15 @@ class ShellReporter(Reporter):
         if shell_config["command"] is None:
             return
 
+        shell_kwargs: dict[str, Any] = {}
         if isinstance(shell_config["command"], list):
             create: Any = asyncio.create_subprocess_exec
             cmd = shell_config["command"]
         else:
             if shell_config["shell"]:
-                create = asyncio.create_subprocess_exec
-                cmd = [shell_config["shell"], "-c", shell_config["command"]]
+                create, cmd, shell_kwargs = shell_spawn(
+                    shell_config["shell"], shell_config["command"]
+                )
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [shell_config["command"]]
@@ -911,6 +1021,7 @@ class ShellReporter(Reporter):
         # below reaches the reporter's descendants as a unit (see
         # platform.new_process_group_kwargs).
         kwargs = platform.new_process_group_kwargs()
+        kwargs.update(shell_kwargs)
         try:
             proc = await create(*cmd, env=env, **kwargs)
         # OSError: a missing reporter binary or a spawn-time resource
@@ -1564,8 +1675,10 @@ class RunningJob:
             cmd = self.config.command
         else:
             if self.config.shell:
-                create = asyncio.create_subprocess_exec
-                cmd = [self.config.shell, "-c", self.config.command]
+                create, cmd, shell_kwargs = shell_spawn(
+                    self.config.shell, self.config.command
+                )
+                kwargs.update(shell_kwargs)
             else:
                 create = asyncio.create_subprocess_shell
                 cmd = [self.config.command]
@@ -1843,12 +1956,17 @@ class RunningJob:
             )
             return
         self._terminated = True
-        # Graceful first: SIGTERM the group, which reaches descendants
-        # even once the leader has exited. On Windows this step IS the
-        # taskkill tree kill: there is no graceful signal, and the tree
-        # walk must run while the root is still alive to anchor it
-        # (killing the root first would orphan every descendant for good).
-        # The direct-child fallback remains for an unsignallable group.
+        # Graceful first: SIGTERM the group on POSIX, CTRL_BREAK_EVENT to the
+        # group on Windows (both trappable, so the job gets killTimeout
+        # seconds to flush and exit). On POSIX this reaches the descendants
+        # even once the leader itself has exited, which is exactly the case
+        # that wedges the run. On Windows, where the break cannot be
+        # delivered (no shared console, as in a service context), this step
+        # degrades to the immediate taskkill tree kill, which must run while
+        # the root is still alive to anchor its walk (killing the root
+        # first, as the fallback below does, would orphan every descendant
+        # for good). The fallback to the direct child remains for a
+        # group/tree that could not be signalled at all.
         if not await platform.kill_process_group(self.proc.pid, force=False):
             if self.proc.returncode is None:
                 try:

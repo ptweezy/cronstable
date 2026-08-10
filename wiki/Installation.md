@@ -245,6 +245,14 @@ on ARM64) and run it directly; no `chmod` is needed:
 .\cronstable-windows-amd64.exe --version
 ```
 
+The Windows binaries carry a version resource but are not
+Authenticode-signed, so the first run of a browser-downloaded copy trips
+SmartScreen: choose "More info", then "Run anyway", and verify the download
+against the release's `SHA256SUMS` if your policy calls for it. `winget
+install ptweezy.cronstable` installs the same binary through the Windows
+Package Manager. See [Running on Windows](Running-on-Windows) for the full
+Windows install and deployment story.
+
 ### macOS signing and notarization
 
 The macOS binaries are Developer ID code-signed (hardened runtime)
@@ -302,14 +310,17 @@ always runs in the foreground:
 cronstable -c /etc/cronstable.d
 ```
 
-The `-c` default is platform-specific: `/etc/cronstable.d` on POSIX, and
-`%APPDATA%\cronstable` on Windows (e.g. `C:\Users\<you>\AppData\Roaming\cronstable`,
-falling back to the user profile `~` if `APPDATA` is unset). The default `shell`
-also differs: `/bin/sh` on POSIX, and on Windows an empty default that runs a
-string `command` through `%ComSpec%` (`cmd.exe`). On Windows, press Ctrl-C (or
-Ctrl-Break) to stop cronstable gracefully; it finishes running jobs first, just as
-SIGTERM does on POSIX. Note that per-job `user`/`group` switching and `unix://`
-web listeners are not available on Windows; see
+The `-c` default is platform-specific: `/etc/cronstable.d` on POSIX; on Windows
+the machine-wide `%ProgramData%\cronstable` when that directory holds
+configuration, otherwise `%APPDATA%\cronstable`
+(e.g. `C:\Users\<you>\AppData\Roaming\cronstable`,
+falling back to the user profile `~` if `APPDATA` is unset). `cronstable init`
+writes a commented starter configuration into the default location. The
+default `shell` also differs: `/bin/sh` on POSIX, and on Windows an empty
+default that runs a string `command` through `%ComSpec%` (`cmd.exe`). On
+Windows, press Ctrl-C to stop cronstable gracefully; it finishes running jobs
+first, just as SIGTERM does on POSIX. Note that per-job `user`/`group`
+switching and `unix://` web listeners are not available on Windows; see
 [Running on Windows](Running-on-Windows) for the full details.
 
 See [Command-Line Reference](CLI-Reference) for all flags, and

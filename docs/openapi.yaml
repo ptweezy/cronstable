@@ -76,6 +76,8 @@ tags:
     description: Durable-state inspector (metadata only).
   - name: push
     description: End-to-end encrypted push alerts and device pairing.
+  - name: daemon
+    description: Daemon lifecycle (the authenticated graceful stop).
   - name: metrics
     description: Prometheus exposition.
 
@@ -1118,6 +1120,34 @@ paths:
           description: No `push:` section, or no device with this id.
         "503":
           description: The device registry's store is unavailable.
+
+  /shutdown:
+    post:
+      tags: [daemon]
+      summary: Gracefully stop this daemon
+      operationId: shutdownDaemon
+      x-required-scope: control
+      description: >-
+        The same drain Ctrl-C / SIGTERM trigger: stop scheduling new runs,
+        wait for the running jobs to finish, stop the web app, exit. The
+        graceful stop for deployments with no console to press Ctrl-C in
+        (service wrappers, supervisors, headless Windows boxes, where no
+        SIGTERM exists). Always refused unless the request is bearer-token
+        authenticated, even on a deployment that leaves every other route
+        open: an unauthenticated listener must not hand every process that
+        can reach it a stop switch. In a cluster this stops only the node
+        addressed.
+      responses:
+        "200":
+          description: "`{shuttingDown: true}`: the drain has begun."
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            No bearer token authenticated this request (including the case
+            where the listener has no tokens configured at all).
 
   /metrics:
     get:
