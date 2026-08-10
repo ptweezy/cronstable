@@ -805,6 +805,70 @@ def test_run_stats_cpu_and_memory_aggregates():
     assert stats["last_rss_bytes"] is None
 
 
+def test_run_stats_last_fields_take_the_newest_by_finished_at():
+    # run records are appended unserialized and a peer node sharing the mount
+    # appends through its own process, so the last row in the list can be an
+    # older run.  Inverted on purpose: the newer run is FIRST.
+    from cronstable.resources import ResourceUsage
+
+    newer = _mk_run("success", dur=5.0)
+    newer.resource_usage = ResourceUsage(3.0, 0.0, 7000, 1)
+    older = _mk_run("success", dur=1.0)
+    older.resource_usage = ResourceUsage(1.0, 0.0, 1000, 1)
+    stats = cronstable.cron._run_stats([newer, older])
+    assert stats["last_duration"] == 5.0
+    assert stats["last_cpu_seconds"] == 3.0
+    assert stats["last_rss_bytes"] == 7000
+    # the aggregates are untouched: only the "last" selection moved
+    assert stats["avg_duration"] == 3.0
+    assert stats["max_cpu_seconds"] == 3.0
+
+
+def test_run_stats_equal_finish_instants_resolve_to_the_later_position():
+    # the documented tiebreak, and the guard for a plain max(): max returns
+    # the FIRST maximum it walks, so folding forwards over rows sharing an
+    # instant would report the OLDEST position's run as "last" and quietly
+    # invert test_run_stats_cpu_and_memory_aggregates above.
+    from cronstable.resources import ResourceUsage
+
+    first = _mk_run("success")
+    first.resource_usage = ResourceUsage(1.0, 0.0, 1000, 1)
+    second = _mk_run("success")
+    second.resource_usage = ResourceUsage(9.0, 0.0, 9000, 1)
+    stats = cronstable.cron._run_stats([first, second])
+    assert stats["last_cpu_seconds"] == 9.0
+    assert stats["last_rss_bytes"] == 9000
+
+
+def test_run_stats_row_without_a_finish_instant_never_wins_the_fold():
+    # the key function is total, so no caller has to pre-filter its rows: a
+    # JobRunInfo without a finish instant sorts oldest instead of making the
+    # fold raise TypeError.  The ledger cannot produce one (a record with
+    # neither finished_at nor interruptedAt is rejected outright by
+    # _job_run_info_from_dict, and a crash-reconciled row carrying only
+    # interruptedAt is rebuilt with the interruption instant standing in), so
+    # this row is hand-constructed.
+    from cronstable.resources import ResourceUsage
+
+    orphan = cronstable.cron.JobRunInfo(
+        outcome="unknown",
+        exit_code=None,
+        started_at=None,
+        finished_at=None,
+        fail_reason="no finish instant",
+        output=JobOutputStream(),
+    )
+    real = _mk_run("success", dur=2.0)
+    real.resource_usage = ResourceUsage(4.0, 0.0, 4000, 1)
+    assert cronstable.cron._run_finish_key(
+        orphan
+    ) < cronstable.cron._run_finish_key(real)
+    stats = cronstable.cron._run_stats([real, orphan])
+    assert stats["last_duration"] == 2.0
+    assert stats["last_cpu_seconds"] == 4.0
+    assert stats["total"] == 2
+
+
 def test_run_stats_no_monitored_runs_leaves_resource_fields_none():
     stats = cronstable.cron._run_stats(
         [_mk_run("success"), _mk_run("failure")]
@@ -856,6 +920,63 @@ def test_record_run_releases_superseded_ring():
     assert [line for _s, line in cron.last_run["alpha"].output.lines] == [
         "the new newest"
     ]
+
+
+def test_record_run_releases_the_ring_of_whichever_row_is_not_newest():
+    # the other direction of the same invariant, and a two-directional trap.
+    # A completion landing older than one already recorded (a peer node's
+    # append on a shared mount, or a backward wall-clock step) does not take
+    # over last_run, so the release has to follow the promotion rather than
+    # the call order: freeing the previous record unconditionally would empty
+    # the drawer the log replay still serves, and freeing nothing would leak
+    # the un-promoted row's 1000-line ring for the whole history window.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    newer = _mk_run("success", dur=5.0)
+    newer.output.publish("stdout", "kept while newest")
+    newer.output.close()
+    cron._record_run("alpha", newer)
+
+    older = _mk_run("failure", exit_code=1, dur=1.0)
+    older.output.publish("stdout", "landed late")
+    older.output.close()
+    cron._record_run("alpha", older)
+
+    assert cron.last_run["alpha"] is newer
+    assert [line for _s, line in newer.output.lines] == ["kept while newest"]
+    # the un-promoted row is the superseded one, so ITS ring is released
+    assert list(older.output.lines) == []
+    assert older.output.published == 1
+    # both rows stay in history as summaries
+    assert list(cron.run_history["alpha"]) == [newer, older]
+    # and the watermarks did not rewind with it
+    assert cron._sla_last_success["alpha"] == newer.finished_at
+    assert cron._last_completed_at["alpha"] == newer.finished_at
+    assert cron._last_real_outcome["alpha"] == (newer.finished_at, "success")
+
+
+async def test_reconcile_open_record_releases_the_superseded_ring():
+    # the third writer of last_run, and the one that installs a row it did
+    # not run: on a runtime slot takeover the outgoing last_run is a real
+    # local run holding a full ring, which would otherwise sit in
+    # run_history until it fell out of RUN_HISTORY_LIMIT.
+    cron = cronstable.cron.Cron(None, config_yaml=TWO_JOBS)
+    ran = _mk_run("success", dur=1.0)
+    ran.output.publish("stdout", "replayable while newest")
+    ran.output.close()
+    cron._record_run("alpha", ran)
+
+    # this host's own crash, so the synthetic row is promoted whatever its
+    # instant, and the run it supersedes gives up its ring
+    cron._reconcile_open_record(
+        "alpha",
+        cron.cron_jobs["alpha"],
+        {"startedAt": "2020-01-01T00:00:00+00:00", "host": cron._state_host},
+        "reconciled-crash",
+    )
+    assert cron.last_run["alpha"].outcome == "unknown"
+    assert list(ran.output.lines) == []
+    assert ran.output.published == 1
+    await asyncio.gather(*list(cron._pending_state_writes))
 
 
 _ARCHIVE_JOB = """
@@ -1154,7 +1275,14 @@ async def test_web_job_runs_endpoint_returns_runs_and_stats():
     assert stats["avg_duration"] == pytest.approx((2 + 4 + 6 + 1) / 4)
     assert stats["min_duration"] == 1.0
     assert stats["max_duration"] == 6.0
-    assert stats["last_duration"] == 1.0
+    # "last" is the newest run by finished_at, not the last one appended:
+    # _mk_run shares one start instant across the four rows and varies the
+    # duration, so the dur=6.0 run is the one that finished last even
+    # though the dur=1.0 cancellation was recorded after it.
+    assert stats["last_duration"] == 6.0
+    # ...and last_run follows the same rule, so the older cancellation
+    # recorded last did not become the job's latest run.
+    assert cron.last_run["alpha"].outcome == "success"
 
 
 @pytest.mark.asyncio

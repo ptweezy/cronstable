@@ -102,7 +102,7 @@ state:
 | `path` | *(required)* | Directory the store lives under. A local directory gives single-node restart durability; an Amazon S3 Files / EFS mount gives the same durability fleet-wide. See [One backend, two topologies](#one-backend-two-topologies). |
 | `topology` | `auto` | Whether the store is shared between hosts. `auto` probes the mount's filesystem type; `single-node` / `shared` override the probe. |
 | `deploymentId` | *(none)* | Namespace inside the store, so several deployments can share one mount without touching each other's records (each also garbage-collects only its own namespace). Unset means the `default` namespace. |
-| `maxRunsPerJob` | `1000` | How many finished-run records (and archived outputs) to retain per job. `<= 0` means unbounded. Bounds the ledger every durable feature reads. |
+| `maxRunsPerJob` | `1000` | How many finished-run records (and archived outputs) to retain per job. `<= 0` means unbounded. Bounds the ledger every durable feature reads. `1` is raised to `2`, logged once at startup; see [Operational notes](#operational-notes). |
 | `onStoreUnavailable` | `degrade` | What the durable-truth gates do when the store cannot answer. See [When the store is unavailable](#when-the-store-is-unavailable-onstoreunavailable). |
 | `gcGraceSeconds` | `604800` | How long a job's streams must be unreferenced *and* idle before [garbage collection](#garbage-collection-and-manifests) deletes them. `<= 0` disables automatic GC. |
 | `maxOpsPerSecond` | `0` | Token-bucket cap on store operations, for request-billed mounts. `0` = unlimited. See [Rate limiting](#rate-limiting-maxopspersecond). |
@@ -285,6 +285,34 @@ history drawer, sparklines, and `GET /jobs/{name}/runs` show runs from before
 the restart, immediately, instead of starting blank. Rehydration is read-only
 and bounded (a slow store skips it with a warning; history then fills in as
 jobs run, exactly as with no rehydration).
+
+A job's *latest* run is the one with the newest finish time, not the last
+record in the stream. Each job's appends are written through a per-job chain,
+which orders what one node writes but cannot order what a peer sharing the
+mount writes through its own process, so an interleaved append can put an
+older run last. Everything that answers "the latest run" folds by finish time
+instead: the rehydrated `last_run`, the retry ladder's superseded-by-run
+watermark, the `maxTimeSinceSuccess` reference, the `onlyIfLastSucceeded`
+memo, and the `last_duration`, `last_cpu_seconds` and `last_rss_bytes` fields
+in the `stats` block. Two runs sharing a finish instant resolve to the later
+one in the stream.
+
+One row is installed as the latest whatever its instant: a run of *this* node
+that a crash interrupted. Its record stands in the instant the run started,
+and since `concurrencyPolicy: Allow` is the default, an overlapping instance
+of the same job routinely finishes after that, so folding would hide the crash
+behind it. A slot takeover reconciling *another* node's interrupted run says
+nothing about what ran here and takes the fold like everything else, so it
+cannot displace a newer local run.
+
+The run *listings* are a different question, and they are never re-ordered at
+read time. After a restart the ring is rebuilt in finish order; from then on
+it grows in the order this node observed the completions, so a peer's
+interleaved append, or a crash-reconciled row standing in a past instant,
+leaves the tail out of finish order. Every row in a listing is displayed, so
+an inverted pair moves a cell rather than changing a verdict, and an
+interrupted run reads better where it was seen than a long way back in the
+history.
 
 > **A different feature with a similar name:** the
 > [Web Dashboard's opt-in run ledger](Web-Dashboard#run-ledger) records
@@ -665,7 +693,9 @@ ledger**:
 ```
 
 The horizon is bounded by `maxRunsPerJob` retention; on a shared mount the
-ledger merges **every node's** runs, so the numbers are fleet-wide. When the
+ledger merges **every node's** runs, so the numbers are fleet-wide, and the
+window's `last_duration`, `last_cpu_seconds` and `last_rss_bytes` describe
+the run in it with the newest finish time whichever node wrote it. When the
 store is unavailable the endpoint degrades to the in-memory history
 (`"source": "memory"`) rather than erroring, so it always answers. It is
 authenticated like every other data endpoint (bearer token when configured);
@@ -1042,6 +1072,14 @@ documents the UI.
   wall-clock timestamps *across hosts* on a shared mount, so fleet-wide use
   assumes bounded clock skew -- run NTP (or your platform's equivalent) on
   every node that mounts the store. Irrelevant to single-node use.
+* **`maxRunsPerJob` below 2.** The ledger prune keeps the newest records by
+  write order, and no node can order a peer's appends against its own, so a
+  retention of `1` leaves no room for a pair that landed inverted: the record
+  kept would be the older run and the newer one would be deleted. cronstable
+  raises `1` to `2` and logs the adjustment once at startup. The prune stays
+  write-ordered on purpose, because a crash-reconciled record under
+  `onMissed: run-once` or `run-all` deliberately carries no finish time and a
+  finish-keyed prune would have no key for exactly those records.
 * **Encryption at rest is the mount's job.** The store writes plain JSON
   files and delegates at-rest encryption to the filesystem underneath --
   LUKS/dm-crypt locally, or the EFS / S3 encryption options on a shared
