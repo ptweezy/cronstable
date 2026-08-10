@@ -75,8 +75,8 @@ Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `workingDirectory`, `priority`, `failsWhen`, run-scoped `secrets`,
 `monitorResources`, and the rest of the shared launch keys; the complete
 list, with types and defaults, is in the
-[configuration reference](Configuration-Reference#dags).
-Because a task **is** a job invocation, its launch fields inherit the file's
+[configuration reference](Configuration-Reference#dags). Because a task **is**
+a job invocation, its launch fields inherit the file's
 [`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a
 job does: a global `shell`, `environment`, `monitorResources`, run-scoped
 `secrets`, or reporter block covers DAG tasks too, and the task's own value

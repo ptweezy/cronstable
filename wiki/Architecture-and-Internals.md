@@ -571,19 +571,19 @@ and sets `self._jobs_running`. The lifecycle inside `RunningJob`:
    error `"Job <name>: changing user/group is not supported on Windows"` (gated on
    `IS_WINDOWS` in `config.py`), so `_demote`/`preexec_fn` never applies there. If
    the spawn raises `SubprocessError`, `ValueError` (an unencodable argv, an
-   embedded NUL) or `OSError` (a bad `argv[0]` or `cwd`, and the
+   embedded NUL), or `OSError` (a bad `argv[0]` or `cwd`, plus the
    resource-exhaustion and permission cases), the error is logged,
-   `self.start_failed = True` is set, and
-   `start()` returns without a process. On success `_on_start()` emits the statsd
-   `job_started` metric (best-effort; `OSError` is caught) and a `StreamReader`
-   task is started for each captured stream.
+   `self.start_failed = True` is set, and `start()` returns without a process.
+   On success `_on_start()` emits the statsd `job_started` metric
+   (best-effort; `OSError` is caught) and a `StreamReader` task is started for
+   each captured stream.
 
    The job's `priority` reaches the spawn through the same two-platform split.
    On Windows the Ctrl-C/`CTRL_BREAK` creation flags also carry it as a
-   priority class, OR-ed in by `new_process_group_kwargs` itself, which is why
-   that helper is the only writer of `creationflags` in the tree:
+   priority class, OR-ed in by `new_process_group_kwargs` itself. That is why
+   the helper is the only writer of `creationflags` in the tree:
    `CreateProcess` is the only race-free moment to set a class, and a caller
-   assembling flags itself could drop one of the two bits. POSIX has no
+   assembling the flags itself could drop one of the two bits. POSIX has no
    spawn-time equivalent, so `platform.apply_priority` renices the job's
    process group (`setpriority` with `PRIO_PGRP`) as the first thing after a
    successful spawn. It is not a `preexec_fn`: that hook runs between fork and

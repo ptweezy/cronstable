@@ -1351,8 +1351,8 @@ with `user` or `group` set is rejected with a configuration error; see
 ### Working directory
 
 By default a job starts in whatever directory cronstable itself is running in.
-`workingDirectory` names the directory instead, which matters most on Windows,
-where an elevated console starts the daemon in the system directory and every
+`workingDirectory` names the directory instead. It matters most on Windows,
+where an elevated console starts the daemon in the system directory, so every
 relative path in a script resolves somewhere unintended. It is the equivalent
 of the "Start in" box on a Task Scheduler action.
 
@@ -1365,10 +1365,10 @@ of the "Start in" box on a Task Scheduler action.
   workingDirectory: C:\jobs\importer
 ```
 
-`~` and `${VAR}` are expanded and the result is made absolute at config load.
-Existence is checked by the OS at spawn, not at load, so a directory that is
-not there records that run as a launch failure rather than failing the whole
-config. The key can also be set in a `defaults:` block and on a DAG task. See
+cronstable expands `~` and `${VAR}` and makes the result absolute at config
+load. The OS checks that the directory exists at spawn, not at load, so a
+missing one fails that one run at launch instead of rejecting the whole
+config. You can also set the key in a `defaults:` block and on a DAG task. See
 [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#workingdirectory).
 
 ### Process priority
@@ -1387,14 +1387,14 @@ box, in five levels: `idle`, `below-normal`, `normal`, `above-normal`,
 ```
 
 On Windows the level becomes the process's priority class at creation; on
-POSIX the job's process group is reniced right after the spawn (`idle` is
-nice 19, `high` is nice -10). Lowered levels are inherited by descendants on
-both platforms; a raised one applies to the job's own process on Windows,
-which resets an unflagged child of an above-normal or high parent to NORMAL.
-POSIX renices the whole group, so it has no such split. The default,
-`normal`, is the one level that is never applied. Raising a priority needs
-privilege on POSIX, and a kernel that refuses leaves the run going at the
-priority it inherited rather than failing it. See
+POSIX cronstable renices the job's process group right after the spawn
+(`idle` is nice 19, `high` is nice -10). Descendants inherit a lowered level
+on both platforms. A raised one reaches only the job's own process on
+Windows, which starts an unflagged child of an above-normal or high parent at
+NORMAL; POSIX renices the whole group, so it has no such split. `normal` is
+the default, and the one level cronstable never applies. Raising a priority
+needs privilege on POSIX, and a kernel that refuses leaves the run going at
+the priority it inherited rather than failing it. See
 [Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#priority).
 
 ### Remote web/HTTP interface
@@ -1484,7 +1484,7 @@ which gives it some useful properties:
 * it covers **every behavior-affecting field** (command, schedule, shell, the
   *names* of `environment` variables, capture flags, `failsWhen`,
   retry/reporting policy, timezone, `enabled`, and so on), so any meaningful
-  change to a job changes the id; per-host values are deliberately left out,
+  change to a job changes the id; it deliberately leaves out per-host values,
   `workingDirectory` among them, so a Windows replica and a Linux one running
   the same jobs from paths they spell differently still agree;
 * `user`/`group` are fingerprinted **as configured** (e.g. `www-data`), not as

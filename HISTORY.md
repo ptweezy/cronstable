@@ -93,10 +93,10 @@ Windows fixes and additions. The first of many updates to address Windows first-
   hazard.
 - The readers that answer "which run is the newest" judge by finish time
   instead of by position in the stream. Chaining orders the appends one
-  node makes; it cannot order the appends a peer node sharing the mount
-  issues through its own process, so the last record in `runs/<job>` can
-  still be an older run. After a restart a job's latest run is now the
-  newest one it finished, so `GET /jobs`, the dashboard and the
+  node makes. It cannot order what a peer node sharing the mount appends
+  through its own process, so the last record in `runs/<job>` can still be
+  an older run. After a restart a job's latest run is now the newest one
+  it finished, so `GET /jobs`, the dashboard and the
   `cronstable_job_last_run_*` gauges can no longer report a failure for a
   job whose newest run succeeded. The retry ladder's superseded-by-run
   watermark, the `maxTimeSinceSuccess` reference, the
@@ -106,23 +106,22 @@ Windows fixes and additions. The first of many updates to address Windows first-
   interrupted run no longer overwrites a newer local run either: the
   synthetic row it installs carries the interrupted run's start instant,
   which is often older than a run this node already recorded. A run of
-  this node that a crash interrupted is still the latest run whatever
-  finished around it, because its record stands in the instant that run
-  started and `concurrencyPolicy: Allow` (the default) lets an
+  this node that a crash interrupted is still the latest run no matter
+  what finished around it, because its record stands in the instant that
+  run started and `concurrencyPolicy: Allow` (the default) lets an
   overlapping instance finish after it; folding there would hide the
   crash. Runs sharing a finish instant resolve to the later one in the
-  stream, the answer the positional read gave. The run listings
-  themselves are never re-ordered when they are read: after a restart the
-  history ring is rebuilt in finish order, and from then on it grows in
-  the order this node observed the completions. Every row in a listing is
-  displayed, so an inverted pair moves a cell rather than changing a
-  verdict, and an interrupted run reads better where it was seen than
-  where it began.
+  stream, the answer the positional read gave. Reading a run listing
+  never re-orders it: after a restart the history ring is rebuilt in
+  finish order, and from then on it grows in the order this node observed
+  the completions. A listing shows every row, so an inverted pair moves a
+  cell rather than changing a verdict, and an interrupted run reads
+  better where it was seen than where it began.
 - `maxRunsPerJob: 1` retains two run records per job and logs the
   adjustment once at startup. The prune keeps the newest records by write
   order, so a retention of one leaves no room for a pair that landed
-  inverted, and the run deleted is then the newer one, which nothing can
-  recover. The prune stays write-ordered on purpose: a crash-reconciled
+  inverted, and the run it deletes is then the newer one, which nothing
+  can recover. The prune stays write-ordered on purpose: a crash-reconciled
   record under `onMissed: run-once` or `run-all` deliberately carries an
   interruption instant and no finish time, so a finish-keyed prune would
   have no key for exactly the records the reconciliation path writes.
@@ -131,19 +130,19 @@ Windows fixes and additions. The first of many updates to address Windows first-
   script written around relative paths no longer depends on wherever the
   daemon happened to be launched from, which on an elevated Windows console
   is the system directory. It is the equivalent of the "Start in" box on a
-  Task Scheduler action, it works in a `defaults:` block and on a DAG task
-  like every other launch field, and `~` and `${VAR}` are expanded and the
-  result made absolute at load. A directory that does not exist is not a
-  load error: config load runs on hosts that are not the target, so the OS
-  decides at spawn and a bad value records the run as a launch failure whose
-  log line names the directory. It is deliberately not part of the job-set
-  id, so replicas running the same jobs from paths their own hosts spell
-  differently still agree on what they are running.
+  Task Scheduler action, and it works in a `defaults:` block and on a DAG
+  task like every other launch field. cronstable expands `~` and `${VAR}`
+  and makes the result absolute at load. A directory that does not exist is
+  not a load error: config load runs on hosts that are not the target, so
+  the OS decides at spawn and a bad value records the run as a launch
+  failure whose log line names the directory. It is deliberately not part
+  of the job-set id, so replicas running the same jobs from paths their own
+  hosts spell differently still agree on what they are running.
 - Jobs can declare a `priority`, one of `idle`, `below-normal`, `normal`,
   `above-normal` and `high`. On Windows it becomes the process's priority
   class at creation; on POSIX the job's process group is reniced to an
   absolute value just after the spawn. How far a Windows class carries is
-  asymmetric: `idle` and `below-normal` are inherited by descendants, while
+  asymmetric: descendants inherit `idle` and `below-normal`, while
   `above-normal` and `high` apply to the job's own process, since Windows
   resets an unflagged child of an above-normal or high parent to NORMAL. So
   a `shell: cmd` job at `high` gets cmd.exe at HIGH and the programs cmd.exe
@@ -151,11 +150,11 @@ Windows fixes and additions. The first of many updates to address Windows first-
   inherits the value, so it has no such split. `normal`, the default, is the
   one level that is never applied. Raising a priority needs
   `CAP_SYS_NICE` or `RLIMIT_NICE` headroom on POSIX: cronstable says so once
-  at config load, naming the job, and a kernel that then refuses leaves the
-  run going at the priority it inherited instead of failing it. `realtime`
-  is deliberately not offered, since a runaway job at that class outranks
-  the threads servicing disk, keyboard and mouse. The level is part of the
-  job-set id when it is set, and rides on `GET /jobs` the same way.
+  at config load and names the job, and a kernel that then refuses leaves
+  the run going at the priority it inherited instead of failing it.
+  `realtime` is deliberately not offered, since a runaway job at that class
+  outranks the threads servicing disk, keyboard and mouse. The level is part
+  of the job-set id when it is set, and rides on `GET /jobs` the same way.
 - Ten endpoints that answered a `404` with aiohttp's own `404: Not Found`
   now say what was not found. `GET /jobs/{name}`, its trends and its log
   stream name the job, and the DAG task log stream names the DAG.
@@ -174,11 +173,11 @@ Windows fixes and additions. The first of many updates to address Windows first-
   A DAG's run and XCom routes no longer report every DAG as nonexistent on
   a daemon with no `state:` section: run documents only live in a durable
   store, and the `404` now says which of the two it was.
-  The published claim is scoped to match what these two applications serve:
-  a request that fails before it reaches one, meaning a malformed request
+  The published claim covers only what these two applications serve.
+  A request that fails before it reaches one, meaning a malformed request
   line, an unparseable method token, request headers past 8190 bytes or an
-  unrecognised `Expect:`, is answered by the HTTP server itself as plain
-  text, and the cluster peer transport is a separate mTLS listener that
+  unrecognised `Expect:`, gets a plain-text answer from the HTTP server
+  itself, and the cluster peer transport is a separate mTLS listener that
   answers its own bodyless `4xx`. The wiki and the OpenAPI spec now say
   that, and every `4xx` and `5xx` in the spec declares the envelope as its
   response body.
@@ -187,10 +186,10 @@ Windows fixes and additions. The first of many updates to address Windows first-
   measurement on Windows as well, while the POSIX branches that cannot run
   there stayed in the denominator and counted as missed; `platform.py` scored
   69% on a Windows run for code that was largely not the code being run.
-  There are now three pragma forms, a bare one that hides a branch on every
-  OS and a `(windows)` and `(posix)` pair that hide it only where it cannot
-  execute, and each interpreter environment in `tox.ini` has an arm per OS
-  that selects the matching profile and carries its own floor. On a Windows
+  There are now three pragma forms: a bare one that hides a branch on every
+  OS, and a `(windows)` and `(posix)` pair that hide it only where it cannot
+  execute. Each interpreter environment in `tox.ini` has an arm per OS that
+  selects the matching profile and carries its own floor. On a Windows
   run `platform.py` now measures 250 statements at 87.67% instead of 149 at
   69.14%. The POSIX side barely moves: 22,329 statements at 96.72%, four
   fewer than before, and those four are the Windows-only user/group
@@ -199,9 +198,9 @@ Windows fixes and additions. The first of many updates to address Windows first-
   unchanged in this release, since honest per-cell numbers have to be read
   off a real CI run rather than one developer machine.
   One number will move for no regression: the merged Codecov figure behind
-  the README badge. It is a union across two exclusion sets now, so a
-  Windows-tagged line no Windows test happens to reach is excluded from the
-  POSIX reports and counted as missed in the merged view. Both Codecov
+  the README badge. It is a union across two exclusion sets now, so the
+  POSIX reports leave out a Windows-tagged line no Windows test happens to
+  reach, and the merged view counts it as missed. Both Codecov
   statuses stay `informational`, so the drop annotates a pull request and
   cannot fail one.
 

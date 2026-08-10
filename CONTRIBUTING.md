@@ -64,9 +64,10 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 > `user`/`group` feature imports `grp`/`pwd` lazily and is rejected on Windows.
 > mypy is pinned to the `linux` platform (it type-checks the POSIX API surface;
 > the Windows branches are runtime-guarded), so type-checking is identical on
-> every OS. The coverage gate is the one that reads those Windows branches, and
-> it only does so if they are tagged: write `# pragma: no cover (windows)`, not
-> a bare `# pragma: no cover`. See [the pragma vocabulary](#coverage-pragmas).
+> every OS. The coverage gate is the one check that reads those Windows
+> branches, and it only does so when they are tagged: write
+> `# pragma: no cover (windows)`, not a bare
+> `# pragma: no cover`. See [the pragma vocabulary](#coverage-pragmas).
 
 ## Running the checks
 
@@ -84,19 +85,19 @@ tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
 ```
 
 Each interpreter row exists twice, once per OS profile, and `tox.ini`'s
-`platform` key makes the arm that does not match the machine skip. A skip is a
-pass as long as the invocation also names an arm that does match: an invocation
-whose only env skips exits 1. That is why a bare `tox` works everywhere and why
-CI names both arms in one command (`tox -e py-windows,py-posix`), while naming
-the single wrong arm for your box does not. `tox -e py-posix` on Windows prints
-`py-posix: skipped because platform win32 does not match (?!win32).*` and then
-`evaluation failed :(`.
+`platform` key makes the arm that does not match the machine skip. A skip
+counts as a pass as long as the invocation also names an arm that does match;
+an invocation whose only env skips exits 1. So a bare `tox` works everywhere,
+and CI names both arms in one command (`tox -e py-windows,py-posix`), but
+naming the single wrong arm for your box fails. On Windows, `tox -e py-posix`
+prints `py-posix: skipped because platform win32 does not match (?!win32).*`
+and then `evaluation failed :(`.
 
 `tox -e py`, `tox -e py312` and the other unfactored envs still run the whole
-suite, and they carry the POSIX profile, which is what the coverage numbers have
-always meant. On Windows, prefer a bare `tox` or `tox -e py-windows` over those:
-the POSIX profile hides the Windows branches you are editing and counts the
-POSIX ones you cannot run as missed, all against the same `--cov-fail-under`.
+suite, at the POSIX profile that the coverage numbers have always used. On
+Windows, prefer a bare `tox` or `tox -e py-windows`: the POSIX profile hides
+the Windows branches you are editing and counts the POSIX ones you cannot run
+as missed, all against the same `--cov-fail-under`.
 
 ### Coverage pragmas
 
@@ -121,7 +122,7 @@ for something that only exists there: `msvcrt`, `fcntl`, `grp`/`pwd`,
 branch takes the other token, and that half is the one people forget. Plenty of
 platform branches here are plain Python that the tests drive from either box by
 monkeypatching `IS_WINDOWS`; those stay untagged on purpose, since they really
-are measured on both. Three details are worth knowing before you write one:
+are measured on both. A few things to get right when you tag a branch:
 
 - Tagging an `if` header excludes that clause only. An `else` needs its own
   tag, and a fall-through tail (code after the `if` block rather than inside an

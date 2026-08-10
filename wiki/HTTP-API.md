@@ -120,17 +120,16 @@ error whose reason says nothing: its `error` is the generic
 `401: Unauthorized`, the same bytes for a missing header, a wrong scheme and
 an unknown token, so the response cannot be used to tell them apart.
 
-Requests that fail before they reach the application are answered by aiohttp
-itself, as `text/plain`: a malformed request line, an unparseable method
-token, and request headers past 8190 bytes are each a `400`, and an
-unrecognised `Expect:` header is a `417`. The envelope covers every response
-from the routing layer inward.
+aiohttp answers requests that fail before they reach the application, as
+`text/plain`. A malformed request line, an unparseable method token, and
+request headers past 8190 bytes are each a `400`, and an unrecognised
+`Expect:` header is a `417`. The envelope covers every response from the
+routing layer inward.
 
 One listener is outside this contract: the cluster peer transport
-([Clustering and Leader Election](Clustering-and-Leader-Election)) is a
-separate mTLS listener running its own application, and it answers its own
-`4xx` with no body at all, since its only client is another cronstable
-daemon.
+([Clustering and Leader Election](Clustering-and-Leader-Election)), a separate
+mTLS listener running its own application, which answers its own `4xx` with no
+body at all, since its only client is another cronstable daemon.
 
 ### `GET /version`
 
@@ -593,7 +592,7 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this job's crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own timezone. |
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
-| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. One exception: a run this host was executing when it crashed is reported here as `unknown` even though it never finished, and it stands at the instant it started, so a run that completed while it was still going can carry a later `finished_at`. A crash is surfaced rather than hidden behind whatever outlived it. |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. One exception: a run this host was executing when it crashed is reported here as `unknown` even though it never finished, and it stands at the instant it started, so a run that completed while it was still going can carry a later `finished_at`. cronstable surfaces the crash rather than hiding it behind whatever outlived it. |
 | `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note applies to this tail too. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
@@ -653,16 +652,17 @@ puts it on the REST surface too.
 Returns the job's retained run history (oldest first, bounded, and held in
 memory -- though with a [durable state store](Durable-State) configured it is
 rehydrated from the durable run ledger after a restart) together with
-aggregate statistics. "Oldest first" is the order this node observed the runs
-in, which is not always finish order. The array is never re-ordered at
-read time: after a restart the ring is rebuilt in finish order and then grows
-in completion order, so on a shared mount a peer's interleaved append can put
-an older run later, and a crash-reconciled row stands where its interrupted
-run began. The `stats` block's `last_*` fields do fold by finish time.
-Returns `404 Not Found` for an unknown job. An optional `?limit=` query caps
-the `runs` array (newest kept, clamped to the retained window; the default
-serves the whole window); `stats` always covers the whole retained window
-regardless of `limit`.
+aggregate statistics. Returns `404 Not Found` for an unknown job. An optional
+`?limit=` query caps the `runs` array (newest kept, clamped to the retained
+window; the default serves the whole window); `stats` always covers the whole
+retained window regardless of `limit`.
+
+"Oldest first" is the order this node observed the runs in, which is not
+always finish order. The array is never re-ordered at read time: after a
+restart the ring is rebuilt in finish order and then grows in completion
+order, so on a shared mount a peer's interleaved append can put an older run
+later, and a crash-reconciled row stands where its interrupted run began. The
+`stats` block's `last_*` fields do fold by finish time.
 
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
@@ -761,9 +761,8 @@ each currently-running monitored instance plus its `current` instantaneous
 readings; `runs` the recorded series of recent finished **monitored** runs
 (oldest first, unmonitored runs are omitted; the ordering note on
 [`GET /jobs/{name}/runs`](#get-jobsnameruns) applies to this array too),
-capped by the `limit` query
-parameter (default 20, clamped to the retained history; `runs` is its
-legacy alias, read when `limit` is absent). With a
+capped by the `limit` query parameter (default 20, clamped to the retained
+history; `runs` is its legacy alias, read when `limit` is absent). With a
 [durable state store](Durable-State), run series survive restarts inside the
 run ledger records. `monitored: false` with empty lists means the job never
 opted into `monitorResources` — distinguishable from "monitored but no data
@@ -857,9 +856,9 @@ count. `name` duplicates `dag` (the generic subject key the job routes use):
 
 The `limit` query parameter caps the number of runs returned (default 50,
 max 500); a missing or unparseable value falls back to the default rather
-than erroring. `404` if the DAG is not configured, or if no
-[`state:` store](Durable-State) is configured at all, since run documents
-only exist in a durable store; the `error` says which.
+than erroring. `404` if the DAG is not configured, or if there is no
+[`state:` store](Durable-State) at all, since run documents only exist in a
+durable store; the `error` says which.
 
 #### `GET /dags/{name}/runs/{run_key}`
 

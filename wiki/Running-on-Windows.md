@@ -208,11 +208,10 @@ jobs:
 A job inherits cronstable's own working directory unless it says otherwise,
 and on Windows that is rarely where you want to be: a daemon started from an
 elevated console starts in the system directory, and one started by Task
-Scheduler starts wherever that action was configured to start. Either way,
-every relative path inside a `.bat` or `.ps1` resolves somewhere the author
-did not mean. `workingDirectory` names the directory the job's process starts
-in, and is the equivalent of the "Start in (optional)" box on a Task
-Scheduler action:
+Scheduler starts wherever that action was configured to. Either way, every
+relative path inside a `.bat` or `.ps1` resolves somewhere the author did not
+mean. `workingDirectory` names the directory the job's process starts in, the
+equivalent of the "Start in (optional)" box on a Task Scheduler action:
 
 ```yaml
 jobs:
@@ -222,11 +221,11 @@ jobs:
     workingDirectory: C:\jobs\importer
 ```
 
-`~` and `${VAR}` are expanded and the result is made absolute at config load.
-A directory that does not exist is not a load error: the OS reports it at
-spawn and the run is recorded as a launch failure with exit `127`. See
-[Commands and Environment](Commands-and-Environment#workingdirectory) for
-the full semantics, and the note below on program lookup, which is the one
+At config load cronstable expands `~` and `${VAR}` and makes the result
+absolute. A directory that does not exist is not a load error: the OS reports
+it at spawn, and cronstable records the run as a launch failure with exit
+`127`. See [Commands and Environment](Commands-and-Environment#workingdirectory)
+for the full semantics, and the note below on program lookup, which is the one
 place Windows and POSIX disagree about what `workingDirectory` covers.
 
 ### Using PowerShell or another interpreter
@@ -471,7 +470,7 @@ jobs:
 ```
 
 The level becomes the process's Windows priority class, set on the creation
-flags at `CreateProcess` time. That is the one race-free place to set it:
+flags at `CreateProcess` time, which is the one race-free place to set it:
 
 | Level | Windows priority class | Task Scheduler `-Priority` |
 | --- | --- | --- |
@@ -482,9 +481,9 @@ flags at `CreateProcess` time. That is the one race-free place to set it:
 | `high` | `HIGH_PRIORITY_CLASS` | 1 |
 
 Windows hands every one of these classes to an unprivileged account, so
-nothing here needs an elevated daemon. That is the sharp difference from
-POSIX, where raising a priority needs `CAP_SYS_NICE` or `RLIMIT_NICE`
-headroom and a refusal leaves the job at the priority it inherited.
+nothing here needs an elevated daemon. POSIX differs: raising a priority
+there needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom, and a refusal leaves
+the job at the priority it inherited.
 
 `realtime` is not reachable, at any level of the config. REALTIME outranks the
 threads that service disk, keyboard and mouse; one runaway job at that class
@@ -494,9 +493,9 @@ error naming the five levels that are accepted.
 
 ### A lowered class covers the tree, a raised one does not
 
-Windows gives a child created with no class flag of its own the creator's
-class only when the creator is idle or below-normal, and NORMAL otherwise.
-That single rule decides how far a job's level reaches:
+A child created with no class flag of its own gets the creator's class only
+when the creator is idle or below-normal; otherwise Windows gives it NORMAL.
+That one rule decides how far a job's level reaches:
 
 - `idle` and `below-normal` cover the whole helper tree. A `.cmd` file at
   `priority: idle` runs cmd.exe at IDLE and every program cmd.exe launches at
@@ -508,27 +507,26 @@ That single rule decides how far a job's level reaches:
 Measured on Windows 11: an unflagged grandchild of a HIGH parent comes back
 NORMAL, and an unflagged grandchild of an IDLE parent comes back IDLE.
 
-That does not make `high` the wrong thing to ask for. It is still the level
-that gets the job's own process scheduled ahead of the rest of the box, and
-for a job whose command is the work (a `.exe`, a `python` script) the tree is
-one process deep anyway. It does mean a `.cmd` wrapper does not hand its
-level down, and a job that needs a raised program should name that program as
-the `command` rather than wrap it. POSIX has no such asymmetry: cronstable
-renices the whole process group, and anything forked afterwards inherits the
-nice value.
+`high` is still worth asking for: it gets the job's own process scheduled
+ahead of the rest of the box, and for a job whose command is the work (a
+`.exe`, a `python` script) the tree is one process deep anyway. A `.cmd`
+wrapper, though, does not hand its level down, so a job that needs a raised
+program should name that program as the `command` rather than wrap it. POSIX
+has no such asymmetry: cronstable renices the whole process group, and
+anything forked afterwards inherits the nice value.
 
 ### The default level
 
 Task Scheduler numbers run the other way (0 highest, 10 lowest), and its
-per-task default is 7, which is BELOW_NORMAL. cronstable's default is neither
-a number nor a class: `normal` emits no class flag at all. That is
-deliberate. Windows defaults a child to NORMAL only when its creator is not
-itself idle or below-normal, so emitting `NORMAL_PRIORITY_CLASS` would
-silently *promote* every job of a daemon that Task Scheduler had started at
-its own default 7. Emitting nothing instead means a daemon at idle or below
-normal hands that class to its jobs, and a daemon at normal or above hands
-them NORMAL. Either way cronstable never promotes a job the operator did not
-ask to promote, which is the case the flag exists to avoid.
+per-task default is 7, which is BELOW_NORMAL. cronstable's default is
+deliberately neither a number nor a class: `normal` emits no class flag at
+all. Windows defaults a child to NORMAL only when its creator is not itself
+idle or below-normal, so emitting `NORMAL_PRIORITY_CLASS` would silently
+*promote* every job of a daemon that Task Scheduler had started at its own
+default 7. Emitting nothing instead means a daemon at idle or below normal
+hands that class to its jobs, and a daemon at normal or above hands them
+NORMAL. Either way cronstable never promotes a job the operator did not ask
+to promote.
 
 See [priority](Commands-and-Environment#priority) for the POSIX half and the
 full semantics.
@@ -601,8 +599,8 @@ Windows `PATH` for the entries below it. See
 
 Setting a job's
 [`workingDirectory`](Commands-and-Environment#workingdirectory) changes where
-the process starts, on Windows exactly as on POSIX. What it does not change on
-Windows is where the *program* is looked up: `CreateProcessW` searches the
+the process starts, on Windows exactly as on POSIX. On Windows it does not
+change where the *program* is looked up: `CreateProcessW` searches the
 calling process's directory (cronstable's) rather than the child's working
 directory. A list-form `command` naming its program by a relative path, one
 carrying a separator such as `.\import.bat`, therefore resolves against the
