@@ -113,16 +113,31 @@ def test_shell_spawn_hands_cmd_the_raw_command_line(shell):
     assert kwargs == {}
 
 
-def test_shell_spawn_honors_an_absolute_cmd_path():
+@pytest.mark.parametrize(
+    "path",
+    [
+        r"C:\Windows\SysWOW64\cmd.exe",
+        "C:/Windows/SysWOW64/cmd.exe",
+        # rooted but not drive-qualified: ntpath.isabs() says yes up
+        # to 3.12 and no from 3.13 on, so gating on it would pick a
+        # different cmd.exe per matrix row
+        r"\Windows\SysWOW64\cmd.exe",
+        # relative, and still the operator's choice rather than ComSpec's
+        r"tools\cmd.exe",
+    ],
+)
+def test_shell_spawn_honors_a_spelled_out_cmd_path(path):
     # a deliberately chosen cmd.exe still beats %ComSpec%; Popen uses
     # `executable` as the comspec when the shell path is spelled out.
-    absolute = r"C:\Windows\SysWOW64\cmd.exe"
+    # The answer has to hold on any host (posixpath reads every one of
+    # these as a bare name) and under any interpreter, so both are
+    # pinned here.
     create, cmd, kwargs = cronstable.job.shell_spawn(
-        absolute, "echo hi", windows=True
+        path, "echo hi", windows=True
     )
     assert create is asyncio.create_subprocess_shell
     assert cmd == ["echo hi"]
-    assert kwargs == {"executable": absolute}
+    assert kwargs == {"executable": path}
 
 
 @pytest.mark.parametrize("shell", ["cmd", r"C:\Windows\System32\cmd.exe"])
