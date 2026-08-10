@@ -96,6 +96,19 @@ Windows fixes and additions. The first of many updates to address Windows first-
   jobs still write concurrently, and it is the same guard the in-flight,
   retry-ladder and pause streams already used against the identical
   hazard.
+- Jobs can say which directory they start in. The new `workingDirectory`
+  key becomes the working directory of the job's process, so a `.bat` or a
+  script written around relative paths no longer depends on wherever the
+  daemon happened to be launched from, which on an elevated Windows console
+  is the system directory. It is the equivalent of the "Start in" box on a
+  Task Scheduler action, it works in a `defaults:` block and on a DAG task
+  like every other launch field, and `~` and `${VAR}` are expanded and the
+  result made absolute at load. A directory that does not exist is not a
+  load error: config load runs on hosts that are not the target, so the OS
+  decides at spawn and a bad value records the run as a launch failure whose
+  log line names the directory. It is deliberately not part of the job-set
+  id, so replicas running the same jobs from paths their own hosts spell
+  differently still agree on what they are running.
 
 ## 1.2.38
 

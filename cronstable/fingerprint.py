@@ -321,6 +321,12 @@ def canonical_job(
         # env_file with the same variable names (only the values may differ per
         # host). Sorted so it is independent of declaration order.
         "environment": sorted(e["key"] for e in job.environment),
+        # `workingDirectory` is deliberately absent, for the reason directly
+        # above: it is a per-host path, and a fleet legitimately runs the
+        # same logical job from D:\jobs on a Windows replica and /srv/jobs
+        # on a Linux one.  Folding it into identity would read as permanent
+        # drift and split the job-set id the state and cluster backends
+        # namespace on.  Do not "fix" this by adding it.
         "executionTimeout": job.executionTimeout,
         "killTimeout": job.killTimeout,
         "statsd": job.statsd,

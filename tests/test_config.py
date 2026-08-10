@@ -1218,6 +1218,185 @@ def test_monitor_resources_out_of_range(snippet, match):
         _monitor_job(snippet)
 
 
+# ---- workingDirectory: normalization and inheritance ------------------------
+#
+# Every fixture path below is built from tmp_path or the process CWD, never
+# from a POSIX-looking literal like "/srv/app": the set of strings that count
+# as absolute is not the same on both platforms (and, for ntpath, not even the
+# same across the interpreters this project supports), so a literal would pin
+# the tests to whichever box wrote them.
+
+
+def _wd_job(snippet):
+    """The single job of a config carrying ``snippet`` as an extra key."""
+    return config.parse_config_string(
+        "jobs:\n"
+        "  - name: wd\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n' + snippet,
+        "",
+    ).jobs[0]
+
+
+def test_working_directory_absolute_path_is_kept_as_written(tmp_path):
+    # The ordinary case: an already-absolute directory reaches the job
+    # unchanged, so what the operator reads in the config is what the spawn
+    # gets.  Single-quoted in the YAML because a Windows path carries
+    # backslashes and a drive colon.
+    job = _wd_job("    workingDirectory: '{}'\n".format(tmp_path))
+    assert job.workingDirectory == str(tmp_path)
+
+
+def test_working_directory_defaults_to_none():
+    # No key means "inherit the daemon's CWD", which is what every job got
+    # before the key existed; RunningJob.start omits the cwd kwarg for it
+    # rather than passing None.
+    assert _wd_job("").workingDirectory is None
+
+
+def test_working_directory_expands_tilde():
+    # `~/jobs` must mean the home directory, not a literal "~" directory
+    # under wherever the daemon happened to start (cronstable.state expands
+    # its own `path:` for the same reason).
+    job = _wd_job('    workingDirectory: "~/jobs"\n')
+    assert job.workingDirectory == os.path.abspath(
+        os.path.expanduser("~/jobs")
+    )
+
+
+def test_relative_working_directory_is_settled_at_load():
+    # Relative values are accepted, not rejected.  An absolute-only gate
+    # would have to ask os.path.isabs, whose answer for the same string
+    # changed in 3.13, so the same config would load on one supported
+    # interpreter and fail on the next.  Settling it here instead means the
+    # directory is decided once, and the resolved form is what the spawn log
+    # and any start failure show.
+    job = _wd_job("    workingDirectory: data/in\n")
+    assert job.workingDirectory == os.path.abspath("data/in")
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        pytest.param("    workingDirectory:\n", id="valueless"),
+        pytest.param('    workingDirectory: ""\n', id="quoted-empty"),
+        pytest.param("    workingDirectory: ${WD_EMPTY}\n", id="empty-var"),
+    ],
+)
+def test_blank_working_directory_means_inherit(snippet, monkeypatch):
+    # A blank value must land on None, never on abspath(""), which would
+    # silently freeze the daemon's load-time CWD into the job as if the
+    # operator had named that directory on purpose.
+    monkeypatch.setenv("WD_EMPTY", "")
+    assert _wd_job(snippet).workingDirectory is None
+
+
+def test_working_directory_inherits_from_defaults_and_is_overridable(
+    tmp_path,
+):
+    # The key lives in _job_defaults_common, so `defaults:` covers it with no
+    # new mechanism.  The third job is why the schema is EmptyNone() | Str():
+    # under an inherited value, a bare `workingDirectory:` is the only
+    # spelling that means "inherit the daemon's CWD instead".
+    base = tmp_path / "base"
+    own = tmp_path / "own"
+    conf = config.parse_config_string(
+        """
+defaults:
+  workingDirectory: '{base}'
+
+jobs:
+  - name: inherits
+    command: echo hi
+    schedule: "* * * * *"
+  - name: overrides
+    command: echo hi
+    schedule: "* * * * *"
+    workingDirectory: '{own}'
+  - name: opts-out
+    command: echo hi
+    schedule: "* * * * *"
+    workingDirectory:
+""".format(base=base, own=own),
+        "",
+    )
+    assert {job.name: job.workingDirectory for job in conf.jobs} == {
+        "inherits": str(base),
+        "overrides": str(own),
+        "opts-out": None,
+    }
+
+
+def test_working_directory_reaches_dag_task_templates(tmp_path):
+    # A task is a job invocation and where it runs from is a launch field, so
+    # it has to be in _DAG_TASK_LAUNCH_KEYS.  Without that entry a `defaults:`
+    # value still reaches the template (DagTaskConfig merges the whole
+    # defaults base) while a per-task key is a schema error, which is a
+    # confusing asymmetry rather than a clean failure.
+    base = tmp_path / "base"
+    own = tmp_path / "own"
+    conf = config.parse_config_string(
+        """
+defaults:
+  workingDirectory: '{base}'
+
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+      - id: b
+        command: bar
+        dependsOn:
+          - a
+        workingDirectory: '{own}'
+""".format(base=base, own=own),
+        "",
+    )
+    templates = {
+        task.id: task.job_template.workingDirectory
+        for task in conf.dags[0].tasks
+    }
+    assert templates == {"a": str(base), "b": str(own)}
+
+
+def test_working_directory_interpolates_env_vars(monkeypatch, tmp_path):
+    # workingDirectory is an ordinary scalar, so ${VAR} expands at load
+    # against the DAEMON environment; it is not on the skip list that leaves
+    # `command` and `shell` for the runtime shell to expand.
+    monkeypatch.setenv("WD_ROOT", str(tmp_path))
+    job = _wd_job("    workingDirectory: ${WD_ROOT}/app\n")
+    assert job.workingDirectory == os.path.join(str(tmp_path), "app")
+
+
+def test_unset_working_directory_variable_is_a_config_error(monkeypatch):
+    # And, being ordinary, it gets the standard unset-variable diagnostic
+    # naming the config location rather than a directory literally called
+    # "${WD_MISSING}".
+    #
+    # The two assertions below are the interpolation diagnostic and nothing
+    # else.  Do not weaken them to "WD_MISSING" in message or to the file
+    # name: interpolation runs after schema validation, so on a tree without
+    # this key the same YAML raises the strictyaml "unexpected key not in
+    # schema" error, which quotes the offending source line (WD_MISSING and
+    # all) and names prod.yaml too.  Either of those would pass against a
+    # workingDirectory that does not exist.
+    monkeypatch.delenv("WD_MISSING", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        config.parse_config_string(
+            "jobs:\n"
+            "  - name: wd\n"
+            "    command: echo hi\n"
+            '    schedule: "* * * * *"\n'
+            "    workingDirectory: ${WD_MISSING}\n",
+            "prod.yaml",
+        )
+    message = str(exc.value)
+    assert "jobs[0].workingDirectory" in message
+    assert "which is not set" in message
+
+
 # ---- web.nodeHistory validation ---------------------------------------------
 
 

@@ -2395,6 +2395,124 @@ jobs:
 
 
 # ---------------------------------------------------------------------------
+# workingDirectory: the config key reaching the spawn as cwd.
+#
+# One place consumes it (RunningJob.start), but that place has two spawn
+# calls, so the first test is parametrized over the argv form
+# (create_subprocess_exec) and the string form, which reaches
+# create_subprocess_shell directly or create_subprocess_exec through
+# shell_spawn depending on the platform's shell default.  The string form is
+# the one wiki/Running-on-Windows.md tells operators to use, so it has to be
+# covered rather than assumed.  Between them these two tests are the runtime
+# contract: the kwarg is present and correct whichever way the process is
+# launched, the kwarg is absent when the key is unset, and a directory that
+# does not exist fails the run in a way that says which directory it was.
+# ---------------------------------------------------------------------------
+
+
+_WD_COMMAND_FORMS = [
+    # (the command config, the spawn callables that form can reach)
+    pytest.param(
+        "    command:\n      - echo\n      - hi\n", {"exec"}, id="argv"
+    ),
+    # With the platform's own shell default: /bin/sh -c through shell_spawn on
+    # POSIX, %ComSpec% /c through create_subprocess_shell on Windows.
+    pytest.param(
+        "    command: echo hi\n", {"exec", "shell"}, id="string-default-shell"
+    ),
+    # An empty shell: is the Windows default spelled out, and takes the
+    # create_subprocess_shell arm on every platform.
+    pytest.param(
+        '    command: echo hi\n    shell: ""\n', {"shell"}, id="string-comspec"
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command_config, spawns", _WD_COMMAND_FORMS)
+async def test_start_passes_working_directory_as_cwd(
+    monkeypatch, tmp_path, command_config, spawns
+):
+    captured = []
+
+    def _recorder(kind):
+        async def fake_spawn(*args, **kwargs):
+            captured.append((kind, kwargs))
+            proc = Mock(stdout=None, stderr=None)
+
+            async def wait():
+                return 0
+
+            proc.wait = wait
+            return proc
+
+        return fake_spawn
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _recorder("exec"))
+    monkeypatch.setattr("asyncio.create_subprocess_shell", _recorder("shell"))
+
+    base = (
+        "jobs:\n"
+        "  - name: t\n"
+        + command_config
+        + '    schedule: "* * * * *"\n'
+        "    captureStdout: false\n"
+        "    captureStderr: false\n"
+    )
+    job = _running_job(base + "    workingDirectory: '{}'\n".format(tmp_path))
+    await job.start()
+    kind, kwargs = captured[-1]
+    assert kind in spawns
+    assert kwargs["cwd"] == str(tmp_path)
+
+    # Without the key there must be no cwd kwarg at all, not cwd=None: the
+    # child keeps inheriting the daemon's CWD byte for byte, which is what
+    # every job did before the key existed.
+    plain = _running_job(base)
+    await plain.start()
+    assert "cwd" not in captured[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_bad_working_directory_is_a_start_failure_naming_cwd(
+    caplog, tmp_path
+):
+    # A directory that does not exist is the OS's call, not the config
+    # layer's (load runs on hosts that are not the target), so it lands on
+    # the ordinary start_failed path with exit 127 rather than failing the
+    # whole load.
+    missing = tmp_path / "gone"
+    job = _running_job(
+        "jobs:\n  - name: badwd\n"
+        + yaml_command(cmd_print(out="hi"))
+        + '\n    schedule: "* * * * *"\n'
+        + "    workingDirectory: '{}'\n".format(missing)
+    )
+    with caplog.at_level(logging.ERROR):
+        await job.start()
+    assert job.proc is None
+    assert job.start_failed
+    await job.wait()
+    assert job.retcode == 127
+
+    # No platform split here on purpose.  job.py logs the failure with
+    # logger.exception, so the OSError text lives in exc_info; the message
+    # itself carries the directory only through the kwargs= repr, on both
+    # platforms.  Windows never names it any other way (WinError 267 arrives
+    # with filename=None), so this repr is the operator's only clue and a
+    # future loggable_spawn_kwargs that drops non-env keys would silently
+    # take it away.
+    launch = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "Error launching subprocess" in rec.getMessage()
+    ]
+    assert launch, caplog.text
+    assert "'cwd'" in launch[0]
+    assert "gone" in launch[0]
+
+
+# ---------------------------------------------------------------------------
 # Shell-reporter CRONSTABLE_* env contract.
 #
 # Users' alerting scripts read these exact variable names; a rename or typo,

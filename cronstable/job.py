@@ -1694,6 +1694,17 @@ class RunningJob:
             env.update(self.extra_env)
             self.env = env
             kwargs["env"] = env
+        if self.config.workingDirectory is not None:
+            # The directory the child starts in.  Omitted rather than passed
+            # as None when unset, so a job that does not ask for one keeps
+            # inheriting the daemon's CWD byte for byte as it always has.
+            # The value was normalized at config load; whether the directory
+            # exists is the OS's call, and a bad one raises OSError into the
+            # start_failed net below.  Note the child chdirs BEFORE
+            # preexec_fn runs, so on a job that also demotes, the chdir uses
+            # the daemon's privileges and the demoted child can land in a
+            # directory it cannot itself read.
+            kwargs["cwd"] = self.config.workingDirectory
         if self.config.uid is not None or self.config.gid is not None:
             # POSIX only: uid/gid are always None on Windows (the config layer
             # rejects user/group there), so preexec_fn is never wired up on a
