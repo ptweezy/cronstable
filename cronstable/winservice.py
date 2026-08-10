@@ -39,6 +39,7 @@ never sees.
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import subprocess
 import sys
@@ -189,9 +190,14 @@ def frozen_layout(executable: str, meipass: Optional[str]) -> str:
     """
     if not meipass:
         return "source"
-    exe_dir = os.path.normcase(os.path.abspath(os.path.dirname(executable)))
-    bundle = os.path.normcase(os.path.abspath(meipass))
-    if bundle == exe_dir or bundle.startswith(exe_dir + os.sep):
+    # ntpath, not os.path: these are Windows paths by definition (the whole
+    # subcommand refuses to run anywhere else), and os.path on a POSIX box
+    # reads "C:\app\cronstable.exe" as one long filename with no
+    # directory, which quietly turns every layout into onedir. Being
+    # explicit also lets the decision be tested on any machine.
+    exe_dir = ntpath.normcase(ntpath.dirname(ntpath.normpath(executable)))
+    bundle = ntpath.normcase(ntpath.normpath(meipass))
+    if bundle == exe_dir or bundle.startswith(exe_dir + ntpath.sep):
         return "onedir"
     return "onefile"
 
@@ -398,9 +404,12 @@ def config_is_user_scoped(config: str, user_profile: Optional[str]) -> bool:
     """
     if not config or not user_profile:
         return False
-    resolved = os.path.normcase(os.path.abspath(config))
-    profile = os.path.normcase(os.path.abspath(user_profile))
-    return resolved == profile or resolved.startswith(profile + os.sep)
+    # ntpath for the same reason as frozen_layout above: a Windows path
+    # compared with os.path on a POSIX box never matches, so the check
+    # would silently never fire.
+    resolved = ntpath.normcase(ntpath.normpath(config))
+    profile = ntpath.normcase(ntpath.normpath(user_profile))
+    return resolved == profile or resolved.startswith(profile + ntpath.sep)
 
 
 #: One sentence per Win32 error this module can actually produce.  These are
