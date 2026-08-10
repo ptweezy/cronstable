@@ -1,10 +1,5 @@
 # History
 
-cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron),
-continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
-entries from 0.19.0 onward document the history of the original yacron
-project, on which cronstable is based.
-
 ## 1.2.39
 
 Windows fixes and additions. The first of many updates to address Windows first-class support.
