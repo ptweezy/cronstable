@@ -1,9 +1,10 @@
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from cronstable import config
+from cronstable import config, platform
 from cronstable.config import (
     DEFAULT_CONFIG,
     ConfigError,
@@ -1395,6 +1396,148 @@ def test_unset_working_directory_variable_is_a_config_error(monkeypatch):
     message = str(exc.value)
     assert "jobs[0].workingDirectory" in message
     assert "which is not set" in message
+
+
+# ---- priority: the vocabulary, its default, and the load-time advisory ------
+
+
+def _priority_job(snippet):
+    """The single job of a config carrying ``snippet`` as an extra key."""
+    return config.parse_config_string(
+        "jobs:\n"
+        "  - name: p\n"
+        "    command: echo hi\n"
+        '    schedule: "* * * * *"\n' + snippet,
+        "",
+    ).jobs[0]
+
+
+def test_priority_parses_and_defaults_to_the_inherit_level():
+    assert (
+        _priority_job("    priority: below-normal\n").priority
+        == "below-normal"
+    )
+    # No key means the level nothing is ever applied for, so the spawn stays
+    # what it always was.  The literal, not platform.DEFAULT_PRIORITY, since
+    # this is the place that pins the constant's value: product code compares
+    # against the name, so only a test can say what the name has to be.
+    assert _priority_job("").priority == "normal"
+
+
+def test_priority_inherits_from_defaults_and_is_overridable():
+    # The key lives in _job_defaults_common, so a `defaults:` block covers a
+    # whole fleet with no new mechanism, and a job can still say otherwise.
+    conf = config.parse_config_string(
+        """
+defaults:
+  priority: idle
+
+jobs:
+  - name: inherits
+    command: echo hi
+    schedule: "* * * * *"
+  - name: overrides
+    command: echo hi
+    schedule: "* * * * *"
+    priority: normal
+""",
+        "",
+    )
+    assert {job.name: job.priority for job in conf.jobs} == {
+        "inherits": "idle",
+        "overrides": "normal",
+    }
+
+
+@pytest.mark.parametrize(
+    "level",
+    [
+        # Excluded on purpose, not by oversight: REALTIME outranks the
+        # threads servicing disk, keyboard and mouse, so a runaway job at
+        # that class can put the host out of its operator's reach.  This
+        # test is the executable record of that decision, and goes red if
+        # anyone adds it to PRIORITY_LEVELS.
+        pytest.param("realtime", id="realtime"),
+        pytest.param("turbo", id="unknown"),
+        # a Task Scheduler number, which is a different vocabulary (0 to 10,
+        # highest first); refusing it is better than reading it as a level.
+        pytest.param("7", id="task-scheduler-number"),
+    ],
+)
+def test_priority_refuses_levels_outside_the_vocabulary(level):
+    with pytest.raises(ConfigError) as exc:
+        _priority_job("    priority: {}\n".format(level))
+    # the load error lists what IS accepted, so the fix is in the message
+    message = str(exc.value)
+    for accepted in platform.PRIORITY_LEVELS:
+        assert accepted in message
+
+
+def test_priority_applies_to_dag_tasks():
+    # A task is a job invocation, so it takes the launch keys a job takes;
+    # without the _DAG_TASK_LAUNCH_KEYS entry a `defaults:` value would
+    # still reach the template while a per-task key was a schema error.
+    conf = config.parse_config_string(
+        """
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+        priority: idle
+""",
+        "",
+    )
+    task = conf.dags[0].tasks[0]
+    assert task.id == "a"
+    assert task.job_template.priority == "idle"
+
+
+# Not skipped on Windows.  config.py reads sys.platform at call time, so
+# both arms of the advisory run on every matrix cell instead of only on the
+# OS they ship for, which is the injection its platform.py siblings got.  The
+# POSIX-only names are stood in for with raising=False, the same pattern
+# tests/test_platform.py::_record_setpriority uses for os.setpriority.
+@pytest.mark.parametrize(
+    "platform_name, level, euid, expected",
+    [
+        # A raise from an unprivileged daemon is the case worth saying out
+        # loud, once, at load: the kernel may refuse it every run, and the
+        # per-run refusal is only DEBUG (see platform.apply_priority).
+        pytest.param("linux", "high", 1000, True, id="unprivileged-raise"),
+        # root can renice freely, so there is nothing to advise about
+        pytest.param("linux", "high", 0, False, id="root-raise"),
+        # and a LOWERING never needs privilege, whoever is asking
+        pytest.param("linux", "idle", 1000, False, id="unprivileged-lowering"),
+        # Windows hands every class in this vocabulary to an unprivileged
+        # account, so the advisory has nothing to say there.  Same inputs as
+        # the first case: only the platform differs, so a lost win32 guard
+        # shows up as the advisory firing where the docs promise silence.
+        pytest.param("win32", "high", 1000, False, id="windows-never-refuses"),
+    ],
+)
+def test_a_raise_that_may_be_refused_is_advised_at_load(
+    monkeypatch, caplog, platform_name, level, euid, expected
+):
+    monkeypatch.setattr(sys, "platform", platform_name)
+    monkeypatch.setattr(os, "geteuid", lambda: euid, raising=False)
+    # cronstable's own nice, pinned so the comparison does not depend on
+    # what the test runner happens to have been started at.
+    monkeypatch.setattr(os, "nice", lambda increment: 0, raising=False)
+    with caplog.at_level("WARNING", logger="cronstable"):
+        job = _priority_job("    priority: {}\n".format(level))
+    assert job.priority == level
+    advisories = [
+        rec.getMessage()
+        for rec in caplog.records
+        if "priority" in rec.getMessage()
+    ]
+    assert (len(advisories) == 1) is expected
+    if expected:
+        # it has to name the job, or an operator with 300 of them cannot act
+        assert "'p'" in advisories[0]
+        assert "high" in advisories[0]
 
 
 # ---- web.nodeHistory validation ---------------------------------------------

@@ -105,9 +105,9 @@ entirely (see [Running on Windows](Running-on-Windows)).
 
 A [DAG task](Orchestration-and-DAGs) is a job invocation, so its launch fields
 inherit the `defaults:` block just as a job's do: a global `shell`,
-`environment`, `env_file`, `workingDirectory`, `captureStdout`/`captureStderr`,
-`monitorResources`, run-scoped `secrets`, or reporter
-(`onFailure`/`onSuccess`/…) block covers DAG tasks too, with the task's own
+`environment`, `env_file`, `workingDirectory`, `priority`,
+`captureStdout`/`captureStderr`, `monitorResources`, run-scoped `secrets`, or
+reporter (`onFailure`/`onSuccess`/…) block covers DAG tasks too, with the task's own
 value winning on any key it sets. The DAG-node fields that shape the graph
 (`dependsOn`, `triggerRule`, `retries`, `expand`, `onReject`, the poke
 settings) are graph structure, not launch config, and are never touched by

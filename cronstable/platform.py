@@ -9,8 +9,10 @@ same on every platform and only this module needs a per-OS branch:
 * :data:`DEFAULT_CONFIG_PATH`: where ``-c`` looks by default;
 * :func:`supports_unix_sockets`: whether ``unix://`` web listeners work;
 * :func:`encode_argv`: the argv form the platform's subprocess layer wants;
-* :func:`new_process_group_kwargs` / :func:`kill_process_group`: spawning a
-  job so its descendants are reachable as one unit, and taking that unit down;
+* :func:`new_process_group_kwargs` / :func:`apply_priority` /
+  :func:`kill_process_group`: spawning a job so its descendants are reachable
+  as one unit, giving that unit one of :data:`PRIORITY_LEVELS` to run at, and
+  taking it down;
 * :func:`install_shutdown_handlers`: wiring Ctrl-C / termination to a
   graceful-shutdown callback on whichever event loop the platform provides.
 
@@ -180,7 +182,125 @@ TASKKILL_TIMEOUT = 10.0
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
-def new_process_group_kwargs() -> dict[str, Any]:
+# --- Job scheduling priority ----------------------------------------------
+#: The scheduling priorities a job can ask for, lowest first.  Named after
+#: the Windows priority classes because those are the fixed points: POSIX
+#: nice is a continuum that can be mapped onto any vocabulary, the Windows
+#: classes cannot, so borrowing their names is what stops ``high`` meaning
+#: one thing in the config and another in Task Manager.  REALTIME is
+#: deliberately not on the list: it outranks the threads that service disk,
+#: keyboard and mouse, so one runaway job at that class can put the host out
+#: of reach of the operator who has to stop it.
+PRIORITY_LEVELS = ("idle", "below-normal", "normal", "above-normal", "high")
+
+#: What a job gets when its config says nothing.  Not a level that is
+#: applied, a level that is *skipped*, which is what keeps the default spawn
+#: byte for byte what it was on both platforms.  What that resolves to is not
+#: the same sentence on each: on POSIX nothing is reniced, so the job simply
+#: keeps the daemon's own nice; on Windows CreateProcess gives an unflagged
+#: child the creator's class only when the creator is idle or below-normal
+#: and NORMAL otherwise, so a daemon at normal or above launches its jobs at
+#: NORMAL rather than at its own class.  Either way cronstable never promotes
+#: a job the operator did not ask to promote, which is the case skipping the
+#: level exists to avoid.
+#: Named (rather than inlined at each comparison) because cronstable.config,
+#: cronstable.cron and cronstable.fingerprint all compare against it, the same
+#: reason cronstable.config.DEFAULT_PUSH_REPORT is named.
+DEFAULT_PRIORITY = "normal"
+
+#: Windows priority-class creation flags, spelled as literals for the same
+#: reason as _CREATE_NEW_PROCESS_GROUP above.  ``normal`` maps to no bit at
+#: all rather than to NORMAL_PRIORITY_CLASS (0x20): CreateProcess defaults a
+#: child to NORMAL only when the creator is not itself idle or below-normal,
+#: so emitting the bit would silently *promote* every job of a daemon that
+#: was launched below normal, which is what Task Scheduler does by default
+#: (its priority 7 is BELOW_NORMAL_PRIORITY_CLASS).
+_WINDOWS_PRIORITY_CLASS = {
+    "idle": 0x00000040,  # IDLE_PRIORITY_CLASS
+    "below-normal": 0x00004000,  # BELOW_NORMAL_PRIORITY_CLASS
+    "normal": 0x00000000,  # inherit; see above
+    "above-normal": 0x00008000,  # ABOVE_NORMAL_PRIORITY_CLASS
+    "high": 0x00000080,  # HIGH_PRIORITY_CLASS
+}
+
+#: Absolute POSIX nice values for the same levels.  Absolute, not a delta,
+#: so a level describes where the job sits rather than how far it moved from
+#: whatever the daemon happened to be started at.  DEFAULT_PRIORITY has no
+#: entry on purpose: it is never applied, and nice 0 would be an actively
+#: wrong description of it (``priority: normal`` means "the daemon's own
+#: nice", which on a daemon started at nice 10 is 10, not 0).
+_POSIX_NICE = {
+    "idle": 19,
+    "below-normal": 10,
+    "above-normal": -5,
+    "high": -10,
+}
+
+
+def _priority_table_drift(
+    levels: tuple[str, ...],
+    default: str,
+    windows_table: dict[str, int],
+    posix_table: dict[str, int],
+) -> list[str]:
+    """The level names the two per-OS tables and ``levels`` disagree about.
+
+    A level the schema accepts but a table has no row for would reach a
+    spawn and raise KeyError there, one job at a time, so the tables are
+    checked against the vocabulary at import.
+
+    ``default`` has no POSIX row on purpose (it is never applied), which is
+    why the two halves are asked different questions.
+    """
+    return sorted(
+        (set(windows_table) ^ set(levels))
+        | (set(posix_table) ^ (set(levels) - {default}))
+    )
+
+
+def _refuse_drifted_priority_tables(
+    levels: tuple[str, ...],
+    default: str,
+    windows_table: dict[str, int],
+    posix_table: dict[str, int],
+) -> None:
+    """Raise unless the priority tables cover exactly ``levels``.
+
+    Dev invariant, in the style of config.py's _DAG_TASK_LAUNCH_KEYS guard.
+    A plain ``if``/``raise``, not an assert, since the release binary runs
+    under -OO.  It takes the tables as arguments rather than reading the
+    module globals so a test can drive both outcomes with a deliberately
+    drifted pair; the call below can only ever be the quiet one in a tree
+    that imports at all.
+    """
+    drift = _priority_table_drift(levels, default, windows_table, posix_table)
+    if drift:
+        raise RuntimeError(
+            "platform: the per-OS priority tables and PRIORITY_LEVELS "
+            "disagree about these levels, so one of them would fail at "
+            "spawn time with a KeyError: {}".format(", ".join(drift))
+        )
+
+
+_refuse_drifted_priority_tables(
+    PRIORITY_LEVELS, DEFAULT_PRIORITY, _WINDOWS_PRIORITY_CLASS, _POSIX_NICE
+)
+
+
+def posix_nice_for(priority: str) -> Optional[int]:
+    """The absolute POSIX nice value ``priority`` maps to, or ``None``.
+
+    ``None`` for :data:`DEFAULT_PRIORITY`, the one level that is never
+    applied.  Exported so the config layer can tell a raise from a lowering
+    without keeping a second copy of the table: whether a level needs
+    privilege is a question about the number, and the numbers live here.
+    """
+    return _POSIX_NICE.get(priority)
+
+
+def new_process_group_kwargs(
+    priority: str = DEFAULT_PRIORITY, *, windows: Optional[bool] = None
+) -> dict[str, Any]:
     """Subprocess kwargs that isolate a job in its own process group.
 
     A job command routinely leaves descendants behind (``sh -c 'helper &
@@ -208,10 +328,100 @@ def new_process_group_kwargs() -> dict[str, Any]:
     Standard Windows behavior worth naming: a process created in its own
     group starts with Ctrl-C delivery disabled (Ctrl-Break is unaffected),
     which is exactly the console shielding the first bullet describes.
+
+    ``priority`` is the second thing those Windows flags carry, because
+    CreateProcess is the only race-free place to set a priority class: the
+    child is never scheduled at the wrong one.  How far the class then
+    reaches is asymmetric, and it is the same CreateProcess rule quoted at
+    :data:`_WINDOWS_PRIORITY_CLASS` above: a grandchild created with no
+    class flag of its own inherits the creator's class only
+    when the creator is idle or below-normal, and gets NORMAL otherwise.  So
+    ``idle`` and ``below-normal`` are inherited by the job's descendants,
+    while ``above-normal`` and ``high`` apply to the process cronstable
+    spawned and not to what that process goes on to launch: a ``shell: cmd``
+    job at ``high`` is cmd.exe at HIGH running its programs at NORMAL.
+    POSIX has no such split, because :func:`apply_priority` renices the
+    whole group and anything forked later inherits the nice value.
+
+    It is a parameter rather than a caller-assembled flag so that this
+    stays the only function in the tree that writes ``creationflags`` (a
+    test holds that), which is what makes it impossible for a caller setting
+    one of the two bits to drop the other.  POSIX has no spawn-time
+    equivalent and is served by :func:`apply_priority` just after the spawn.
+
+    ``windows`` overrides the platform detection so both arms can be
+    exercised from either OS, the same injection
+    :func:`cronstable.job.shell_spawn` takes.
     """
-    if IS_WINDOWS:  # pragma: no cover - Windows-only path
-        return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+    if windows is None:
+        windows = IS_WINDOWS
+    if windows:
+        return {
+            "creationflags": _CREATE_NEW_PROCESS_GROUP
+            | _WINDOWS_PRIORITY_CLASS[priority]
+        }
     return {"start_new_session": True}
+
+
+def apply_priority(
+    pid: int, priority: str, *, windows: Optional[bool] = None
+) -> bool:
+    """Give an already-spawned job's process group its priority, on POSIX.
+
+    Windows needs nothing here: the class rode in on the creation flags
+    (:func:`new_process_group_kwargs`).  POSIX has no such knob in
+    ``subprocess``, so the group is reniced from the parent the moment the
+    child exists, which leaves a brief window where the job runs at the
+    priority it inherited; the caller closes that window as far as it can by
+    calling this first thing after a successful spawn.
+
+    Renicing from the parent rather than through a ``preexec_fn`` is
+    deliberate.  That hook runs between fork and exec, where only
+    async-signal-safe calls are sound, and wiring one would put a fork-time
+    hook on every spawn including the jobs that have no privilege to drop,
+    which :meth:`cronstable.job.RunningJob.start` keeps clear of one on
+    purpose (a test asserts the kwarg is absent without ``user``/``group``).
+
+    ``PRIO_PGRP`` rather than ``PRIO_PROCESS``, so a descendant the shell
+    already forked in the microseconds before this call is reniced too.
+    ``pid`` is by construction the pgid (see
+    :func:`new_process_group_kwargs`), and it cannot reach an unrelated
+    group for the reason :func:`kill_process_group` sets out.
+
+    Returns ``False`` only when the kernel refused a renice that was
+    attempted.  That is not fatal and never fails the run: a refusal is the
+    daemon's own privilege ceiling (no CAP_SYS_NICE, no RLIMIT_NICE
+    headroom), not anything wrong with this job, so it is logged here once
+    at DEBUG and the job goes on at the priority it inherited.  The operator
+    is told at config load instead, by
+    :meth:`cronstable.config.JobConfig._warn_if_priority_needs_privilege`,
+    because a per-run WARNING on a minutely job would be ~1,440 lines a day
+    describing a condition that will not change until the deployment does.
+
+    ``windows`` overrides the platform detection, as it does above.
+    """
+    if windows is None:
+        windows = IS_WINDOWS
+    if priority == DEFAULT_PRIORITY:
+        return True  # inherit: nothing to apply on either platform
+    if windows:
+        return True
+    try:
+        os.setpriority(os.PRIO_PGRP, pid, _POSIX_NICE[priority])
+    except ProcessLookupError:
+        # The group emptied between the spawn and this call.  A run that
+        # short did not care what priority it had, and nothing was refused.
+        return True
+    except OSError as ex:
+        logger.debug(
+            "could not set priority %r on the process group of pid %s (%s); "
+            "the job runs at the priority it inherited",
+            priority,
+            pid,
+            ex,
+        )
+        return False
+    return True
 
 
 async def kill_process_group(pid: int, *, force: bool) -> bool:

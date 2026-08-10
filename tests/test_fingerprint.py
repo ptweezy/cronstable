@@ -562,6 +562,27 @@ def test_working_directory_stays_out_of_identity(tmp_path):
     assert _id(plain) == _id(relocated)
 
 
+def test_priority_enters_identity_only_when_set():
+    # The other half of the pair above.  A priority is host-independent (the
+    # LEVEL is stored, never the nice number or priority class one platform
+    # resolves it to) and it changes how the job runs, so replicas that
+    # disagree on it must show as drift rather than quietly running the same
+    # work at different priorities.
+    plain = job_yaml("a")
+    lowered = job_yaml("a", extra="    priority: idle\n")
+    (job,) = _jobs(lowered)
+    assert canonical_job(job)["priority"] == "idle"
+    (plain_job,) = _jobs(plain)
+    assert "priority" not in canonical_job(plain_job)
+    assert _id(lowered) != _id(plain)
+
+    # But only when set.  Writing the default level longhand has to hash the
+    # same as saying nothing, which is both the inline-versus-defaults
+    # guarantee and what keeps every persisted retry ladder and @reboot
+    # marker keyed by job_digest pointing where it already pointed.
+    assert _id(job_yaml("a", extra="    priority: normal\n")) == _id(plain)
+
+
 _IDENTITY_BASE = job_yaml(
     "a",
     extra=(

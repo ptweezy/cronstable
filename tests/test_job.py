@@ -2513,6 +2513,144 @@ async def test_bad_working_directory_is_a_start_failure_naming_cwd(
 
 
 # ---------------------------------------------------------------------------
+# priority: the config key reaching both halves of the platform split.
+#
+# start() has to feed the level to two different places, because the
+# platforms take it at different times: Windows at CreateProcess (so it
+# rides on the spawn kwargs) and POSIX after the child exists (so it is a
+# renice).  Both are asserted here from either OS, because start() itself is
+# the same code on both and it is start() that has to get the wiring right.
+# ---------------------------------------------------------------------------
+
+
+def _priority_job_yaml(extra=""):
+    return (
+        "jobs:\n"
+        "  - name: t\n"
+        "    command:\n"
+        "      - echo\n"
+        "      - hi\n"
+        '    schedule: "* * * * *"\n'
+        "    captureStdout: false\n"
+        "    captureStderr: false\n" + extra
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra, expected",
+    [
+        pytest.param("    priority: idle\n", "idle", id="set"),
+        # A job that says nothing still goes through the same two calls: the
+        # skipping is platform.py's job, not a second code path here.
+        pytest.param("", cronstable.platform.DEFAULT_PRIORITY, id="unset"),
+    ],
+)
+async def test_start_carries_the_priority_to_both_platform_halves(
+    monkeypatch, extra, expected
+):
+    captured = []
+    reniced = []
+
+    async def fake_exec(*args, **kwargs):
+        captured.append(kwargs)
+        proc = Mock(stdout=None, stderr=None)
+        proc.pid = 4242
+
+        async def wait():
+            return 0
+
+        proc.wait = wait
+        return proc
+
+    levels = []
+    real_kwargs = cronstable.platform.new_process_group_kwargs
+
+    def recording_kwargs(*args, **kwargs):
+        # No default of its own: a start() that dropped the argument would
+        # otherwise record the real function's default and look correct for
+        # the id="unset" case, which is the case with no other coverage on a
+        # POSIX runner.
+        levels.append(args + tuple(kwargs.values()))
+        return real_kwargs(*args, **kwargs)
+
+    def recording_apply(pid, priority):
+        reniced.append((pid, priority))
+        return True
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(
+        cronstable.platform, "new_process_group_kwargs", recording_kwargs
+    )
+    monkeypatch.setattr(
+        cronstable.platform, "apply_priority", recording_apply
+    )
+
+    job = _running_job(_priority_job_yaml(extra))
+    await job.start()
+
+    # Windows half: the level reaches the flags builder, which is the only
+    # race-free moment to set a priority class.
+    assert levels == [(expected,)]
+    # POSIX half: the renice targets the pid start() just spawned, which is
+    # by construction the pgid of the job's whole tree.
+    assert reniced == [(4242, expected)]
+    # and whatever the platform uses to give the job its own process group
+    # is still on the spawn: a priority must never cost a job its group.
+    if cronstable.platform.IS_WINDOWS:
+        assert captured[-1]["creationflags"] & 0x00000200
+    else:
+        assert captured[-1]["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_refused_priority_neither_fails_nor_re_logs_the_run(
+    monkeypatch, caplog
+):
+    # A kernel that refuses the renice leaves the job running at the
+    # priority it inherited, which is a preference not being met, not a
+    # failure.  And the refusal is logged exactly once, inside
+    # platform.apply_priority; start() deliberately says nothing, so an
+    # unprivileged host does not get a per-run line from both layers.
+    async def fake_exec(*args, **kwargs):
+        proc = Mock(stdout=None, stderr=None)
+        proc.pid = 4242
+
+        async def wait():
+            return 0
+
+        proc.wait = wait
+        return proc
+
+    refusals = []
+
+    def refuse(pid, priority):
+        refusals.append((pid, priority))
+        return False
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(cronstable.platform, "apply_priority", refuse)
+
+    job = _running_job(_priority_job_yaml("    priority: high\n"))
+    # The config layer's own load-time advisory about a raise is a different
+    # message from a different layer; drop it and watch only start().
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="cronstable"):
+        await job.start()
+
+    # A refusal really happened on the path under test.  Without this the
+    # two claims below hold vacuously on a start() that never asks.
+    assert refusals == [(4242, "high")]
+    assert job.proc is not None
+    assert job.start_failed is False
+    assert [
+        rec.getMessage()
+        for rec in caplog.records
+        if "priority" in rec.getMessage()
+    ] == []
+
+
+# ---------------------------------------------------------------------------
 # Shell-reporter CRONSTABLE_* env contract.
 #
 # Users' alerting scripts read these exact variable names; a rename or typo,

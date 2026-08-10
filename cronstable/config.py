@@ -557,6 +557,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "workingDirectory": None,
     "executionTimeout": None,
     "killTimeout": 30,
+    # scheduling priority of the job's process ("Priority" on a Task
+    # Scheduler task's Settings).  The default level is the one that is never
+    # applied, so the spawn is unchanged for every job that says nothing.
+    # How far a level reaches past the job's own process is per-platform; see
+    # cronstable.platform.new_process_group_kwargs.
+    "priority": platform.DEFAULT_PRIORITY,
     "statsd": None,
     "streamPrefix": "[{job_name} {stream_name}] ",
     "enabled": True,
@@ -818,6 +824,11 @@ _job_defaults_common = {
     Opt("workingDirectory"): EmptyNone() | Str(),
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
+    # Built from platform.PRIORITY_LEVELS so the accepted values cannot drift
+    # from the per-OS tables that have to map them.  Enum is what refuses
+    # `priority: realtime` loudly, naming the values that are accepted,
+    # instead of silently downgrading it to something safe.
+    Opt("priority"): Enum(list(platform.PRIORITY_LEVELS)),
     Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
     # Int() is tried first so a numeric ``user: 1000`` parses as the integer
     # 1000 (a uid/gid), reaching the isinstance(..., int) branches in
@@ -862,6 +873,7 @@ _DAG_TASK_LAUNCH_KEYS = frozenset(
         "failsWhen",
         "executionTimeout",
         "killTimeout",
+        "priority",
         "statsd",
         "user",
         "group",
@@ -1514,6 +1526,7 @@ class JobConfig:
         "workingDirectory",
         "executionTimeout",
         "killTimeout",
+        "priority",
         "statsd",
         "user",
         "group",
@@ -1630,6 +1643,11 @@ class JobConfig:
 
         self.executionTimeout = config.pop("executionTimeout")
         self.killTimeout = config.pop("killTimeout")
+        # How the job's process tree is scheduled.  Unlike workingDirectory
+        # this IS fingerprinted (see cronstable.fingerprint.canonical_job):
+        # the level is host-independent, and it changes how the job runs, so
+        # replicas that disagree on it must show as drift.
+        self.priority = config.pop("priority")
         self.statsd = config.pop("statsd")
 
         self.uid: int | None = None
@@ -1639,6 +1657,7 @@ class JobConfig:
         # groups instead of inheriting root's. None when unknown.
         self.username: Optional[str] = None
         self._resolve_user_group(config)
+        self._warn_if_priority_needs_privilege()
 
         self._validate_numeric_ranges()
 
@@ -1927,6 +1946,49 @@ class JobConfig:
                         self.name
                     )
                 )
+
+    def _warn_if_priority_needs_privilege(self) -> None:
+        """Say at load time that this job's priority may be refused.
+
+        Advisory, and the opposite call from the ``user``/``group`` check
+        above: a job that cannot get the priority it asked for still does
+        its work, so refusing the load over it would turn a preference into
+        an outage.  It is said here, once per load, because the alternative
+        is a per-run line describing a condition that will not change until
+        the deployment does; the refusal itself is logged at DEBUG when it
+        happens (:func:`cronstable.platform.apply_priority`).
+
+        Only "may": an unprivileged process can still lower its nice value
+        as far as its ``RLIMIT_NICE`` allows, so this is an advisory rather
+        than a prediction.  The comparison is against cronstable's own nice
+        rather than against zero because only a *raise* needs privilege, and
+        a daemon deliberately started at nice 10 can hand a job
+        ``below-normal`` without asking anyone.
+        """
+        wanted = platform.posix_nice_for(self.priority)
+        if wanted is None:
+            return  # the default level: nothing is ever applied for it
+        if sys.platform == "win32":
+            # Windows hands every class this vocabulary offers to an
+            # unprivileged account; the one that does need a privilege
+            # (realtime) is deliberately not reachable, so there is nothing
+            # to advise about.  Spelled as ``sys.platform``, as
+            # _resolve_user_group above is, so the type checker prunes the
+            # POSIX-only calls below.
+            return
+        current = os.nice(0)
+        if wanted >= current or os.geteuid() == 0:
+            return
+        logger.warning(
+            "job %r asks for priority %r (nice %d), a raise from "
+            "cronstable's own nice %d, which needs CAP_SYS_NICE or "
+            "RLIMIT_NICE headroom; where the kernel refuses it the job "
+            "still runs, at the priority it inherited",
+            self.name,
+            self.priority,
+            wanted,
+            current,
+        )
 
     def _reject(self, message: str) -> "ConfigError":
         """Build (never raise) the job-scoped ConfigError for a failed check.

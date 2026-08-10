@@ -51,7 +51,10 @@ not the raw YAML text, which gives it these properties:
   `onFailure` / `onPermanentFailure` / `onSuccess` (including the retry and
   reporting policy, with secret values redacted); the sorted *names* of
   `environment` variables; `executionTimeout`; `killTimeout`; `statsd`;
-  `user`; `group`; and `concurrencyScope` when set to `cluster`.
+  `user`; `group`; `concurrencyScope` when set to `cluster`; and `priority`
+  when set to anything but `normal` (the level, never the nice value or the
+  priority class one platform resolves it to, so a Windows replica and a
+  Linux one still agree).
 
 Deliberately **not** part of the identity: the catch-up trio (`onMissed`,
 `startingDeadlineSeconds`, `catchupJitterSeconds`) and the archival pair
