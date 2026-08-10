@@ -203,6 +203,12 @@ Windows fixes and additions. The first of many updates to address Windows first-
   reach, and the merged view counts it as missed. Both Codecov
   statuses stay `informational`, so the drop annotates a pull request and
   cannot fail one.
+- An `onLate` block that enables only the push reporter and sets no `sla`
+  thresholds is now refused at config load, as the same block naming any
+  other reporter already was. The check that decides whether an `onLate`
+  would really fire predates push and never learned about it, so such a
+  hook loaded cleanly and then never fired, which is the silent outcome
+  the check exists to prevent.
 
 ## 1.2.38
 

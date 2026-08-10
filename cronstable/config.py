@@ -586,6 +586,12 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
 
     A reporter left at its all-None defaults is not "configured": only an
     onLate that would really fire demands an ``sla`` block to fire about.
+
+    Every reporter has to be named here, and a new one is easy to forget:
+    a reporter this function does not know about makes an onLate that WOULD
+    really fire skip the "onLate requires sla" check below, so the hook
+    loads clean and is then dead for the life of the config.  That is the
+    exact failure push had until it was added.
     """
     report = on_late.get("report") or {}
     sentry_dsn = (report.get("sentry") or {}).get("dsn") or {}
@@ -599,6 +605,11 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
         or mail.get("from") is not None
         or shell.get("command") is not None
         or any(webhook_url.get(k) is not None for k in secret_keys)
+        # bool(), not the `is not None` the four above use: `enabled` is
+        # always present carrying its False default, so `is not None` would
+        # make this function true for every job and trip the import-time
+        # drift guard below.
+        or bool((report.get("push") or {}).get("enabled"))
     )
 
 
