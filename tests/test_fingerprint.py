@@ -854,3 +854,56 @@ def test_job_digest_unchanged_by_sla_attributes():
     job.onLate = {"report": {"shell": {"command": "notify"}}}
     assert job_digest(job) == before
     assert job_set_id([job]) == before_set
+
+
+# ---------------------------------------------------------------------------
+# report.eventlog and job identity
+# ---------------------------------------------------------------------------
+
+
+def test_default_eventlog_block_stays_out_of_identity():
+    # the block post-dates the v1 scheme, so at its defaults it must leave
+    # the canonical form entirely; otherwise adding it would have repointed
+    # every existing job's digest on upgrade.
+    job = _jobs(
+        "jobs:\n  - name: a\n    command: x\n    schedule: '* * * * *'\n"
+    )[0]
+    canonical = canonical_job(job)
+    for hook in ("onFailure", "onPermanentFailure", "onSuccess", "onLate"):
+        block = canonical.get(hook) or {}
+        assert "eventlog" not in (block.get("report") or {})
+
+
+def test_enabled_eventlog_changes_the_digest():
+    # opting in IS drift: what happens on failure changed.
+    plain = _jobs(
+        "jobs:\n  - name: a\n    command: x\n    schedule: '* * * * *'\n"
+    )
+    enabled = _jobs(
+        "jobs:\n"
+        "  - name: a\n"
+        "    command: x\n"
+        "    schedule: '* * * * *'\n"
+        "    onFailure:\n"
+        "      report:\n"
+        "        eventlog:\n"
+        "          enabled: true\n"
+    )
+    assert job_set_id(plain) != job_set_id(enabled)
+
+
+def test_eventlog_source_is_identity_when_the_block_is_set():
+    def _with(source):
+        return _jobs(
+            "jobs:\n"
+            "  - name: a\n"
+            "    command: x\n"
+            "    schedule: '* * * * *'\n"
+            "    onFailure:\n"
+            "      report:\n"
+            "        eventlog:\n"
+            "          enabled: true\n"
+            "          source: {}\n".format(source)
+        )
+
+    assert job_set_id(_with("alpha")) != job_set_id(_with("beta"))

@@ -1004,3 +1004,226 @@ def fsync_directory(path: str) -> None:
             pass
         finally:
             os.close(fd)
+
+
+# --- Windows Event Log ----------------------------------------------------
+#: ``ReportEventW``'s ``wType``, the severity that Event Viewer's Level
+#: column, a Windows Event Forwarding subscription and every SIEM connector
+#: all read.  Three of the six documented values: the two audit types mean
+#: something only in the Security log, which needs a registered source and a
+#: privilege the daemon does not hold, and ``EVENTLOG_SUCCESS`` (0) is shown
+#: as "Information" by one viewer and "LogAlways" by another, so a success
+#: is written as information and 0 is never emitted.
+EVENTLOG_ERROR_TYPE = 0x0001
+EVENTLOG_WARNING_TYPE = 0x0002
+EVENTLOG_INFORMATION_TYPE = 0x0004
+
+#: ``ERROR_INVALID_HANDLE``.  Named because it is the one write failure a
+#: caller can repair: the EventLog service restarting invalidates a source
+#: handle opened before it, and registering the source again is the fix.
+EVENTLOG_ERROR_INVALID_HANDLE = 6
+
+#: What :func:`write_event_log` reports where there is no Event Log at all.
+#: Nonzero, because the contract is that 0 means written, and 0x1FFFF, which
+#: sits above every documented Win32 system error code, so it can never
+#: collide with a real one a caller later comes to special-case.
+EVENTLOG_ERROR_UNSUPPORTED = 0x1FFFF
+
+#: How many wide characters one ``ReportEventW`` call may carry across ALL
+#: of its insertion strings together.
+#:
+#: Measured on Windows 11 rather than taken from the documentation, because
+#: the real constraint is a shared budget and not a per-string length: the
+#: call fails with ``ERROR_INVALID_PARAMETER`` unless ``sum(len(s) + 1)``
+#: over the strings is at most 32,732.  One string of 32,731 is accepted and
+#: 32,732 refused; two of 16,365 accepted and 16,366 refused; four of 8,182
+#: and eight of 4,090 land on that same total, which is what shows the
+#: ``+ 1`` is each string's own terminator rather than a per-string cap.
+#:
+#: The number here is deliberately well inside that, because an over-long
+#: vector is not a soft failure: ReportEventW writes no record at all, so
+#: the alert most worth having (the run that produced the most output) is
+#: exactly the one that would go missing.  Callers size their own field
+#: ceilings against this; nothing trims to it at write time.
+EVENTLOG_MAX_TOTAL_CHARS = 30000
+
+#: advapi32 with the three Event Log prototypes declared, built once.
+#:
+#: Cached because :func:`write_event_log` runs once per reported run on a
+#: long-lived daemon, and ``ctypes.WinDLL`` builds a fresh wrapper object
+#: (and re-declares every prototype) each time it is called.  A module
+#: global rather than an ``lru_cache`` so the whole thing stays inside the
+#: Windows-only clause it belongs in; ``None`` means "not built yet", never
+#: "could not be built", since a failure to build is not cached.
+_EVENT_LOG_API: Any = None
+
+
+def _event_log_api() -> Any:  # pragma: no cover (windows) - Windows-only
+    """Build (or return) advapi32 with the Event Log prototypes declared.
+
+    ``ctypes.WinDLL("advapi32", use_last_error=True)`` rather than
+    ``ctypes.windll.advapi32``, which is the shape the rest of this module
+    uses for kernel32.  The difference matters here and nowhere else in the
+    package: ``windll`` caches library wrappers built with
+    ``use_last_error=False``, which do not snapshot the calling thread's
+    last-error value around the foreign call, so a later unrelated call can
+    overwrite the code before it is read.  :func:`write_event_log` acts on
+    exactly one code (:data:`EVENTLOG_ERROR_INVALID_HANDLE` means close,
+    re-open and retry), so it has to read the snapshotted copy.
+
+    Declaring ``restype`` on ``RegisterEventSourceW`` is load-bearing, not
+    tidiness: ctypes defaults every foreign function to ``c_int``, which
+    truncates a 64-bit handle on Win64 to something ``ReportEventW`` then
+    rejects.  :func:`fsync_directory` guards the identical hazard on
+    ``CreateFileW`` above; this is the second site in the file.
+
+    The arguments that are always the same, and why:
+
+    * ``lpUNCServerName`` is NULL (this machine).  Logging to another host
+      needs a share, credentials and a firewall path, none of which an
+      unattended daemon can be expected to have.
+    * ``lpUserSid`` is NULL, typed ``LPVOID``.  Attaching the daemon's SID
+      costs an ``OpenProcessToken`` plus a ``GetTokenInformation`` for a
+      field nothing consumes; Event Viewer's User column reads N/A.
+    * ``dwDataSize`` is 0 and ``lpRawData`` NULL.  Binary event data is
+      opaque in Event Viewer and meaningless to a SIEM connector, so
+      everything cronstable writes rides the insertion strings.
+    """
+    global _EVENT_LOG_API
+    if _EVENT_LOG_API is not None:
+        return _EVENT_LOG_API
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL(  # type: ignore[attr-defined]
+        "advapi32", use_last_error=True
+    )
+    advapi32.RegisterEventSourceW.restype = wintypes.HANDLE
+    advapi32.RegisterEventSourceW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+    ]
+    advapi32.ReportEventW.restype = wintypes.BOOL
+    advapi32.ReportEventW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.WORD,
+        wintypes.WORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.WORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPCWSTR),
+        wintypes.LPVOID,
+    ]
+    advapi32.DeregisterEventSource.restype = wintypes.BOOL
+    advapi32.DeregisterEventSource.argtypes = [wintypes.HANDLE]
+    _EVENT_LOG_API = advapi32
+    return advapi32
+
+
+def open_event_log(source: str) -> Optional[int]:
+    """Register ``source`` with the Event Log and return its handle.
+
+    ``None`` where there is no Event Log to open, or the service refused.
+    A source that was never registered under
+    ``HKLM\\SYSTEM\\CurrentControlSet\\Services\\EventLog`` still opens and
+    still writes; its records land in the Application log and render with
+    the generic "The description for Event ID ... cannot be found" preamble,
+    which costs the rendered prose and nothing else (the provider name, the
+    event id, the level and the insertion strings are all still there for
+    the XML view, a forwarder and a SIEM connector).  Registering would
+    need HKLM writes, so it is the operator's decision, not the daemon's.
+
+    Blocking, and that is the reason this is a separate call rather than
+    something :func:`write_event_log` does lazily: ``RegisterEventSourceW``
+    is an RPC to the EventLog service, not a local call, so it must be
+    reached from the same worker thread as the writes and never from the
+    event loop.
+    """
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
+        try:
+            advapi32 = _event_log_api()
+            handle: Optional[int] = advapi32.RegisterEventSourceW(None, source)
+        except Exception:  # noqa: BLE001 - any ctypes failure -> no log
+            return None
+        return int(handle) if handle else None
+    else:  # pragma: no cover (posix) - there is no event log here
+        return None
+
+
+def write_event_log(
+    handle: int,
+    *,
+    event_type: int,
+    category: int,
+    event_id: int,
+    strings: list[str],
+) -> int:
+    """Write one Event Log record.  Returns 0 written, else an error code.
+
+    An error code rather than a bool because exactly one code is
+    actionable: :data:`EVENTLOG_ERROR_INVALID_HANDLE` tells the caller to
+    re-open the source and retry the record once.  Everything else is worth
+    logging and dropping.
+
+    ``strings`` must not contain ``None``.  A NULL in the ``LPCWSTR`` array
+    renders as nothing at that position, which silently shifts every later
+    field an operator (or a parser reading ``EventData/Data`` by index)
+    reads; an empty field is ``""``.  The caller is also responsible for
+    keeping the vector inside :data:`EVENTLOG_MAX_TOTAL_CHARS`, since
+    overshooting it writes no record at all rather than a truncated one.
+    """
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            advapi32 = _event_log_api()
+            # Held in a local across the call: ctypes pins the converted
+            # wide buffers on the array's own _objects, so letting the
+            # array go first would free them under the callee.
+            array = (wintypes.LPCWSTR * len(strings))(*strings)
+            written: int = advapi32.ReportEventW(
+                handle,
+                event_type,
+                category,
+                event_id,
+                None,
+                len(strings),
+                0,
+                array,
+                None,
+            )
+            if written:
+                return 0
+            code: int = ctypes.get_last_error()  # type: ignore[attr-defined]
+        # Broader than it looks, and deliberately so.  A handle this
+        # function never opened does not come back as an error code: passing
+        # a made-up integer faults inside advapi32 and ctypes reports the
+        # access violation as OSError (measured).  A handle that WAS opened
+        # and has since been closed or invalidated, which is the case that
+        # actually happens when the EventLog service restarts, returns
+        # ERROR_INVALID_HANDLE properly (also measured).  So the first shape
+        # has to be swallowed here or it would escape into the writer thread
+        # and take it down, and the second stays an actionable code below.
+        except Exception:  # noqa: BLE001 - see above
+            return EVENTLOG_ERROR_UNSUPPORTED
+        # `or` guards the pathological "returned FALSE but last error is 0"
+        # case, so 0 never comes to mean written when nothing was.
+        return int(code) or EVENTLOG_ERROR_UNSUPPORTED
+    else:  # pragma: no cover (posix) - there is no event log here
+        return EVENTLOG_ERROR_UNSUPPORTED
+
+
+def close_event_log(handle: int) -> None:
+    """Release a source handle.  Never raises, on either platform."""
+    if IS_WINDOWS:  # pragma: no cover (windows) - Windows-only path
+        # Best effort on purpose: this is reached while shutting down or
+        # after the EventLog service went away, and in either case the
+        # handle dies with the process anyway.
+        try:
+            _event_log_api().DeregisterEventSource(handle)
+        except Exception:  # noqa: BLE001 - see above
+            return
+    else:  # pragma: no cover (posix) - there is no event log here
+        return

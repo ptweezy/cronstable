@@ -370,10 +370,10 @@ curl -X POST -H "Authorization: Bearer <token>" http://127.0.0.1:8080/shutdown
 Killing the process instead (`taskkill /F`, Task Manager) skips the drain and
 leaves any spawned job trees running.
 
-**A log file.** An unattended daemon's stderr goes nowhere. cronstable writes no
-Windows Event Log entries; give the root logger a rotating file via the
-`logging:` section (a plain `logging.config.dictConfig` passthrough, stdlib
-only, works in the frozen .exe):
+**A log file.** An unattended daemon's stderr goes nowhere. Give the root
+logger a rotating file via the `logging:` section (a plain
+`logging.config.dictConfig` passthrough, stdlib only, works in the frozen
+.exe):
 
 ```yaml
 logging:
@@ -397,6 +397,11 @@ logging:
 See [Logging Configuration](Logging-Configuration) for the section's
 semantics (including that `--validate-config` does not exercise it).
 
+That log file and the Event Log reporter below cover different things and
+an unattended box usually wants both: the `logging:` section captures the
+daemon's own log, while `report.eventlog` publishes per-run outcomes where
+monitoring can pick them up.
+
 **A firewall rule, only if you bind beyond loopback.** Loopback-only
 listeners (`127.0.0.1`) need no rule. A routable `web.listen` or
 `cluster.listen` needs an inbound allow rule, created ahead of time for an
@@ -413,6 +418,40 @@ enabled, the client default) resumes the same kernel session at the next
 power-on, and cronstable treats it as the same OS boot, so `@reboot` does not
 re-fire after it; a Restart always begins a new boot. See
 [Durable State](Durable-State) for the boot-identity mechanics.
+
+## Windows Event Log
+
+Job outcomes can be written to the Windows Event Log, which is where a
+Windows shop's monitoring already looks: Event Viewer, a Windows Event
+Forwarding subscription, SCOM, and every SIEM connector. It is a sixth
+reporter in the same `report` block as the other five, so it fires from the
+same hooks:
+
+```yaml
+defaults:
+  onFailure:
+    report:
+      eventlog:
+        enabled: true
+```
+
+Records carry a stable event ID (1000 succeeded, 1001 failed, 1002 failed
+permanently, 1003 overdue, 1010 and 1011 for daemon events) and a fixed set
+of insertion strings, so a rule written against them keeps working:
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronstable'; ID = 1001, 1002 }
+```
+
+cronstable does not register its event source, because that needs an HKLM
+write and buys nothing without a message DLL, so Event Viewer prefixes the
+rendered text with its generic "description cannot be found" note. That
+costs the rendered prose only: the provider, the ID, the level and every
+insertion string are all present, so the XML view, `wevtutil`, forwarding
+and SIEM connectors read the record normally.
+
+See [Windows Event Log](Windows-Event-Log) for the full tables, the optional
+source registration, and why `includeOutput` is off by default.
 
 ## Job termination semantics
 
@@ -702,7 +741,8 @@ Apart from the differences above, cronstable behaves the same on Windows as on
 POSIX. The YAML crontab, classic crontabs (with the `SHELL=` guard above),
 schedules and timezones, environment variables and env files, output
 capturing, concurrency, failure detection and retries, reporting
-(mail / Sentry / shell / webhook), statsd metrics, the Prometheus `/metrics` endpoint,
+(mail / Sentry / shell / webhook / push, plus the Windows-only
+[Event Log reporter](Windows-Event-Log)), statsd metrics, the Prometheus `/metrics` endpoint,
 the HTTP control API, the web dashboard, and the `cronstable tui` terminal
 dashboard (which enables VT mode on the Windows console and reads keys via
 `msvcrt`) all work as documented elsewhere in this wiki:

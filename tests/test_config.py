@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 from types import SimpleNamespace
@@ -139,6 +140,9 @@ jobs:
                     config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
                 ),
                 "push": config.DEFAULT_CONFIG["onFailure"]["report"]["push"],
+                "eventlog": (
+                    config.DEFAULT_CONFIG["onFailure"]["report"]["eventlog"]
+                ),
             },
             "retry": {
                 "backoffMultiplier": 2,
@@ -217,6 +221,9 @@ jobs:
                     config.DEFAULT_CONFIG["onFailure"]["report"]["webhook"]
                 ),
                 "push": config.DEFAULT_CONFIG["onFailure"]["report"]["push"],
+                "eventlog": (
+                    config.DEFAULT_CONFIG["onFailure"]["report"]["eventlog"]
+                ),
             },
             "retry": {
                 "backoffMultiplier": 2,
@@ -2839,3 +2846,90 @@ def test_duplicate_job_names_rejected(tmp_path):
         config.parse_config(str(cfg))
     assert "duplicate job name" in str(exc.value)
     assert "backup" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# report.eventlog (the Windows Event Log reporter)
+# ---------------------------------------------------------------------------
+
+_EVENTLOG_JOB = """
+jobs:
+  - name: el
+    command: echo hi
+    schedule: "* * * * *"
+    onFailure:
+      report:
+        eventlog:
+          enabled: {enabled}
+          source: {source}
+"""
+
+
+def _eventlog_conf(tmp_path, source="cronstable", enabled="true"):
+    """Parse through parse_config, the only entry point that runs the
+    cross-section validators the eventlog checks live in."""
+    (tmp_path / "jobs.yaml").write_text(
+        _EVENTLOG_JOB.format(enabled=enabled, source=source), encoding="utf-8"
+    )
+    return config.parse_config(str(tmp_path))
+
+
+def test_eventlog_report_defaults():
+    job = config.parse_config_string(
+        "jobs:\n  - name: a\n    command: x\n    schedule: '* * * * *'\n", ""
+    ).jobs[0]
+    for hook in ("onFailure", "onPermanentFailure", "onSuccess", "onLate"):
+        assert getattr(job, hook)["report"]["eventlog"] == {
+            "enabled": False,
+            "source": "cronstable",
+            "includeOutput": False,
+        }
+
+
+@pytest.mark.parametrize(
+    "source", ["''", r"'a\b'", "'a/b'", "Application", "security"]
+)
+def test_eventlog_source_rejects_a_separator_or_a_log_name(source, tmp_path):
+    # the source names a registry key UNDER a log, so a path separator
+    # addresses something else, and the three log names are not source names
+    # at all (Security additionally needs a privilege the daemon lacks).
+    with pytest.raises(ConfigError, match="report.eventlog.source"):
+        _eventlog_conf(tmp_path, source=source)
+
+
+def test_eventlog_source_is_ignored_in_a_disabled_block(tmp_path):
+    # `source` carries a default into every report block of every hook, so
+    # inspecting disabled blocks would let a stray value in a block nobody
+    # turned on refuse the whole configuration.
+    conf = _eventlog_conf(tmp_path, source="Application", enabled="false")
+    assert conf.jobs[0].onFailure["report"]["eventlog"]["enabled"] is False
+
+
+def test_eventlog_on_posix_warns_once_naming_every_user(
+    tmp_path, caplog, monkeypatch
+):
+    monkeypatch.setattr(config.platform, "IS_WINDOWS", False)
+    with caplog.at_level(logging.WARNING):
+        _eventlog_conf(tmp_path)
+    warnings = [
+        r for r in caplog.records if "report.eventlog is enabled" in r.message
+    ]
+    assert len(warnings) == 1
+    assert "job el" in warnings[0].getMessage()
+
+
+def test_eventlog_on_windows_stays_quiet(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(config.platform, "IS_WINDOWS", True)
+    with caplog.at_level(logging.WARNING):
+        _eventlog_conf(tmp_path)
+    assert "report.eventlog is enabled" not in caplog.text
+
+
+def test_onlate_with_only_eventlog_requires_sla():
+    with pytest.raises(ConfigError, match="onLate requires sla"):
+        _sla_job(
+            "    onLate:\n"
+            "      report:\n"
+            "        eventlog:\n"
+            "          enabled: true\n"
+        )

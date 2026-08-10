@@ -881,3 +881,96 @@ def test_fsync_directory_swallows_fsync_failure(monkeypatch, tmp_path):
 
     monkeypatch.setattr(platform.os, "fsync", refuse)
     platform.fsync_directory(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Windows Event Log leaf calls
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="the POSIX arms of the event log shim"
+)
+def test_event_log_calls_are_inert_on_posix():
+    # There is no Event Log here, so opening reports "no handle" and a write
+    # reports a nonzero code that is not a Win32 error, which is what keeps
+    # the caller's "0 means written" contract honest on both platforms.
+    assert platform.open_event_log("cronstable") is None
+    assert (
+        platform.write_event_log(
+            1, event_type=4, category=1, event_id=1000, strings=["a"]
+        )
+        == platform.EVENTLOG_ERROR_UNSUPPORTED
+    )
+    assert platform.EVENTLOG_ERROR_UNSUPPORTED != 0
+    platform.close_event_log(1)  # never raises
+
+
+@pytest.mark.skipif(
+    platform.IS_WINDOWS, reason="drives the Windows arm from POSIX"
+)
+def test_open_event_log_survives_a_ctypes_failure(monkeypatch):
+    # With IS_WINDOWS forced true on a box that has no ctypes.wintypes, the
+    # import inside the clause raises. That has to come back as "no handle"
+    # rather than escape into the writer thread and kill it.
+    monkeypatch.setattr(platform, "IS_WINDOWS", True)
+    assert platform.open_event_log("cronstable") is None
+    assert (
+        platform.write_event_log(
+            1, event_type=4, category=1, event_id=1000, strings=["a"]
+        )
+        == platform.EVENTLOG_ERROR_UNSUPPORTED
+    )
+    platform.close_event_log(1)
+
+
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS, reason="needs a real Windows Event Log"
+)
+def test_event_log_direct_calls_on_windows():
+    # Deliberately unskippable beyond the platform check, because the
+    # `(windows)` coverage profile MEASURES these bodies on the Windows
+    # rows: a test that self-skips on a locked-down runner would leave them
+    # measured and missed. It asserts only what is true on any Windows host,
+    # so it needs no policy, no elevation and no readback.
+    source = "cronstable-test-direct"
+    handle = platform.open_event_log(source)
+    assert handle is None or isinstance(handle, int)
+    if handle is None:  # a policy-locked host may refuse the source
+        return
+    try:
+        code = platform.write_event_log(
+            handle,
+            event_type=platform.EVENTLOG_INFORMATION_TYPE,
+            category=1,
+            event_id=1000,
+            strings=["cronstable self-test", "direct-call"],
+        )
+        assert code == 0
+        # A vector past the API's combined ceiling writes NO record at all,
+        # which is exactly why the reporter caps its fields by arithmetic
+        # rather than trusting the call to truncate.
+        assert (
+            platform.write_event_log(
+                handle,
+                event_type=platform.EVENTLOG_INFORMATION_TYPE,
+                category=1,
+                event_id=1000,
+                strings=["x" * (platform.EVENTLOG_MAX_TOTAL_CHARS * 2)],
+            )
+            != 0
+        )
+    finally:
+        platform.close_event_log(handle)
+    # Writing through a handle that has been released reports the one code
+    # the writer acts on, by re-registering the source and retrying once.
+    assert (
+        platform.write_event_log(
+            handle,
+            event_type=platform.EVENTLOG_INFORMATION_TYPE,
+            category=1,
+            event_id=1000,
+            strings=["after close"],
+        )
+        == platform.EVENTLOG_ERROR_INVALID_HANDLE
+    )

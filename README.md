@@ -53,7 +53,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Schedule introspection](#schedule-introspection))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
-* **End-to-end encrypted push notifications**: a fifth reporter seals each
+* **End-to-end encrypted push notifications**: a dedicated reporter seals each
   alert to a paired device's own key (libsodium sealed box), so the relay
   that forwards it to the platform push service never sees job names,
   hostnames, or log lines; pairing is a dashboard QR scan or one API call,
@@ -503,7 +503,7 @@ in the wiki is the full walkthrough, and
 [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
 enable it.
 
-**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** (a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all five failure reporters wired to live sinks), run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** (a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all five cross-platform failure reporters wired to live sinks), run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
 
 ## Terminal dashboard
 
@@ -736,7 +736,7 @@ quickstart uses the root `docker-compose.yml`). Highlights:
 | Example | One command | Shows off |
 | --- | --- | --- |
 | [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-runner, an on-demand job. |
-| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five reporters wired to live sinks. |
+| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five cross-platform reporters wired to live sinks. |
 | [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
 | [`cluster-large`](example/cluster-large) | `docker compose -f example/cluster-large/docker-compose.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
 | [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
@@ -998,7 +998,7 @@ Note: if the configuration option is a directory and there are multiple configur
 
 ### Reporting
 
-cronstable has five built-in reporters: `sentry`, `mail`, `shell`, `webhook`
+cronstable has six built-in reporters: `sentry`, `mail`, `shell`, `webhook`
 (Slack-compatible out of the box), and `push`
 ([end-to-end encrypted push notifications](#push-notifications), below). Each
 can fire on the `onFailure`, `onPermanentFailure`, `onSuccess`, and `onLate`
@@ -1046,7 +1046,7 @@ the shell reporter's `CRONSTABLE_*` environment.
 
 ### Push notifications
 
-A fifth reporter, `push`, delivers end-to-end encrypted alerts to paired
+The `push` reporter delivers end-to-end encrypted alerts to paired
 devices. Each alert is sealed to the device's X25519 public key (a libsodium
 sealed box) before it leaves the daemon; the hosted relay that forwards it to
 the platform push service (APNs) sees only ciphertext and routing metadata,
@@ -1093,6 +1093,40 @@ See
 [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
 in the wiki for the report options, pairing and revocation, storage, size
 limits, and the relay trust model.
+
+### Windows Event Log
+
+On Windows, the `eventlog` reporter writes each outcome to the Event Log,
+where a Windows shop's monitoring already looks: Event Viewer, a Windows
+Event Forwarding subscription, SCOM, and every SIEM connector. It needs no
+extra and no dependency, and each record carries a stable event ID plus a
+fixed set of insertion strings, so a rule written against it keeps working:
+
+```yaml
+defaults:
+  onFailure:
+    report:
+      eventlog:
+        enabled: true
+```
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronstable'; ID = 1001, 1002 }
+```
+
+Jobs use event IDs 1000 (succeeded), 1001 (failed), 1002 (failed
+permanently) and 1003 (overdue); daemon and orchestration events use 1010
+and 1011. cronstable does not register its event source, so Event Viewer
+prefixes the rendered text with its generic "description cannot be found"
+note; the provider, ID, level and every insertion string are unaffected, so
+the XML view, `wevtutil`, forwarding and SIEM connectors read the record
+normally. On any other platform the reporter does nothing and the config
+load says so once.
+
+See
+[Windows Event Log](https://github.com/ptweezy/cronstable/wiki/Windows-Event-Log)
+in the wiki for the full ID and field tables, the optional source
+registration, and the reasons behind both defaults.
 
 ### Metrics
 
