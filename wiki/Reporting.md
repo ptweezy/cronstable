@@ -286,8 +286,9 @@ Execution model:
 - If `command` is a **list**, it is executed directly with
   `asyncio.create_subprocess_exec` (no shell).
 - If `command` is a **string** and `shell` is set (on POSIX the default
-  `/bin/sh` applies), it is executed as `[shell, "-c", command]` with
-  `asyncio.create_subprocess_exec`.
+  `/bin/sh` applies), it is executed as `[shell, <flag>, command]` with
+  `asyncio.create_subprocess_exec`, where the flag is per-shell: `/c` for
+  `cmd`/`cmd.exe`, `-c` for everything else.
 - If `command` is a **string** and `shell` resolves to a falsy value (e.g.
   `shell: ""`), the string is passed to `asyncio.create_subprocess_shell`
   (run by the system default shell). **This is the Windows default**, where

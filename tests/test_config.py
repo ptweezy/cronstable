@@ -316,6 +316,21 @@ def test_invalid_environ_file(env_file):
     assert "env_file" in str(exc.value)
 
 
+def test_environ_file_with_utf8_bom(tmp_path):
+    # Windows editors (Notepad historically, PowerShell `>` redirects)
+    # prepend a UTF-8 BOM; it must not ride into the first variable's
+    # name, where it silently produced a look-alike U+FEFF-prefixed FOO
+    # with the expected FOO absent and no error anywhere. CRLF endings
+    # are the same file's other Windows trait and already handled by
+    # universal newlines; both are pinned here.
+    env_path = tmp_path / "bom.env"
+    env_path.write_bytes(b"\xef\xbb\xbfFOO=bar\r\nBAZ=qux\r\n")
+    assert config.parse_environment_file(str(env_path)) == {
+        "FOO": "bar",
+        "BAZ": "qux",
+    }
+
+
 def test_config_include():
     conf = config.parse_config(
         os.path.join(os.path.dirname(__file__), "test_include_parent.yaml")
