@@ -575,6 +575,226 @@ async def test_rehydrate_rehydrate_from_state_warms_history(tmp_path):
     )
 
 
+# --- rehydrate: order tolerance on a shared mount ---------------------------
+#
+# The per-job write chain orders THIS node's appends to runs/<job>; it cannot
+# order appends a peer node sharing the mount issues through its own process.
+# These seeds invert a pair deterministically: the record with the NEWER
+# finished_at is appended FIRST, so the last record in the stream is the older
+# run and any reader trusting stream position picks it.  Sequential awaits plus
+# the backend's monotonic record-name floor fix the file order, so there is no
+# race to lose (unlike the write-side ordering tests, which had to delay the
+# first append to make the natural inversion deterministic).
+
+
+async def _seed_inverted_pair(cron):
+    # newer FIRST...
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "finished_at": "2026-07-01T09:05:00+00:00",
+            "ranAt": "2026-07-01T09:05:00+00:00",
+        },
+    )
+    # ...older SECOND, so it is last in the stream
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {
+            "outcome": "failure",
+            "exit_code": 1,
+            "finished_at": "2026-07-01T09:00:00+00:00",
+            "ranAt": "2026-07-01T09:00:00+00:00",
+        },
+    )
+
+
+async def test_rehydrate_last_run_is_newest_by_finished_at_not_position(
+    tmp_path,
+):
+    # the highest-stakes case in the whole item: taking the last record in
+    # the stream reports the job FAILED after a restart when its newest run
+    # succeeded, and /jobs, the dashboard and the Prometheus last-run gauges
+    # all read it.
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_rehydrated = False
+    await _seed_inverted_pair(cron)
+    await cron._rehydrate_from_state()
+    assert cron.last_run["j"].outcome == "success"
+    assert cron.last_run["j"].finished_at.isoformat() == (
+        "2026-07-01T09:05:00+00:00"
+    )
+    # and the warmed ring itself is in finish order, so the history the
+    # sparkline renders reads oldest to newest
+    assert [r.finished_at.isoformat() for r in cron.run_history["j"]] == [
+        "2026-07-01T09:00:00+00:00",
+        "2026-07-01T09:05:00+00:00",
+    ]
+
+
+async def test_rehydrate_last_completed_at_is_newest_by_finished_at(tmp_path):
+    # separate test from the one above so a half-fix is caught: the retry
+    # ladder's superseded-by-run watermark must not rewind to the older run
+    # of an inverted pair, or a ladder armed between the two settles.
+    # `failure` (not `skipped`) for the older row, so the walk's own outcome
+    # filter cannot mask the ordering.
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._state_rehydrated = False
+    await _seed_inverted_pair(cron)
+    await cron._rehydrate_from_state()
+    assert cron._last_completed_at["j"].isoformat() == (
+        "2026-07-01T09:05:00+00:00"
+    )
+
+
+async def test_rehydrate_orders_a_reconciled_row_by_its_interruption(
+    tmp_path,
+):
+    # a crash-reconciled row under onMissed run-all carries interruptedAt and
+    # NO finished_at, which is the record shape a finished_at fold has to
+    # survive: _job_run_info_from_dict substitutes the interruption instant,
+    # so the row sorts where the interrupted run STARTED and can never make
+    # the fold raise.
+    cron = await _rehydrate_state_cron(tmp_path, _RUNALL_REHYDRATE)
+    cron._state_rehydrated = False
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {
+            "outcome": "success",
+            "exit_code": 0,
+            "finished_at": "2026-07-01T11:00:00+00:00",
+            "ranAt": "2026-07-01T11:00:00+00:00",
+        },
+    )
+    await cron.state_backend.append_record(
+        cron._run_stream("j"),
+        {
+            "outcome": "unknown",
+            "exit_code": None,
+            "started_at": None,
+            "duration": None,
+            "fail_reason": "run interrupted",
+            "interruptedAt": "2026-07-01T10:00:00+00:00",
+        },
+    )
+    await cron._rehydrate_from_state()
+    assert cron.last_run["j"].outcome == "success"
+    assert [r.outcome for r in cron.run_history["j"]] == ["unknown", "success"]
+    assert cron._last_completed_at["j"].isoformat() == (
+        "2026-07-01T11:00:00+00:00"
+    )
+
+
+async def test_rehydrate_reconciled_takeover_does_not_regress_last_run(
+    tmp_path,
+):
+    # a slot takeover reconciles a FOREIGN node's interrupted run, and the
+    # synthetic row's instant is that run's START, which can predate a run
+    # this node already recorded.  Installing it as last_run made the whole
+    # status surface report `unknown` for a job whose newest run succeeded.
+    cron = await _rehydrate_state_cron(tmp_path)
+    cron._record_run("j", _mem_run5("success", 5))
+    cron._reconcile_open_record(
+        "j",
+        cron.cron_jobs["j"],
+        {"startedAt": "2026-07-01T10:00:00+00:00", "host": "other-node"},
+        "reconciled-takeover",
+    )
+    assert cron.last_run["j"].outcome == "success"
+    # the interrupted run is still VISIBLE; only the "which is newest"
+    # answer changed
+    assert [r.outcome for r in cron.run_history["j"]] == [
+        "success",
+        "unknown",
+    ]
+    assert cron._last_completed_at["j"].isoformat() == (
+        "2026-07-01T10:05:00+00:00"
+    )
+    await asyncio.gather(*list(cron._pending_state_writes))
+
+
+async def _seed_two_overlapping_successes(cron):
+    # concurrencyPolicy: Allow is the default, so a job whose runtime exceeds
+    # its interval routinely has instances finishing while an earlier one is
+    # still going.  These two finish at 10:03 and 10:04, after the 10:02
+    # start the reconcile rows below stand in.
+    cron._record_run("j", _mem_run5("success", 3))
+    cron._record_run("j", _mem_run5("success", 4))
+
+
+async def test_rehydrate_local_crash_outranks_the_runs_that_outlived_it(
+    tmp_path,
+):
+    # THIS host's own interrupted run is the newest thing that happened here,
+    # whatever finished around it.  The synthetic row is keyed on the run's
+    # START, so folding it against the overlapping instances that finished
+    # after that instant would report `success` for a job that just died, on
+    # GET /jobs, the dashboard tile, every cronstable_job_last_run_* gauge
+    # and the /jobs/{name}/logs replay target.
+    cron = await _rehydrate_state_cron(tmp_path)
+    await _seed_two_overlapping_successes(cron)
+    cron._reconcile_open_record(
+        "j",
+        cron.cron_jobs["j"],
+        {
+            "startedAt": "2026-07-01T10:02:00+00:00",
+            "host": cron._state_host,
+        },
+        "reconciled-crash",
+    )
+    assert cron.last_run["j"].outcome == "unknown"
+    # the watermark is a separate question and stays monotonic: a run that
+    # started before the newest completion must not rewind the retry
+    # ladder's supersede reference.
+    assert cron._last_completed_at["j"].isoformat() == (
+        "2026-07-01T10:04:00+00:00"
+    )
+    await asyncio.gather(*list(cron._pending_state_writes))
+
+
+async def test_rehydrate_foreign_crash_loses_to_a_newer_local_run(tmp_path):
+    # the sibling of the test above, and the case the conditional promotion
+    # was written for: a slot takeover reconciles ANOTHER node's interrupted
+    # run, which says nothing about what ran here, so it must not displace a
+    # local run that finished after it started.
+    cron = await _rehydrate_state_cron(tmp_path)
+    await _seed_two_overlapping_successes(cron)
+    cron._reconcile_open_record(
+        "j",
+        cron.cron_jobs["j"],
+        {"startedAt": "2026-07-01T10:02:00+00:00", "host": "other-node"},
+        "reconciled-takeover",
+    )
+    assert cron.last_run["j"].outcome == "success"
+    assert cron.last_run["j"].finished_at.isoformat() == (
+        "2026-07-01T10:04:00+00:00"
+    )
+    # still visible in the history either way; only the "which is newest"
+    # answer differs between the two hosts
+    assert [r.outcome for r in cron.run_history["j"]] == [
+        "success",
+        "success",
+        "unknown",
+    ]
+    # losing the fold is not the same as being barred from it: a foreign
+    # row whose run really did start after everything here recorded IS the
+    # newest thing known about the job.
+    cron._reconcile_open_record(
+        "j",
+        cron.cron_jobs["j"],
+        {"startedAt": "2026-07-01T10:06:00+00:00", "host": "other-node"},
+        "reconciled-takeover",
+    )
+    assert cron.last_run["j"].outcome == "unknown"
+    await asyncio.gather(*list(cron._pending_state_writes))
+
+
+# The ring-release half of the conditional promotion lives with its sibling
+# invariant in tests/test_cron_web.py, beside
+# test_record_run_releases_superseded_ring.
+
+
 # --- rehydrate counters -----------------------------------------------------
 
 

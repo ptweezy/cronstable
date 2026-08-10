@@ -858,8 +858,71 @@ class PauseInfo:
         }
 
 
+def _run_finish_key(info: "JobRunInfo") -> datetime.datetime:
+    """The instant a finished-run row is ordered by.
+
+    Every reader that has to answer "which of these runs is the newest"
+    folds on this key rather than trusting the row's position in the
+    stream. The per-job write chain orders the appends THIS node makes to
+    ``runs/<job>``; it cannot order appends a peer node sharing the mount
+    issues through its own process, so the last record in a listing can
+    be an older run.
+
+    ``finished_at`` is the key, and on a crash-reconciled row it is the
+    interrupted run's START instant: the ledger record for an
+    ``onMissed`` run-once/run-all reconcile deliberately carries
+    ``interruptedAt`` and NO ``finished_at`` (see
+    :meth:`Cron._reconcile_open_record`, which keeps the occurrence owed
+    to catch-up), and :func:`_job_run_info_from_dict` substitutes the
+    interruption instant when it rebuilds the row. So an interrupted run
+    sorts where it started, which is the only instant it has.
+
+    The None arm is a totality guarantee for the key function, not a
+    path that the ledger can reach: a hand-constructed JobRunInfo without
+    a finish instant sorts OLDEST rather than making ``max``/``sort``
+    raise TypeError, so no caller has to pre-filter its rows. Rehydration
+    cannot produce one, because :func:`_job_run_info_from_dict` returns
+    None for a record carrying neither ``finished_at`` nor
+    ``interruptedAt``.
+
+    What deliberately does NOT fold on this key: the display tails over
+    ``run_history``. The ``/jobs`` inline sparkline, ``/activity``'s
+    per-job rows and ``/jobs/{name}/resources``' monitored tail all stay
+    positional cuts of the bounded ring. Three reasons. They render every
+    row in the cut, so an inverted pair moves a cell one column, it does
+    not produce a wrong verdict the way a wrong ``last_run`` does. The
+    ring is not in finish order at the end of boot anyway, because
+    :meth:`Cron._reconcile_inflight` runs after the warm loop and
+    installs a reconciled row carrying the interrupted run's START
+    instant. And sorting them would file that interruption BEFORE runs
+    that finished while it was still running, which is not where an
+    operator looks for the run that just died. Ordering a display is a
+    presentation question; these three answer it with "the order this
+    node observed", and only the single-value readers (``last_run`` and
+    the ``last_*`` stats) answer "which run is newest". ``last_run`` has
+    one deliberate exception to the fold, this host's own crash-reconciled
+    run; see :meth:`Cron._install_run_info`.
+    """
+    finished = info.finished_at
+    if finished is None:
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    return finished
+
+
 def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
-    """Aggregate stats over a job's retained run history, for the web UI."""
+    """Aggregate stats over a job's retained run history, for the web UI.
+
+    Order-independent: every field is a fold over ``runs``, and "last"
+    means newest by ``finished_at`` (:func:`_run_finish_key`), not last
+    in the list. Records are appended unserialized and a peer node
+    sharing the mount interleaves its own appends, so list position is
+    not finish order.
+
+    Equal instants resolve to the LATER list position, which for a single
+    node is append (completion) order. Callers: the trends builder per
+    window, :meth:`Cron.job_runs_payload`, and :meth:`Cron._avg_duration`
+    (the .ics event lengths, which read ``avg_duration`` only).
+    """
     total = len(runs)
     success = sum(1 for r in runs if r.outcome == "success")
     failure = sum(1 for r in runs if r.outcome == "failure")
@@ -875,7 +938,13 @@ def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
     ]
     cpu_totals = [u.cpu_total_seconds for u in monitored]
     rss_values = [u.max_rss_bytes for u in monitored]
-    last_usage = runs[-1].resource_usage if runs else None
+    # The newest run by finish time, NOT by list position. reversed() is
+    # what makes an equal-instant tie resolve to the LATER position, i.e.
+    # exactly what runs[-1] returned before: max returns the FIRST maximum
+    # it walks, so walking backwards yields the last maximum in list order.
+    # default=None replaces the `if runs else None` empty-list guard.
+    newest = max(reversed(runs), key=_run_finish_key, default=None)
+    last_usage = newest.resource_usage if newest is not None else None
     return {
         "total": total,
         "success": success,
@@ -892,7 +961,9 @@ def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
         ),
         "min_duration": min(durations) if durations else None,
         "max_duration": max(durations) if durations else None,
-        "last_duration": runs[-1].duration if runs else None,
+        # from the same fold as last_cpu_seconds/last_rss_bytes below, so
+        # the three "last" fields can never describe two different runs.
+        "last_duration": newest.duration if newest is not None else None,
         # CPU time (seconds) and peak resident memory (bytes) over the
         # monitored runs; None when no run in the window was monitored.
         "avg_cpu_seconds": (
@@ -922,6 +993,10 @@ def _activity_jobs(
     its arguments, and the three fields it reads are frozen at row
     construction, so the large-fleet branch of the product build runs
     this on a worker thread beside the serialize/hash/gzip.
+
+    "Newest" here is a positional cut of the retained ring, not a fold
+    by finish time; see :func:`_run_finish_key` for why the display tails
+    stay positional while the single-value readers do not.
     """
     return {
         "jobs": {
@@ -5105,6 +5180,8 @@ class Cron:
         # compact, oldest-first tail of recent runs for the inline sparkline:
         # only outcome + duration are needed there, so the per-poll payload
         # stays small. Full per-run detail comes from /jobs/{name}/runs.
+        # A positional cut of the ring, deliberately not a finish-time fold
+        # (see _run_finish_key); `last_run` above is the one that folds.
         recent = (
             [
                 {"outcome": r.outcome, "duration": r.duration}
@@ -5713,6 +5790,11 @@ class Cron:
         """Retained run history + stats for one job, or ``None`` if unknown.
 
         Behind ``GET /jobs/{name}/runs`` and MCP ``cron_list_runs``.
+
+        The listing is the retained ring in the order this node observed
+        it (see :func:`_run_finish_key` for why the display tails stay
+        positional); the ``stats`` block's ``last_*`` fields inside it do
+        fold by finish time.
         """
         if name not in self.cron_jobs:
             return None
@@ -5887,6 +5969,8 @@ class Cron:
             )
         history = list(self.run_history.get(name) or [])
         monitored = [r for r in history if r.resource_usage is not None]
+        # a positional tail of the ring, like the other chart feeds and
+        # unlike the stats block's last_* fields (see _run_finish_key)
         runs = [
             r.to_dict(include_series=True)
             for r in monitored[len(monitored) - max_runs :]
@@ -5995,7 +6079,12 @@ class Cron:
         if recs is not None:
             source = "durable"
             infos: list[JobRunInfo] = []
-            recs.reverse()  # oldest first, matching _run_stats
+            # oldest first, matching the in-memory fallback's orientation
+            # below: _run_stats is order-independent now, so this is what
+            # the window bucketing's "same relative order" property and
+            # _run_stats' equal-instant tiebreak read, not a correctness
+            # requirement of the "last" fields.
+            recs.reverse()
             # one shared, already-closed output stream for every rehydrated
             # record: the trends aggregation never reads output, so the
             # per-record buffer allocation would be pure waste at
@@ -7082,6 +7171,27 @@ class Cron:
                 return
             self.state_backend = backend
             self._state_max_runs = state_config.get("maxRunsPerJob", 0)
+            if self._state_max_runs == 1:
+                # Once per backend start, never per append, and never
+                # silently: the daemon is not honouring the number the
+                # operator typed. Deliberately NOT gated on the resolved
+                # topology. `shared` is the case this protects, but
+                # `topology: auto` probes to single-node on Windows (the
+                # shared-mount probe cannot answer there), so a topology
+                # gate would be dead on the platform the setting bites
+                # hardest on; and a retention of 1 is a poor setting on
+                # one node anyway, since the prune is amortised every
+                # _PRUNE_EVERY_APPENDS appends and the stream oscillates
+                # between 1 and 8 records regardless.
+                logger.warning(
+                    "state: maxRunsPerJob is 1; retaining 2 run records "
+                    "per job instead. The ledger prune keeps the newest "
+                    "records by write order, so a retention of 1 leaves "
+                    "no room for a pair that landed inverted (a peer node "
+                    "sharing the mount, or a completion persisted after a "
+                    "later one) and the newer run would be the one "
+                    "deleted."
+                )
             # a fresh backend generation re-anchors the periodic chores:
             # record this node's manifest immediately (the GC anchor), and
             # let the first GC pass run on the next housekeeping tick;
@@ -10563,7 +10673,35 @@ class Cron:
             fail_reason=fail_reason,
             output=output,
         )
-        self._install_run_info(name, info)
+        # Whose crash this was decides whether the row outranks a newer
+        # completion. THIS host's interrupted run is the latest news about
+        # this host whatever finished around it, and `finished` above is
+        # the run's START, so with concurrencyPolicy: Allow (the default)
+        # an overlapping instance routinely finishes after it; folding
+        # would hide the crash behind that instance on GET /jobs, the
+        # dashboard tile, the cronstable_job_last_run_* gauges and the log
+        # replay target. A takeover's row belongs to ANOTHER node, says
+        # nothing about what ran here, and keeps taking the fold.
+        prev = self.last_run.get(name)
+        self._install_run_info(
+            name, info, promote=rec.get("host") == self._state_host
+        )
+        # and release the superseded row's ring, the same way _record_run
+        # does after its own install: on a runtime takeover the outgoing
+        # last_run can be a real local run holding a full ring, which would
+        # otherwise sit in run_history until it fell out of
+        # RUN_HISTORY_LIMIT. Symmetric for the same reason, though only
+        # `prev` can ever free anything here: the synthetic row's own
+        # output is the fresh empty stream closed just above.
+        current = self.last_run.get(name)
+        superseded = prev if current is info else info
+        if (
+            superseded is not None
+            and current is not None
+            and superseded is not current
+            and superseded.output is not current.output
+        ):
+            superseded.output.release_lines()
         # a takeover can reconcile a foreign record older than a run this
         # node already recorded, so advance the supersede watermark rather
         # than assigning it (the durable side is a derive_max, i.e. already
@@ -10587,11 +10725,7 @@ class Cron:
         stream = self._run_stream(name)
         try:
             await backend.append_record(
-                stream,
-                data,
-                prune_keep=(
-                    self._state_max_runs if self._state_max_runs > 0 else None
-                ),
+                stream, data, prune_keep=self._run_prune_keep()
             )
         except Exception as ex:  # noqa: BLE001 - fire-and-forget
             self.metrics.state_write_dropped("run-record")
@@ -10738,7 +10872,12 @@ class Cron:
         self._bust_response_memos()
         return last
 
-    def _install_run_info(self, name: str, info: JobRunInfo) -> None:
+    def _install_run_info(
+        self,
+        name: str,
+        info: JobRunInfo,
+        promote: Optional[bool] = None,
+    ) -> None:
         """Record one finished-run row; the ONE writer of ``run_history``
         and ``last_run``.
 
@@ -10746,9 +10885,41 @@ class Cron:
         cannot be forgotten (the shared /jobs product folds over
         last_run and the history slice). The source-shape test pins the
         funnel.
+
+        ``last_run`` is by default the NEWEST finished run by
+        ``finished_at`` (:func:`_run_finish_key`), not the last row
+        installed. Two paths install a row older than one this node
+        already recorded: a slot takeover reconciling a FOREIGN node's
+        interrupted run (see :meth:`_reconcile_open_record`, which
+        advances rather than assigns its own watermark for the same
+        reason), and a completion landing out of order on a mount a peer
+        node also writes. ``>=`` keeps a same-instant install behaving
+        exactly as the plain assignment did, which several tests depend
+        on.
+
+        ``promote`` overrides the fold in ONE direction. ``True`` installs
+        the row whatever its instant, for the one caller that knows its
+        row is the latest news about this host regardless of what
+        finished around it: this host's own crash-reconciled run, whose
+        synthetic instant is the interrupted run's START and so routinely
+        predates instances that overlapped it (``concurrencyPolicy:
+        Allow`` is the default). ``None`` and ``False`` both take the
+        fold; ``False`` is the foreign-takeover answer, which does not
+        BAR the row from becoming ``last_run``, it only makes it lose to
+        a newer local run.
+
+        ``run_history`` is appended to unconditionally: it is a bounded
+        display ring, and dropping or re-sorting rows here would hide the
+        interrupted run the reconcile exists to surface.
         """
         self.run_history[name].append(info)
-        self.last_run[name] = info
+        prev = self.last_run.get(name)
+        if (
+            prev is None
+            or promote
+            or _run_finish_key(info) >= _run_finish_key(prev)
+        ):
+            self.last_run[name] = info
         self._bust_response_memos()
 
     def _record_run(self, name: str, info: JobRunInfo) -> None:
@@ -10764,22 +10935,41 @@ class Cron:
         self.metrics.job_run_recorded(
             name, info.outcome, info.duration, info.resource_usage
         )
+        # The three watermarks below ADVANCE rather than assign, for the
+        # reason last_run does (see _install_run_info): a completion can
+        # land older than one already recorded. Their siblings elsewhere
+        # already fold this way (the rehydrate seeds are a max fold, and
+        # _reconcile_open_record advances _last_completed_at), so an
+        # unconditional assignment here was the odd one out: it could
+        # re-stale the SLA reference, reopen an onlyIfLastSucceeded gate a
+        # newer failure had closed, or rewind the retry ladder's
+        # supersede watermark.
+        #
         # the maxTimeSinceSuccess reference (see _sla_periodic): every
         # recorded success moves it, whatever path ran the job.
         if info.outcome == "success" and info.finished_at is not None:
-            self._sla_last_success[name] = info.finished_at
+            sla_prev = self._sla_last_success.get(name)
+            if sla_prev is None or info.finished_at > sla_prev:
+                self._sla_last_success[name] = info.finished_at
         # onlyIfLastSucceeded's eviction-proof memo (_depends_on_past_ok):
         # a long pause's synthetic rows can push the last real outcome out
         # of the bounded ring and reopen a gate a failure had closed.
         if info.outcome in ("success", "failure") and (
             info.finished_at is not None
         ):
-            self._last_real_outcome[name] = (info.finished_at, info.outcome)
+            real_prev = self._last_real_outcome.get(name)
+            if real_prev is None or info.finished_at >= real_prev[0]:
+                self._last_real_outcome[name] = (
+                    info.finished_at,
+                    info.outcome,
+                )
         # retry ladder's superseded-by-run watermark
         # (_validate_pending_retry). Every outcome but "skipped" counts:
         # a pause-held slot ran nothing and must not settle a ladder.
         if info.outcome != "skipped" and info.finished_at is not None:
-            self._last_completed_at[name] = info.finished_at
+            done_prev = self._last_completed_at.get(name)
+            if done_prev is None or info.finished_at > done_prev:
+                self._last_completed_at[name] = info.finished_at
         # persist the run to the ledger (fire-and-forget: a slow store
         # must never stall run handling). No-op on the stateless default.
         if self.state_backend is not None:
@@ -10797,15 +10987,26 @@ class Cron:
                 lambda: self._persist_run_record(name, info, archive_lines),
             )
         # Release the superseded record's ring buffer: only the NEWEST
-        # finished run's output is replayable, yet `prev`'s ring would
-        # otherwise sit in run_history for many more completions. The
-        # identity guards keep odd construction shapes safe.
+        # finished run's output is replayable, yet the other record's ring
+        # would otherwise sit in run_history for many more completions.
+        #
+        # Symmetric, because _install_run_info's promotion is conditional:
+        # when it declines an out-of-order row THIS run is the superseded
+        # one and `prev` keeps serving log replay, so releasing `prev`
+        # unconditionally would empty the drawer of the run still on
+        # display, and releasing nothing would leak `info`'s 1000-line
+        # ring until it fell out of RUN_HISTORY_LIMIT. Release whichever
+        # of the pair is not last_run. The identity guards keep odd
+        # construction shapes safe.
+        current = self.last_run.get(name)
+        superseded = prev if current is info else info
         if (
-            prev is not None
-            and prev is not info
-            and prev.output is not info.output
+            superseded is not None
+            and current is not None
+            and superseded is not current
+            and superseded.output is not current.output
         ):
-            prev.output.release_lines()
+            superseded.output.release_lines()
 
     @staticmethod
     def _run_stream(name: str) -> str:
@@ -10836,6 +11037,38 @@ class Cron:
         """The durable stream name for this host's counter snapshots."""
         return COUNTER_STREAM_PREFIX + self._state_host
 
+    def _run_prune_keep(self) -> Optional[int]:
+        """How many per-job records (``runs/<job>`` and the archived
+        output in ``logs/<job>``) an append prunes down to, or None.
+
+        ``maxRunsPerJob <= 0`` means unbounded (None). Any positive value
+        is floored at 2, and the adjustment is logged once at backend
+        start (see :meth:`start_stop_state`).
+
+        A retention of 1 leaves no room for an inverted pair. The prune
+        keeps the newest records by WRITE order, so an append this node
+        did not order (a peer sharing the mount, or a fire-and-forget
+        completion landing after a later one) can leave the newer run
+        deleted and the older one retained, which is unrecoverable rather
+        than merely misread. Keeping two records means an ADJACENT
+        inverted pair both survive the cut, so the order-tolerant readers
+        can still find the newer of the two. A deeper interleaving is not
+        covered (with a keep of 2 and a write order of newest, older,
+        older still, the newest is the one deleted); that is the
+        write-ordering chain's job, and it is why the readers fold by
+        finish time rather than relying on retention.
+
+        The prune itself is deliberately NOT made order-tolerant: a
+        crash-reconciled row under ``onMissed`` run-once/run-all carries
+        ``interruptedAt`` and NO ``finished_at`` (see
+        :meth:`_reconcile_open_record`), so a finished_at-keyed prune
+        would have no sort key for exactly the records the reconciliation
+        path writes.
+        """
+        if self._state_max_runs <= 0:
+            return None
+        return max(2, self._state_max_runs)
+
     async def _persist_run_record(
         self,
         name: str,
@@ -10862,11 +11095,7 @@ class Cron:
                 backend.append_record(
                     stream,
                     info.to_dict(include_series=True),
-                    prune_keep=(
-                        self._state_max_runs
-                        if self._state_max_runs > 0
-                        else None
-                    ),
+                    prune_keep=self._run_prune_keep(),
                 ),
                 timeout=STATE_OP_TIMEOUT,
             )
@@ -10969,11 +11198,7 @@ class Cron:
         # Bounded; the caller catches a timeout as a dropped write.
         await asyncio.wait_for(
             backend.append_record(
-                stream,
-                record,
-                prune_keep=(
-                    self._state_max_runs if self._state_max_runs > 0 else None
-                ),
+                stream, record, prune_keep=self._run_prune_keep()
             ),
             timeout=STATE_OP_TIMEOUT,
         )
@@ -11100,11 +11325,25 @@ class Cron:
                 # last_run and scramble history order.
                 await self._seed_stale_reference(name, self.run_history[name])
                 return None
-            recs.reverse()  # oldest-first, to match the append order
-            for rec in recs:
-                restored = _job_run_info_from_dict(rec)
-                if restored is not None:
-                    self._install_run_info(name, restored)
+            # oldest-first: the stable sort below then keeps stream order
+            # as the equal-instant tiebreak, matching a live node's
+            # append order.
+            recs.reverse()
+            restored_rows = [
+                info
+                for info in (_job_run_info_from_dict(rec) for rec in recs)
+                if info is not None
+            ]
+            # By finish time, not stream position. The per-job write chain
+            # orders THIS node's appends; a peer sharing the mount appends
+            # through its own process and no local chain can order those,
+            # so the last record in the listing can be an older run.
+            # sorted() is stable, so records sharing an instant keep their
+            # stream order. At most RUN_HISTORY_LIMIT rows per job, once
+            # per boot, and they all end up in the deque anyway.
+            restored_rows.sort(key=_run_finish_key)
+            for restored in restored_rows:
+                self._install_run_info(name, restored)
             history = self.run_history.get(name)
             if not history:
                 return None
@@ -11129,17 +11368,21 @@ class Cron:
                     name, (newest.finished_at, newest.outcome)
                 )
             # and the retry ladder's supersede watermark: a pause across
-            # the restart makes history[-1] a "skipped" row whose fresh
-            # finished_at would settle every pending retry.
-            for restored in reversed(history):
-                if (
-                    restored.outcome != "skipped"
-                    and restored.finished_at is not None
-                ):
-                    self._last_completed_at.setdefault(
-                        name, restored.finished_at
-                    )
-                    break
+            # the restart makes the LAST row a "skipped" one whose fresh
+            # finished_at would settle every pending retry. A max fold
+            # over the non-skipped rows, not a backwards walk off the end
+            # of the deque: the rows above are installed in finish order,
+            # but the fold is what makes this reader correct on its own,
+            # and it mirrors the _last_real_outcome fold just above.
+            completed = [
+                r
+                for r in history
+                if r.outcome != "skipped" and r.finished_at is not None
+            ]
+            if completed:
+                self._last_completed_at.setdefault(
+                    name, max(_run_finish_key(r) for r in completed)
+                )
             return "counted"
 
         warmed = await self._bounded_boot_scan(
@@ -11153,8 +11396,9 @@ class Cron:
                 "state: rehydrated run history for %d job(s) from the ledger",
                 warmed,
             )
-        # BEFORE the retry re-arm: a reconciled interrupted run updates
-        # last_run, and the superseded-by-run guard must see it.
+        # BEFORE the retry re-arm: a reconciled interrupted run advances
+        # _last_completed_at (see _reconcile_open_record), and the
+        # superseded-by-run guard must see it.
         await self._reconcile_inflight()
         await self._rehydrate_counters()
         # pause state before the retry re-arm too: a re-armed ladder's gate

@@ -1338,6 +1338,47 @@ async def test_trends_from_durable_ledger(stateful_cron):
     assert body["windows"]["7d"]["success_rate"] == 0.5
 
 
+async def test_trends_last_duration_is_newest_by_finished_at(stateful_cron):
+    # the trends endpoint's last_* fields read the newest run in the window
+    # by finish time, not the last record in the stream.  Inverted
+    # deterministically: the NEWER run is appended first, so the record last
+    # in the ledger is the older one.
+    cron = await stateful_cron(_RETRY_JOB)
+    cron.web_config = {}
+    now = _now_utc()
+
+    async def put(minutes_ago, duration):
+        finished = now - datetime.timedelta(minutes=minutes_ago)
+        await cron.state_backend.append_record(
+            "runs/j",
+            {
+                "outcome": "success",
+                "exit_code": 0,
+                # started_at is the knob, not "duration":
+                # _job_run_info_from_dict never reads the record's duration
+                # key, and JobRunInfo.duration is recomputed in
+                # __post_init__ from finished_at - started_at.
+                "started_at": (
+                    finished - datetime.timedelta(seconds=duration)
+                ).isoformat(),
+                "finished_at": finished.isoformat(),
+                "fail_reason": None,
+            },
+        )
+
+    await put(30, 10.0)  # newer, appended FIRST
+    await put(90, 99.0)  # older, appended SECOND
+    resp = await cron._web_job_trends(_FakeRequest("j"))
+    body = json.loads(resp.body)
+    assert body["source"] == "durable"
+    assert body["windows"]["all"]["last_duration"] == 10.0
+    assert body["windows"]["24h"]["last_duration"] == 10.0
+    # only the "last" selection moved: the window membership and the
+    # aggregate over it are unchanged
+    assert body["windows"]["24h"]["total"] == 2
+    assert body["windows"]["all"]["avg_duration"] == pytest.approx(54.5)
+
+
 async def test_trends_single_pass_matches_filter_per_window(
     monkeypatch, stateful_cron
 ):
@@ -1349,7 +1390,9 @@ async def test_trends_single_pass_matches_filter_per_window(
     finished_at order (fire-and-forget persistence and shared-mount merges
     do not guarantee time order in the ledger).  The payload's windows must
     match a reference computed with the original per-window filter over the
-    same rehydrated infos, including the order-sensitive last_* fields.
+    same rehydrated infos, field for field.  The last_* fields are no longer
+    order-sensitive (they fold by finished_at); the sibling above covers
+    that, and this one covers window membership and the aggregates.
     """
     from cronstable.cron import (
         TREND_WINDOWS,

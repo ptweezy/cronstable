@@ -91,6 +91,41 @@ Windows fixes and additions. The first of many updates to address Windows first-
   jobs still write concurrently, and it is the same guard the in-flight,
   retry-ladder and pause streams already used against the identical
   hazard.
+- The readers that answer "which run is the newest" judge by finish time
+  instead of by position in the stream. Chaining orders the appends one
+  node makes; it cannot order the appends a peer node sharing the mount
+  issues through its own process, so the last record in `runs/<job>` can
+  still be an older run. After a restart a job's latest run is now the
+  newest one it finished, so `GET /jobs`, the dashboard and the
+  `cronstable_job_last_run_*` gauges can no longer report a failure for a
+  job whose newest run succeeded. The retry ladder's superseded-by-run
+  watermark, the `maxTimeSinceSuccess` reference, the
+  `onlyIfLastSucceeded` memo, and `last_duration`, `last_cpu_seconds` and
+  `last_rss_bytes` on `/jobs/{name}/runs` and `/jobs/{name}/trends` all
+  fold the same way. A slot takeover reconciling another node's
+  interrupted run no longer overwrites a newer local run either: the
+  synthetic row it installs carries the interrupted run's start instant,
+  which is often older than a run this node already recorded. A run of
+  this node that a crash interrupted is still the latest run whatever
+  finished around it, because its record stands in the instant that run
+  started and `concurrencyPolicy: Allow` (the default) lets an
+  overlapping instance finish after it; folding there would hide the
+  crash. Runs sharing a finish instant resolve to the later one in the
+  stream, the answer the positional read gave. The run listings
+  themselves are never re-ordered when they are read: after a restart the
+  history ring is rebuilt in finish order, and from then on it grows in
+  the order this node observed the completions. Every row in a listing is
+  displayed, so an inverted pair moves a cell rather than changing a
+  verdict, and an interrupted run reads better where it was seen than
+  where it began.
+- `maxRunsPerJob: 1` retains two run records per job and logs the
+  adjustment once at startup. The prune keeps the newest records by write
+  order, so a retention of one leaves no room for a pair that landed
+  inverted, and the run deleted is then the newer one, which nothing can
+  recover. The prune stays write-ordered on purpose: a crash-reconciled
+  record under `onMissed: run-once` or `run-all` deliberately carries an
+  interruption instant and no finish time, so a finish-keyed prune would
+  have no key for exactly the records the reconciliation path writes.
 - Jobs can say which directory they start in. The new `workingDirectory`
   key becomes the working directory of the job's process, so a `.bat` or a
   script written around relative paths no longer depends on wherever the
