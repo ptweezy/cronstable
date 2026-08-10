@@ -5,11 +5,10 @@ exports into cronstable jobs, so an existing estate does not have to be
 retyped.
 
 It is a one-shot converter, not a loader. It writes YAML you read, edit and
-commit; cronstable never reads Task Scheduler XML at run time. That is
-deliberate, and the first reason is the one that matters most: **exporting a
-task does not unregister it**, so an export describes tasks Task Scheduler is
-still running. Loading the output without reviewing it first means both
-schedulers run the same work.
+commit; cronstable never reads Task Scheduler XML at run time. The main
+reason is that exporting a task does not unregister it, so an export
+describes tasks Task Scheduler is still running. Loading the output without
+reviewing it first means both schedulers run the same work.
 
 ## Exporting
 
@@ -105,86 +104,82 @@ A task with more than one trigger becomes one job per trigger, suffixed
 
 ## What does not, and why
 
-Every one of these is a line in the report, never a silent drop.
+Nothing is dropped silently. Everything below is a line in the report,
+naming the element responsible.
 
-**Triggers that are not schedules.** Logon, idle, event-log, session change,
-registration and the internal notification trigger have no cron equivalent.
+Six trigger types have no cron equivalent at all: logon, idle, event-log,
+session change, registration, and the internal notification trigger.
 
-**Day intervals other than 1 or 7.** A cron day-of-month step restarts each
-month, so "every 3 days" would fire on the 1st, 4th and so on to the 31st,
-then the 1st again, a one-day gap. Run it daily and gate it on a durable
-[`cronstable cursor`](CLI-Reference#cursor-getadvance-etl-watermark) instead.
-Week intervals above 1 are refused for the same kind of reason: cron has no
-week-of-year phase.
+Three kinds of calendar schedule cannot be written as a cron expression
+either. A day interval other than 1 or 7 is one, because a cron day-of-month
+step restarts each month: "every 3 days" would fire on the 1st, the 4th and
+so on to the 31st, then the 1st again, leaving a one-day gap. Week intervals
+above 1 fail for a related reason, since cron has no week-of-year phase. In
+both cases you can run the job daily or weekly and gate it on a durable
+[`cronstable cursor`](CLI-Reference#cursor-getadvance-etl-watermark).
+Repetitions are the third: a cron minute field and hour field multiply, so a
+repetition converts only when its occurrences over a day are exactly that
+product. `PT1H` becomes `0 * * * *`, while `PT90M` does not, because the
+product would include times it never fires at, and widening it would double
+the job's rate. A repetition with a bounded `Duration` is refused on the
+same grounds.
 
-**Repetitions that are not one cron expression.** A cron minute field and
-hour field multiply, so a repetition converts only when its occurrences over
-a day are exactly that product. `PT1H` converts to `0 * * * *`; `PT90M` does
-not, because its minute-by-hour product would include times it never fires
-at, and widening it would double the job's rate. A repetition with a bounded
-`Duration` is refused on the same grounds.
+Actions cronstable cannot run are reported too. A COM handler, an e-mail and
+a message box have no command line between them. A task with more than one
+action does convert, but its jobs are written out commented, because Task
+Scheduler runs a task's actions in sequence inside one instance while
+separate cronstable jobs on one schedule run at once. Chain them as a
+[DAG](Orchestration-and-DAGs) if the order matters.
 
-**Tasks with more than one action.** Task Scheduler runs a task's actions in
-sequence inside one instance, while separate cronstable jobs on one schedule
-run at once. The jobs are still written out, commented, so the command lines
-reach your editor; chain them as a [DAG](Orchestration-and-DAGs) if the order
-matters.
+`UserId`, `GroupId` and `RunLevel` are reported and never written as `user:`
+or `group:`. Those keys are a config-load error on Windows, so emitting them
+would produce a file that cannot load on the platform it was converted for.
+cronstable runs every job as the account the daemon runs as.
 
-**COM handler, e-mail and message-box actions.** cronstable runs a command
-line, and those have none.
-
-**Principals.** `UserId`, `GroupId` and `RunLevel` are reported and never
-emitted as `user:` or `group:`, because those keys are a config-load error on
-Windows, so writing them would produce a file that cannot load on the
-platform it was converted for. cronstable runs every job as the account the
-daemon runs as.
-
-**Machine conditions.** Run only if idle, only on AC power, only when a
-network is available, wake to run, and the rest are reported. cronstable
-schedules on time and does not test machine state. `RestartOnFailure` has a
-near equivalent worth naming:
-[`onFailure.retry`](Failure-Detection-and-Retries).
-
-**`RandomDelay`.** cronstable does not delay a fire randomly.
+What is left is settings with no counterpart. cronstable schedules on time
+and does not test machine state, so run only if idle, only on AC power, only
+when a network is available and wake to run are all reported;
+`RestartOnFailure` is the one of those with a near equivalent worth naming,
+[`onFailure.retry`](Failure-Detection-and-Retries). `RandomDelay` has none.
 [Hashed schedules](Hashed-Schedules) spread jobs deterministically, which is
-usually what the delay was for, but it is not the same thing.
-
-**`EndBoundary`.** cronstable schedules have no end date.
+usually what the delay was for, but it is not the same thing. Nor does
+`EndBoundary`, since a cronstable schedule has no end date.
 
 ## Details worth knowing
 
-**Seconds are dropped.** A `StartBoundary` carries a seconds field, and a
-registration artefact like `:38` is common. A cronstable schedule with a
-seconds column makes the **whole daemon** wake every second, for every other
-job too, so an imported second would be an expensive accident. Add the column
-by hand to the one job that genuinely needs it.
+Seconds are always dropped. A `StartBoundary` carries a seconds field and a
+registration artefact like `:38` is common, but a cronstable schedule with a
+seconds column makes the whole daemon wake every second, for every other job
+on the box as well. That is an expensive thing to import by accident. Add
+the column by hand to the one job that genuinely needs it.
 
-**`ExecutionTimeLimit` of `PT0S` means no limit** in Task Scheduler, while
-cronstable requires `executionTimeout` to be greater than zero. It is
-therefore emitted as nothing rather than as zero, which would have made 34 of
-those 195 tasks fail to load.
+`ExecutionTimeLimit: PT0S` means no limit in Task Scheduler, while cronstable
+requires `executionTimeout` to be greater than zero, so it is emitted as
+nothing rather than as zero. Mapping it literally would have made 34 of those
+195 tasks fail to load.
 
-**Clocks.** Task Scheduler means machine local time unless the boundary says
-otherwise, so a naive start time becomes `utc: false`. A start time in UTC
-emits nothing, since that is already the default. A stored numeric offset
-such as `-04:00` is reported rather than converted: it is not an IANA zone
-name, so it cannot be written as `timezone:`, and inferring one would be a
-guess about daylight saving. Use `--timezone` to name the real zone.
+Task Scheduler means machine local time unless the boundary says otherwise,
+so a naive start time becomes `utc: false`, and one already in UTC emits
+nothing. A stored numeric offset such as `-04:00` is reported rather than
+converted: it is not an IANA zone name, so it cannot be written as
+`timezone:`, and inferring one would be a guess about daylight saving. Name
+the real zone with `--timezone` if you want one.
 
-**A one-shot in the past still loads.** cronstable reports it as
+A one-shot whose instant has passed still loads. cronstable reports it as
 `never-fires` on `/status` and `/jobs` rather than refusing it, so a lapsed
-`TimeTrigger` shows up as a job to delete rather than as a load failure.
+`TimeTrigger` shows up as a job to delete instead of as a load failure.
 
-**Names.** A task's URI becomes the job name, with the folder separator
-becoming `.` and spaces becoming `-`, so `\Contoso\Nightly Backup` becomes
-`Contoso.Nightly-Backup`. Collisions get a numeric suffix. Note that a
-`<folder>.<task>` name looks exactly like a DAG task name, so if you later
-add a DAG named after a Task Scheduler folder the load will refuse the pair.
+A task's URI becomes the job name, with the folder separator becoming `.` and
+spaces becoming `-`, so `\Contoso\Nightly Backup` becomes
+`Contoso.Nightly-Backup`, and a collision gets a numeric suffix. One
+consequence is worth knowing: a `<folder>.<task>` name looks exactly like a
+DAG task name, so if you later add a DAG named after a Task Scheduler folder,
+the load refuses the pair.
 
-**A directory scan skips what it does not recognise.** `.xml` is a name half
-the tooling on a Windows box writes, so a stray file in a scanned directory
-is a report line and a skip. A file you name on the command line is not: that
-is a mistake worth stopping for.
+A directory scan skips what it does not recognise. `.xml` is a name half the
+tooling on a Windows box writes, so a stray file in a scanned directory is a
+report line and a skip. A file you name on the command line is not: that is a
+mistake worth stopping for.
 
 ## Related pages
 
