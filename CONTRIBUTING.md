@@ -64,19 +64,78 @@ pip install -e ".[dev]"                         # or: pip install -r requirement
 > `user`/`group` feature imports `grp`/`pwd` lazily and is rejected on Windows.
 > mypy is pinned to the `linux` platform (it type-checks the POSIX API surface;
 > the Windows branches are runtime-guarded), so type-checking is identical on
-> every OS.
+> every OS. The coverage gate is the one that reads those Windows branches, and
+> it only does so if they are tagged: write `# pragma: no cover (windows)`, not
+> a bare `# pragma: no cover`. See [the pragma vocabulary](#coverage-pragmas).
 
 ## Running the checks
 
 Everything CI runs is driven by `tox`:
 
 ```sh
-tox            # all envs: py310, py311, py312, py313, py314, lint, mypy, bandit
-tox -e lint    # ruff check + ruff format --check
-tox -e mypy    # mypy
-tox -e bandit  # bandit security lint (medium+ severity)
-tox -e py      # pytest on the current interpreter
+tox                # all envs: py310-py314 (each in a windows and a posix arm),
+                   # lint, mypy, bandit, openapi
+tox -e lint        # ruff check + ruff format --check
+tox -e mypy        # mypy
+tox -e bandit      # bandit security lint (medium+ severity)
+tox -e py          # pytest on the current interpreter, POSIX coverage profile
+tox -e py-windows  # Windows hosts: the Windows coverage profile explicitly
+tox -e py-posix    # POSIX hosts: the POSIX coverage profile explicitly
 ```
+
+Each interpreter row exists twice, once per OS profile, and `tox.ini`'s
+`platform` key makes the arm that does not match the machine skip. A skip is a
+pass as long as the invocation also names an arm that does match: an invocation
+whose only env skips exits 1. That is why a bare `tox` works everywhere and why
+CI names both arms in one command (`tox -e py-windows,py-posix`), while naming
+the single wrong arm for your box does not. `tox -e py-posix` on Windows prints
+`py-posix: skipped because platform win32 does not match (?!win32).*` and then
+`evaluation failed :(`.
+
+`tox -e py`, `tox -e py312` and the other unfactored envs still run the whole
+suite, and they carry the POSIX profile, which is what the coverage numbers have
+always meant. On Windows, prefer a bare `tox` or `tox -e py-windows` over those:
+the POSIX profile hides the Windows branches you are editing and counts the
+POSIX ones you cannot run as missed, all against the same `--cov-fail-under`.
+
+### Coverage pragmas
+
+`# pragma: no cover` comes in three forms, and picking the wrong one is how a
+branch stops being gated:
+
+| Form | Hidden on | Measured on |
+| --- | --- | --- |
+| `# pragma: no cover` | every OS | nowhere |
+| `# pragma: no cover (windows)` | POSIX | Windows |
+| `# pragma: no cover (posix)` | Windows | POSIX |
+
+Use the bare form only for code no CI row can reach: defensive branches,
+unreachable raises, the etcd/kubernetes network glue, and `tui.py`'s macOS
+branch (the matrix has no macOS row, so a third token would have no profile to
+be measured in).
+
+A branch guarded by `IS_WINDOWS` or `sys.platform == "win32"` takes a token
+where its clause genuinely cannot execute on the other OS, because it reaches
+for something that only exists there: `msvcrt`, `fcntl`, `grp`/`pwd`,
+`os.nice`, `os.killpg`, `ctypes.windll`. Where it does, the other side of the
+branch takes the other token, and that half is the one people forget. Plenty of
+platform branches here are plain Python that the tests drive from either box by
+monkeypatching `IS_WINDOWS`; those stay untagged on purpose, since they really
+are measured on both. Three details are worth knowing before you write one:
+
+- Tagging an `if` header excludes that clause only. An `else` needs its own
+  tag, and a fall-through tail (code after the `if` block rather than inside an
+  `else`) has no header to tag at all, which is why `cronstable/platform.py`
+  spells its POSIX arms out as explicit `else` clauses.
+- The token may sit anywhere after `cover`, so a site can keep the trailing
+  prose that explains it.
+- Keep the guard spelled the way the tests drive it. Several Windows arms are
+  exercised from Linux by monkeypatching `platform.IS_WINDOWS`, which cannot
+  patch `sys.platform`; rewriting such a guard to `sys.platform == "win32"`
+  sends the test down the POSIX arm for real.
+
+`tests/test_coverage_profiles.py` holds the vocabulary and both profiles, and
+fails a branch that is tagged on one side only.
 
 `tox.ini` declares `requires = tox-uv`, so `tox` provisions its environments and
 installs dependencies with uv automatically (much faster; behavior-identical).

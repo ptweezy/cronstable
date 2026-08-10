@@ -1891,61 +1891,68 @@ class JobConfig:
         # the wrong account.  Spelled as ``sys.platform == "win32"`` (rather
         # than platform.IS_WINDOWS) so the type checker statically prunes the
         # POSIX-only imports/calls below on Windows.
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: no cover (windows)
             raise ConfigError(
                 "Job {}: changing user/group is not supported on "
                 "Windows".format(self.name)
             )
+        else:  # pragma: no cover (posix) - grp/pwd are POSIX-only
+            # The ``else`` is what the pruning above needs: the reject comes
+            # first because that is the rule being stated, and the POSIX
+            # body has to be a clause of the same statement for mypy to
+            # discard it under ``--platform win32`` and for the Windows
+            # coverage profile to leave it out of the denominator.
+            #
+            # POSIX only: the passwd/group databases live in modules that
+            # don't exist on Windows; imported lazily (reached only here).
+            from grp import getgrnam
+            from pwd import getpwnam, getpwuid
 
-        # POSIX only: the passwd/group databases live in modules that don't
-        # exist on Windows; imported lazily (only reached above on POSIX).
-        from grp import getgrnam
-        from pwd import getpwnam, getpwuid
-
-        if user is not None:
-            if isinstance(user, int):
-                self.uid = user
-                # Derive the primary gid (and login name) from the passwd
-                # database so a numeric ``user`` without an explicit ``group``
-                # does not silently keep cronstable's (root) gid 0.
-                try:
-                    pw = getpwuid(user)
-                except KeyError:
-                    pw = None
-                if pw is not None:
-                    self.username = pw.pw_name
-                    if self.gid is None:
+            if user is not None:
+                if isinstance(user, int):
+                    self.uid = user
+                    # Derive the primary gid (and login name) from the
+                    # passwd database so a numeric ``user`` without an
+                    # explicit ``group`` does not silently keep
+                    # cronstable's (root) gid 0.
+                    try:
+                        pw = getpwuid(user)
+                    except KeyError:
+                        pw = None
+                    if pw is not None:
+                        self.username = pw.pw_name
+                        if self.gid is None:
+                            self.gid = pw.pw_gid
+                else:
+                    try:
+                        pw = getpwnam(user)
+                        self.uid = pw.pw_uid
                         self.gid = pw.pw_gid
-            else:
-                try:
-                    pw = getpwnam(user)
-                    self.uid = pw.pw_uid
-                    self.gid = pw.pw_gid
-                    self.username = pw.pw_name
-                except KeyError as e:
-                    raise ConfigError(
-                        "User not found: {!r}".format(user)
-                    ) from e
+                        self.username = pw.pw_name
+                    except KeyError as e:
+                        raise ConfigError(
+                            "User not found: {!r}".format(user)
+                        ) from e
 
-        if group is not None:
-            if isinstance(group, int):
-                self.gid = group
-            else:
-                try:
-                    self.gid = getgrnam(group).gr_gid
-                except KeyError as e:
-                    raise ConfigError(
-                        "Group not found: {!r}".format(group)
-                    ) from e
+            if group is not None:
+                if isinstance(group, int):
+                    self.gid = group
+                else:
+                    try:
+                        self.gid = getgrnam(group).gr_gid
+                    except KeyError as e:
+                        raise ConfigError(
+                            "Group not found: {!r}".format(group)
+                        ) from e
 
-        if self.uid is not None or self.gid is not None:
-            if os.geteuid() != 0:
-                raise ConfigError(
-                    "Job {} wants to change user or group, "
-                    "but cronstable is not running as superuser".format(
-                        self.name
+            if self.uid is not None or self.gid is not None:
+                if os.geteuid() != 0:
+                    raise ConfigError(
+                        "Job {} wants to change user or group, "
+                        "but cronstable is not running as superuser".format(
+                            self.name
+                        )
                     )
-                )
 
     def _warn_if_priority_needs_privilege(self) -> None:
         """Say at load time that this job's priority may be refused.
@@ -1968,7 +1975,7 @@ class JobConfig:
         wanted = platform.posix_nice_for(self.priority)
         if wanted is None:
             return  # the default level: nothing is ever applied for it
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: no cover (windows)
             # Windows hands every class this vocabulary offers to an
             # unprivileged account; the one that does need a privilege
             # (realtime) is deliberately not reachable, so there is nothing
@@ -1976,19 +1983,20 @@ class JobConfig:
             # _resolve_user_group above is, so the type checker prunes the
             # POSIX-only calls below.
             return
-        current = os.nice(0)
-        if wanted >= current or os.geteuid() == 0:
-            return
-        logger.warning(
-            "job %r asks for priority %r (nice %d), a raise from "
-            "cronstable's own nice %d, which needs CAP_SYS_NICE or "
-            "RLIMIT_NICE headroom; where the kernel refuses it the job "
-            "still runs, at the priority it inherited",
-            self.name,
-            self.priority,
-            wanted,
-            current,
-        )
+        else:  # pragma: no cover (posix) - os.nice/os.geteuid
+            current = os.nice(0)
+            if wanted >= current or os.geteuid() == 0:
+                return
+            logger.warning(
+                "job %r asks for priority %r (nice %d), a raise from "
+                "cronstable's own nice %d, which needs CAP_SYS_NICE or "
+                "RLIMIT_NICE headroom; where the kernel refuses it the job "
+                "still runs, at the priority it inherited",
+                self.name,
+                self.priority,
+                wanted,
+                current,
+            )
 
     def _reject(self, message: str) -> "ConfigError":
         """Build (never raise) the job-scoped ConfigError for a failed check.

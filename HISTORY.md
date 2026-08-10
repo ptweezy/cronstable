@@ -182,6 +182,28 @@ Windows fixes and additions. The first of many updates to address Windows first-
   answers its own bodyless `4xx`. The wiki and the OpenAPI spec now say
   that, and every `4xx` and `5xx` in the spec declares the envelope as its
   response body.
+- The coverage gate now reads the Windows code on the Windows CI rows. Every
+  Windows branch carried a plain `# pragma: no cover`, which hid it from the
+  measurement on Windows as well, while the POSIX branches that cannot run
+  there stayed in the denominator and counted as missed; `platform.py` scored
+  69% on a Windows run for code that was largely not the code being run.
+  There are now three pragma forms, a bare one that hides a branch on every
+  OS and a `(windows)` and `(posix)` pair that hide it only where it cannot
+  execute, and each interpreter environment in `tox.ini` has an arm per OS
+  that selects the matching profile and carries its own floor. On a Windows
+  run `platform.py` now measures 250 statements at 87.67% instead of 149 at
+  69.14%. The POSIX side barely moves: 22,329 statements at 96.72%, four
+  fewer than before, and those four are the Windows-only user/group
+  rejection and priority advisory in `config.py`, which could never run on
+  a POSIX cell and were being counted there as missed. The floors are
+  unchanged in this release, since honest per-cell numbers have to be read
+  off a real CI run rather than one developer machine.
+  One number will move for no regression: the merged Codecov figure behind
+  the README badge. It is a union across two exclusion sets now, so a
+  Windows-tagged line no Windows test happens to reach is excluded from the
+  POSIX reports and counted as missed in the merged view. Both Codecov
+  statuses stay `informational`, so the drop annotates a pull request and
+  cannot fail one.
 
 ## 1.2.38
 
