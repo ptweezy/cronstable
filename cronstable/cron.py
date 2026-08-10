@@ -406,6 +406,12 @@ WEB_ROUTES: "tuple[tuple[str, str, str, Optional[str]], ...]" = (
     ("POST", "/push/devices", "_web_push_pair", None),
     ("DELETE", "/push/devices/{id}", "_web_push_revoke", None),
     ("POST", "/push/devices/{id}/test", "_web_push_test", None),
+    # Daemon lifecycle: the graceful stop for deployments with no console
+    # to press Ctrl-C in (service wrappers, supervisors, headless boxes;
+    # on Windows there is no SIGTERM to send). The handler refuses unless
+    # the request was bearer-token authenticated, so an unauthenticated
+    # local listener never hands every local process a stop switch.
+    ("POST", "/shutdown", "_web_shutdown", None),
     # /mcp is NEVER in WEB_PUBLIC_PATHS: it inherits the bearer-token gate
     # (and the `control` scope override above) on every method.
     ("POST", "/mcp", "handle_http", "mcp"),
@@ -2054,6 +2060,13 @@ class Cron:
         # run's close could sort BEFORE its open, which the next restart
         # would reconcile as a spurious interrupted run.
         self._inflight_write_tail: dict[str, asyncio.Task] = {}
+        # and the same guard for the run LEDGER (runs/<job>, plus the
+        # logs/<job> archive its task writes second): two completions of
+        # one job close enough to overlap can land filename-inverted and
+        # leave the OLDER run newest in the stream, which is what
+        # rehydration reads back as `last_run` and what an at-the-bound
+        # prune evicts by.
+        self._run_write_tail: dict[str, asyncio.Task] = {}
         # latched when a @reboot marker op times out during startup, so the
         # remaining @reboot jobs apply the policy without more I/O instead
         # of serially stalling the first pass on a hung mount.
@@ -4787,6 +4800,39 @@ class Cron:
         # the MCP cron_cancel_job shape, instances included
         return _json_response(
             {"cancelled": name, "instances": count},
+            headers=self._web_headers(),
+        )
+
+    async def _web_shutdown(self, request: web.Request) -> web.Response:
+        """Gracefully stop this daemon (`POST /shutdown`).
+
+        The same drain Ctrl-C / SIGTERM trigger: stop scheduling new runs,
+        wait for the running jobs, stop the web app, exit. This is the one
+        graceful stop that needs no console or signal delivery, which is
+        what a service wrapper or supervisor drives, and on Windows the
+        only graceful stop reachable from outside the daemon's own console.
+
+        Refused (403) unless the request was authenticated by a configured
+        bearer token: on an unauthenticated listener this endpoint would
+        otherwise hand every process that can reach it a stop switch for
+        the scheduler, a step beyond what the other control routes can do.
+        In a cluster this stops only the node addressed.
+        """
+        matched = request.get(WEB_TOKEN_REQUEST_KEY)
+        if matched is None:
+            raise _api_error(
+                web.HTTPForbidden,
+                "POST /shutdown requires bearer-token authentication: "
+                "configure web.authToken (or a web.authTokens entry whose "
+                "scopes include `control`) and present it on this request",
+                headers=self._web_headers(),
+            )
+        logger.info(
+            "shutdown requested via POST /shutdown (token %r)", matched.label
+        )
+        self.signal_shutdown()
+        return _json_response(
+            {"shuttingDown": True},
             headers=self._web_headers(),
         )
 
@@ -10047,6 +10093,42 @@ class Cron:
     def _inflight_stream(name: str) -> str:
         return INFLIGHT_STREAM_PREFIX + name
 
+    def _queue_run_write(
+        self, name: str, make_coro: Callable[[], Coroutine[Any, Any, None]]
+    ) -> asyncio.Task:
+        """Run a run-ledger write ordered behind the job's previous one.
+
+        The :meth:`_queue_inflight_write` idiom, for the same reason and the
+        same failure: ``runs/<job>`` records are appended fire-and-forget on
+        pooled worker threads, and each record's filename sort key (which is
+        what orders the stream, and what both rehydration and the prune read
+        it back by) is minted on the thread that runs the append.  Two
+        completions of one job whose appends overlap can therefore land
+        inverted, leaving the OLDER run newest.  Chaining per job keeps the
+        stream's order equal to completion order; different jobs still write
+        concurrently.  Ordering only, as everywhere else: a predecessor's
+        failure is its own (``_install_tail_task`` waits, it does not
+        propagate), and each write is individually bounded by
+        ``STATE_OP_TIMEOUT``, so a wedged store delays a job's next ledger
+        write rather than stranding the chain.
+
+        Same-node only, by construction: two nodes sharing a mount write
+        through different processes and no local chain can order them, which
+        is exactly why the readers that must not be fooled fold by
+        ``finished_at`` instead of trusting position.
+
+        Takes a factory rather than a coroutine, for the reason
+        :meth:`_install_tail_task` gives: a write shed under overload closes
+        the ordered wrapper, and an eagerly-built inner coroutine would be
+        left neither awaited nor closed.
+        """
+        return self._install_tail_task(
+            self._run_write_tail,
+            name,
+            make_coro,
+            spawn=self._track_state_write,
+        )
+
     def _queue_inflight_write(
         self, name: str, make_coro: Callable[[], Coroutine[Any, Any, None]]
     ) -> asyncio.Task:
@@ -10358,7 +10440,12 @@ class Cron:
         self._queue_inflight_write(
             name, lambda: self._persist_inflight_closed(name, reason)
         )
-        self._track_state_write(self._persist_reconciled_record(name, data))
+        # through the same per-job chain as a live completion: reconciliation
+        # runs at boot alongside them, and an unordered pair here would
+        # invert exactly as two completions would.
+        self._queue_run_write(
+            name, lambda: self._persist_reconciled_record(name, data)
+        )
         # make it visible on this node's dashboard immediately (bypassing
         # _record_run: no metric emission, no double-persist).
         finished = _parse_iso_utc(started_iso) or get_now(
@@ -10603,8 +10690,9 @@ class Cron:
                 if job is not None and job.archiveOutput
                 else None
             )
-            self._track_state_write(
-                self._persist_run_record(name, info, archive_lines)
+            self._queue_run_write(
+                name,
+                lambda: self._persist_run_record(name, info, archive_lines),
             )
         # Release the superseded record's ring buffer: only the NEWEST
         # finished run's output is replayable, yet `prev`'s ring would

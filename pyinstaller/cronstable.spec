@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import re
 import sys
 
 from PyInstaller.utils.hooks import collect_data_files
@@ -114,6 +115,77 @@ excludes = [
 # The source-run test suite does not exercise the frozen -OO build; CI's
 # per-arch `--version` smoke test is the backstop for a dependency that might
 # misbehave without its docstrings/asserts.
+# A Windows VERSIONINFO resource, so the shipped .exe identifies itself in
+# Explorer's Properties > Details (product name, version, copyright) the way
+# every in-box Windows tool does, instead of shipping with a blank details
+# tab like an anonymous binary. Built as a VSVersionInfo object (PyInstaller
+# accepts that directly for EXE's `version`); non-Windows builds drop the
+# resource themselves, so the guard here just skips the work. The version
+# module exists because the binary lanes `pip install .` before freezing.
+version_resource = None
+if sys.platform == "win32":
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo,
+        StringFileInfo,
+        StringStruct,
+        StringTable,
+        VarFileInfo,
+        VarStruct,
+        VSVersionInfo,
+    )
+
+    from cronstable.version import version as cronstable_version
+
+    # A PE FILEVERSION is four 16-bit integers. Take the leading numeric
+    # dotted components (a dev/local suffix contributes nothing) and pad:
+    # "1.2.37" -> (1, 2, 37, 0), "1.2.38.dev5+g94d6fad" -> (1, 2, 38, 0).
+    numbers = []
+    for part in cronstable_version.split("."):
+        match = re.match(r"\d+", part)
+        if match is None:
+            break
+        numbers.append(int(match.group()) & 0xFFFF)
+        if len(numbers) == 4:
+            break
+    while len(numbers) < 4:
+        numbers.append(0)
+    filevers = tuple(numbers)
+    version_resource = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=filevers, prodvers=filevers),
+        kids=[
+            StringFileInfo(
+                [
+                    StringTable(
+                        "040904B0",  # en-US, Unicode
+                        [
+                            StringStruct("CompanyName", "cronstable"),
+                            StringStruct(
+                                "FileDescription",
+                                "cronstable job scheduler",
+                            ),
+                            StringStruct(
+                                "FileVersion", cronstable_version
+                            ),
+                            StringStruct("InternalName", "cronstable"),
+                            StringStruct(
+                                "LegalCopyright",
+                                "MIT License. (c) the cronstable authors.",
+                            ),
+                            StringStruct(
+                                "OriginalFilename", "cronstable.exe"
+                            ),
+                            StringStruct("ProductName", "cronstable"),
+                            StringStruct(
+                                "ProductVersion", cronstable_version
+                            ),
+                        ],
+                    )
+                ]
+            ),
+            VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
+        ],
+    )
+
 a = Analysis(
     ["cronstable"],
     pathex=["."],
@@ -145,4 +217,5 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=True,
+    version=version_resource,
 )

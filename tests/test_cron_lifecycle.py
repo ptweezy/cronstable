@@ -2564,6 +2564,81 @@ def test_sigterm_triggers_graceful_shutdown():
         loop.close()
 
 
+@pytest.mark.skipif(
+    not platform.IS_WINDOWS,
+    reason="Windows console-signal delivery (SIGINT fallback + heartbeat)",
+)
+def test_sigint_triggers_graceful_shutdown_on_windows():
+    # End-to-end of the documented Windows Ctrl-C path, the sibling of the
+    # SIGTERM test above: a real SIGINT through the signal.signal fallback
+    # (whose heartbeat is what makes it observable while the Proactor loop
+    # is parked in IOCP) must drive run() to a clean return. Before this
+    # test existed the Windows handlers were installed but never fired.
+    loop = asyncio.new_event_loop()
+    try:
+        # no jobs: run() idles until signalled
+        cron = cronstable.cron.Cron(None)
+        remove = platform.install_shutdown_handlers(loop, cron.signal_shutdown)
+        try:
+            loop.call_later(0.05, lambda: signal.raise_signal(signal.SIGINT))
+            loop.run_until_complete(asyncio.wait_for(cron.run(), timeout=10))
+            assert cron._stop_event.is_set()
+        finally:
+            remove()
+    finally:
+        loop.close()
+
+
+class _ShutdownReq:
+    """The slice of aiohttp's Request _web_shutdown reads: the token the
+    auth middleware filed (or nothing, when no auth is configured)."""
+
+    def __init__(self, token=None):
+        self._store = {}
+        if token is not None:
+            self._store[cronstable.cron.WEB_TOKEN_REQUEST_KEY] = token
+
+    def get(self, key, default=None):
+        return self._store.get(key, default)
+
+
+@pytest.mark.asyncio
+async def test_web_shutdown_refused_without_authentication():
+    # POST /shutdown is fail-closed: with no auth middleware there is no
+    # matched token, and an unauthenticated listener must not hand every
+    # process that can reach it a stop switch for the scheduler.
+    import json
+
+    from aiohttp import web
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    with pytest.raises(web.HTTPForbidden) as exc:
+        await cron._web_shutdown(_ShutdownReq())
+    # the refusal carries the API's one JSON error envelope, remedy named
+    assert exc.value.content_type == "application/json"
+    assert "web.authToken" in json.loads(exc.value.text)["error"]
+    assert not cron._stop_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_web_shutdown_with_a_token_signals_the_drain():
+    # an authenticated caller gets the same graceful drain Ctrl-C/SIGTERM
+    # trigger; this is the stop path for service wrappers and supervisors
+    # (and the only graceful stop a console-less Windows daemon has).
+    import json
+
+    cron = cronstable.cron.Cron(None)
+    cron.web_config = {}
+    token = cronstable.cron._WebToken(
+        b"t", frozenset({"view", "control"}), "supervisor"
+    )
+    resp = await cron._web_shutdown(_ShutdownReq(token=token))
+    assert resp.status == 200
+    assert json.loads(resp.body) == {"shuttingDown": True}
+    assert cron._stop_event.is_set()
+
+
 @pytest.mark.asyncio
 async def test_fleet_job_summaries_snapshot():
     # the compact per-job snapshot gossiped to peers for the fleet view:
@@ -4516,6 +4591,81 @@ async def test_track_state_write_sheds_when_pending_set_full(monkeypatch):
     assert ran is True
 
 
+async def test_back_to_back_runs_land_in_the_ledger_in_order(tmp_path):
+    # Two completions of one job close enough to overlap (a
+    # concurrencyPolicy: Allow pair, a retry firing straight after its
+    # parent's failure, a catch-up burst) each issue a fire-and-forget
+    # append. The filename that orders runs/<job> is minted INSIDE the
+    # append, on whichever pooled worker thread runs it, so unchained the
+    # pair can land filename-INVERTED and leave the OLDER run newest in the
+    # stream -- which is what rehydration reads back as last_run and what an
+    # at-the-bound prune evicts by. (Unchained this reproduced ~47% of the
+    # time against the real backend on an idle box; the delay below makes
+    # the overtake deterministic instead of leaving the guard to chance.)
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        backend = cron.state_backend
+        real_append = backend.append_record
+        run_stream = cron._run_stream("j")
+        seen = []
+
+        async def slow_first_append(stream, data, **kwargs):
+            # hold the FIRST run-record append open long enough that an
+            # unordered second one would mint its filename first. Models a
+            # store whose latency varies between two adjacent writes.
+            if stream == run_stream:
+                seen.append(data.get("outcome"))
+                if len(seen) == 1:
+                    await asyncio.sleep(0.2)
+            return await real_append(stream, data, **kwargs)
+
+        backend.append_record = slow_first_append
+
+        first = _mem_run("failure", 1)
+        second = _mem_run("success", 2)
+        cron._record_run("j", first)
+        cron._record_run("j", second)
+        await asyncio.gather(*list(cron._pending_state_writes))
+
+        recs = await backend.list_records(run_stream)
+        assert [r["outcome"] for r in recs] == ["failure", "success"], (
+            "the ledger must keep completion order even when the earlier "
+            "run's write is the slower one; got %r"
+            % ([r["outcome"] for r in recs],)
+        )
+        # the consequence that matters: the newest record by stream position
+        # is the run that actually finished last.
+        assert recs[-1]["finished_at"] == second.finished_at.isoformat()
+    finally:
+        await cron.start_stop_state(None)
+
+
+async def test_run_writes_chain_per_job_not_across_jobs(tmp_path):
+    # The chain is per job, so one job's slow ledger write cannot delay
+    # another's (the whole point of keeping these writes off the scheduling
+    # path). Pin that the tail is keyed by name.
+    cron = Cron(
+        None,
+        config_yaml=(
+            "jobs:\n"
+            "  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+            "  - name: k\n    command: 'true'\n    schedule: '* * * * *'\n"
+        ),
+    )
+    await cron.start_stop_state(_state_cfg(_state_yaml(tmp_path)))
+    try:
+        cron._record_run("j", _mem_run("success", 1))
+        cron._record_run("k", _mem_run("success", 1))
+        assert set(cron._run_write_tail) == {"j", "k"}
+        assert cron._run_write_tail["j"] is not cron._run_write_tail["k"]
+        await asyncio.gather(*list(cron._pending_state_writes))
+        # each tail deregisters itself once its own write completes
+        assert cron._run_write_tail == {}
+    finally:
+        await cron.start_stop_state(None)
+
+
 async def test_a_shed_chained_write_leaves_no_unawaited_coroutine(monkeypatch):
     # The chained-tail helper builds its body INSIDE the ordered wrapper, so
     # that shedding closes the only coroutine that was ever created. Built at
@@ -4531,11 +4681,21 @@ async def test_a_shed_chained_write_leaves_no_unawaited_coroutine(monkeypatch):
         "_append_retry_record",
         lambda self, name, record: appended.append(name),
     )
+    persisted = []
+    monkeypatch.setattr(
+        Cron,
+        "_persist_run_record",
+        lambda self, name, info, lines=None: persisted.append(name),
+    )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         # every chained-write entry point, through its real caller
         await cron._queue_retry_write("alpha", {"kind": "armed"})
         await cron._queue_pause_write("alpha", {"kind": "paused"})
+        await cron._queue_run_write(
+            "alpha", lambda: cron._persist_run_record("alpha", None, None)
+        )
         gc.collect()
     assert appended == []  # shed, as the cap demands
+    assert persisted == []
     assert [w for w in caught if "never awaited" in str(w.message)] == []
