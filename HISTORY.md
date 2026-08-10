@@ -203,6 +203,43 @@ Windows fixes and additions. The first of many updates to address Windows first-
   reach, and the merged view counts it as missed. Both Codecov
   statuses stay `informational`, so the drop annotates a pull request and
   cannot fail one.
+- `cronstable import-taskscheduler` converts Windows Task Scheduler XML
+  exports into cronstable jobs, so a Windows estate does not have to be
+  retyped. It reads what the documented commands actually emit, including
+  the two shapes that stop a parser before any conversion happens:
+  `schtasks /query /XML` without `ONE` writes one XML declaration per task
+  inside a single root, and the declaration lies about the encoding whenever
+  the export passed through a redirect, since `Export-ScheduledTask` returns
+  a string stamped UTF-16 that PowerShell writes as UTF-8. Time, calendar
+  and boot triggers convert, including the two calendar forms cron can
+  express exactly, the nth weekday of a month and the last one. `Exec`
+  actions become list-form commands split by the Windows argument rules and
+  checked by rebuilding the line, along with the working directory, the
+  execution time limit, the instance policy and the priority.
+  It is a converter rather than a config-directory loader, which is where it
+  departs from what was planned, and the reason is that exporting a task
+  does not unregister it: a loader would silently double-run an estate on
+  first start. The output is YAML to read, edit and commit.
+  Everything that could not be carried across is reported with the element
+  responsible and, where one exists, a remedy. On a whole-machine export
+  that list is longer than the converted one, and the documentation says so
+  with the numbers: of 195 tasks registered on a stock Windows 11 machine,
+  111 act through a COM handler, 97 use an internal notification trigger and
+  57 have no trigger at all. Those are Windows' own plumbing rather than
+  schedules.
+  Several refusals exist because the naive mapping would produce
+  configuration that cannot load or does not do what the task did. An
+  execution time limit of `PT0S` means no limit in Task Scheduler while
+  cronstable requires one greater than zero, so it emits nothing rather than
+  making 34 of those 195 tasks a load failure. A repetition converts only
+  when its occurrences over a day are exactly the product of an hour set and
+  a minute set, because a cron minute and hour field multiply, so `PT1H`
+  converts and `PT90M` is refused rather than silently doubled. Seconds are
+  always dropped, because one imported registration artefact would set the
+  whole daemon ticking every second for every other job too. A principal is
+  reported and never emitted as `user:`, which is a config-load error on
+  Windows and would produce a file that cannot load on the platform it was
+  converted for.
 - cronstable installs itself as a Windows service. `cronstable service
   install -c C:\ProgramData\cronstable` registers it with the Service
   Control Manager, so it starts at boot and runs whether or not anyone is

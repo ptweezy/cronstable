@@ -121,6 +121,7 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_mcp_command(sub)
     _cliargs.add_tui_command(sub)
     _cliargs.add_service_command(sub)
+    _cliargs.add_import_taskscheduler_command(sub)
     _add_init_command(sub)
 
 
@@ -418,6 +419,14 @@ def main_loop(loop=None):
 
     if command == "init":
         sys.exit(_run_init(args))
+
+    if command == "import-taskscheduler":
+        # Dispatch-time import, like every other subcommand branch: the XML
+        # parser and this converter cost nothing to an invocation that is
+        # not converting anything.
+        from cronstable import taskxml
+
+        sys.exit(taskxml.dispatch(args))
 
     if command == "service":
         # Before the configuration-not-found guard below: `service remove`

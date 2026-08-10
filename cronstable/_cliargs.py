@@ -440,6 +440,56 @@ def _add_service_log_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_import_taskscheduler_command(sub: Any) -> None:
+    """Register ``cronstable import-taskscheduler``.
+
+    A flat verb rather than ``import <format>``: a nested subparser would
+    buy a second dest, another --help level and a "no format given" error
+    path today, against a compatibility break that only exists if a second
+    format ever ships. A future importer is a sibling verb, which costs
+    nothing either way.
+
+    Declared in this leaf rather than beside `init` in __main__ because,
+    unlike `init`, its implementation is a separate module that pulls in
+    the XML parser, and that is exactly the distinction this module exists
+    to draw.
+    """
+    parser = sub.add_parser(
+        "import-taskscheduler",
+        help="convert Windows Task Scheduler XML exports into cronstable "
+        "jobs and exit",
+        description=(
+            "Convert one or more Task Scheduler exports (schtasks /query "
+            "/XML ONE, or Export-ScheduledTask) into cronstable YAML. The "
+            "converted configuration goes to stdout or -o; a report of "
+            "everything that could not be carried across goes to stderr. "
+            "Review the result before loading it: exporting a task does "
+            "not unregister it."
+        ),
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        metavar="PATH",
+        help="export files, directories of *.xml, or - for stdin",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        metavar="FILE",
+        help="write the configuration here instead of stdout",
+    )
+    parser.add_argument(
+        "--timezone",
+        default=None,
+        metavar="NAME",
+        help="evaluate every converted schedule in this IANA timezone "
+        "(default: keep each task's own clock, which for a task with no "
+        "stored offset is the daemon host's local time)",
+    )
+
+
 def add_service_command(sub: Any) -> None:
     """Register ``cronstable service <action>`` on the root subparsers.
 

@@ -355,6 +355,17 @@ POSIX. A few platform details differ:
   and
   [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows).
 
+* **Migrating from Task Scheduler.** `cronstable import-taskscheduler
+  tasks.xml -o jobs.yaml` converts an estate's exports into cronstable jobs,
+  mapping time, calendar and boot triggers, `Exec` actions, working
+  directories, execution time limits, instance policy and priority. It is a
+  one-shot converter, not a loader, because exporting a task does not
+  unregister it. Everything it cannot carry across is listed with a reason
+  rather than dropped, and on a whole-machine export that list is long: most
+  registered tasks on a stock Windows install are COM-handler or
+  event-driven internals rather than schedules. See
+  [Importing from Task Scheduler](https://github.com/ptweezy/cronstable/wiki/Importing-Task-Scheduler).
+
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
   and `unix://` web listeners are skipped with a warning. Use an `http://`

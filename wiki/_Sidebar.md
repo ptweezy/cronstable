@@ -5,6 +5,7 @@
   - [Command-Line Reference](CLI-Reference)
   - [Running on Windows](Running-on-Windows)
   - [Windows Service](Windows-Service)
+  - [Importing from Task Scheduler](Importing-Task-Scheduler)
   - [Production and Container Deployment](Production-Deployment)
 - **Configuration**
   - [Configuration Reference](Configuration-Reference)
