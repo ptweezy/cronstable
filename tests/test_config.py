@@ -2385,6 +2385,22 @@ def test_onlate_without_sla_is_rejected(snippet):
         _sla_job("    onLate:\n      report:\n" + snippet)
 
 
+def test_onlate_with_only_push_requires_sla():
+    # push is a report destination like the other four, so an onLate that
+    # enables only push and sets no sla threshold is the same dead hook.
+    # It is its own test rather than a row in the list above because it is
+    # the one destination that also has a cross-section validator: without
+    # the sla check firing first, this config fails later and elsewhere,
+    # with the "no push: section" message, which names the wrong mistake.
+    with pytest.raises(ConfigError, match="onLate requires sla"):
+        _sla_job(
+            "    onLate:\n"
+            "      report:\n"
+            "        push:\n"
+            "          enabled: true\n"
+        )
+
+
 def test_onlate_with_sla_is_accepted():
     job = _sla_job(
         "    sla:\n"
