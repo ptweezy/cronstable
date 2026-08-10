@@ -593,7 +593,12 @@ and every `@reboot` job runs again. With `state` configured, a standalone
   Elsewhere the boot time is derived from uptime (`GetTickCount64` on
   Windows, `/proc/uptime` on POSIX) and compared with a 60-second tolerance.
   Where neither exists (macOS, the BSDs) behaviour is unchanged: the job runs
-  every daemon start, exactly as before.
+  every daemon start, exactly as before. One Windows caveat: Fast Startup
+  ("Shut down" with hiberboot enabled, the client default) hibernates the
+  kernel session, so the next power-on resumes the same uptime counter and
+  reads as the *same* boot; `@reboot` does not re-fire after it, only after
+  a Restart (which always begins a new boot). Disable Fast Startup
+  (`powercfg /h off`) if "every power-on" is the behaviour you need.
 * **Record-then-run.** The marker (stream `reboot/<job>`: host, boot
   id/time, job digest) is written *before* the launch, so a crash between
   record and spawn errs toward not re-running -- the same at-most-once
@@ -1022,6 +1027,12 @@ documents the UI.
 * **File modes.** The store's directories are created `0o700` and its data
   files `0o600` (both further narrowed by your umask): records can carry job
   output, which routinely includes things that should not be world-readable.
+  POSIX-only: Windows does not map mode bits onto ACLs, so there the store
+  simply inherits its parent directory's ACL. On a multi-user Windows host,
+  root the store under a directory whose ACL is restricted to the daemon's
+  account; see
+  [Running on Windows](Running-on-Windows#posix-file-modes-are-advisory-only)
+  for an `icacls` recipe. The same applies to `cronstable state backup` output.
 * **Same user on shared stores.** Because records are `0o600`, **every node
   sharing a store must run cronstable as the same user**; two nodes running as
   different users silently hide half the history from each other (a
