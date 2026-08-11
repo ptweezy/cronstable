@@ -542,6 +542,39 @@ async def test_retire_event_log_writers_drops_a_renamed_source(
     assert "alpha" not in cronstable.job._EVENTLOG_WRITERS
 
 
+@pytest.mark.asyncio
+async def test_retire_event_log_writers_releases_the_source_handle(
+    fake_event_log,
+):
+    # Dropping the registry entry is only half the retirement.  The reload
+    # path pops a writer and deliberately does NOT join it, so a release
+    # that lived in join() never ran on this path: every reload that
+    # renamed `source` leaked one source handle, unbounded, and invisible
+    # to EVENTLOG_MAX_WRITERS, which caps the LIVE registry rather than
+    # what has already left it.  The writer's own thread releases it now,
+    # so the reload never has to wait for it.
+    job_config = _job_config(_SOURCE_JOB)
+    await EventLogReporter().report(
+        True, _ctx(job_config), job_config.onSuccess["report"]
+    )
+    writer = cronstable.job._EVENTLOG_WRITERS["alpha"]
+    # the handle opens lazily on the writer thread, so wait for the record
+    deadline = time.monotonic() + 5.0
+    while not fake_event_log.written and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert fake_event_log.written
+    handle = fake_event_log.written[0]["handle"]
+    assert fake_event_log.closed == []
+
+    retire_event_log_writers({"beta"})
+
+    # the raw thread, NOT writer.join(): joining is exactly what the reload
+    # path does not do, so a test that called it would pass either way.
+    writer._thread.join(5.0)
+    assert not writer._thread.is_alive()
+    assert fake_event_log.closed == [handle]
+
+
 _SOURCE_JOB = """
 jobs:
   - name: backup

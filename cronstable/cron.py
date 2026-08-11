@@ -7844,7 +7844,14 @@ class Cron:
             token = str(spec["value"])
         elif spec.get("fromFile"):
             try:
-                with open(spec["fromFile"], "rt") as token_file:
+                # utf-8-sig for the reason config._resolve_secret gives: a
+                # locale-default read decodes the ANSI code page on Windows,
+                # and a BOM survives .strip(), so a BOM'd ASCII token passes
+                # the non-empty check below and then 401s every request that
+                # sends the token the operator actually wrote.
+                with open(
+                    spec["fromFile"], "rt", encoding="utf-8-sig"
+                ) as token_file:
                     token = token_file.read().strip()
             # UnicodeDecodeError too: a binary token file raises it from
             # read(), and only ConfigError gets the clean "not starting

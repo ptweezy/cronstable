@@ -1154,7 +1154,7 @@ anywhere other local users matter.
 | Sub-option | Type | Description |
 | --- | --- | --- |
 | `value` | string or null | Literal token value. |
-| `fromFile` | string or null | Path to a file; the token is the file contents with surrounding whitespace stripped. |
+| `fromFile` | string or null | Path to a file; the token is the file contents with surrounding whitespace stripped. Read as UTF-8, and a leading byte-order mark is stripped too, so a file written by Notepad or a PowerShell redirect resolves to the token you typed. |
 | `fromEnvVar` | string or null | Name of an environment variable holding the token. |
 
 When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) requires

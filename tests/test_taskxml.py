@@ -463,6 +463,82 @@ _DAILY = (
 )
 
 
+def test_a_percent_variable_makes_the_command_one_string():
+    # Task Scheduler expands %VAR% before CreateProcess and cronstable
+    # expands nothing, so an argv whose argv[0] is '%windir%\\...' reaches
+    # create_subprocess_exec verbatim and fails with WinError 2 on every
+    # run. A string command with no shell: goes to create_subprocess_shell,
+    # which is %ComSpec% /c on Windows, so cmd.exe does the expansion.
+    # Measured on this project's own dev box: 18 of the 31 jobs a
+    # whole-machine export converted had one in argv[0].
+    converted = _convert(
+        _task(
+            triggers=_DAILY,
+            actions=(
+                "<Exec><Command>%windir%\\system32\\rundll32.exe</Command>"
+                "<Arguments>acproxy.dll,Run</Arguments></Exec>"
+            ),
+        )
+    )
+    command = converted.jobs[0]["command"]
+    assert isinstance(command, str)
+    # the program is quoted even though the literal text has no space in
+    # it: Task Scheduler decides quoting on what it stored and calls
+    # CreateProcess, so a variable that expands to a spaced path is stored
+    # bare, and cmd.exe handed that bare runs the wrong program.
+    assert command == r'"%windir%\system32\rundll32.exe" acproxy.dll,Run'
+    assert "%VAR% environment variables" in _reasons(converted)
+    # advisory, not blocking: the job works, it just runs under a shell
+    assert not any(note.blocking for note in converted.notes)
+    # and it survives the emitter and the real config parser
+    conf = parse_config_string(render_yaml([converted], sources=["t.xml"]), "")
+    assert conf.jobs[0].command == command
+    # no `shell:` key is emitted, which is what routes a string command
+    # through %ComSpec% /c on Windows. Asserted on the emitted job rather
+    # than on the parsed config, whose `shell` defaults to the platform's
+    # own ("" on Windows, /bin/sh on POSIX) and would make this pass or
+    # fail depending on where the suite runs.
+    assert "shell" not in converted.jobs[0]
+
+
+def test_a_quoted_percent_command_keeps_its_quotes_for_the_shell():
+    # The argv path strips the quote pair around a spaced path because a
+    # quote is a literal character in an argv. The string path must NOT:
+    # Task Scheduler quotes it precisely because Command and Arguments are
+    # concatenated into one command line, so the quotes are what make the
+    # concatenation parse.
+    converted = _convert(
+        _task(
+            triggers=_DAILY,
+            actions=(
+                '<Exec><Command>"%ProgramFiles(x86)%\\App\\a b.exe"</Command>'
+                "<Arguments>--now</Arguments></Exec>"
+            ),
+        )
+    )
+    assert converted.jobs[0]["command"] == (
+        '"%ProgramFiles(x86)%\\App\\a b.exe" --now'
+    )
+
+
+def test_no_percent_variable_still_becomes_an_argv_list():
+    # The bias check: the string form is for command lines that need a
+    # shell, and everything else keeps the argv it always had.
+    converted = _convert(
+        _task(
+            triggers=_DAILY,
+            actions=(
+                '<Exec><Command>"C:\\Program Files\\a b.exe"</Command>'
+                "<Arguments>--now</Arguments></Exec>"
+            ),
+        )
+    )
+    assert converted.jobs[0]["command"] == [
+        "C:\\Program Files\\a b.exe",
+        "--now",
+    ]
+
+
 def test_exec_becomes_an_argv_list_and_a_working_directory():
     converted = _convert(
         _task(
@@ -851,6 +927,96 @@ def test_no_seconds_column_is_ever_emitted():
     conf = parse_config_string(document, "")
     assert all(not job.has_seconds for job in conf.jobs)
     assert len(converted.jobs[0]["schedule"].split()) == 6
+
+
+def test_a_partly_converted_task_is_not_reported_as_not_converted():
+    # A blocking note is per TRIGGER; `commented` is per task. A task with
+    # an unconvertible trigger beside a daily one emits a live job AND
+    # carries a blocking note, and the report used to call that "NOT
+    # CONVERTED" while the job sat live in the same file. On a real
+    # 195-task export that was 11 of the 24 converted tasks, and the
+    # report is the only place an operator learns which tasks Task
+    # Scheduler is still firing too.
+    converted = _convert(
+        _task(
+            triggers=(
+                "<LogonTrigger><Enabled>true</Enabled></LogonTrigger>" + _DAILY
+            )
+        )
+    )
+    assert converted.jobs and not converted.commented
+    assert any(note.blocking for note in converted.notes)
+    assert taskxml.report_state(converted) == "PARTIAL"
+    report = taskxml.render_report([converted])
+    assert "PARTIAL: " in report
+    assert "NOT CONVERTED" not in report
+    # the headline has to agree with the label under it
+    assert "1 converted into 1 job(s), 0 not converted." in report
+    assert "1 of the converted task(s)" in report
+
+
+def test_a_task_with_nothing_emitted_is_still_not_converted():
+    # The other side of the same rule: a state read off the YAML, so a
+    # task that produced no job keeps the words render_yaml uses.
+    converted = _convert(_task(triggers=""))
+    assert not converted.jobs
+    assert taskxml.report_state(converted) == "NOT CONVERTED"
+    assert "NOT CONVERTED: " in taskxml.render_report([converted])
+
+
+def test_one_unreadable_task_no_longer_costs_the_whole_export(
+    tmp_path, capsys
+):
+    # `P1M` is one MONTH (the M is before the T), which has no fixed
+    # length, so duration_seconds raises. The raise used to reach
+    # dispatch, which printed one line and wrote NO yaml, so one bad task
+    # in the 34th of 195 cost the other 194 and hand-editing the export
+    # was the only recourse. Every other unconvertible thing here is a
+    # Note, and now so is this.
+    good = _task(uri="\\Good", triggers=_DAILY)
+    bad = _task(
+        uri="\\Bad",
+        triggers=_DAILY,
+        settings="<ExecutionTimeLimit>P1M</ExecutionTimeLimit>",
+    )
+    source = tmp_path / "t.xml"
+    source.write_text("<Tasks>" + good + bad + "</Tasks>", encoding="utf-8")
+    out = tmp_path / "jobs.yaml"
+
+    assert taskxml.dispatch(_args([str(source)], output=str(out))) == 0
+
+    document = out.read_text(encoding="utf-8")
+    conf = parse_config_string(document, "")
+    assert [job.name for job in conf.jobs] == ["Good"]
+    err = capsys.readouterr().err
+    assert "NOT CONVERTED: \\Bad" in err
+    assert "not a duration this converter can read" in err
+    assert "1 converted into 1 job(s), 1 not converted." in err
+
+
+def test_a_bare_value_error_is_isolated_too(tmp_path, capsys):
+    # TaskXmlError subclasses ValueError, so catching only the module's own
+    # error leaves the plain int() calls uncovered: Priority here, and
+    # DaysInterval and WeeksInterval on the calendar triggers. Those would
+    # abort the whole export with a traceback, which is the thing the
+    # isolation exists to stop.
+    good = _task(uri="\\Good", triggers=_DAILY)
+    bad = _task(
+        uri="\\Bad",
+        triggers=_DAILY,
+        settings="<Priority>not-a-number</Priority>",
+    )
+    source = tmp_path / "t.xml"
+    source.write_text("<Tasks>" + good + bad + "</Tasks>", encoding="utf-8")
+    out = tmp_path / "jobs.yaml"
+
+    assert taskxml.dispatch(_args([str(source)], output=str(out))) == 0
+
+    conf = parse_config_string(out.read_text(encoding="utf-8"), "")
+    assert [job.name for job in conf.jobs] == ["Good"]
+    err = capsys.readouterr().err
+    assert "NOT CONVERTED: \\Bad" in err
+    assert "could not be read" in err
 
 
 @pytest.mark.skipif(

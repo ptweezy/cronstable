@@ -3110,6 +3110,44 @@ async def test_flush_emit_buffer_survives_broken_daemon_stream(
     await reader.join()  # let the (already EOF) read task settle
 
 
+async def test_mirror_says_it_once_when_the_daemon_has_no_streams(
+    monkeypatch, caplog
+):
+    # A Windows service has no standard streams at all: sys.stdout is None,
+    # not a closed file.  The mirrored write then raised AttributeError on
+    # `out.buffer`, which the "could not mirror" arm turned into a WARNING
+    # plus a full traceback for EVERY batch of EVERY job's output, i.e. the
+    # loudest log the daemon can produce for a condition that is already
+    # settled by the time the first batch arrives.
+    import sys
+
+    monkeypatch.setattr(sys, "stdout", None)
+    mirror = cronstable.job._MIRROR
+    # process-global latch: reset so this test does not depend on order
+    monkeypatch.setattr(mirror, "_no_stream_logged", False)
+    fake = asyncio.StreamReader()
+    fake.feed_eof()
+    reader = cronstable.job.StreamReader("j", "stdout", fake, "", 10)
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        for i in range(5):
+            reader._emit_buffer = ["line %d\n" % i]
+            reader._flush_emit_buffer()
+        assert mirror.drain(5.0)
+    said = [
+        rec
+        for rec in caplog.records
+        if "no stdout/stderr" in rec.getMessage()
+    ]
+    assert len(said) == 1
+    assert said[0].exc_info is None
+    assert not [
+        rec
+        for rec in caplog.records
+        if "could not mirror" in rec.getMessage()
+    ]
+    await reader.join()
+
+
 async def test_mirror_writes_off_the_event_loop_thread(monkeypatch):
     # The whole point of the writer thread: the passthrough write (and its
     # flush) must never run on the event-loop thread, where a full pipe (a

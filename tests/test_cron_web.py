@@ -143,6 +143,31 @@ def test_resolve_web_token_empty_file_fails_closed(tmp_path):
         )
 
 
+def test_resolve_web_token_file_tolerates_a_bom(tmp_path):
+    # The failure this closes is silent at both ends.  A BOM is not
+    # whitespace, so .strip() leaves it on the front of the token; the
+    # non-empty check above therefore passes, the daemon starts
+    # authenticated, and every request carrying the token the operator
+    # actually wrote comes back 401 with nothing in the log to say why.
+    # Notepad's "UTF-8 with BOM" and a PowerShell redirect both write one,
+    # and wiki/Running-on-Windows.md documents exactly this file as the
+    # unattended POST /shutdown stop path.
+    token = tmp_path / "token"
+    token.write_bytes("\ufeffhunter2\n".encode("utf-8"))
+    assert (
+        cronstable.cron.Cron._resolve_web_token(
+            {
+                "authToken": {
+                    "value": None,
+                    "fromFile": str(token),
+                    "fromEnvVar": None,
+                }
+            }
+        )
+        == "hunter2"
+    )
+
+
 @pytest.mark.asyncio
 async def test_auth_middleware():
     from aiohttp import web

@@ -620,7 +620,7 @@ string or empty value:
 | Source | Description |
 | --- | --- |
 | `value` | The secret inline in the config. |
-| `fromFile` | Path to a file whose contents (stripped of surrounding whitespace) are the secret. |
+| `fromFile` | Path to a file whose contents (stripped of surrounding whitespace) are the secret. Read as UTF-8, with a leading byte-order mark stripped as well. |
 | `fromEnvVar` | Name of an environment variable holding the secret. |
 
 Resolution order is `value`, then `fromFile`, then `fromEnvVar` - the first

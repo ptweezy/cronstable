@@ -139,6 +139,14 @@ the real log and treat the bootstrap file as the startup record. See
 [Logging Configuration](Logging-Configuration) and the rotating-file recipe
 in [Running on Windows](Running-on-Windows#running-unattended).
 
+The missing streams also decide where job output goes. With
+[`captureStdout`](Configuration-Reference#output-capturing) or
+`captureStderr` set, cronstable echoes each captured line to its own stdout
+as well as saving it. A service has nowhere to echo to, so it skips that
+copy and logs the fact once rather than once per batch. Reports,
+`GET /jobs/{name}/logs`, the dashboard's live tail and `archiveOutput` read
+the saved lines, so they still see everything the job wrote.
+
 ## `--console` and job termination
 
 By default a service has no console, and that has one visible consequence:

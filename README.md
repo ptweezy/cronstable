@@ -160,7 +160,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
 
-> The (optional) Web UI tour.
+> Web UI tour.
 
 ## Quick start
 

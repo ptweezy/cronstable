@@ -3017,7 +3017,15 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
         secret = str(spec["value"])
     elif spec.get("fromFile"):
         try:
-            with open(spec["fromFile"], "rt") as secret_file:
+            # utf-8-sig, not the locale default, for the reason
+            # parse_environment_file gives: on Windows "rt" decodes the ANSI
+            # code page, so a UTF-8 secret with any non-ASCII byte is
+            # mojibake from a file that is correct on Linux, and a BOM
+            # (Notepad, a PowerShell redirect) survives .strip() and rides
+            # into the secret itself.
+            with open(
+                spec["fromFile"], "rt", encoding="utf-8-sig"
+            ) as secret_file:
                 secret = secret_file.read().strip()
         # Broad on purpose: callers only handle ConfigError, and on the
         # job-secret staging path anything else escapes the scheduler loop
