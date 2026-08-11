@@ -139,6 +139,43 @@ configuration:
 cronstable init
 ```
 
+### Who may write the config directory
+
+Whoever can write the config directory decides what the scheduler runs, and a
+service runs it as SYSTEM. On Windows that is easy to get wrong without
+touching anything: `%ProgramData%` grants `BUILTIN\Users` the right to create
+files, and a directory made under it inherits that, so every local account can
+drop a `.yaml` there. A directory created at the root of a drive is worse
+again, since `C:\` hands new subdirectories `Modify` for Authenticated Users.
+
+`cronstable init` therefore checks the directory it created and, when any
+local account could write to it, restricts it: full control for LocalSystem
+and the local Administrators group, read and execute for everyone else, with
+inheritance from the parent severed. It says so when it does. A per-user
+`%APPDATA%\cronstable` carries no such permission to begin with and is left
+alone.
+
+Read is deliberately left in place. The boundary this defends is who may
+*write* a job, and removing read would stop an unelevated account from listing
+the directory at all, which in turn makes the machine-wide path stop resolving
+for that account. If your config holds secrets inline rather than in
+[`fromFile`](Reporting#secrets) sources, tighten it further.
+
+For a directory that already exists, the daemon says so once at startup and
+prints the same fix:
+
+```text
+C:\ProgramData\cronstable can be written by BUILTIN\Users, so any local
+account can add or change a job this daemon runs, and a service runs them
+as SYSTEM. Restrict it with: icacls "C:\ProgramData\cronstable"
+/inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F
+```
+
+The recipe names SIDs rather than group names so it pastes unchanged on a
+localized install, where `BUILTIN\Administrators` is spelled in the local
+language. Add `/grant *S-1-5-11:(OI)(CI)(RX)` to keep read for everyone, which
+is what `init` does.
+
 ### "Configuration file not found" applies to this path
 
 cronstable has a special-case exit for a missing **default** config path: when the

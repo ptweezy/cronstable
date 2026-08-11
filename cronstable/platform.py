@@ -27,6 +27,7 @@ import contextlib
 import errno
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -1008,6 +1009,311 @@ def fsync_directory(path: str) -> None:
             pass
         finally:
             os.close(fd)
+
+
+# --- Config-directory permissions (Windows) --------------------------------
+#: The DACL :func:`harden_config_dir` writes: full control for LocalSystem
+#: and the local Administrators group, read and execute for everyone else,
+#: all of it inherited by whatever is created inside.
+#:
+#: ``D:P`` is the load-bearing part.  It PROTECTS the DACL, which severs
+#: inheritance from the parent, and inheritance is the entire problem:
+#: ``%ProgramData%`` grants ``BUILTIN\\Users`` the ``DCLCRPCR`` set (create
+#: file, create folder, write EA, write attributes) with container
+#: inheritance, so a directory made under it with a plain ``mkdir`` hands
+#: every local account the right to plant a job there.  Measured without
+#: ``P``: the new ACEs are added, the inherited ones stay, and the call
+#: still reports success, so the hardening reads as done and is a no-op.
+#:
+#: Read is deliberately kept.  Removing it closes nothing that matters
+#: (the trust boundary this defends is who may WRITE a job) and breaks two
+#: things measurably: an unelevated caller, which a split-token
+#: administrator is, cannot afterwards list the directory it just created,
+#: and :func:`_holds_config` turns that ``OSError`` into "no config here",
+#: so the machine-wide path silently stops resolving for exactly the
+#: accounts that are not elevated.  ``C:\\ProgramData\\ssh`` makes the same
+#: trade.  An operator keeping secrets inline can tighten it further, and
+#: the documentation says so.
+#:
+#: ``FA``/``FRFX`` rather than ``GA``/``GRGX``: the generic forms are not
+#: mapped on this path and read back as six split ACEs carrying unmapped
+#: generic bits, which Windows' own tools cannot render as a permission.
+_CONFIG_DIR_SDDL = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;AU)"
+
+#: SDDL aliases for "any account on this machine", the only principals a
+#: write grant to is reported as a finding.  CREATOR OWNER (``CO``) is
+#: deliberately absent: it appears on ``%ProgramData%`` itself and resolves
+#: per object to whoever made it, so counting it would flag every directory
+#: on the system.  A grant to one named non-admin account is also not
+#: reported, because nothing here can tell that apart from a deliberate
+#: delegation, and a check that cries wolf on a correct machine at every
+#: start is worse than no check.
+_ANY_USER_SIDS = {
+    "WD": "Everyone",
+    "BU": "BUILTIN\\Users",
+    "AU": "Authenticated Users",
+    "IU": "INTERACTIVE",
+    "BG": "BUILTIN\\Guests",
+    "AN": "Anonymous Logon",
+    "DU": "Domain Users",
+    "S-1-1-0": "Everyone",
+    "S-1-5-32-545": "BUILTIN\\Users",
+    "S-1-5-11": "Authenticated Users",
+    "S-1-5-4": "INTERACTIVE",
+}
+
+#: SDDL rights tokens that let the holder create a file in a directory.
+#: ``DC`` is FILE_ADD_FILE and ``LC`` is FILE_ADD_SUBDIRECTORY, which is
+#: how the ``%ProgramData%`` ACE spells itself; the rest are the coarser
+#: aliases that contain them.
+_WRITE_TOKENS = {"FA", "FW", "GA", "GW", "KA", "KW", "DC", "LC"}
+
+#: The same rights as a numeric mask: FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY,
+#: GENERIC_WRITE and GENERIC_ALL.  A DACL read back from disk gives either
+#: form, sometimes both in one ACL (measured on C:\\Windows\\System32).
+_WRITE_MASK = 0x00000002 | 0x00000004 | 0x40000000 | 0x10000000
+
+
+def _sddl_write_grantee(sddl: str) -> Optional[str]:
+    """The first any-user principal an SDDL string lets create files.
+
+    Parses the ACE list rather than walking ACEs through ``GetAce``: the
+    text form is what ``ConvertSecurityDescriptorToStringSecurityDescriptorW``
+    already produces, and reading it needs no struct layouts, no SID
+    comparisons and no ``MapGenericMask``.
+
+    Deny ACEs are honoured, coarsely: a principal denied any of the same
+    rights is skipped entirely rather than intersected properly.  That errs
+    toward silence, which is the right direction for a warning that fires
+    at every start.
+    """
+    aces = re.findall(r"\(([^)]*)\)", sddl)
+    denied = set()
+    for ace in aces:
+        parts = ace.split(";")
+        if len(parts) < 6 or not parts[0].startswith("D"):
+            continue
+        if _sddl_rights_write(parts[2]):
+            denied.add(parts[5])
+    for ace in aces:
+        parts = ace.split(";")
+        if len(parts) < 6 or parts[0] != "A":
+            continue
+        who = parts[5]
+        if who in denied or who not in _ANY_USER_SIDS:
+            continue
+        if _sddl_rights_write(parts[2]):
+            return _ANY_USER_SIDS[who]
+    return None
+
+
+def _sddl_rights_write(rights: str) -> bool:
+    """Whether one ACE's rights field grants create-a-file."""
+    rights = rights.strip()
+    if rights[:2].lower() == "0x":
+        try:
+            return bool(int(rights, 16) & _WRITE_MASK)
+        except ValueError:
+            return False
+    tokens = {rights[i : i + 2] for i in range(0, len(rights) - 1, 2)}
+    return bool(tokens & _WRITE_TOKENS)
+
+
+def any_user_write_grantee(path: str) -> Optional[str]:
+    """Who, other than an administrator, may write to ``path``.
+
+    Returns the principal's familiar name, or ``None`` when nobody can and
+    on every non-Windows host.  Reads one DACL and asks one question of
+    it, so it is cheap enough to run at startup, and it answers for
+    directories created long before anything hardened them, which is the
+    case that matters: the hole is inherited rather than written.
+
+    Correct for a configuration FILE as well as a directory, and not by
+    accident: FILE_ADD_FILE and FILE_WRITE_DATA are the same bit, as are
+    FILE_ADD_SUBDIRECTORY and FILE_APPEND_DATA, so one mask answers "can
+    add a job here" for a directory and "can rewrite this" for a file.
+
+    Never raises.  A path on a filesystem with no ACLs, a disconnected
+    share and a revoked READ_CONTROL all mean "cannot tell", and cannot
+    tell has to read as no finding.
+    """
+    if not IS_WINDOWS:  # pragma: no cover (posix) - no ACLs to read
+        return None
+    sddl = _read_dacl_sddl(path)  # pragma: no cover (windows)
+    return _sddl_write_grantee(sddl) if sddl else None
+
+
+def _read_dacl_sddl(path: str) -> Optional[str]:
+    """One directory's DACL as SDDL text, or ``None`` if it cannot be read."""
+    if not IS_WINDOWS:  # pragma: no cover (posix) - Windows-only path
+        return None
+    try:  # pragma: no cover (windows) - measured live, not in the suite
+        import ctypes
+        from ctypes import wintypes
+
+        SE_FILE_OBJECT = 1
+        DACL_SECURITY_INFORMATION = 0x00000004
+        SDDL_REVISION_1 = 1
+
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.GetNamedSecurityInfoW.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+        convert.restype = wintypes.BOOL
+        convert.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPWSTR),
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+
+        dacl = ctypes.c_void_p()
+        descriptor = ctypes.c_void_p()
+        if advapi32.GetNamedSecurityInfoW(
+            path,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            ctypes.byref(dacl),
+            None,
+            ctypes.byref(descriptor),
+        ):
+            return None
+        try:
+            text = wintypes.LPWSTR()
+            length = wintypes.ULONG()
+            if not convert(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                ctypes.byref(text),
+                ctypes.byref(length),
+            ):
+                return None
+            try:
+                return text.value
+            finally:
+                kernel32.LocalFree(text)
+        finally:
+            # GetNamedSecurityInfoW allocates ONE buffer holding the whole
+            # descriptor; `dacl` points inside it and must not be freed.
+            kernel32.LocalFree(descriptor)
+    except Exception:  # noqa: BLE001 - cannot tell is not a finding
+        return None
+
+
+def harden_config_dir(path: str) -> bool:
+    """Give ``path`` a DACL only administrators and LocalSystem can write.
+
+    True when the directory now carries it, False when it could not be
+    applied and on every non-Windows host, where the mode the directory
+    was created with already answers the question.
+
+    Best-effort by contract: the caller has already written a working
+    configuration, so a filesystem with no ACL support or a caller without
+    WRITE_DAC is a warning and not a failure.
+    """
+    if not IS_WINDOWS:  # pragma: no cover (posix) - POSIX modes, not DACLs
+        return False
+    try:  # pragma: no cover (windows) - measured live, not in the suite
+        import ctypes
+        from ctypes import wintypes
+
+        SE_FILE_OBJECT = 1
+        DACL_SECURITY_INFORMATION = 0x00000004
+        PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+        SDDL_REVISION_1 = 1
+
+        advapi32 = ctypes.windll.advapi32  # type: ignore[attr-defined]
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        parse = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        parse.restype = wintypes.BOOL
+        parse.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+        advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR,
+            ctypes.c_int,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+
+        descriptor = ctypes.c_void_p()
+        size = wintypes.ULONG()
+        if not parse(
+            _CONFIG_DIR_SDDL,
+            SDDL_REVISION_1,
+            ctypes.byref(descriptor),
+            ctypes.byref(size),
+        ):
+            return False
+        try:
+            present = wintypes.BOOL()
+            dacl = ctypes.c_void_p()
+            defaulted = wintypes.BOOL()
+            if not advapi32.GetSecurityDescriptorDacl(
+                descriptor,
+                ctypes.byref(present),
+                ctypes.byref(dacl),
+                ctypes.byref(defaulted),
+            ):
+                return False
+            if not present.value or not dacl:
+                # An ABSENT DACL is not an empty one.  SetNamedSecurityInfoW
+                # given NULL here writes a null DACL, which grants every
+                # account full control, and returns 0 for it: the exact
+                # inverse of this function, reported as success.  Only a
+                # malformed _CONFIG_DIR_SDDL reaches this, which is why it
+                # is a refusal rather than a fallback: the converter accepts
+                # the empty string and answers DaclPresent=False for it.
+                return False
+            # DWORD, not BOOL: this returns a Win32 error code and does not
+            # touch the thread's last error, so ERROR_ACCESS_DENIED (5)
+            # would read as truthy success under the ctypes default.
+            return not advapi32.SetNamedSecurityInfoW(
+                path,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                dacl,
+                None,
+            )
+        finally:
+            kernel32.LocalFree(descriptor)
+    except Exception:  # noqa: BLE001 - the configuration is written already
+        return False
 
 
 # --- Windows Event Log ----------------------------------------------------

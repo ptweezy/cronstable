@@ -902,10 +902,38 @@ def windows_argv_split(text: str) -> list[str]:
     return [arg for arg in args if arg != ""] or ([""] if started else [])
 
 
+#: A ``%VAR%`` reference in a command line.  Deliberately greedy about
+#: what a name may contain (``%ProgramFiles(x86)%`` is real), because the
+#: two ways of being wrong are not equally expensive: a false positive
+#: routes a command through cmd.exe that did not need it, while a false
+#: negative emits a job that loads cleanly and then fails every run.
+_PERCENT_VAR = re.compile(r"%[^%\s]+%")
+
+
 def lower_exec(
     action: ET.Element, task: str
-) -> tuple[Optional[list[str]], Optional[str], list[Note]]:
-    """One ``Exec`` action as an argv plus a working directory."""
+) -> tuple[Optional[list[str] | str], Optional[str], list[Note]]:
+    """One ``Exec`` action as a command plus a working directory.
+
+    Usually an argv list.  A command line carrying ``%VAR%`` comes back as
+    one STRING instead, and that is the whole reason this returns either.
+    Task Scheduler expands environment variables before it calls
+    ``CreateProcess``; cronstable expands nothing (``${VAR}`` interpolation
+    excludes ``command``, and no code here calls ``expandvars``), so an
+    argv whose first element is ``%SystemRoot%\\system32\\foo.exe`` reaches
+    ``create_subprocess_exec`` verbatim and fails with "the system cannot
+    find the file specified" on every single run.  It is not a small
+    corner: on a whole-machine export of this project's own dev box, 18 of
+    the 31 jobs that converted had one in ``argv[0]``.
+
+    A string ``command`` with no ``shell:`` is spawned through
+    :func:`asyncio.create_subprocess_shell`, which on Windows is
+    ``%ComSpec% /c``, so cmd.exe performs the expansion Task Scheduler
+    used to perform.  Emitting the string is therefore the conversion, not
+    a workaround: it keeps expansion at RUN time on the target host, where
+    baking in this machine's values at import time would be wrong for
+    every other machine in the estate.
+    """
     command = _text(action, "Command")
     if not command:
         return (
@@ -913,13 +941,45 @@ def lower_exec(
             None,
             [Note(task, "Exec", "it names no command", "", True)],
         )
+    arguments = _text(action, "Arguments") or ""
+    workdir = _text(action, "WorkingDirectory")
+    if _PERCENT_VAR.search(command) or _PERCENT_VAR.search(arguments):
+        # Quote the program unless it already is.  Task Scheduler decides
+        # quoting on the LITERAL text it stored, and it calls CreateProcess
+        # rather than a shell, so a path that only gains its space once the
+        # variable expands is stored bare: 14 of the 86 Exec actions on the
+        # export this was measured against are spaced and unquoted already.
+        # Handed bare to cmd.exe, `C:\Program Files\...` runs `C:\Program`.
+        # Measured: bare exits 1 with "is not recognized", quoted runs.
+        program = command.strip()
+        if not (len(program) >= 2 and program[0] == program[-1] == '"'):
+            program = '"{}"'.format(program)
+        line = " ".join(part for part in (program, arguments.strip()) if part)
+        return (
+            line,
+            workdir,
+            [
+                Note(
+                    task,
+                    "Exec/Command",
+                    "it uses %VAR% environment variables, which nothing "
+                    "but a shell expands, so the command is emitted as "
+                    "one string and runs through cmd.exe on Windows",
+                    "check any & | < > ^ in the arguments: Task Scheduler "
+                    "passed those through as text and cmd.exe reads them "
+                    "as operators. On a non-Windows host the job runs "
+                    "under /bin/sh, which knows neither the variables nor "
+                    "the paths",
+                    False,
+                )
+            ],
+        )
     # Task Scheduler stores a spaced path quoted, because Command and
     # Arguments are concatenated into one command line. cronstable's list
     # form is an argv, where a quote is a literal character in the file
     # name, so the pair has to come off or the program cannot be found.
     if len(command) >= 2 and command[0] == command[-1] == '"':
         command = command[1:-1]
-    arguments = _text(action, "Arguments") or ""
     argv = [command] + windows_argv_split(arguments)
     notes = []
     if arguments:
@@ -941,7 +1001,7 @@ def lower_exec(
                     False,
                 )
             )
-    return argv, _text(action, "WorkingDirectory"), notes
+    return argv, workdir, notes
 
 
 # --- Settings --------------------------------------------------------------
@@ -1085,6 +1145,18 @@ def _principal_notes(task_element: ET.Element, task: str) -> list[Note]:
 
 
 # --- One task --------------------------------------------------------------
+def task_label(task_element: ET.Element, fallback: str) -> str:
+    """The name one task is known by in the report and the YAML comment.
+
+    Its own function because :func:`convert_source` needs it for a task
+    whose conversion RAISED, and reporting that task under a different
+    name than a working one would get is how an operator loses it in a
+    195-task listing.
+    """
+    registration = task_element.find(_NS + "RegistrationInfo")
+    return (_text(registration, "URI") or fallback).strip()
+
+
 def convert_task(
     task_element: ET.Element,
     source: str,
@@ -1094,7 +1166,7 @@ def convert_task(
 ) -> ConvertedTask:
     """Lower one ``<Task>`` into jobs plus everything that did not carry."""
     registration = task_element.find(_NS + "RegistrationInfo")
-    label = (_text(registration, "URI") or fallback).strip()
+    label = task_label(task_element, fallback)
     name = job_name(_text(registration, "URI"), fallback)
     where = "{}: {}".format(source, label)
     notes: list[Note] = list(_principal_notes(task_element, label))
@@ -1351,21 +1423,49 @@ def render_yaml(tasks: list[ConvertedTask], *, sources: list[str]) -> str:
     return "\n".join(out) + "\n"
 
 
+def report_state(task: ConvertedTask) -> str:
+    """The word the report puts in front of one task's notes.
+
+    Read off what the YAML actually holds, never off whether some note is
+    blocking.  A blocking note is per TRIGGER and per ACTION while
+    ``commented`` is per task, so a task carrying a logon trigger beside a
+    daily one emits a live job AND a blocking note.  Calling that "NOT
+    CONVERTED" contradicts the job sitting live in the same file, and the
+    report is the only place an operator learns which tasks are now
+    scheduled twice, once by cronstable and once by the Task Scheduler
+    registration that exporting them leaves in place.  On a real 195-task
+    export, 11 of the 24 converted tasks were labelled that way.
+    """
+    if not task.jobs or task.commented:
+        # Nothing emitted, or emitted commented out under these same two
+        # words in render_yaml.
+        return "NOT CONVERTED"
+    if any(note.blocking for note in task.notes):
+        return "PARTIAL"
+    return "note"
+
+
 def render_report(tasks: list[ConvertedTask]) -> str:
     """What was converted and, for everything else, why it was not."""
     converted = sum(1 for t in tasks if t.jobs and not t.commented)
     jobs = sum(len(t.jobs) for t in tasks if not t.commented)
-    lines = [
+    partial = sum(1 for t in tasks if report_state(t) == "PARTIAL")
+    headline = (
         "Read {} task(s): {} converted into {} job(s), {} not "
         "converted.".format(
             len(tasks), converted, jobs, len(tasks) - converted
         )
-    ]
+    )
+    if partial:
+        headline += (
+            " {} of the converted task(s) carried something that did not,"
+            " and are marked PARTIAL below.".format(partial)
+        )
+    lines = [headline]
     for task in tasks:
         if not task.notes:
             continue
-        blocking = [note for note in task.notes if note.blocking]
-        state = "NOT CONVERTED" if (blocking or task.commented) else "note"
+        state = report_state(task)
         lines.append("")
         lines.append("{}: {}".format(state, task.label))
         for note in task.notes:
@@ -1387,34 +1487,55 @@ def convert_source(
     skip, because ``.xml`` is a name half the tooling on a Windows box
     writes.
     """
-    data, label = read_source(path)
-    text = strip_xml_declarations(decode_task_xml(data, label))
+    label = os.path.basename(path)
     try:
+        data, label = read_source(path)
+        text = strip_xml_declarations(decode_task_xml(data, label))
         documents = parse_task_documents(text, label)
-    except TaskXmlError:
+    except TaskXmlError as ex:
         if strict:
             raise
-        return [], [
-            Note(
-                label,
-                "file",
-                "skipped: it is not a Task Scheduler export",
-                "",
-                False,
-            )
-        ]
+        # Reading and decoding are inside this guard, not only the parse:
+        # an unreadable or oversized file found by a directory scan is the
+        # same kind of accident as a stray .xml, and aborting the run for
+        # it would throw away every file already converted.
+        return [], [Note(label, "file", "skipped: {}".format(ex), "", False)]
     stem = (
         "stdin" if path == "-" else os.path.splitext(os.path.basename(path))[0]
     )
-    return [
-        convert_task(
-            document,
-            label,
-            "{}-{}".format(stem, index),
-            timezone=timezone,
-        )
-        for index, document in enumerate(documents, start=1)
-    ], []
+    tasks = []
+    for index, document in enumerate(documents, start=1):
+        fallback = "{}-{}".format(stem, index)
+        try:
+            tasks.append(
+                convert_task(document, label, fallback, timezone=timezone)
+            )
+        except ValueError as ex:
+            # Every other thing a task can get wrong is already a Note, so
+            # one unreadable duration or timestamp should be one too.  It
+            # was the single exception, and an expensive one: the raise
+            # reached dispatch, which printed one line and wrote no YAML
+            # at all, so `P1M` in the 34th of 195 tasks cost the other
+            # 194.  A whole-machine export is exactly where such a task
+            # turns up, and hand-editing the export was the only recourse.
+            #
+            # ValueError rather than TaskXmlError, which subclasses it:
+            # lower_settings and the calendar triggers reach a bare int()
+            # on Priority, DaysInterval and WeeksInterval, and catching
+            # only the module's own error would leave those three aborting
+            # the whole export with a traceback.
+            failed = task_label(document, fallback)
+            reason = (
+                str(ex)
+                if isinstance(ex, TaskXmlError)
+                else "it could not be read: {!r}".format(ex)
+            )
+            tasks.append(
+                ConvertedTask(
+                    failed, [], [Note(failed, "Task", reason, "", True)], True
+                )
+            )
+    return tasks, []
 
 
 def _expand(paths: list[str]) -> list[tuple[str, bool]]:

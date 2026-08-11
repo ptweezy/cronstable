@@ -290,6 +290,7 @@ class _MirrorWriter:
         self.dropped_batches = 0
         self._drop_logged = False
         self._drop_warn_pending = False
+        self._no_stream_logged = False
 
     def submit(self, job_name: str, stream_name: str, text: str) -> None:
         """Queue one passthrough batch; never blocks, sheds when full."""
@@ -329,6 +330,21 @@ class _MirrorWriter:
         """Wait until every queued batch was written (tests, atexit)."""
         return self._idle.wait(timeout)
 
+    def _log_no_stream(self) -> None:
+        # This latch stays set for the life of the process, where
+        # _drop_logged re-arms: a backed-up consumer recovers, a missing
+        # stream stays missing.  Only the writer thread reaches this, so
+        # the latch needs no lock.
+        if self._no_stream_logged:
+            return
+        self._no_stream_logged = True
+        logger.warning(
+            "the daemon has no stdout/stderr, so job output is not being "
+            "mirrored to it (a Windows service has no standard streams); "
+            "captured output still reaches the API, the reporters and "
+            "archiveOutput"
+        )
+
     def _run(self) -> None:
         while True:
             self._wake.wait()
@@ -340,6 +356,19 @@ class _MirrorWriter:
             wrote = False
             for job_name, stream_name, text in batch:
                 out = sys.stdout if stream_name == "stdout" else sys.stderr
+                if out is None:
+                    # A Windows service has no standard streams at all, so
+                    # there is nothing to mirror TO.  Without this guard the
+                    # write raises AttributeError on `out.buffer`, and the
+                    # arm below turns that into a WARNING plus a traceback
+                    # for every batch of every job's output, which is the
+                    # loudest log the daemon can produce for a condition
+                    # that holds for the whole run.  Log it once instead.
+                    # The saved lines still hold everything the job wrote:
+                    # capture, the log tail, the archive and every reporter
+                    # read those.
+                    self._log_no_stream()
+                    continue
                 try:
                     StreamReader._emit(out, text)
                     wrote = True
@@ -1662,16 +1691,30 @@ class _EventLogWriter:
         logger.error(message, *args)
 
     def _run(self) -> None:
-        while True:
-            record = self._queue.get()
-            try:
-                if record is None:
-                    return
-                self._write(record)
-            except Exception:  # noqa: BLE001 - a writer thread never dies
-                logger.exception("eventlog: unexpected writer failure")
-            finally:
-                self._queue.task_done()
+        try:
+            while True:
+                record = self._queue.get()
+                try:
+                    if record is None:
+                        return
+                    self._write(record)
+                except Exception:  # noqa: BLE001 - a writer thread never dies
+                    logger.exception("eventlog: unexpected writer failure")
+                finally:
+                    self._queue.task_done()
+        finally:
+            # The thread owns the handle, so it can release it here with
+            # no caller waiting.  It has to be here rather than in join(),
+            # because retire_event_log_writers drops a renamed writer
+            # WITHOUT joining it (a reload runs on the scheduler's own
+            # loop iteration, and the bounded drain belongs to
+            # shutdown).  A close that lived only in join() therefore
+            # leaked one source handle per reload that renamed the source:
+            # unbounded, and invisible to EVENTLOG_MAX_WRITERS, which caps
+            # the live registry rather than what has already left it.
+            handle, self._handle = self._handle, None
+            if handle is not None:
+                platform.close_event_log(handle)
 
     def stop(self) -> None:
         """Ask the thread to finish once it has drained what is queued."""
@@ -1681,10 +1724,8 @@ class _EventLogWriter:
             pass
 
     def join(self, timeout: float) -> None:
+        """Wait out the drain.  The writer thread closes the handle."""
         self._thread.join(timeout)
-        if self._handle is not None and not self._thread.is_alive():
-            platform.close_event_log(self._handle)
-            self._handle = None
 
 
 #: One writer per distinct ``source`` name.
@@ -1734,6 +1775,11 @@ def retire_event_log_writers(live_sources: set[str]) -> None:
     asked to finish once it has drained, and is not waited for.  The bounded
     drain belongs to shutdown, not to a config reload, which runs on the
     scheduler's own loop iteration.
+
+    Because it does not wait, the thread releases the source handle itself
+    as it exits (see :meth:`_EventLogWriter._run`).  Once a writer is
+    popped from the registry nothing else can reach it, so a release that
+    needed a join would never run on this path.
     """
     for source in [s for s in _EVENTLOG_WRITERS if s not in live_sources]:
         _EVENTLOG_WRITERS.pop(source).stop()

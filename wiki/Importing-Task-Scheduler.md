@@ -147,6 +147,39 @@ usually what the delay was for, but it is not the same thing. Nor does
 
 ## Details worth knowing
 
+A command line containing `%SystemRoot%` or any other `%VAR%` is emitted as a
+single string rather than as a `command` list. Task Scheduler expands
+environment variables itself before it launches anything; cronstable does not,
+and a list is passed to the OS as an argv, so `%windir%\system32\foo.exe`
+would be looked up as a file with a percent sign in its name and fail on every
+run. A string `command` with no `shell` set runs through `%ComSpec% /c` on
+Windows, which performs the same expansion, at run time on the target machine
+rather than baking this machine's values in. On the 195-task export above, 18
+of the 31 emitted jobs took this form, and the report notes each one.
+
+The program is quoted on the way out even when the original was not. Task
+Scheduler decides quoting on the literal text it stored, and it calls
+`CreateProcess` rather than a shell, so a path that only gains its space once
+the variable expands is stored bare. `%ProgramFiles%\App\app.exe` handed to
+`cmd.exe` unquoted runs `C:\Program`.
+
+Two things change with the shell in the middle. `&`, `|`, `<`, `>` and `^` in
+the arguments were text to Task Scheduler and are operators to `cmd.exe`, so
+check any job whose arguments contain them. And the job runs `cmd.exe` as its
+own process with the real program underneath it, which is worth knowing if you
+also set [`priority`](Configuration-Reference#process-priority): Windows only
+propagates a lowered priority class to children.
+
+Three labels appear in the report. `NOT CONVERTED` means no job was emitted
+for that task, or that its jobs were written commented out. `PARTIAL` means
+jobs were emitted and are live in the file, but something else about the task
+did not carry across, usually one trigger of several. `note` means the jobs
+are complete and something is worth reading anyway.
+
+One task that cannot be converted does not stop the others. A duration or
+timestamp the converter cannot read becomes a blocking note for that task, so
+the rest of the export still converts and still gets written.
+
 Seconds are always dropped. A `StartBoundary` carries a seconds field and a
 registration artefact like `:38` is common, but a cronstable schedule with a
 seconds column makes the whole daemon wake every second, for every other job

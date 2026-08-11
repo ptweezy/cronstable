@@ -262,6 +262,37 @@ def _run_init(args: Any) -> int:
         )
         return 1
     print("wrote {}".format(path))
+    # Harden only where there is something to harden, asked of the
+    # directory itself rather than of its path. %ProgramData% inherits
+    # BUILTIN\Users create-file rights and a directory at the root of C:
+    # inherits Authenticated Users MODIFY, which is worse, while
+    # %APPDATA%\cronstable carries no any-user ACE at all and must be left
+    # alone: giving a per-user configuration a DACL naming only
+    # administrators would take it away from the person who wrote it.
+    #
+    # Applied AFTER the starter is written, because a caller who is not an
+    # administrator would otherwise be refused the write it just asked
+    # for. Ordering it this way also covers the file, since
+    # SetNamedSecurityInfoW propagates the new inheritable ACEs onto
+    # children whose own DACLs are unprotected.
+    grantee = platform.any_user_write_grantee(target)
+    if grantee is not None:
+        if platform.harden_config_dir(target):
+            print(
+                "restricted {} so {} can no longer add a job there".format(
+                    target, grantee
+                )
+            )
+        else:
+            print(
+                "cronstable init: {} can write {}, so any local account "
+                "can add a job, and a service runs it as SYSTEM. "
+                'Restrict it with: icacls "{}" /inheritance:r /grant '
+                "*S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F".format(
+                    grantee, target, target
+                ),
+                file=sys.stderr,
+            )
     # Bare `cronstable` finds the default location on its own; anywhere else
     # has to be named, whichever way the caller named it here.
     if os.path.abspath(target) != os.path.abspath(CONFIG_DEFAULT):
@@ -554,6 +585,35 @@ def _install_default_executor(loop) -> None:
     )
 
 
+def _warn_if_config_is_writable(config_arg: str | None) -> None:
+    """Say so, once, when any local account can edit what this will run.
+
+    Here rather than in the config layer because the config layer runs
+    again on every housekeeping tick, and a permission a reload cannot
+    change does not deserve a line a minute.  This is the one place both
+    the console daemon and the service host pass through exactly once.
+
+    The recipe names SIDs rather than group names because group names are
+    localized: ``BUILTIN\\Administrators`` is ``VORDEFINIERT\\Administratoren``
+    on a German install, and a recipe that fails to paste is worse than
+    none.
+    """
+    if config_arg is None:
+        return
+    grantee = platform.any_user_write_grantee(config_arg)
+    if grantee is None:
+        return
+    logging.getLogger("cronstable").warning(
+        "%s can be written by %s, so any local account can add or change "
+        "a job this daemon runs, and a service runs them as SYSTEM. "
+        'Restrict it with: icacls "%s" /inheritance:r /grant '
+        "*S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F",
+        config_arg,
+        grantee,
+        config_arg,
+    )
+
+
 def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
     """Run the scheduler to completion, with shutdown signalling wired up.
 
@@ -579,6 +639,7 @@ def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
     same way, so leaving it on would abort the run before the scheduler
     ever started.
     """
+    _warn_if_config_is_writable(cron.config_arg)
     owned = loop is None
     if owned:
         loop = _new_event_loop()

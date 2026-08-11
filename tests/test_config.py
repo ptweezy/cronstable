@@ -1616,6 +1616,19 @@ def test_resolve_secret_unreadable_file_is_config_error(tmp_path, content):
         config._resolve_secret({"fromFile": str(blob)}, "job j secret s")
 
 
+def test_resolve_secret_file_is_utf8_and_tolerates_a_bom(tmp_path):
+    # The sibling of parse_environment_file's utf-8-sig.  Read with the
+    # locale codec this file is two different secrets on two OSes: on
+    # Windows "rt" decodes the ANSI code page, so the non-ASCII byte is
+    # mojibake from a file that is correct on Linux.  And a BOM (Notepad's
+    # "UTF-8 with BOM", a PowerShell redirect) is not whitespace, so
+    # .strip() cannot remove it and it rides into the secret itself.
+    blob = tmp_path / "secret.txt"
+    blob.write_bytes("\ufeffs\xfcper-secret\n".encode("utf-8"))
+    resolved = config._resolve_secret({"fromFile": str(blob)}, "what")
+    assert resolved == "s\xfcper-secret"
+
+
 def test_web_allowed_origins_parse():
     cfg = _web_config("  allowedOrigins:\n    - https://dash.example\n")
     assert cfg["allowedOrigins"] == ["https://dash.example"]

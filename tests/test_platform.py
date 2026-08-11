@@ -974,3 +974,96 @@ def test_event_log_direct_calls_on_windows():
         )
         == platform.EVENTLOG_ERROR_INVALID_HANDLE
     )
+
+
+# ---------------------------------------------------------------------------
+# Config-directory permissions
+#
+# The SDDL reading is a pure function on purpose, split from the ctypes call
+# that produces the string, so the decision every one of these pins runs on
+# Linux and macOS too.  Every string below was read off a real Windows 11
+# box with ConvertSecurityDescriptorToStringSecurityDescriptorW.
+# ---------------------------------------------------------------------------
+
+# C:\ProgramData itself. The last ACE is the hole: DCLCRPCR on BUILTIN\Users
+# is FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_WRITE_EA and
+# FILE_WRITE_ATTRIBUTES, with (CI) so every directory made under it inherits
+# it. icacls spells the same ACE (CI)(WD,AD,WEA,WA).
+_PROGRAMDATA_SDDL = (
+    "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICIIO;GA;;;CO)"
+    "(A;OICI;0x1200a9;;;BU)(A;CI;DCLCRPCR;;;BU)"
+)
+# C:\ProgramData\ssh: OpenSSH resets inheritance and grants read only.
+_SSH_SDDL = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;AU)"
+# What harden_config_dir writes.
+_HARDENED_SDDL = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+
+
+def test_programdata_grants_every_local_account_a_write():
+    assert (
+        platform._sddl_write_grantee(_PROGRAMDATA_SDDL) == r"BUILTIN\Users"
+    )
+
+
+@pytest.mark.parametrize(
+    "sddl, why",
+    [
+        pytest.param(_HARDENED_SDDL, "hardened", id="hardened"),
+        pytest.param(_SSH_SDDL, "read only for AU", id="programdata-ssh"),
+        # C:\Windows\System32, the widest real DACL on the box: BUILTIN\Users
+        # and the app-package SIDs get 0x1200a9, which is read and execute,
+        # and the GA grants are all CO or IO-inherit-only.
+        pytest.param(
+            "D:PAI(A;;0x1301bf;;;SY)(A;OICIIO;GA;;;SY)(A;;0x1301bf;;;BA)"
+            "(A;OICIIO;GA;;;BA)(A;;0x1200a9;;;BU)(A;OICIIO;GXGR;;;BU)"
+            "(A;OICIIO;GA;;;CO)(A;;0x1200a9;;;AC)",
+            "read and execute only",
+            id="system32",
+        ),
+    ],
+)
+def test_a_correctly_permissioned_directory_raises_no_alarm(sddl, why):
+    # A check that cries wolf at every start on a correct machine is worse
+    # than no check, so the false-alarm side gets more pins than the true
+    # one. CREATOR OWNER carries GENERIC_ALL on %ProgramData% itself and
+    # resolves per object to whoever made it, so counting CO would flag
+    # every directory on the system.
+    assert platform._sddl_write_grantee(sddl) is None
+
+
+def test_a_deny_ace_beats_the_allow_it_precedes():
+    denied = "D:P(D;OICI;FA;;;BU)(A;OICI;FA;;;BU)(A;OICI;FA;;;SY)"
+    assert platform._sddl_write_grantee(denied) is None
+
+
+def test_write_rights_are_read_in_both_forms():
+    # A DACL read back from disk gives numeric and token rights, sometimes
+    # both in one ACL, so both forms have to answer the same question.
+    assert platform._sddl_rights_write("DCLCRPCR")  # FILE_ADD_FILE et al
+    assert platform._sddl_rights_write("FA")
+    assert platform._sddl_rights_write("0x1301bf")
+    assert platform._sddl_rights_write("0x40000000")  # GENERIC_WRITE
+    assert not platform._sddl_rights_write("0x1200a9")  # read and execute
+    assert not platform._sddl_rights_write("FR")
+    assert not platform._sddl_rights_write("GXGR")
+    assert not platform._sddl_rights_write("nonsense")
+
+
+def test_the_helpers_are_inert_on_posix(monkeypatch):
+    # Both are called unconditionally from the startup and init paths, so
+    # a POSIX run has to fall straight through rather than reach ctypes.
+    monkeypatch.setattr(platform, "IS_WINDOWS", False)
+    assert platform.any_user_write_grantee("/etc/cronstable.d") is None
+    assert platform.harden_config_dir("/etc/cronstable.d") is False
+
+
+def test_the_hardened_dacl_keeps_read_and_removes_write():
+    # What harden_config_dir writes, checked by the same reader the
+    # startup warning uses: nobody but an administrator may write, and
+    # Authenticated Users keep read so an unelevated caller can still
+    # list the directory it just created. Dropping read makes
+    # _holds_config answer "no config here" for every unelevated account,
+    # which silently moves DEFAULT_CONFIG_PATH back to %APPDATA%.
+    assert platform._sddl_write_grantee(platform._CONFIG_DIR_SDDL) is None
+    assert "FRFX;;;AU" in platform._CONFIG_DIR_SDDL
+    assert platform._CONFIG_DIR_SDDL.startswith("D:P")
