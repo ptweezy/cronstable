@@ -15,6 +15,7 @@ suite runs on Windows.  ``tests/test_platform.py`` owns the real calls.
 """
 
 import asyncio
+import threading
 import time
 import types
 
@@ -510,21 +511,42 @@ async def test_eventlog_writer_continues_when_the_source_will_not_open(
 
 @pytest.mark.asyncio
 async def test_eventlog_writer_drops_and_logs_when_the_queue_is_full(
-    fake_event_log, caplog
+    fake_event_log, caplog, monkeypatch
 ):
+    # Park the writer inside its first write so the queue can fill. The
+    # fake write returns immediately, so a thread left running drains as
+    # fast as the loop below fills, and whether any record got rejected
+    # then depended on how the GIL scheduled the two threads.
+    parked = threading.Event()
+    release = threading.Event()
+
+    def park(handle, *, event_type, category, event_id, strings):
+        parked.set()
+        release.wait(10.0)
+        return 0
+
+    monkeypatch.setattr(platform, "write_event_log", park)
     writer = cronstable.job._EventLogWriter("full-probe")
     try:
-        # block the thread so the queue can actually fill
         writer._queue.put((platform.EVENTLOG_INFORMATION_TYPE, 1, 1000, []))
+        assert parked.wait(10.0)
         accepted = 0
         for _ in range(cronstable.job.EVENTLOG_QUEUE_LIMIT + 50):
             if writer.submit(
                 (platform.EVENTLOG_INFORMATION_TYPE, 1, 1000, [])
             ):
                 accepted += 1
-        assert accepted < cronstable.job.EVENTLOG_QUEUE_LIMIT + 50
+        # The parked thread still holds the record it took, so the queue
+        # starts empty here: it admits the limit and refuses the other 50.
+        assert accepted == cronstable.job.EVENTLOG_QUEUE_LIMIT
         assert "is not keeping up" in caplog.text
     finally:
+        release.set()
+        # Drain before stopping: stop() puts its sentinel with put_nowait
+        # and swallows Full, so a stop issued while the queue is still at
+        # its bound drops the sentinel and leaves the daemon thread
+        # running into the next test.
+        writer._queue.join()
         writer.stop()
         writer.join(2.0)
 
