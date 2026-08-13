@@ -760,14 +760,19 @@ class WinApi:
             advapi32.CloseServiceHandle(manager)
 
     def _config2(  # pragma: no cover (windows)
-        self, name: str, level: int, payload: Any, action: str
+        self,
+        name: str,
+        level: int,
+        payload: Any,
+        action: str,
+        access: int = SERVICE_CHANGE_CONFIG,
     ) -> None:
         import ctypes
 
         advapi32, manager, service = self._open_service(
             name,
             SC_MANAGER_CONNECT,
-            SERVICE_CHANGE_CONFIG,
+            access,
             action,
         )
         try:
@@ -839,11 +844,16 @@ class WinApi:
         payload = SERVICE_FAILURE_ACTIONSW(
             reset_s, None, None, len(actions), array
         )
+        # SERVICE_START on top of SERVICE_CHANGE_CONFIG: ChangeServiceConfig2W
+        # refuses a failure-actions payload containing SC_ACTION_RESTART with
+        # ERROR_ACCESS_DENIED unless the handle carries the start right, even
+        # from an elevated caller.
         self._config2(
             name,
             SERVICE_CONFIG_FAILURE_ACTIONS,
             payload,
             "set the recovery actions",
+            access=SERVICE_CHANGE_CONFIG | SERVICE_START,
         )
 
     def set_failure_actions_flag(  # pragma: no cover (windows)
