@@ -38,7 +38,7 @@ from cronstable.jobapi import (
 )
 from cronstable.jobstate import JobStateError
 from cronstable.state import Lease
-from tests._helpers import _instant_sleep, _state_cfg
+from tests._helpers import _instant_sleep, _state_cfg, bare_http_raises
 
 _ONE_JOB = (
     "state:\n  path: {path}\n"
@@ -92,6 +92,147 @@ async def test_auth_non_ascii_token_is_401_not_500(job_api):
             headers={"Authorization": "Bearer t\xf6k"},
         )
         assert r.status == 401
+
+
+# --------------------------------------------------------------------------
+# The JSON error envelope
+# --------------------------------------------------------------------------
+
+# The four `get` routes that used to answer with a bare
+# `raise web.HTTPNotFound()`.  error_mw re-raised HTTPException unwrapped, so
+# unlike the web API's these really did reach the caller as text/plain
+# `404: Not Found`.  Each reason names the missing thing, and the scoped
+# three name the scope as well: it defaults to the run's own job name, so a
+# caller who omitted `scope` and looked in the wrong namespace otherwise has
+# nothing to go on.
+_JOB_API_404_ROUTES = [
+    ("/v1/kv/get?key=absent", "key 'absent' is not set in scope 'job'"),
+    (
+        "/v1/cursor/get?name=missing",
+        "cursor 'missing' is not set in scope 'job'",
+    ),
+    (
+        "/v1/artifact/get?name=nope",
+        "artifact 'nope' not found in scope 'job'",
+    ),
+    (
+        "/v1/secret/get?name=OTHER",
+        "secret 'OTHER' is not staged for this run",
+    ),
+    # the row that can tell the two strings apart. Everywhere above, the
+    # requested scope and the run's job name are both 'job', so a handler
+    # formatting ctx.job_name instead of the RESOLVED scope would pass
+    # every one of them. This one names a different scope ('global' needs
+    # no stateAllowedScopes entry, per test_kv_explicit_scope_shared).
+    (
+        "/v1/kv/get?scope=global&key=absent",
+        "key 'absent' is not set in scope 'global'",
+    ),
+]
+
+
+@pytest.mark.parametrize("path,reason", _JOB_API_404_ROUTES)
+async def test_job_api_404s_name_what_was_not_found(job_api, path, reason):
+    r = await job_api.session.get(job_api.url(path))
+    assert r.status == 404
+    assert r.content_type == "application/json"
+    assert await r.json() == {"error": reason}
+
+
+async def test_job_api_errors_carry_the_json_envelope(job_api):
+    # Everything error_mw did not build itself used to escape as aiohttp's
+    # text/plain: the deliberately reasonless 401s, the router's own 404 on
+    # an unrouted /v1 path and 405 on a wrong method. The 401 keeps its
+    # reasonless body on purpose (see JobStateAPI._run), but its SHAPE is
+    # the envelope like every other failure on this endpoint.
+    async with aiohttp.ClientSession() as s:
+        for headers in ({}, _auth("garbage")):
+            r = await s.get(job_api.url("/v1/run"), headers=headers)
+            assert r.status == 401
+            assert r.content_type == "application/json"
+            assert "error" in await r.json()
+
+    r = await job_api.session.get(job_api.url("/v1/nope"))
+    assert r.status == 404
+    assert r.content_type == "application/json"
+    assert "error" in await r.json()
+
+    r = await job_api.session.post(job_api.url("/v1/kv/get"))
+    assert r.status == 405
+    assert r.content_type == "application/json"
+    assert "error" in await r.json()
+    # the header the 405 legitimately owns survives the rewrap; only the
+    # pair describing the replaced body is dropped.
+    assert "GET" in r.headers.get("Allow", "")
+
+
+async def test_job_api_500_carries_the_json_envelope(
+    job_api, monkeypatch, caplog
+):
+    # error_mw's last arm, the one change here that alters behavior on
+    # EVERY route rather than the four in scope. Before it, an unhandled
+    # error escaped to aiohttp's own handler and answered text/plain, so
+    # the 500 was the one status a job's client could not parse like the
+    # rest. It is a no-leak arm: the caller gets a fixed sentence and the
+    # real reason goes only to the log, so BOTH halves are asserted here.
+    # Reverting the arm must fail this test.
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(jobapi.jobstate, "kv_get", _boom)
+    with caplog.at_level(logging.ERROR, logger="cronstable.jobapi"):
+        r = await job_api.session.get(job_api.url("/v1/kv/get?key=k"))
+    assert r.status == 500
+    assert r.content_type == "application/json"
+    body = await r.text()
+    assert json.loads(body) == {
+        "error": "internal error; the reason is in the cronstable log"
+    }
+    assert "boom" not in body  # the reason never reaches the caller
+    assert "boom" in caplog.text  # but it does reach the log
+
+
+async def test_job_api_error_mw_passes_through_non_rewrap_cases(job_api):
+    # The two disjuncts of error_mw's pass-through guard, which no route in
+    # jobapi.py can reach today: nothing here redirects, and the bare-raise
+    # guard forbids naming a web.HTTP* class outside the reasonless 401. The
+    # branch is kept so the arm stays diff-identical with cron.py's
+    # _error_envelope_middleware (change one, change the other), and it is
+    # pinned here rather than left uncovered.
+    async def _redirect(request):
+        raise web.HTTPFound("/elsewhere")
+
+    async def _already_json(request):
+        raise web.HTTPNotFound(
+            text=json.dumps({"error": "built by a handler"}),
+            content_type="application/json",
+        )
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    app = web.Application(middlewares=job_api.api._middlewares())
+    app.router.add_get("/redirect", _redirect)
+    app.router.add_get("/json", _already_json)
+    async with TestClient(TestServer(app)) as client:
+        r = await client.get("/redirect", allow_redirects=False)
+        assert r.status == 302  # sub-400: untouched, not rewrapped
+        assert r.content_type != "application/json"
+        assert r.headers["Location"] == "/elsewhere"
+        r = await client.get("/json")
+        assert r.status == 404
+        assert r.content_type == "application/json"
+        assert await r.json() == {"error": "built by a handler"}
+
+
+def test_no_job_api_handler_raises_a_bare_http_error():
+    # The same pin cronstable/cron.py carries in tests/test_cron_web.py,
+    # scanned here because this is jobapi's own test home: an error
+    # response is built through JobStateError (which error_mw turns into
+    # the envelope with its status), never by naming a web.HTTP* class in
+    # a raise or a return. HTTPUnauthorized is allowlisted only for an
+    # ARGUMENTLESS raise, which is what makes its body reasonless, and the
+    # rationale is written at its three sites in JobStateAPI._run.
+    assert bare_http_raises(jobapi.__file__) == []
 
 
 # --------------------------------------------------------------------------
@@ -317,6 +458,16 @@ async def test_json_body_over_transport_cap_is_413_not_400(job_api_factory):
     )
     assert r.status == 413
     assert "not valid JSON" not in (await r.text())
+    # It is also the one transport-level failure that reaches error_mw's
+    # rewrap arm, which is why both module docstrings name it: _json_body
+    # re-raises the HTTPException instead of masking it, so aiohttp's own
+    # text/plain body is what the middleware turns into the envelope. A
+    # 413 that still arrived as text/plain would be the one status a job's
+    # client could not parse like the rest.
+    assert r.content_type == "application/json"
+    body = await r.json()
+    assert set(body) == {"error"}
+    assert body["error"]  # aiohttp's own reason, not an empty string
 
 
 # --------------------------------------------------------------------------

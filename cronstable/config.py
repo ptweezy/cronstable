@@ -418,6 +418,25 @@ DEFAULT_PUSH_REPORT = {
     "includeLogTail": True,
 }
 
+# Named for the same fingerprint reason as DEFAULT_PUSH_REPORT above: the
+# eventlog block post-dates the v1 identity scheme, so cronstable.fingerprint
+# omits it from a job's canonical form while it still equals these defaults.
+DEFAULT_EVENTLOG_REPORT = {
+    "enabled": False,
+    # The Event Log source name, which is also the registry key name a
+    # message DLL would be registered under. cronstable never registers the
+    # source (that needs HKLM writes, and buys nothing without a message
+    # DLL); it is configurable so two instances on one host, or a shop that
+    # does register a source of its own, can tell their records apart.
+    "source": "cronstable",
+    # Carry a bounded tail of the run's captured output. Off by default, the
+    # opposite of push's includeLogTail, and not for symmetry's sake: a push
+    # payload is sealed to a paired device's key, while the Application log
+    # is readable by every authenticated account on the machine. Turning
+    # this on is a decision to publish job output locally.
+    "includeOutput": False,
+}
+
 _REPORT_DEFAULTS = {
     "sentry": {
         "dsn": {"value": None, "fromFile": None, "fromEnvVar": None},
@@ -466,6 +485,9 @@ _REPORT_DEFAULTS = {
     # Off by default; the relay endpoint and device registry live in the
     # daemon-global `push:` section, this block only opts a job/event in.
     "push": dict(DEFAULT_PUSH_REPORT),
+    # Windows Event Log records (cronstable.job.EventLogReporter). Off by
+    # default and a no-op on POSIX, where the load says so once.
+    "eventlog": dict(DEFAULT_EVENTLOG_REPORT),
 }
 
 
@@ -551,8 +573,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # (403). See cronstable.jobapi.JobStateAPI._scope.
     "stateAllowedScopes": [],
     "env_file": None,
+    # directory the job's process starts in ("Start in" on a Task Scheduler
+    # action).  None, the default, inherits the daemon's own CWD, which is
+    # what every job got before this key existed.
+    "workingDirectory": None,
     "executionTimeout": None,
     "killTimeout": 30,
+    # scheduling priority of the job's process ("Priority" on a Task
+    # Scheduler task's Settings).  The default level is the one that is never
+    # applied, so the spawn is unchanged for every job that says nothing.
+    # How far a level reaches past the job's own process is per-platform; see
+    # cronstable.platform.new_process_group_kwargs.
+    "priority": platform.DEFAULT_PRIORITY,
     "statsd": None,
     "streamPrefix": "[{job_name} {stream_name}] ",
     "enabled": True,
@@ -576,6 +608,12 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
 
     A reporter left at its all-None defaults is not "configured": only an
     onLate that would really fire demands an ``sla`` block to fire about.
+
+    Every reporter has to be named here, and a new one is easy to forget:
+    a reporter this function does not know about makes an onLate that WOULD
+    really fire skip the "onLate requires sla" check below, so the hook
+    loads clean and is then dead for the life of the config.  That is the
+    exact failure push had until it was added.
     """
     report = on_late.get("report") or {}
     sentry_dsn = (report.get("sentry") or {}).get("dsn") or {}
@@ -589,6 +627,12 @@ def _onlate_names_a_destination(on_late: dict[str, Any]) -> bool:
         or mail.get("from") is not None
         or shell.get("command") is not None
         or any(webhook_url.get(k) is not None for k in secret_keys)
+        # bool(), not the `is not None` the four above use: `enabled` is
+        # always present carrying its False default, so `is not None` would
+        # make this function true for every job and trip the import-time
+        # drift guard below.
+        or bool((report.get("push") or {}).get("enabled"))
+        or bool((report.get("eventlog") or {}).get("enabled"))
     )
 
 
@@ -710,6 +754,18 @@ _report_schema = Map(
                 Opt("includeLogTail"): Bool(),
             }
         ),
+        Opt("eventlog"): Map(
+            {
+                # Windows only, and a no-op elsewhere rather than a load
+                # error; the load announces that once, naming every hook
+                # that enabled it (see _validate_eventlog_config).
+                Opt("enabled"): Bool(),
+                Opt("source"): Str(),
+                # publish a bounded output tail into a log every local
+                # account can read; see DEFAULT_EVENTLOG_REPORT.
+                Opt("includeOutput"): Bool(),
+            }
+        ),
     }
 )
 
@@ -806,8 +862,19 @@ _job_defaults_common = {
     # loopback state calls; see cronstable.jobapi.JobStateAPI._scope.
     Opt("stateAllowedScopes"): Seq(Str()),
     Opt("env_file"): Str(),
+    # ~ and ${VAR} are expanded and the result is made absolute at load (see
+    # JobConfig._resolve_working_directory).  EmptyNone() so a job under a
+    # `defaults:` block that sets this key still has a spelling that means
+    # "inherit the daemon's CWD instead": a bare `workingDirectory:` writes
+    # the inherited value back to None, like startingDeadlineSeconds above.
+    Opt("workingDirectory"): EmptyNone() | Str(),
     Opt("executionTimeout"): Float(),
     Opt("killTimeout"): Float(),
+    # Built from platform.PRIORITY_LEVELS so the accepted values cannot drift
+    # from the per-OS tables that have to map them.  Enum is what refuses
+    # `priority: realtime` loudly, naming the values that are accepted,
+    # instead of silently downgrading it to something safe.
+    Opt("priority"): Enum(list(platform.PRIORITY_LEVELS)),
     Opt("statsd"): Map({"prefix": Str(), "host": Str(), "port": Int()}),
     # Int() is tried first so a numeric ``user: 1000`` parses as the integer
     # 1000 (a uid/gid), reaching the isinstance(..., int) branches in
@@ -852,10 +919,12 @@ _DAG_TASK_LAUNCH_KEYS = frozenset(
         "failsWhen",
         "executionTimeout",
         "killTimeout",
+        "priority",
         "statsd",
         "user",
         "group",
         "env_file",
+        "workingDirectory",
         "secrets",
         "stateAllowedScopes",
         "onSuccess",
@@ -1500,8 +1569,10 @@ class JobConfig:
         "environment",
         "secrets",
         "stateAllowedScopes",
+        "workingDirectory",
         "executionTimeout",
         "killTimeout",
+        "priority",
         "statsd",
         "user",
         "group",
@@ -1607,9 +1678,22 @@ class JobConfig:
         self.stateAllowedScopes = config.pop("stateAllowedScopes")
         if self.env_file is not None:
             self._merge_env_file(env_cache)
+        # Where the job's process starts; None keeps the daemon's own CWD.
+        # Deliberately NOT fingerprinted, for the reason the environment
+        # VALUES are not (see cronstable.fingerprint.canonical_job): a path
+        # is per-host, and a Windows replica running the same logical job
+        # from D:\jobs must not read as drift against a Linux one on
+        # /srv/jobs.
+        self.workingDirectory: Optional[str] = config.pop("workingDirectory")
+        self._resolve_working_directory()
 
         self.executionTimeout = config.pop("executionTimeout")
         self.killTimeout = config.pop("killTimeout")
+        # How the job's process tree is scheduled.  Unlike workingDirectory
+        # this IS fingerprinted (see cronstable.fingerprint.canonical_job):
+        # the level is host-independent, and it changes how the job runs, so
+        # replicas that disagree on it must show as drift.
+        self.priority = config.pop("priority")
         self.statsd = config.pop("statsd")
 
         self.uid: int | None = None
@@ -1619,6 +1703,7 @@ class JobConfig:
         # groups instead of inheriting root's. None when unknown.
         self.username: Optional[str] = None
         self._resolve_user_group(config)
+        self._warn_if_priority_needs_privilege()
 
         self._validate_numeric_ranges()
 
@@ -1793,6 +1878,48 @@ class JobConfig:
             for key, value in file_environs.items()
         ]
 
+    def _resolve_working_directory(self) -> None:
+        """Normalize ``workingDirectory`` to an absolute path, once, at load.
+
+        ``~`` is expanded first, for the reason the filesystem state backend
+        expands it (see cronstable.state): ``~/jobs`` must mean the home
+        directory, not a literal ``~`` under whatever directory the daemon
+        happened to start in.  On a job that also sets ``user``, note that
+        the expansion resolves against the DAEMON user's home, because it
+        happens at load and the demotion happens per run; operators who want
+        the target user's home should write ``${HOME}`` in an environment
+        the demoted child sees instead.
+
+        ``abspath`` then settles a relative value against the daemon's CWD
+        at load time rather than at fire time, so the directory a job runs
+        in is decided once, and the resolved form is what the spawn log and
+        any launch failure show.
+
+        There is deliberately no absolute-only rejection.  ``ntpath.isabs``
+        was rewritten in 3.13 and answers differently for the same string
+        across the interpreters this project supports, so gating on it would
+        make ``\\\\fileserver\\share\\jobs`` legal config on one Python and a
+        load failure on another.  cronstable.job.shell_spawn already carries
+        that lesson for shell paths; which directory a job runs in must not
+        depend on the interpreter that scheduled it either.
+
+        Existence is not checked.  Config load runs on every hot reload and
+        under ``--validate-config`` on machines that are not the target
+        host, so one job naming a share that is not mounted yet must not
+        fail the whole load.  The OS checks at spawn, where a bad directory
+        lands on RunningJob.start's start_failed path like any command that
+        cannot launch.
+        """
+        configured = self.workingDirectory
+        if not configured:
+            # Unset, or written back to None by a job opting out of an
+            # inherited `defaults:` value.  The empty string an interpolated
+            # ${VAR} can produce means the same thing, and must NOT reach
+            # abspath, which would silently pin the daemon's load-time CWD.
+            self.workingDirectory = None
+            return
+        self.workingDirectory = os.path.abspath(os.path.expanduser(configured))
+
     def _resolve_user_group(self, config: dict) -> None:
         user = config.pop("user", None)
         group = config.pop("group", None)
@@ -1810,61 +1937,112 @@ class JobConfig:
         # the wrong account.  Spelled as ``sys.platform == "win32"`` (rather
         # than platform.IS_WINDOWS) so the type checker statically prunes the
         # POSIX-only imports/calls below on Windows.
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: no cover (windows)
             raise ConfigError(
                 "Job {}: changing user/group is not supported on "
                 "Windows".format(self.name)
             )
+        else:  # pragma: no cover (posix) - grp/pwd are POSIX-only
+            # The ``else`` is what the pruning above needs: the reject comes
+            # first because that is the rule being stated, and the POSIX
+            # body has to be a clause of the same statement for mypy to
+            # discard it under ``--platform win32`` and for the Windows
+            # coverage profile to leave it out of the denominator.
+            #
+            # POSIX only: the passwd/group databases live in modules that
+            # don't exist on Windows; imported lazily (reached only here).
+            from grp import getgrnam
+            from pwd import getpwnam, getpwuid
 
-        # POSIX only: the passwd/group databases live in modules that don't
-        # exist on Windows; imported lazily (only reached above on POSIX).
-        from grp import getgrnam
-        from pwd import getpwnam, getpwuid
-
-        if user is not None:
-            if isinstance(user, int):
-                self.uid = user
-                # Derive the primary gid (and login name) from the passwd
-                # database so a numeric ``user`` without an explicit ``group``
-                # does not silently keep cronstable's (root) gid 0.
-                try:
-                    pw = getpwuid(user)
-                except KeyError:
-                    pw = None
-                if pw is not None:
-                    self.username = pw.pw_name
-                    if self.gid is None:
+            if user is not None:
+                if isinstance(user, int):
+                    self.uid = user
+                    # Derive the primary gid (and login name) from the
+                    # passwd database so a numeric ``user`` without an
+                    # explicit ``group`` does not silently keep
+                    # cronstable's (root) gid 0.
+                    try:
+                        pw = getpwuid(user)
+                    except KeyError:
+                        pw = None
+                    if pw is not None:
+                        self.username = pw.pw_name
+                        if self.gid is None:
+                            self.gid = pw.pw_gid
+                else:
+                    try:
+                        pw = getpwnam(user)
+                        self.uid = pw.pw_uid
                         self.gid = pw.pw_gid
-            else:
-                try:
-                    pw = getpwnam(user)
-                    self.uid = pw.pw_uid
-                    self.gid = pw.pw_gid
-                    self.username = pw.pw_name
-                except KeyError as e:
-                    raise ConfigError(
-                        "User not found: {!r}".format(user)
-                    ) from e
+                        self.username = pw.pw_name
+                    except KeyError as e:
+                        raise ConfigError(
+                            "User not found: {!r}".format(user)
+                        ) from e
 
-        if group is not None:
-            if isinstance(group, int):
-                self.gid = group
-            else:
-                try:
-                    self.gid = getgrnam(group).gr_gid
-                except KeyError as e:
-                    raise ConfigError(
-                        "Group not found: {!r}".format(group)
-                    ) from e
+            if group is not None:
+                if isinstance(group, int):
+                    self.gid = group
+                else:
+                    try:
+                        self.gid = getgrnam(group).gr_gid
+                    except KeyError as e:
+                        raise ConfigError(
+                            "Group not found: {!r}".format(group)
+                        ) from e
 
-        if self.uid is not None or self.gid is not None:
-            if os.geteuid() != 0:
-                raise ConfigError(
-                    "Job {} wants to change user or group, "
-                    "but cronstable is not running as superuser".format(
-                        self.name
+            if self.uid is not None or self.gid is not None:
+                if os.geteuid() != 0:
+                    raise ConfigError(
+                        "Job {} wants to change user or group, "
+                        "but cronstable is not running as superuser".format(
+                            self.name
+                        )
                     )
-                )
+
+    def _warn_if_priority_needs_privilege(self) -> None:
+        """Say at load time that this job's priority may be refused.
+
+        Advisory, and the opposite call from the ``user``/``group`` check
+        above: a job that cannot get the priority it asked for still does
+        its work, so refusing the load over it would turn a preference into
+        an outage.  It is said here, once per load, because the alternative
+        is a per-run line describing a condition that will not change until
+        the deployment does; the refusal itself is logged at DEBUG when it
+        happens (:func:`cronstable.platform.apply_priority`).
+
+        Only "may": an unprivileged process can still lower its nice value
+        as far as its ``RLIMIT_NICE`` allows, so this is an advisory rather
+        than a prediction.  The comparison is against cronstable's own nice
+        rather than against zero because only a *raise* needs privilege, and
+        a daemon deliberately started at nice 10 can hand a job
+        ``below-normal`` without asking anyone.
+        """
+        wanted = platform.posix_nice_for(self.priority)
+        if wanted is None:
+            return  # the default level: nothing is ever applied for it
+        if sys.platform == "win32":  # pragma: no cover (windows)
+            # Windows hands every class this vocabulary offers to an
+            # unprivileged account; the one that does need a privilege
+            # (realtime) is deliberately not reachable, so there is nothing
+            # to advise about.  Spelled as ``sys.platform``, as
+            # _resolve_user_group above is, so the type checker prunes the
+            # POSIX-only calls below.
+            return
+        else:  # pragma: no cover (posix) - os.nice/os.geteuid
+            current = os.nice(0)
+            if wanted >= current or os.geteuid() == 0:
+                return
+            logger.warning(
+                "job %r asks for priority %r (nice %d), a raise from "
+                "cronstable's own nice %d, which needs CAP_SYS_NICE or "
+                "RLIMIT_NICE headroom; where the kernel refuses it the job "
+                "still runs, at the priority it inherited",
+                self.name,
+                self.priority,
+                wanted,
+                current,
+            )
 
     def _reject(self, message: str) -> "ConfigError":
         """Build (never raise) the job-scoped ConfigError for a failed check.
@@ -2839,7 +3017,15 @@ def _resolve_secret(spec: Optional[dict], what: str) -> Optional[str]:
         secret = str(spec["value"])
     elif spec.get("fromFile"):
         try:
-            with open(spec["fromFile"], "rt") as secret_file:
+            # utf-8-sig, not the locale default, for the reason
+            # parse_environment_file gives: on Windows "rt" decodes the ANSI
+            # code page, so a UTF-8 secret with any non-ASCII byte is
+            # mojibake from a file that is correct on Linux, and a BOM
+            # (Notepad, a PowerShell redirect) survives .strip() and rides
+            # into the secret itself.
+            with open(
+                spec["fromFile"], "rt", encoding="utf-8-sig"
+            ) as secret_file:
                 secret = secret_file.read().strip()
         # Broad on purpose: callers only handle ConfigError, and on the
         # job-secret staging path anything else escapes the scheduler loop
@@ -3593,6 +3779,129 @@ def _push_report_users(config: "CronstableConfig") -> list[str]:
     return users
 
 
+def _eventlog_report_users(config: "CronstableConfig") -> list[str]:
+    """Every place the assembled config ENABLES the eventlog reporter.
+
+    Deliberately a near-copy of :func:`_push_report_users` rather than the
+    two sharing one walker.  That function's inner ``_uses`` returns on the
+    first matching hook, so it yields at most one name per job, and it feeds
+    a fail-closed refusal whose exact wording operators have been reading
+    since push shipped.  Folding both through one traversal would either
+    change that wording or constrain this one; nine duplicated lines is the
+    cheaper of the two.
+    """
+
+    def _uses(holder: Any) -> bool:
+        for action in (
+            "onFailure",
+            "onPermanentFailure",
+            "onSuccess",
+            "onLate",
+        ):
+            block = getattr(holder, action, None)
+            if isinstance(block, dict):
+                report = (block.get("report") or {}).get("eventlog") or {}
+                if report.get("enabled"):
+                    return True
+        return False
+
+    users = []
+    for job in config.jobs:
+        if _uses(job):
+            users.append("job {}".format(job.name))
+    for dag_config in config.dags:
+        for taskkey, template in dag_config.task_templates.items():
+            if _uses(template):
+                users.append("dag {} task {}".format(dag_config.name, taskkey))
+    notify = config.notify_config
+    if notify is not None:
+        report = (notify.get("report") or {}).get("eventlog") or {}
+        if report.get("enabled"):
+            users.append("notify")
+    return users
+
+
+#: Log names, which are not source names.  Registering a source under one of
+#: these addresses the log's own key rather than a source under it, so the
+#: write either lands somewhere the operator did not mean or (Security) is
+#: refused for want of a privilege the daemon does not hold.
+_EVENTLOG_RESERVED_SOURCES = frozenset({"application", "system", "security"})
+
+
+def _validate_eventlog_config(config: "CronstableConfig") -> None:
+    """Shape checks for ``report.eventlog``, plus the POSIX advisory.
+
+    Both refusals apply ONLY to blocks that are enabled.  ``source`` carries
+    a default into every report block of every job, every DAG task template
+    and ``notify:`` through ``_REPORT_DEFAULTS``, so inspecting disabled
+    blocks would let a stray value in a block nobody turned on refuse the
+    whole configuration.
+
+    On POSIX this warns rather than refusing, which is the opposite of what
+    ``user``/``group`` does one screen up, and the difference is the point.
+    ``user`` on Windows is a ConfigError because the alternative is running
+    a job as the WRONG account, and ``push`` without a ``push:`` section is
+    one because the operator can add the section.  Neither applies here:
+    nothing can be installed on Linux to make an Event Log appear, so
+    refusing would mean one config directory cannot serve a mixed fleet,
+    which is precisely the complaint the Windows notes file against the
+    ``user``/``group`` rejection.  What keeps a warning honest rather than a
+    silent self-disable is that it fires on every load, names every hook
+    that asked, and is emitted by ``--validate-config`` too.
+    """
+    users = _eventlog_report_users(config)
+
+    def _blocks() -> Any:
+        holders = [(job.name, job) for job in config.jobs]
+        for dag_config in config.dags:
+            for taskkey, template in dag_config.task_templates.items():
+                holders.append(
+                    (
+                        "dag {} task {}".format(dag_config.name, taskkey),
+                        template,
+                    )
+                )
+        for where, holder in holders:
+            for action in (
+                "onFailure",
+                "onPermanentFailure",
+                "onSuccess",
+                "onLate",
+            ):
+                block = getattr(holder, action, None)
+                if isinstance(block, dict):
+                    yield where, (block.get("report") or {})
+        notify = config.notify_config
+        if notify is not None:
+            yield "notify", (notify.get("report") or {})
+
+    for where, report in _blocks():
+        eventlog = report.get("eventlog") or {}
+        if not eventlog.get("enabled"):
+            continue
+        source = eventlog.get("source") or ""
+        if not source or "\\" in source or "/" in source:
+            raise ConfigError(
+                "{}: report.eventlog.source must be a non-empty name with "
+                "no path separator (it names a registry key under the "
+                "event log, not a path); got {!r}".format(where, source)
+            )
+        if source.lower() in _EVENTLOG_RESERVED_SOURCES:
+            raise ConfigError(
+                "{}: report.eventlog.source {!r} is the name of a LOG, not "
+                "of a source within one; choose a source name such as "
+                "'cronstable'".format(where, source)
+            )
+
+    if users and not platform.IS_WINDOWS:
+        logger.warning(
+            "report.eventlog is enabled (%s) but there is no Windows Event "
+            "Log on this platform, so those reports are dropped; the rest "
+            "of each report block still fires normally",
+            ", ".join(sorted(users)),
+        )
+
+
 def _validate_push_config(config: "CronstableConfig") -> None:
     """Fail-closed checks for push that need the fully assembled config.
 
@@ -4204,6 +4513,7 @@ def _validate_cross_sections(config: CronstableConfig) -> None:
     _validate_dags(config)
     _validate_mcp_config(config)
     _validate_push_config(config)
+    _validate_eventlog_config(config)
 
 
 def _validate_dags(config: CronstableConfig) -> None:

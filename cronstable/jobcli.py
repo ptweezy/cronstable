@@ -238,11 +238,13 @@ def _http(
 def _parse_body(body: bytes) -> dict[str, Any]:
     """A response body as a dict, tolerating non-JSON.
 
-    Error bodies are not always JSON: a daemon that restarted mid-run no
-    longer knows the run token, and its bare 401 renders as the plaintext
-    ``401: Unauthorized``.  A parse failure must degrade to ``{}`` so the
-    caller's ``_ok`` raises the endpoint's HTTP status as a clean
-    ``_CliError``, never a ``JSONDecodeError`` traceback.
+    Error bodies are not always JSON.  This daemon's endpoint now wraps
+    every error it serves in the ``{"error": ...}`` envelope, but the CLI
+    may be talking to one older than that arm, and a reverse proxy or a
+    transport-level failure aiohttp answers itself still renders as
+    plaintext (``401: Unauthorized``).  A parse failure must degrade to
+    ``{}`` so the caller's ``_ok`` raises the endpoint's HTTP status as a
+    clean ``_CliError``, never a ``JSONDecodeError`` traceback.
     """
     try:
         parsed = json.loads(body) if body else {}

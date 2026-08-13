@@ -16,6 +16,9 @@ from cronstable.fingerprint import SCHEME_VERSION
 
 
 class FakeCron:
+    # the real Cron sets this in __init__; _run_daemon reads it
+    config_arg = None
+
     def __init__(self, config_arg):
         parse_config(config_arg)
 
@@ -359,6 +362,9 @@ def test_init_reports_an_unreadable_target(monkeypatch, tmp_path, capsys):
 def test_config_error_exits_1(monkeypatch):
     # A ConfigError from constructing Cron is caught and turned into exit 1.
     class BadCron:
+        # the real Cron sets this in __init__; _run_daemon reads it
+        config_arg = None
+
         def __init__(self, config):
             raise ConfigError("boom")
 
@@ -440,6 +446,9 @@ def test_main_loop_builds_and_closes_its_own_loop(monkeypatch):
     built = []
 
     class RunCron:
+        # the real Cron sets this in __init__; _run_daemon reads it
+        config_arg = None
+
         def __init__(self, config):
             pass
 
@@ -497,6 +506,9 @@ def test_run_and_shutdown_wiring(monkeypatch):
     ran = {"value": False}
 
     class RunCron:
+        # the real Cron sets this in __init__; _run_daemon reads it
+        config_arg = None
+
         def __init__(self, config):
             pass
 
@@ -515,3 +527,96 @@ def test_run_and_shutdown_wiring(monkeypatch):
     finally:
         loop.close()
     assert ran["value"] is True
+
+
+def test_run_daemon_installs_shutdown_handlers_by_default(monkeypatch):
+    installed = []
+    monkeypatch.setattr(
+        main.platform,
+        "install_shutdown_handlers",
+        lambda loop, callback: installed.append(callback) or (lambda: None),
+    )
+
+    class _Cron:
+        # the real Cron sets this in __init__; _run_daemon reads it
+        config_arg = None
+
+        async def run(self):
+            return None
+
+        def signal_shutdown(self):
+            pass
+
+    cron = _Cron()
+    loop = asyncio.new_event_loop()
+    try:
+        main._run_daemon(cron, loop)
+    finally:
+        loop.close()
+    assert installed == [cron.signal_shutdown]
+
+
+def test_run_daemon_can_skip_the_shutdown_handlers(monkeypatch):
+    # The Windows service host runs the loop on a thread the SCM created,
+    # and install_shutdown_handlers reaches signal.signal there, which the
+    # interpreter refuses off the main thread (loop.add_signal_handler
+    # refuses the same way on POSIX). Its stop surface is the SCM control
+    # handler instead, so it opts out.
+    def _refuse(loop, callback):
+        raise AssertionError("must not be reached")
+
+    monkeypatch.setattr(main.platform, "install_shutdown_handlers", _refuse)
+
+    class _Cron:
+        # the real Cron sets this in __init__; _run_daemon reads it
+        config_arg = None
+
+        async def run(self):
+            return None
+
+        def signal_shutdown(self):
+            pass
+
+    loop = asyncio.new_event_loop()
+    try:
+        main._run_daemon(_Cron(), loop, shutdown_handlers=False)
+    finally:
+        loop.close()
+
+
+def test_a_writable_config_is_warned_about_once_at_startup(
+    monkeypatch, caplog
+):
+    # %ProgramData% grants BUILTIN\Users the right to create files, with
+    # container inheritance, so a config directory made under it with a
+    # plain mkdir lets any local account drop a YAML that a LocalSystem
+    # service then runs as SYSTEM. The check lives on the startup path
+    # rather than in the config layer because the config layer runs again
+    # on every housekeeping tick, and a permission a reload cannot change
+    # does not deserve a line a minute.
+    monkeypatch.setattr(
+        main.platform, "any_user_write_grantee", lambda path: r"BUILTIN\Users"
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        main._warn_if_config_is_writable(r"C:\ProgramData\cronstable")
+    text = caplog.text
+    assert r"can be written by BUILTIN\Users" in text
+    assert "runs them as SYSTEM" in text
+    # the remedy has to paste as-is on a non-English install, so it names
+    # SIDs rather than localized group names
+    assert "icacls" in text
+    assert "*S-1-5-18:(OI)(CI)F" in text
+    assert "*S-1-5-32-544:(OI)(CI)F" in text
+    # the AU read grant _CONFIG_DIR_SDDL keeps: dropping it would break
+    # unelevated config resolution (see platform.config_dir_icacls_recipe)
+    assert "*S-1-5-11:(OI)(CI)RX" in text
+
+
+def test_nothing_is_said_when_the_config_is_not_writable(monkeypatch, caplog):
+    monkeypatch.setattr(
+        main.platform, "any_user_write_grantee", lambda path: None
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        main._warn_if_config_is_writable(r"C:\ProgramData\cronstable")
+        main._warn_if_config_is_writable(None)
+    assert caplog.text == ""

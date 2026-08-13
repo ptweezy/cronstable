@@ -1,9 +1,312 @@
 # History
 
-cronstable is a fork of [yacron](https://github.com/gjcarneiro/yacron),
-continuing from yacron 0.19.  The 1.0.x entries below document the fork; the
-entries from 0.19.0 onward document the history of the original yacron
-project, on which cronstable is based.
+## 1.2.40
+
+More Windows work: a service host, a Task Scheduler importer, and a
+reporter that writes to the Windows Event Log.
+
+- The readers that answer "which run is the newest" judge by finish time
+  instead of by position in the stream. Chaining orders the appends one
+  node makes. It cannot order what a peer node sharing the mount appends
+  through its own process, so the last record in `runs/<job>` can still be
+  an older run. After a restart a job's latest run is now the newest one
+  it finished, so `GET /jobs`, the dashboard and the
+  `cronstable_job_last_run_*` gauges can no longer report a failure for a
+  job whose newest run succeeded. The retry ladder's superseded-by-run
+  watermark, the `maxTimeSinceSuccess` reference, the
+  `onlyIfLastSucceeded` memo, and `last_duration`, `last_cpu_seconds` and
+  `last_rss_bytes` on `/jobs/{name}/runs` and `/jobs/{name}/trends` all
+  fold the same way. A slot takeover reconciling another node's
+  interrupted run no longer overwrites a newer local run either: the
+  synthetic row it installs carries the interrupted run's start instant,
+  which is often older than a run this node already recorded. A run of
+  this node that a crash interrupted is still the latest run no matter
+  what finished around it, because its record stands in the instant that
+  run started and `concurrencyPolicy: Allow` (the default) lets an
+  overlapping instance finish after it; folding there would hide the
+  crash. Runs sharing a finish instant resolve to the later one in the
+  stream, the answer the positional read gave. Reading a run listing
+  never re-orders it: after a restart the history ring is rebuilt in
+  finish order, and from then on it grows in the order this node observed
+  the completions. A listing shows every row, so an inverted pair moves a
+  cell rather than changing a verdict, and an interrupted run reads
+  better where it was seen than where it began.
+- `maxRunsPerJob: 1` retains two run records per job and logs the
+  adjustment once at startup. The prune keeps the newest records by write
+  order, so a retention of one leaves no room for a pair that landed
+  inverted, and the run it deletes is then the newer one, which nothing
+  can recover. The prune stays write-ordered on purpose: a crash-reconciled
+  record under `onMissed: run-once` or `run-all` deliberately carries an
+  interruption instant and no finish time, so a finish-keyed prune would
+  have no key for exactly the records the reconciliation path writes.
+- Jobs can say which directory they start in. The new `workingDirectory`
+  key becomes the working directory of the job's process, so a `.bat` or a
+  script written around relative paths no longer depends on wherever the
+  daemon happened to be launched from, which on an elevated Windows console
+  is the system directory. It is the equivalent of the "Start in" box on a
+  Task Scheduler action, and it works in a `defaults:` block and on a DAG
+  task like every other launch field. cronstable expands `~` and `${VAR}`
+  and makes the result absolute at load. A directory that does not exist is
+  not a load error: config load runs on hosts that are not the target, so
+  the OS decides at spawn and a bad value records the run as a launch
+  failure whose log line names the directory. It is deliberately not part
+  of the job-set id, so replicas running the same jobs from paths their own
+  hosts spell differently still agree on what they are running.
+- Jobs can declare a `priority`, one of `idle`, `below-normal`, `normal`,
+  `above-normal` and `high`. On Windows it becomes the process's priority
+  class at creation; on POSIX the job's process group is reniced to an
+  absolute value just after the spawn. How far a Windows class carries is
+  asymmetric: descendants inherit `idle` and `below-normal`, while
+  `above-normal` and `high` apply to the job's own process, since Windows
+  resets an unflagged child of an above-normal or high parent to NORMAL. So
+  a `shell: cmd` job at `high` gets cmd.exe at HIGH and the programs cmd.exe
+  launches at NORMAL. POSIX renices the whole group and a later fork
+  inherits the value, so it has no such split. `normal`, the default, is the
+  one level that is never applied. Raising a priority needs
+  `CAP_SYS_NICE` or `RLIMIT_NICE` headroom on POSIX: cronstable says so once
+  at config load and names the job, and a kernel that then refuses leaves
+  the run going at the priority it inherited instead of failing it.
+  `realtime` is deliberately not offered, since a runaway job at that class
+  outranks the threads servicing disk, keyboard and mouse. The level is part
+  of the job-set id when it is set, and rides on `GET /jobs` the same way.
+- Ten endpoints that answered a `404` with aiohttp's own `404: Not Found`
+  now say what was not found. `GET /jobs/{name}`, its trends and its log
+  stream name the job, and the DAG task log stream names the DAG.
+  `/schedule/why` and `/jobs/{name}/calendar.ics` answer `no job or DAG
+  schedule named ...`, because both resolve a DAG's schedule as readily as
+  a job, so the older phrasing described a lookup neither route performs.
+  The MCP tool over the same lookup, `cron_why_no_run`, says the same thing
+  and now points at `cron_list_dags` alongside `cron_list_jobs`.
+  On the loopback endpoint jobs use for durable state, the four `get`
+  routes name the missing key, cursor, artifact or secret, and the scoped
+  three name the scope they looked in, which is the calling job's own name
+  unless the request passed one. That endpoint also gained the error
+  envelope the web API already had, so its `401`, the router's `404` and
+  `405`, an oversized body's `413` and an unexpected `500` now arrive as
+  `{"error": "..."}` rather than plain text a client has to sniff for.
+  A DAG's run and XCom routes no longer report every DAG as nonexistent on
+  a daemon with no `state:` section: run documents only live in a durable
+  store, and the `404` now says which of the two it was.
+  The published claim covers only what these two applications serve.
+  A request that fails before it reaches one, meaning a malformed request
+  line, an unparseable method token, request headers past 8190 bytes or an
+  unrecognised `Expect:`, gets a plain-text answer from the HTTP server
+  itself, and the cluster peer transport is a separate mTLS listener that
+  answers its own bodyless `4xx`. The wiki and the OpenAPI spec now say
+  that, and every `4xx` and `5xx` in the spec declares the envelope as its
+  response body.
+- The coverage gate now reads the Windows code on the Windows CI rows. Every
+  Windows branch carried a plain `# pragma: no cover`, which hid it from the
+  measurement on Windows as well, while the POSIX branches that cannot run
+  there stayed in the denominator and counted as missed; `platform.py` scored
+  69% on a Windows run for code that was largely not the code being run.
+  There are now three pragma forms: a bare one that hides a branch on every
+  OS, and a `(windows)` and `(posix)` pair that hide it only where it cannot
+  execute. Each interpreter environment in `tox.ini` has an arm per OS that
+  selects the matching profile and carries its own floor. On a Windows
+  run `platform.py` now measures 250 statements at 87.67% instead of 149 at
+  69.14%. The POSIX side barely moves: 22,329 statements at 96.72%, four
+  fewer than before, and those four are the Windows-only user/group
+  rejection and priority advisory in `config.py`, which could never run on
+  a POSIX cell and were being counted there as missed. The floors are
+  unchanged in this release, since honest per-cell numbers have to be read
+  off a real CI run rather than one developer machine.
+  One number will move for no regression: the merged Codecov figure behind
+  the README badge. It is a union across two exclusion sets now, so the
+  POSIX reports leave out a Windows-tagged line no Windows test happens to
+  reach, and the merged view counts it as missed. Both Codecov
+  statuses stay `informational`, so the drop annotates a pull request and
+  cannot fail one.
+- `cronstable import-taskscheduler` converts Windows Task Scheduler XML
+  exports into cronstable jobs, so a Windows estate does not have to be
+  retyped. It reads what the documented commands actually emit, including
+  the two shapes that stop a parser before any conversion happens:
+  `schtasks /query /XML` without `ONE` writes one XML declaration per task
+  inside a single root, and the declaration lies about the encoding whenever
+  the export passed through a redirect, since `Export-ScheduledTask` returns
+  a string stamped UTF-16 that PowerShell writes as UTF-8. Time, calendar
+  and boot triggers convert, including the two calendar forms cron can
+  express exactly, the nth weekday of a month and the last one. `Exec`
+  actions become list-form commands split by the Windows argument rules and
+  checked by rebuilding the line, along with the working directory, the
+  execution time limit, the instance policy and the priority.
+  It is a converter rather than a config-directory loader, which is where it
+  departs from what was planned, and the reason is that exporting a task
+  does not unregister it: a loader would silently double-run an estate on
+  first start. The output is YAML to read, edit and commit.
+  Everything that could not be carried across is reported with the element
+  responsible and, where one exists, a remedy. On a whole-machine export
+  that list is longer than the converted one, and the documentation says so
+  with the numbers: of 195 tasks registered on a stock Windows 11 machine,
+  111 act through a COM handler, 97 use an internal notification trigger and
+  57 have no trigger at all. Those are Windows' own plumbing rather than
+  schedules.
+  Several refusals exist because the naive mapping would produce
+  configuration that cannot load or does not do what the task did. An
+  execution time limit of `PT0S` means no limit in Task Scheduler while
+  cronstable requires one greater than zero, so it emits nothing rather than
+  making 34 of those 195 tasks a load failure. A repetition converts only
+  when its occurrences over a day are exactly the product of an hour set and
+  a minute set, because a cron minute and hour field multiply, so `PT1H`
+  converts and `PT90M` is refused rather than silently doubled. Seconds are
+  always dropped, because one imported registration artefact would set the
+  whole daemon ticking every second for every other job too. A principal is
+  reported and never emitted as `user:`, which is a config-load error on
+  Windows and would produce a file that cannot load on the platform it was
+  converted for.
+- cronstable installs itself as a Windows service. `cronstable service
+  install -c C:\ProgramData\cronstable` registers it with the Service
+  Control Manager, so it starts at boot and runs whether or not anyone is
+  logged on, which is the first thing a Windows evaluation asks for and
+  the one thing the documented lifecycle (a console window stopped with
+  Ctrl-C) could not do. `remove`, `start`, `stop` and `status` round out
+  the set, and `run` is what the SCM invokes; typed by hand it says so
+  rather than appearing to hang. It is a ctypes shim over advapi32, in the
+  shape the platform module already used for its kernel32 work, so it adds
+  no runtime dependency, no PyInstaller hidden import and no second binary.
+  Stopping drains running jobs exactly as Ctrl-C does, and the service
+  keeps reporting the stop as in progress for as long as the drain takes,
+  so an hour-long job does not make Windows call the service hung. The same
+  mechanism covers startup, so a slow configuration parse is never a failed
+  start. Windows' own recovery actions are configured at install, along
+  with the flag that makes them apply to an orderly exit carrying a nonzero
+  code rather than only to a crash, without which they would have been
+  decorative here. `POST /shutdown` stops the service cleanly and it stays
+  stopped.
+  Two things an operator has to know, both documented rather than papered
+  over. The published one-file executable, which is also what winget
+  installs, cannot host a service at all: its bootloader unpacks itself and
+  runs the program in a child process, so the process the SCM starts and
+  watches never registers. `install` refuses that shape by name and points
+  at pip, pipx or the existing `schtasks` recipe. And a service has no
+  console, which is what the graceful CTRL_BREAK step of a job kill needs,
+  so `killTimeout` bounds nothing unless the service is installed with
+  `--console`; that is off by default because an allocated console changes
+  what a job inherits, and the trade is written out in full.
+  A service also has no stderr, so `service run` opens a rotating bootstrap
+  log before anything else and refuses to start if it cannot. Without it a
+  service that fails to start is undiagnosable: its standard streams are
+  not merely redirected somewhere unhelpful, they are `None`, so the
+  default logging setup formats every record, fails to write it, and
+  swallows the failure too.
+- A sixth reporter, `eventlog`, writes job outcomes to the Windows Event
+  Log, which is where a Windows shop's monitoring already looks: Event
+  Viewer, a Windows Event Forwarding subscription, SCOM, every SIEM
+  connector. It sits in the same `report` block as the other five and fires
+  from the same hooks. Each record carries a stable event id (1000
+  succeeded, 1001 failed, 1002 failed permanently, 1003 overdue, 1010 and
+  1011 for daemon events) and eleven insertion strings in a fixed order, so
+  a rule written against it keeps working; there is deliberately no
+  template, because the id and the field positions are the contract.
+  cronstable does not register its event source, since that needs an HKLM
+  write and buys nothing without a message DLL, so Event Viewer prefixes
+  the rendered text with its generic "description cannot be found" note.
+  That costs the prose only: the provider, the id, the level and every
+  insertion string are all present, so the XML view, `wevtutil`, forwarding
+  and SIEM connectors read the record normally. Writes go to a background
+  thread because registering a source and writing a record are both
+  synchronous calls into the Event Log service, and reports run inline on
+  the completion path. Fields are capped by arithmetic rather than trimmed
+  at the API, because a vector past the combined ceiling makes the write
+  fail outright, which would drop exactly the alerts for the jobs that
+  produced the most output. `includeOutput` is off by default, the opposite
+  of push's `includeLogTail`, because the Application log is readable by
+  every local account. On any other platform the reporter does nothing and
+  the load warns once, naming every hook that asked for it, rather than
+  refusing: nothing can be installed on Linux to satisfy a refusal, so one
+  config directory still serves a mixed fleet.
+- An `onLate` block that enables only the push reporter and sets no `sla`
+  thresholds is now refused at config load, as the same block naming any
+  other reporter already was. The check that decides whether an `onLate`
+  would really fire predates push and never learned about it, so such a
+  hook loaded cleanly and then never fired, which is the silent outcome
+  the check exists to prevent.
+- Retiring an Event Log writer releases its source handle. A reload that
+  renames `report.eventlog.source` drops the old writer without waiting
+  for it, which is deliberate, but the handle was only ever released by
+  the wait, so each such reload leaked one. The writer's own thread
+  releases it now, as it finishes draining. The cap on live writers
+  counts what sits in the registry rather than what has left it, so it
+  bounded this leak at nothing.
+- A secret or bearer token read with `fromFile` is decoded as UTF-8, and a
+  leading byte-order mark is stripped along with the surrounding
+  whitespace. Both readers took the locale encoding before, which made the
+  same file two different secrets on Linux and Windows, and left a mark
+  written by Notepad or a PowerShell redirect on the front of the value.
+  A token with one passed the non-empty check, so the daemon started
+  authenticated and answered 401 to the token its operator had written.
+  `env_file` was already read this way; these were the two readers the
+  earlier fix did not cover. A secret file genuinely encoded in the local
+  code page and holding a non-ASCII byte now fails to load instead of
+  resolving to a different string on each platform.
+- Running as a Windows service no longer logs a warning and a traceback
+  for every batch of captured job output. A service has no standard
+  streams, so cronstable skips the copy it would echo to its own stdout,
+  and logs that once. The captured lines still reach the reports, the log
+  tail and `archiveOutput`, as they always did.
+- `import-taskscheduler` converts a command line containing `%SystemRoot%`
+  or any other `%VAR%` into a string `command` rather than a list. Task
+  Scheduler expands environment variables before it launches anything and
+  cronstable expands nothing, so those jobs used to load cleanly and then
+  fail every run looking for a file with a percent sign in its name. A
+  string command runs through `%ComSpec% /c` on Windows, which expands
+  them at run time on the machine the job runs on. On a 195-task export
+  from a stock Windows 11 install this is 18 of the 31 jobs it emits.
+- The import report no longer labels a task NOT CONVERTED while its jobs
+  sit live in the file it just wrote. A task whose second trigger did not
+  carry across is now PARTIAL, and NOT CONVERTED means what the YAML says
+  it means. The report is the only place that lists which tasks Task
+  Scheduler is still running as well, so it had to agree with itself; on
+  the same export, 11 of the 24 converted tasks were labelled wrongly.
+- One task the importer cannot read no longer costs the whole export. A
+  duration or timestamp it cannot parse becomes a blocking note for that
+  task, as every other unconvertible thing already was, instead of
+  ending the run with a single line and no file. The same applies to one
+  unreadable file in a scanned directory.
+- `cronstable init` restricts the directory it creates on Windows when any
+  local account could otherwise write to it. `%ProgramData%` grants
+  `BUILTIN\Users` the right to create files and a new directory under it
+  inherits that, so the documented machine-wide setup let any local
+  account add a job that a service then ran as SYSTEM. The directory now
+  gets full control for LocalSystem and the Administrators group and read
+  for everyone else, with inheritance severed. A per-user directory under
+  `%APPDATA%` has no such permission and is left as it is. Where the
+  directory already exists, the daemon says so once at startup and prints
+  an `icacls` line that fixes it.
+- The DAG advance pass does less work per entry. The tasks and fan-out
+  tables are resolved once per pass instead of once per task or
+  dependency, the common terminal states settle on one comparison rather
+  than two frozenset lookups, the cycle check walks the graph once, and
+  a claim builds its entry from a prepared template. In the same vein,
+  config fingerprinting splices the canonical bytes of unchanged hook
+  blocks instead of re-encoding them per job, the run stats behind
+  `/jobs/{name}/trends` fold their listing in one walk, and the stream
+  reader and output mirror shed per-line work. Digests and document
+  bytes are unchanged.
+- An advance pass refuses a run document that records null where a task
+  entry or the fan-out map belongs, naming the entry, before anything
+  is copied or claimed. Nothing writes those shapes, so they mean a
+  damaged or hand-edited document, and what happened before depended on
+  iteration order: an early null crashed the pass, and a late one read
+  as absent, which could start a task whose upstreams had failed.
+- A `%VAR%` in an imported task's Start-in directory is a blocking
+  note. The cmd.exe route that carries a `%VAR%` command cannot carry a
+  working directory, since the OS applies it before any shell runs, so
+  the task's YAML is emitted commented out with the literal path in
+  place to edit, rather than live and failing every spawn.
+- `report.eventlog.source` is validated on DAG task templates as it is
+  on jobs and `notify:`. A reserved log name or a path separator on a
+  task's hook loaded cleanly and surfaced only at runtime, as a dropped
+  record or one filed under the log's own key.
+- The printed `icacls` remedy grants read to Authenticated Users, the
+  same permissions `init` itself applies. As printed before, it severed
+  inheritance without the read grant, after which an unelevated
+  `cronstable` read the machine-wide directory as holding no
+  configuration and fell back to the per-user path.
+- Stopping the daemon waits for the Event Log writers on one shared
+  deadline. Each writer was joined with the full flush timeout in turn,
+  so several writers behind a wedged Event Log service could hold
+  shutdown for that many multiples of it.
 
 ## 1.2.39
 

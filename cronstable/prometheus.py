@@ -1256,6 +1256,12 @@ class PrometheusMetrics:
         )
         for name, job_config in cron.cron_jobs.items():
             labels = {"job_name": name}
+            # A job's `priority` is deliberately absent from these labels,
+            # unlike on the /jobs payload, which carries it when it is set.
+            # An info metric spells the same label set for every job, so the
+            # only way to add it is to emit priority="normal" for all of
+            # them, which repoints every existing series of this metric to
+            # say something that was already true.
             info.add(
                 {
                     "job_name": name,

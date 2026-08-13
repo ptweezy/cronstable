@@ -17,6 +17,8 @@ Types and defaults are taken from the strictyaml schema and `DEFAULT_CONFIG`.
 | `shell` | `Str` | `/bin/sh` (POSIX) / empty (Windows) | Shell used when `command` is a string. The default is platform-specific: `/bin/sh` on POSIX, empty on Windows (an empty default routes a string command through the native command processor `%ComSpec%` / `cmd.exe`). To use PowerShell or another interpreter, set `shell:` explicitly, or pass `command` as a list (which bypasses the shell on every platform). See [Running on Windows](Running-on-Windows). |
 | `environment` | `Seq(Map({key, value}))` | `[]` | Environment variables (each an item with `key` and `value`, both `Str`) added to the subprocess environment. |
 | `env_file` | `Str` | `None` | Path to a `KEY=VALUE` file whose variables are merged into `environment`. |
+| `workingDirectory` | `Str` or null | `None` | Directory the subprocess starts in. With it unset, the job inherits cronstable's own working directory. See [workingDirectory](#workingdirectory) below. |
+| `priority` | `Enum(idle, below-normal, normal, above-normal, high)` | `normal` | Scheduling priority of the subprocess. Descendants inherit a lowered level; a raised level applies to the subprocess itself on Windows. cronstable never applies the default level: the job keeps cronstable's own nice on POSIX, and cronstable's own class on Windows only when cronstable is at idle or below-normal, otherwise NORMAL. See [priority](#priority) below. |
 | `user` | `Str` or `Int` | unset | User (login name or numeric uid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 | `group` | `Str` or `Int` | unset | Group (group name or numeric gid) to run the subprocess as. POSIX-only; a job setting it raises a configuration error on Windows (see [Running on Windows](Running-on-Windows)). |
 
@@ -70,8 +72,10 @@ Whatever the command form, the subprocess is spawned with
 fresh session (`start_new_session`), placing it and every descendant in their
 own process group, so a cancellation (an `executionTimeout` expiry,
 `concurrencyPolicy: Replace`, or an API cancel) can take the whole tree down
-as a unit; on Windows no creation flag is used and cancellation walks the
-process tree instead. See
+as a unit; on Windows the job is created with `CREATE_NEW_PROCESS_GROUP`,
+which shields it from the daemon console's Ctrl-C and makes it a trappable
+`CTRL_BREAK_EVENT` target ahead of the forced tree kill. Those same Windows
+creation flags carry the job's [`priority`](#priority). See
 [Cancellation and killTimeout](Concurrency-and-Timeouts#cancellation-and-killtimeout).
 
 ```yaml
@@ -222,6 +226,166 @@ process environment (including injected `HOSTNAME`) < `env_file` < merged
 `environment` (defaults then job, job winning). See
 [Includes, Defaults, and Multi-File Config](Includes-and-Defaults) for how
 `defaults` and includes are merged overall.
+
+## workingDirectory
+
+`workingDirectory` is the directory the job's process starts in. It is the
+`cwd` of the spawn, and the equivalent of the "Start in (optional)" box on a
+Task Scheduler action or of systemd's `WorkingDirectory=`.
+
+```yaml
+jobs:
+  - name: nightly-report
+    command: python report.py
+    schedule: "0 2 * * *"
+    workingDirectory: /srv/reports
+```
+
+With the key unset, the job inherits cronstable's own working directory. Like
+the other launch fields it can be set in a `defaults:` block and on a DAG
+task; under a `defaults:` block that sets it, a bare `workingDirectory:` on
+one job opts that job back out to inheriting.
+
+At load, cronstable expands `~` and makes the result absolute:
+
+- `~/jobs` means the home directory, not a directory literally named `~`
+  under wherever cronstable was started. On a job that also sets `user`, the
+  expansion resolves against cronstable's own user, because it happens once
+  at load while the demotion happens per run.
+- cronstable expands `${VAR}` from its own environment like any other config
+  scalar, unlike `command` and `shell`, which it leaves verbatim for the
+  runtime shell to expand. See
+  [Environment Variable Interpolation](Environment-Variable-Interpolation).
+- cronstable resolves a relative value against its own working directory at
+  load rather than at each fire, so the directory a job runs in is settled
+  once and the logs show the resolved form. Nothing requires the value to be
+  absolute: on Windows, `ntpath.isabs` answers what counts as an absolute
+  path differently across the Python versions cronstable supports, and which
+  directory a job runs in must not depend on the interpreter that scheduled
+  it.
+
+cronstable does not check at load whether the directory exists. Config load
+runs on every hot reload, and under `--validate-config` on machines that are
+not the target host, so one job naming a share that is not mounted yet must
+not fail the whole load. The OS checks at spawn instead, and a directory that
+is not there is an ordinary [launch failure](#launch-failures): the run
+records exit `127` and the logged spawn line carries the `cwd` that was
+attempted. On Windows that log line is the only place the directory appears,
+since the error the OS returns there (`WinError 267`, "The directory name is
+invalid") carries no filename of its own.
+
+`workingDirectory` is deliberately not part of the
+[job-set ID](Job-Set-ID), so replicas that run the same jobs from paths their
+own hosts spell differently still agree on what they are running.
+
+Two behaviors to know before relying on it:
+
+- The child changes directory **before** `preexec_fn` runs, so on a job that
+  also sets `user`/`group` the change uses cronstable's privileges, not the
+  target user's. A demoted child can therefore end up sitting in a directory
+  it cannot itself read.
+- A list-form `command` that names its program by a **relative path**, one
+  containing a separator such as `./import.sh`, resolves that path against
+  `workingDirectory` on POSIX and fails on Windows, where `CreateProcessW`
+  searches the calling process's directory instead. A **bare** name carrying
+  no separator is looked up on `PATH` on both platforms and never comes from
+  the working directory, because CPython builds the `PATH` candidate list in
+  the parent, before the child changes directory. Name the program by full
+  path, or set `shell:` and let the shell resolve it. See
+  [Running on Windows](Running-on-Windows#workingdirectory-does-not-change-program-lookup).
+
+## priority
+
+`priority` is how the job is scheduled against everything else on the box. It
+takes one of five levels, lowest first:
+
+```yaml
+jobs:
+  - name: reindex
+    command: reindex.sh
+    schedule: "0 3 * * *"
+    priority: idle
+```
+
+| Level | Windows priority class | POSIX nice |
+| --- | --- | --- |
+| `idle` | `IDLE_PRIORITY_CLASS` | 19 |
+| `below-normal` | `BELOW_NORMAL_PRIORITY_CLASS` | 10 |
+| `normal` (default) | no class set; see below | inherited, no renice |
+| `above-normal` | `ABOVE_NORMAL_PRIORITY_CLASS` | -5 |
+| `high` | `HIGH_PRIORITY_CLASS` | -10 |
+
+`normal` is the one level cronstable never applies. On POSIX that means the
+job keeps cronstable's own nice, which on a daemon started at nice 10 is nice
+10, not nice 0. On Windows it means the job gets cronstable's own class when
+cronstable runs at idle or below normal, and NORMAL when cronstable runs at
+normal or above, because that is what `CreateProcess` gives a child with no
+class flag. Either way cronstable never promotes a job that did not ask to be
+promoted. Like the other launch fields it can be set in a `defaults:` block
+and on a DAG task.
+
+The other four levels are **absolute**, not offsets: `idle` means nice 19
+whatever the daemon sits at.
+
+The two platforms apply it at different moments:
+
+- **Windows** sets the priority class at `CreateProcess` time, which is the
+  one race-free place to set it, on the same creation flags that give the job
+  its own process group. `normal` emits no class flag rather than
+  `NORMAL_PRIORITY_CLASS`, because a child only defaults to NORMAL when its
+  creator is not itself idle or below-normal; emitting the flag would
+  silently *promote* the jobs of a daemon that was launched below normal,
+  which is what Task Scheduler does by default.
+- **POSIX** has no such spawn-time knob, so cronstable renices the job's
+  process *group* (`setpriority` with `PRIO_PGRP`) as the first thing after a
+  successful spawn. It renices the group rather than the process, so a helper
+  the shell forked in the microseconds before the call is reniced too. This
+  does not happen in a `preexec_fn`: that hook runs between fork and exec,
+  where only async-signal-safe calls are sound, and it would put a fork-time
+  hook on every spawn including the jobs that have no privilege to drop.
+
+How far the level reaches also differs, and the difference comes from the
+same `CreateProcess` rule. Descendants inherit a lowered level (`idle`,
+`below-normal`) on both platforms. A raised level (`above-normal`, `high`)
+applies to the job's own process on Windows and not to the tree it spawns,
+because an unflagged child of an above-normal or high parent gets NORMAL.
+That shows up in the commonest Windows job shape: a `shell: cmd` job or a
+`.cmd` file at `priority: high` runs cmd.exe at HIGH, and every program
+cmd.exe launches runs at NORMAL. POSIX has no such asymmetry, because
+`setpriority(PRIO_PGRP)` covers the whole group and anything forked after it
+inherits the nice value. `high` is still worth asking for where the job's own
+process is the work, but on Windows it will not raise a tree of helpers.
+
+Lowering a priority is always allowed. **Raising** one on POSIX (any level
+whose nice sits below cronstable's own; from the usual nice 0 that means
+`above-normal` and `high`) needs `CAP_SYS_NICE` or `RLIMIT_NICE` headroom,
+and cronstable cannot know at load whether the kernel will grant it. What it
+does instead:
+
+- at config load, if the level is a raise from cronstable's own nice and
+  cronstable is not root, it logs one `WARNING` naming the job, so the
+  warning lands on the deployment that introduces the ask;
+- at run time, a refusal from the kernel does **not** fail the run. The job
+  runs at the priority it inherited and cronstable logs the refusal at
+  `DEBUG`. A minutely job on an unprivileged host would otherwise emit some
+  1,440 warnings a day about a condition that will not change until the
+  deployment does.
+
+Windows grants all five classes to an unprivileged account, so none of that
+applies there.
+
+cronstable deliberately does not offer `realtime`. It outranks the threads
+that service disk, keyboard and mouse, so one runaway job at REALTIME can put
+the host out of reach of the operator who has to stop it.
+`priority: realtime` is a load error listing the accepted levels, not a
+silent downgrade.
+
+When a job sets it, the level (never the nice number or priority class it
+resolves to) is part of the [job-set ID](Job-Set-ID), so replicas that
+disagree about how a job is scheduled show as drift. A set level also appears
+on the [`GET /jobs`](HTTP-API#get-jobs) payload. See
+[Running on Windows](Running-on-Windows#process-priority) for how the levels
+compare with Task Scheduler's own `-Priority` numbers.
 
 ## user and group (privilege switching)
 

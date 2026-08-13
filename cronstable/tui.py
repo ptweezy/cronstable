@@ -82,11 +82,11 @@ from cronstable.croninfo import (  # noqa: F401  (re-exported for tests/back-com
 )
 from cronstable.platform import IS_WINDOWS
 
-if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
+if sys.platform == "win32":  # pragma: no cover (windows)
     import ctypes
     import msvcrt
     import threading
-else:
+else:  # pragma: no cover (posix) - termios/tty live nowhere else
     import fcntl  # noqa: F401  (re-exported guard parity; unused directly)
     import signal
     import termios
@@ -1291,13 +1291,14 @@ PREF_DEFAULTS: dict[str, Any] = {
 
 def prefs_path() -> str:
     """``%APPDATA%\\cronstable\\tui.json`` / ``$XDG_CONFIG_HOME`` analogue."""
-    if IS_WINDOWS:  # pragma: no cover - exercised on Windows only
+    if IS_WINDOWS:  # pragma: no cover (windows) - exercised on Windows only
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         return os.path.join(base, "cronstable", "tui.json")
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
-        os.path.expanduser("~"), ".config"
-    )
-    return os.path.join(base, "cronstable", "tui.json")
+    else:  # pragma: no cover (posix) - XDG, exercised on POSIX only
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+        return os.path.join(base, "cronstable", "tui.json")
 
 
 def load_prefs(path: Optional[str] = None) -> dict[str, Any]:
@@ -1520,7 +1521,7 @@ class PosixKeyReader:
             self._flusher.cancel()
 
 
-if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
+if sys.platform == "win32":  # pragma: no cover (windows)
 
     class WindowsKeyReader:
         """msvcrt reader thread -> key-name queue (Proactor-safe).
@@ -1569,7 +1570,7 @@ if sys.platform == "win32":  # pragma: no cover - exercised on Windows only
             self._stop = True
 
 
-def _enable_vt_windows() -> None:  # pragma: no cover - Windows only
+def _enable_vt_windows() -> None:  # pragma: no cover (windows) - Windows only
     """Turn on ANSI/VT processing for the console (idempotent)."""
     if sys.platform == "win32":
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
@@ -1597,9 +1598,9 @@ class Term:
 
     # ---- lifecycle ---------------------------------------------------
     def enter(self) -> None:
-        if sys.platform == "win32":  # pragma: no cover - Windows only
+        if sys.platform == "win32":  # pragma: no cover (windows)
             _enable_vt_windows()
-        else:
+        else:  # pragma: no cover (posix) - raw mode via termios
             fd = sys.stdin.fileno()
             self._saved = termios.tcgetattr(fd)
             tty.setraw(fd, termios.TCSADRAIN)
@@ -1731,22 +1732,27 @@ def copy_to_clipboard(term: Term, text: str) -> bool:
     """Best-effort clipboard: OSC 52 plus the platform's copy tool."""
     term.osc52_copy(text)
     try:
-        if IS_WINDOWS:  # pragma: no cover - Windows only
+        if IS_WINDOWS:  # pragma: no cover (windows) - Windows only
             proc = subprocess.run(
                 ["clip.exe"], input=text.encode("utf-16-le"), timeout=3
             )
             return proc.returncode == 0
-        if sys.platform == "darwin":  # pragma: no cover - macOS only
-            proc = subprocess.run(
-                ["pbcopy"], input=text.encode("utf-8"), timeout=3
-            )
-            return proc.returncode == 0
-        for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"]):
-            if shutil.which(tool[0]):
+        else:  # pragma: no cover (posix) - pbcopy/wl-copy/xclip
+            # The macOS arm nests here rather than sitting beside the
+            # Windows one so the whole non-Windows tail has a header the
+            # profiles can tag; it keeps a bare pragma of its own because
+            # the matrix has no macOS row to measure it in.
+            if sys.platform == "darwin":  # pragma: no cover - macOS only
                 proc = subprocess.run(
-                    tool, input=text.encode("utf-8"), timeout=3
+                    ["pbcopy"], input=text.encode("utf-8"), timeout=3
                 )
                 return proc.returncode == 0
+            for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"]):
+                if shutil.which(tool[0]):
+                    proc = subprocess.run(
+                        tool, input=text.encode("utf-8"), timeout=3
+                    )
+                    return proc.returncode == 0
     except (OSError, subprocess.SubprocessError):  # pragma: no cover
         pass
     return True  # OSC 52 alone very likely worked; stay quiet either way
@@ -7721,9 +7727,9 @@ def dispatch(args: Any) -> int:
     async def _amain() -> int:
         loop = asyncio.get_running_loop()
         keys: Any
-        if sys.platform == "win32":  # pragma: no cover - Windows only
+        if sys.platform == "win32":  # pragma: no cover (windows)
             keys = WindowsKeyReader(loop)
-        else:
+        else:  # pragma: no cover (posix) - PosixKeyReader
             keys = PosixKeyReader(loop, sys.stdin.fileno())
         app = TuiApp(
             Api(str(args.url), _resolve_token(args), ssl_context),
