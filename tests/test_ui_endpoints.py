@@ -1264,6 +1264,37 @@ def test_job_to_dict_spread_owner_block():
     assert prefer["clusterOwner"] == "node-B"  # PreferLeader -> available_
 
 
+_PRIORITY_YAML = """
+jobs:
+  - name: quiet
+    command: echo hi
+    schedule: "*/5 * * * *"
+    priority: idle
+  - name: plain
+    command: echo hi
+    schedule: "*/5 * * * *"
+"""
+
+
+def test_job_to_dict_carries_priority_only_when_set():
+    # /jobs is where other tools read a job's priority from, so it has to be
+    # there; omitted at the default level so the polled payload of a fleet
+    # that never sets one is byte for byte what it was.
+    cron = _cron(_PRIORITY_YAML)
+    assert cron._job_to_dict("quiet", cron.cron_jobs["quiet"])["priority"] == (
+        "idle"
+    )
+    assert "priority" not in cron._job_to_dict(
+        "plain", cron.cron_jobs["plain"]
+    )
+    # both callers of _job_to_dict see it: the list poll and the detail read
+    assert cron.job_detail_payload("quiet")["priority"] == "idle"
+    assert [job.get("priority") for job in cron.jobs_payload()] == [
+        "idle",
+        None,
+    ]
+
+
 # ---------------------------------------------------------------------------
 # state inspector payloads, driven by small fake backends
 # ---------------------------------------------------------------------------

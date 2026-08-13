@@ -120,6 +120,8 @@ def _add_state_subcommands(parser: argparse.ArgumentParser) -> None:
     _cliargs.add_job_commands(sub)
     _cliargs.add_mcp_command(sub)
     _cliargs.add_tui_command(sub)
+    _cliargs.add_service_command(sub)
+    _cliargs.add_import_taskscheduler_command(sub)
     _add_init_command(sub)
 
 
@@ -260,6 +262,38 @@ def _run_init(args: Any) -> int:
         )
         return 1
     print("wrote {}".format(path))
+    # Harden only where there is something to harden, asked of the
+    # directory itself rather than of its path. %ProgramData% inherits
+    # BUILTIN\Users create-file rights and a directory at the root of C:
+    # inherits Authenticated Users MODIFY, which is worse, while
+    # %APPDATA%\cronstable carries no any-user ACE at all and must be left
+    # alone: giving a per-user configuration a DACL naming only
+    # administrators would take it away from the person who wrote it.
+    #
+    # Applied AFTER the starter is written, because a caller who is not an
+    # administrator would otherwise be refused the write it just asked
+    # for. Ordering it this way also covers the file, since
+    # SetNamedSecurityInfoW propagates the new inheritable ACEs onto
+    # children whose own DACLs are unprotected.
+    grantee = platform.any_user_write_grantee(target)
+    if grantee is not None:
+        if platform.harden_config_dir(target):
+            print(
+                "restricted {} so {} can no longer add a job there".format(
+                    target, grantee
+                )
+            )
+        else:
+            print(
+                "cronstable init: {} can write {}, so any local account "
+                "can add a job, and a service runs it as SYSTEM. "
+                "Restrict it with: {}".format(
+                    grantee,
+                    target,
+                    platform.config_dir_icacls_recipe(target),
+                ),
+                file=sys.stderr,
+            )
     # Bare `cronstable` finds the default location on its own; anywhere else
     # has to be named, whichever way the caller named it here.
     if os.path.abspath(target) != os.path.abspath(CONFIG_DEFAULT):
@@ -418,6 +452,33 @@ def main_loop(loop=None):
     if command == "init":
         sys.exit(_run_init(args))
 
+    if command == "import-taskscheduler":
+        # Dispatch-time import, like every other subcommand branch: the XML
+        # parser and this converter cost nothing to an invocation that is
+        # not converting anything.
+        from cronstable import taskxml
+
+        sys.exit(taskxml.dispatch(args))
+
+    if command == "service":
+        # Before the configuration-not-found guard below: `service remove`
+        # and `service status` have to keep working on a host whose config
+        # was deleted, which is exactly when an operator reaches for them.
+        # _run_daemon and _new_event_loop are PASSED rather than imported by
+        # winservice: the ImagePath `install` writes for a source install is
+        # `python -m cronstable`, and importing this module by name from
+        # there would execute it a second time under its package name,
+        # giving the process two module objects and two CONFIG_DEFAULTs.
+        from cronstable import winservice
+
+        sys.exit(
+            winservice.dispatch(
+                args,
+                run_daemon=_run_daemon,
+                new_event_loop=_new_event_loop,
+            )
+        )
+
     if args.config == CONFIG_DEFAULT and not os.path.exists(args.config):
         print(
             "cronstable error: configuration file not found at the default "
@@ -525,7 +586,35 @@ def _install_default_executor(loop) -> None:
     )
 
 
-def _run_daemon(cron, loop=None) -> None:
+def _warn_if_config_is_writable(config_arg: str | None) -> None:
+    """Say so, once, when any local account can edit what this will run.
+
+    Here rather than in the config layer because the config layer runs
+    again on every housekeeping tick, and a permission a reload cannot
+    change does not deserve a line a minute.  This is the one place both
+    the console daemon and the service host pass through exactly once.
+
+    The recipe names SIDs rather than group names because group names are
+    localized: ``BUILTIN\\Administrators`` is ``VORDEFINIERT\\Administratoren``
+    on a German install, and a recipe that fails to paste is worse than
+    none.
+    """
+    if config_arg is None:
+        return
+    grantee = platform.any_user_write_grantee(config_arg)
+    if grantee is None:
+        return
+    logging.getLogger("cronstable").warning(
+        "%s can be written by %s, so any local account can add or change "
+        "a job this daemon runs, and a service runs them as SYSTEM. "
+        "Restrict it with: %s",
+        config_arg,
+        grantee,
+        platform.config_dir_icacls_recipe(config_arg),
+    )
+
+
+def _run_daemon(cron, loop=None, *, shutdown_handlers: bool = True) -> None:
     """Run the scheduler to completion, with shutdown signalling wired up.
 
     The event loop is built HERE rather than in :func:`main` because asyncio
@@ -538,14 +627,28 @@ def _run_daemon(cron, loop=None) -> None:
     Wiring Ctrl-C / termination to a graceful shutdown differs per platform
     (loop signal handlers on POSIX, signal.signal on Windows), so it lives
     behind platform.install_shutdown_handlers.
+
+    ``shutdown_handlers=False`` skips that wiring, for a caller that runs
+    this off the main thread and has its own stop surface.  It exists for
+    :mod:`cronstable.winservice`, whose loop runs on a thread the Service
+    Control Manager creates and whose stop request arrives as an SCM
+    control rather than a console event.  The flag is needed rather than
+    merely tidy: the Windows arm of install_shutdown_handlers reaches
+    ``signal.signal``, which the interpreter refuses anywhere but the main
+    thread, and the POSIX arm's ``loop.add_signal_handler`` refuses the
+    same way, so leaving it on would abort the run before the scheduler
+    ever started.
     """
+    _warn_if_config_is_writable(cron.config_arg)
     owned = loop is None
     if owned:
         loop = _new_event_loop()
     try:
         _install_default_executor(loop)
-        remove_shutdown_handlers = platform.install_shutdown_handlers(
-            loop, cron.signal_shutdown
+        remove_shutdown_handlers = (
+            platform.install_shutdown_handlers(loop, cron.signal_shutdown)
+            if shutdown_handlers
+            else (lambda: None)
         )
         try:
             loop.run_until_complete(cron.run())
