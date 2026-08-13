@@ -1054,6 +1054,7 @@ def config_dir_icacls_recipe(path: str) -> str:
         "/grant *S-1-5-11:(OI)(CI)RX".format(path)
     )
 
+
 #: SDDL aliases for "any account on this machine", the only principals a
 #: write grant to is reported as a finding.  CREATOR OWNER (``CO``) is
 #: deliberately absent: it appears on ``%ProgramData%`` itself and resolves
