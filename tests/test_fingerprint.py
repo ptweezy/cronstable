@@ -4,10 +4,14 @@ import pytest
 
 from cronstable.config import parse_config_string
 from cronstable.fingerprint import (
+    _SECRET_PLACEHOLDER,
     SCHEME_VERSION,
+    _canonical_json,
+    _new_memo,
+    _normalize_numbers,
     _redact_action,
     _redact_report,
-    _SECRET_PLACEHOLDER,
+    _spliced_bytes,
     canonical_job,
     job_digest,
     job_set_id,
@@ -907,3 +911,148 @@ def test_eventlog_source_is_identity_when_the_block_is_set():
         )
 
     assert job_set_id(_with("alpha")) != job_set_id(_with("beta"))
+
+
+# ---------------------------------------------------------------------------
+# The serialization splice.
+#
+# job_set_id() assembles each payload from cached fragments for the hook
+# blocks its jobs share (fingerprint._spliced_bytes), while job_digest()
+# without a memo serializes the whole dict in one encoder call.  The two MUST
+# agree on every byte: the id namespaces the state and cluster backends, so a
+# divergence would surface as a fleet that had quietly stopped sharing state
+# with itself rather than as a visibly wrong answer.
+# ---------------------------------------------------------------------------
+
+# Keys that sort immediately around the three hook keys, plus keys and values
+# holding the JSON metacharacters a naive splice would trip over.
+SPLICE_DOCS = [
+    {},
+    {"a": 1},
+    {"onFailure": {}},
+    {"onFailure": {}, "onPermanentFailure": {}, "onSuccess": {}},
+    # a run before the hooks, after them, and both
+    {"AAA": 1, "onFailure": {"x": 1}},
+    {"zzz": 1, "onSuccess": {"x": 1}},
+    {"AAA": 1, "onFailure": {"x": 1}, "zzz": 2},
+    # neighbours that sort just outside and just between the hook keys
+    {
+        "onFailur": 1,
+        "onFailure": {"a": 1},
+        "onFailure0": 2,
+        "onPermanentFailurd": 3,
+        "onPermanentFailure": {"b": 2},
+        "onSucces": 4,
+        "onSuccess": {"c": 3},
+        "onSuccess0": 5,
+        "onlyIfLastSucceeded": True,
+    },
+    # a hook that is not a dict at all, and two that are the same object
+    {"onFailure": 0, "onSuccess": 0},
+    {"onFailure": "", "onPermanentFailure": None, "onSuccess": [1, 2]},
+    # keys and values that look like the splice's own output
+    {'"onFailure":0': 1, "onFailure": {"y": 2}},
+    {"onFailure": {"v": '","onSuccess":0,"'}, "k": '{"a":1}'},
+    {"onFailure": {"v": 'a\\b"c\nd\te\x00'}, "\x00": "\x7f"},
+    # non-ASCII, which ensure_ascii escapes and the byte slicing must survive
+    {"é中": "\U0001f600", "onSuccess": {"中": "é"}},
+    # nested hook-named keys, which are NOT top level and must not be spliced
+    {"a": {"onFailure": {"x": 1}}, "onFailure": {"a": {"onSuccess": 2}}},
+    # every value type the walker can hand it
+    {"f": 0.5, "i": 3, "b": True, "n": None, "l": [], "d": {}},
+]
+
+
+@pytest.mark.parametrize("doc", SPLICE_DOCS, ids=range(len(SPLICE_DOCS)))
+def test_spliced_payload_matches_the_plain_encoder(doc):
+    doc = _normalize_numbers(doc)
+    memo = _new_memo()
+    expected = _canonical_json(doc).encode("ascii")
+    # twice: the second call reads the fragments the first one cached, which
+    # is the path every job after the first in a set takes.
+    assert _spliced_bytes(doc, memo) == expected
+    assert _spliced_bytes(doc, memo) == expected
+
+
+SPLICE_CONFIG = """
+defaults:
+  environment:
+    - key: ZED
+      value: z
+    - key: ALPHA
+      value: a
+  onFailure:
+    retry:
+      maximumRetries: 3
+      initialDelay: 1.0
+      maximumDelay: 30
+      backoffMultiplier: 2.0
+    report:
+      sentry:
+        dsn:
+          value: https://aaa@example.com/1
+jobs:
+  - name: shares the defaults
+    command: echo one
+    schedule: "*/5 * * * *"
+  - name: also shares them
+    command:
+      - echo
+      - two
+    schedule: "0 0 * * *"
+  - name: overrides its own hook
+    command: echo three
+    schedule: "@daily"
+    executionTimeout: 0.5
+    killTimeout: 30
+    onSuccess:
+      report:
+        shell:
+          command: echo done
+"""
+
+
+def test_memoized_digest_matches_the_unmemoized_one():
+    # the invariant the splice rests on, over two jobs that share their hook
+    # blocks and one that overrides a hook.
+    jobs = _jobs(SPLICE_CONFIG)
+    memo = _new_memo()
+    for job in jobs:
+        assert job_digest(job, memo) == job_digest(job)
+
+
+def test_job_set_id_matches_digests_taken_one_at_a_time():
+    jobs = _jobs(SPLICE_CONFIG)
+    memo = _new_memo()
+    assert job_set_id(jobs) == job_set_id(jobs)
+    # a set built from per-job (memo-free) digests must land on the same id
+    assert sorted(job_digest(job, memo) for job in jobs) == sorted(
+        job_digest(job) for job in jobs
+    )
+
+
+def test_shared_hook_fragments_are_cached_but_one_off_blocks_are_not():
+    # guards the optimization itself: if the sharing ever stops (a merge that
+    # copies instead of pointing, say), the splice still answers correctly and
+    # only the speed quietly regresses, so assert on the cache directly.
+    jobs = _jobs(SPLICE_CONFIG)
+    memo = _new_memo()
+    for job in jobs:
+        job_digest(job, memo)
+    stored = [payload for _, payload in memo.fragments.values()]
+    # the three blocks the first two jobs share are held as bytes
+    assert sum(1 for payload in stored if payload is not None) == 3
+    # the third job's own onSuccess is remembered without its text, so a
+    # fleet of one-off hooks costs a pointer per job
+    assert sum(1 for payload in stored if payload is None) == 1
+
+
+def test_one_job_never_stores_a_fragment_payload():
+    (job,) = _jobs(job_yaml("a"))
+    memo = _new_memo()
+    job_digest(job, memo)
+    assert [payload for _, payload in memo.fragments.values()] == [
+        None,
+        None,
+        None,
+    ]
