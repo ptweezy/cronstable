@@ -316,6 +316,44 @@ reporter that writes to the Windows Event Log.
   recovery configured. The handle now requests both rights for exactly
   that call.
 
+### Packaging
+
+- **A one-directory Windows build ships beside the .exe.** Every release
+  now attaches `cronstable-windows-amd64.zip` and
+  `cronstable-windows-arm64.zip`, each holding a single `cronstable`
+  directory (`cronstable.exe` beside `_internal`), so extracting into
+  `C:\Program Files` yields the `C:\Program Files\cronstable\cronstable.exe`
+  path the Windows documentation already uses. The zip exists because the
+  one-file `.exe` cannot host the Windows service: its bootloader runs the
+  program in a child process the Service Control Manager never sees, so
+  `cronstable service install` refuses it by name, and until now the
+  service reached pip and pipx installs only. The one-directory build has
+  no child process and hosts a service normally; the refusal message now
+  points at the zip and the MSI alongside pip and pipx. The build comes
+  from the same spec behind a new `CRONSTABLE_BUNDLE=onedir` switch, and
+  the Windows release lane proves each zip against the real SCM (`service
+  install`, `status`, `remove` under a CI-scoped name) before attaching
+  it. winget continues to install the portable one-file executable.
+- **An MSI for managed machine-wide deployment.** Every release also
+  attaches `cronstable-windows-amd64.msi` and
+  `cronstable-windows-arm64.msi`, WiX-built per-machine installers for
+  GPO, Intune and SCCM. The MSI installs the one-directory build to
+  `C:\Program Files\cronstable`, puts the install directory on the system
+  `PATH`, and registers the `cronstable` service with exactly the
+  settings `cronstable service install` writes, including the recovery
+  actions and the flag that applies them to orderly failure exits; a
+  parity test holds the two spellings equal. A first install registers
+  the service without starting it, because there is no configuration yet
+  and a start would burn the recovery retries; an upgrade that finds the
+  machine-wide configuration directory stops the running service for the
+  file switch and starts it again, and `STARTSERVICE=1` starts it on a
+  first install whose configuration was deployed ahead of the package.
+  Uninstalling removes the service, the files and the `PATH` entry and
+  leaves `C:\ProgramData\cronstable` alone. The release lane installs and
+  uninstalls each MSI for real on the runner, asserting the registered
+  ImagePath and recovery actions in between. Like the other Windows
+  assets, the MSI ships unsigned.
+
 ## 1.2.39
 
 Windows fixes and additions. The first of many updates to address Windows first-class support.

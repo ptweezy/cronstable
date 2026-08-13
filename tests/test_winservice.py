@@ -577,6 +577,9 @@ def test_install_refuses_a_one_file_binary(monkeypatch, capsys):
     out = capsys.readouterr().err
     assert "one-file build cannot host a Windows service" in out
     assert "pip" in out
+    # The pointer to the shipped one-directory artifact, so the message
+    # cannot regress to pip/pipx being the only named way out.
+    assert "zip" in out
 
 
 def test_install_refuses_a_missing_config(monkeypatch, capsys, tmp_path):

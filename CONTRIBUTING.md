@@ -226,7 +226,7 @@ wiki](#editing-the-wiki)). On a release it, in order:
    GitHub Release with the wheel, sdist, and all the binaries
    (`cronstable-linux-{amd64,arm64,i686,armv7,ppc64le,s390x,riscv64}`, their
    `-musl` variants plus `cronstable-linux-armv6-musl`, `cronstable-macos-{arm64,amd64}`,
-   and `cronstable-windows-{amd64,arm64}.exe`) plus a single `SHA256SUMS`
+   and `cronstable-windows-{amd64,arm64}.exe`, `.zip` and `.msi`) plus a single `SHA256SUMS`
    attached, then pushes the multi-arch container images and updates the
    Homebrew tap.
 

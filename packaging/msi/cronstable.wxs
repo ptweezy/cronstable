@@ -1,0 +1,159 @@
+<!-- cronstable MSI (WiX v6). Built by .github/workflows/release.yml as:
+
+       wix build packaging/msi/cronstable.wxs -arch x64|arm64
+         -d Version=X.Y.Z -d Payload=ABS\PATH\TO\dist\cronstable
+         -ext WixToolset.Util.wixext -sw1149
+         -o dist/cronstable-windows-ARCH.msi
+
+     Payload is a preprocessor variable, not a bind path, because the Files
+     harvest below resolves at compile time while bind paths resolve at
+     bind time (a bindpath spelling harvests zero files, warning WIX8600).
+     It points at a PyInstaller one-directory build (a one-file build
+     cannot host a Windows service; see cronstable/winservice.py).
+
+     The service authoring below mirrors what `cronstable service install`
+     writes, and tests/test_msi_parity.py fences every mirrored value
+     against cronstable/winservice.py. Change either side only in lockstep.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="cronstable"
+           Manufacturer="cronstable"
+           Version="$(var.Version)"
+           UpgradeCode="b995cba8-16cd-48f1-a13b-c4c4b927e7be"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <SummaryInformation Description="cronstable job scheduler" />
+
+    <!-- Early RemoveExistingProducts: the old product (whose own
+         ServiceControl stops and deletes a running service) is fully
+         removed before this one's files are costed in, which is what makes
+         the auto-generated component GUIDs of the Files harvest below safe
+         across releases. Do not reschedule this to afterInstallExecute or
+         afterInstallFinalize; tests/test_msi_parity.py pins it. -->
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of cronstable is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Public properties, documented in wiki/Windows-MSI.md:
+         CONFIGDIR     configuration directory baked into the service
+                       command line (default C:\ProgramData\cronstable).
+         ADDPATH       1 (default) adds the install dir to the system PATH;
+                       0 skips it.
+         STARTSERVICE  1 starts the service at the end of this install even
+                       on a first install; pass it when configuration is
+                       deployed ahead of the package. -->
+    <Property Id="CONFIGDIR" Secure="yes" />
+    <SetProperty Id="CONFIGDIR" Value="[CommonAppDataFolder]cronstable"
+                 After="CostFinalize" Condition="NOT CONFIGDIR" />
+    <Property Id="ADDPATH" Value="1" Secure="yes" />
+    <Property Id="STARTSERVICE" Secure="yes" />
+
+    <!-- Does the default machine-wide configuration directory exist? Feeds
+         the start-on-upgrade condition below: "a config is present" is the
+         declarative approximation of "the service was running before". -->
+    <Property Id="CRONSTABLE_CONFIG_FOUND">
+      <DirectorySearch Id="CronstableConfigDirSearch"
+                       Path="[CommonAppDataFolder]cronstable" />
+    </Property>
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="cronstable">
+
+        <!-- The service host, hand-authored: harvested files cannot carry
+             ServiceInstall, so the harvest below excludes cronstable.exe. -->
+        <Component Id="MainExecutable">
+          <File Id="CronstableExe"
+                Source="$(var.Payload)\cronstable.exe"
+                KeyPath="yes" />
+          <!-- Account omitted means LocalSystem, matching install()'s NULL
+               lpServiceStartName; do not spell it out and pick up a string
+               to keep in sync. Arguments mirror winservice.host_argv for a
+               frozen build ([CONFIGDIR] quoted the way image_path quotes a
+               path containing spaces). -->
+          <ServiceInstall Id="CronstableService"
+                          Name="cronstable"
+                          DisplayName="cronstable scheduler"
+                          Description="Runs the cronstable job scheduler, so scheduled jobs run whether or not a user is logged on."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Vital="yes"
+                          Arguments="-l INFO service run --name cronstable -c &quot;[CONFIGDIR]&quot;">
+            <!-- MsiServiceConfig (Windows Installer 5.0):
+                 SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, so the recovery
+                 actions also fire on an orderly stop carrying a nonzero
+                 exit code, the only way this host reports failure
+                 (winservice.set_failure_actions_flag). WiX warns WIX1149
+                 on every ServiceConfig; the SDK's "not as expected" note
+                 is about the MsiServiceConfigFailureActions table, and
+                 this flag row is the one thing util:ServiceConfig cannot
+                 set, so the build suppresses that number (-sw1149). -->
+            <ServiceConfig FailureActionsWhen="failedToStopOrReturnedError"
+                           OnInstall="yes" OnReinstall="yes" />
+            <!-- Recovery actions, mirroring
+                 winservice.failure_actions_plan(60.0): restart after 60s,
+                 restart after 60s, then give up; reset the count daily.
+                 The native ServiceConfigFailureActions element writes the
+                 MsiServiceConfigFailureActions table, which the Windows
+                 Installer SDK documents as broken; this util element runs
+                 ChangeServiceConfig2 at execute time instead. -->
+            <util:ServiceConfig FirstFailureActionType="restart"
+                                SecondFailureActionType="restart"
+                                ThirdFailureActionType="none"
+                                RestartServiceDelayInSeconds="60"
+                                ResetPeriodInDays="1" />
+          </ServiceInstall>
+          <!-- Stop on install, repair, upgrade and uninstall; unregister on
+               uninstall only. Deliberately no Start here: a first install
+               has no configuration yet, and starting an unconfigured
+               service would burn its recovery retries and park it in an
+               error state. The conditional component below is the only
+               place a start is expressed. -->
+          <ServiceControl Id="CronstableServiceLifecycle"
+                          Name="cronstable"
+                          Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+
+        <!-- Start at the end of this install only when asked outright, or
+             when this is an upgrade and the machine-wide configuration
+             directory exists. -->
+        <Component Id="ServiceStartOnUpgrade"
+                   Condition="STARTSERVICE=1 OR (WIX_UPGRADE_DETECTED AND CRONSTABLE_CONFIG_FOUND)">
+          <RegistryValue Root="HKLM" Key="SOFTWARE\cronstable"
+                         Name="ServiceStartedByMsi" Type="integer" Value="1"
+                         KeyPath="yes" />
+          <ServiceControl Id="CronstableServiceStart" Name="cronstable"
+                          Start="install" Wait="no" />
+        </Component>
+
+        <!-- The install dir on the system PATH so `cronstable` works in a
+             fresh elevated shell; removed on uninstall. ADDPATH=0 opts out
+             for image builders. Open shells do not see the change until
+             restarted. -->
+        <Component Id="PathEntry" Condition="ADDPATH &lt;&gt; 0">
+          <RegistryValue Root="HKLM" Key="SOFTWARE\cronstable"
+                         Name="InstallDir" Type="string"
+                         Value="[INSTALLFOLDER]" KeyPath="yes" />
+          <Environment Id="SystemPathEntry" Name="PATH"
+                       Value="[INSTALLFOLDER]" Action="set" Part="last"
+                       Permanent="no" System="yes" />
+        </Component>
+
+        <!-- The one-directory payload: hundreds of files that change every
+             release. One auto component per file; GUIDs derive from the
+             installed path, and the early MajorUpgrade above is what makes
+             that churn safe. A PyInstaller one-directory build keeps
+             cronstable.exe (hand-authored above) as the only file at the
+             payload root and everything else under _internal, so
+             harvesting _internal is harvesting everything else. -->
+        <Directory Id="InternalFolder" Name="_internal">
+          <Files Include="$(var.Payload)\_internal\**" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+  </Package>
+</Wix>

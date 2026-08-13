@@ -153,3 +153,46 @@ def test_every_browser_backed_test_module_is_fenced():
         "re-driven by the enforcement step, so nothing proves they ever "
         "ran: {}".format(missing)
     )
+
+
+def test_release_hashes_exactly_what_it_attaches():
+    # The SHA256SUMS cp list and the gh-release files: list are both
+    # deliberately explicit (a glob would fold the CI-only macos26 assets
+    # in), and the attach is one-shot under immutable-release protection,
+    # so a name present in one list and missing from the other ships an
+    # unhashed asset or a hashed-but-unattached one with no red anywhere.
+    steps = _named_steps(_workflow()["jobs"]["release"])
+    hashed = set(
+        re.findall(r"binaries/\S+", steps["Generate SHA256SUMS"]["run"])
+    )
+    attached = set(
+        re.findall(
+            r"binaries/\S+", steps["Create GitHub Release"]["with"]["files"]
+        )
+    )
+    assert hashed == attached, (
+        "SHA256SUMS and the release files: list disagree; hashed-only: "
+        "{}, attached-only: {}".format(
+            sorted(hashed - attached), sorted(attached - hashed)
+        )
+    )
+
+
+def test_wix_tool_and_extension_pins_match():
+    # The Util extension's major must match the wix tool's major, and the
+    # two are pinned in the same step; a bump that moves one without the
+    # other fails at build time in CI, but only on a Windows lane run,
+    # which a docs-only PR never triggers. Pin them to each other here.
+    job = _workflow()["jobs"]["binaries-windows"]
+    run = _named_steps(job)["Build MSI"]["run"]
+    tool = re.search(
+        r"dotnet tool install --global wix --version (\S+)", run
+    )
+    ext = re.search(r"WixToolset\.Util\.wixext/(\S+)", run)
+    assert tool is not None, "the wix tool install lost its pin"
+    assert ext is not None, "the Util extension lost its pin"
+    assert tool.group(1) == ext.group(1), (
+        "wix tool pin {} and Util extension pin {} moved apart".format(
+            tool.group(1), ext.group(1)
+        )
+    )
