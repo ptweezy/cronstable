@@ -734,8 +734,9 @@ def _refuse_null_shapes(body: dict[str, Any]) -> None:
         for taskkey, entry in tasks.items():
             if entry is None:
                 raise ValueError(
-                    "damaged run document: task entry {!r} is "
-                    "null".format(taskkey)
+                    "damaged run document: task entry {!r} is null".format(
+                        taskkey
+                    )
                 )
 
 
