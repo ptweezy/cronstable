@@ -19,6 +19,8 @@ cronstable cursor|lock|artifact|idempotent|secret ...  [--scope NAME | --global]
 cronstable xcom push|pull|list ...
 cronstable mcp [--url URL] [--token TOKEN | --token-env VAR] [--check]
 cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [options]
+cronstable service install|remove|start|stop|status|run [options]
+cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
 ```
 
 Without a subcommand, `cronstable` is the scheduler daemon described below. With
@@ -477,6 +479,58 @@ cronstable tui [--url URL] [--token TOKEN | --token-env VAR] [--theme NAME]
 running daemon's web listener (`--url`, default `http://127.0.0.1:8080`). It
 requires an interactive terminal. Every option, key, and panel is documented
 on the [Terminal Dashboard](Terminal-Dashboard) page.
+
+## The `import-taskscheduler` subcommand
+
+```
+cronstable import-taskscheduler PATH... [-o FILE] [--timezone NAME]
+```
+
+Converts Windows Task Scheduler XML exports into cronstable jobs and exits.
+`PATH` may be an export file, a directory of `*.xml`, or `-` for standard
+input. The configuration goes to stdout or `-o`; a report of everything that
+could not be carried across goes to stderr, so the two separate cleanly:
+
+```shell
+schtasks /query /XML ONE > tasks.xml
+cronstable import-taskscheduler tasks.xml -o jobs.yaml 2> report.txt
+cronstable -v -c jobs.yaml
+```
+
+Exit `0` when something converted, `1` when the input could not be read or
+nothing usable came out, `2` for a usage error. It runs on any platform, not
+only Windows.
+
+Review the output before loading it: exporting a task does not unregister it.
+Expect a whole-machine export to convert only in part, since most registered
+tasks on a stock Windows install are COM-handler or event-driven internals.
+[Importing from Task Scheduler](Importing-Task-Scheduler) has the full
+mapping table and the reason behind every refusal.
+
+## The `service` subcommand
+
+```
+cronstable service install [--name NAME] [-c FILE-OR-DIR]
+                           [--start-type auto|delayed|demand]
+                           [--log-level LEVEL] [--log-file PATH | --no-log-file]
+                           [--console] [--restart-delay SECONDS] [--no-restart]
+cronstable service remove|start|stop|status [--name NAME] [--timeout SECONDS]
+cronstable service run [--name NAME] [-c FILE-OR-DIR] [options]
+```
+
+Windows only; on any other platform every action prints one line and exits
+`2`. `cronstable service install` registers the scheduler with the Service
+Control Manager so it starts at boot and runs whether or not anyone is
+logged on, and needs an elevated prompt. `run` is the entry point the SCM
+itself invokes and is not meant to be typed; run by hand it says so and
+exits `2`.
+
+Exit codes for the whole subcommand: `0` success, `1` a Windows failure
+(the message names the fix), `2` a refusal or a usage error.
+
+The full command set, the recovery-action behavior, where a service logs,
+the configuration-path rule, and the one install shape that cannot host a
+service are on [Windows Service](Windows-Service).
 
 ## Runtime model
 

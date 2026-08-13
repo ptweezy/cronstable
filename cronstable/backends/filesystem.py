@@ -381,7 +381,7 @@ class FilesystemBackend(ElectionReadsBase):
                         else ""
                     ),
                 )
-            elif IS_WINDOWS:  # pragma: no cover - Windows-only advisory
+            elif IS_WINDOWS:  # pragma: no cover (windows) - advisory
                 logger.warning(
                     "cluster: filesystem election on a Windows shared "
                     "mount: cross-host lock fidelity cannot be verified on "

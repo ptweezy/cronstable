@@ -1190,6 +1190,107 @@ def test_state_max_runs_custom():
     assert cfg["maxRunsPerJob"] == 5
 
 
+_ARCHIVING_JOB = (
+    "jobs:\n  - name: j\n    command: 'true'\n    schedule: '* * * * *'\n"
+    "    captureStdout: true\n    archiveOutput: true\n"
+)
+
+
+async def test_max_runs_of_one_is_floored_to_two_and_logged(tmp_path, caplog):
+    # the prune keeps the newest records by WRITE order, so a retention of 1
+    # leaves no room for a pair that landed inverted and the newer run is
+    # the one deleted, which is unrecoverable rather than merely misread.
+    # The floor prevents it; the log keeps the adjustment from being silent.
+    # archiveOutput is on so the SECOND stream the floor bounds is driven
+    # too, and the reconcile below drives the third call site.
+    from cronstable.state import _PRUNE_EVERY_APPENDS
+
+    cron = Cron(None, config_yaml=_ARCHIVING_JOB)
+    cfg = _state_cfg(
+        "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 1\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron.start_stop_state(cfg)
+        for i in range(_PRUNE_EVERY_APPENDS + 1):
+            cron._record_run("j", _info(i))
+            await _drain_state_writes(cron)
+        # _persist_reconciled_record, the third prune_keep call site and the
+        # one the plan for this item missed.  On its own stream, seeded with
+        # prune_keep=None appends: those do not tick the amortisation
+        # countdown, so the reconcile's append is the first prune-carrying
+        # one for runs/k and prunes immediately.
+        for i in range(3):
+            await cron.state_backend.append_record(
+                cron._run_stream("k"), {"outcome": "success", "i": i}
+            )
+        cron._reconcile_open_record(
+            "k",
+            None,
+            {
+                "startedAt": "2026-07-01T00:00:30+00:00",
+                "host": cron._state_host,
+            },
+            "reconciled-crash",
+        )
+        await _drain_state_writes(cron)
+    backend = cron.state_backend
+    assert len(await backend.list_records(cron._run_stream("j"))) == 2
+    # _archive_output prunes to the same bound, so a maxRunsPerJob: 1
+    # deployment retains two archived outputs as well
+    assert len(await backend.list_records(cron._log_stream("j"))) == 2
+    assert len(await backend.list_records(cron._run_stream("k"))) == 2
+    # ONCE at backend start, not once per append: an exact count, because
+    # `any` would stay green if the log moved into _run_prune_keep(), which
+    # is where the floor is applied and so the obvious place to put it.
+    floored = [
+        r for r in caplog.records if "maxRunsPerJob is 1" in r.getMessage()
+    ]
+    assert len(floored) == 1
+    # the configured value is left alone; only the prune floor moves
+    assert cron._state_max_runs == 1
+    assert cron._run_prune_keep() == 2
+
+
+async def test_max_runs_above_one_is_neither_floored_nor_logged(
+    tmp_path, caplog
+):
+    # the negative arm (green before and after, by design): a retention the
+    # floor does not touch is retained exactly and logs nothing
+    from cronstable.state import _PRUNE_EVERY_APPENDS
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    cfg = _state_cfg(
+        "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 5\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron.start_stop_state(cfg)
+    for i in range(_PRUNE_EVERY_APPENDS + 1):
+        cron._record_run("j", _info(i))
+        await _drain_state_writes(cron)
+    recs = await cron.state_backend.list_records(cron._run_stream("j"))
+    assert len(recs) == 5
+    assert not any("maxRunsPerJob" in r.getMessage() for r in caplog.records)
+
+
+async def test_max_runs_of_zero_leaves_the_ledger_unbounded(tmp_path, caplog):
+    # the other negative arm: <= 0 still means unbounded, so the floor
+    # applies to a retention bound and never imposes one
+    from cronstable.state import _PRUNE_EVERY_APPENDS
+
+    cron = Cron(None, config_yaml=_ONE_JOB)
+    cfg = _state_cfg(
+        "state:\n  path: " + str(tmp_path) + "\n  maxRunsPerJob: 0\n"
+    )
+    with caplog.at_level(logging.WARNING, logger="cronstable"):
+        await cron.start_stop_state(cfg)
+    for i in range(_PRUNE_EVERY_APPENDS + 1):
+        cron._record_run("j", _info(i))
+        await _drain_state_writes(cron)
+    recs = await cron.state_backend.list_records(cron._run_stream("j"))
+    assert len(recs) == _PRUNE_EVERY_APPENDS + 1
+    assert not any("maxRunsPerJob" in r.getMessage() for r in caplog.records)
+
+
 # --- JobRunInfo reconstruction ----------------------------------
 
 
