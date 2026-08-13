@@ -9,7 +9,9 @@ behavior, and [CLI Reference](CLI-Reference) for every other subcommand.
 
 ## Quick start
 
-From an elevated prompt:
+From an elevated prompt (the commands work identically from a pip or pipx
+install and from the extracted `cronstable.exe` of the published
+one-directory zip):
 
 ```shell
 cronstable init C:\ProgramData\cronstable
@@ -26,7 +28,8 @@ service.
 | Install shape | Can host a service |
 | --- | --- |
 | `pip install cronstable` / pipx | yes |
-| A PyInstaller one-directory build | yes |
+| The published zip (a one-directory build) | yes |
+| The [MSI](Windows-MSI) | yes (registers the service itself) |
 | The published one-file `.exe` (also what winget installs) | **no** |
 
 The one-file executable cannot host a Windows service, and `install`
@@ -38,7 +41,12 @@ SCM's timeout while the real program's own registration is refused with
 error 1063. Nothing in cronstable can change that, because it is the
 bootloader that forks.
 
-Install with pip or pipx to run as a service. The
+Download `cronstable-windows-amd64.zip` or `cronstable-windows-arm64.zip`
+(see [Running on
+Windows](Running-on-Windows#one-directory-zip-hosts-the-service)), or
+install with pip or pipx, to run as a service. The [MSI](Windows-MSI)
+registers the service during the install with the same settings `service
+install` writes, so none of the commands above are needed there. The
 [`schtasks` recipe](Running-on-Windows#running-unattended) remains the
 answer for the one-file executable, and it does start at boot and survive
 logoff; what it does not give you is the Services console, recovery actions

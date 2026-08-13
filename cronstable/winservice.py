@@ -33,7 +33,11 @@ What this module deliberately does not do is described in
 identity is its own piece of work), and it refuses to install from a
 one-file frozen binary, which cannot host a service at all because the
 PyInstaller bootloader runs the application in a child process the SCM
-never sees.
+never sees.  The published ``cronstable-windows-<arch>.zip`` and ``.msi``
+are one-directory builds and host a service normally; the one-file ``.exe``
+(also what winget installs) is the shape ``install`` refuses.  The MSI
+registers the service itself with the same settings ``install`` writes,
+fenced by ``tests/test_msi_parity.py``.
 """
 
 from __future__ import annotations
@@ -1348,9 +1352,13 @@ def install(args: Any, api: WinApi) -> int:
             "Windows service. Its bootloader unpacks itself and runs the "
             "program in a child process, so the process the Service "
             "Control Manager starts never registers, and the start fails "
-            "on the SCM's timeout. Install cronstable with pip or pipx and "
-            "run `cronstable service install` from there, or keep using "
-            "the schtasks recipe in the Windows documentation."
+            "on the SCM's timeout. Download the one-directory build "
+            "(cronstable-windows-amd64.zip or cronstable-windows-arm64.zip "
+            "on the releases page), extract it, and run `cronstable "
+            "service install` from its cronstable.exe; or install the "
+            ".msi, which registers the service itself; or install "
+            "cronstable with pip or pipx; or keep using the schtasks "
+            "recipe in the Windows documentation."
         )
     config = getattr(args, "config", None)
     if not config:

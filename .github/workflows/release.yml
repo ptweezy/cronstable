@@ -923,9 +923,13 @@ jobs:
   # Self-contained Windows binaries: amd64 on the hosted runner, arm64 on the
   # windows-11-arm runner. Any C-extension dep lacking a win_arm64 wheel (parts
   # of the aiohttp stack, ruamel.yaml.clib) compiles from sdist via the runner's
-  # Visual Studio ARM64 toolchain. Same pyinstaller pin + `--version` smoke test;
-  # the assets are cronstable-windows-<arch>.exe. Steps use bash (git bash ships
-  # on the Windows runners).
+  # Visual Studio ARM64 toolchain. Same pyinstaller pin + `--version` smoke test.
+  # Three assets per arch come out of here: the one-file
+  # cronstable-windows-<arch>.exe, the one-directory cronstable-windows-<arch>.zip
+  # (the shape that can host the Windows service; the one-file bootloader runs
+  # the app in a child process the SCM never sees), and the WiX MSI
+  # cronstable-windows-<arch>.msi carrying the same one-directory payload.
+  # Steps use bash (git bash ships on the Windows runners).
   binaries-windows:
     needs: version
     strategy:
@@ -989,6 +993,112 @@ jobs:
         with:
           name: cronstable-windows-${{ matrix.arch }}
           path: dist/cronstable-windows-${{ matrix.arch }}.exe
+          if-no-files-found: error
+          retention-days: 7
+      - name: Build one-directory bundle
+        env:
+          CRONSTABLE_BUNDLE: onedir
+        run: |
+          set -euo pipefail
+          # Second invocation of the same spec with the onedir knob; its own
+          # workpath so the one-file build's guts cache cannot bleed into a
+          # different layout. dist/cronstable.exe was renamed away above, so
+          # dist/cronstable/ is free.
+          uv run pyinstaller --workpath build-onedir --noconfirm pyinstaller/cronstable.spec
+          ./dist/cronstable/cronstable.exe --version
+          ./dist/cronstable/cronstable.exe --validate-config -c pyinstaller/smoke-push.yaml
+          # A real SCM round trip, because hosting a service is this
+          # artifact's whole point and the hosted runners are elevated.
+          # `service install` only needs the -c path to exist (it is baked
+          # absolute into the ImagePath); it never opens the service's log.
+          # Never `service start` here: there is nothing to run and a start
+          # would burn the recovery retries the install just configured.
+          # The trap keeps a failed step from leaking the service on the VM.
+          trap './dist/cronstable/cronstable.exe service remove --name cronstable-ci-smoke >/dev/null 2>&1 || true' EXIT
+          ./dist/cronstable/cronstable.exe service install --name cronstable-ci-smoke -c pyinstaller/smoke-push.yaml
+          ./dist/cronstable/cronstable.exe service status --name cronstable-ci-smoke | grep -i stopped
+          ./dist/cronstable/cronstable.exe service remove --name cronstable-ci-smoke
+          # Zip with the single top-level cronstable/ directory, so
+          # extracting into C:\Program Files yields the exact
+          # C:\Program Files\cronstable\cronstable.exe path the Windows
+          # documentation uses. root_dir/base_dir keep the folder prefix on
+          # every entry.
+          uv run python -c "import shutil; shutil.make_archive('dist/cronstable-windows-${{ matrix.arch }}', 'zip', root_dir='dist', base_dir='cronstable')"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-windows-${{ matrix.arch }}-zip
+          path: dist/cronstable-windows-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          retention-days: 7
+      # WiX is not preinstalled on windows-latest (removed from the WS2025
+      # image) or on windows-11-arm; the .NET tool install is the one path
+      # that is identical on both runners. Pinned like pyinstaller, and the
+      # Util extension major must match the tool major. (WiX v6 is under
+      # FireGiant's Open Source Maintenance Fee; open-source CI use is
+      # unaffected.) MSI assembly is not compilation, so -arch is metadata
+      # and the same steps serve both runners.
+      - name: Build MSI
+        env:
+          VERSION: ${{ needs.version.outputs.new }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          dotnet tool install --global wix --version 6.0.1
+          export PATH="$PATH:$(cygpath -u "$USERPROFILE")/.dotnet/tools"
+          wix extension add --global WixToolset.Util.wixext/6.0.1
+          # ProductVersion must be numeric X.Y.Z (MSI caps 255.255.65535);
+          # strip the setuptools_scm dev suffix on non-release builds, whose
+          # MSIs are 7-day CI artifacts and never published.
+          msiver="$(printf '%s' "$VERSION" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')"
+          case "$ARCH" in
+            amd64) wixarch=x64 ;;
+            arm64) wixarch=arm64 ;;
+          esac
+          # -sw1149: WiX warns on every native ServiceConfig element; the
+          # rationale for keeping it lives at the element in the .wxs.
+          wix build packaging/msi/cronstable.wxs \
+            -arch "$wixarch" \
+            -d Version="$msiver" \
+            -d Payload="$(cygpath -w "$PWD/dist/cronstable")" \
+            -ext WixToolset.Util.wixext \
+            -sw1149 \
+            -o "dist/cronstable-windows-${ARCH}.msi"
+          # ICE validation is a separate command in WiX v4+ (build does not
+          # run it). Errors fail the job.
+          wix msi validate "dist/cronstable-windows-${ARCH}.msi"
+      # A real machine-wide install/uninstall on the elevated runner. The
+      # service must exist afterwards but never be started: the runner has
+      # no configuration, and the .wxs only starts a service on an upgrade
+      # that finds one, or on an explicit STARTSERVICE=1.
+      # MSYS2_ARG_CONV_EXCL stops git bash from turning /i /qn into paths.
+      - name: Smoke-test MSI (install, verify, uninstall)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          msi="$(cygpath -w "$PWD/dist/cronstable-windows-${ARCH}.msi")"
+          MSYS2_ARG_CONV_EXCL='*' msiexec /i "$msi" /qn /norestart /l*v msi-install.log \
+            || { tail -n 100 msi-install.log; exit 1; }
+          # Registered, stopped, and the ImagePath is the exact quoted
+          # command line winservice.host_argv/image_path would write.
+          sc query cronstable | grep -q 'STOPPED'
+          sc qc cronstable | grep -F '"C:\Program Files\cronstable\cronstable.exe" -l INFO service run --name cronstable -c "C:\ProgramData\cronstable"'
+          # The recovery actions the Util custom action configured.
+          sc qfailure cronstable | grep -qi 'RESTART'
+          # The installed exe runs from Program Files.
+          "/c/Program Files/cronstable/cronstable.exe" --version
+          MSYS2_ARG_CONV_EXCL='*' msiexec /x "$msi" /qn /norestart /l*v msi-uninstall.log \
+            || { tail -n 100 msi-uninstall.log; exit 1; }
+          # Service and files are gone.
+          if sc query cronstable >/dev/null 2>&1; then
+            echo "service still registered after uninstall" >&2
+            exit 1
+          fi
+          test ! -e "/c/Program Files/cronstable/cronstable.exe"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: cronstable-windows-${{ matrix.arch }}-msi
+          path: dist/cronstable-windows-${{ matrix.arch }}.msi
           if-no-files-found: error
           retention-days: 7
 
@@ -1430,6 +1540,8 @@ jobs:
              binaries/cronstable-linux-riscv64-musl binaries/cronstable-linux-armv6-musl \
              binaries/cronstable-macos-amd64 binaries/cronstable-macos-arm64 \
              binaries/cronstable-windows-amd64.exe binaries/cronstable-windows-arm64.exe \
+             binaries/cronstable-windows-amd64.zip binaries/cronstable-windows-arm64.zip \
+             binaries/cronstable-windows-amd64.msi binaries/cronstable-windows-arm64.msi \
              "$work"/
           ( cd "$work" && sha256sum -- * ) > SHA256SUMS
           cat SHA256SUMS
@@ -1542,6 +1654,10 @@ jobs:
             binaries/cronstable-macos-arm64
             binaries/cronstable-windows-amd64.exe
             binaries/cronstable-windows-arm64.exe
+            binaries/cronstable-windows-amd64.zip
+            binaries/cronstable-windows-arm64.zip
+            binaries/cronstable-windows-amd64.msi
+            binaries/cronstable-windows-arm64.msi
 
   # Build + push the multi-arch container images at the just-released version.
   # Runs after `release` (so the tag it checks out exists) and is thus gated on
