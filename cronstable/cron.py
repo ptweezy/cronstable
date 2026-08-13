@@ -860,6 +860,11 @@ class PauseInfo:
         }
 
 
+#: What a row with no finish instant sorts as: OLDEST.  Shared by
+#: :func:`_run_finish_key` and the copy of it inlined into :func:`_run_stats`.
+_OLDEST_INSTANT = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
 def _run_finish_key(info: "JobRunInfo") -> datetime.datetime:
     """The instant a finished-run row is ordered by.
 
@@ -907,7 +912,7 @@ def _run_finish_key(info: "JobRunInfo") -> datetime.datetime:
     """
     finished = info.finished_at
     if finished is None:
-        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        return _OLDEST_INSTANT
     return finished
 
 
@@ -926,26 +931,48 @@ def _run_stats(runs: list[JobRunInfo]) -> dict[str, Any]:
     (the .ics event lengths, which read ``avg_duration`` only).
     """
     total = len(runs)
-    success = sum(1 for r in runs if r.outcome == "success")
-    failure = sum(1 for r in runs if r.outcome == "failure")
-    cancelled = sum(1 for r in runs if r.outcome == "cancelled")
-    # crash-reconciled runs, bucketed on their own so they are neither
-    # hidden in `total` nor miscounted as real failures.
-    unknown = sum(1 for r in runs if r.outcome == "unknown")
-    durations = [r.duration for r in runs if r.duration is not None]
+    success = failure = cancelled = unknown = 0
+    durations: list[float] = []
     # resource-monitored runs only (monitorResources); an unmonitored history
     # leaves these all None/absent so the dashboard hides the section.
-    monitored = [
-        r.resource_usage for r in runs if r.resource_usage is not None
-    ]
-    cpu_totals = [u.cpu_total_seconds for u in monitored]
-    rss_values = [u.max_rss_bytes for u in monitored]
-    # The newest run by finish time, NOT by list position. reversed() is
-    # what makes an equal-instant tie resolve to the LATER position, i.e.
-    # exactly what runs[-1] returned before: max returns the FIRST maximum
-    # it walks, so walking backwards yields the last maximum in list order.
-    # default=None replaces the `if runs else None` empty-list guard.
-    newest = max(reversed(runs), key=_run_finish_key, default=None)
+    cpu_totals: list[float] = []
+    rss_values: list[int] = []
+    newest: Optional[JobRunInfo] = None
+    newest_key: Optional[datetime.datetime] = None
+    # One walk over `runs`: the trends builder folds five windows of up to
+    # TREND_SCAN_LIMIT records per build, so each extra pass over the list
+    # is paid five times over.  The sums and extremes run over the collected
+    # lists vs. accumulating in the loop: sum() compensates float
+    # error, and a scalar accumulator would move avg_duration by an ULP and
+    # churn the /trends ETag.
+    for r in runs:
+        outcome = r.outcome
+        if outcome == "success":
+            success += 1
+        elif outcome == "failure":
+            failure += 1
+        elif outcome == "cancelled":
+            cancelled += 1
+        elif outcome == "unknown":
+            # crash-reconciled runs, bucketed on their own so they are
+            # neither hidden in `total` nor miscounted as real failures.
+            unknown += 1
+        duration = r.duration
+        if duration is not None:
+            durations.append(duration)
+        usage = r.resource_usage
+        if usage is not None:
+            cpu_totals.append(usage.cpu_total_seconds)
+            rss_values.append(usage.max_rss_bytes)
+        # Newest by finish time, NOT by list position: equivalent to
+        # max(reversed(runs), key=_run_finish_key), with the key inlined
+        # to keep the fold call-free.  `>=` resolves an equal instant to
+        # the LAST such row in list order.
+        finished = r.finished_at
+        key = _OLDEST_INSTANT if finished is None else finished
+        if newest_key is None or key >= newest_key:
+            newest_key = key
+            newest = r
     last_usage = newest.resource_usage if newest is not None else None
     return {
         "total": total,
