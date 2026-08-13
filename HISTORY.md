@@ -273,6 +273,40 @@ reporter that writes to the Windows Event Log.
   `%APPDATA%` has no such permission and is left as it is. Where the
   directory already exists, the daemon says so once at startup and prints
   an `icacls` line that fixes it.
+- The DAG advance pass does less work per entry. The tasks and fan-out
+  tables are resolved once per pass instead of once per task or
+  dependency, the common terminal states settle on one comparison rather
+  than two frozenset lookups, the cycle check walks the graph once, and
+  a claim builds its entry from a prepared template. In the same vein,
+  config fingerprinting splices the canonical bytes of unchanged hook
+  blocks instead of re-encoding them per job, the run stats behind
+  `/jobs/{name}/trends` fold their listing in one walk, and the stream
+  reader and output mirror shed per-line work. Digests and document
+  bytes are unchanged.
+- An advance pass refuses a run document that records null where a task
+  entry or the fan-out map belongs, naming the entry, before anything
+  is copied or claimed. Nothing writes those shapes, so they mean a
+  damaged or hand-edited document, and what happened before depended on
+  iteration order: an early null crashed the pass, and a late one read
+  as absent, which could start a task whose upstreams had failed.
+- A `%VAR%` in an imported task's Start-in directory is a blocking
+  note. The cmd.exe route that carries a `%VAR%` command cannot carry a
+  working directory, since the OS applies it before any shell runs, so
+  the task's YAML is emitted commented out with the literal path in
+  place to edit, rather than live and failing every spawn.
+- `report.eventlog.source` is validated on DAG task templates as it is
+  on jobs and `notify:`. A reserved log name or a path separator on a
+  task's hook loaded cleanly and surfaced only at runtime, as a dropped
+  record or one filed under the log's own key.
+- The printed `icacls` remedy grants read to Authenticated Users, the
+  same permissions `init` itself applies. As printed before, it severed
+  inheritance without the read grant, after which an unelevated
+  `cronstable` read the machine-wide directory as holding no
+  configuration and fell back to the per-user path.
+- Stopping the daemon waits for the Event Log writers on one shared
+  deadline. Each writer was joined with the full flush timeout in turn,
+  so several writers behind a wedged Event Log service could hold
+  shutdown for that many multiples of it.
 
 ## 1.2.39
 

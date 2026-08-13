@@ -2910,6 +2910,31 @@ def test_eventlog_source_rejects_a_separator_or_a_log_name(source, tmp_path):
         _eventlog_conf(tmp_path, source=source)
 
 
+def test_eventlog_source_is_validated_on_dag_task_templates(tmp_path):
+    # the walker once covered jobs and notify only, so a source refused on
+    # a job loaded clean on a DAG task template and only failed at runtime
+    (tmp_path / "jobs.yaml").write_text(
+        """
+state:
+  path: /tmp/x
+dags:
+  - name: pipe
+    schedule: "* * * * *"
+    tasks:
+      - id: a
+        command: foo
+        onFailure:
+          report:
+            eventlog:
+              enabled: true
+              source: Application
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="dag pipe task a"):
+        config.parse_config(str(tmp_path))
+
+
 def test_eventlog_source_is_ignored_in_a_disabled_block(tmp_path):
     # `source` carries a default into every report block of every hook, so
     # inspecting disabled blocks would let a stray value in a block nobody

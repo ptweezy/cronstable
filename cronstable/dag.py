@@ -28,6 +28,7 @@ than re-deriving it from a possibly-changed upstream output.
 """
 
 import re
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -97,6 +98,11 @@ TERMINAL_STATES = frozenset({SUCCESS, FAILED, SKIPPED, UPSTREAM_FAILED})
 SUCCESS_STATES = frozenset({SUCCESS})
 #: terminal states that make a downstream ``all_success`` dependency fail.
 FAILURE_STATES = frozenset({FAILED, UPSTREAM_FAILED})
+#: the states a claim pass leaves untouched: terminal, plus the EXPANDED
+#: group placeholder whose instances carry the real work.  One membership
+#: test for what was a membership test plus a comparison, on the first line
+#: of the per-instance dispatch.
+_INERT_TASK_STATES = TERMINAL_STATES | {EXPANDED}
 
 TASK = "task"
 SENSOR = "sensor"
@@ -192,6 +198,14 @@ class DagValidationError(Exception):
     """A malformed DAG graph (unknown dep, cycle, bad expand target)."""
 
 
+#: The characters :func:`validate_graph` bars from a task id: the C0 control
+#: range and DEL.  One precompiled scan per id, not a per-character generator:
+#: config load validates every task of every DAG, and the ``any(ord(ch) ...)``
+#: form paid a generator resume plus two ``ord`` calls for every character of
+#: every id (two thirds of the validation walk on a 10k-task graph).
+_ID_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def validate_graph(spec: DagSpec) -> None:
     """Raise :class:`DagValidationError` on an unusable graph.
 
@@ -218,7 +232,7 @@ def validate_graph(spec: DagSpec) -> None:
         # character (CR/LF) could forge or split daemon log lines. Reject the
         # C0 range and DEL here (the docstring already promises a safe
         # charset) without narrowing the printable set configs may rely on.
-        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in task.id):
+        if _ID_CONTROL.search(task.id):
             raise DagValidationError(
                 "task id {!r} may not contain control characters".format(
                     task.id
@@ -274,18 +288,39 @@ def _check_acyclic(spec: DagSpec) -> None:
     # Kahn's algorithm over the DEDUPED edge set: a repeated dependsOn entry
     # is one edge (counting it twice would leave a phantom indegree and a
     # false cycle verdict on an acyclic graph).
-    deps = {t.id: set(t.depends_on) for t in spec.tasks}
-    indeg = {t.id: len(deps[t.id]) for t in spec.tasks}
-    # Reverse adjacency, built from the SAME deduped map: popping a node then
+    #
+    # Indegrees, the reverse adjacency and the initial ready set are built in
+    # ONE walk over the tasks (they were four passes, three of them re-walking
+    # the same tuple or re-reading the deduped map).  Popping a node then
     # rescanning every task for it made the walk O(V^2) set tests (a 10k-task
     # chain took seconds of the config load).  validate_graph has already
     # rejected unknown deps, self-deps and duplicate ids above, so every dep
     # here names a real node and the edge set is identical either way.
+    #
+    # Two allocations per node are dropped along the way: the dedupe set is
+    # skipped for the 0- and 1-dep shapes, which cannot repeat an entry (the
+    # common node in a chain or a wide DAG), and each dependents list is built
+    # on its first edge rather than through ``setdefault(dep, [])``, which
+    # constructed and discarded a list on EVERY edge.  ``ready`` keeps its old
+    # contents and order: both it and ``indeg`` are filled in spec.tasks
+    # order, exactly what iterating ``indeg`` afterwards yielded.
+    indeg: dict[str, int] = {}
     dependents: dict[str, list[str]] = {}
-    for tid, d in deps.items():
-        for dep in d:
-            dependents.setdefault(dep, []).append(tid)
-    ready = [tid for tid, d in indeg.items() if d == 0]
+    ready: list[str] = []
+    for t in spec.tasks:
+        deps: Collection[str] = t.depends_on
+        if len(deps) > 1:
+            deps = set(deps)
+        indeg[t.id] = len(deps)
+        if not deps:
+            ready.append(t.id)
+            continue
+        for dep in deps:
+            downs = dependents.get(dep)
+            if downs is None:
+                dependents[dep] = [t.id]
+            else:
+                downs.append(t.id)
     ordered = 0
     while ready:
         tid = ready.pop()
@@ -361,9 +396,7 @@ def new_run_body(
     ``mapped: true``; they materialise into ``<id>#<i>`` instances once their
     upstream produces the item list (see :func:`plan_and_claim`).
     """
-    tasks: dict[str, dict[str, Any]] = {}
-    for task in spec.tasks:
-        tasks[task.id] = _new_task_entry(task, now)
+    tasks = {task.id: _new_task_entry(task, now) for task in spec.tasks}
     return {
         "dag": dag,
         "runKey": run_key,
@@ -378,24 +411,34 @@ def new_run_body(
     }
 
 
+#: The constant shape of a fresh task entry, copied rather than rebuilt: one
+#: run document holds one of these per task and up to MAX_MAPPED_ITEMS per
+#: mapped fan-out, so ``dict.copy()`` beats re-executing the literal.  Every
+#: value is an immutable scalar, so the copies share nothing mutable, and
+#: copy-then-overwrite preserves the key order the literal produced.
+_TASK_ENTRY: dict[str, Any] = {
+    "id": None,
+    "mapIndex": None,
+    "state": PENDING,
+    "attempt": 0,
+    "proc": None,
+    "pid": None,
+    "host": None,
+    "startedAt": None,
+    "finishedAt": None,
+    "exitCode": None,
+    "failReason": None,
+    # sampled CPU/peak-RSS of the finished instance (monitorResources);
+    # absent from pre-feature documents, so read it with .get().
+    "resources": None,
+    "updatedAt": None,
+}
+
+
 def _new_task_entry(task: TaskSpec, now: float) -> dict[str, Any]:
-    entry: dict[str, Any] = {
-        "id": task.id,
-        "mapIndex": None,
-        "state": PENDING,
-        "attempt": 0,
-        "proc": None,
-        "pid": None,
-        "host": None,
-        "startedAt": None,
-        "finishedAt": None,
-        "exitCode": None,
-        "failReason": None,
-        # sampled CPU/peak-RSS of the finished instance (monitorResources);
-        # absent from pre-feature documents, so read it with .get().
-        "resources": None,
-        "updatedAt": now,
-    }
+    entry = _TASK_ENTRY.copy()
+    entry["id"] = task.id
+    entry["updatedAt"] = now
     if task.expand is not None:
         entry["mapped"] = True
     if task.type == SENSOR:
@@ -464,13 +507,22 @@ class ReconcileAdvanceResult:
 # --------------------------------------------------------------------------
 
 
-def _mapped_instance_state(
-    tasks: dict[str, Any], prefix: str, index: int
-) -> str:
-    """The state of one ``<id>#<i>`` instance of an expanded task.
+#: Absent-key sentinel for the ``body["mapped"]`` lookups that ask both "is
+#: this task recorded as expanded?" and "give me its record": one ``.get``
+#: with the sentinel answers both, where a membership test followed by a
+#: ``.get`` hashed the id twice on paths that run once per task per advance
+#: pass.  Distinct from ``None``, which a damaged document can hold as a
+#: recorded value and which those paths already treat as "no instances".
+_UNSET = object()
 
-    THE one absent-entry rule, shared by the fan-in barrier
-    (:func:`_mapped_group_state`) and the run terminaliser
+
+def _fold_mapped_instances(
+    tasks: dict[str, Any], prefix: str, count: int
+) -> tuple[bool, bool, bool]:
+    """Reduce an expanded task's instances to ``(holds, failed, skipped)``.
+
+    THE one absent-entry rule (and the one WALK over it) shared by the
+    fan-in barrier (:func:`_mapped_group_state`) and the run terminaliser
     (:func:`_maybe_terminalise`).  Expansion materialises every instance in
     the same RMW that records the item list, so an entry missing for a
     run-recorded index can only mean a foreign or damaged run document; it
@@ -483,9 +535,36 @@ def _mapped_instance_state(
     materialises a run-recorded index it finds missing and fails it (see
     :func:`_resolve_missing_instance`), so the run terminalises on that
     very pass rather than wedging.
+
+    ``holds`` is the barrier verdict: at least one instance is not terminal,
+    which BOTH consumers act on before anything else, so the walk returns on
+    the first one and never builds the remaining keys.  Folding here rather
+    than per instance keeps the two consumers call-free over a fan-out that
+    can hold MAX_MAPPED_ITEMS entries.
     """
-    entry = tasks.get(prefix + str(index))
-    return PENDING if entry is None else str(entry.get("state", PENDING))
+    failed = False
+    skipped = False
+    tasks_get = tasks.get
+    for i in range(count):
+        entry = tasks_get(prefix + str(i))
+        state = PENDING if entry is None else entry.get("state", PENDING)
+        # An equality chain, not the TERMINAL_STATES/FAILURE_STATES
+        # memberships: SUCCESS is the overwhelmingly common instance state of
+        # a fan-out being folded, and settling it takes ONE comparison here
+        # where the sets took a hash plus a lookup in each of two frozensets.
+        # It also drops the str() coercion the memberships needed: a
+        # damaged document's non-string (even unhashable) state compares
+        # unequal to all four and falls to the same "not terminal" arm the
+        # coercion produced, instead of hashing it inside a flock.
+        if state == SUCCESS:
+            continue
+        if state == FAILED or state == UPSTREAM_FAILED:
+            failed = True
+        elif state == SKIPPED:
+            skipped = True
+        else:
+            return True, failed, skipped
+    return False, failed, skipped
 
 
 def _mapped_group_state(body: dict[str, Any], task_id: str) -> str:
@@ -501,28 +580,23 @@ def _mapped_group_state(body: dict[str, Any], task_id: str) -> str:
     Once all are terminal: any failed/upstream_failed -> ``upstream_failed``;
     else any skipped -> ``skipped``; else ``success``.
     """
-    mapped = body.get("mapped", {}).get(task_id)
+    mapped_all = body.get("mapped")
+    mapped = mapped_all.get(task_id) if mapped_all else None
     if mapped is None:
-        return str(body["tasks"].get(task_id, {}).get("state", PENDING))
+        entry = body["tasks"].get(task_id)
+        return PENDING if entry is None else str(entry.get("state", PENDING))
     items = mapped.get("items", [])
     if not items:
         return SUCCESS
-    tasks = body["tasks"]
     # One pass with an early exit, not a materialised states list plus three
     # scans: while a fan-out is in flight the FIRST instance is usually
     # non-terminal, so building the other MAX_MAPPED_ITEMS-1 keys and lookups
     # only to discard them is the bulk of this function's cost.
-    failed = False
-    skipped = False
-    prefix = task_id + "#"
-    for i in range(len(items)):
-        state = _mapped_instance_state(tasks, prefix, i)
-        if state not in TERMINAL_STATES:
-            return RUNNING  # fan-in barrier: not every instance is terminal
-        if state in FAILURE_STATES:
-            failed = True
-        elif state == SKIPPED:
-            skipped = True
+    holds, failed, skipped = _fold_mapped_instances(
+        body["tasks"], task_id + "#", len(items)
+    )
+    if holds:
+        return RUNNING  # fan-in barrier: not every instance is terminal
     if failed:
         return UPSTREAM_FAILED
     if skipped:
@@ -540,9 +614,11 @@ def effective_state(spec: DagSpec, body: dict[str, Any], task_id: str) -> str:
     would leave every downstream (and the run) waiting forever.
     """
     task = spec.by_id[task_id]
-    if task.expand is not None or task_id in body.get("mapped", {}):
+    mapped_all = body.get("mapped")
+    if task.expand is not None or (mapped_all and task_id in mapped_all):
         return _mapped_group_state(body, task_id)
-    return str(body["tasks"].get(task_id, {}).get("state", PENDING))
+    entry = body["tasks"].get(task_id)
+    return PENDING if entry is None else str(entry.get("state", PENDING))
 
 
 def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
@@ -557,7 +633,11 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
         # non-terminal, failed or skipped); this is the common shape in a wide
         # DAG and it skips the whole reduction below.
         return "ready"
-    tasks = body.get("tasks", {})
+    # ``or {}`` rather than a ``.get`` default: the default is built on every
+    # call, key present or not, and this resolves once per task per pass.
+    tasks = body.get("tasks") or {}
+    by_id = spec.by_id
+    mapped_all = body.get("mapped")
     # A dependency with NO entry in this run document was added to the DAG by a
     # config reload AFTER the run was created (creation materialises every
     # then-current task): it is not part of this run's plan, so it cannot gate
@@ -567,17 +647,30 @@ def _deps_verdict(spec: DagSpec, body: dict[str, Any], task: TaskSpec) -> str:
     failed = False
     skipped = False
     for dep in task.depends_on:
-        if dep not in tasks:
+        entry = tasks.get(dep)
+        if entry is None:
             continue
-        state = effective_state(spec, body, dep)
-        if state not in TERMINAL_STATES:
-            # one non-terminal upstream settles it: the remaining reductions
-            # (each an O(instances) walk for a mapped upstream) are dead work.
-            return "wait"
-        if state in FAILURE_STATES:
+        if (mapped_all and dep in mapped_all) or by_id[dep].expand is not None:
+            state = _mapped_group_state(body, dep)
+        else:
+            # effective_state's plain branch, inlined: the fan-out map and
+            # the dep's entry are both already in hand here, where the call
+            # re-resolved them from the body for every dependency.
+            state = entry.get("state", PENDING)
+        # The same equality chain :func:`_fold_mapped_instances` folds with,
+        # for the same reasons: SUCCESS is the state an upstream reduction
+        # almost always lands on, and comparing rather than hashing keeps a
+        # damaged document's non-string state out of a frozenset.
+        if state == SUCCESS:
+            continue
+        if state == FAILED or state == UPSTREAM_FAILED:
             failed = True
         elif state == SKIPPED:
             skipped = True
+        else:
+            # one non-terminal upstream settles it: the remaining reductions
+            # (each an O(instances) walk for a mapped upstream) are dead work.
+            return "wait"
     if task.trigger_rule == ALL_DONE:
         return "ready"
     # all_success
@@ -609,11 +702,13 @@ def tasks_awaiting_expansion(
         return out  # nothing in this DAG can expand: no candidates to walk
     if is_terminal_run(body):
         return out
+    mapped_all = body.get("mapped")
+    tasks = body.get("tasks") or {}
     for task in spec.mapped_tasks:
         exp = task.expand
-        if exp is None or task.id in body.get("mapped", {}):
+        if exp is None or (mapped_all and task.id in mapped_all):
             continue
-        entry = body.get("tasks", {}).get(task.id)
+        entry = tasks.get(task.id)
         if entry is not None and entry.get("state") != PENDING:
             # the placeholder already resolved without expanding (upstream
             # failed/skipped, or the fan-out failed the item cap): re-reading
@@ -622,6 +717,26 @@ def tasks_awaiting_expansion(
         if effective_state(spec, body, exp.from_task) == SUCCESS:
             out.append((task.id, exp.from_task, exp.key))
     return out
+
+
+def _refuse_null_shapes(body: dict[str, Any]) -> None:
+    """Refuse ``tasks: {x: null}`` and ``mapped: null`` before any mutation.
+
+    Nothing in this module writes either shape, so both mean a damaged or
+    foreign document.  The readers below disagree on what null means
+    (absent, pending, or an empty fan-out), so one check up front replaces
+    an order-dependent crash or a silent wedge.
+    """
+    if body.get("mapped", _UNSET) is None:
+        raise ValueError("damaged run document: 'mapped' is null")
+    tasks = body.get("tasks")
+    if tasks:
+        for taskkey, entry in tasks.items():
+            if entry is None:
+                raise ValueError(
+                    "damaged run document: task entry {!r} is "
+                    "null".format(taskkey)
+                )
 
 
 def plan_and_claim(
@@ -659,6 +774,7 @@ def plan_and_claim(
         result = AdvanceResult()
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
+        _refuse_null_shapes(body)
         if _is_quiescent(spec, body, now, proc, expansions):
             # the pre-scan proved nothing below can change this body: skip
             # the deep copy (and the rewrite) entirely.  On a large fan-out
@@ -710,7 +826,8 @@ def _apply_expansions(
         task = spec.by_id.get(task_id)
         if task is None or task.expand is None:
             continue
-        if task_id in body.get("mapped", {}):
+        mapped_all = body.get("mapped")
+        if mapped_all and task_id in mapped_all:
             continue  # already expanded (stale pre-read); idempotent
         if effective_state(spec, body, task.expand.from_task) != SUCCESS:
             continue  # upstream no longer success under this fresh body
@@ -739,13 +856,25 @@ def _apply_expansions(
         if placeholder is not None:
             placeholder["state"] = EXPANDED
             placeholder["updatedAt"] = now
+        # Materialise the instances from ONE built entry: the rest are shallow
+        # copies carrying their own mapIndex/mapItem.  A fan-out can hold
+        # MAX_MAPPED_ITEMS instances, and this replaces that many entry builds
+        # (each re-deciding the mapped/sensor/approval keys, then popping the
+        # placeholder-only "mapped" flag straight back off) with that many
+        # dict.copy() calls.  Every template value is an immutable scalar, so
+        # the copies share nothing mutable, and copy-then-overwrite leaves the
+        # key order the per-instance build produced.
+        tasks = body["tasks"]
+        prefix = task_id + "#"
+        template = _new_task_entry(task, now)
+        # task.expand is not None here (checked above), so the flag is always
+        # present; an instance is not the group placeholder.
+        del template["mapped"]
         for i, item in enumerate(items):
-            key = task_display_key(task_id, i)
-            entry = _new_task_entry(task, now)
+            entry = template.copy()
             entry["mapIndex"] = i
-            entry.pop("mapped", None)
             entry["mapItem"] = item
-            body["tasks"][key] = entry
+            tasks[prefix + str(i)] = entry
         result.changed = True
 
 
@@ -761,15 +890,23 @@ def _instances_of(
     its ``expand:`` keeps dispatching its recorded instances, because its
     placeholder is parked EXPANDED and no path could ever advance it.
     """
-    if task.expand is None and task.id not in body.get("mapped", {}):
-        return [(task.id, None, None)]
-    mapped = body.get("mapped", {}).get(task.id)
+    # ONE sentinel-defaulted lookup answers both questions the two
+    # ``body["mapped"]`` reads used to ask separately ("is it recorded?", then
+    # "give me the record"), on a path that runs once per spec task per
+    # advance pass.  A recorded-but-null value still means "no instances",
+    # exactly as the second read's ``is None`` arm did.
+    mapped_all: Any = body.get("mapped")
+    mapped: Any = mapped_all.get(task.id, _UNSET) if mapped_all else _UNSET
+    if mapped is _UNSET:
+        return [] if task.expand is not None else [(task.id, None, None)]
     if mapped is None:
         return []
     items = mapped.get("items", [])
-    return [
-        (task_display_key(task.id, i), i, item) for i, item in enumerate(items)
-    ]
+    # task_display_key's mapped branch with its prefix hoisted out of the
+    # comprehension: every index here has a real map_index, so the None arm
+    # and the call itself are dead weight once per instance.
+    prefix = task.id + "#"
+    return [(prefix + str(i), i, item) for i, item in enumerate(items)]
 
 
 def _propagate_and_claim(
@@ -780,13 +917,52 @@ def _propagate_and_claim(
     host: str,
     result: AdvanceResult,
 ) -> None:
+    # Hoisted out of the loops: both were re-resolved once per TASK, and
+    # body["tasks"] again once per INSTANCE, so a wide DAG or a large fan-out
+    # repeated the same two lookups thousands of times per pass.  Both are
+    # safe to bind once: nothing below replaces either dict, it only mutates
+    # them (_resolve_missing_instance adds a task entry, and no path here
+    # records a fan-out), so the loop still sees every write.
+    tasks = body["tasks"]
+    mapped_all: Any = body.get("mapped")
     for task in spec.tasks:
-        if task.expand is not None and task.id not in body.get("mapped", {}):
+        expanded = bool(mapped_all) and task.id in mapped_all
+        if task.expand is not None and not expanded:
             # un-expanded mapped placeholder: only propagate an upstream
             # failure/skip to it (readiness -> expansion needs an out-of-band
             # XCom read, applied in _apply_expansions, so leave a ready one
             # pending here for the next pass).
             _propagate_placeholder(spec, body, task, now, result)
+            continue
+        if not expanded:
+            # A plain task with no recorded fan-out is exactly one instance
+            # keyed by its id: :func:`_instances_of`'s single-instance
+            # branch, inlined because it is the node every non-mapped DAG is
+            # made of and the call built a one-tuple inside a one-list for
+            # each of them on every pass.  The mapped arm below still goes
+            # through _instances_of, which owns the recorded-fan-out rule.
+            entry = tasks.get(task.id)
+            if entry is None:
+                # deliberately skipped: a task a reload added after the run
+                # was created, which the terminaliser skips as well
+                continue
+            verdict: Optional[str] = None
+            if entry.get("state") == PENDING:
+                verdict = _deps_verdict(spec, body, task)
+            _advance_task(
+                spec,
+                body,
+                task,
+                task.id,
+                None,
+                None,
+                entry,
+                now,
+                proc,
+                host,
+                result,
+                verdict,
+            )
             continue
         # The deps verdict is a function of the TASK (all map instances
         # share the same upstreams), and nothing this task's own instance
@@ -796,9 +972,9 @@ def _propagate_and_claim(
         # mapped upstream of M instances that is the difference between
         # O(M) and O(N*M) state reductions per pass.  Computed lazily so
         # a task with no pending instance skips it entirely.
-        verdict: Optional[str] = None
+        verdict = None
         for taskkey, map_index, item in _instances_of(spec, body, task):
-            entry = body["tasks"].get(taskkey)
+            entry = tasks.get(taskkey)
             if entry is None:
                 if map_index is not None:
                     # A HOLE: the run's own mapped item list records this
@@ -857,8 +1033,9 @@ def _propagate_placeholder(spec, body, task, now, result) -> None:
     # "fail"/"skip") does not wedge the run when its source fails/skips.
     if task.expand is not None:
         from_task = task.expand.from_task
-        in_run = from_task in body.get("tasks", {}) or from_task in body.get(
-            "mapped", {}
+        mapped_all = body.get("mapped")
+        in_run = from_task in body["tasks"] or bool(
+            mapped_all and from_task in mapped_all
         )
         if not in_run:
             # The expand source has NO entry in this run document, so it was
@@ -925,7 +1102,7 @@ def _resolve_missing_instance(
     :func:`_apply_expansions` wrote an entry for it and something later
     removed it: a partial backup restore, a hand edit, or a peer on a
     different build.  The entry cannot be recovered, and leaving the hole is
-    worse than failing it: :func:`_mapped_instance_state` reads an absent
+    worse than failing it: :func:`_fold_mapped_instances` reads an absent
     entry as PENDING (the fan-in barrier's rule), so the terminaliser would
     hold the run open forever, renewing its advance lease for the life of the
     daemon and never becoming eligible for retention.
@@ -970,7 +1147,7 @@ def _resolve_stale_placeholder(task, entry, now, result) -> None:
     (``awaitingApproval`` -- an operator decision can still resolve it).
     """
     state = entry.get("state")
-    if state in TERMINAL_STATES or state == EXPANDED:
+    if state in _INERT_TASK_STATES:
         return
     if state == RUNNING and (
         entry.get("proc") is not None or entry.get("awaitingApproval")
@@ -1000,7 +1177,7 @@ def _advance_task(
     verdict=None,
 ) -> None:
     state = entry.get("state")
-    if state in TERMINAL_STATES or state == EXPANDED:
+    if state in _INERT_TASK_STATES:
         return
     if state == RUNNING:
         _advance_running(
@@ -1182,14 +1359,15 @@ def _maybe_terminalise(spec, body, now, result) -> None:
     # usually the one that proves it.  ``failed`` accumulates inline for the
     # run-state verdict, which is only consulted once every state is terminal.
     tasks = body["tasks"]
-    mapped_all = body.get("mapped", {})
+    mapped_all = body.get("mapped")
     failed = False
     for task in spec.tasks:
         # keyed on the RUN's recorded fan-out, not the spec: a task that
         # expanded before a reload removed its `expand:` still contributes
         # its instances, never its placeholder (parked non-terminally in
         # EXPANDED, which would hold the run open forever).
-        if task.id not in mapped_all:
+        mapped: Any = mapped_all.get(task.id, _UNSET) if mapped_all else _UNSET
+        if mapped is _UNSET:
             entry = tasks.get(task.id)
             if entry is None:
                 continue  # task added post-creation: not part of this run
@@ -1199,22 +1377,21 @@ def _maybe_terminalise(spec, body, now, result) -> None:
             if st in FAILURE_STATES:
                 failed = True
             continue
-        mapped = mapped_all.get(task.id)
         items = mapped.get("items", []) if mapped is not None else []
-        prefix = task.id + "#"
-        for i in range(len(items)):
-            # _mapped_instance_state is the shared absent-entry rule: an
-            # entry missing for a run-recorded index reads as pending, so a
-            # damaged document holds the run open (matching the fan-in
-            # barrier's verdict) instead of completing around the hole.
-            # _propagate_and_claim, earlier in this same transform, has
-            # already materialised and failed any such hole, so holding
-            # open here costs at most the rest of this pass.
-            st = _mapped_instance_state(tasks, prefix, i)
-            if st not in TERMINAL_STATES:
-                return
-            if st in FAILURE_STATES:
-                failed = True
+        # _fold_mapped_instances is the shared absent-entry rule: an entry
+        # missing for a run-recorded index reads as pending, so a damaged
+        # document holds the run open (matching the fan-in barrier's
+        # verdict) instead of completing around the hole.
+        # _propagate_and_claim, earlier in this same transform, has already
+        # materialised and failed any such hole, so holding open here costs
+        # at most the rest of this pass.
+        holds, inst_failed, _skipped = _fold_mapped_instances(
+            tasks, task.id + "#", len(items)
+        )
+        if holds:
+            return
+        if inst_failed:
+            failed = True
     run_state = FAILED if failed else SUCCESS
     if body.get("state") != run_state:
         body["state"] = run_state
@@ -1283,8 +1460,14 @@ def _is_quiescent(
     if tasks_awaiting_expansion(spec, body):
         return False
     blocked = False
-    for taskkey, entry in body.get("tasks", {}).items():
-        verdict = _entry_quiescence(spec, body, taskkey, entry, now, proc)
+    # resolved once for the whole scan rather than once (twice, inside
+    # _q_blocked) per entry: this walks every entry of a document that can
+    # hold MAX_MAPPED_ITEMS of them, on every advance.
+    mapped_all: Any = body.get("mapped")
+    for taskkey, entry in (body.get("tasks") or {}).items():
+        verdict = _entry_quiescence(
+            spec, body, taskkey, entry, now, proc, mapped_all
+        )
         if verdict == _Q_ACT:
             return False
         if verdict == _Q_BLOCKED:
@@ -1302,16 +1485,24 @@ def _entry_quiescence(
     entry: dict[str, Any],
     now: float,
     proc: str,
+    mapped_all: Any = _UNSET,
 ) -> str:
     """Classify one task entry for :func:`_is_quiescent` (see the verdicts).
 
     Mirrors the state dispatch of :func:`_advance_task`,
     :func:`_advance_running` and the reconcile loop, erring to ``_Q_ACT``
     for anything it cannot positively place.
+
+    ``mapped_all`` is the body's recorded fan-out map, hoisted out of the
+    scan by :func:`_is_quiescent` so the whole walk resolves it once; omitted
+    (a direct caller), it is resolved here, after the terminal-entry fast
+    path that never needs it.
     """
     state = entry.get("state")
     if state in TERMINAL_STATES:
         return _Q_INERT
+    if mapped_all is _UNSET:
+        mapped_all = body.get("mapped")
     task_id = entry.get("id")
     task = spec.by_id.get(task_id) if isinstance(task_id, str) else None
     if task is None:
@@ -1321,7 +1512,7 @@ def _entry_quiescence(
         # quiescent verdict resting on it would keep the document forever).
         return _Q_ACT
     if state == EXPANDED:
-        if task.expand is None and task_id not in body.get("mapped", {}):
+        if task.expand is None and not (mapped_all and task_id in mapped_all):
             # marked expanded with no recorded fan-out to stand in for it:
             # a shape this scan does not recognise; the full pass owns it.
             return _Q_ACT
@@ -1336,12 +1527,12 @@ def _entry_quiescence(
             return _Q_ACT
         if due_at <= now:
             return _Q_ACT  # the backoff has elapsed: claimable this pass
-        return _q_blocked(body, task, taskkey, entry)
+        return _q_blocked(mapped_all, task, taskkey, entry)
     if state == RUNNING:
         if entry.get("awaitingApproval"):
             # a parked approval gate: reconcile skips it, claims skip it,
             # and its non-terminal state pins the run open.
-            return _q_blocked(body, task, taskkey, entry)
+            return _q_blocked(mapped_all, task, taskkey, entry)
         entry_proc = entry.get("proc")
         if entry_proc is not None:
             if entry_proc != proc:
@@ -1350,7 +1541,7 @@ def _entry_quiescence(
                 return _Q_ACT
             # our own live claim: reconcile trusts the proc token, and the
             # claim/poke logic always skips an in-flight instance.
-            return _q_blocked(body, task, taskkey, entry)
+            return _q_blocked(mapped_all, task, taskkey, entry)
         if task.type != SENSOR or entry.get("pid") is not None:
             # a proc-less RUNNING entry is only ever a sensor idling
             # between pokes (see reconcile_crashed); anything else here is
@@ -1364,7 +1555,7 @@ def _entry_quiescence(
                 return _Q_ACT  # the poke is due at this pass's now
         except (TypeError, ValueError):
             return _Q_ACT
-        return _q_blocked(body, task, taskkey, entry)
+        return _q_blocked(mapped_all, task, taskkey, entry)
     if state == PENDING and task.expand is None:
         # A pending PLAIN task whose upstreams are not all terminal is inert
         # this pass exactly like an in-flight one: _advance_task returns on a
@@ -1378,14 +1569,14 @@ def _entry_quiescence(
         # A mapped placeholder is deliberately excluded: expansion and
         # _propagate_placeholder can both move it while its deps still "wait".
         if _deps_verdict(spec, body, task) == "wait":
-            return _q_blocked(body, task, taskkey, entry)
+            return _q_blocked(mapped_all, task, taskkey, entry)
     # PENDING and claimable/propagatable, or a state this build does not
     # recognise.
     return _Q_ACT
 
 
 def _q_blocked(
-    body: dict[str, Any],
+    mapped_all: Any,
     task: TaskSpec,
     taskkey: str,
     entry: dict[str, Any],
@@ -1400,10 +1591,17 @@ def _q_blocked(
     quiescent verdict resting on such an entry could wedge the run.
     Anything that cannot be positively matched to a consulted slot falls
     back to the full pass.
+
+    ``mapped_all`` is the body's recorded fan-out map, resolved once by
+    :func:`_is_quiescent` for the whole scan: this ran on nearly every entry
+    of the document and read ``body["mapped"]`` twice each time.
     """
-    if task.expand is None and task.id not in body.get("mapped", {}):
+    # one sentinel-defaulted lookup for the membership test and the record
+    # alike; a non-dict (missing, or damaged) fails the isinstance below and
+    # lands on _Q_ACT, exactly as the separate reads did.
+    mapped = mapped_all.get(task.id, _UNSET) if mapped_all else _UNSET
+    if task.expand is None and mapped is _UNSET:
         return _Q_BLOCKED if taskkey == task.id else _Q_ACT
-    mapped = body.get("mapped", {}).get(task.id)
     items = mapped.get("items") if isinstance(mapped, dict) else None
     map_index = entry.get("mapIndex")
     if (
@@ -1889,6 +2087,7 @@ def reconcile_and_plan(
         result = ReconcileAdvanceResult(advance=advance)
         if body is None or is_terminal_run(body):
             return _DOC_KEEP, result
+        _refuse_null_shapes(body)
         if _is_quiescent(spec, body, now, proc, None):
             return _DOC_KEEP, result
         # deep copy for the same reason plan_and_claim does: the transform
