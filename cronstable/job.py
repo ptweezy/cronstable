@@ -349,8 +349,8 @@ class _MirrorWriter:
         while True:
             self._wake.wait()
             with self._lock:
-                batch = list(self._batches)
-                self._batches.clear()
+                batch = self._batches
+                self._batches = deque()
                 self._pending_bytes = 0
                 self._wake.clear()
             wrote = False
@@ -549,7 +549,7 @@ class StreamReader:
         # (the web UI) can tail output as the job produces it.
         self.on_line = on_line
         # lines awaiting one batched passthrough write to the daemon's own
-        # stdout/stderr; flushed once per drained read (see _queue_emit).
+        # stdout/stderr; flushed once per drained read (see _read).
         self._emit_buffer: list[str] = []
         self._emit_scheduled = False
         self._reader = asyncio.create_task(self._read(stream))
@@ -593,16 +593,6 @@ class StreamReader:
         # whole daemon behind one wedged log consumer.
         _MIRROR.submit(self.job_name, self.stream_name, text)
 
-    def _queue_emit(self, out_line: str) -> None:
-        # One write+flush per DRAINED READ, not per line: a flush scheduled
-        # with call_soon runs only once the read loop actually blocks for
-        # new data, by which point the whole burst is buffered and goes out
-        # as a single write.
-        self._emit_buffer.append(out_line)
-        if not self._emit_scheduled:
-            self._emit_scheduled = True
-            asyncio.get_running_loop().call_soon(self._flush_emit_buffer)
-
     async def _read(self, stream):
         """Drain ``stream`` to EOF, splitting it into lines.
 
@@ -627,13 +617,21 @@ class StreamReader:
         )
         limit_top = self.save_limit // 2
         limit_bottom = self.save_limit - limit_top
-        passthrough = self.stream_name in ("stdout", "stderr")
+        stream_name = self.stream_name
+        passthrough = stream_name in ("stdout", "stderr")
         cap = self.max_line_length
         on_line = self.on_line
-        save_limit = self.save_limit
-        save_top = self.save_top
+        saving = self.save_limit > 0
         save_bottom = self.save_bottom
         discarded = self.discarded_lines
+        save_top_append = self.save_top.append
+        save_bottom_append = save_bottom.append
+        save_bottom_popleft = save_bottom.popleft
+        top_room = limit_top
+        bottom_room = limit_bottom
+        emit_buffer = self._emit_buffer
+        emit_buffer_append = emit_buffer.append
+        loop = asyncio.get_running_loop()
         # Bytes after the last newline seen: not a line until the next
         # chunk (or EOF) terminates it.  Held as a LIST of chunks plus a
         # running length and joined exactly once, so an unterminated run
@@ -673,30 +671,36 @@ class StreamReader:
                 lines = []
             for line in lines:
                 if on_line is not None:
-                    on_line(self.stream_name, line)
+                    on_line(stream_name, line)
                 if passthrough:
-                    self._queue_emit(prefix + line)
-                if save_limit > 0:
-                    if len(save_top) < limit_top:
-                        save_top.append(line)
+                    emit_buffer_append(prefix + line)
+                if saving:
+                    if top_room:
+                        top_room -= 1
+                        save_top_append(line)
+                    elif bottom_room:
+                        bottom_room -= 1
+                        save_bottom_append(line)
                     else:
                         # deque(maxlen) would evict silently; track discards
                         # explicitly to preserve the "N lines discarded"
                         # count.
-                        if len(save_bottom) == limit_bottom:
-                            save_bottom.popleft()
-                            discarded += 1
-                        save_bottom.append(line)
+                        save_bottom_popleft()
+                        discarded += 1
+                        save_bottom_append(line)
                 else:
                     discarded += 1
             # Published before the next await, so a reader cancelled by
             # join()'s timeout still reports the count it had reached.
             self.discarded_lines = discarded
             if not chunk:
-                # EOF: push out whatever the last drain accumulated (the
+                # EOF: push out whatever the last drain accumulated (an
                 # already-scheduled callback then finds an empty buffer).
                 self._flush_emit_buffer()
                 return
+            if emit_buffer and not self._emit_scheduled:
+                self._emit_scheduled = True
+                loop.call_soon(self._flush_emit_buffer)
             if self._over_cap(tail_len, cap):
                 # unterminated run past the cap: drop what has piled up and
                 # keep reading. Measured on the running length, so it is
@@ -1465,7 +1469,10 @@ def _eventlog_safe(value: Any, limit: int) -> str:
     else:
         text = str(value)
     text = text.replace("\x00", " ")
-    text = text.encode("utf-16-le", "replace").decode("utf-16-le", "replace")
+    if not text.isascii():
+        text = text.encode("utf-16-le", "replace").decode(
+            "utf-16-le", "replace"
+        )
     if len(text) > limit:
         # Marked, so nobody reads a cut tail as the whole story, and sized
         # off the marker so the result is exactly `limit` and the ceiling
@@ -2476,17 +2483,18 @@ class RunningJob:
 
     @property
     def fail_reason(self) -> Optional[str]:
-        if self.config.failsWhen["always"]:
+        fails_when = self.config.failsWhen
+        if fails_when["always"]:
             return "failsWhen=always"
-        if self.config.failsWhen["nonzeroReturn"] and self.retcode != 0:
+        if fails_when["nonzeroReturn"] and self.retcode != 0:
             return "failsWhen=nonzeroReturn and retcode={}".format(
                 self.retcode
             )
-        if self.config.failsWhen["producesStdout"] and (
+        if fails_when["producesStdout"] and (
             self.stdout or self.stdout_discarded
         ):
             return "failsWhen=producesStdout and stdout is not empty"
-        if self.config.failsWhen["producesStderr"] and (
+        if fails_when["producesStderr"] and (
             self.stderr or self.stderr_discarded
         ):
             return "failsWhen=producesStderr and stderr is not empty"
