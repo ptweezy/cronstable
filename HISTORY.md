@@ -307,6 +307,14 @@ reporter that writes to the Windows Event Log.
   deadline. Each writer was joined with the full flush timeout in turn,
   so several writers behind a wedged Event Log service could hold
   shutdown for that many multiples of it.
+- `service install` sets its recovery actions again. The handle it
+  configured the service through carried only the change-config right,
+  and Windows refuses a recovery plan containing a restart action unless
+  the handle also carries the start right, even from an elevated prompt.
+  Every install therefore registered the service and then failed with
+  "could not set the recovery actions: access denied", exiting 1 with no
+  recovery configured. The handle now requests both rights for exactly
+  that call.
 
 ## 1.2.39
 
