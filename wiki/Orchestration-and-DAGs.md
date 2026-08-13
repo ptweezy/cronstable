@@ -72,8 +72,9 @@ A task's readiness is governed by its `triggerRule`:
 
 Per-task launch fields mirror a job: `shell`, `environment`, `captureStdout` /
 `captureStderr`, `executionTimeout`, `killTimeout`, `user` / `group`,
-`failsWhen`, run-scoped `secrets`, `monitorResources`, and the rest of the
-shared launch keys; the complete list, with types and defaults, is in the
+`workingDirectory`, `priority`, `failsWhen`, run-scoped `secrets`,
+`monitorResources`, and the rest of the shared launch keys; the complete
+list, with types and defaults, is in the
 [configuration reference](Configuration-Reference#dags). Because a task **is**
 a job invocation, its launch fields inherit the file's
 [`defaults:` block](Includes-and-Defaults#the-defaults-section) the same way a

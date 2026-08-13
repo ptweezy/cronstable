@@ -20,12 +20,19 @@ import cronstable.__main__ as main
 def test_building_cli_does_not_import_tui(monkeypatch):
     """The whole point: constructing the parser must not pull in cronstable.tui
     (its module body + unicodedata table cost ~50ms). mcpcli is likewise heavy
-    enough to keep off the parser-build path every thin client walks, and
-    jobcli drags urllib.request/ssl/email in for ~27ms more.
+    enough to keep off the parser-build path every thin client walks, jobcli
+    drags urllib.request/ssl/email in for ~27ms more, and winservice pulls the
+    ctypes Win32 surface (and, in its run branch, the whole scheduler graph).
     """
     # Evict any copy imported by an earlier test; if building the parser
     # re-imports one it reappears in sys.modules and the check fails.
-    heavy = ("cronstable.tui", "cronstable.mcpcli", "cronstable.jobcli")
+    heavy = (
+        "cronstable.tui",
+        "cronstable.mcpcli",
+        "cronstable.jobcli",
+        "cronstable.winservice",
+        "cronstable.taskxml",
+    )
     for name in heavy:
         monkeypatch.delitem(sys.modules, name, raising=False)
 
@@ -80,12 +87,13 @@ def test_entry_point_module_does_not_import_asyncio():
 def test_entry_point_module_does_not_import_heavy_surfaces():
     """Importing cronstable.__main__ registers every subcommand (through the
     cronstable._cliargs leaf), and that alone must not pull in tui / mcpcli /
-    jobcli; only dispatching one of their commands may.
+    jobcli / winservice; only dispatching one of their commands may.
     """
     probe = (
         "import sys, cronstable.__main__; "
         "print(sorted(m for m in sys.modules if m in ("
-        "'cronstable.tui', 'cronstable.mcpcli', 'cronstable.jobcli')))"
+        "'cronstable.tui', 'cronstable.mcpcli', 'cronstable.jobcli', "
+        "'cronstable.winservice', 'cronstable.taskxml')))"
     )
     assert _probe(probe) == "[]"
 

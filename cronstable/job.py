@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime
 from functools import lru_cache
+
+# The names, not the module: `queue` is already a local variable in this
+# file (the per-subscriber output queues in JobOutputStream), so importing
+# the module under its own name shadows them and ruff refuses it.
+from queue import Full, Queue
 from socket import gethostname
 from typing import (
     TYPE_CHECKING,
@@ -285,6 +290,7 @@ class _MirrorWriter:
         self.dropped_batches = 0
         self._drop_logged = False
         self._drop_warn_pending = False
+        self._no_stream_logged = False
 
     def submit(self, job_name: str, stream_name: str, text: str) -> None:
         """Queue one passthrough batch; never blocks, sheds when full."""
@@ -324,17 +330,45 @@ class _MirrorWriter:
         """Wait until every queued batch was written (tests, atexit)."""
         return self._idle.wait(timeout)
 
+    def _log_no_stream(self) -> None:
+        # This latch stays set for the life of the process, where
+        # _drop_logged re-arms: a backed-up consumer recovers, a missing
+        # stream stays missing.  Only the writer thread reaches this, so
+        # the latch needs no lock.
+        if self._no_stream_logged:
+            return
+        self._no_stream_logged = True
+        logger.warning(
+            "the daemon has no stdout/stderr, so job output is not being "
+            "mirrored to it (a Windows service has no standard streams); "
+            "captured output still reaches the API, the reporters and "
+            "archiveOutput"
+        )
+
     def _run(self) -> None:
         while True:
             self._wake.wait()
             with self._lock:
-                batch = list(self._batches)
-                self._batches.clear()
+                batch = self._batches
+                self._batches = deque()
                 self._pending_bytes = 0
                 self._wake.clear()
             wrote = False
             for job_name, stream_name, text in batch:
                 out = sys.stdout if stream_name == "stdout" else sys.stderr
+                if out is None:
+                    # A Windows service has no standard streams at all, so
+                    # there is nothing to mirror TO.  Without this guard the
+                    # write raises AttributeError on `out.buffer`, and the
+                    # arm below turns that into a WARNING plus a traceback
+                    # for every batch of every job's output, which is the
+                    # loudest log the daemon can produce for a condition
+                    # that holds for the whole run.  Log it once instead.
+                    # The saved lines still hold everything the job wrote:
+                    # capture, the log tail, the archive and every reporter
+                    # read those.
+                    self._log_no_stream()
+                    continue
                 try:
                     StreamReader._emit(out, text)
                     wrote = True
@@ -515,7 +549,7 @@ class StreamReader:
         # (the web UI) can tail output as the job produces it.
         self.on_line = on_line
         # lines awaiting one batched passthrough write to the daemon's own
-        # stdout/stderr; flushed once per drained read (see _queue_emit).
+        # stdout/stderr; flushed once per drained read (see _read).
         self._emit_buffer: list[str] = []
         self._emit_scheduled = False
         self._reader = asyncio.create_task(self._read(stream))
@@ -559,16 +593,6 @@ class StreamReader:
         # whole daemon behind one wedged log consumer.
         _MIRROR.submit(self.job_name, self.stream_name, text)
 
-    def _queue_emit(self, out_line: str) -> None:
-        # One write+flush per DRAINED READ, not per line: a flush scheduled
-        # with call_soon runs only once the read loop actually blocks for
-        # new data, by which point the whole burst is buffered and goes out
-        # as a single write.
-        self._emit_buffer.append(out_line)
-        if not self._emit_scheduled:
-            self._emit_scheduled = True
-            asyncio.get_running_loop().call_soon(self._flush_emit_buffer)
-
     async def _read(self, stream):
         """Drain ``stream`` to EOF, splitting it into lines.
 
@@ -593,13 +617,21 @@ class StreamReader:
         )
         limit_top = self.save_limit // 2
         limit_bottom = self.save_limit - limit_top
-        passthrough = self.stream_name in ("stdout", "stderr")
+        stream_name = self.stream_name
+        passthrough = stream_name in ("stdout", "stderr")
         cap = self.max_line_length
         on_line = self.on_line
-        save_limit = self.save_limit
-        save_top = self.save_top
+        saving = self.save_limit > 0
         save_bottom = self.save_bottom
         discarded = self.discarded_lines
+        save_top_append = self.save_top.append
+        save_bottom_append = save_bottom.append
+        save_bottom_popleft = save_bottom.popleft
+        top_room = limit_top
+        bottom_room = limit_bottom
+        emit_buffer = self._emit_buffer
+        emit_buffer_append = emit_buffer.append
+        loop = asyncio.get_running_loop()
         # Bytes after the last newline seen: not a line until the next
         # chunk (or EOF) terminates it.  Held as a LIST of chunks plus a
         # running length and joined exactly once, so an unterminated run
@@ -639,30 +671,36 @@ class StreamReader:
                 lines = []
             for line in lines:
                 if on_line is not None:
-                    on_line(self.stream_name, line)
+                    on_line(stream_name, line)
                 if passthrough:
-                    self._queue_emit(prefix + line)
-                if save_limit > 0:
-                    if len(save_top) < limit_top:
-                        save_top.append(line)
+                    emit_buffer_append(prefix + line)
+                if saving:
+                    if top_room:
+                        top_room -= 1
+                        save_top_append(line)
+                    elif bottom_room:
+                        bottom_room -= 1
+                        save_bottom_append(line)
                     else:
                         # deque(maxlen) would evict silently; track discards
                         # explicitly to preserve the "N lines discarded"
                         # count.
-                        if len(save_bottom) == limit_bottom:
-                            save_bottom.popleft()
-                            discarded += 1
-                        save_bottom.append(line)
+                        save_bottom_popleft()
+                        discarded += 1
+                        save_bottom_append(line)
                 else:
                     discarded += 1
             # Published before the next await, so a reader cancelled by
             # join()'s timeout still reports the count it had reached.
             self.discarded_lines = discarded
             if not chunk:
-                # EOF: push out whatever the last drain accumulated (the
+                # EOF: push out whatever the last drain accumulated (an
                 # already-scheduled callback then finds an empty buffer).
                 self._flush_emit_buffer()
                 return
+            if emit_buffer and not self._emit_scheduled:
+                self._emit_scheduled = True
+                loop.call_soon(self._flush_emit_buffer)
             if self._over_cap(tail_len, cap):
                 # unterminated run past the cap: drop what has piled up and
                 # keep reading. Measured on the running length, so it is
@@ -1337,8 +1375,504 @@ class PushReporter(Reporter):
         await service.send_report(job, success, push_config)
 
 
+#: The Windows Event Log contract, and a PUBLIC one: an Event Viewer custom
+#: view, a Windows Event Forwarding subscription and every SIEM rule key on
+#: these numbers, so a shipped row keeps its meaning forever.
+#:
+#: outcome -> (event id, wType, wCategory).
+#:
+#: One band per subject, so a single rule can express "anything that happened
+#: to a job": 1000 to 1003 is contiguous, and daemon/orchestration events
+#: start a fresh decade at 1010.  The band starts at 1000 rather than 1
+#: because an unregistered source writes into the Application log, where
+#: single- and double-digit ids collide with half of Windows.
+#:
+#: Plain small positive integers, with no severity or customer bits folded
+#: in: Event Viewer and the modern EventLog API report an id masked to its
+#: low 16 bits, so a number carrying 0x2000_0000 would be documented as one
+#: value and displayed as another.  Severity travels in wType, which is
+#: where every consumer already reads it.
+EVENTLOG_EVENTS: dict[str, tuple[int, int, int]] = {
+    "success": (1000, platform.EVENTLOG_INFORMATION_TYPE, 1),
+    "failure": (1001, platform.EVENTLOG_ERROR_TYPE, 1),
+    "permanent-failure": (1002, platform.EVENTLOG_ERROR_TYPE, 1),
+    "late": (1003, platform.EVENTLOG_WARNING_TYPE, 1),
+    "event": (1010, platform.EVENTLOG_INFORMATION_TYPE, 2),
+    "event-alert": (1011, platform.EVENTLOG_ERROR_TYPE, 2),
+}
+
+#: What each insertion string means, BY POSITION, which is the other half of
+#: the contract.  An unregistered source has no message table to name its
+#: fields, and a forwarder ships them as ``<Data>`` elements in order, so the
+#: arity is fixed for every outcome and an unused field is ``""`` rather than
+#: absent.  Appending a twelfth field is additive and safe; reordering or
+#: removing one of these is not.
+EVENTLOG_STRING_FIELDS = (
+    "summary",
+    "name",
+    "outcome",
+    "host",
+    "exitCode",
+    "failReason",
+    "runId",
+    "startedAt",
+    "schedule",
+    "detail",
+    "output",
+)
+
+#: Per-field ceiling for everything except ``output``.
+EVENTLOG_MAX_FIELD_CHARS = 1024
+
+#: Ceiling on the captured-output tail.
+EVENTLOG_MAX_OUTPUT_CHARS = 8000
+
+#: Events queued for one writer thread before further ones are dropped.
+#: Bounded rather than unbounded because the failure this exists to survive
+#: is a wedged EventLog service, and an unbounded queue would turn that into
+#: unbounded memory in the daemon.
+EVENTLOG_QUEUE_LIMIT = 1000
+
+#: How long shutdown waits for queued events to reach the service.
+EVENTLOG_FLUSH_TIMEOUT = 5.0
+
+#: Hard cap on distinct live writers.  See :data:`_EVENTLOG_WRITERS` for why
+#: a dict keyed on a config string is not self-limiting.
+EVENTLOG_MAX_WRITERS = 8
+
+#: What a cut field ends with, so a truncated tail is never read as the whole
+#: story.  Named because :func:`_eventlog_safe` sizes the kept prefix off its
+#: length, which is what keeps a capped field exactly at its ceiling.
+_EVENTLOG_TRUNCATED = "...[truncated]"
+
+
+def _eventlog_safe(value: Any, limit: int) -> str:
+    """One insertion string: never None, never NUL, always encodable.
+
+    ``None`` becomes ``""``, because a NULL in the ``LPCWSTR`` array renders
+    as nothing and shifts every later position an operator (or a parser
+    reading ``EventData/Data`` by index) is counting on.
+
+    An embedded NUL becomes a space: ctypes accepts it into the wide buffer
+    and the API then truncates the field there, silently.
+
+    Lone surrogates are folded out through a utf-16 round trip.  They reach
+    ``template_vars`` from ``os.environ`` via surrogateescape, the same
+    hazard the webhook reporter documents, and they would otherwise raise
+    UnicodeEncodeError inside the ctypes conversion, which happens on the
+    writer thread where the fan-out's gather cannot see it.
+    """
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    text = text.replace("\x00", " ")
+    if not text.isascii():
+        text = text.encode("utf-16-le", "replace").decode(
+            "utf-16-le", "replace"
+        )
+    if len(text) > limit:
+        # Marked, so nobody reads a cut tail as the whole story, and sized
+        # off the marker so the result is exactly `limit` and the ceiling
+        # arithmetic in the caller stays exact.
+        keep = max(0, limit - len(_EVENTLOG_TRUNCATED))
+        text = text[:keep] + _EVENTLOG_TRUNCATED
+    return text
+
+
+def _eventlog_summary(outcome: str, tvars: dict[str, Any]) -> str:
+    """Field 0: the one line a human reads in the Event Viewer list."""
+    name = tvars.get("name")
+    host = tvars.get("host")
+    if outcome in ("event", "event-alert"):
+        return "cronstable event {} on {} concerning {}".format(
+            tvars.get("event"), host, name
+        )
+    if outcome == "late":
+        return "Cron job {!r} is overdue on {} ({})".format(
+            name, host, tvars.get("sla_check")
+        )
+    if outcome == "success":
+        return "Cron job {!r} succeeded on {}".format(name, host)
+    what = "failed permanently" if outcome == "permanent-failure" else "failed"
+    return "Cron job {!r} {} on {} (exit {}): {}".format(
+        name, what, host, tvars.get("exit_code"), tvars.get("fail_reason")
+    )
+
+
+def _eventlog_detail(outcome: str, tvars: dict[str, Any]) -> str:
+    """Field 9: the per-outcome extras that have no column of their own."""
+    if outcome == "late":
+        return "check={} threshold={}s observed={}s lastSuccess={}".format(
+            tvars.get("sla_check"),
+            tvars.get("threshold_seconds"),
+            tvars.get("observed_seconds"),
+            tvars.get("last_success_at"),
+        )
+    if outcome in ("event", "event-alert"):
+        return "event={}".format(tvars.get("event"))
+    usage = []
+    for key in ("cpu_seconds", "max_rss_bytes"):
+        value = tvars.get(key)
+        if value is not None:
+            usage.append("{}={}".format(key, value))
+    return " ".join(usage)
+
+
+def _eventlog_outcome(ctx: Any, config: dict[str, Any], success: bool) -> str:
+    """Which :data:`EVENTLOG_EVENTS` row one report belongs to.
+
+    A reporter is handed ``(success, ctx, config)`` and nothing else, so
+    which hook is firing has to be recovered from those three.  All three
+    are enough, and none of it needs a new attribute on the hot path:
+
+    * a notify event is the only context carrying ``event``;
+    * an SLA breach is the only one carrying ``sla_vars``;
+    * onFailure and onPermanentFailure are told apart by the IDENTITY of the
+      report dict.  Each hook's block is an independent ``copy.deepcopy`` of
+      ``_REPORT_DEFAULTS`` and ``mergedicts`` is copy-on-write, so the test
+      is exact both for a job that configured the hooks and for one that
+      wrote neither, which still points at a distinct per-hook default
+      object.  ``test_eventlog_hook_report_blocks_never_alias`` pins the
+      invariant that rests on, because it is an implementation detail of
+      config.py that a well-meant deduplication there could quietly break.
+
+    ``getattr`` throughout: the notify context's job shim carries
+    ``__slots__`` with four names and no ``onPermanentFailure``, and the
+    fan-out's ``return_exceptions`` gather would turn an AttributeError
+    raised here into a log line rather than a test failure.
+    """
+    if getattr(ctx, "event", None) is not None:
+        return "event" if success else "event-alert"
+    if getattr(ctx, "sla_vars", None) is not None:
+        return "late"
+    if not success:
+        job_config = getattr(ctx, "config", None)
+        permanent = getattr(job_config, "onPermanentFailure", None)
+        if isinstance(permanent, dict) and config is permanent.get("report"):
+            return "permanent-failure"
+        return "failure"
+    return "success"
+
+
+def eventlog_event_strings(
+    ctx: Any, outcome: str, *, include_output: bool
+) -> list[str]:
+    """The :data:`EVENTLOG_STRING_FIELDS` vector for one report.
+
+    Built off ``ctx.template_vars`` rather than by reaching into the
+    context's attributes: that dict is the documented cross-context
+    contract, all three reporting contexts fill it through the same
+    builder, and the notify context's job shim carries ``__slots__``, so
+    attribute probing is the brittle way to ask the same question.
+    """
+    tvars = dict(ctx.template_vars)
+    output = ""
+    if include_output:
+        output = _eventlog_safe(
+            tvars.get("stderr") or tvars.get("stdout") or "",
+            EVENTLOG_MAX_OUTPUT_CHARS,
+        )
+    field = EVENTLOG_MAX_FIELD_CHARS
+    return [
+        _eventlog_safe(_eventlog_summary(outcome, tvars), field),
+        _eventlog_safe(tvars.get("name"), field),
+        _eventlog_safe(outcome, field),
+        _eventlog_safe(tvars.get("host"), field),
+        _eventlog_safe(tvars.get("exit_code"), field),
+        _eventlog_safe(tvars.get("fail_reason"), field),
+        _eventlog_safe(tvars.get("run_id"), field),
+        _eventlog_safe(tvars.get("started_at"), field),
+        _eventlog_safe(tvars.get("schedule"), field),
+        _eventlog_safe(_eventlog_detail(outcome, tvars), field),
+        output,
+    ]
+
+
+class _EventLogWriter:
+    """One daemon thread owning one source handle and its write queue.
+
+    ``ReportEventW`` is a synchronous RPC to the EventLog service and can
+    block on a stalled disk or a busy service, and so can
+    ``RegisterEventSourceW``, which is why the handle is opened on this
+    thread rather than on the reporter's first call.  Reports run INLINE on
+    the reaper (the reason the shell reporter carries a timeout), so neither
+    call may be reached from the event loop.
+
+    A dedicated thread rather than ``run_in_executor(None, ...)``: the
+    default pool is shared with the durable-state writes and the fromFile
+    secret resolver, and a wedged event write would hold one of its handful
+    of slots for every report.  A dedicated ThreadPoolExecutor was rejected
+    for a sharper reason: concurrent.futures registers an atexit hook that
+    JOINS its worker threads, so one stuck ReportEventW would hang
+    interpreter exit, which is exactly the shutdown behavior this platform
+    work spent several fixes on.  A daemon thread cannot; the OS reclaims
+    it.
+
+    Fire and forget, therefore: :meth:`submit` does a bounded
+    ``put_nowait`` and returns, so the reporter never awaits anything, and a
+    failed write is logged from the thread rather than surfaced to the
+    fan-out.  The alternative is delaying every job's completion on an OS
+    service.
+    """
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self._queue: Queue = Queue(EVENTLOG_QUEUE_LIMIT)
+        self._handle: Optional[int] = None
+        self._dropped = 0
+        self._logged_codes: set[int] = set()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="cronstable-eventlog-{}".format(source),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, record: tuple[int, int, int, list[str]]) -> bool:
+        """Queue one record.  False when the queue is full."""
+        try:
+            self._queue.put_nowait(record)
+        except Full:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 100 == 0:
+                logger.error(
+                    "eventlog: the writer for source %r is not keeping up; "
+                    "%d record(s) dropped so far",
+                    self.source,
+                    self._dropped,
+                )
+            return False
+        return True
+
+    def _write(self, record: tuple[int, int, int, list[str]]) -> None:
+        event_type, category, event_id, strings = record
+        if self._handle is None:
+            self._handle = platform.open_event_log(self.source)
+        if self._handle is None:
+            self._log_once(
+                0,
+                "eventlog: could not open the event source %r; "
+                "the record was dropped",
+                self.source,
+            )
+            return
+        code = platform.write_event_log(
+            self._handle,
+            event_type=event_type,
+            category=category,
+            event_id=event_id,
+            strings=strings,
+        )
+        if code == platform.EVENTLOG_ERROR_INVALID_HANDLE:
+            # The EventLog service restarted under us; re-registering the
+            # source is the whole repair, so do it and retry this record
+            # exactly once rather than dropping the alert.
+            platform.close_event_log(self._handle)
+            self._handle = platform.open_event_log(self.source)
+            if self._handle is not None:
+                code = platform.write_event_log(
+                    self._handle,
+                    event_type=event_type,
+                    category=category,
+                    event_id=event_id,
+                    strings=strings,
+                )
+        if code:
+            self._log_once(
+                code,
+                "eventlog: writing to source %r failed with code %s; "
+                "the record was dropped",
+                self.source,
+                code,
+            )
+
+    def _log_once(self, code: int, message: str, *args: Any) -> None:
+        # One line per distinct failure code, so a sink that is permanently
+        # broken cannot become the log.
+        if code in self._logged_codes:
+            return
+        self._logged_codes.add(code)
+        logger.error(message, *args)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                record = self._queue.get()
+                try:
+                    if record is None:
+                        return
+                    self._write(record)
+                except Exception:  # noqa: BLE001 - a writer thread never dies
+                    logger.exception("eventlog: unexpected writer failure")
+                finally:
+                    self._queue.task_done()
+        finally:
+            # The thread owns the handle, so it can release it here with
+            # no caller waiting.  It has to be here rather than in join(),
+            # because retire_event_log_writers drops a renamed writer
+            # WITHOUT joining it (a reload runs on the scheduler's own
+            # loop iteration, and the bounded drain belongs to
+            # shutdown).  A close that lived only in join() therefore
+            # leaked one source handle per reload that renamed the source:
+            # unbounded, and invisible to EVENTLOG_MAX_WRITERS, which caps
+            # the live registry rather than what has already left it.
+            handle, self._handle = self._handle, None
+            if handle is not None:
+                platform.close_event_log(handle)
+
+    def stop(self) -> None:
+        """Ask the thread to finish once it has drained what is queued."""
+        try:
+            self._queue.put_nowait(None)
+        except Full:
+            pass
+
+    def join(self, timeout: float) -> None:
+        """Wait out the drain.  The writer thread closes the handle."""
+        self._thread.join(timeout)
+
+
+#: One writer per distinct ``source`` name.
+#:
+#: NOT the shape ``_WEBHOOK_CONNECTORS`` uses.  That is a WeakKeyDictionary
+#: keyed on the event loop, swept when a loop dies and backstopped by an
+#: atexit, so its entries retire themselves.  This is keyed on a config
+#: STRING, and a config reload can change that string any number of times in
+#: one process, so nothing here retires an entry by itself.  A leaked entry
+#: is a leaked OS thread and a leaked source handle, so there are two
+#: guards: :func:`retire_event_log_writers` drops writers the live config no
+#: longer names, and :data:`EVENTLOG_MAX_WRITERS` refuses to mint past a
+#: hard cap, so even a pathological reload loop degrades to "no new events"
+#: rather than exhausting threads.
+_EVENTLOG_WRITERS: dict[str, _EventLogWriter] = {}
+
+#: Whether the writer cap has already been logged, so hitting it repeatedly
+#: costs one line rather than one per report.
+_EVENTLOG_CAP_LOGGED = False
+
+
+def _eventlog_writer(source: str) -> Optional[_EventLogWriter]:
+    """The writer for ``source``, minting one if the cap allows."""
+    global _EVENTLOG_CAP_LOGGED
+    writer = _EVENTLOG_WRITERS.get(source)
+    if writer is not None:
+        return writer
+    if len(_EVENTLOG_WRITERS) >= EVENTLOG_MAX_WRITERS:
+        if not _EVENTLOG_CAP_LOGGED:
+            _EVENTLOG_CAP_LOGGED = True
+            logger.error(
+                "eventlog: refusing to open more than %d event sources "
+                "(wanted %r); reports to it are dropped",
+                EVENTLOG_MAX_WRITERS,
+                source,
+            )
+        return None
+    writer = _EventLogWriter(source)
+    _EVENTLOG_WRITERS[source] = writer
+    return writer
+
+
+def retire_event_log_writers(live_sources: set[str]) -> None:
+    """Stop and drop writers the running config no longer names.
+
+    Called from the reload path.  Non-blocking per writer: the thread is
+    asked to finish once it has drained, and is not waited for.  The bounded
+    drain belongs to shutdown, not to a config reload, which runs on the
+    scheduler's own loop iteration.
+
+    Because it does not wait, the thread releases the source handle itself
+    as it exits (see :meth:`_EventLogWriter._run`).  Once a writer is
+    popped from the registry nothing else can reach it, so a release that
+    needed a join would never run on this path.
+    """
+    for source in [s for s in _EVENTLOG_WRITERS if s not in live_sources]:
+        _EVENTLOG_WRITERS.pop(source).stop()
+
+
+async def close_event_log_writers() -> None:
+    """Drain and stop every writer.  The sibling of close_webhook_pool.
+
+    Bounded by :data:`EVENTLOG_FLUSH_TIMEOUT`, so a wedged EventLog service
+    delays shutdown by that much and no more.  The joins run on the default
+    executor, which is safe at the point this is called specifically because
+    the state backend has already stopped by then, so the pool it briefly
+    occupies is otherwise idle.  Safe to call twice, and with no writer ever
+    created.
+    """
+    writers = list(_EVENTLOG_WRITERS.values())
+    _EVENTLOG_WRITERS.clear()
+    if not writers:
+        return
+    for writer in writers:
+        writer.stop()
+
+    def _join() -> None:
+        # one deadline shared by every writer: all stop sentinels are
+        # already queued, so the drains overlap and N wedged threads still
+        # cost EVENTLOG_FLUSH_TIMEOUT total, not N times it
+        deadline = time.monotonic() + EVENTLOG_FLUSH_TIMEOUT
+        for writer in writers:
+            writer.join(max(0.0, deadline - time.monotonic()))
+
+    await asyncio.get_running_loop().run_in_executor(None, _join)
+
+
+@atexit.register
+def _close_event_log_writers_atexit() -> None:
+    """Best-effort drain for a process that never shuts down gracefully.
+
+    The threads are daemon threads, so the OS reclaims them either way; this
+    exists so a short-lived process flushes what it queued instead of
+    dropping it.  A hard kill still drops the queue, which the Event Log
+    documentation states outright rather than implying a durability this
+    design does not have.
+    """
+    writers = [_EVENTLOG_WRITERS.pop(s) for s in list(_EVENTLOG_WRITERS)]
+    for writer in writers:
+        writer.stop()  # all sentinels first, so the drains overlap
+    deadline = time.monotonic() + EVENTLOG_FLUSH_TIMEOUT
+    for writer in writers:
+        writer.join(max(0.0, deadline - time.monotonic()))
+
+
+class EventLogReporter(Reporter):
+    """Job outcomes as Windows Event Log records (Windows only).
+
+    Writes where a Windows shop's monitoring already looks: Event Viewer, a
+    Windows Event Forwarding subscription, SCOM, every SIEM connector.  What
+    it writes is a stable event id plus a fixed-arity insertion-string
+    vector, never a rendered template, because the id and the field
+    positions ARE the contract and a free-text override of either is a
+    contract this reporter cannot keep.  An operator who wants prose has the
+    shell and webhook reporters.
+
+    On POSIX it is a no-op, and the config load has already said so once,
+    naming every hook that enabled it.
+    """
+
+    async def report(
+        self, success: bool, job: "RunningJob", config: dict[str, Any]
+    ) -> None:
+        conf = config.get("eventlog") or {}
+        if not conf.get("enabled"):
+            return  # event log reporting disabled: early return
+        if not platform.IS_WINDOWS:
+            return  # no Event Log here; warned once at config load
+        outcome = _eventlog_outcome(job, config, success)
+        event_id, event_type, category = EVENTLOG_EVENTS[outcome]
+        strings = eventlog_event_strings(
+            job, outcome, include_output=bool(conf.get("includeOutput"))
+        )
+        writer = _eventlog_writer(conf.get("source") or "cronstable")
+        if writer is not None:
+            writer.submit((event_type, category, event_id, strings))
+
+
 def report_config_enabled(report_config: dict[str, Any]) -> bool:
-    """Whether any of the five reporters would actually fire for this config.
+    """Whether any of the six reporters would actually fire for this config.
 
     Mirrors each reporter's own disabled early-return EXACTLY, so a caller
     can skip scheduling a fan-out every reporter would drop on arrival;
@@ -1358,7 +1892,19 @@ def report_config_enabled(report_config: dict[str, Any]) -> bool:
         return True
     # .get, not [], so report dicts predating the push block (older
     # persisted shapes, hand-built test configs) keep working.
-    return bool((report_config.get("push") or {}).get("enabled"))
+    if (report_config.get("push") or {}).get("enabled"):
+        return True
+    # eventlog last, and the platform probe behind the dict probe: this
+    # function is the whole cost of a completion in the common
+    # no-reporter deployment, so the default path must short-circuit
+    # before it reads a module global. The platform test belongs to the
+    # mirror rather than being a nicety, because the reporter's own second
+    # early return IS the platform: without it, an eventlog-only config
+    # would schedule a fan-out on every completion on Linux for six
+    # reporters that all drop it on arrival.
+    return bool((report_config.get("eventlog") or {}).get("enabled")) and bool(
+        platform.IS_WINDOWS
+    )
 
 
 #: The key set every reporting context's ``template_vars`` exposes.
@@ -1496,6 +2042,7 @@ class RunningJob:
         ShellReporter(),
         WebhookReporter(),
         PushReporter(),
+        EventLogReporter(),
     ]
 
     def __init__(
@@ -1669,7 +2216,12 @@ class RunningJob:
         # Isolate the job in its own process group, so cancel() can take its
         # whole descendant tree down as a unit rather than only the process we
         # spawned -- see cronstable.platform.new_process_group_kwargs.
-        kwargs: dict[str, Any] = platform.new_process_group_kwargs()
+        # The job's scheduling priority rides along on Windows, where the
+        # creation flags are the only race-free place to set one; POSIX is
+        # served by the renice below, once there is a group to renice.
+        kwargs: dict[str, Any] = platform.new_process_group_kwargs(
+            self.config.priority
+        )
         if isinstance(self.config.command, list):
             create: Any = asyncio.create_subprocess_exec
             cmd = self.config.command
@@ -1694,6 +2246,17 @@ class RunningJob:
             env.update(self.extra_env)
             self.env = env
             kwargs["env"] = env
+        if self.config.workingDirectory is not None:
+            # The directory the child starts in.  Omitted rather than passed
+            # as None when unset, so a job that does not ask for one keeps
+            # inheriting the daemon's CWD byte for byte as it always has.
+            # The value was normalized at config load; whether the directory
+            # exists is the OS's call, and a bad one raises OSError into the
+            # start_failed net below.  Note the child chdirs BEFORE
+            # preexec_fn runs, so on a job that also demotes, the chdir uses
+            # the daemon's privileges and the demoted child can land in a
+            # directory it cannot itself read.
+            kwargs["cwd"] = self.config.workingDirectory
         if self.config.uid is not None or self.config.gid is not None:
             # POSIX only: uid/gid are always None on Windows (the config layer
             # rejects user/group there), so preexec_fn is never wired up on a
@@ -1751,6 +2314,16 @@ class RunningJob:
             )
             self.start_failed = True
             return
+
+        if self.proc.pid is not None:
+            # POSIX: renice the group now that it exists (on Windows the
+            # class already rode in on the creation flags).  First thing
+            # after the spawn, so the window in which the job runs at the
+            # inherited priority is as short as it can be, and called for
+            # its effect alone: a refusal is best-effort by design and
+            # apply_priority logs it, so there is nothing to decide here and
+            # nothing to say twice.
+            platform.apply_priority(self.proc.pid, self.config.priority)
 
         # Spawned, not awaited: every launch path holds the daemon-wide
         # spawn gate around start(), and a stalled statsd send would hold
@@ -1916,17 +2489,18 @@ class RunningJob:
 
     @property
     def fail_reason(self) -> Optional[str]:
-        if self.config.failsWhen["always"]:
+        fails_when = self.config.failsWhen
+        if fails_when["always"]:
             return "failsWhen=always"
-        if self.config.failsWhen["nonzeroReturn"] and self.retcode != 0:
+        if fails_when["nonzeroReturn"] and self.retcode != 0:
             return "failsWhen=nonzeroReturn and retcode={}".format(
                 self.retcode
             )
-        if self.config.failsWhen["producesStdout"] and (
+        if fails_when["producesStdout"] and (
             self.stdout or self.stdout_discarded
         ):
             return "failsWhen=producesStdout and stdout is not empty"
-        if self.config.failsWhen["producesStderr"] and (
+        if fails_when["producesStderr"] and (
             self.stderr or self.stderr_discarded
         ):
             return "failsWhen=producesStderr and stderr is not empty"

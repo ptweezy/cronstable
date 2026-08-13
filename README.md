@@ -53,7 +53,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
   (see [Schedule introspection](#schedule-introspection))
 * Builtin sending of Sentry, Mail, and webhook (Slack-compatible)
   notifications when cron jobs fail
-* **End-to-end encrypted push notifications**: a fifth reporter seals each
+* **End-to-end encrypted push notifications**: a dedicated reporter seals each
   alert to a paired device's own key (libsodium sealed box), so the relay
   that forwards it to the platform push service never sees job names,
   hostnames, or log lines; pairing is a dashboard QR scan or one API call,
@@ -160,7 +160,7 @@ A stability-focused, container-friendly, optionally-distributed, fault-tolerant,
 
 [![cronstable web dashboard, animated: a tour of the live job overview, the command palette, a live log tail, a DAG's task graph, the nine-node cluster and fleet matrix, the wallboard and incident timeline, the device-pairing QR panel for encrypted push alerts, and the accessibility options (a colour-vision-safe palette and larger UI scale)](https://raw.githubusercontent.com/ptweezy/cronstable/develop/docs/img/dashboard-reel.webp)](#web-dashboard)
 
-> The (optional) Web UI tour.
+> Web UI tour.
 
 ## Quick start
 
@@ -336,14 +336,35 @@ POSIX. A few platform details differ:
   job runs in its own console process group, so the keystroke never reaches
   the jobs themselves). Closing the console window and OS shutdown trigger the
   same drain on the OS's few seconds of grace, and the authenticated
-  `POST /shutdown` route stops a console-less daemon. Logging off does not stop
-  it: an unattended daemon sees that event for every user on the machine.
+  `POST /shutdown` route stops a console-less daemon (and stops the Windows
+  service cleanly, without tripping its recovery actions). Logging off does
+  not stop it: an unattended daemon sees that event for every user on the
+  machine.
 
-* **Running unattended.** Register cronstable as a boot-time Task Scheduler task
-  (or under a service wrapper) with the machine-wide config; the wiki's
-  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows)
-  page carries the copy-paste `schtasks` recipe, a rotating-log config, and
-  the stop path.
+* **Running unattended, as a real Windows service.** `cronstable service
+  install -c C:\ProgramData\cronstable` registers the scheduler with the
+  Service Control Manager, so it starts at boot, runs whether or not anyone
+  is logged on, appears in `services.msc`, and gets Windows' own recovery
+  actions; stopping it drains running jobs first, and the SCM is told the
+  stop is still in progress for as long as that takes. It is a ctypes shim
+  over advapi32, so it adds no dependency. The published one-file `.exe`
+  cannot host a service (its bootloader runs the program in a child process
+  the SCM never sees) and `install` says so; install with pip or pipx for
+  that, or use the `schtasks` recipe. See
+  [Windows Service](https://github.com/ptweezy/cronstable/wiki/Windows-Service)
+  and
+  [Running on Windows](https://github.com/ptweezy/cronstable/wiki/Running-on-Windows).
+
+* **Migrating from Task Scheduler.** `cronstable import-taskscheduler
+  tasks.xml -o jobs.yaml` converts an estate's exports into cronstable jobs,
+  mapping time, calendar and boot triggers, `Exec` actions, working
+  directories, execution time limits, instance policy and priority. It is a
+  one-shot converter, not a loader, because exporting a task does not
+  unregister it. Everything it cannot carry across is listed with a reason
+  rather than dropped, and on a whole-machine export that list is long: most
+  registered tasks on a stock Windows install are COM-handler or
+  event-driven internals rather than schedules. See
+  [Importing from Task Scheduler](https://github.com/ptweezy/cronstable/wiki/Importing-Task-Scheduler).
 
 * **Not supported on Windows.** Per-job `user`/`group` switching (there is no
   `setuid`/`setgid` equivalent) is rejected with a clear configuration error,
@@ -503,7 +524,7 @@ in the wiki is the full walkthrough, and
 [Remote web/HTTP interface](#remote-webhttp-interface) below shows how to
 enable it.
 
-**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** (a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all five failure reporters wired to live sinks), run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
+**Try it:** `docker compose -f example/zen-demo/docker-compose.yml up` boots a single node with a demo job set, and `docker compose -f example/cluster/docker-compose.yml up` boots a 3-node cluster (`cronstable-a`/`cronstable-b`/`cronstable-c`) so you can open each node's dashboard and watch the cluster panel and leader election live. For **every feature at once** (a 9-node mutual-TLS cluster sharing one durable state store and running the classic job set, durable-state jobs, orchestration DAGs and second-level probes together, with all five cross-platform failure reporters wired to live sinks), run `docker compose -f example/grand-tour/docker-compose.yml up --build` (the [grand tour](example/grand-tour); see its [README](example/grand-tour/README.md)). More one-command demos are in the [example gallery](#example-gallery).
 
 ## Terminal dashboard
 
@@ -736,7 +757,7 @@ quickstart uses the root `docker-compose.yml`). Highlights:
 | Example | One command | Shows off |
 | --- | --- | --- |
 | [`demo`](example/demo) | `docker compose up` | The dashboard playground: varied jobs, live logs, retries, a long-runner, an on-demand job. |
-| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five reporters wired to live sinks. |
+| [`grand-tour`](example/grand-tour) | `docker compose -f example/grand-tour/docker-compose.yml up --build` | **Everything at once**: a 9-node mTLS cluster, shared durable state, five DAG patterns, second-level probes, all five cross-platform reporters wired to live sinks. |
 | [`cluster`](example/cluster) | `docker compose -f example/cluster/docker-compose.yml up` | A 3-node gossip cluster: peer attestation, quorum, leader election, live failover. |
 | [`cluster-large`](example/cluster-large) | `docker compose -f example/cluster-large/docker-compose.yml up` | A 10-node, CPU-heavy fleet for watching `distribution: spread` and the load meters. |
 | [`dag`](example/dag) | `cronstable -c example/dag` | Orchestration alone, single node: dependencies, XCom, fan-out, a sensor, an approval gate. |
@@ -998,7 +1019,7 @@ Note: if the configuration option is a directory and there are multiple configur
 
 ### Reporting
 
-cronstable has five built-in reporters: `sentry`, `mail`, `shell`, `webhook`
+cronstable has six built-in reporters: `sentry`, `mail`, `shell`, `webhook`
 (Slack-compatible out of the box), and `push`
 ([end-to-end encrypted push notifications](#push-notifications), below). Each
 can fire on the `onFailure`, `onPermanentFailure`, `onSuccess`, and `onLate`
@@ -1046,7 +1067,7 @@ the shell reporter's `CRONSTABLE_*` environment.
 
 ### Push notifications
 
-A fifth reporter, `push`, delivers end-to-end encrypted alerts to paired
+The `push` reporter delivers end-to-end encrypted alerts to paired
 devices. Each alert is sealed to the device's X25519 public key (a libsodium
 sealed box) before it leaves the daemon; the hosted relay that forwards it to
 the platform push service (APNs) sees only ciphertext and routing metadata,
@@ -1093,6 +1114,40 @@ See
 [Push Notifications](https://github.com/ptweezy/cronstable/wiki/Push-Notifications)
 in the wiki for the report options, pairing and revocation, storage, size
 limits, and the relay trust model.
+
+### Windows Event Log
+
+On Windows, the `eventlog` reporter writes each outcome to the Event Log,
+where a Windows shop's monitoring already looks: Event Viewer, a Windows
+Event Forwarding subscription, SCOM, and every SIEM connector. It needs no
+extra and no dependency, and each record carries a stable event ID plus a
+fixed set of insertion strings, so a rule written against it keeps working:
+
+```yaml
+defaults:
+  onFailure:
+    report:
+      eventlog:
+        enabled: true
+```
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'cronstable'; ID = 1001, 1002 }
+```
+
+Jobs use event IDs 1000 (succeeded), 1001 (failed), 1002 (failed
+permanently) and 1003 (overdue); daemon and orchestration events use 1010
+and 1011. cronstable does not register its event source, so Event Viewer
+prefixes the rendered text with its generic "description cannot be found"
+note; the provider, ID, level and every insertion string are unaffected, so
+the XML view, `wevtutil`, forwarding and SIEM connectors read the record
+normally. On any other platform the reporter does nothing and the config
+load says so once.
+
+See
+[Windows Event Log](https://github.com/ptweezy/cronstable/wiki/Windows-Event-Log)
+in the wiki for the full ID and field tables, the optional source
+registration, and the reasons behind both defaults.
 
 ### Metrics
 
@@ -1348,6 +1403,55 @@ This feature is POSIX-only (it relies on `setuid`/`setgid`). On Windows, a job
 with `user` or `group` set is rejected with a configuration error; see
 [Running on Windows](#running-on-windows).
 
+### Working directory
+
+By default a job starts in whatever directory cronstable itself is running in.
+`workingDirectory` names the directory instead. It matters most on Windows,
+where an elevated console starts the daemon in the system directory, so every
+relative path in a script resolves somewhere unintended. It is the equivalent
+of the "Start in" box on a Task Scheduler action.
+
+```yaml
+- name: nightly-import
+  command: import.bat
+  schedule:
+    minute: "0"
+    hour: "2"
+  workingDirectory: C:\jobs\importer
+```
+
+cronstable expands `~` and `${VAR}` and makes the result absolute at config
+load. The OS checks that the directory exists at spawn, not at load, so a
+missing one fails that one run at launch instead of rejecting the whole
+config. You can also set the key in a `defaults:` block and on a DAG task. See
+[Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#workingdirectory).
+
+### Process priority
+
+`priority` says how a job should be scheduled against everything else on the
+box, in five levels: `idle`, `below-normal`, `normal`, `above-normal`,
+`high`.
+
+```yaml
+- name: nightly-reindex
+  command: reindex.sh
+  schedule:
+    minute: "0"
+    hour: "3"
+  priority: idle
+```
+
+On Windows the level becomes the process's priority class at creation; on
+POSIX cronstable renices the job's process group right after the spawn
+(`idle` is nice 19, `high` is nice -10). Descendants inherit a lowered level
+on both platforms. A raised one reaches only the job's own process on
+Windows, which starts an unflagged child of an above-normal or high parent at
+NORMAL; POSIX renices the whole group, so it has no such split. `normal` is
+the default, and the one level cronstable never applies. Raising a priority
+needs privilege on POSIX, and a kernel that refuses leaves the run going at
+the priority it inherited rather than failing it. See
+[Commands and Environment](https://github.com/ptweezy/cronstable/wiki/Commands-and-Environment#priority).
+
 ### Remote web/HTTP interface
 
 If you wish to remotely control cronstable, you can optionally enable an HTTP REST
@@ -1435,7 +1539,9 @@ which gives it some useful properties:
 * it covers **every behavior-affecting field** (command, schedule, shell, the
   *names* of `environment` variables, capture flags, `failsWhen`,
   retry/reporting policy, timezone, `enabled`, and so on), so any meaningful
-  change to a job changes the id;
+  change to a job changes the id; it deliberately leaves out per-host values,
+  `workingDirectory` among them, so a Windows replica and a Linux one running
+  the same jobs from paths they spell differently still agree;
 * `user`/`group` are fingerprinted **as configured** (e.g. `www-data`), not as
   the resolved numeric uid/gid, which can differ host to host;
 * **secret/value material is never embedded**: inline reporting secrets

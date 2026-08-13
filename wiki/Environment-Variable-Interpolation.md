@@ -61,6 +61,14 @@ reached, since `${PORT}` is not an integer. Put the variable inside a string
 instead. A listen address carries its port inside a string
 (`"0.0.0.0:${PORT}"`), which is why the port can come from the environment.
 
+Path-typed fields are strings, so they expand like any other. The one to watch
+is a job's [`workingDirectory`](Commands-and-Environment#workingdirectory),
+because the `command` beside it behaves the opposite way. The directory is
+expanded at load against the **daemon's** environment, then `~`-expanded and
+made absolute, while the command is handed to the runtime shell verbatim.
+`workingDirectory: ${JOB_ROOT}/importer` is settled once, at load;
+`command: cd ${JOB_ROOT}` is never touched.
+
 ## Skipped fields
 
 Some subtrees are left untouched, because their `${...}` is another layer's

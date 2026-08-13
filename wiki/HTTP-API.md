@@ -105,11 +105,31 @@ which CI pins against the daemon's served route table in both directions. The
 sections below carry what the spec deliberately leaves to prose: field
 meanings, defaults, edge cases, and behavior.
 
-Every error body on this API is one JSON envelope: `{"error": "<reason>"}`
-(`Content-Type: application/json`), across the job, DAG, schedule, state, and
-push routes alike. That includes the `401` from the auth middleware and the
-router's own responses (`405` on a wrong method, `404` on an unmatched path).
-`docs/openapi.yaml` declares the same envelope as the `Error` schema.
+Every error body the web API and the loopback state endpoint serve is one JSON
+envelope: `{"error": "<reason>"}` (`Content-Type: application/json`), across
+the job, DAG, schedule, state, and push routes alike. That includes the `401`
+from the auth middleware and the router's own responses (`405` on a wrong
+method, `404` on an unmatched path). `docs/openapi.yaml` declares the same
+envelope as the `Error` schema.
+
+A `404` for a named subject says what was not found, for example
+`{"error": "job 'nightly' not found"}` or, on the routes that also accept a
+DAG's schedule (`/schedule/why`, `/jobs/{name}/calendar.ics`),
+`{"error": "no job or DAG schedule named 'nightly'"}`. The `401` is the one
+error whose reason says nothing: its `error` is the generic
+`401: Unauthorized`, the same bytes for a missing header, a wrong scheme and
+an unknown token, so the response cannot be used to tell them apart.
+
+aiohttp answers requests that fail before they reach the application, as
+`text/plain`. A malformed request line, an unparseable method token, and
+request headers past 8190 bytes are each a `400`, and an unrecognised
+`Expect:` header is a `417`. The envelope covers every response from the
+routing layer inward.
+
+One listener is outside this contract: the cluster peer transport
+([Clustering and Leader Election](Clustering-and-Leader-Election)), a separate
+mTLS listener running its own application, which answers its own `4xx` with no
+body at all, since its only client is another cronstable daemon.
 
 ### `GET /version`
 
@@ -572,13 +592,14 @@ the endpoint the [Web Dashboard](Web-Dashboard) polls.
 | `never_fires` | `true` when the job is enabled but its crontab has no future occurrence (a fixed past year, an impossible date), distinguishing the dead-schedule `null` above from the running/disabled ones. See [Schedule Linting](Schedule-Linting). |
 | `schedule_findings` | The [schedule linter's](Schedule-Linting) advisory findings for this job's crontab, each `{code, level, message}` (empty for a clean schedule). Computed once at config load, in the job's own timezone. |
 | `schedule_resolved` | Present only for [`H` hashed schedules](Hashed-Schedules): the plain expression the `H` items resolved to for this job, so clients can compute previews while displaying the `H` the user wrote. |
-| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. |
-| `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`. |
+| `last_run` | The most recent finished run (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`, `fail_reason`), or `null` if the job has not run yet. One exception: a run this host was executing when it crashed is reported here as `unknown` even though it never finished, and it stands at the instant it started, so a run that completed while it was still going can carry a later `finished_at`. cronstable surfaces the crash rather than hiding it behind whatever outlived it. |
+| `history` | Compact oldest-first tail of recent runs (`outcome` and `duration` only), sized for the dashboard's inline sparkline. Full per-run detail comes from `/jobs/{name}/runs`, whose ordering note applies to this tail too. |
 | `paused` | Always present: the active [runtime pause](Pausing-Jobs), `{since, until, note, by, channel}` (ISO-8601 instants), or `null` when the job is not paused. |
 | `sla` | Present only for jobs with a configured [`sla:` block](Late-Run-Detection): `{thresholds, state, breaches}`, where `thresholds` holds the non-null threshold keys, `state` is `"ok"` or `"late"`, and `breaches` lists each latched check as `{check, since, observed_seconds, threshold_seconds}` (`observed_seconds` re-measured at payload time). |
 | `retry` | Present only while a [retry ladder](Failure-Detection-and-Retries) is armed for the job: `{attempt, maxAttempts, nextRetryAt, delaySeconds}`. `maxAttempts` is `null` for an unlimited ladder (`maximumRetries: -1`). |
 | `rebootPending` | Present (as `true`) only for a deferred `@reboot` one-shot still awaiting its boot run (the cluster had not elected an owner at boot, or a pause is holding it), so a client can tell "pending boot run" from "already ran". |
 | `concurrencyScope`, `slot` | Present only for `concurrencyScope: cluster` jobs: the literal scope, and `slot` as `{held, holder, refs}`: whether this node holds the job's [cluster-wide concurrency slot](Clustering-and-Leader-Election) lease, the holding node's name (`null` when unheld), and how many live instances reference it. |
+| `priority` | Present only when the job sets a non-default [scheduling priority](Commands-and-Environment#priority): one of `idle`, `below-normal`, `above-normal`, `high`. A job at the default level (`normal`, the one level that is never applied) carries no key. |
 | `clusterPolicy`, `clusterOwner` | Present only when leader election is configured: the job's [cluster policy](Clustering-and-Leader-Election#per-job-policy), and, under `distribution: spread` for leader-gated jobs, the node that currently owns the job (`null` when there is no quorum). |
 
 ```shell
@@ -636,6 +657,13 @@ aggregate statistics. Returns `404 Not Found` for an unknown job. An optional
 window; the default serves the whole window); `stats` always covers the whole
 retained window regardless of `limit`.
 
+"Oldest first" is the order this node observed the runs in, which is not
+always finish order. The array is never re-ordered at read time: after a
+restart the ring is rebuilt in finish order and then grows in completion
+order, so on a shared mount a peer's interleaved append can put an older run
+later, and a crash-reconciled row stands where its interrupted run began. The
+`stats` block's `last_*` fields do fold by finish time.
+
 Each entry in `runs` carries the same fields as `last_run` in `GET /jobs`
 (`outcome`, `exit_code`, `started_at`, `finished_at`, `duration`,
 `fail_reason`, and `resources`), plus `ranAt` on every entry whose outcome is
@@ -657,9 +685,9 @@ Skipped rows carry no `started_at`, `exit_code`, or `duration`, and like
 | --- | --- |
 | `total`, `success`, `failure`, `cancelled` | Counts by outcome over the retained history. |
 | `success_rate` | Success rate over runs that ran to completion. Cancellations are user-initiated, not a verdict on the job, so they are excluded; `null` when no run has completed. |
-| `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. |
-| `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Resource-Monitoring) runs in the window; `null` when none were monitored. |
-| `avg_rss_bytes`, `max_rss_bytes`, `last_rss_bytes` | Peak-RSS aggregates (bytes) over the monitored runs; `null` when none were monitored. |
+| `avg_duration`, `min_duration`, `max_duration`, `last_duration` | Duration aggregates in seconds, over runs with a recorded duration; `null` when there are none. `last_duration` is the newest run in the window by finish time, not the last row of `runs`. |
+| `avg_cpu_seconds`, `max_cpu_seconds`, `last_cpu_seconds` | CPU-time aggregates over the [`monitorResources`](Resource-Monitoring) runs in the window; `null` when none were monitored. `last_cpu_seconds` reads the same newest-by-finish-time run as `last_duration`, so it is `null` when that run was not monitored. |
+| `avg_rss_bytes`, `max_rss_bytes`, `last_rss_bytes` | Peak-RSS aggregates (bytes) over the monitored runs; `null` when none were monitored. `last_rss_bytes` reads the same run as `last_cpu_seconds`. |
 
 ### `GET /activity`
 
@@ -669,7 +697,7 @@ The feed behind the activity heatmap on the
 retained runs, oldest first, each reduced to the three fields the heatmap
 plots (`started_at`, `finished_at`, `outcome`); a job that has never run maps
 to `[]`, so a client can tell "no runs" from "unknown job". The records, the
-bounds, and the restart behavior are exactly those of
+bounds, the ordering note, and the restart behavior are exactly those of
 [`GET /jobs/{name}/runs`](#get-jobsnameruns), without the per-job fan-out,
 and one built response is shared across every viewer polling it (with
 `ETag` / `If-None-Match` and gzip, like `GET /jobs`). An optional `?limit=`
@@ -731,9 +759,10 @@ CPU%, **peak** RSS per merged bucket, so spikes survive), so a series is
 bounded no matter how long the run. `live` carries the run-so-far series of
 each currently-running monitored instance plus its `current` instantaneous
 readings; `runs` the recorded series of recent finished **monitored** runs
-(oldest first, unmonitored runs are omitted), capped by the `limit` query
-parameter (default 20, clamped to the retained history; `runs` is its
-legacy alias, read when `limit` is absent). With a
+(oldest first, unmonitored runs are omitted; the ordering note on
+[`GET /jobs/{name}/runs`](#get-jobsnameruns) applies to this array too),
+capped by the `limit` query parameter (default 20, clamped to the retained
+history; `runs` is its legacy alias, read when `limit` is absent). With a
 [durable state store](Durable-State), run series survive restarts inside the
 run ledger records. `monitored: false` with empty lists means the job never
 opted into `monitorResources` — distinguishable from "monitored but no data
@@ -827,12 +856,15 @@ count. `name` duplicates `dag` (the generic subject key the job routes use):
 
 The `limit` query parameter caps the number of runs returned (default 50,
 max 500); a missing or unparseable value falls back to the default rather
-than erroring. `404` if the DAG is not configured.
+than erroring. `404` if the DAG is not configured, or if there is no
+[`state:` store](Durable-State) at all, since run documents only exist in a
+durable store; the `error` says which.
 
 #### `GET /dags/{name}/runs/{run_key}`
 
 One run's full durable document -- every task's state, attempt, timing, XCom
-expansion (`mapped`), and approval decisions. `404` if the run is unknown.
+expansion (`mapped`), and approval decisions. `404` if the run is unknown,
+with the same split between an unknown DAG and a missing `state:` store.
 
 #### `POST /dags/{name}/trigger`
 
@@ -859,7 +891,8 @@ Body: `{"decision": "approve"|"reject", "by": "<who>"}`. `200` on success,
 The XCom outputs the run's tasks published, as a flat list of entries (task,
 key, sha256, size, timestamp) with small text values inlined and larger ones
 metadata-only; `truncated` flags a run with more entries than the cap. `404`
-if the DAG or run is unknown.
+if the DAG or run is unknown, or if no [`state:` store](Durable-State) is
+configured; the `error` says which.
 
 #### `GET /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs`
 
@@ -1121,7 +1154,7 @@ anywhere other local users matter.
 | Sub-option | Type | Description |
 | --- | --- | --- |
 | `value` | string or null | Literal token value. |
-| `fromFile` | string or null | Path to a file; the token is the file contents with surrounding whitespace stripped. |
+| `fromFile` | string or null | Path to a file; the token is the file contents with surrounding whitespace stripped. Read as UTF-8, and a leading byte-order mark is stripped too, so a file written by Notepad or a PowerShell redirect resolves to the token you typed. |
 | `fromEnvVar` | string or null | Name of an environment variable holding the token. |
 
 When `authToken` is set, an aiohttp middleware (`_make_auth_middleware`) requires
@@ -1432,7 +1465,9 @@ job can test the variable instead of guessing whether it was set.
 Every request must carry `Authorization: Bearer $CRONSTABLE_STATE_TOKEN`. The token
 is matched in constant time against the live run set, so a missing, malformed,
 forged, or stale token returns `401 Unauthorized` before any state is touched.
-Other outcomes:
+Its body is the same JSON envelope as every other error here, but its `error`
+is the generic `401: Unauthorized`, the same bytes whichever of those it was,
+so the response tells a caller nothing beyond the status. Other outcomes:
 
 | Status | When | Body |
 | --- | --- | --- |
@@ -1440,7 +1475,8 @@ Other outcomes:
 | `409` | A cursor advanced with a value not comparable to its stored one (a type clash). | `{"error": "..."}` |
 | `410` | An artifact record survives but its payload blob was garbage collected. | `{"error": "..."}` |
 | `413` | A value or artifact larger than the configured `maxValueBytes` / `maxArtifactBytes`. | `{"error": "..."}` |
-| `404` | A `get` for a key, cursor, artifact, or secret that is not set. | (empty) |
+| `404` | A `get` for a key, cursor, artifact, or secret that is not set. The reason names it, and the scoped three name the scope too. | `{"error": "..."}` |
+| `500` | An unexpected failure inside the endpoint. The reason is in the cronstable log, not the body. | `{"error": "..."}` |
 | `503` | The state store is unavailable or a backend call timed out. | `{"error": "..."}` |
 
 ### Scopes

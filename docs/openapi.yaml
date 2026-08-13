@@ -427,7 +427,11 @@ paths:
                 type: object
                 properties:
                   paused: { $ref: "#/components/schemas/Pause" }
-        "400": { description: A malformed or out-of-range pause request. }
+        "400":
+          description: A malformed or out-of-range pause request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -515,7 +519,10 @@ paths:
         "404":
           description: >-
             No such DAG, or no `state:` store is configured (run documents
-            only exist in a durable store).
+            only exist in a durable store). The `error` says which.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /dags/{name}/runs/{run_key}:
     get:
@@ -552,7 +559,10 @@ paths:
         "404":
           description: >-
             No such DAG or run, or no `state:` store is configured (XCom only
-            exists in a durable store).
+            exists in a durable store). The `error` says which.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /dags/{name}/runs/{run_key}/tasks/{taskkey}/logs:
     get:
@@ -596,7 +606,11 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "500": { description: The run could not be durably recorded. }
+        "500":
+          description: The run could not be durably recorded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /dags/{name}/backfill:
     post:
@@ -630,6 +644,9 @@ paths:
           description: >-
             A bad range or an unknown/unscheduled DAG (every refused backfill
             is 400 with a `reason`; this route never returns 404).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -655,10 +672,18 @@ paths:
               required: [decision]
       responses:
         "200": { description: The decision was recorded. }
-        "400": { description: A bad decision value. }
+        "400":
+          description: A bad decision value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
-        "409": { description: The task is not awaiting a decision. }
+        "409":
+          description: The task is not awaiting a decision.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /cluster:
     get:
@@ -760,7 +785,11 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
-        "400": { description: A missing `expr` or unknown `tz`. }
+        "400":
+          description: A missing `expr` or unknown `tz`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /schedule/pressure:
@@ -781,7 +810,11 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
-        "400": { description: An unknown `tz`. }
+        "400":
+          description: An unknown `tz`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /schedule/duplicates:
@@ -815,7 +848,11 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
-        "400": { description: A bad `period` or unknown `tz`. }
+        "400":
+          description: A bad `period` or unknown `tz`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /schedule/why:
@@ -838,7 +875,11 @@ paths:
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
-        "400": { description: A missing `job`/`at` or unparseable `at`. }
+        "400":
+          description: A missing `job`/`at` or unparseable `at`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
 
@@ -940,9 +981,15 @@ paths:
               schema: { type: object, additionalProperties: true }
         "400":
           description: "`ns` missing or not a `kv/`/`cursor/`/`idem/` namespace."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           description: No `state:` store is configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /state/records:
     get:
@@ -968,13 +1015,22 @@ paths:
               schema: { type: object, additionalProperties: true }
         "400":
           description: "`stream` missing or empty."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: >-
             `logs/` streams carry raw job output and are refused by the
             metadata-only inspector.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "404":
           description: No `state:` store is configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /whoami:
     get:
@@ -1018,8 +1074,14 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           description: No `push:` section is configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: The device registry's store is unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     post:
       tags: [push]
       summary: Pair a device
@@ -1061,12 +1123,21 @@ paths:
           description: >-
             Malformed JSON body, or a field missing, over-long, or not a
             valid base64 32-byte key.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404":
           description: No `push:` section is configured.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: The device registry's store is unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /push/devices/{id}:
     delete:
@@ -1086,8 +1157,14 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404":
           description: No `push:` section, or no device with this id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: The device registry's store is unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /push/devices/{id}/test:
     post:
@@ -1110,16 +1187,29 @@ paths:
         "502":
           description: >-
             `{device, status, error}`: sealing failed or the relay refused
-            or was unreachable.
+            or was unreachable. The one error body that carries more than
+            the envelope, so a `test` caller can see which device and which
+            relay status produced the reason; it is still readable as the
+            envelope.
           content:
             application/json:
-              schema: { type: object, additionalProperties: true }
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    additionalProperties: true
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404":
           description: No `push:` section, or no device with this id.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "503":
           description: The device registry's store is unavailable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /shutdown:
     post:
@@ -1148,6 +1238,9 @@ paths:
           description: >-
             No bearer token authenticated this request (including the case
             where the listener has no tokens configured at all).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /metrics:
     get:
@@ -1202,6 +1295,9 @@ paths:
           description: A notification or client response; no reply body.
         "400":
           description: Empty body, malformed JSON, or a JSON-RPC batch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     get:
@@ -1214,6 +1310,9 @@ paths:
           description: >-
             Always; the stateless transport opens no server-to-client SSE
             stream. `Allow: POST, OPTIONS`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     options:
@@ -1227,8 +1326,14 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: The `Origin` is not on `mcp.allowedOrigins`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "405":
           description: No `Origin` header (not a browser preflight).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /:
     get:
@@ -1328,7 +1433,11 @@ components:
       description: >-
         Missing or unrecognised bearer token (when `web.authToken` or any
         `web.authTokens` entry is configured). The body is the same JSON
-        error envelope every other error response carries.
+        error envelope every other error response carries, but its `error`
+        is the generic `401: Unauthorized`, byte-identical for a missing
+        header, a wrong scheme and an unknown token: a reason that told
+        those apart would answer, for an unauthenticated caller, which half
+        of a guess was right.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1340,7 +1449,12 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     NotFound:
-      description: No such job, DAG, or run.
+      description: >-
+        No such job, DAG, or run. The `error` names the subject that was not
+        found, and on the routes that resolve a job or a DAG's schedule
+        (`/schedule/why`, `/jobs/{name}/calendar.ics`) it says so. On the DAG
+        run routes it also distinguishes an unknown DAG from a daemon with no
+        `state:` store, since run documents only exist in a durable store.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1349,9 +1463,15 @@ components:
     Error:
       type: object
       description: >-
-        The uniform error envelope. Every 4xx/5xx body this API serves is
-        this object, the auth middleware's 401 included, so clients parse
-        failures one way across every endpoint.
+        The uniform error envelope. Every 4xx/5xx body this API's application
+        serves is this object, the auth middleware's 401 included, so clients
+        parse failures one way across every endpoint. A request that fails
+        before it reaches the application (a malformed request line, an
+        unparseable method token, oversized request headers, an unrecognised
+        `Expect:`) is answered by the HTTP server itself as text/plain and is
+        not described by this specification. Neither is the cluster peer
+        transport, a separate mTLS listener this specification does not
+        cover, which answers its own bodyless 4xx.
       properties:
         error:
           type: string
